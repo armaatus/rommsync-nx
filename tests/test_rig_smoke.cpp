@@ -78,7 +78,7 @@ int main() {
   const Response live = Request(heartbeat);
   if (live.code != CURLE_OK) {
     std::cerr << "rig unreachable at " << base << ": " << curl_easy_strerror(live.code)
-              << "\n  start it with: docker compose -f server/testing/docker-compose.yml up -d\n";
+              << "\n  start it with: ./scripts/orca/compose.sh up -d\n";
     curl_global_cleanup();
     return kSkip;
   }

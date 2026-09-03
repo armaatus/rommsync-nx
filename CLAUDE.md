@@ -100,6 +100,7 @@ serialising to avoid.
 | Path | What |
 |---|---|
 | `core/` | Portable engine — auth, sync, downloads, config, state. Host-testable. |
+| `host/` | Desktop backends for `core/`'s interfaces (libcurl `HttpClient`). Never built for Switch. |
 | `sysmodule/` | `sys-rommsync`, the background engine. devkitPro Makefile. |
 | `overlay/` | `ovl-rommsync`, the libultrahand overlay. devkitPro Makefile. |
 | `server/` | Pinned RomM API snapshot, contract probe, and the Docker test fixture. |

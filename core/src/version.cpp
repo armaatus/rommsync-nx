@@ -1,5 +1,5 @@
-// Placeholder translation unit so the core library has something to compile
-// before M0-2 lands the HttpClient interface. Replace, do not accumulate.
+// The compiled-in version string, so a build in the wild can say what it is.
+// kVersion itself comes from CMake via version.hpp.in.
 #include "rommsync/version.hpp"
 
 namespace rommsync {
