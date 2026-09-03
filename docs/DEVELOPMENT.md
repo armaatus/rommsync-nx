@@ -40,7 +40,10 @@ Recommended: build in the official devkitpro docker image
 ```
 CMakeLists.txt       # host build entry point
 core/                # portable engine, host- and devkitPro-compatible
-  include/rommsync/
+  include/rommsync/  # http.hpp -- the one HTTP surface the engine may use
+  src/
+host/                # host-only backends for core/'s interfaces; never built
+  include/rommsync/host/   # for the Switch. Today: the libcurl HttpClient.
   src/
 tests/               # CTest suites
 sysmodule/
@@ -68,7 +71,14 @@ mbedTLS/OpenSSL stack is heavy.
      applet/NRO that does the networking when foregrounded (less "auto", keep as
      last resort).
 - Keep all networking behind an `HttpClient` interface so the TLS backend is
-  swappable without touching sync/download logic.
+  swappable without touching sync/download logic. That interface is
+  [`core/include/rommsync/http.hpp`](../core/include/rommsync/http.hpp) (M0-2):
+  GET/POST, multipart with file parts streamed from disk, streamed
+  download-to-file with `Range` resume, connect/total/stall timeouts and
+  cancellation. The native backend is `host/src/curl_http_client.cpp`, the only
+  file in the tree that names a transport library. Two CI checks keep it that
+  way: `static` rejects any include in `core/` that is not a standard or
+  `rommsync/` header, and `switch-build` syntax-checks `core/` with devkitA64.
 
 Budget note: sysmodules declare their heap in `config.json`/`npdm`; size it for
 one in-flight download buffer + TLS context, stream to file rather than buffering

@@ -7,8 +7,11 @@ break by accident.
 - **Never** include a libnx header (`switch.h`, `<switch/...>`) or a host-only
   header here. Anything platform-specific goes behind an interface, implemented
   in `sysmodule/` (Horizon) and in the host backend.
-- All networking goes through the `HttpClient` interface (M0-2). No file in this
-  directory may name a concrete TLS or HTTP library.
+- All networking goes through the `HttpClient` interface,
+  `include/rommsync/http.hpp`. No file in this directory may name a concrete TLS
+  or HTTP library, and CI enforces the sharper version of that rule: an include
+  here must be either a standard header or a `rommsync/` one. Backends live in
+  `host/` (libcurl) and, from M0-3, `sysmodule/` (Horizon `ssl`).
 - Sources are globbed by `core/CMakeLists.txt` — add a `.cpp`, no CMake edit.
 - Streaming, not buffering: a rom may be gigabytes and the sysmodule heap is
   tiny. Write to a file as bytes arrive.
