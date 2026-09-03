@@ -1,0 +1,70 @@
+name: 🐞 Bug report
+description: Something in rommsync-nx behaves incorrectly.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. **Do not report security vulnerabilities here** —
+        use [Security → Report a vulnerability](https://github.com/armaatus/rommsync-nx/security/advisories/new)
+        (see [SECURITY.md](https://github.com/armaatus/rommsync-nx/blob/main/SECURITY.md)).
+
+        > Note: rommsync-nx is **pre-release** — the on-console client isn't
+        > implemented yet. Bugs today will mostly concern the docs, the API
+        > contract, or the `server/` probe script.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you file
+      options:
+        - label: I searched existing issues and this isn't a duplicate.
+          required: true
+        - label: This is not a security vulnerability (those go through the private advisory flow).
+          required: true
+        - label: This is not a bug in RomM itself (those go to rommapp/romm).
+          required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part is affected?
+      options:
+        - "server/ (probe script / contract)"
+        - "docs / API contract / protocol"
+        - "sysmodule (sys-rommsync)"
+        - "overlay (ovl-rommsync)"
+        - "repo / tooling"
+        - "not sure"
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you observe? What did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps to trigger the problem.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: romm-version
+    attributes:
+      label: RomM version
+      description: If relevant. The contract targets RomM 5.2.0.
+      placeholder: "5.2.0"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / output
+      description: Paste any relevant output. **Redact tokens and URLs.**
+      render: text

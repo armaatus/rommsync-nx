@@ -1,0 +1,14 @@
+# Dependabot version updates.
+# Only the GitHub Actions ecosystem exists in the tree today (see
+# .github/workflows/ci.yml). Add `pip`, `docker`, etc. as those manifests land.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
+      - "github-actions"
