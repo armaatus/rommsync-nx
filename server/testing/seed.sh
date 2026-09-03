@@ -50,10 +50,17 @@ done < "$MANIFEST"
 # --- generated fixtures ----------------------------------------------------
 large="$ROM_CACHE/synthetic-large-${LARGE_MB}mb.bin"
 multi="$LIBRARY/roms/psx/Synthetic Two Disc Game"
+# $ROM_CACHE is shared across worktrees (orca.yaml), so generate only when
+# missing and publish atomically -- an in-place rewrite lets a concurrent
+# worktree copy a half-written file and fail the M3-3 resume test with a bogus
+# hash mismatch.
 if [ ! -f "$large" ]; then
   echo "  generating ${LARGE_MB}MiB synthetic rom (Range-resume fixture)"
+  python3 server/testing/make_fixtures.py --large "$large.tmp" --size-mb "$LARGE_MB" --multi "$multi"
+  mv -f "$large.tmp" "$large"
+else
+  python3 server/testing/make_fixtures.py --multi "$multi"
 fi
-python3 server/testing/make_fixtures.py "$large" "$LARGE_MB" "$multi" >/dev/null
 mkdir -p "$LIBRARY/roms/gba"
 cp -f "$large" "$LIBRARY/roms/gba/synthetic-large.gba"
 

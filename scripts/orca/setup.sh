@@ -17,14 +17,18 @@ set -a; . ./.env; set +a
 echo "==> seeding ROM fixtures (shared cache: $ROM_CACHE)"
 ./server/testing/seed.sh
 
-echo "==> configuring build"
+# Build, not just configure. A configured-but-unbuilt tree makes the agent's
+# first `ctest` fail with "Not Run" and no explanation, which is exactly the
+# confusion `wait-for-setup` exists to avoid. It also warms the shared ccache.
+echo "==> building"
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug >/dev/null
+cmake --build build --parallel >/dev/null
 
 echo "==> starting RomM ($COMPOSE_PROJECT_NAME on :$ROMM_PORT)"
-docker compose -f server/testing/docker-compose.yml up -d
+./scripts/orca/compose.sh up -d
 
 echo
 echo "worktree ready."
 echo "  RomM        $ROMM_BASE_URL"
 echo "  fault proxy $PROXY_BASE_URL"
-echo "  tests       cmake --build build && ctest --test-dir build --output-on-failure"
+echo "  tests       ctest --test-dir build --output-on-failure"

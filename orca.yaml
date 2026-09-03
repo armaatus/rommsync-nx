@@ -30,7 +30,7 @@ defaultTabs:
   - title: romm
     # Streams the fixture's logs so infrastructure failure is distinguishable
     # from code failure at a glance.
-    command: docker compose -f server/testing/docker-compose.yml logs -f
+    command: ./scripts/orca/compose.sh logs -f
   - title: shell
 
 worktree:
