@@ -7,40 +7,101 @@ on:
   release:
     types: [created]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  # Rung 1 of the test ladder (docs/TESTING.md): the core engine compiled with the
-  # native toolchain and run against the mock RomM. This is what proves the logic
-  # off-console — no Switch, no real server. See issues M0-2, M0-3, M0-5.
+  # Cheap, fast checks on the scripts that stand up everyone's environment. If
+  # one of these is broken, every worktree created afterwards is broken too.
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell scripts parse
+        run: |
+          for script in scripts/orca/*.sh server/testing/*.sh; do
+            bash -n "$script"
+          done
+      - name: Python compiles
+        run: python3 -m compileall -q server/
+      - name: Compose file is valid
+        run: |
+          ./scripts/orca/env.sh
+          set -a; . ./.env; set +a
+          docker compose -f server/testing/docker-compose.yml config --quiet
+
+  # The primary rig (docs/TESTING.md): the core engine built natively and run
+  # against a REAL RomM 5.2.0 in Docker, reached through the fault proxy so the
+  # failure paths are exercised too.
+  #
+  # ROMMSYNC_REQUIRE_RIG=ON means an unreachable fixture FAILS here rather than
+  # skipping. A green run must mean the tests actually ran.
   host-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - name: Build host harness + run tests (mock RomM)
-        run: |
-          if [ -f Makefile ] && grep -q '^test:' Makefile 2>/dev/null; then
-            make test
-          elif [ -f host/Makefile ]; then
-            make -C host test
-          else
-            echo "host harness not present yet - skipping (M0-2 / M0-5)"
-          fi
 
-  build:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build libcurl4-openssl-dev ccache
+
+      - name: Derive environment and seed ROM fixtures
+        run: |
+          ./scripts/orca/env.sh
+          ./server/testing/seed.sh
+
+      - name: Start the RomM fixture
+        run: |
+          set -a; . ./.env; set +a
+          docker compose -f server/testing/docker-compose.yml up -d
+
+      - name: Wait for RomM
+        run: |
+          set -a; . ./.env; set +a
+          curl -sS --retry 60 --retry-delay 5 --retry-all-errors --retry-connrefused \
+            -o /dev/null -w 'romm: %{http_code}\n' "$ROMM_BASE_URL/api/heartbeat"
+          curl -sS --retry 20 --retry-delay 2 --retry-all-errors --retry-connrefused \
+            -o /dev/null -w 'proxy: %{http_code}\n' "$PROXY_BASE_URL/api/heartbeat"
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DROMMSYNC_REQUIRE_RIG=ON
+          cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: RomM logs on failure
+        if: failure()
+        run: docker compose -f server/testing/docker-compose.yml logs --tail=200
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f server/testing/docker-compose.yml down -v || true
+
+  # The Switch targets. devkitPro builds them but nothing runs them -- Horizon
+  # behaviour is proven on the Ryujinx rung and, last, on hardware (M8).
+  #
+  # The Makefiles do not exist yet; M0-3 completes this job. Until then it
+  # reports honestly rather than pretending to have built something.
+  switch-build:
     runs-on: ubuntu-latest
-    container: devkitpro/devkita64:latest   # devkitA64 + libnx + portlibs
+    container: devkitpro/devkita64:latest
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive   # libultrahand for the overlay
+          submodules: recursive
 
       - name: Build sysmodule
         run: |
           if [ -f sysmodule/Makefile ]; then
             make -C sysmodule -j"$(nproc)"
           else
-            echo "sysmodule/Makefile not present yet - skipping (M0-3)"
+            echo "::notice::sysmodule/Makefile not present yet — completed by M0-3"
           fi
 
       - name: Build overlay
@@ -48,7 +109,7 @@ jobs:
           if [ -f overlay/Makefile ]; then
             make -C overlay -j"$(nproc)"
           else
-            echo "overlay/Makefile not present yet - skipping (M0-3)"
+            echo "::notice::overlay/Makefile not present yet — completed by M0-3"
           fi
 
       - name: Collect artifacts

@@ -1,0 +1,83 @@
+# Throwaway RomM 5.2.0 fixture — the primary test rig (docs/TESTING.md).
+#
+# This is a REAL RomM, not a mock: when a test passes against it, the behaviour
+# is real. Failure modes a healthy RomM will not produce on demand (401 mid-sync,
+# truncated body, dropped connection, stall) are injected by the fault proxy in
+# front of it — see fault_proxy.py.
+#
+# Every worktree runs its own copy. COMPOSE_PROJECT_NAME and the ports come from
+# .env, generated per worktree by scripts/orca/env.sh, so three concurrent
+# worktrees never share a port or a database. NEVER point this at a production
+# RomM volume.
+
+name: ${COMPOSE_PROJECT_NAME:-rmx-local}
+
+volumes:
+  db_data:
+  romm_resources:
+  romm_redis_data:
+  romm_assets:
+
+services:
+  romm:
+    image: rommapp/romm:5.2.0
+    restart: unless-stopped
+    environment:
+      DB_HOST: romm-db
+      DB_NAME: romm
+      DB_USER: romm-user
+      DB_PASSWD: rommsync-test-only
+      # Fixture-only secret. This stack is disposable and never holds real data,
+      # so a committed key is deliberate — it keeps runs reproducible.
+      ROMM_AUTH_SECRET_KEY: 0000000000000000000000000000000000000000000000000000000000000001
+      # Metadata providers are OFF on purpose: tests must be deterministic and
+      # runnable offline, and enrichment would vary run to run.
+      HASHEOUS_API_ENABLED: "false"
+      SCAN_WORKERS: "1"
+      WEB_SERVER_CONCURRENCY: "2"
+    volumes:
+      - romm_resources:/romm/resources
+      - romm_redis_data:/redis-data
+      - romm_assets:/romm/assets
+      # Seeded by seed.sh from the shared, checksum-pinned ROM cache.
+      - ./library:/romm/library
+    ports:
+      - "127.0.0.1:${ROMM_PORT:-21515}:8080"
+    depends_on:
+      romm-db:
+        condition: service_healthy
+        restart: true
+
+  romm-db:
+    image: mariadb:11
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: rommsync-test-only-root
+      MARIADB_DATABASE: romm
+      MARIADB_USER: romm-user
+      MARIADB_PASSWORD: rommsync-test-only
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      start_period: 30s
+      start_interval: 5s
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Sits between the harness and RomM. Passes traffic through untouched until a
+  # scenario is armed, then damages exactly one thing about a real response.
+  fault-proxy:
+    image: python:3.12-alpine
+    restart: unless-stopped
+    command: ["python", "/app/fault_proxy.py"]
+    environment:
+      UPSTREAM: http://romm:8080
+      LISTEN_PORT: "8080"
+    volumes:
+      - ./fault_proxy.py:/app/fault_proxy.py:ro
+    ports:
+      - "127.0.0.1:${PROXY_PORT:-23515}:8080"
+    depends_on:
+      - romm

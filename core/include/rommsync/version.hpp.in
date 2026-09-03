@@ -1,0 +1,13 @@
+// Generated from version.hpp.in by CMake. Do not edit the generated copy.
+#pragma once
+
+namespace rommsync {
+
+/// Project version, single-sourced from the top-level CMakeLists.txt.
+inline constexpr const char* kVersion = "@PROJECT_VERSION@";
+
+/// User agent sent on every request to RomM. RomM records the client string, so
+/// keeping it stable and identifiable matters for server-side debugging.
+inline constexpr const char* kUserAgent = "rommsync-nx/@PROJECT_VERSION@";
+
+}  // namespace rommsync

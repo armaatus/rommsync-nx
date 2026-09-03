@@ -6,6 +6,23 @@ RomM and the contract snapshot/probe under `server/`.
 
 ## Toolchain
 
+Two build systems, on purpose:
+
+- **Host / `core/` — CMake + CTest.** This is where ~90% of development happens,
+  so it gets the toolchain with per-test granularity and a globbed source list
+  (no shared object list for parallel worktrees to conflict on).
+- **Switch targets — devkitPro Makefiles.** devkitA64's build rules and the
+  `.ovl`/`.nsp` packaging steps are Makefile-native; fighting that would mean
+  debugging build tooling instead of building the app.
+
+Both consume the same `core/` sources.
+
+```bash
+cmake -S . -B build && cmake --build build      # host
+ctest --test-dir build --output-on-failure       # host tests
+make -C sysmodule                                # devkitPro (in the container)
+```
+
 - [devkitPro](https://devkitpro.org/wiki/Getting_Started) with the **switch-dev**
   group: `devkitA64`, `libnx`, and portlibs.
 - `pacman -S switch-dev switch-portlibs` after installing devkitPro's pacman.
@@ -18,9 +35,14 @@ RomM and the contract snapshot/probe under `server/`.
 Recommended: build in the official devkitpro docker image
 `devkitpro/devkita64` so contributors and CI match. See `.github/workflows/ci.yml`.
 
-## Repo build layout (to be created under each component)
+## Repo build layout
 
 ```
+CMakeLists.txt       # host build entry point
+core/                # portable engine, host- and devkitPro-compatible
+  include/rommsync/
+  src/
+tests/               # CTest suites
 sysmodule/
   Makefile
   source/            # engine: auth, http(tls), sync, downloads, ipc, scheduler
@@ -64,20 +86,29 @@ Commands: `GetStatus`, `SetEnabled`, `SyncNow`, `GetConfig`, `SetConfig`,
 **Hard rule: no real Switch and no production RomM until v1 is proven
 off-console.** Full strategy in [TESTING.md](TESTING.md); the ladder:
 
-1. **Host build + mock RomM** — the core engine (auth, sync, downloads, config,
-   `state.db`, IPC protocol) compiles native and runs against a scriptable mock
-   RomM that forces every edge case (401, conflict, partial failure, `Range`
-   resume, multi-file skip). Fast, offline, runs in CI. This is the primary loop.
-2. **Host build + docker RomM** — the same harness against a real RomM 5.2.0 in
-   docker-compose (throwaway volume) to confirm the mock matches reality.
-3. **Ryujinx NRO** — a manually-launched **NRO** (not a sysmodule, not on the boot
+1. **Host build + real docker RomM** — the core engine (auth, sync, downloads,
+   config, `state.db`, IPC protocol) compiles native and runs against a genuine
+   RomM 5.2.0 in Docker. There is **no mock**: a passing test means the behaviour
+   is real. Failure modes a healthy RomM will not produce on demand (401
+   mid-sync, truncated body, dropped connection, stall) are forced by a fault
+   proxy sitting in front of it. Runs in CI. This is the primary loop.
+2. **Ryujinx NRO** — a manually-launched **NRO** (not a sysmodule, not on the boot
    path) built from the same core lib, run in Ryujinx against docker RomM. This is
    where the Horizon `ssl`/`fs`/socket path is exercised without hardware.
-4. **Real hardware** — last, gated behind the v1 gate (milestone **M8**).
+3. **Real hardware** — last, gated behind the v1 gate (milestone **M8**).
 
 The sysmodule heap behavior under Atmosphère, boot scheduling, and the
 Tesla/Ultrahand overlay UI are the only things that truly need a console — they're
 deliberately the last things touched. Everything else is proven before then.
+
+### Worktree isolation
+
+Agents work in parallel worktrees and sync tests mutate saves by design, so each
+worktree runs **its own** RomM. `scripts/orca/env.sh` derives a compose project
+name and two ports from the worktree path into `.env`; `orca.yaml` runs it on
+worktree creation and tears the stack down on removal. Only immutable, expensive
+things are shared across worktrees — the checksum-pinned ROM cache and the
+content-addressed ccache. Never hardcode a port; read `.env`.
 
 The **server contract** is testable off-console: `server/probe_contract.py`
 exercises auth + negotiate + saves against a RomM and prints the real response
@@ -86,6 +117,7 @@ schema before implementing.
 
 ## Coding standards
 
-- C++20, warnings-as-errors in CI.
+- C++20, warnings-as-errors everywhere (`-Wall -Wextra -Wpedantic -Werror`),
+  not just in CI.
 - No secrets in the tree; `config.ini`/`token.dat` are git-ignored.
 - Every network call: timeout, offline-safe, ret/backoff. Never block boot.

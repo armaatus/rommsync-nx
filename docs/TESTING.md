@@ -14,40 +14,85 @@ Horizon `ssl` service. The sync engine, matcher, download worker, config parser,
 `state.db`, and the IPC protocol don't know or care which backend is underneath —
 so they are fully testable natively.
 
+## There is no mock RomM
+
+Tests run against a **real RomM 5.2.0** in Docker, not a hand-written mock. A
+mock only ever encodes what we *believe* RomM does; when a test passes against
+the real thing, the behaviour is real, and the whole class of "the mock drifted
+from the server" bugs cannot happen.
+
+The cost of that choice is that a healthy RomM will not fail on command — and the
+failure paths are where saves get corrupted. So a small **fault-injecting proxy**
+sits between the harness and RomM ([`server/testing/fault_proxy.py`](../server/testing/fault_proxy.py)).
+It forwards everything untouched until a scenario is armed, then damages exactly
+one thing about a genuine response:
+
+| Mode | Effect |
+|---|---|
+| `status` | Return an arbitrary status (401 mid-sync, 500, …) instead of forwarding |
+| `truncate` | Forward the real response but cut the body short, cleanly |
+| `drop` | Cut the body short and abort the connection with a TCP reset |
+| `stall` | Delay past the client's timeout |
+
+Scenarios can target a path prefix, skip the first N matching requests
+(`after`), and apply a fixed number of times before auto-disarming (`count`), so
+"the third call to `/api/sync/negotiate` fails with 401" is one line:
+
+```bash
+. ./.env
+curl -XPOST "$PROXY_BASE_URL/__fault" \
+  -d '{"mode":"status","status":401,"path":"/api/sync/negotiate","after":2}'
+```
+
+The proxy never synthesises a RomM response of its own — that is what keeps the
+fidelity while still making failure deterministic and repeatable in CI.
+
 ## The test ladder
 
 Climb it in order. You do not go up a rung until the one below is green.
 
 | Rung | Environment | Proves | Console? |
 |---|---|---|---|
-| 1 | **Host build + mock RomM** | Engine logic + every edge case (401, conflict, partial failure, `Range` resume, multi-file skip). Fast, offline, runs in CI. | No |
-| 2 | **Host build + docker RomM** | Fidelity — the mock matched a real RomM 5.2.0. | No |
-| 3 | **Ryujinx NRO + docker RomM** | The real Horizon path (`ssl`/`fs`/`socket`) via a manually-launched NRO built from the same core lib. The only pre-hardware place Horizon code actually runs. | No (emulator) |
-| 4 | **Real hardware (M8)** | Final bring-up, on a backup SD/emuMMC, NRO first then a disabled sysmodule. | Yes — last, gated |
+| 1 | **Host build + real docker RomM (+ fault proxy)** | Engine logic against a genuine RomM, plus every forced edge case: 401, conflict, partial failure, `Range` resume, multi-file skip. Runs in CI. | No |
+| 2 | **Ryujinx NRO + docker RomM** | The real Horizon path (`ssl`/`fs`/`socket`) via a manually-launched NRO built from the same core lib. The only pre-hardware place Horizon code actually runs. | No (emulator) |
+| 3 | **Real hardware (M8)** | Final bring-up, on a backup SD/emuMMC, NRO first then a disabled sysmodule. | Yes — last, gated |
 
-Rungs 1–2 are the day-to-day loop. Rung 3 is where the M0-1 `ssl` question gets
-answered without hardware. Rung 4 is a single gated milestone, not part of normal
+Rung 1 is the day-to-day loop. Rung 2 is where the M0-1 `ssl` question gets
+answered without hardware. Rung 3 is a single gated milestone, not part of normal
 development.
 
-## Rung 1 — host harness + mock RomM (primary)
+## Rung 1 — host + docker RomM (primary)
 
-- `make test` builds the core library + native `HttpClient` and runs the suite
-  against the **mock RomM** (`server/testing/` — see M0-5). No external services.
-- The mock is scriptable: it can return any negotiate plan and force 401s,
-  conflicts (`server_wins` / `device_wins` / `keep_both`), mid-plan failures, and
-  dropped-connection resume.
+```bash
+cmake -S . -B build && cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+- The fixture is [`server/testing/docker-compose.yml`](../server/testing/docker-compose.yml):
+  RomM 5.2.0 on a throwaway volume, with metadata providers disabled so runs are
+  deterministic and offline.
+- [`seed.sh`](../server/testing/seed.sh) populates the library from
+  `roms.manifest` — **homebrew and freely redistributable ROMs only**,
+  checksum-pinned, since it is fetched in public CI. Two fixtures no real ROM
+  provides are generated deterministically instead: a large file for `Range`
+  resume, and a multi-file rom directory for the `has_multiple_files` skip.
 - Every save-overwrite test asserts a backup is written **first**
   ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md) hard rule).
+- With Docker stopped, `rig.smoke` reports **Skipped** rather than failing, so a
+  local `ctest` is still useful. CI configures with `-DROMMSYNC_REQUIRE_RIG=ON`,
+  which turns the same condition into a failure — a green CI run always means the
+  tests actually ran.
 
-## Rung 2 — docker RomM (fidelity)
+### Worktree isolation
 
-- `server/testing/docker-compose.yml` (M0-6) brings up a real RomM 5.2.0 on a
-  throwaway volume, seeded with a small `Handheld` collection and a sample save.
-- Used to capture real response shapes (`probe_contract.py`, M0-4) and to re-run
-  the harness scenarios against the genuine article.
-- **Never** point this at a production RomM database.
+Several agents work in parallel worktrees, and sync tests mutate saves by design.
+Each worktree therefore gets its **own** RomM: `scripts/orca/env.sh` derives a
+compose project name and two ports from the worktree path and writes them to
+`.env`, so no two worktrees share a port or a database. Only immutable, expensive
+things are shared between worktrees — the checksum-pinned ROM downloads and the
+content-addressed ccache, declared in [`orca.yaml`](../orca.yaml).
 
-## Rung 3 — Ryujinx NRO
+## Rung 2 — Ryujinx NRO
 
 - A standalone **NRO** (manually launched, *not* a sysmodule, *not* on the boot
   path) built from the same core lib, run in Ryujinx against docker RomM.
@@ -55,7 +100,7 @@ development.
 - If Ryujinx's `ssl`/`bsd` support turns out to be insufficient, the same NRO is
   the fallback experiment on a **backup SD** — still never an auto-boot sysmodule.
 
-## Rung 4 — the v1 gate and real hardware (M8)
+## Rung 3 — the v1 gate and real hardware (M8)
 
 Do not begin M8 until **M8-1** is fully checked:
 
@@ -73,7 +118,7 @@ sysmodule **disabled**, and only sync against a **disposable** collection with
 - **Fully off-console:** auth flow, sync negotiate/execute/complete, conflict
   handling, downloads + resume + hash verify, config parsing, `state.db`, backup
   guarantees, the IPC command/response protocol.
-- **Emulator (rung 3):** the `ssl`-service TLS path and libnx fs/socket calls —
+- **Emulator (rung 2):** the `ssl`-service TLS path and libnx fs/socket calls —
   as far as Ryujinx implements them.
 - **Only real hardware (M8):** sysmodule heap behavior under Atmosphère, boot-time
   scheduling, ovl-sysmodules toggling, and the Tesla/Ultrahand overlay UI itself
