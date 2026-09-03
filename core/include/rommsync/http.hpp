@@ -97,7 +97,8 @@ struct Request {
   Headers headers;
 
   /// The raw request body -- JSON, form-urlencoded, anything. Ignored when
-  /// `form` is non-empty.
+  /// `form` is non-empty. Only POST and PUT may carry one; a body on any other
+  /// method is `Error::kInvalidRequest` rather than a silently dropped body.
   std::string body;
 
   /// When non-empty the body is built as `multipart/form-data` from these parts
@@ -105,8 +106,10 @@ struct Request {
   std::vector<FormPart> form;
 
   /// Start the response at this byte offset (`Range: bytes=N-`). A server that
-  /// honours it answers 206; one that ignores it answers 200 with the whole
-  /// resource, and `Download` handles that by starting the file over.
+  /// honours it answers 206. One that ignores it answers 200 with the whole
+  /// resource: `Download` then starts the file over, so the destination holds
+  /// the entire resource rather than a splice, and `Response::status` is what
+  /// tells the two apart.
   std::uint64_t range_start = 0;
 
   std::chrono::milliseconds connect_timeout = kDefaultConnectTimeout;
@@ -128,11 +131,15 @@ struct Response {
   int status = 0;
   Headers headers;
 
-  /// The response body. Always empty for `Download` -- the bytes went to disk.
+  /// The response body. Empty for a *successful* `Download` -- those bytes went
+  /// to disk. A failed one keeps the server's explanation here instead, capped,
+  /// because a 404's body says why there is no content and must never be
+  /// mistaken for content.
   std::string body;
 
   /// Body bytes actually received. For a resumed download this counts only the
-  /// bytes this call fetched, not the bytes already in the partial file.
+  /// bytes this call fetched, not the bytes already in the partial file, and it
+  /// can exceed `body.size()` when a long error body was capped.
   std::uint64_t bytes_received = 0;
 
   /// What the server said the body would be: `Content-Length`, or the total
@@ -167,10 +174,13 @@ struct DownloadTarget {
   /// Continue an interrupted download from the bytes already in `<path>.part`.
   bool resume = false;
 
-  /// The size the caller already knows from elsewhere (rom metadata, a sync
-  /// plan). When set, a body that ends early is `Error::kTruncated` even if the
-  /// server declared no length -- which is the only way to catch a server that
-  /// closes cleanly mid-body. Zero means "trust whatever the server declares".
+  /// How many bytes `path` must hold to be complete: the resource size for a
+  /// whole download, the slice length for a ranged one. When set, a body that
+  /// ends early is `Error::kTruncated` even if the server declared no length --
+  /// the only way to catch a server that closes cleanly mid-body. Zero means
+  /// "trust whatever the server declares", which a `resume` cannot do: there is
+  /// no way to check the seam between two halves without a total, so a resumed
+  /// download against a server that declares nothing fails rather than guesses.
   std::uint64_t expected_size = 0;
 };
 

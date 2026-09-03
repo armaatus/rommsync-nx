@@ -66,6 +66,10 @@ set(HTTP_SCENARIOS
   drop              # a TCP reset mid-body: an error, and no file at the destination
   resume            # pick that interrupted download back up
   resume_no_range   # ...even when the server ignores Range and starts over
+  resume_empty_body # ...and a bodyless 2xx never promotes the stale partial
+  resume_stale_range # a partial the server rejects with 416 does not wedge retries
+  range_expected_size # the caller's known size is checked for a slice too
+  not_found         # a 404 reaches the caller and leaves no debris
   truncate          # a clean short close, caught only by the caller's known size
   stall             # total and no-progress timeouts both fire
   cancel            # cancellation from another thread, and nothing left behind

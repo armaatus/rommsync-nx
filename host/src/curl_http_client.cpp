@@ -13,7 +13,9 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
+#include <system_error>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -99,9 +101,10 @@ struct Transfer {
   std::FILE* file = nullptr;
   std::string error_body;      ///< a non-2xx body goes here, never to the file
   std::uint64_t resume_from = 0;
-  bool restart_needed = false;  ///< asked for a range, got the whole resource
+  /// There are bytes on disk from an earlier attempt and this response has not
+  /// yet said whether they are still part of the file.
+  bool restart_needed = false;
   bool write_failed = false;
-  bool canceled = false;
 
   std::uint64_t received = 0;
 };
@@ -115,6 +118,9 @@ std::size_t OnHeader(char* data, std::size_t size, std::size_t nmemb, void* cont
   // Continue) only the last block describes the response the caller gets.
   if (line.rfind("HTTP/", 0) == 0) {
     transfer->headers.clear();
+    // A redirect's body belongs to the redirect, not to the response the caller
+    // ends up with, so it goes when its header block does.
+    transfer->error_body.clear();
     transfer->status = 0;
     const std::size_t space = line.find(' ');
     if (space != std::string_view::npos) {
@@ -149,6 +155,7 @@ std::size_t OnBodyToFile(char* data, std::size_t size, std::size_t nmemb, void* 
   if (transfer->status < 200 || transfer->status >= 300) {
     const std::size_t room = kErrorBodyCap - std::min(kErrorBodyCap, transfer->error_body.size());
     transfer->error_body.append(data, std::min(length, room));
+    transfer->received += length;  // what arrived, even though only `room` was kept
     return length;
   }
 
@@ -177,9 +184,8 @@ std::size_t OnBodyToFile(char* data, std::size_t size, std::size_t nmemb, void* 
 }
 
 int OnProgress(void* context, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
-  auto* transfer = static_cast<Transfer*>(context);
+  const auto* transfer = static_cast<const Transfer*>(context);
   if (transfer->request->cancel != nullptr && transfer->request->cancel->canceled()) {
-    transfer->canceled = true;
     return 1;  // aborts with CURLE_ABORTED_BY_CALLBACK
   }
   return 0;
@@ -214,27 +220,23 @@ Error Classify(CURLcode code, const Transfer& transfer) {
       // mid-download takes, and the one the fault proxy's `drop` mode forces.
       return Error::kTruncated;
     case CURLE_WRITE_ERROR:
-      return transfer.canceled ? Error::kCanceled : Error::kWriteFailed;
+      // Our write callback is the only thing that can short-change libcurl, and
+      // it only does so when the destination file refused the bytes.
+      return transfer.write_failed ? Error::kWriteFailed : Error::kTransport;
     default:
       return Error::kTransport;
   }
 }
 
 /// Size of an existing file, or zero when it is not there.
+///
+/// Not ftell: its `long` is not a file offset, and a rom past 2 GiB would come
+/// back negative, be read as "nothing to resume", and quietly restart a
+/// multi-gigabyte download from zero.
 std::uint64_t FileSize(const std::string& path) {
-  std::FILE* file = std::fopen(path.c_str(), "rb");
-  if (file == nullptr) {
-    return 0;
-  }
-  std::uint64_t size = 0;
-  if (std::fseek(file, 0, SEEK_END) == 0) {
-    const long offset = std::ftell(file);
-    if (offset > 0) {
-      size = static_cast<std::uint64_t>(offset);
-    }
-  }
-  std::fclose(file);
-  return size;
+  std::error_code error;
+  const auto size = std::filesystem::file_size(path, error);
+  return error ? 0 : static_cast<std::uint64_t>(size);
 }
 
 /// Owns one easy handle and the lists hung off it, so every early return frees
@@ -317,12 +319,11 @@ class CurlHttpClient final : public http::HttpClient {
 
     const std::string partial_path = target.path + ".part";
 
-    // A caller-set range means "fetch this slice"; a resume means "finish this
-    // file". Only a resume keeps the bytes already on disk, and only a resume
-    // is checked against the resource's total size.
-    const bool whole_resource = request.range_start == 0;
+    // A caller-set range means "fetch this slice" and starts the file fresh; a
+    // resume means "finish this file" and is the only case that keeps the bytes
+    // already on disk.
     const std::uint64_t already_have =
-        (target.resume && whole_resource) ? FileSize(partial_path) : 0;
+        (target.resume && request.range_start == 0) ? FileSize(partial_path) : 0;
     const bool resuming = already_have > 0;
 
     Request effective = request;
@@ -351,6 +352,13 @@ class CurlHttpClient final : public http::HttpClient {
 
     Perform(exchange, transfer, result);
 
+    // Still set means no body ever reached the write callback, so this response
+    // never confirmed the bytes already on disk. They are not part of it, and
+    // counting them would let an empty 200 promote a stale partial file.
+    if (transfer.restart_needed) {
+      transfer.resume_from = 0;
+    }
+
     const bool flushed = std::fflush(transfer.file) == 0 && fsync(fileno(transfer.file)) == 0;
     const std::uint64_t written = transfer.resume_from + transfer.received;
     std::fclose(transfer.file);
@@ -360,21 +368,50 @@ class CurlHttpClient final : public http::HttpClient {
     if (!result.ok()) {
       return result;  // the partial file stays behind for a later resume
     }
+
+    const int status = result.response.status;
+    if (resuming && status == 416) {
+      // Our offset is not valid for this resource any more, so the bytes we
+      // were building on are worthless -- and keeping them would make every
+      // future resume ask for the same impossible range. Start the next attempt
+      // clean instead.
+      std::remove(partial_path.c_str());
+      result.error = Error::kTruncated;
+      result.message = "the partial file no longer matches the resource; retry from the start";
+      return result;
+    }
+    if (status != 200 && status != 206) {
+      // Not a body-bearing response: a status the caller has to handle, with
+      // nothing at the destination. Do not leave the empty part file we just
+      // created lying next to it.
+      if (!resuming) {
+        std::remove(partial_path.c_str());
+      }
+      return result;
+    }
     if (!flushed) {
       result.error = Error::kWriteFailed;
       result.message = "could not flush " + partial_path;
       return result;
     }
-    if (!result.successful()) {
-      return result;  // a status the caller must handle; nothing was written
-    }
 
-    // The whole point of the .part file: a body that ended early never becomes
-    // the destination. `expected_size` catches the case the transport cannot --
-    // a server that closes cleanly without ever declaring a length.
-    const std::uint64_t expected =
-        target.expected_size != 0 ? target.expected_size : result.response.declared_size;
-    if (whole_resource && expected != 0 && written != expected) {
+    // What the destination has to weigh to be complete. A caller-supplied size
+    // wins: it is the only thing that can catch a server which ends the body
+    // cleanly without ever declaring a length. Otherwise the server's own
+    // declaration does, except for a slice the caller asked for -- there
+    // `declared_size` is the whole resource, not the slice.
+    const bool got_slice = request.range_start > 0 && status == 206;
+    std::uint64_t expected = target.expected_size;
+    if (expected == 0 && !got_slice) {
+      expected = result.response.declared_size;
+    }
+    if (resuming && expected == 0) {
+      // Stitching two halves together is only safe if we can check the seam.
+      result.error = Error::kTruncated;
+      result.message = "resumed download cannot be verified: the server declared no size";
+      return result;
+    }
+    if (expected != 0 && written != expected) {
       result.error = Error::kTruncated;
       result.message = "expected " + std::to_string(expected) + " bytes, wrote " +
                        std::to_string(written);
@@ -421,10 +458,11 @@ class CurlHttpClient final : public http::HttpClient {
       result.message = "request url is empty";
       return false;
     }
-    if (!request.form.empty() && request.method != Method::kPost &&
-        request.method != Method::kPut) {
+    if (request.method != Method::kPost && request.method != Method::kPut &&
+        (!request.form.empty() || !request.body.empty())) {
+      // Silently dropping it is how a caller ends up debugging the server.
       result.error = Error::kInvalidRequest;
-      result.message = "multipart bodies are only valid on POST and PUT";
+      result.message = "a request body is only valid on POST and PUT";
       return false;
     }
 
