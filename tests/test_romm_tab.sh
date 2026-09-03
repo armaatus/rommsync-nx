@@ -58,6 +58,13 @@ ROMM_PORT=21999
 PROXY_PORT=23999
 ENV
 
+    # Without this the phase is vacuous: stack_is_up returns 1 on ANY failure --
+    # including a fixture too incomplete to run compose at all -- and the script
+    # then waits, which is exactly what the assertions below look for. Deleting
+    # compose.sh from the fixture used to still report PASS.
+    "$tmp/scripts/orca/compose.sh" config --services >/dev/null 2>&1 \
+      || fail "fixture is broken: compose.sh cannot read the compose file, so waiting proves nothing"
+
     survived_for "$tmp" 6 \
       || fail "the tab exited while the stack was still coming up (this is the bug)"
     grep -q "waiting for RomM" "$OUT" \
@@ -74,8 +81,13 @@ ENV
     fi
 
     survived_for "$REPO_ROOT" 12 || fail "the tab exited while the stack was up"
-    # `logs --tail` on a live stack always has something to show.
-    [ "$(grep -c . "$OUT")" -gt 1 ] || fail "attached but streamed nothing"
+    # Count only container output: the script's own `==>` status lines are
+    # present either way, so counting every line would pass even for a tab that
+    # showed no RomM logs at all. `logs --tail` on a live stack always has
+    # something to show.
+    streamed="$(grep -v '^==>' "$OUT" | grep -c .)"
+    [ "${streamed:-0}" -gt 0 ] \
+      || fail "attached but streamed no container output; got: $(tail -5 "$OUT")"
     echo "PASS: tab attaches and streams while the stack is up"
     ;;
 

@@ -20,16 +20,14 @@ cd "$REPO_ROOT"
 COMPOSE="./scripts/orca/compose.sh"
 POLL_SECONDS="${ROMM_LOGS_POLL_SECONDS:-2}"
 
-# Every service must have a container before following, not just any one of
-# them. `up -d` creates romm-db first and only creates romm once the database is
-# healthy, so attaching at the first sign of life would follow the database and
-# miss RomM's own startup entirely -- the output the tab exists to show.
+# One running container is enough to attach. `up -d` creates romm-db first and
+# only creates romm once the database is healthy, so waiting for all three would
+# show nothing at all when a bring-up stops half way -- an image pull failing
+# offline, say -- which is the very failure this tab exists to make visible.
+# Attaching early costs nothing: `docker compose logs -f` picks up containers
+# created after it attached, verified against this compose version.
 stack_is_up() {
-  local services containers
-  services="$($COMPOSE config --services 2>/dev/null | grep -c .)" || return 1
-  [ "$services" -gt 0 ] || return 1
-  containers="$($COMPOSE ps -q 2>/dev/null | grep -c .)" || return 1
-  [ "$containers" -ge "$services" ]
+  [ -n "$($COMPOSE ps -q 2>/dev/null)" ]
 }
 
 while :; do
@@ -39,7 +37,12 @@ while :; do
     # history before it shows anything current.
     $COMPOSE logs -f --tail 200
     echo
-    echo "==> stack went away; waiting for it to come back"
+    echo "==> log stream ended; waiting for the stack to come back"
+    # Unconditional, because `logs -f` can return while the stack is still up --
+    # the daemon dropping the stream, for one. Without it that path loops
+    # straight back into `logs -f` and spins the tab at tens of iterations a
+    # second, three `docker compose` forks each.
+    sleep "$POLL_SECONDS"
   else
     echo "==> waiting for RomM (scripts/orca/setup.sh brings it up last)"
     while ! stack_is_up; do sleep "$POLL_SECONDS"; done

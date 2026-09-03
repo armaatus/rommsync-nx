@@ -3,6 +3,7 @@ config.ini
 token.dat
 *.token
 .env
+.env.tmp
 
 # generated per-worktree environment / fixtures — never shared, never committed
 .cache/
