@@ -18,6 +18,7 @@ declare -A labels=(
   [sysmodule]=1f6feb [overlay]=8957e5 [server]=0e8a16 [auth]=b60205
   [sync]=fbca04 [download]=0052cc [ipc]=5319e7 [config]=006b75
   [packaging]=c2e0c6 [docs]=cccccc [risk]=d93f0b [good-first-issue]=7057ff
+  [test-harness]=5def9e
 )
 for name in "${!labels[@]}"; do
   run "gh label create '$name' --color '${labels[$name]}' --force >/dev/null"
@@ -33,6 +34,7 @@ milestones=(
   "M5 - Config & IPC"
   "M6 - Packaging & CI"
   "M7 - Polish"
+  "M8 - Hardware bring-up (after proven v1)"
 )
 for m in "${milestones[@]}"; do
   # gh has no native milestone create; use the API. Ignore "already_exists".
@@ -46,15 +48,21 @@ issue() {
 }
 
 echo "== issues =="
-# --- M0
-issue "M0-1: Prototype HTTPS from a sysmodule via the ssl service" "M0 - Foundations & de-risking" "risk,sysmodule" \
-  "Spike: TLS GET to RomM /openapi.json from a minimal sysmodule using the Horizon ssl service (+bsd/socket). Measure heap. Go/no-go vs fallbacks. BLOCKS all networked work. See docs/DEVELOPMENT.md."
-issue "M0-2: Define the HttpClient interface" "M0 - Foundations & de-risking" "docs,sysmodule" \
-  "Interface for GET/POST, multipart upload, streaming download-to-file, timeouts, cancellation. TLS backend must be swappable."
-issue "M0-3: Repo skeleton builds in CI" "M0 - Foundations & de-risking" "packaging" \
-  "devkitpro docker image; empty sysmodule + overlay compile and emit artifacts. Wire .github/workflows/ci.yml."
-issue "M0-4: Confirm auth/sync response shapes against live RomM" "M0 - Foundations & de-risking" "server,docs" \
-  "Run server/probe_contract.py --auth --negotiate; paste real init/token/negotiate JSON into docs/API_CONTRACT.md and AUTH.md."
+# --- M0  (off-console harness first; hardware-ish TLS spike is de-risked, not a blocker)
+issue "M0-1: Sysmodule TLS feasibility via ssl service — Ryujinx-first, off the boot path" "M0 - Foundations & de-risking" "risk,sysmodule,test-harness" \
+  "De-risking spike (not a blocker): a manually-launched NRO (not a sysmodule) does a TLS GET over the Horizon ssl service, run in Ryujinx against docker RomM; only if Ryujinx can't exercise ssl, run on a backup SD. Measure heap; go/no-go vs fallbacks. See docs/DEVELOPMENT.md#tls-in-a-sysmodule."
+issue "M0-2: HttpClient interface + native (libcurl) backend for the host harness" "M0 - Foundations & de-risking" "sysmodule,test-harness,docs" \
+  "GET/POST/multipart, streaming download-to-file, timeouts, cancellation, Range. Swappable TLS backend; ship the native (libcurl) backend so all networked logic is testable off-console."
+issue "M0-3: CI builds host harness (runs tests) + Switch skeleton (artifacts)" "M0 - Foundations & de-risking" "packaging,test-harness" \
+  "Two jobs: native build runs the test suite against the mock RomM; devkitpro build compiles empty sysmodule + overlay to artifacts (not run). Wire .github/workflows/ci.yml."
+issue "M0-4: Capture real RomM auth/sync response shapes (docker RomM, never production)" "M0 - Foundations & de-risking" "server,docs,test-harness" \
+  "Run server/probe_contract.py --auth --negotiate against a docker RomM (never production); paste real init/token/negotiate JSON into docs/API_CONTRACT.md and AUTH.md; feed the mock fixtures."
+issue "M0-5: Host test harness + mock RomM server (fully offline)" "M0 - Foundations & de-risking" "server,test-harness,sync" \
+  "Native rig wiring the core engine to a scriptable mock RomM that forces every edge case (401, conflict, partial failure, Range resume, multi-file skip). Backbone of proving v1 before hardware."
+issue "M0-6: docker-compose RomM fixture for integration/fidelity tests" "M0 - Foundations & de-risking" "server,test-harness" \
+  "One-command real RomM 5.2.0 on a throwaway volume, seeded with sample roms/saves; used to capture shapes, confirm the mock matches reality, and back the Ryujinx tier. Never a production DB."
+issue "M0-7: No real hardware / no production data until proven v1 policy + M0 exit gate" "M0 - Foundations & de-risking" "docs,risk,test-harness" \
+  "Write docs/TESTING.md, update DEVELOPMENT.md, define the v1 gate M8 depends on. M0 done = every component below the Horizon glue proven on host + mock + docker in CI, no console/production needed."
 # --- M1
 issue "M1-1: Device-code init/poll/token" "M1 - Authentication" "auth,sysmodule" "Implement init -> show code via IPC -> poll token. Persist token+expiry."
 issue "M1-2: Verify & code against init/token response fields" "M1 - Authentication" "auth,docs" "Depends on M0-4."
@@ -97,5 +105,10 @@ issue "M7-1: Conflict UX in overlay" "M7 - Polish" "sync,overlay" "List, keep-bo
 issue "M7-2: Backoff + battery-friendly scheduling" "M7 - Polish" "sysmodule" "No sync in sleep; resume on wake/network."
 issue "M7-3: Troubleshooting guide" "M7 - Polish" "docs" "401s, folder mismatches, Tico paths."
 issue "M7-4: Play-session recording (optional)" "M7 - Polish" "sync" "me.write, /api/play-sessions."
+# --- M8  (real hardware, last, gated on a proven v1)
+issue "M8-1: v1 gate — do not touch hardware until this passes" "M8 - Hardware bring-up (after proven v1)" "risk" \
+  "Checklist gate: sync/downloads/auth/config+IPC all green on host + docker RomM; ssl backend proven in Ryujinx NRO; backups verified by tests; tagged v1 build; NAND/SD backup ready. Nothing in M8 starts until every box is checked."
+issue "M8-2: First real-console smoke test (backup SD, non-boot NRO first)" "M8 - Hardware bring-up (after proven v1)" "sysmodule,risk" \
+  "On a backup SD/emuMMC: run the manually-launched NRO first, then install the sysmodule disabled, then first sync against a disposable collection with .backup/ populated. Never the production library until all pass."
 
 echo "done."

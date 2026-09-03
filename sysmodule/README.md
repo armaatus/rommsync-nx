@@ -31,6 +31,13 @@ include/
 
 ## First task
 
-**M0-1: prototype HTTPS from a sysmodule** using the `ssl` service. This
-de-risks the whole project — do it before anything else. See milestone M0 in
-[`../ISSUES.md`](../ISSUES.md).
+Start with the **off-console harness**, not hardware. The core engine here is
+built and proven natively (host build + mock/docker RomM) before any of it runs on
+a Switch — see [`../docs/TESTING.md`](../docs/TESTING.md).
+
+- **M0-2** — `HttpClient` interface + native (libcurl) backend.
+- **M0-5** — host harness + mock RomM to run the engine end-to-end offline.
+- **M0-1** — the sysmodule `ssl`-service TLS question is a *de-risking spike*
+  (Ryujinx-first, off the boot path), not a prerequisite for the logic above.
+
+See milestone M0 in [`../ISSUES.md`](../ISSUES.md).

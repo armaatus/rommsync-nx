@@ -5,25 +5,51 @@ on GitHub (labels, milestones, issues) via `gh`. Issue IDs (M0-1 …) are
 referenced from the docs; keep them stable.
 
 Labels: `sysmodule`, `overlay`, `server`, `auth`, `sync`, `download`, `ipc`,
-`config`, `packaging`, `docs`, `risk`, `good-first-issue`.
+`config`, `packaging`, `docs`, `risk`, `test-harness`, `good-first-issue`.
+
+## Testing policy (hard rule)
+
+**Nothing touches a real Switch or a production RomM until v1 is proven
+off-console.** All of M1–M5 is developed and tested on the host harness against a
+mock RomM and a throwaway docker RomM (see [TESTING.md](docs/TESTING.md)). Real
+hardware is a single, gated milestone at the end (**M8**).
 
 ---
 
 ## M0 — Foundations & de-risking
 
-- **M0-1** `risk` `sysmodule` **Prototype HTTPS from a sysmodule via the `ssl`
-  service.** Standalone spike: from a minimal sysmodule, do a TLS GET to the RomM
-  `/openapi.json` over the Horizon `ssl` service (+ `bsd`/socket) and print the
-  status. Measure heap use. Decide go/no-go vs. fallbacks in
-  [DEVELOPMENT.md](docs/DEVELOPMENT.md#tls-in-a-sysmodule). **Blocks everything
-  networked.**
-- **M0-2** `docs` **Define the `HttpClient` interface** (methods, streaming to
-  file, timeouts, cancellation) so TLS backend is swappable.
-- **M0-3** `packaging` **Repo skeleton builds in CI** (devkitpro docker image;
-  empty sysmodule + overlay compile and produce artifacts).
-- **M0-4** `server` **Confirm auth/sync response shapes** by running
-  `server/probe_contract.py --auth --negotiate` against live RomM; paste the real
-  response JSON into [API_CONTRACT.md](docs/API_CONTRACT.md) / [AUTH.md](docs/AUTH.md).
+Everything here runs off-console. The goal is a test harness that can prove the
+whole engine on a laptop/CI before a single line runs on real hardware.
+
+- **M0-1** `risk` `sysmodule` `test-harness` **Sysmodule TLS feasibility via the
+  `ssl` service — Ryujinx-first, off the boot path.** De-risking spike (no longer
+  a blocker): a standalone, manually-launched **NRO** (not a sysmodule) does a TLS
+  GET over the `ssl` service, run **in Ryujinx** against docker RomM; only if
+  Ryujinx can't exercise `ssl`, run the same NRO on a backup SD. Measure heap;
+  go/no-go vs. fallbacks. See [DEVELOPMENT.md](docs/DEVELOPMENT.md#tls-in-a-sysmodule).
+- **M0-2** `sysmodule` `test-harness` `docs` **`HttpClient` interface + native
+  (libcurl) backend.** GET/POST/multipart, streaming download-to-file, timeouts,
+  cancellation, `Range`. Swappable TLS backend; ship the **native backend** so all
+  networked logic is testable off-console.
+- **M0-3** `packaging` `test-harness` **CI builds host harness (runs tests) +
+  Switch skeleton (artifacts).** Two jobs: native build runs the test suite
+  against the mock; devkitpro build compiles the empty sysmodule + overlay to
+  artifacts (not run).
+- **M0-4** `server` `test-harness` `docs` **Capture real RomM auth/sync response
+  shapes** by running `server/probe_contract.py --auth --negotiate` against a
+  **docker RomM (never production)**; paste real JSON into
+  [API_CONTRACT.md](docs/API_CONTRACT.md) / [AUTH.md](docs/AUTH.md) and feed the
+  mock fixtures.
+- **M0-5** `server` `test-harness` `sync` **Host test harness + mock RomM server
+  (fully offline).** Native rig wiring the core engine to a mock RomM that can
+  force every edge case (401, conflict, partial failure, `Range` resume,
+  multi-file skip). Backbone of "prove v1 before hardware."
+- **M0-6** `server` `test-harness` **docker-compose RomM fixture** for
+  integration/fidelity tests — one-command real RomM on a throwaway volume, used
+  to capture shapes, confirm the mock matches reality, and back the Ryujinx tier.
+- **M0-7** `docs` `risk` `test-harness` **"No real hardware / no production data
+  until proven v1" policy + M0 exit gate.** Write [TESTING.md](docs/TESTING.md),
+  update DEVELOPMENT.md, define the v1 gate M8 depends on.
 
 ## M1 — Authentication
 
@@ -101,3 +127,17 @@ Labels: `sysmodule`, `overlay`, `server`, `auth`, `sync`, `download`, `ipc`,
   sleep, resume on wake/network-up).
 - **M7-3** `docs` Troubleshooting guide (401s, folder mismatches, Tico paths).
 - **M7-4** Optional: play-session recording (`me.write`, `/api/play-sessions`).
+
+## M8 — Hardware bring-up (after proven v1)
+
+First contact with a real modded Switch. **Gated:** nothing here starts until the
+v1 gate passes. Everything below the thin Horizon glue has already been proven on
+host + mock + docker RomM + Ryujinx.
+
+- **M8-1** `risk` **v1 gate — do not touch hardware until this passes.** Checklist:
+  sync/downloads/auth/config+IPC all green on host + docker; `ssl` backend proven
+  in Ryujinx NRO; backups verified by tests; tagged v1 build; NAND/SD backup ready.
+- **M8-2** `sysmodule` `risk` **First real-console smoke test** on a backup
+  SD/emuMMC: manually-launched NRO first, then sysmodule installed **disabled**,
+  first sync against a **disposable** collection with `.backup/` populated. Never
+  the production library until all pass.
