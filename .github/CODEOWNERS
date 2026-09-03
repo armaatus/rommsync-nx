@@ -1,0 +1,14 @@
+# Code owners for rommsync-nx.
+# These owners are requested for review automatically on matching PRs.
+# Docs: https://docs.github.com/articles/about-code-owners
+
+# Default owner for everything in the repo.
+*                   @armaatus
+
+# Security-sensitive surfaces — auth, sync protocol, token handling, policy.
+/SECURITY.md        @armaatus
+/docs/SECURITY.md   @armaatus
+/docs/AUTH.md       @armaatus
+/docs/SYNC_PROTOCOL.md @armaatus
+/docs/API_CONTRACT.md  @armaatus
+/.github/           @armaatus
