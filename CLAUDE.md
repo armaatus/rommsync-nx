@@ -61,6 +61,21 @@ in [server/testing/fault_proxy.py](server/testing/fault_proxy.py).
 Never add a commercial ROM to `server/testing/roms.manifest` — it is fetched in
 public CI. Homebrew and freely redistributable only.
 
+## Working in parallel
+
+At most **3 worktrees** run at once, and an issue is startable only when it
+carries `ready` rather than `blocked` — those labels are maintained by
+[`.github/workflows/unblock.yml`](.github/workflows/unblock.yml) from the
+`Blocked by #N` lines in each issue body. Do not hand-edit them, and do not
+start a `blocked` issue.
+
+One exception the labels cannot express: **a foundation issue lands alone.**
+When an issue defines an interface that later issues include — M0-2's
+`HttpClient` is the standing example — it merges before anything that depends on
+it starts, even if the labels say several things are ready. Three agents each
+inventing their own version of a shared header is the one merge conflict worth
+serialising to avoid.
+
 ## Code
 
 - C++20. `-Wall -Wextra -Wpedantic -Werror` — warnings are errors, including in
