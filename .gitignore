@@ -1,0 +1,24 @@
+# secrets / per-user state — never commit
+config.ini
+token.dat
+*.token
+.env
+
+# build output
+build/
+*.o
+*.elf
+*.nso
+*.nsp
+*.npdm
+*.ovl
+*.nacp
+
+# python (server/)
+__pycache__/
+*.pyc
+
+# editor / os
+.vscode/
+.idea/
+.DS_Store

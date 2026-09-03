@@ -1,0 +1,43 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  release:
+    types: [created]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest   # devkitA64 + libnx + portlibs
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive   # libultrahand for the overlay
+
+      - name: Build sysmodule
+        run: |
+          if [ -f sysmodule/Makefile ]; then
+            make -C sysmodule -j"$(nproc)"
+          else
+            echo "sysmodule/Makefile not present yet - skipping (M0-3)"
+          fi
+
+      - name: Build overlay
+        run: |
+          if [ -f overlay/Makefile ]; then
+            make -C overlay -j"$(nproc)"
+          else
+            echo "overlay/Makefile not present yet - skipping (M0-3)"
+          fi
+
+      - name: Collect artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rommsync-nx
+          path: |
+            sysmodule/**/*.nsp
+            overlay/**/*.ovl
+          if-no-files-found: ignore
