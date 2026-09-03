@@ -29,8 +29,11 @@ defaultTabs:
   # Tab 1 is the agent, opened by Orca itself.
   - title: romm
     # Streams the fixture's logs so infrastructure failure is distinguishable
-    # from code failure at a glance.
-    command: ./scripts/orca/compose.sh logs -f
+    # from code failure at a glance. Goes through romm-logs.sh rather than
+    # `compose.sh logs -f` directly because the tabs start alongside setup.sh --
+    # `wait-for-setup` above holds only the agent's tab -- and following a stack
+    # that setup.sh has not brought up yet exits instantly. See the script.
+    command: ./scripts/orca/romm-logs.sh
   - title: shell
 
 worktree:
