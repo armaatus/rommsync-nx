@@ -17,7 +17,10 @@ fi
 num="$(printf '%s' "$ref" | sed -nE 's#.*/issues/([0-9]+).*#\1#p; s#^([0-9]+)$#\1#p' | head -1)"
 [ -n "$num" ] || { echo "issue-command: could not resolve an issue from '${ref}'" >&2; exit 1; }
 
-gh issue view "$num" --json number,title,body,labels,milestone,url \
+# GH_PAGER: Orca runs this hook on a TTY, and `gh` pages TTY output through
+# less, which then waits for a keypress no one will press -- the hook never
+# exits, Orca never gets the spec, and the agent tab sits on a bare URL forever.
+GH_PAGER=cat gh issue view "$num" --json number,title,body,labels,milestone,url \
   --template '{{printf "# %v: %v" .number .title}}
 {{.url}}
 Milestone: {{if .milestone}}{{.milestone.title}}{{else}}none{{end}}

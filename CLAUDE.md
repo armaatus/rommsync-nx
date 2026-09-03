@@ -33,8 +33,8 @@ ctest --test-dir build -R sync --output-on-failure   # one group
 
 ./scripts/orca/env.sh                            # regenerate .env
 ./server/testing/seed.sh                         # re-seed ROM fixtures
-docker compose -f server/testing/docker-compose.yml up -d    # start RomM
-docker compose -f server/testing/docker-compose.yml logs -f  # tab 2 shows this
+./scripts/orca/compose.sh up -d                  # start RomM
+./scripts/orca/compose.sh logs -f                # follow it; tab 2 shows this
 ```
 
 If `ctest` reports `rig.smoke` as **Skipped**, RomM is not running — start it
