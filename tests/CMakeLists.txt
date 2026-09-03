@@ -41,3 +41,19 @@ if(NOT ROMMSYNC_REQUIRE_RIG)
   set_tests_properties(rig.smoke PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 set_tests_properties(rig.smoke PROPERTIES TIMEOUT 120)
+
+# --- worktree environment: the `romm` tab in orca.yaml -----------------------
+# Shell, not C++, because the thing under test is a shell script. Splitting the
+# two phases keeps the regression (`waits`) meaningful with Docker stopped --
+# only `follows` needs the rig, so only it can skip.
+find_program(BASH_PROGRAM bash REQUIRED)
+set(ROMM_TAB_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_romm_tab.sh")
+
+add_test(NAME orca.romm_tab_waits COMMAND "${BASH_PROGRAM}" "${ROMM_TAB_TEST}" wait)
+set_tests_properties(orca.romm_tab_waits PROPERTIES TIMEOUT 60)
+
+add_test(NAME orca.romm_tab_follows COMMAND "${BASH_PROGRAM}" "${ROMM_TAB_TEST}" follow)
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(orca.romm_tab_follows PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+set_tests_properties(orca.romm_tab_follows PROPERTIES TIMEOUT 60)
