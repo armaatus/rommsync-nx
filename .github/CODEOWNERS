@@ -12,3 +12,14 @@
 /docs/SYNC_PROTOCOL.md @armaatus
 /docs/API_CONTRACT.md  @armaatus
 /.github/           @armaatus
+
+# Code that EXECUTES on a maintainer's machine when a worktree is created.
+# Orca hashes only the command strings in orca.yaml for its trust prompt, not
+# the contents of the scripts those strings invoke — so a change to a script
+# here runs without any re-confirmation. Both paths are listed: orca.yaml
+# decides what runs, scripts/orca/ decides what it does. Review accordingly.
+/orca.yaml          @armaatus
+/scripts/orca/      @armaatus
+
+# Invoked by the setup hook above, so it inherits the same exposure.
+/server/testing/    @armaatus
