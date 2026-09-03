@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 🔒 Report a security vulnerability
+    url: https://github.com/armaatus/rommsync-nx/security/advisories/new
+    about: Please report vulnerabilities privately, not as a public issue. See SECURITY.md.
+  - name: 💬 Questions & discussion
+    url: https://github.com/armaatus/rommsync-nx/discussions
+    about: For questions, ideas, and general discussion (enable Discussions to use this).
+  - name: 🎮 RomM server issues
+    url: https://github.com/rommapp/romm/issues
+    about: Bugs in RomM itself belong upstream, not here.

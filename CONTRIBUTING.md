@@ -14,7 +14,8 @@
 1. Pick an issue (start at milestone **M0**; `good-first-issue` where labelled).
 2. Branch from `main`: `feature/M2-2-rom-matching`.
 3. Keep changes scoped to the issue. Reference it in commits (`M2-2: ...`).
-4. CI must pass (warnings-as-errors). Open a PR; link the issue.
+4. CI must pass (warnings-as-errors). Open a PR; link the issue and fill in the
+   PR template.
 
 ## Order of work
 
@@ -35,3 +36,9 @@ IPC and integrate later.
 ## Commit attribution
 
 See the repo's commit history for the established trailer format.
+
+## Conduct & security
+
+- By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
+- Found a vulnerability? Don't open a public issue — follow
+  [SECURITY.md](SECURITY.md).
