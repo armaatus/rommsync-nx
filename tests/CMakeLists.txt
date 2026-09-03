@@ -41,3 +41,42 @@ if(NOT ROMMSYNC_REQUIRE_RIG)
   set_tests_properties(rig.smoke PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 set_tests_properties(rig.smoke PROPERTIES TIMEOUT 120)
+
+# --- the native HttpClient against the real rig ------------------------------
+# One CTest entry per scenario, selected by argv[1], so a red run names the
+# behaviour that broke. The scratch directory is per-build-tree, because three
+# worktrees run these concurrently and a shared /tmp path would have them
+# overwrite each other's downloads.
+add_executable(test_http_native test_http_native.cpp)
+target_link_libraries(test_http_native PRIVATE rommsync::host)
+target_compile_definitions(test_http_native PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+find_package(Threads REQUIRED)
+target_link_libraries(test_http_native PRIVATE Threads::Threads)
+
+set(HTTP_SCENARIOS
+  get               # a real RomM response, and the accessors around it
+  status            # an HTTP error status is a response, not a transport error
+  post_json         # the JSON POST the device-code flow starts on
+  post_form         # form-urlencoded, and the login every other scenario needs
+  multipart         # a file part streamed from disk
+  download          # stream a whole resource to disk
+  range             # fetch a slice and prove it is the right slice
+  drop              # a TCP reset mid-body: an error, and no file at the destination
+  resume            # pick that interrupted download back up
+  resume_no_range   # ...even when the server ignores Range and starts over
+  truncate          # a clean short close, caught only by the caller's known size
+  stall             # total and no-progress timeouts both fire
+  cancel            # cancellation from another thread, and nothing left behind
+)
+
+foreach(scenario IN LISTS HTTP_SCENARIOS)
+  add_test(NAME http.${scenario} COMMAND test_http_native ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(http.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  # The fault proxy is a single armed scenario shared by every client, so two of
+  # these running at once would inject each other's faults.
+  set_tests_properties(http.${scenario} PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
+endforeach()
