@@ -1,0 +1,51 @@
+name: 💡 Feature request
+description: Suggest an idea or enhancement for rommsync-nx.
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have a rough idea rather than a concrete proposal? Consider opening a
+        [Discussion](https://github.com/armaatus/rommsync-nx/discussions) instead —
+        it's a better home for open-ended brainstorming.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you file
+      options:
+        - label: I searched existing issues and discussions and this isn't a duplicate.
+          required: true
+        - label: This fits rommsync-nx's scope (on-device RomM sync/downloads), not RomM itself.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What are you trying to do, and why is it hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like to see happen?
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - "sysmodule (sys-rommsync)"
+        - "overlay (ovl-rommsync)"
+        - "server/ tooling"
+        - "docs / protocol / contract"
+        - "spans multiple / not sure"
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you thought about, and why you set them aside.
