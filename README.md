@@ -13,6 +13,11 @@ you control from an **Ultrahand / Tesla overlay**.
 > Status: **planning / server-side groundwork complete.** The Switch components
 > are specced and issue-tracked but not yet implemented. The RomM 5.2.0 API this
 > targets is captured and verified — see [`docs/API_CONTRACT.md`](docs/API_CONTRACT.md).
+>
+> **Test-first, hardware-last.** No real Switch and no production RomM is touched
+> until a v1 is fully proven off-console — on a native host harness against a mock
+> RomM, a throwaway docker RomM, and Ryujinx. See
+> [`docs/TESTING.md`](docs/TESTING.md).
 
 ## Why a sysmodule + overlay (not just an app)
 
@@ -74,8 +79,10 @@ Full detail in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 Read, in order: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) →
 [`docs/API_CONTRACT.md`](docs/API_CONTRACT.md) →
 [`docs/SYNC_PROTOCOL.md`](docs/SYNC_PROTOCOL.md) →
-[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md). Then pick an issue from milestone
-**M1**.
+[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) →
+[`docs/TESTING.md`](docs/TESTING.md). Then start with milestone **M0** — it builds
+the off-console test harness (host + mock/docker RomM) that every later milestone
+is developed and proven against before any hardware.
 
 ## Credit / prior art
 

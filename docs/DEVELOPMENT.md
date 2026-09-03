@@ -61,11 +61,28 @@ Commands: `GetStatus`, `SetEnabled`, `SyncNow`, `GetConfig`, `SetConfig`,
 
 ## Testing without hardware
 
-- **Ryujinx/emulator** can run homebrew NROs; sysmodule + overlay testing
-  realistically needs a real console (Atmosphère). Document findings in issues.
-- The **server contract** is testable off-console: `server/probe_contract.py`
-  exercises auth + negotiate + saves against a live RomM and prints the real
-  response shapes — run it to confirm any schema before implementing.
+**Hard rule: no real Switch and no production RomM until v1 is proven
+off-console.** Full strategy in [TESTING.md](TESTING.md); the ladder:
+
+1. **Host build + mock RomM** — the core engine (auth, sync, downloads, config,
+   `state.db`, IPC protocol) compiles native and runs against a scriptable mock
+   RomM that forces every edge case (401, conflict, partial failure, `Range`
+   resume, multi-file skip). Fast, offline, runs in CI. This is the primary loop.
+2. **Host build + docker RomM** — the same harness against a real RomM 5.2.0 in
+   docker-compose (throwaway volume) to confirm the mock matches reality.
+3. **Ryujinx NRO** — a manually-launched **NRO** (not a sysmodule, not on the boot
+   path) built from the same core lib, run in Ryujinx against docker RomM. This is
+   where the Horizon `ssl`/`fs`/socket path is exercised without hardware.
+4. **Real hardware** — last, gated behind the v1 gate (milestone **M8**).
+
+The sysmodule heap behavior under Atmosphère, boot scheduling, and the
+Tesla/Ultrahand overlay UI are the only things that truly need a console — they're
+deliberately the last things touched. Everything else is proven before then.
+
+The **server contract** is testable off-console: `server/probe_contract.py`
+exercises auth + negotiate + saves against a RomM and prints the real response
+shapes — run it against the docker fixture (never production) to confirm any
+schema before implementing.
 
 ## Coding standards
 
