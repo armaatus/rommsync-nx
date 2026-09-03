@@ -1,0 +1,42 @@
+# Orca workspace configuration for rommsync-nx.
+#
+# Every worktree created from this repo self-provisions: it derives its own
+# isolated ports and compose project, seeds the ROM fixtures, configures the
+# build, and brings up its own RomM. By the time the agent's tab is live,
+# `ctest` is a meaningful command.
+#
+# Orca will ask you to trust this file before it runs anything, and again after
+# each change -- these scripts execute on your machine.
+
+scripts:
+  # Runs once per new worktree. See scripts/orca/setup.sh.
+  setup: ./scripts/orca/setup.sh
+  # Runs when a worktree is removed: tears down that worktree's RomM stack and
+  # its volumes, leaving the shared caches alone.
+  archive: ./scripts/orca/archive.sh
+
+# Hold the agent's tab until setup finishes. Without this the agent can run
+# `ctest` before RomM is listening, read the connection error as a code bug, and
+# go chasing it. The few seconds this costs buys away that whole failure mode.
+setupAgentStartupPolicy: wait-for-setup
+
+# Turns a task picked from the Tasks tab into a full spec. Orca often prefills
+# only an issue URL; this resolves it to the issue body, labels and milestone,
+# which is the sole channel design intent travels through on this project.
+issueCommand: ./scripts/orca/issue-command.sh
+
+defaultTabs:
+  # Tab 1 is the agent, opened by Orca itself.
+  - title: romm
+    # Streams the fixture's logs so infrastructure failure is distinguishable
+    # from code failure at a glance.
+    command: ./scripts/orca/compose.sh logs -f
+  - title: shell
+
+worktree:
+  # Shared across worktrees because they are immutable and expensive to rebuild.
+  # Everything mutable -- RomM's database volume, .env, build/ -- stays strictly
+  # per-worktree, so no agent can corrupt another's fixtures. See docs/TESTING.md.
+  sharedDirectories:
+    - .cache/roms     # checksum-pinned homebrew ROM downloads
+    - .cache/ccache   # content-addressed compiler cache; safe for concurrent use

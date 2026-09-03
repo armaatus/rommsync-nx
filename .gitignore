@@ -4,8 +4,14 @@ token.dat
 *.token
 .env
 
+# generated per-worktree environment / fixtures — never shared, never committed
+.cache/
+server/testing/library/
+TASK.md
+
 # build output
 build/
+build-*/
 *.o
 *.elf
 *.nso

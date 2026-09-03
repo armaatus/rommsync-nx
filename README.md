@@ -15,9 +15,9 @@ you control from an **Ultrahand / Tesla overlay**.
 > targets is captured and verified — see [`docs/API_CONTRACT.md`](docs/API_CONTRACT.md).
 >
 > **Test-first, hardware-last.** No real Switch and no production RomM is touched
-> until a v1 is fully proven off-console — on a native host harness against a mock
-> RomM, a throwaway docker RomM, and Ryujinx. See
-> [`docs/TESTING.md`](docs/TESTING.md).
+> until a v1 is fully proven off-console — on a native host harness against a
+> throwaway **real** RomM in docker (with a fault-injecting proxy forcing the
+> failure paths), then Ryujinx. See [`docs/TESTING.md`](docs/TESTING.md).
 
 ## Why a sysmodule + overlay (not just an app)
 
@@ -70,9 +70,12 @@ Full detail in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 | `docs/` | Architecture, the pinned RomM API contract, auth & sync protocol, config, security, dev environment |
 | `sysmodule/` | `sys-rommsync` — the background engine (to be built) |
 | `overlay/` | `ovl-rommsync` — the libultrahand overlay (to be built) |
-| `server/` | Server-side: API snapshot (source of truth) + a contract-probe script that runs against a live RomM |
+| `core/` | The portable engine — auth, sync, downloads, config, state. Builds and is tested natively. |
+| `server/` | API snapshot (source of truth), contract-probe script, and the docker RomM test fixture |
+| `orca.yaml` | Per-worktree provisioning: isolated RomM, seeded fixtures, ready-to-run build |
 | `ISSUES.md` | The full milestone + issue backlog |
 | `scripts/create_issues.sh` | Creates the GitHub milestones/labels/issues via `gh` |
+| `CLAUDE.md` | Working agreement for agents and contributors — rules, commands, PR flow |
 
 ## Getting started (contributors)
 
@@ -81,8 +84,16 @@ Read, in order: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) →
 [`docs/SYNC_PROTOCOL.md`](docs/SYNC_PROTOCOL.md) →
 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) →
 [`docs/TESTING.md`](docs/TESTING.md). Then start with milestone **M0** — it builds
-the off-console test harness (host + mock/docker RomM) that every later milestone
+the off-console test harness (host + real docker RomM) that every later milestone
 is developed and proven against before any hardware.
+
+Quick start once a worktree exists:
+
+```bash
+cmake -S . -B build && cmake --build build
+docker compose -f server/testing/docker-compose.yml up -d
+ctest --test-dir build --output-on-failure
+```
 
 ## Credit / prior art
 
