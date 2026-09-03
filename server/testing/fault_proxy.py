@@ -29,7 +29,10 @@ Scenario fields::
               auto-disarm                        (default 1)
     path      only match requests whose path
               starts with this prefix            (default: all)
-    bytes     cut the body after this many bytes (modes truncate/drop)
+    bytes     cut the body after this many bytes (modes truncate/drop).
+              ``drop`` still sends the real Content-Length and then resets, the
+              way a genuinely dropped transfer looks; ``truncate`` sends no
+              length at all, so only the caller's own expected size can catch it
     seconds   delay before responding            (mode=stall, default 30)
 
 Example -- make the 3rd call to /api/sync/negotiate fail with 401, once::
@@ -77,9 +80,11 @@ _SKIP_RESPONSE_HEADERS = {
 def _reset(connection) -> None:
     """Abort a connection with a TCP RST rather than a graceful FIN.
 
-    ``truncate`` and ``drop`` differ only here, and the difference matters: a
-    clean close looks to the client like a short-but-complete response, whereas
-    a reset is an unmistakable mid-transfer failure. SO_LINGER with a zero
+    Half of what separates ``drop`` from ``truncate``; the other half is that
+    ``drop`` keeps the real ``Content-Length`` (see ``_stream``). Together they
+    make a mid-transfer failure unmistakable -- the client is owed bytes and the
+    connection is gone -- where ``truncate`` deliberately leaves a clean, short,
+    plausible response that no transport can fault. SO_LINGER with a zero
     timeout is what turns close() into a reset.
     """
     try:
@@ -243,18 +248,26 @@ class Handler(BaseHTTPRequestHandler):
             if key.lower() not in _SKIP_RESPONSE_HEADERS:
                 self.send_header(key, value)
 
+        length = upstream.headers.get("Content-Length")
         if cutting:
-            # No Content-Length: the point is that the body ends early. For
-            # `drop` we also kill the connection, so the client sees a genuine
-            # mid-stream disconnect rather than a clean short response.
-            self.send_header("Transfer-Encoding", "identity")
             self.close_connection = True
-        else:
-            length = upstream.headers.get("Content-Length")
-            if length is not None:
+            if fault["mode"] == "drop" and length is not None:
+                # Keep the promise the real server made. A connection that dies
+                # mid-transfer is a server that said "N bytes" and delivered
+                # fewer -- dropping Content-Length here would instead look to
+                # the client like a complete, shorter response, and the reset
+                # would be indistinguishable from a clean close. That is the one
+                # thing this fault exists to prove a downloader notices.
                 self.send_header("Content-Length", length)
             else:
-                self.close_connection = True
+                # `truncate` is the contrast case on purpose: a clean short
+                # close with nothing to compare against, which no transport can
+                # detect. Only the caller's own size/hash check catches it.
+                self.send_header("Transfer-Encoding", "identity")
+        elif length is not None:
+            self.send_header("Content-Length", length)
+        else:
+            self.close_connection = True
         self.end_headers()
 
         sent = 0

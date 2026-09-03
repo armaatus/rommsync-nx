@@ -30,8 +30,8 @@ one thing about a genuine response:
 | Mode | Effect |
 |---|---|
 | `status` | Return an arbitrary status (401 mid-sync, 500, …) instead of forwarding |
-| `truncate` | Forward the real response but cut the body short, cleanly |
-| `drop` | Cut the body short and abort the connection with a TCP reset |
+| `truncate` | Forward the real response but cut the body short, cleanly, with no `Content-Length` to compare against |
+| `drop` | Cut the body short, keep the real `Content-Length`, and abort the connection with a TCP reset |
 | `stall` | Delay past the client's timeout |
 
 Scenarios can target a path prefix, skip the first N matching requests
@@ -46,6 +46,24 @@ curl -XPOST "$PROXY_BASE_URL/__fault" \
 
 The proxy never synthesises a RomM response of its own — that is what keeps the
 fidelity while still making failure deterministic and repeatable in CI.
+
+`truncate` and `drop` differ in exactly one header, and the difference is the
+point. A server whose connection dies mid-transfer had already promised a
+`Content-Length`, so `drop` keeps it: the client is owed bytes it never gets, and
+any competent transport says so. `truncate` drops the header, which is the
+harder case — a clean, short, *plausible* response that no transport can fault.
+Only a size the caller already knew catches that one, which is why
+`http.truncate` asserts on both halves of that behaviour.
+
+## The fixture account
+
+RomM starts empty, so anything authenticated has to create an account first. The
+tests do it themselves (`tests/rig.hpp`, `EnsureUser`) rather than a provisioning
+script, so a worktree created before those tests existed also just works:
+`rommsync` / `rommsync-test-only`, admin, created through RomM's own
+first-user bootstrap and then used via `POST /api/token`. Those are not secrets —
+this RomM is a throwaway container bound to `127.0.0.1` holding no real data,
+the same reasoning that already puts the database password in the compose file.
 
 ## The test ladder
 
@@ -78,6 +96,14 @@ ctest --test-dir build --output-on-failure
   resume, and a multi-file rom directory for the `has_multiple_files` skip.
 - Every save-overwrite test asserts a backup is written **first**
   ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md) hard rule).
+- The `http.*` tests cover the native `HttpClient` backend end to end: `get`,
+  `status`, `post_json`, `post_form`, `multipart`, `download`, `range`, `drop`,
+  `resume`, `resume_no_range`, `truncate`, `stall`, `cancel`. One CTest entry
+  each, so a red run names the behaviour rather than "the http tests". They run
+  `RUN_SERIAL` because the fault proxy holds one armed scenario for all
+  clients. The streaming ones pull RomM's own frontend bundle — the only large
+  resource the rig serves that does not first need a library scan, which is
+  socket.io-driven rig work belonging to M0-5.
 - With Docker stopped, `rig.smoke` reports **Skipped** rather than failing, so a
   local `ctest` is still useful. CI configures with `-DROMMSYNC_REQUIRE_RIG=ON`,
   which turns the same condition into a failure — a green CI run always means the

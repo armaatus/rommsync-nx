@@ -41,6 +41,7 @@ if(CCACHE_PROGRAM)
 endif()
 
 add_subdirectory(core)
+add_subdirectory(host)
 
 include(CTest)
 if(BUILD_TESTING)
