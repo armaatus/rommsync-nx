@@ -5,13 +5,23 @@ on GitHub (labels, milestones, issues) via `gh`. Issue IDs (M0-1 …) are
 referenced from the docs; keep them stable.
 
 Labels: `sysmodule`, `overlay`, `server`, `auth`, `sync`, `download`, `ipc`,
-`config`, `packaging`, `docs`, `risk`, `test-harness`, `good-first-issue`.
+`config`, `packaging`, `docs`, `risk`, `test-harness`, `good-first-issue`,
+`blocked`, `ready`.
+
+## Dependencies
+
+GitHub has no native blocking relation, so an issue that cannot start yet carries
+`Blocked by #N` lines in its body and the `blocked` label; when every blocker is
+closed it becomes `ready`. Labels are maintained by
+[`.github/workflows/unblock.yml`](.github/workflows/unblock.yml) on merge — do
+not hand-edit them.
 
 ## Testing policy (hard rule)
 
 **Nothing touches a real Switch or a production RomM until v1 is proven
 off-console.** All of M1–M5 is developed and tested on the host harness against a
-mock RomM and a throwaway docker RomM (see [TESTING.md](docs/TESTING.md)). Real
+throwaway **real** RomM in docker, with a fault-injecting proxy forcing the
+failure paths (see [TESTING.md](docs/TESTING.md)). There is no mock RomM. Real
 hardware is a single, gated milestone at the end (**M8**).
 
 ---
@@ -21,6 +31,11 @@ hardware is a single, gated milestone at the end (**M8**).
 Everything here runs off-console. The goal is a test harness that can prove the
 whole engine on a laptop/CI before a single line runs on real hardware.
 
+- **M0-0** `test-harness` `packaging` `docs` **Project scaffolding — make the
+  repo buildable, testable and agent-ready.** CMake+CTest host build, the real
+  docker RomM fixture + seed script, the fault-injecting proxy, `orca.yaml`
+  per-worktree provisioning, `CLAUDE.md`/`AGENTS.md`, a CI that can genuinely go
+  red, and the blocked/ready workflow. Everything else in M0 depends on this.
 - **M0-1** `risk` `sysmodule` `test-harness` **Sysmodule TLS feasibility via the
   `ssl` service — Ryujinx-first, off the boot path.** De-risking spike (no longer
   a blocker): a standalone, manually-launched **NRO** (not a sysmodule) does a TLS
@@ -30,23 +45,26 @@ whole engine on a laptop/CI before a single line runs on real hardware.
 - **M0-2** `sysmodule` `test-harness` `docs` **`HttpClient` interface + native
   (libcurl) backend.** GET/POST/multipart, streaming download-to-file, timeouts,
   cancellation, `Range`. Swappable TLS backend; ship the **native backend** so all
-  networked logic is testable off-console.
+  networked logic is testable off-console. This is the interface every later
+  milestone includes, so it lands alone before any fan-out.
 - **M0-3** `packaging` `test-harness` **CI builds host harness (runs tests) +
-  Switch skeleton (artifacts).** Two jobs: native build runs the test suite
-  against the mock; devkitpro build compiles the empty sysmodule + overlay to
-  artifacts (not run).
+  Switch skeleton (artifacts).** Native build runs the test suite against the
+  docker RomM rig; devkitpro build compiles the sysmodule + overlay to artifacts
+  (not run). Scaffolded in M0-0; this issue completes the devkitpro job once the
+  Makefiles exist.
 - **M0-4** `server` `test-harness` `docs` **Capture real RomM auth/sync response
   shapes** by running `server/probe_contract.py --auth --negotiate` against a
   **docker RomM (never production)**; paste real JSON into
-  [API_CONTRACT.md](docs/API_CONTRACT.md) / [AUTH.md](docs/AUTH.md) and feed the
-  mock fixtures.
-- **M0-5** `server` `test-harness` `sync` **Host test harness + mock RomM server
-  (fully offline).** Native rig wiring the core engine to a mock RomM that can
-  force every edge case (401, conflict, partial failure, `Range` resume,
-  multi-file skip). Backbone of "prove v1 before hardware."
-- **M0-6** `server` `test-harness` **docker-compose RomM fixture** for
-  integration/fidelity tests — one-command real RomM on a throwaway volume, used
-  to capture shapes, confirm the mock matches reality, and back the Ryujinx tier.
+  [API_CONTRACT.md](docs/API_CONTRACT.md) / [AUTH.md](docs/AUTH.md) and pin them
+  as typed structs.
+- **M0-5** `server` `test-harness` `sync` **Host test harness + fault-injection
+  scenarios.** Wire the core engine to the real docker RomM (M0-6) through the
+  fault proxy, and cover every edge case: 401, conflict, partial failure,
+  `Range` resume, multi-file skip. Backbone of "prove v1 before hardware."
+- **M0-6** `server` `test-harness` **docker-compose RomM fixture** — the primary
+  test rig. One-command real RomM 5.2.0 on a throwaway volume, seeded with
+  homebrew ROMs, used to capture shapes and to back the Ryujinx tier. Scaffolded
+  in M0-0; this issue seeds a curated collection and a scoped client token.
 - **M0-7** `docs` `risk` `test-harness` **"No real hardware / no production data
   until proven v1" policy + M0 exit gate.** Write [TESTING.md](docs/TESTING.md),
   update DEVELOPMENT.md, define the v1 gate M8 depends on.
@@ -132,7 +150,7 @@ whole engine on a laptop/CI before a single line runs on real hardware.
 
 First contact with a real modded Switch. **Gated:** nothing here starts until the
 v1 gate passes. Everything below the thin Horizon glue has already been proven on
-host + mock + docker RomM + Ryujinx.
+host + docker RomM + Ryujinx.
 
 - **M8-1** `risk` **v1 gate — do not touch hardware until this passes.** Checklist:
   sync/downloads/auth/config+IPC all green on host + docker; `ssl` backend proven

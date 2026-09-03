@@ -1,0 +1,7 @@
+# Seed ROM manifest — homebrew / freely redistributable only.
+# NEVER add a commercial ROM here: this file is fetched in public CI.
+# Format: sha256<TAB>platform_fs_slug<TAB>filename<TAB>url
+04f01d7372f66ea2befe325b9bd655a9fcc395a31fa46d9466286bb8f9d2e62e	nes	240pee.nes	https://github.com/pinobatch/240p-test-mini/releases/download/v0.23/240pee.nes
+e4780e90b9d1587489bfb797d2ca395be21371ea9262fa9f87f99324ec6960ab	nes	nova.nes	https://github.com/NovaSquirrel/NovaTheSquirrel/releases/download/v1.0.6a/nova.nes
+47844f7140738a06f8f3bc09780da3ab095539a250b870f614feed561d9d6f34	gba	240pee_mb.gba	https://github.com/pinobatch/240p-test-mini/releases/download/v0.23/240pee_mb.gba
+733eb6e7ec0719752ddd5fcda4e715c2f2e20f4ac4bc971c4bd1d49272f9bb04	gb	gb240p.gb	https://github.com/pinobatch/240p-test-mini/releases/download/v0.23/gb240p.gb
