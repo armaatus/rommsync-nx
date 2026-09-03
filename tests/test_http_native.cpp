@@ -341,6 +341,123 @@ int ResumeWithoutRangeSupport(http::HttpClient& client, const std::string& base)
   return checks.failures();
 }
 
+// A 2xx that carries no body must not promote the partial file it did not
+// confirm. This is the shape a reverse proxy in front of a home RomM produces
+// on a bad day, and renaming stale bytes onto the destination would be exactly
+// the silent corruption the .part file exists to prevent.
+int ResumeEmptyBody(http::HttpClient& client, const std::string& base,
+                    const std::string& asset) {
+  rig::Checks checks;
+
+  const std::string path = Scratch("resume-empty.bin");
+  Clear(path);
+  const std::string planted(64, 'x');
+  checks.Expect(rig::WriteFile(path + ".part", planted), "planted a partial file");
+
+  rig::ArmFault(client, base,
+                R"({"mode":"status","status":200,"body":"","path":")" + asset + R"("})");
+
+  http::Request request;
+  request.url = base + asset;
+  const http::Result result = client.Download(request, {path, true, 0});
+
+  checks.ExpectEq(result.response.status, 200, "the server answered 2xx");
+  checks.ExpectError(result, http::Error::kTruncated,
+                     "an unverifiable resume is not a success");
+  checks.Expect(!Exists(path), "and the stale bytes were not promoted");
+  checks.ExpectEq(rig::ReadFile(path + ".part"), planted, "the partial file is untouched");
+
+  rig::DisarmFault(client, base);
+  return checks.failures();
+}
+
+// A partial file the server no longer recognises (here: already the whole
+// resource, so the resume asks for a range past the end) must not wedge every
+// future attempt on the same 416.
+int ResumeStaleRange(http::HttpClient& client, const std::string& base,
+                     const std::string& asset) {
+  rig::Checks checks;
+
+  http::Request reference_request;
+  reference_request.url = base + asset;
+  const http::Result reference = client.Send(reference_request);
+  checks.Expect(reference.successful(), "fetched the reference copy");
+
+  const std::string path = Scratch("resume-stale.bin");
+  Clear(path);
+  checks.Expect(rig::WriteFile(path + ".part", reference.response.body),
+                "planted a partial file that is already the whole resource");
+
+  http::Request request;
+  request.url = base + asset;
+  const http::Result result = client.Download(request, {path, true, 0});
+
+  checks.ExpectEq(result.response.status, 416, "the server rejected the range");
+  checks.ExpectError(result, http::Error::kTruncated, "which is an error, not a success");
+  checks.Expect(!Exists(path), "nothing at the destination");
+  checks.Expect(!Exists(path + ".part"),
+                "and the unusable partial file is gone, so a retry starts clean");
+  return checks.failures();
+}
+
+// `expected_size` is the caller's own knowledge of what the file should weigh.
+// It has to hold for a slice too -- a ranged download is how a resume of a
+// multi-gigabyte rom is done, and it is the one place a wrong size matters most.
+int RangeExpectedSize(http::HttpClient& client, const std::string& base,
+                      const std::string& asset) {
+  rig::Checks checks;
+  constexpr std::uint64_t kOffset = 1'000'000;
+
+  http::Request reference_request;
+  reference_request.url = base + asset;
+  const http::Result reference = client.Send(reference_request);
+  checks.Expect(reference.successful() && reference.response.body.size() > kOffset,
+                "the reference copy is bigger than the offset");
+  if (checks.failures() != 0) {
+    return checks.failures();
+  }
+  const std::uint64_t slice = reference.response.body.size() - kOffset;
+
+  const std::string path = Scratch("range-expected.bin");
+  Clear(path);
+  rig::ArmFault(client, base,
+                R"({"mode":"truncate","bytes":1000,"path":")" + asset + R"("})");
+
+  http::Request request;
+  request.url = base + asset;
+  request.range_start = kOffset;
+  request.timeout = std::chrono::milliseconds{0};
+  const http::Result result = client.Download(request, {path, false, slice});
+
+  checks.ExpectError(result, http::Error::kTruncated, "a short slice is caught");
+  checks.Expect(!Exists(path), "and nothing lands at the destination");
+
+  rig::DisarmFault(client, base);
+  return checks.failures();
+}
+
+// A download of something that is not there: the status and the server's
+// explanation reach the caller, and no debris is left in the target directory.
+int DownloadNotFound(http::HttpClient& client, const std::string& base) {
+  rig::Checks checks;
+
+  const std::string path = Scratch("not-found.bin");
+  Clear(path);
+
+  http::Request request;
+  request.url = base + "/api/no-such-endpoint";
+  const http::Result result = client.Download(request, {path, false, 0});
+
+  checks.ExpectOk(result, "a 404 is a response, not a transport failure");
+  checks.ExpectEq(result.response.status, 404, "status");
+  checks.Expect(!result.response.body.empty(), "the server's explanation reached the caller");
+  checks.ExpectEq(result.response.bytes_received, result.response.body.size(),
+                  "and bytes_received agrees with it");
+  checks.Expect(!Exists(path), "nothing at the destination");
+  checks.Expect(!Exists(path + ".part"), "and no empty part file left behind");
+  return checks.failures();
+}
+
 // A clean close mid-body is invisible to the transport: the server never said
 // how long the body would be, so nothing about the exchange looks wrong. Only
 // the size the caller already knows can catch it -- and it must, because this is
@@ -481,7 +598,9 @@ int main(int argc, char** argv) {
   // Only the streaming scenarios need it, and discovering it costs a request.
   std::string asset;
   if (scenario == "download" || scenario == "range" || scenario == "drop" ||
-      scenario == "resume" || scenario == "truncate" || scenario == "cancel") {
+      scenario == "resume" || scenario == "truncate" || scenario == "cancel" ||
+      scenario == "resume_empty_body" || scenario == "resume_stale_range" ||
+      scenario == "range_expected_size") {
     asset = rig::DiscoverLargeAsset(*client, base);
     if (asset.empty()) {
       std::cerr << "could not find a large asset to stream from " << base << "\n";
@@ -510,6 +629,14 @@ int main(int argc, char** argv) {
     failures = Resume(*client, base, asset);
   } else if (scenario == "resume_no_range") {
     failures = ResumeWithoutRangeSupport(*client, base);
+  } else if (scenario == "resume_empty_body") {
+    failures = ResumeEmptyBody(*client, base, asset);
+  } else if (scenario == "resume_stale_range") {
+    failures = ResumeStaleRange(*client, base, asset);
+  } else if (scenario == "range_expected_size") {
+    failures = RangeExpectedSize(*client, base, asset);
+  } else if (scenario == "not_found") {
+    failures = DownloadNotFound(*client, base);
   } else if (scenario == "truncate") {
     failures = Truncate(*client, base, asset);
   } else if (scenario == "stall") {

@@ -272,15 +272,21 @@ inline std::string DiscoverLargeAsset(http::HttpClient& client, const std::strin
     return {};
   }
   const std::string_view body = result.response.body;
-  const std::size_t at = body.find("/assets/index-");
-  if (at == std::string_view::npos) {
-    return {};
+  // Bounded to the one quoted attribute it starts in: RomM's HTML also links an
+  // `index-<hash>.css`, and scanning past the closing quote for the next ".js"
+  // would return a "path" made of intervening markup.
+  for (std::size_t at = body.find("/assets/index-"); at != std::string_view::npos;
+       at = body.find("/assets/index-", at + 1)) {
+    const std::size_t end = body.find('"', at);
+    if (end == std::string_view::npos) {
+      break;
+    }
+    const std::string_view candidate = body.substr(at, end - at);
+    if (candidate.size() > 3 && candidate.substr(candidate.size() - 3) == ".js") {
+      return std::string(candidate);
+    }
   }
-  const std::size_t end = body.find(".js", at);
-  if (end == std::string_view::npos) {
-    return {};
-  }
-  return std::string(body.substr(at, end - at + 3));
+  return {};
 }
 
 // --- a deterministic PNG, so no binary fixture has to live in the repo --------
