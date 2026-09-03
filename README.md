@@ -91,7 +91,7 @@ Quick start once a worktree exists:
 
 ```bash
 cmake -S . -B build && cmake --build build
-docker compose -f server/testing/docker-compose.yml up -d
+./scripts/orca/compose.sh up -d
 ctest --test-dir build --output-on-failure
 ```
 
