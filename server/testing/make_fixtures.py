@@ -14,6 +14,7 @@ byte-identical files and therefore stable SHA1/SHA256 hashes.
 
 from __future__ import annotations
 
+import argparse
 import random
 import sys
 from pathlib import Path
@@ -45,11 +46,17 @@ def make_multifile(directory: Path) -> None:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 4:
-        print(f"usage: {argv[0]} <large-file> <size-mb> <multifile-dir>", file=sys.stderr)
-        return 2
-    make_large(Path(argv[1]), int(argv[2]))
-    make_multifile(Path(argv[3]))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--multi", required=True, type=Path,
+                        help="rom directory to fill with a two-disc set")
+    parser.add_argument("--large", type=Path,
+                        help="large fixture to write; omit to generate only --multi")
+    parser.add_argument("--size-mb", type=int, default=120)
+    args = parser.parse_args(argv[1:])
+
+    if args.large is not None:
+        make_large(args.large, args.size_mb)
+    make_multifile(args.multi)
     return 0
 
 

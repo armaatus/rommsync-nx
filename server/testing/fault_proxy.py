@@ -168,19 +168,28 @@ class Handler(BaseHTTPRequestHandler):
             except json.JSONDecodeError as exc:
                 self._respond(400, json.dumps({"error": str(exc)}).encode())
                 return
-            if spec.get("mode") not in {"status", "truncate", "drop", "stall"}:
+            mode = spec.get("mode")
+            if mode not in {"status", "truncate", "drop", "stall"}:
                 self._respond(400, b'{"error": "unknown mode"}')
+                return
+            # Without a byte count there is nothing to cut, so the fault would
+            # relay the whole body untouched *and* consume itself -- a test that
+            # looks green having exercised nothing. Refuse it instead.
+            if mode in {"truncate", "drop"} and not isinstance(spec.get("bytes"), int):
+                self._respond(400, b'{"error": "truncate and drop require an integer \'bytes\'"}')
                 return
             FAULT.arm(spec)
             payload = json.dumps({"armed": spec}).encode()
         self._respond(200, payload, "application/json")
 
-    def _respond(self, status: int, body: bytes, ctype: str = "application/json") -> None:
+    def _respond(self, status: int, body: bytes, ctype: str = "application/json",
+                 write_body: bool = True) -> None:
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if write_body:  # a HEAD response carries the headers but no content
+            self.wfile.write(body)
 
     # -- proxying ----------------------------------------------------------
     def _proxy(self, method: str) -> None:
@@ -188,16 +197,23 @@ class Handler(BaseHTTPRequestHandler):
             self._control(method)
             return
 
+        # Drain the request body BEFORE any fault can short-circuit. On a
+        # keep-alive connection unread bytes are parsed as the next request
+        # line, so a 401 armed on a POST endpoint would desync the connection
+        # instead of testing the 401 — and every interesting endpoint here
+        # (/api/sync/negotiate, /api/auth/device/token) is a POST.
+        body = self._read_body()
+
         fault = FAULT.claim(self.path)
 
         if fault and fault["mode"] == "stall":
             time.sleep(float(fault.get("seconds", 30)))
         if fault and fault["mode"] == "status":
-            body = str(fault.get("body", "")).encode()
-            self._respond(int(fault.get("status", 401)), body)
+            payload = str(fault.get("body", "")).encode()
+            self._respond(int(fault.get("status", 401)), payload,
+                          write_body=method != "HEAD")
             return
 
-        body = self._read_body()
         headers = {
             k: v for k, v in self.headers.items()
             if k.lower() not in {"host", "content-length", "accept-encoding"}

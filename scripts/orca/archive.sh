@@ -11,7 +11,7 @@ cd "$REPO_ROOT"
 if [ -f .env ]; then
   set -a; . ./.env; set +a
   echo "==> removing RomM stack $COMPOSE_PROJECT_NAME and its volumes"
-  docker compose -f server/testing/docker-compose.yml down -v --remove-orphans || true
+  ./scripts/orca/compose.sh down -v --remove-orphans || true
 else
   echo "no .env; nothing to tear down"
 fi

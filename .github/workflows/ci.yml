@@ -26,10 +26,7 @@ jobs:
       - name: Python compiles
         run: python3 -m compileall -q server/
       - name: Compose file is valid
-        run: |
-          ./scripts/orca/env.sh
-          set -a; . ./.env; set +a
-          docker compose -f server/testing/docker-compose.yml config --quiet
+        run: ./scripts/orca/compose.sh config --quiet
 
   # The primary rig (docs/TESTING.md): the core engine built natively and run
   # against a REAL RomM 5.2.0 in Docker, reached through the fault proxy so the
@@ -55,16 +52,14 @@ jobs:
           ./server/testing/seed.sh
 
       - name: Start the RomM fixture
-        run: |
-          set -a; . ./.env; set +a
-          docker compose -f server/testing/docker-compose.yml up -d
+        run: ./scripts/orca/compose.sh up -d
 
       - name: Wait for RomM
         run: |
           set -a; . ./.env; set +a
-          curl -sS --retry 60 --retry-delay 5 --retry-all-errors --retry-connrefused \
+          curl -fsS --retry 60 --retry-delay 5 --retry-all-errors --retry-connrefused \
             -o /dev/null -w 'romm: %{http_code}\n' "$ROMM_BASE_URL/api/heartbeat"
-          curl -sS --retry 20 --retry-delay 2 --retry-all-errors --retry-connrefused \
+          curl -fsS --retry 20 --retry-delay 2 --retry-all-errors --retry-connrefused \
             -o /dev/null -w 'proxy: %{http_code}\n' "$PROXY_BASE_URL/api/heartbeat"
 
       - name: Build
@@ -75,13 +70,17 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+      # Both go through the wrapper: every step is a fresh shell, and compose
+      # reads .env from the compose file's directory, not the repo root -- so a
+      # bare `docker compose` here would target the default project and dump
+      # nothing, exactly when a failure needs the logs.
       - name: RomM logs on failure
         if: failure()
-        run: docker compose -f server/testing/docker-compose.yml logs --tail=200
+        run: ./scripts/orca/compose.sh logs --tail=200
 
       - name: Tear down
         if: always()
-        run: docker compose -f server/testing/docker-compose.yml down -v || true
+        run: ./scripts/orca/compose.sh down -v || true
 
   # The Switch targets. devkitPro builds them but nothing runs them -- Horizon
   # behaviour is proven on the Ryujinx rung and, last, on hardware (M8).

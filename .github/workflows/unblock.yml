@@ -58,8 +58,10 @@ jobs:
 
               const blockers = [...(issue.body || '').matchAll(/blocked\s+by\s+#(\d+)/gi)]
                 .map((m) => Number(m[1]));
-              if (blockers.length === 0) continue;
 
+              // An issue that was never blocked still needs `ready`: CLAUDE.md
+              // says only start a `ready` issue, so skipping these would make
+              // them permanently unstartable.
               const open = [];
               for (const number of blockers) {
                 if (await isOpen(number)) open.push(number);

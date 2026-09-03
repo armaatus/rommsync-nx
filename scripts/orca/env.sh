@@ -20,7 +20,11 @@ print(int.from_bytes(h[:2],'big') % 2000)
 
 ROMM_PORT=$((21000 + offset))
 PROXY_PORT=$((23000 + offset))
-COMPOSE_PROJECT_NAME="rmx-${slug}"
+# The offset is part of the name, not just the ports: two worktrees whose
+# leaf directory names collide (a checkout and a worktree both called
+# "rommsync-nx") would otherwise share a compose project, and the second
+# `up -d` would adopt and recreate the first's containers and database.
+COMPOSE_PROJECT_NAME="rmx-${slug}-${offset}"
 
 # Shared across worktrees on purpose: immutable, expensive to refetch. These are
 # worktree-relative because Orca shares them via worktree.sharedDirectories in
