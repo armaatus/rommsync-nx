@@ -8,6 +8,8 @@ token.dat
 # generated per-worktree environment / fixtures — never shared, never committed
 .cache/
 server/testing/library/
+server/testing/fixture-auth.env
+.venv/
 TASK.md
 
 # build output
