@@ -117,6 +117,23 @@ inline std::string ReadFile(const std::string& path) {
   return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
 }
 
+/// Read one `KEY=value` out of the file provision.py writes.
+inline std::string FixtureValue(const std::string& contents, const std::string& key) {
+  const std::string needle = key + "=";
+  std::size_t at = contents.rfind("\n" + needle);
+  if (at == std::string::npos) {
+    if (contents.rfind(needle, 0) != 0) {
+      return {};
+    }
+    at = 0;
+  } else {
+    ++at;  // step over the newline
+  }
+  at += needle.size();
+  const std::size_t end = contents.find('\n', at);
+  return contents.substr(at, end == std::string::npos ? std::string::npos : end - at);
+}
+
 inline bool WriteFile(const std::string& path, std::string_view content) {
   std::ofstream out(path, std::ios::binary | std::ios::trunc);
   out.write(content.data(), static_cast<std::streamsize>(content.size()));
