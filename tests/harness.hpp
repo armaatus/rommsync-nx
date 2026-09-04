@@ -80,6 +80,13 @@ class Sandbox {
  public:
   /// `checks` receives the teardown audit, so a test that overwrites a save
   /// without backing it up goes red without having to remember to look.
+  ///
+  /// **That only works if `checks` outlives the sandbox**, which is why every
+  /// scenario in test_harness.cpp takes its `Checks` from `main` and returns
+  /// void rather than `checks.failures()`. A return expression is evaluated
+  /// before block-scope destructors run, so a scenario that returned its own
+  /// count would copy the number out first and let this audit raise a failure
+  /// into a value nobody reads -- printing FAIL and exiting 0.
   Sandbox(::checks::Checks& checks, std::string_view name) : checks_(&checks) {
     // The build tree, not /tmp: three worktrees run this suite at once and a
     // shared path would have them delete each other's sandboxes. The pid and a
@@ -264,13 +271,26 @@ class Fault {
   std::string base_;
 };
 
-/// Assert nothing is armed. `GET /__fault` answers the scenario or `null`.
+/// Assert nothing is armed. `GET /__fault` answers the armed scenario as JSON,
+/// or the bare literal `null`.
+///
+/// Compared exactly rather than searched for. A spec is echoed back verbatim, so
+/// any armed scenario carrying a JSON `null` -- `{"mode":"status","body":null}`
+/// is one -- would contain the word and satisfy a substring test with the fault
+/// still live. That is the one thing this helper exists to rule out.
 inline void ExpectDisarmed(::checks::Checks& checks, http::HttpClient& client,
                            const std::string& base, std::string_view what) {
   http::Request request;
   request.url = base + "/__fault";
   const http::Result result = client.Send(request);
-  checks.Expect(result.successful() && result.response.body.find("null") != std::string::npos,
+  std::string_view body = result.response.body;
+  while (!body.empty() && (body.front() == ' ' || body.front() == '\n')) {
+    body.remove_prefix(1);
+  }
+  while (!body.empty() && (body.back() == ' ' || body.back() == '\n')) {
+    body.remove_suffix(1);
+  }
+  checks.Expect(result.successful() && body == "null",
                 std::string(what) + " -- the proxy holds: " + result.response.body);
 }
 
