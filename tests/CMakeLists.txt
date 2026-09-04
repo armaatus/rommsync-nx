@@ -305,10 +305,21 @@ add_test(NAME switch.ci_requires_artifacts
          COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" ci)
 set_tests_properties(switch.ci_requires_artifacts PROPERTIES TIMEOUT 60)
 
-# The real cross-compile, in the same devkitpro/devkita64 image CI uses. It
-# needs that image, which the CI host runner does not have and will not pull for
-# 2.7GB -- there the switch-build job is the enforcement and this is its local
-# equivalent, so it skips on its own rather than under ROMMSYNC_REQUIRE_RIG.
+# The real cross-compile, in the same devkitpro/devkita64 image CI uses. It needs
+# that image, which the CI host runner does not have and will not pull for 2.7GB.
+#
+# Read the next line before changing it: this is the ONLY test in this file whose
+# SKIP_RETURN_CODE is not wrapped in if(NOT ROMMSYNC_REQUIRE_RIG). Every other
+# skippable test flips to a failure under that option precisely so CI cannot go
+# green on a skip -- and that is the right default, so the exception needs its
+# reason recorded rather than inferred. The reason is that this one's enforcement
+# lives in a different CI job: `switch-build` in .github/workflows/ci.yml runs
+# the same build, in the same image, on every push, and fails there. This entry
+# is its local equivalent, not its enforcement.
+#
+# So do not "fix" it by wrapping it like the others. That would fail the
+# host-tests job on a runner that has no devkitpro image -- which is every runner
+# the host job uses.
 add_test(NAME switch.builds
          COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" builds)
 set_tests_properties(switch.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
