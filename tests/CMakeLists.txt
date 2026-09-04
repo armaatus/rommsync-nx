@@ -177,7 +177,26 @@ add_test(NAME orca.env_concurrent_writers
          COMMAND "${BASH_PROGRAM}" "${ORCA_ENV_TEST}" concurrent)
 add_test(NAME orca.env_never_partial
          COMMAND "${BASH_PROGRAM}" "${ORCA_ENV_TEST}" readable)
+
+# The venv interpreter. setup.sh used to inherit `python3`, which is macOS's
+# 3.9.6 under Orca's hook environment -- below the floor server/requirements.txt
+# needs, so provisioning died in pip with no usable explanation.
+add_test(NAME orca.env_picks_python
+         COMMAND "${BASH_PROGRAM}" "${ORCA_ENV_TEST}" python)
+
+# A venv whose interpreter went away is the case that makes a worktree
+# unprovisionable forever: `venv` over a dangling bin/python exits 1, so every
+# re-run of setup.sh fails identically.
+add_test(NAME orca.env_replaces_dead_venv
+         COMMAND "${BASH_PROGRAM}" "${ORCA_ENV_TEST}" venv)
+
+# And setup.sh's own half, which a test of the picker alone cannot see.
+add_test(NAME orca.env_setup_fails_fast
+         COMMAND "${BASH_PROGRAM}" "${ORCA_ENV_TEST}" setup_fails_fast)
+
 set_tests_properties(orca.env_concurrent_writers orca.env_never_partial
+                     orca.env_picks_python orca.env_replaces_dead_venv
+                     orca.env_setup_fails_fast
                      PROPERTIES TIMEOUT 60)
 
 # --- worktree teardown: the archive hook in orca.yaml -------------------------

@@ -9,6 +9,20 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
+. ./scripts/orca/lib.sh
+
+# First, before the ROM seeding and the full build below. This check is free and
+# its failure is fatal, so paying for a download and a compile before reporting
+# it would only mean waiting minutes to be told about a one-line problem.
+if ! PYTHON="$(orca_pick_python)"; then
+  echo "!! server/requirements.txt needs Python >= ${ORCA_PYTHON_MIN_MAJOR}.${ORCA_PYTHON_MIN_MINOR}" >&2
+  echo "   and nothing usable was found. Tried:" >&2
+  orca_python_rejections >&2
+  echo "   PATH=$PATH" >&2
+  echo "   Install one (brew install python@3.13 / apt install python3.13 python3.13-venv)" >&2
+  echo "   and make sure it is on the PATH Orca runs hooks with, then re-run this script." >&2
+  exit 1
+fi
 
 echo "==> deriving isolated worktree environment"
 ./scripts/orca/env.sh
@@ -30,8 +44,28 @@ cmake --build build --parallel >/dev/null
 # The server tooling (fixture provisioner, contract probe) is python and needs
 # third-party clients; the C++ build needs none of this. A per-worktree venv
 # keeps those out of the user's system python and out of other worktrees.
-echo "==> installing server tooling into .venv"
-python3 -m venv .venv >/dev/null
+#
+# $PYTHON, resolved at the top of this script, rather than bare `python3`.
+#
+# An existing .venv is reused only if its OWN interpreter still answers and
+# still satisfies the floor -- see orca_venv_is_usable in lib.sh for why testing
+# the file with `-x` is the wrong question and leaves a worktree permanently
+# unprovisionable. Replacing it is what makes a worktree that failed here
+# recoverable by re-running this script rather than by hand.
+if [ -d .venv ] && ! orca_venv_is_usable .venv; then
+  echo "==> replacing .venv (its interpreter is missing, broken or too old)"
+  rm -rf .venv
+fi
+
+if [ -d .venv ]; then
+  # Reported from the venv, not from $PYTHON: `venv` leaves an existing
+  # bin/python alone, so announcing the interpreter we picked would describe a
+  # venv that is not the one about to be installed into.
+  echo "==> installing server tooling into the existing .venv ($(./.venv/bin/python -V 2>&1))"
+else
+  echo "==> installing server tooling into .venv ($("$PYTHON" -V 2>&1))"
+  "$PYTHON" -m venv .venv >/dev/null
+fi
 ./.venv/bin/pip install -q --disable-pip-version-check -r server/requirements.txt
 
 # Before the stack, not after it. The steps below are the ones that fail on a bad
