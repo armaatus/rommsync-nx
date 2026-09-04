@@ -165,9 +165,9 @@ json::Error Validate(const ClientSaveState& save);
 
 /// The request body for `POST /api/sync/negotiate`, or a named error.
 ///
-/// Every save is validated first and the first failure stops the encode: a body
-/// that is missing the one save the tick was about is worse than no body, since
-/// the plan that comes back looks complete.
+/// The `device_id` and every save are validated first, and the first failure
+/// stops the encode: a body that is missing the one save the tick was about is
+/// worse than no body, since the plan that comes back looks complete.
 Encoded EncodeNegotiateRequest(const SyncNegotiatePayload& payload);
 
 }  // namespace rommsync::sync
