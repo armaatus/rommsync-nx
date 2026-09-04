@@ -222,6 +222,19 @@ const json::Value* Entry(checks::Checks& c, const json::ParseResult& document, s
   return &saves->elements()[index];
 }
 
+/// A field's value, or an empty/zero stand-in when it is absent or the wrong
+/// type. Never dereferences a missing member, so a dropped field is a named
+/// failure rather than a crash.
+std::string Text(const json::Value& object, const char* key) {
+  const json::Value* value = object.Find(key);
+  return value != nullptr && value->is_string() ? value->string() : std::string();
+}
+
+std::int64_t Integer(const json::Value& object, const char* key) {
+  const json::Value* value = object.Find(key);
+  return value != nullptr && value->is_integer() ? value->integer() : 0;
+}
+
 void EncodesTheSnapshotShape(checks::Checks& c) {
   sync::SyncNegotiatePayload payload;
   payload.device_id = "b242014b-5774-44dc-b495-139fc7b856da";
@@ -260,18 +273,19 @@ void EncodesTheSnapshotShape(checks::Checks& c) {
     c.Expect(right_type, std::string("the encoded ") + field.name + " is a " + field.type);
   }
 
-  c.ExpectEq(entry->Find("rom_id")->integer(), std::int64_t{4}, "rom_id");
-  c.ExpectEq(entry->Find("file_name")->string(), std::string("Game (USA).srm"), "file_name");
-  c.ExpectEq(entry->Find("slot")->string(), std::string("autosave"), "slot");
-  c.ExpectEq(entry->Find("emulator")->string(), std::string("retroarch"), "emulator");
-  c.ExpectEq(entry->Find("content_hash")->string(),
-             std::string("abd8fff93894e8112c7dd17386e54a5f"), "content_hash");
-  c.ExpectEq(entry->Find("updated_at")->string(), std::string("2026-09-04T11:36:27Z"),
-             "updated_at");
-  c.ExpectEq(entry->Find("file_size_bytes")->integer(), std::int64_t{32768}, "file_size_bytes");
+  // Read through helpers rather than off `Find(...)->` directly: the regression
+  // this test exists to catch is a field the encoder stopped emitting, and that
+  // must print as the named failure above, not as a segfault here.
+  c.ExpectEq(Integer(*entry, "rom_id"), std::int64_t{4}, "rom_id");
+  c.ExpectEq(Text(*entry, "file_name"), std::string("Game (USA).srm"), "file_name");
+  c.ExpectEq(Text(*entry, "slot"), std::string("autosave"), "slot");
+  c.ExpectEq(Text(*entry, "emulator"), std::string("retroarch"), "emulator");
+  c.ExpectEq(Text(*entry, "content_hash"), std::string("abd8fff93894e8112c7dd17386e54a5f"),
+             "content_hash");
+  c.ExpectEq(Text(*entry, "updated_at"), std::string("2026-09-04T11:36:27Z"), "updated_at");
+  c.ExpectEq(Integer(*entry, "file_size_bytes"), std::int64_t{32768}, "file_size_bytes");
 
-  const json::Value* device_id = document.value.Find("device_id");
-  c.ExpectEq(device_id != nullptr ? device_id->string() : std::string(),
+  c.ExpectEq(Text(document.value, "device_id"),
              std::string("b242014b-5774-44dc-b495-139fc7b856da"), "device_id");
 }
 
@@ -339,7 +353,7 @@ void QuotesRatherThanConcatenates(checks::Checks& c) {
   if (entry == nullptr) {
     return;
   }
-  c.ExpectEq(entry->Find("file_name")->string(), std::string("a\"b\\c.srm"),
+  c.ExpectEq(Text(*entry, "file_name"), std::string("a\"b\\c.srm"),
              "the file name survives encoding unchanged");
   c.ExpectEq(entry->size(), std::size_t{std::size(kSaveFields)},
              "and did not smuggle extra fields into the entry");
@@ -367,12 +381,18 @@ void RefusesWhatItCannotSendFaithfully(checks::Checks& c) {
        with([](sync::ClientSaveState& s) { s.file_name.clear(); })},
       {"a path where a name belongs", "file_name",
        with([](sync::ClientSaveState& s) { s.file_name = "saves/Game.srm"; })},
+      {"`..`, which redirects the join without a separator in it", "file_name",
+       with([](sync::ClientSaveState& s) { s.file_name = ".."; })},
       {"a file name with a NUL in it", "file_name",
        with([](sync::ClientSaveState& s) { s.file_name = std::string("Game\0.srm", 9); })},
       {"a blank slot, which is neither a slot nor archival", "slot",
        with([](sync::ClientSaveState& s) { s.slot = ""; })},
       {"a blank emulator", "emulator",
        with([](sync::ClientSaveState& s) { s.emulator = ""; })},
+      // The emulator is a directory in the stored path, not a label:
+      // `users/<user>/saves/<platform>/<rom>/<emulator>/<file_name>`.
+      {"an emulator that names a directory", "emulator",
+       with([](sync::ClientSaveState& s) { s.emulator = "retroarch/cores"; })},
       {"a SHA1 where the MD5 goes", "content_hash",
        with([](sync::ClientSaveState& s) {
          s.content_hash = "da39a3ee5e6b4b0d3255bfef95601890afd80709";

@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <random>
 #include <string>
 
 #include "rig.hpp"
@@ -101,10 +102,15 @@ std::string Field(const json::Value& object, const char* key) {
 }
 
 /// A slot nobody else is using. RomM pairs saves on `(rom_id, slot)`, so a
-/// constant would make one run's leftovers another run's sync history.
+/// constant would make one run's leftovers another run's sync history -- and a
+/// run that failed before its cleanup does leave one behind. A timestamp alone
+/// is not enough: `understood` finishes in a tenth of a second, so
+/// `ctest --repeat until-fail:N` puts several runs inside the same second.
 std::string UniqueSlot(const char* scenario) {
+  std::random_device entropy;
   const std::int64_t now = sync::UnixSeconds(std::chrono::system_clock::now());
-  return std::string("m2-1-") + scenario + "-" + std::to_string(now);
+  return std::string("m2-1-") + scenario + "-" + std::to_string(now) + "-" +
+         std::to_string(entropy());
 }
 
 /// The client's own view of one save, as the sysmodule will build it.
