@@ -52,8 +52,9 @@ Real `init` response (`captures/auth-device-init.json`):
   "interval": 5
 }
 ```
-Both verification fields are **paths, not URLs** — the server is origin-agnostic,
-so the client joins them with the origin it was configured with.
+`init` answers **`201 Created`**, not `200`. Both verification fields are
+**paths, not URLs** — the server is origin-agnostic, so the client joins them
+with the origin it was configured with.
 
 Real `token` response (`captures/auth-device-token.json`):
 ```json
@@ -73,6 +74,15 @@ Real `token` response (`captures/auth-device-token.json`):
 sorted, which is not necessarily what was requested — check it rather than
 assuming. The response already carries a `device_id`, so pairing alone is enough
 to start syncing; see below before calling `POST /api/devices`.
+
+A poll that is not yet approved answers **`400`** with FastAPI's `detail`, not
+RFC 8628's `error`: `authorization_pending`, `slow_down`, `access_denied` and
+`expired_token` all share that one status, and only the string separates "keep
+polling" from "this pairing is dead". Over-polling from one IP answers `429`
+with an English sentence instead of a code. None of this is in the OpenAPI
+snapshot, which declares `200` and `422` and no error body; the full table is in
+[AUTH.md](AUTH.md#polling-the-token-endpoint) and the shape is captured in
+`captures/auth-device-token-pending.json`.
 
 Client-token pairing (alternative / management) also exists:
 `POST /api/client-tokens`, `POST /api/client-tokens/exchange {code}`,

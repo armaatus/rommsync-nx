@@ -157,7 +157,13 @@ def device_auth(s, base, cap, approver):
         "client_version": "0.0.0",
         "requested_scopes": REQUESTED_SCOPES,
     }, timeout=30)
-    init.raise_for_status()
+    # 201, not 200 -- the OpenAPI snapshot declares it and docs/AUTH.md now says
+    # so, which is only worth writing down if something checks it.
+    # `raise_for_status()` would wave any 2xx through.
+    if init.status_code != 201:
+        print(f"!! init answered {init.status_code}, not the documented 201: "
+              f"{init.text[:200]}", file=sys.stderr)
+        sys.exit(1)
     init = init.json()
     show_shape(init, "init response")
     device_code = cap.secret(init.get("device_code"), "<device_code>")
@@ -171,6 +177,28 @@ def device_auth(s, base, cap, approver):
     if verify.startswith("/"):
         verify = base + verify
     interval = init.get("interval", 5)
+
+    # One poll before anyone has approved anything. This is the shape the
+    # sysmodule sees on every tick of the pairing screen, and the OpenAPI
+    # snapshot does not declare it at all -- it lists 200 and 422 and no error
+    # body. `authorization_pending` and `expired_token` are both 400, so the
+    # `detail` string is the only thing separating "keep polling" from "this
+    # pairing is dead": capture it, and refuse to write a file that says
+    # something else.
+    hr("device auth: poll before approval")
+    pending = s.post(f"{base}/api/auth/device/token",
+                     json={"device_code": device_code}, timeout=30)
+    try:
+        pending_body = pending.json()
+    except ValueError:
+        pending_body = {"raw": pending.text[:200]}
+    if pending.status_code != 400 or pending_body.get("detail") != "authorization_pending":
+        print(f"!! an unapproved poll answered {pending.status_code} "
+              f"{json.dumps(cap.redacted(pending_body))[:200]}, not 400 "
+              f"authorization_pending", file=sys.stderr)
+        sys.exit(1)
+    cap.record("auth-device-token-pending", pending_body)
+    print(f"  {pending.status_code} {json.dumps(pending_body)}")
 
     if approver:
         hr("device auth: approve (no browser)")

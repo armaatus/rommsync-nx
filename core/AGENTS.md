@@ -12,6 +12,14 @@ break by accident.
   or HTTP library, and CI enforces the sharper version of that rule: an include
   here must be either a standard header or a `rommsync/` one. Backends live in
   `host/` (libcurl) and, from M0-3, `sysmodule/` (Horizon `ssl`).
+- **Every response shape is read through `rommsync::json`**
+  (`include/rommsync/json.hpp`), not through substring scans and not through a
+  third-party parser — the include rule above rules one out anyway. It is
+  strict on purpose: a truncated or hostile body has to become a named error,
+  never a struct that looks parsed. `json::Reader` turns a field that is missing
+  or the wrong type into a message naming *which* field, which is the difference
+  between a bug found here and one found on a console.
+  `include/rommsync/auth.hpp` is the worked example.
 - Sources are globbed by `core/CMakeLists.txt` — add a `.cpp`, no CMake edit.
 - Streaming, not buffering: a rom may be gigabytes and the sysmodule heap is
   tiny. Write to a file as bytes arrive.
