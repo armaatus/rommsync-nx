@@ -128,6 +128,16 @@ ctest --test-dir build --output-on-failure
   local `ctest` is still useful. CI configures with `-DROMMSYNC_REQUIRE_RIG=ON`,
   which turns the same condition into a failure — a green CI run always means the
   tests actually ran.
+- The `switch.*` pair covers the console half of the build, which CMake does not
+  drive. `switch.ci_requires_artifacts` reads the workflow and never skips: the
+  `switch-build` job must build both targets unconditionally and refuse to
+  publish an empty artifact set, which is what it did *not* do while the
+  Makefiles were missing. `switch.builds` runs the real devkitA64 build in the
+  same `devkitpro/devkita64` image CI uses and checks that the `.nsp` is a PFS0
+  archive, that the `.ovl` carries its `ULTR` signature, and that every `core/`
+  translation unit produced an aarch64 object. It skips when that image is not
+  pulled — including under `ROMMSYNC_REQUIRE_RIG`, since the host CI runner does
+  not have it and the `switch-build` job is the enforcement there.
 
 ### Provisioning the fixture
 

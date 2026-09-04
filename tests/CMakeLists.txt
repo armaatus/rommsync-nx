@@ -290,3 +290,36 @@ if(NOT ROMMSYNC_REQUIRE_RIG)
   set_tests_properties(orca.reap_spares_live_worktrees PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 set_tests_properties(orca.reap_spares_live_worktrees PROPERTIES TIMEOUT 60)
+
+# --- the Switch targets: sysmodule/, overlay/ and switch.mk ------------------
+# The devkitPro Makefiles are not driven by this build -- CMake builds the host
+# half and devkitA64 builds the console half (docs/DEVELOPMENT.md#toolchain) --
+# but the guarantee that they still produce something loadable belongs with
+# every other guarantee, in `ctest`.
+set(SWITCH_BUILD_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_switch_build.sh")
+
+# Reads .github/workflows/ci.yml and the two Makefiles, so it never skips: the
+# guards that let the job stay green over a Switch build that never happened
+# must not be able to come back unnoticed.
+add_test(NAME switch.ci_requires_artifacts
+         COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" ci)
+set_tests_properties(switch.ci_requires_artifacts PROPERTIES TIMEOUT 60)
+
+# The real cross-compile, in the same devkitpro/devkita64 image CI uses. It needs
+# that image, which the CI host runner does not have and will not pull for 2.7GB.
+#
+# Read the next line before changing it: this is the ONLY test in this file whose
+# SKIP_RETURN_CODE is not wrapped in if(NOT ROMMSYNC_REQUIRE_RIG). Every other
+# skippable test flips to a failure under that option precisely so CI cannot go
+# green on a skip -- and that is the right default, so the exception needs its
+# reason recorded rather than inferred. The reason is that this one's enforcement
+# lives in a different CI job: `switch-build` in .github/workflows/ci.yml runs
+# the same build, in the same image, on every push, and fails there. This entry
+# is its local equivalent, not its enforcement.
+#
+# So do not "fix" it by wrapping it like the others. That would fail the
+# host-tests job on a runner that has no devkitpro image -- which is every runner
+# the host job uses.
+add_test(NAME switch.builds
+         COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" builds)
+set_tests_properties(switch.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
