@@ -51,6 +51,7 @@ stop_follower() {
 }
 cleanup() {
   local pid
+  rm -f "${OUT}.pid"
   for pid in $FOLLOWER_PIDS; do stop_follower "$pid"; done
   rm -f "$OUT"
   [ -n "$TMPDIR_FIXTURE" ] && rm -rf "$TMPDIR_FIXTURE"
@@ -121,7 +122,11 @@ STUB
 survived_for() {
   local root="$1" seconds="$2" pid
   OUT="$(mktemp)"
-  ROMM_LOGS_POLL_SECONDS=1 bash "$root/scripts/orca/romm-logs.sh" >"$OUT" 2>&1 &
+  # Its own pidfile: the `follow` phase runs against the REAL worktree, and
+  # without this it steals the live romm tab's pidfile and deletes it on the way
+  # out -- leaving that tab streaming but invisible to ensure-romm-tab.sh.
+  ROMM_LOGS_POLL_SECONDS=1 ROMM_LOGS_PIDFILE="${OUT}.pid" \
+    bash "$root/scripts/orca/romm-logs.sh" >"$OUT" 2>&1 &
   pid=$!
   sleep "$seconds"
   local alive=1
@@ -240,7 +245,8 @@ case "${1:-}" in
     # and the tab keeps the absolute-path name Orca gives it.
     grep -q -- "terminal create --json" <<<"$calls" || fail "create asked for no handle to rename by: $calls"
     grep -q -- "path:$tmp" <<<"$calls" || fail "tab would land in the wrong worktree: $calls"
-    grep -q "romm-logs.sh" <<<"$calls" || fail "tab would run no follower: $calls"
+    grep -q -- "--command ./scripts/orca/romm-logs.sh" <<<"$calls" \
+      || fail "tab would run no follower, or by a path that becomes its title: $calls"
     # The stub exits 0 without starting anything -- which is also how Orca
     # behaves in the bug being worked around, and how it behaves when it falls
     # back to a background handle the UI never adopts. Reporting "created" there
@@ -264,8 +270,61 @@ case "${1:-}" in
     echo "PASS: a missing follower is created, and a stale pidfile does not mask it"
     ;;
 
+  pidfile_streaming)
+    # The `pidfile` phase covers a follower that is WAITING. Following is the
+    # steady state, and there the script is blocked in `compose logs -f` -- so a
+    # reclaim that only runs between loop iterations never runs at all.
+    make_fixture; tmp="$TMPDIR_FIXTURE"
+    pf="$tmp/romm-logs.pid"
+    # A stack that is up and a log stream that never ends, without docker.
+    cat >"$tmp/scripts/orca/compose.sh" <<'STUBC'
+#!/usr/bin/env bash
+case "${1:-}" in
+  ps)   echo stub-container ;;
+  logs) exec sleep 3600 ;;
+  *)    exit 0 ;;
+esac
+STUBC
+    chmod +x "$tmp/scripts/orca/compose.sh"
+
+    start_follower "$tmp" "$pf"; first="$STARTED_FOLLOWER"
+    await_pidfile "$pf" || fail "streaming follower published no pidfile"
+    streaming=""
+    for _ in $(seq 1 50); do
+      grep -q "following" "$OUT" && { streaming=yes; break; }
+      sleep 0.1
+    done
+    [ -n "$streaming" ] \
+      || fail "fixture is broken: follower never reached the streaming branch; got: $(cat "$OUT")"
+
+    # A second follower comes and goes, taking the pidfile with it.
+    start_follower "$tmp" "$pf"; second="$STARTED_FOLLOWER"
+    await_pidfile "$pf" || fail "second follower published no pidfile"
+    stop_follower "$second"
+    reclaimed=""
+    for _ in $(seq 1 60); do
+      [ "$(cat "$pf" 2>/dev/null)" = "$first" ] && { reclaimed=yes; break; }
+      sleep 0.2
+    done
+    [ -n "$reclaimed" ] \
+      || fail "a streaming follower never reclaimed its pidfile; it is now: $(cat "$pf" 2>/dev/null || echo gone)"
+
+    # And a pid left behind by a follower that was killed outright -- no trap, so
+    # the file survives holding a dead pid. Present is not the same as live.
+    (exit 0) & dead=$!; wait "$dead" 2>/dev/null
+    echo "$dead" >"$pf"
+    reclaimed=""
+    for _ in $(seq 1 60); do
+      [ "$(cat "$pf" 2>/dev/null)" = "$first" ] && { reclaimed=yes; break; }
+      sleep 0.2
+    done
+    [ -n "$reclaimed" ] \
+      || fail "a dead pid in the pidfile was treated as claimed forever"
+    echo "PASS: a streaming follower reclaims its pidfile from a departed and from a dead one"
+    ;;
+
   *)
-    echo "usage: $0 wait|follow|pidfile|ensure_noop|ensure_creates" >&2
+    echo "usage: $0 wait|follow|pidfile|pidfile_streaming|ensure_noop|ensure_creates" >&2
     exit 2
     ;;
 esac

@@ -31,6 +31,13 @@ echo "==> installing server tooling into .venv"
 python3 -m venv .venv >/dev/null
 ./.venv/bin/pip install -q --disable-pip-version-check -r server/requirements.txt
 
+# Before the stack, not after it. The steps below are the ones that fail on a bad
+# day -- an image pull with no network, a scan that never finishes -- and `set -e`
+# means a failure there would skip this and leave exactly the case the tab exists
+# for: no RomM, and nothing on screen saying why. romm-logs.sh waits for a stack
+# that is not up yet, so there is nothing to gain by running it later.
+./scripts/orca/ensure-romm-tab.sh
+
 echo "==> starting RomM ($COMPOSE_PROJECT_NAME on :$ROMM_PORT)"
 ./scripts/orca/compose.sh up -d
 
@@ -40,10 +47,6 @@ echo "==> starting RomM ($COMPOSE_PROJECT_NAME on :$ROMM_PORT)"
 # device-code flow, so tests authenticate without a human approving anything.
 echo "==> provisioning the fixture (scan, collection, client token)"
 ./.venv/bin/python server/testing/provision.py --base-url "$ROMM_BASE_URL"
-
-# Last, because it reports on the tab that shows everything above: creating it
-# earlier would only prove the tab exists, not that there was a stack to follow.
-./scripts/orca/ensure-romm-tab.sh
 
 echo
 echo "worktree ready."
