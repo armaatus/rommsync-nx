@@ -54,6 +54,24 @@ sync across ticks; a `null` slot means "archival, manual upload" to RomM and is
 never paired with a slotted server save, so it negotiates as `upload` every time
 even when the identical bytes are already there. Pick a slot and keep it.
 
+That entry is `rommsync::sync::ClientSaveState`
+([`core/include/rommsync/sync.hpp`](../core/include/rommsync/sync.hpp)), and
+`EncodeNegotiateRequest` is the only thing that writes this body. It refuses,
+with the field named, a save it cannot send faithfully — a SHA1 or an uppercase
+digest in `content_hash`, a blank `slot` (which is neither a slot nor archival),
+an `updated_at` at the epoch. Every one of those is a save RomM would accept and
+then arbitrate as something the client did not mean; see
+[API_CONTRACT.md](API_CONTRACT.md#save-sync--negotiate--execute--complete) for
+what the server does and does not complain about.
+
+`updated_at` is the file's mtime in UTC, whole seconds, `…Z`. RomM stores these
+at second granularity and compares with a strict `>`, so sub-second precision is
+dropped *downwards* — rounding 11:36:27.9 up to :28 would claim a file is newer
+than it is and win an arbitration it should have lost. A timestamp at or before
+the epoch is refused rather than sent: that is a console whose clock never got
+set, and the server would read it as "very old" and plan a `download` over what
+may be the only copy of the save.
+
 `POST /api/sync/negotiate` → `SyncNegotiateResponse { session_id, operations[],
 total_upload, total_download, total_conflict, total_no_op }`.
 
