@@ -133,8 +133,17 @@ back on every docker start and hold two ports each. Sweep them up with:
 ./scripts/orca/reap.sh --yes    # remove them, volumes included
 ```
 
-It derives every live worktree's project name the same way `env.sh` did and
-protects those, so it can never take down a worktree still in use.
+It protects two sets of stacks: those belonging to a live worktree of this repo,
+whose project names it derives the same way `env.sh` did, and those whose
+containers still point at a directory that exists — which covers a separate
+clone of this repo that `git worktree list` cannot see. Anything it cannot
+positively establish as stale is left alone, and it refuses to sweep at all
+rather than run with an incomplete idea of what is live, so a stack it cannot
+account for survives instead of being deleted.
+
+The gap that remains: a *separate clone* whose stack has been reduced to volumes
+alone leaves nothing pointing at its directory, so it looks stale. Run the
+dry-run first if more than one clone of this repo is in play.
 
 ## Rung 2 — Ryujinx NRO
 
