@@ -38,7 +38,9 @@ import sys
 import urllib.parse
 
 SKIP = 77
-LOOPBACK = ("127.0.0.1", "localhost", "::1", "[::1]")
+# urlparse().hostname strips the brackets from an IPv6 authority, so "::1"
+# is the form that reaches here, never "[::1]".
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
 
 # TEST-NET-1 (RFC 5737): reserved for documentation, routed nowhere. If a guard
 # ever fails to fire, this is the address it fails to reach.
@@ -61,6 +63,15 @@ def phase_loopback(args) -> int:
     checks: list[tuple[str, str]] = [
         ("compiled into the test binaries", args.proxy_url),
     ]
+
+    # The environment beats the compiled-in value: rig::BaseUrl() (tests/rig.hpp)
+    # and test_rig_smoke.cpp both prefer $PROXY_BASE_URL, so a shell that
+    # exported a remote one would point every http.*, pair.* and rig.* test at
+    # it while every file this function reads still said 127.0.0.1.
+    for var in ("PROXY_BASE_URL", "ROMM_BASE_URL"):
+        value = os.environ.get(var)
+        if value:
+            checks.append((f"${var} in this environment", value))
 
     # This worktree's .env, if it has one. A plain clone has not run env.sh yet.
     env_file = os.path.join(args.repo, ".env")
@@ -89,6 +100,24 @@ def phase_loopback(args) -> int:
             return fail(f"{path} no longer assigns a base URL this check can see; "
                         "the check has stopped checking, which is worse than a red one")
 
+    # And the far end of the proxy, which is where the suite's traffic actually
+    # lands. Its host is a compose service name rather than an address, so
+    # is_loopback() cannot judge it: what makes it safe is that it names the
+    # `romm` service in this project's own compose file, and nothing else.
+    compose = os.path.join(args.repo, "server/testing/docker-compose.yml")
+    upstreams = re.findall(r"^\s*UPSTREAM:\s*(\S+)", open(compose, encoding="utf-8").read(),
+                           re.MULTILINE)
+    if not upstreams:
+        return fail("server/testing/docker-compose.yml no longer sets UPSTREAM; the fault "
+                    "proxy's far end is now unchecked")
+    for upstream in upstreams:
+        host = urllib.parse.urlparse(upstream).hostname or ""
+        if host not in ("romm", *LOOPBACK):
+            return fail(f"the fault proxy forwards to {upstream}, which is neither this "
+                        "project's `romm` service nor loopback. Every http.*, pair.* and "
+                        "rig.* test writes to whatever is on the far end of that proxy.")
+        print(f"  ok  {upstream}  (fault proxy upstream)")
+
     bad = [(where, url) for where, url in checks if not is_loopback(url)]
     for where, url in bad:
         print(f"  not loopback: {url}  ({where})", file=sys.stderr)
@@ -98,7 +127,7 @@ def phase_loopback(args) -> int:
 
     for where, url in checks:
         print(f"  ok  {url}  ({where})")
-    print(f"{len(checks)} configured URL(s), all loopback")
+    print(f"{len(checks)} configured URL(s), all loopback, plus the proxy upstream")
     return 0
 
 
@@ -109,7 +138,11 @@ def find_python(repo: str) -> str | None:
     for candidate in (os.path.join(repo, ".venv/bin/python"), sys.executable):
         if not candidate or not os.path.exists(candidate):
             continue
-        probe = subprocess.run([candidate, "-c", "import requests"],
+        # Both imports, not just requests: provision.py imports socketio at
+        # module scope, and an interpreter with only half of them dies with a
+        # ModuleNotFoundError that this test would have reported as "the guard
+        # does not refuse" -- a red run pointing at the wrong file.
+        probe = subprocess.run([candidate, "-c", "import requests, socketio"],
                                capture_output=True, timeout=60)
         if probe.returncode == 0:
             return candidate
@@ -123,7 +156,11 @@ def phase_guards(args) -> int:
         return SKIP
 
     invocations = [
+        # One per writing mode, because the guard is a condition over three flags
+        # and dropping any one of them from it leaves this test green.
         ("probe_contract.py --auth", ["server/probe_contract.py", "--url", REMOTE, "--auth"]),
+        ("probe_contract.py --negotiate",
+         ["server/probe_contract.py", "--url", REMOTE, "--negotiate"]),
         ("probe_contract.py --sync-scenarios",
          ["server/probe_contract.py", "--url", REMOTE, "--sync-scenarios"]),
         ("provision.py", ["server/testing/provision.py", "--base-url", REMOTE]),
