@@ -11,6 +11,19 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 . ./scripts/orca/lib.sh
 
+# First, before the ROM seeding and the full build below. This check is free and
+# its failure is fatal, so paying for a download and a compile before reporting
+# it would only mean waiting minutes to be told about a one-line problem.
+if ! PYTHON="$(orca_pick_python)"; then
+  echo "!! server/requirements.txt needs Python >= ${ORCA_PYTHON_MIN_MAJOR}.${ORCA_PYTHON_MIN_MINOR}" >&2
+  echo "   and nothing usable was found. Tried:" >&2
+  orca_python_rejections >&2
+  echo "   PATH=$PATH" >&2
+  echo "   Install one (brew install python@3.13 / apt install python3.13 python3.13-venv)" >&2
+  echo "   and make sure it is on the PATH Orca runs hooks with, then re-run this script." >&2
+  exit 1
+fi
+
 echo "==> deriving isolated worktree environment"
 ./scripts/orca/env.sh
 set -a; . ./.env; set +a
@@ -32,29 +45,27 @@ cmake --build build --parallel >/dev/null
 # third-party clients; the C++ build needs none of this. A per-worktree venv
 # keeps those out of the user's system python and out of other worktrees.
 #
-# The interpreter is chosen rather than inherited -- see orca_pick_python in
-# lib.sh for why bare `python3` is the wrong one when Orca runs this hook.
-if ! PYTHON="$(orca_pick_python)"; then
-  echo "!! server/requirements.txt needs Python >= ${ORCA_PYTHON_MIN_MAJOR}.${ORCA_PYTHON_MIN_MINOR}," >&2
-  echo "   and nothing on this PATH is that new:" >&2
-  echo "     python3 -> $(command -v python3 || echo 'not found') ($(python3 -V 2>&1 || true))" >&2
-  echo "     PATH=$PATH" >&2
-  echo "   Install one (brew install python@3.13 / apt install python3.13) and make" >&2
-  echo "   sure it is on the PATH Orca runs hooks with, then re-run this script." >&2
-  exit 1
-fi
-
-# An existing .venv built by an interpreter that is now too old is not repaired
-# by running `venv` over it -- the interpreter is baked into pyvenv.cfg -- so it
-# is replaced. This is also what makes a worktree that failed here recoverable
-# by re-running setup.sh rather than by hand.
-if [ -x .venv/bin/python ] && ! orca_python_is_new_enough ./.venv/bin/python; then
-  echo "==> replacing .venv (built with $(./.venv/bin/python -V 2>&1), too old)"
+# $PYTHON, resolved at the top of this script, rather than bare `python3`.
+#
+# An existing .venv is reused only if its OWN interpreter still answers and
+# still satisfies the floor -- see orca_venv_is_usable in lib.sh for why testing
+# the file with `-x` is the wrong question and leaves a worktree permanently
+# unprovisionable. Replacing it is what makes a worktree that failed here
+# recoverable by re-running this script rather than by hand.
+if [ -d .venv ] && ! orca_venv_is_usable .venv; then
+  echo "==> replacing .venv (its interpreter is missing, broken or too old)"
   rm -rf .venv
 fi
 
-echo "==> installing server tooling into .venv ($("$PYTHON" -V 2>&1))"
-"$PYTHON" -m venv .venv >/dev/null
+if [ -d .venv ]; then
+  # Reported from the venv, not from $PYTHON: `venv` leaves an existing
+  # bin/python alone, so announcing the interpreter we picked would describe a
+  # venv that is not the one about to be installed into.
+  echo "==> installing server tooling into the existing .venv ($(./.venv/bin/python -V 2>&1))"
+else
+  echo "==> installing server tooling into .venv ($("$PYTHON" -V 2>&1))"
+  "$PYTHON" -m venv .venv >/dev/null
+fi
 ./.venv/bin/pip install -q --disable-pip-version-check -r server/requirements.txt
 
 # Before the stack, not after it. The steps below are the ones that fail on a bad
