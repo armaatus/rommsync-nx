@@ -106,13 +106,21 @@ a re-pair, or from a device registered this boot. Executing a plan the server
 just issued must not be rejected by the server, so send `overwrite=true` and let
 negotiate be the arbiter.
 
-Two traps in the operation itself:
+Three traps in the operation itself:
 
 - **`file_name` is the server's name, not yours.** RomM renames a save on ingest:
   `probe.srm` is stored as `probe [2026-09-04_11-12-27].srm`, and every later
   operation echoes that. Match the operation back to your local file on
   `(rom_id, slot)` and keep your own path; writing the server's name to the SD
   produces a file no emulator will load.
+- **That rename is also why a second upload is a second save.** The datetime tag
+  is part of the stored name, so `POST /api/saves` for a slot that already has a
+  save creates a *new row* a second later — `overwrite=true` included — and the
+  new row has no sync history for this device. The next negotiation therefore
+  falls into the no-history branch and answers
+  `upload / Client save is newer (no sync history)` rather than comparing against
+  the last sync. Only `PUT /api/saves/{id}` moves an existing row forward.
+  `harness.conflict` depends on that distinction, and says so.
 - **`save_id` is null for an `upload`** when the server has nothing yet, and set
   when it has an older copy. Don't dereference it unconditionally.
 
@@ -122,6 +130,12 @@ written. Track `operations_completed` / `operations_failed`.
 
 Backups go to `sdmc:/config/rommsync/.backup/<rom_id>-<ts>.<ext>`. Never destroy
 a save without a backup — this is a hard rule.
+
+That name carries neither the slot nor the save's own name, so **two saves of one
+rom backed up in the same second are the same file**, and the second backup
+destroys the first — one rom with two slots, or a save and its state, is enough.
+Whatever M2-5 writes has to disambiguate them; `harness.backup` currently steps
+around the collision rather than hiding it (`Sandbox::BackupPathFor`).
 
 ### Conflicts
 

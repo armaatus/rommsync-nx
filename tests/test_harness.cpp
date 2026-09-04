@@ -1,0 +1,978 @@
+// The host harness, and the edge cases only a fault proxy can force.
+//
+// Every scenario here runs the engine's own code -- `EncodeNegotiateRequest`,
+// the native `HttpClient`, `WriteAtomically` -- against the real RomM 5.2.0 in
+// docker, with `server/testing/fault_proxy.py` in front of it damaging exactly
+// one thing about one genuine response. Nothing is mocked, so a green run means
+// a live server did that.
+//
+// The table in issue M0-5, and where each row is:
+//
+//   401 / expired token mid-flow      `expired`
+//   conflict                          `conflict`, `same_timestamp`
+//   partial failure mid-plan          `partial`
+//   dropped connection + Range resume `resume`
+//   truncated body                    `truncate`
+//   timeout / stall                   `stall`
+//   multi-file rom skip               `multifile`
+//
+// plus the harness's own two guarantees, which are the ones that keep the rest
+// honest: `sandbox` (the per-test SD card, and the backup rule it enforces
+// whether or not a test remembers to look) and `disarms` (a fault cannot
+// outlive the scope that armed it).
+//
+// **What is deliberately not here.** The issue's wording asks for the client's
+// *behaviour* on a conflict and on a partial plan -- resolve by policy, count
+// `operations_failed`, retry next tick. That behaviour is M2-5's and M2-7's
+// code, which is not written; docs/TESTING.md records the split. So these
+// scenarios prove the two things M0 owes: that each case can be produced on
+// demand, and what the server actually does in it -- including the parts a
+// reasonable client would guess wrong, which are named at each scenario.
+#include <chrono>
+#include <cstdint>
+#include <iostream>
+#include <memory>
+#include <streambuf>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "harness.hpp"
+#include "rommsync/atomic_file.hpp"
+
+namespace {
+
+namespace http = rommsync::http;
+namespace io = rommsync::io;
+namespace json = rommsync::json;
+namespace sync = rommsync::sync;
+
+using harness::Fixture;
+using harness::Sandbox;
+
+/// The seeded fixtures these scenarios need by name. Generated deterministically
+/// by server/testing/make_fixtures.py, so both are byte-identical everywhere.
+constexpr const char* kLargeRom = "synthetic-large.gba";
+constexpr const char* kMultiRom = "Synthetic Two Disc Game";
+
+/// The large rom as it sits in the library RomM serves, for a byte-for-byte
+/// comparison against what a download produced.
+constexpr const char* kLargeRomSource = ROMMSYNC_FIXTURE_LIBRARY "/roms/gba/synthetic-large.gba";
+
+/// A save path on the card. `/retroarch/saves` is a real entry in the default
+/// folder map (config.cpp), not a path invented here.
+std::string SavePath(const std::string& file_name) {
+  return std::string(harness::kSavesDir) + "/" + file_name;
+}
+
+/// Wait long enough that two server timestamps are distinguishable.
+///
+/// RomM compares stored datetimes directly, but it also *renders* some of them
+/// to whole seconds, and `sync.hpp` sends whole seconds by design. A test that
+/// arranges "the server's copy changed after the last sync" inside one second
+/// is a test that passes or fails on how long a docker container took, so these
+/// wait instead of racing.
+void PassASecond() { std::this_thread::sleep_for(std::chrono::seconds{2}); }
+
+/// Swallow `std::cerr` for the duration of a scope.
+///
+/// Only for the handful of assertions below that *expect* a failure -- proving
+/// the sandbox audit and the fault-proxy arm check are load-bearing means making
+/// them fire, and `checks::Checks` reports a failure by printing one. Without
+/// this a green run prints FAIL lines and reads like a broken test.
+class Quiet {
+ public:
+  Quiet() : previous_(std::cerr.rdbuf(&sink_)) {}
+  ~Quiet() { std::cerr.rdbuf(previous_); }
+
+  Quiet(const Quiet&) = delete;
+  Quiet& operator=(const Quiet&) = delete;
+
+ private:
+  /// Discards everything written to it. A null buffer would set badbit instead,
+  /// which some standard libraries then report on their own.
+  class Sink : public std::streambuf {
+   protected:
+    int overflow(int character) override { return character; }
+  };
+
+  Sink sink_;
+  std::streambuf* previous_;
+};
+
+// --- sandbox ------------------------------------------------------------------
+//
+// The harness's own guarantee, and the only scenario here that needs no server:
+// a per-test SD card that is removed afterwards, and an audit that turns
+// docs/SYNC_PROTOCOL.md's hard rule into something a test cannot forget.
+
+int SandboxScenario() {
+  rig::Checks checks;
+
+  // 1. the SD-path mapping, and teardown -------------------------------------
+  std::string remembered;
+  {
+    Sandbox sandbox(checks, "layout");
+    remembered = sandbox.root().string();
+    checks.Expect(sandbox.Host("/retroarch/saves/Game.srm") ==
+                      (sandbox.root() / "retroarch/saves/Game.srm").string(),
+                  "an SD-root path maps onto the sandbox");
+    checks.Expect(sandbox.Exists(harness::kConfigDir), "/config/rommsync exists");
+    checks.Expect(sandbox.Exists(harness::kBackupDir), ".backup/ exists");
+    checks.Expect(sandbox.Exists(harness::kSavesDir), "the save directory exists");
+
+    // A second sandbox in the same process gets its own tree; two tests cannot
+    // see each other's files even inside one binary.
+    Sandbox other(checks, "layout");
+    checks.Expect(other.root() != sandbox.root(), "two sandboxes are two directories");
+  }
+  checks.Expect(!std::filesystem::exists(remembered), "the sandbox is removed when the test ends");
+
+  // 2. the audit passes for an overwrite that backed up first ------------------
+  {
+    rig::Checks audited;
+    Sandbox sandbox(audited, "backed-up");
+    sandbox.Detach();
+    sandbox.SeedSave(SavePath("Game.srm"), "the previous save\n");
+    sandbox.Write(sandbox.BackupPathFor(7, "Game.srm"), "the previous save\n");
+    sandbox.Write(SavePath("Game.srm"), "the new save\n");
+    checks.ExpectEq(sandbox.Audit(audited), 0, "backing up first satisfies the audit");
+  }
+
+  // 3. ...and fails for every way of not doing it -----------------------------
+  // Each of these is a way a real implementation gets it wrong, and none of them
+  // is caught by a test that merely asserts the save now holds the new bytes.
+  {
+    const Quiet quiet;
+    rig::Checks audited;
+    Sandbox sandbox(audited, "no-backup");
+    sandbox.Detach();
+    sandbox.SeedSave(SavePath("Game.srm"), "the previous save\n");
+    sandbox.Write(SavePath("Game.srm"), "the new save\n");
+    checks.ExpectEq(sandbox.Audit(audited), 1, "an overwrite with no backup is caught");
+  }
+  {
+    const Quiet quiet;
+    rig::Checks audited;
+    Sandbox sandbox(audited, "backed-up-wrong");
+    sandbox.Detach();
+    sandbox.SeedSave(SavePath("Game.srm"), "the previous save\n");
+    sandbox.Write(SavePath("Game.srm"), "the new save\n");
+    // The commonest wrong version: back up *after* the write, so the copy holds
+    // the bytes that replaced the save rather than the ones it destroyed.
+    sandbox.Write(sandbox.BackupPathFor(7, "Game.srm"), "the new save\n");
+    checks.ExpectEq(sandbox.Audit(audited), 1,
+                    "a backup taken after the overwrite is not a backup");
+  }
+  {
+    const Quiet quiet;
+    rig::Checks audited;
+    Sandbox sandbox(audited, "interrupted");
+    sandbox.Detach();
+    sandbox.SeedSave(SavePath("Game.srm"), "the previous save\n");
+    // An overwrite that died half way: the save is gone and the replacement
+    // never arrived. This is the case the fault proxy exists to produce, and the
+    // one where a missing backup costs the only copy.
+    std::error_code error;
+    std::filesystem::remove(sandbox.Host(SavePath("Game.srm")), error);
+    checks.ExpectEq(sandbox.Audit(audited), 1, "an interrupted overwrite is caught too");
+  }
+  return checks.failures();
+}
+
+// --- disarms ------------------------------------------------------------------
+//
+// "Each test leaves the proxy disarmed" is an acceptance criterion, and the way
+// it gets broken is a scenario that returns early past its own cleanup. A red
+// run then lands in whichever test happens to go next.
+
+int Disarms(http::HttpClient& client, const std::string& base) {
+  rig::Checks checks;
+
+  {
+    harness::Fault fault(checks, client, base,
+                         R"({"mode":"status","status":401,"path":"/api/heartbeat"})");
+    http::Request request;
+    request.url = base + "/__fault";
+    const http::Result armed = client.Send(request);
+    checks.Expect(armed.successful() && armed.response.body.find("\"status\"") != std::string::npos,
+                  "the scenario is armed inside the scope: " + armed.response.body);
+  }
+  harness::ExpectDisarmed(checks, client, base, "the scope disarmed it");
+
+  // The other half: a spec the proxy refuses must be loud. It answers 400 and
+  // forwards everything untouched, so a scenario built on it runs clean and
+  // passes having exercised nothing -- which is the failure this whole file is
+  // written against.
+  {
+    const Quiet quiet;
+    rig::Checks rejected;
+    { harness::Fault fault(rejected, client, base, R"({"mode":"truncate"})"); }
+    checks.ExpectEq(rejected.failures(), 1,
+                    "a refused spec fails the test rather than running unarmed");
+  }
+  harness::ExpectDisarmed(checks, client, base, "and the refusal left nothing behind");
+  return checks.failures();
+}
+
+// --- expired ------------------------------------------------------------------
+//
+// A 401 arriving in the middle of a sync. RomM issues no refresh token, so a
+// genuine 401 means revoked (docs/AUTH.md) -- but a 401 is still a *response*,
+// not a transport failure, and the client has to read it as one. That is the
+// distinction `http::Result` draws and the one a client that checks only
+// `ok()` gets wrong.
+
+int Expired(http::HttpClient& client, const std::string& base, const Fixture& fixture) {
+  rig::Checks checks;
+  Sandbox sandbox(checks, "expired");
+
+  sync::SyncNegotiatePayload payload;
+  payload.device_id = fixture.device_id;  // an empty `saves` is a legitimate "what am I missing?"
+
+  {
+    // "Mid-flow" is the point: the fault lets the tick start normally and then
+    // fails its SECOND negotiate. `after` counts only requests whose path
+    // matches, so the heartbeat and the fixture calls around it do not consume
+    // it -- which is what makes the target deterministic rather than a race.
+    harness::Fault fault(
+        checks, client, base,
+        R"({"mode":"status","status":401,"path":"/api/sync/negotiate","after":1,"count":1})");
+
+    const http::Result first = harness::Negotiate(checks, client, base, fixture, payload);
+    checks.ExpectEq(first.response.status, 200, "the tick starts normally");
+
+    const http::Result denied = harness::Negotiate(checks, client, base, fixture, payload);
+    checks.Expect(denied.ok(),
+                  "a 401 is a response, not a transport error -- Result::ok() stays true");
+    checks.Expect(!denied.successful(), "...and successful() does not");
+    checks.ExpectEq(denied.response.status, 401, "the token was refused mid-flow");
+
+    // The fault disarmed itself after one use, so this is the real server again.
+    // The point is what the client must NOT conclude: one 401 from something in
+    // front of RomM is not a revoked pairing, and a client that shreds
+    // `token.dat` on the first one sends the user to a pairing screen for a
+    // proxy hiccup.
+    const http::Result recovered = harness::Negotiate(checks, client, base, fixture, payload);
+    checks.ExpectEq(recovered.response.status, 200,
+                    "the same token still works -- one 401 is not a verdict on the pairing");
+  }
+
+  checks.Expect(!sandbox.Exists(harness::kConfigDir + std::string("/token.dat")),
+                "a refused tick wrote no credentials");
+  return checks.failures();
+}
+
+// --- conflict -----------------------------------------------------------------
+//
+// `Both sides changed since last sync`: this device has a sync record for the
+// save, and each side moved past it.
+//
+// Arranging it needs one fact that is not guessable and that a client will meet
+// the first time it uploads twice: **a slot upload gets a datetime tag in its
+// file name**, so a second `POST /api/saves` a second later is a *new save row*
+// with no sync history, whatever `overwrite` says. Only `PUT /api/saves/{id}`
+// moves the same row forward. Get that wrong and this scenario silently becomes
+// the no-history one below.
+
+int Conflict(http::HttpClient& client, const std::string& base, const Fixture& fixture,
+             const harness::Rom& rom) {
+  rig::Checks checks;
+  Sandbox sandbox(checks, "conflict");
+  const std::string slot = harness::UniqueSlot("m0-5-conflict");
+  const std::string name = "conflict.srm";
+
+  // The server's first copy, uploaded with `device_id` so RomM writes this
+  // device's sync row. That row is the "last sync" both sides are compared to.
+  sandbox.Write(SavePath(name), "server v1\n");
+  harness::Save server;
+  if (!harness::UploadSave(client, base, fixture, rom.id, slot, "harness",
+                           sandbox.Host(SavePath(name)), name, /*with_device=*/true, &server)) {
+    checks.Expect(false, "the first server copy was stored");
+    return checks.failures();
+  }
+
+  PassASecond();
+
+  // The server's copy changes after that sync -- somebody else's console
+  // uploaded, or the user edited it in RomM.
+  sandbox.Write(SavePath(name), "server v2, longer\n");
+  harness::Save moved;
+  if (!harness::ReplaceSave(client, base, fixture, server.id, sandbox.Host(SavePath(name)), name,
+                            &moved)) {
+    checks.Expect(false, "the server copy moved forward in place");
+    harness::DeleteSave(client, base, fixture, server.id);
+    return checks.failures();
+  }
+  checks.ExpectEq(moved.id, server.id,
+                  "PUT moved the same save row -- a second POST would have made a new one");
+
+  // And so did this device's, to different bytes.
+  sandbox.Write(SavePath(name), "device v2\n");
+  std::string device_hash;
+  checks.Expect(
+      harness::ServerMd5(client, base, fixture, rom.id, sandbox.Host(SavePath(name)), &device_hash),
+      "the device copy's MD5");
+
+  sync::SyncNegotiatePayload payload;
+  payload.device_id = fixture.device_id;
+  payload.saves.push_back(harness::LocalSave(
+      rom.id, name, slot, "harness", device_hash,
+      std::chrono::system_clock::now() + std::chrono::seconds{300}, 10));
+
+  const http::Result result = harness::Negotiate(checks, client, base, fixture, payload);
+  checks.ExpectEq(result.response.status, 200, "the negotiation is answered");
+  const json::ParseResult plan = json::Parse(result.response.body);
+  const json::Value* operation = plan.ok() ? harness::OperationFor(plan.value, slot) : nullptr;
+  if (operation == nullptr) {
+    checks.Expect(false, "the plan carries an operation for this run's slot: " +
+                             result.response.body);
+    harness::DeleteSave(client, base, fixture, server.id);
+    return checks.failures();
+  }
+
+  checks.ExpectEq(harness::Field(*operation, "action"), std::string("conflict"),
+                  "both sides moved past the last sync, so the server refuses to choose");
+  checks.ExpectEq(harness::Field(*operation, "reason"),
+                  std::string("Both sides changed since last sync"),
+                  "...and says which of the two conflicts this is");
+
+  // RomM sends no resolution -- there is no server_wins/keep_both field to obey
+  // (docs/SYNC_PROTOCOL.md). What it sends is what the client needs to show a
+  // human and to write a backup against, so their absence is worth asserting.
+  checks.ExpectEq(harness::Field(*operation, "server_content_hash"), moved.content_hash,
+                  "the server's hash comes back, so the client can tell the copies apart");
+  checks.Expect(!harness::Field(*operation, "server_updated_at").empty(),
+                "and the server's timestamp, so a human can be shown what they are choosing");
+  checks.Expect(operation->Find("resolution") == nullptr,
+                "the server does NOT pick a winner -- the policy is the client's");
+  checks.ExpectEq(harness::Number(plan.value, "total_conflict"), 1,
+                  "and the totals count it as one");
+
+  // The file name in the operation is the server's, datetime tag and all -- not
+  // the name this device holds. Writing it to the SD produces a save no
+  // emulator loads, which is why the pairing key is (rom_id, slot).
+  checks.Expect(harness::Field(*operation, "file_name") != name,
+                "the operation echoes the SERVER's file name, not the local one: " +
+                    harness::Field(*operation, "file_name"));
+
+  harness::DeleteSave(client, base, fixture, server.id);
+  return checks.failures();
+}
+
+// --- same_timestamp -----------------------------------------------------------
+//
+// The other conflict, and the one a client drops on the floor: **no sync
+// history**, the two timestamps equal, the hashes different. RomM compares at
+// second granularity, so a save written in the same second as the server's copy
+// by a device that has not synced it lands here. A `switch` on the first reason
+// alone sends this into the default branch -- and on a conflict the default
+// branch is the one that can overwrite a save.
+
+int SameTimestamp(http::HttpClient& client, const std::string& base, const Fixture& fixture,
+                  const harness::Rom& rom) {
+  rig::Checks checks;
+  Sandbox sandbox(checks, "same-timestamp");
+  const std::string slot = harness::UniqueSlot("m0-5-same-ts");
+  const std::string name = "same-timestamp.srm";
+
+  // No `device_id`: this device has never synced this save, which is what puts
+  // the comparison in the timestamp branch.
+  sandbox.Write(SavePath(name), "server copy\n");
+  harness::Save server;
+  if (!harness::UploadSave(client, base, fixture, rom.id, slot, "harness",
+                           sandbox.Host(SavePath(name)), name, /*with_device=*/false, &server)) {
+    checks.Expect(false, "the server copy was stored");
+    return checks.failures();
+  }
+
+  sync::Timestamp when;
+  checks.Expect(harness::ParseServerTimestamp(server.updated_at, &when),
+                "the server's updated_at parses: " + server.updated_at);
+
+  sandbox.Write(SavePath(name), "device copy\n");
+  std::string device_hash;
+  checks.Expect(
+      harness::ServerMd5(client, base, fixture, rom.id, sandbox.Host(SavePath(name)), &device_hash),
+      "the device copy's MD5");
+  checks.Expect(device_hash != server.content_hash, "the two copies really are different bytes");
+
+  sync::SyncNegotiatePayload payload;
+  payload.device_id = fixture.device_id;
+  payload.saves.push_back(harness::LocalSave(rom.id, name, slot, "harness", device_hash, when, 12));
+
+  const http::Result result = harness::Negotiate(checks, client, base, fixture, payload);
+  const json::ParseResult plan = json::Parse(result.response.body);
+  const json::Value* operation = plan.ok() ? harness::OperationFor(plan.value, slot) : nullptr;
+  if (operation == nullptr) {
+    checks.Expect(false, "the plan carries an operation for this run's slot: " +
+                             result.response.body);
+    harness::DeleteSave(client, base, fixture, server.id);
+    return checks.failures();
+  }
+
+  checks.ExpectEq(harness::Field(*operation, "action"), std::string("conflict"),
+                  "equal timestamps and different content is a conflict, not a guess");
+  checks.ExpectEq(harness::Field(*operation, "reason"),
+                  std::string("Same timestamp but different content"),
+                  "...with the second of the two reasons a client must handle");
+
+  harness::DeleteSave(client, base, fixture, server.id);
+  return checks.failures();
+}
+
+// --- partial ------------------------------------------------------------------
+//
+// A plan whose Nth operation fails. The client owes the server an accurate
+// `operations_failed` at `complete` and owes the next tick the files it did not
+// manage -- never a half-written one.
+
+int Partial(http::HttpClient& client, const std::string& base, const Fixture& fixture,
+            const harness::Rom& rom) {
+  rig::Checks checks;
+  Sandbox sandbox(checks, "partial");
+
+  // Three saves this device has and the server does not, so the plan is three
+  // uploads. Distinct bytes per slot, so a mixed-up upload is visible.
+  struct Planned {
+    std::string slot;
+    std::string name;
+    std::int64_t save_id = 0;
+    bool uploaded = false;
+  };
+  std::vector<Planned> planned;
+  sync::SyncNegotiatePayload payload;
+  payload.device_id = fixture.device_id;
+  for (int index = 0; index < 3; ++index) {
+    Planned entry;
+    entry.slot = harness::UniqueSlot("m0-5-partial-" + std::to_string(index));
+    entry.name = "partial-" + std::to_string(index) + ".srm";
+    const std::string bytes = "partial save " + std::to_string(index) + "\n";
+    sandbox.Write(SavePath(entry.name), bytes);
+
+    std::string hash;
+    checks.Expect(harness::ServerMd5(client, base, fixture, rom.id,
+                                     sandbox.Host(SavePath(entry.name)), &hash),
+                  "the MD5 of " + entry.name);
+    payload.saves.push_back(harness::LocalSave(
+        rom.id, entry.name, entry.slot, "harness", hash,
+        std::chrono::system_clock::now() + std::chrono::seconds{300},
+        static_cast<std::int64_t>(bytes.size())));
+    planned.push_back(entry);
+  }
+
+  const http::Result negotiated = harness::Negotiate(checks, client, base, fixture, payload);
+  const json::ParseResult plan = json::Parse(negotiated.response.body);
+  if (!plan.ok()) {
+    checks.Expect(false, "the plan parses: " + negotiated.response.body);
+    return checks.failures();
+  }
+  const std::int64_t session_id = harness::Number(plan.value, "session_id");
+  checks.Expect(session_id != 0, "a session was opened");
+  for (Planned& entry : planned) {
+    const json::Value* operation = harness::OperationFor(plan.value, entry.slot);
+    checks.Expect(operation != nullptr && harness::Field(*operation, "action") == "upload",
+                  "a save the server does not have is planned as an upload");
+  }
+
+  int completed = 0;
+  int failed = 0;
+  {
+    // The *second* upload fails. `after` counts only requests whose path starts
+    // with the prefix, so the negotiate above and the MD5 uploads before it do
+    // not consume it -- but note that the prefix does match `/api/saves/delete`
+    // too, which is why the fault is scoped to the walk and not to the cleanup.
+    harness::Fault fault(checks, client, base,
+                         R"({"mode":"status","status":500,"path":"/api/saves","after":1,"count":1})");
+
+    for (Planned& entry : planned) {
+      harness::Save stored;
+      if (harness::UploadSave(client, base, fixture, rom.id, entry.slot, "harness",
+                              sandbox.Host(SavePath(entry.name)), entry.name,
+                              /*with_device=*/true, &stored)) {
+        entry.save_id = stored.id;
+        entry.uploaded = true;
+        ++completed;
+      } else {
+        ++failed;
+      }
+    }
+  }
+
+  checks.ExpectEq(completed, 2, "two operations of the three got through");
+  checks.ExpectEq(failed, 1, "and one did not");
+  checks.Expect(!planned[1].uploaded, "the failure landed on the operation the fault named");
+
+  // The one that failed left nothing on the server. "Never a half-written save"
+  // is the rule; this is its server-side half.
+  const http::Result listed = client.Send(harness::Authed(
+      http::Method::kGet, base + "/api/saves?rom_id=" + std::to_string(rom.id), fixture));
+  checks.Expect(listed.successful(), "the save list came back");
+  checks.Expect(listed.response.body.find(planned[1].slot) == std::string::npos,
+                "the failed upload left no save behind");
+
+  const http::Result done = harness::Complete(client, base, fixture, session_id, completed, failed);
+  checks.ExpectEq(done.response.status, 200, "the session completes");
+  const json::ParseResult session = json::Parse(done.response.body);
+  const json::Value* record = session.ok() ? session.value.Find("session") : nullptr;
+  if (record == nullptr) {
+    checks.Expect(false, "the completed session comes back: " + done.response.body);
+  } else {
+    checks.ExpectEq(harness::Number(*record, "operations_failed"), 1,
+                    "the server records the accurate failure count");
+    checks.ExpectEq(harness::Number(*record, "operations_completed"), 2,
+                    "and the accurate completed count");
+    checks.ExpectEq(harness::Field(*record, "status"), std::string("COMPLETED"),
+                    "a partial plan still completes its session -- it is not an aborted sync");
+    // `operations_planned` counts the operations that needed *work*, over the
+    // whole plan -- not the three this test sent. Negotiate also reports every
+    // server save this device has no history for, so the number is only
+    // meaningful against the plan it came from.
+    std::int64_t needing_work = 0;
+    for (const json::Value& operation : plan.value.Find("operations")->elements()) {
+      if (harness::Field(operation, "action") != "no_op") {
+        ++needing_work;
+      }
+    }
+    checks.Expect(needing_work >= 3, "the plan asked for at least this test's three uploads");
+    checks.ExpectEq(harness::Number(*record, "operations_planned"), needing_work,
+                    "operations_planned counts the operations that needed work");
+  }
+
+  for (const Planned& entry : planned) {
+    harness::DeleteSave(client, base, fixture, entry.save_id);
+  }
+  return checks.failures();
+}
+
+// --- resume -------------------------------------------------------------------
+//
+// A dropped connection mid-download, then `Range` resume -- against the 120 MiB
+// seeded rom rather than a JSON body, because that is the transfer this matters
+// for and the only fixture big enough to interrupt convincingly.
+//
+// The reset is a real TCP RST from the proxy, and the bytes that survive it are
+// whatever the kernel delivered, so nothing here asserts an exact count. What is
+// asserted is the pair of guarantees a downloader lives or dies by: the
+// destination never holds a short file, and the resumed halves are the original
+// bytes -- checked against the file RomM is serving, not against a hash, so a
+// splice at the wrong offset names the byte it went wrong at.
+
+int Resume(http::HttpClient& client, const std::string& base, const Fixture& fixture,
+           const harness::Rom& rom) {
+  rig::Checks checks;
+  Sandbox sandbox(checks, "resume");
+  sandbox.MakeDirs("/tico/roms/gba");
+  const std::string sd_path = "/tico/roms/gba/synthetic-large.gba";
+  const std::string destination = sandbox.Host(sd_path);
+
+  constexpr std::uint64_t kCutAt = 4 * 1024 * 1024;
+  checks.Expect(rom.size > static_cast<std::int64_t>(kCutAt),
+                "the fixture rom is big enough to interrupt");
+
+  http::Request request = harness::Authed(http::Method::kGet, base + rom.ContentPath(), fixture);
+  // No total timeout on a large transfer: `stall_timeout` is what tells slow
+  // from dead (http.hpp).
+  request.timeout = std::chrono::milliseconds{0};
+
+  {
+    harness::Fault fault(checks, client, base,
+                         R"({"mode":"drop","bytes":)" + std::to_string(kCutAt) + R"(,"path":")" +
+                             rom.ContentPath() + R"("})");
+    const http::Result interrupted =
+        client.Download(request, {destination, false, static_cast<std::uint64_t>(rom.size)});
+    checks.ExpectError(interrupted, http::Error::kTruncated, "a reset mid-body is an error");
+  }
+
+  checks.Expect(!sandbox.Exists(sd_path), "no short file at the destination");
+  const std::uintmax_t partial = sandbox.SizeOf(sd_path + ".part");
+  checks.Expect(partial > 0 && partial <= kCutAt, "the bytes that did arrive are kept to resume");
+
+  const http::Result resumed =
+      client.Download(request, {destination, true, static_cast<std::uint64_t>(rom.size)});
+  checks.ExpectOk(resumed, "the resumed attempt");
+  checks.ExpectEq(resumed.response.status, 206, "the resume was a Range request RomM honoured");
+  checks.ExpectEq(resumed.response.bytes_received,
+                  static_cast<std::uint64_t>(rom.size) - partial,
+                  "only the missing bytes were fetched");
+  checks.Expect(!sandbox.Exists(sd_path + ".part"), "the partial file was renamed away");
+  checks.ExpectEq(static_cast<std::int64_t>(sandbox.SizeOf(sd_path)), rom.size,
+                  "the rom is its whole declared size");
+
+  std::uint64_t differs_at = 0;
+  checks.Expect(harness::SameBytes(destination, kLargeRomSource, &differs_at),
+                "the two halves are the rom RomM is serving, byte for byte -- first difference at " +
+                    std::to_string(differs_at));
+  return checks.failures();
+}
+
+// --- truncate -----------------------------------------------------------------
+//
+// The quiet one. `truncate` is a clean, short, plausible response with no
+// declared length to compare against: no transport can fault it, and the only
+// thing that catches it is the caller's own knowledge of what the file weighs.
+//
+// It is aimed at a *save* here rather than a rom, because that is where being
+// wrong costs something irreplaceable: a short body written over a save is a
+// destroyed save, and the destination must never see it.
+
+int Truncate(http::HttpClient& client, const std::string& base, const Fixture& fixture,
+             const harness::Rom& rom) {
+  rig::Checks checks;
+  Sandbox sandbox(checks, "truncate");
+  const std::string slot = harness::UniqueSlot("m0-5-truncate");
+  const std::string name = "truncate.srm";
+  const std::string previous = "the save already on the card, which must survive\n";
+
+  sandbox.SeedSave(SavePath(name), previous);
+
+  // Something to download: a server copy, with different bytes and a length
+  // worth checking against.
+  const std::string staged = sandbox.Host("/config/rommsync/server-copy.srm");
+  const std::string server_bytes = "the server's copy of this save, longer than the local one\n";
+  rig::WriteFile(staged, server_bytes);
+  harness::Save server;
+  if (!harness::UploadSave(client, base, fixture, rom.id, slot, "harness", staged, name,
+                           /*with_device=*/false, &server)) {
+    checks.Expect(false, "the server copy was stored");
+    return checks.failures();
+  }
+  checks.ExpectEq(server.file_size_bytes, static_cast<std::int64_t>(server_bytes.size()),
+                  "the server reports the size the client will verify against");
+
+  {
+    harness::Fault fault(checks, client, base,
+                         R"({"mode":"truncate","bytes":5,"path":")" + server.ContentPath() +
+                             R"("})");
+
+    http::Request request =
+        harness::Authed(http::Method::kGet, base + server.ContentPath(), fixture);
+    const http::Result cut = client.Download(
+        request, {sandbox.Host(SavePath(name)), false,
+                  static_cast<std::uint64_t>(server.file_size_bytes)});
+    checks.ExpectError(cut, http::Error::kTruncated,
+                       "a clean short body is caught by the caller's own expected size");
+  }
+
+  // The three things that make this a *safe* failure rather than a lost save.
+  checks.ExpectEq(sandbox.Read(SavePath(name)), previous,
+                  "the save on the card is untouched -- the download never reached it");
+  // A partial file IS kept -- that is what a resume picks up (http.hpp). What
+  // matters is that it is still under the other name and still short, so nothing
+  // downstream can mistake it for the save.
+  checks.Expect(static_cast<std::int64_t>(sandbox.SizeOf(SavePath(name) + ".part")) <
+                    server.file_size_bytes,
+                "whatever survived is short, and is not where the save lives");
+
+  // Now prove the size check is what caught it, rather than luck: the same
+  // truncated body with no expected size is accepted as a complete file. This is
+  // the one assertion that makes the previous one mean something.
+  {
+    harness::Fault fault(checks, client, base,
+                         R"({"mode":"truncate","bytes":5,"path":")" + server.ContentPath() +
+                             R"("})");
+    const std::string blind = sandbox.Host("/config/rommsync/blind.srm");
+    http::Request request =
+        harness::Authed(http::Method::kGet, base + server.ContentPath(), fixture);
+    const http::Result unchecked = client.Download(request, {blind, false, 0});
+    checks.ExpectOk(unchecked, "without an expected size the same body looks complete");
+    checks.ExpectEq(rig::ReadFile(blind).size(), std::size_t{5},
+                    "...and five bytes are accepted as the whole save");
+  }
+
+  harness::DeleteSave(client, base, fixture, server.id);
+  return checks.failures();
+}
+
+// --- stall --------------------------------------------------------------------
+//
+// A server that accepts the connection and then says nothing. The rule is that
+// a tick aborts cleanly and changes nothing (docs/SYNC_PROTOCOL.md): a sync that
+// hangs is a sysmodule that never gets to the next one, and `Never block boot`
+// is a hard rule.
+
+int Stall(http::HttpClient& client, const std::string& base, const Fixture& fixture) {
+  rig::Checks checks;
+  Sandbox sandbox(checks, "stall");
+
+  sync::SyncNegotiatePayload payload;
+  payload.device_id = fixture.device_id;
+  const sync::Encoded encoded = sync::EncodeNegotiateRequest(payload);
+  checks.Expect(encoded.ok(), "the payload encodes");
+
+  const auto started = std::chrono::steady_clock::now();
+  {
+    harness::Fault fault(checks, client, base,
+                         R"({"mode":"stall","seconds":10,"path":"/api/sync/negotiate"})");
+
+    http::Request request =
+        harness::Authed(http::Method::kPost, base + "/api/sync/negotiate", fixture);
+    request.headers.push_back({"Content-Type", "application/json"});
+    request.body = encoded.body;
+    request.timeout = std::chrono::milliseconds{2'000};
+    const http::Result stalled = client.Send(request);
+    checks.ExpectError(stalled, http::Error::kTimeout, "the tick gives up rather than hanging");
+  }
+  const auto waited =
+      std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started);
+  checks.Expect(waited < std::chrono::seconds{9},
+                "...and gives up on its own timeout, not on the server's -- waited " +
+                    std::to_string(waited.count()) + "s");
+
+  // Nothing was written and the next tick is unaffected. A stall must cost one
+  // tick, not the pairing.
+  checks.Expect(!sandbox.Exists(harness::kConfigDir + std::string("/token.dat")),
+                "an abandoned tick wrote no state");
+  const http::Result next = harness::Negotiate(checks, client, base, fixture, payload);
+  checks.ExpectEq(next.response.status, 200, "and the next tick negotiates normally");
+  return checks.failures();
+}
+
+// --- multifile ----------------------------------------------------------------
+//
+// The two-disc fixture. M3-4 skips these, and this is what the skip hangs off.
+//
+// Two things here are not what a reading of the endpoint names suggests, and
+// both are silent:
+//
+//   * `GET /api/roms/{id}/content/{file_name}` on a multi-file rom does not
+//     serve a rom. It serves a **zip RomM builds on the fly**, with no
+//     `Content-Length` -- so a client that treats it like any other rom writes
+//     an archive to the SD under the rom's name and has nothing to verify the
+//     length against.
+//   * the `{id}` in `/api/roms/{id}/files/content/{file_name}` is the **RomFile
+//     id**, not the rom id, and the `{file_name}` segment selects nothing at
+//     all. Building that URL from a rom id and a file name returns 200 and the
+//     bytes of whatever file happens to carry that id.
+
+int MultiFile(http::HttpClient& client, const std::string& base, const Fixture& fixture,
+              const harness::Rom& multi, const harness::Rom& single) {
+  rig::Checks checks;
+
+  // The signal is on the LIST schema, not only the detail one, so a client can
+  // skip a rom without a second call per rom.
+  checks.Expect(multi.has_multiple_files,
+                "the two-disc fixture reports has_multiple_files from GET /api/roms");
+  checks.Expect(!single.has_multiple_files, "and a single-file rom does not");
+  checks.ExpectEq(multi.files.size(), std::size_t{2}, "with one entry per disc");
+
+  // The whole-rom download is an archive with nothing to verify against.
+  http::Request whole = harness::Authed(http::Method::kGet, base + multi.ContentPath(), fixture);
+  whole.method = http::Method::kHead;
+  const http::Result archive = client.Send(whole);
+  checks.Expect(archive.successful(), "the whole-rom endpoint answers for a multi-file rom");
+  const std::string* type = http::FindHeader(archive.response.headers, "Content-Type");
+  checks.Expect(type != nullptr && type->find("zip") != std::string::npos,
+                "...with a zip, not a rom");
+  checks.ExpectEq(archive.response.declared_size, std::uint64_t{0},
+                  "and no length a download could be verified against");
+
+  if (multi.files.size() != 2) {
+    return checks.failures();
+  }
+
+  // Each disc, by its own file id.
+  std::vector<std::string> contents;
+  for (const harness::RomFile& file : multi.files) {
+    const http::Result disc = client.Send(harness::Authed(
+        http::Method::kGet,
+        base + "/api/roms/" + std::to_string(file.id) + "/files/content/" +
+            harness::UrlEncode(file.file_name),
+        fixture));
+    checks.Expect(disc.successful(), "GET the disc " + file.file_name);
+    checks.ExpectEq(static_cast<std::int64_t>(disc.response.body.size()), file.size,
+                    "...and it is the size the rom's files[] declared");
+    contents.push_back(disc.response.body);
+  }
+  checks.Expect(contents.size() == 2 && contents[0] != contents[1],
+                "the two discs are different files");
+
+  // The trap: swap the file names and the *same* bytes come back, with a 200.
+  // Nothing tells a client it asked for the wrong disc.
+  const http::Result mislabelled = client.Send(harness::Authed(
+      http::Method::kGet,
+      base + "/api/roms/" + std::to_string(multi.files[0].id) + "/files/content/" +
+          harness::UrlEncode(multi.files[1].file_name),
+      fixture));
+  checks.Expect(mislabelled.successful(), "a mismatched {id}/{file_name} pair is not refused");
+  checks.ExpectEq(mislabelled.response.body, contents[0],
+                  "the id selects the file and the name selects nothing -- so the name in that "
+                  "URL cannot be trusted to say what arrived");
+  return checks.failures();
+}
+
+// --- backup -------------------------------------------------------------------
+//
+// docs/SYNC_PROTOCOL.md's hard rule, on both paths: back up *first*, then
+// overwrite. The word doing the work is "first", and the only way to show the
+// difference between "first" and "eventually" is to interrupt the overwrite --
+// which is the fault proxy's whole reason for existing.
+//
+// The backup is written with the engine's own `io::WriteAtomically` and the
+// overwrite is the engine's own `HttpClient::Download`; the sandbox audits the
+// result independently of what this test thought it was doing.
+
+int Backup(http::HttpClient& client, const std::string& base, const Fixture& fixture,
+           const harness::Rom& rom) {
+  rig::Checks checks;
+  Sandbox sandbox(checks, "backup");
+  const std::string slot = harness::UniqueSlot("m0-5-backup");
+  const std::string name = "backup.srm";
+  const std::string previous = "the only copy of this save\n";
+  const std::string server_bytes = "the server's copy, which wins this round\n";
+
+  sandbox.SeedSave(SavePath(name), previous);
+
+  const std::string staged = sandbox.Host("/config/rommsync/server-copy.srm");
+  rig::WriteFile(staged, server_bytes);
+  harness::Save server;
+  if (!harness::UploadSave(client, base, fixture, rom.id, slot, "harness", staged, name,
+                           /*with_device=*/false, &server)) {
+    checks.Expect(false, "the server copy was stored");
+    return checks.failures();
+  }
+
+  // 1. back up, then overwrite -- the success path.
+  const std::string backup = sandbox.BackupPathFor(rom.id, name);
+  const io::WriteResult written =
+      io::WriteAtomically(sandbox.Host(backup), sandbox.Read(SavePath(name)));
+  checks.Expect(written.ok(), "the backup is written first: " + written.message);
+
+  http::Request request = harness::Authed(http::Method::kGet, base + server.ContentPath(), fixture);
+  const http::Result downloaded = client.Download(
+      request, {sandbox.Host(SavePath(name)), false,
+                static_cast<std::uint64_t>(server.file_size_bytes)});
+  checks.ExpectOk(downloaded, "the server's copy is written over the local one");
+  checks.ExpectEq(sandbox.Read(SavePath(name)), server_bytes, "the save now holds the server's copy");
+  checks.ExpectEq(sandbox.Read(backup), previous, "and the backup holds the bytes it replaced");
+
+  // 2. the same thing, interrupted. This is where "first" earns its keep: the
+  // overwrite never lands, and the copy that would have been destroyed is
+  // already safe. A backup taken after a successful write would have nothing
+  // here at all.
+  // A second apart, because the documented backup path is
+  // `<rom_id>-<unix seconds>.<ext>` and both saves here belong to one rom: in
+  // the same second they would be the same file, and the second backup would
+  // destroy the first. That is a real hole in the scheme rather than a quirk of
+  // this test -- see `Sandbox::BackupPathFor` and docs/SYNC_PROTOCOL.md.
+  PassASecond();
+  const std::string second = "second.srm";
+  const std::string second_previous = "the second save, also the only copy\n";
+  sandbox.SeedSave(SavePath(second), second_previous);
+  const std::string second_backup = sandbox.BackupPathFor(rom.id, second);
+  checks.Expect(io::WriteAtomically(sandbox.Host(second_backup), second_previous).ok(),
+                "backed up before touching the second save");
+
+  {
+    harness::Fault fault(checks, client, base,
+                         R"({"mode":"drop","bytes":4,"path":")" + server.ContentPath() + R"("})");
+    const http::Result interrupted = client.Download(
+        request, {sandbox.Host(SavePath(second)), false,
+                  static_cast<std::uint64_t>(server.file_size_bytes)});
+    checks.Expect(!interrupted.ok(), "the overwrite was interrupted");
+  }
+
+  checks.ExpectEq(sandbox.Read(SavePath(second)), second_previous,
+                  "the save survived, because Download stages to .part");
+  checks.ExpectEq(sandbox.Read(second_backup), second_previous,
+                  "and the backup taken first is there either way");
+
+  harness::DeleteSave(client, base, fixture, server.id);
+  return checks.failures();
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  const std::string scenario = argc > 1 ? argv[1] : "sandbox";
+  const std::string base = rig::BaseUrl();
+
+  std::error_code error;
+  std::filesystem::create_directories(rig::ScratchDir(), error);
+
+  // The sandbox is the harness's own guarantee and needs no server, so it runs
+  // with docker stopped -- which is when a broken sandbox is most likely to be
+  // introduced and least likely to be noticed.
+  if (scenario == "sandbox") {
+    const int failures = SandboxScenario();
+    if (failures == 0) {
+      std::cout << "harness.sandbox ok\n";
+    }
+    return failures == 0 ? 0 : 1;
+  }
+
+  const std::unique_ptr<http::HttpClient> client = rommsync::host::MakeCurlHttpClient();
+  if (!rig::Reachable(*client, base)) {
+    std::cerr << "rig unreachable at " << base
+              << "\n  start it with: ./scripts/orca/compose.sh up -d\n";
+    return rig::kSkip;
+  }
+  // Whatever an earlier run left armed would damage this one's first request.
+  rig::DisarmFault(*client, base);
+
+  Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    return rig::kSkip;
+  }
+
+  int failures = 0;
+  if (scenario == "disarms") {
+    failures = Disarms(*client, base);
+  } else if (scenario == "expired") {
+    failures = Expired(*client, base, fixture);
+  } else if (scenario == "stall") {
+    failures = Stall(*client, base, fixture);
+  } else {
+    // Everything left needs a rom to hang a save or a download off. A library
+    // that was staged but never scanned is an empty one, and reads exactly like
+    // a bug in the scenario rather than an unprovisioned fixture.
+    harness::Rom small;
+    harness::Rom large;
+    harness::Rom multi;
+    const bool have_small = harness::FindRom(*client, base, fixture, "gb240p.gb", &small);
+    if (!have_small) {
+      std::cerr << "the fixture library holds no roms\n"
+                   "  scan it with: ./.venv/bin/python server/testing/provision.py\n";
+      return rig::kSkip;
+    }
+
+    if (scenario == "conflict") {
+      failures = Conflict(*client, base, fixture, small);
+    } else if (scenario == "same_timestamp") {
+      failures = SameTimestamp(*client, base, fixture, small);
+    } else if (scenario == "partial") {
+      failures = Partial(*client, base, fixture, small);
+    } else if (scenario == "truncate") {
+      failures = Truncate(*client, base, fixture, small);
+    } else if (scenario == "backup") {
+      failures = Backup(*client, base, fixture, small);
+    } else if (scenario == "resume") {
+      if (!harness::FindRom(*client, base, fixture, kLargeRom, &large)) {
+        std::cerr << "the library has no " << kLargeRom
+                  << "; re-seed it with: ./server/testing/seed.sh\n";
+        return rig::kSkip;
+      }
+      failures = Resume(*client, base, fixture, large);
+    } else if (scenario == "multifile") {
+      if (!harness::FindRom(*client, base, fixture, kMultiRom, &multi) ||
+          !harness::FindRom(*client, base, fixture, kLargeRom, &large)) {
+        std::cerr << "the library has no " << kMultiRom
+                  << "; re-seed it with: ./server/testing/seed.sh\n";
+        return rig::kSkip;
+      }
+      failures = MultiFile(*client, base, fixture, multi, large);
+    } else {
+      std::cerr << "unknown scenario: " << scenario << "\n";
+      return 2;
+    }
+  }
+
+  // Whatever the scenario did, it does not get to leave a fault armed for
+  // whichever test runs next.
+  rig::DisarmFault(*client, base);
+
+  if (failures == 0) {
+    std::cout << "harness." << scenario << " ok against " << base << "\n";
+  }
+  return failures == 0 ? 0 : 1;
+}
