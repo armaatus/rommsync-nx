@@ -104,6 +104,23 @@ ctest --test-dir build --output-on-failure
   clients. The streaming ones pull RomM's own frontend bundle — the only large
   resource the rig serves that does not first need a library scan, which is
   socket.io-driven rig work belonging to M0-5.
+- The `pair.*` tests cover the device-code flow end to end (M1-1): `happy`,
+  `mid_poll`, `denied`, `expired`, `retry`, `unauthorized`, `stall`, `drop`,
+  `lost_grant`, `payload`. Every code is one a real RomM issued, every approval
+  goes through RomM's own `/api/auth/device/approve` and every denial through
+  `/api/auth/device/deny` — the endpoints that let a test be the human the grant
+  assumes. They wait out real poll intervals rather than faking a clock, because
+  RomM answers `slow_down` to a client that undercuts the `interval` it asked
+  for, and that is the one rule the loop has to obey. `RUN_SERIAL`, like the
+  `http.*` tests, for the same fault-proxy reason.
+- One rig constraint worth knowing before it looks like a flake: RomM rate
+  limits `POST /api/auth/device/init` to **ten a minute, per IP**. A console
+  pairs once; the suite opens a dozen codes from one address, so `pair.*` waits
+  a rate-limited init out rather than failing on it. The wait is bounded, so an
+  init broken for any other reason still goes red.
+- `core.token_store` covers `token.dat`: the atomic write, and specifically what
+  survives a write that cannot complete. No network and no rig, so it never
+  skips.
 - With Docker stopped, `rig.smoke` reports **Skipped** rather than failing, so a
   local `ctest` is still useful. CI configures with `-DROMMSYNC_REQUIRE_RIG=ON`,
   which turns the same condition into a failure — a green CI run always means the
@@ -179,8 +196,8 @@ committed files through `rommsync::auth` rather than restating them as literals.
 A field RomM renames therefore fails twice — once as drift, once as a struct
 that can no longer read its own capture — and a struct that quietly guessed a
 name cannot pass. Neither `auth.shapes` nor `core.json` (the JSON reader itself,
-mostly a list of bodies that must be *refused*) touches the network, so neither
-ever skips: a body that should have been rejected is a bug with or without a
+mostly a list of bodies that must be *refused*) touches the network, nor does
+`core.token_store`, so none of them ever skips: a body that should have been rejected is a bug with or without a
 server to have sent it.
 
 The Python tooling lives in a per-worktree `.venv` built from
