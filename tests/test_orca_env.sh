@@ -15,8 +15,20 @@
 #                                 on a real worktree on 2026-09-04.
 #   test_orca_env.sh readable     a reader never observes a partial .env, which
 #                                 is what the atomic rename was for originally.
+#   test_orca_env.sh python       setup.sh installs server/requirements.txt with
+#                                 an interpreter new enough for it, and says so
+#                                 in one line when there is none. This is the
+#                                 regression: a worktree created from the Orca
+#                                 UI got macOS's 3.9.6 as `python3`, pip filtered
+#                                 out every candidate for `requests==2.33.0`
+#                                 (requires-python >=3.10) and reported "no
+#                                 matching distribution" over two hundred lines,
+#                                 naming neither Python nor the reason. setup.sh
+#                                 died under `set -e` and the worktree arrived
+#                                 with no RomM and no agent -- observed on a real
+#                                 worktree on 2026-09-04.
 #
-# Neither phase needs Docker or Orca.
+# No phase needs Docker or Orca.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -37,7 +49,68 @@ make_fixture() {
 
 WRITERS=6
 
+# A directory holding fake interpreters: $1 is the name, $2 the version it
+# reports. Enough of `python3 -V` and the version_info check for orca_pick_python
+# to make the same decision it would about a real one.
+fake_python() {
+  local name="$1" major="${2%%.*}" minor="${2#*.}"
+  mkdir -p "$FIXTURE/fakebin"
+  # An absolute shebang, not `/usr/bin/env bash`: these run with PATH stripped
+  # down to this directory, and `env` would find no bash to hand them to -- the
+  # fake would fail to execute and read as "too old" whatever it claims to be.
+  cat >"$FIXTURE/fakebin/$name" <<FAKE
+#!/bin/bash
+case "\${1:-}" in
+  -V|--version) echo "Python $2" ;;
+  -c) exec "$(command -v python3)" -c "import sys; sys.version_info=($major, $minor, 0); \$2" ;;
+esac
+FAKE
+  chmod +x "$FIXTURE/fakebin/$name"
+}
+
 case "${1:-}" in
+  python)
+    FIXTURE="$(mktemp -d)"
+    . "$REPO_ROOT/scripts/orca/lib.sh"
+
+    # Only an old interpreter on PATH. Picking it is the bug: pip then fails
+    # with a wall of version numbers instead of anything actionable.
+    # `PATH=x var=$(...)` would be two assignments to the CURRENT shell, not a
+    # prefix for one command -- it overwrites PATH for the rest of the phase and
+    # every later `mkdir` fails. Saved and restored instead.
+    REAL_PATH="$PATH"
+    with_fake_path() { PATH="$FIXTURE/fakebin"; }
+    restore_path() { PATH="$REAL_PATH"; }
+
+    fake_python python3 3.9
+    with_fake_path
+    picked="$(orca_pick_python)"; found=$?
+    restore_path
+    [ "$found" -eq 0 ] \
+      && fail "picked $picked, an interpreter too old to install requirements.txt"
+
+    # A versioned one beside it is found even though bare `python3` is first on
+    # PATH and is the one an inherited environment would have used.
+    fake_python python3.12 3.12
+    with_fake_path
+    picked="$(orca_pick_python)"; found=$?
+    restore_path
+    [ "$found" -eq 0 ] || fail "found nothing usable while a 3.12 was on PATH"
+    [ "$picked" = python3.12 ] \
+      || fail "picked $picked instead of the new-enough python3.12"
+
+    # And the real one this machine has, so the phase is not only about fakes.
+    picked="$(orca_pick_python)" || fail "no interpreter >= 3.10 on this machine's PATH"
+    orca_python_is_new_enough "$picked" \
+      || fail "orca_pick_python returned $picked, which its own check rejects"
+
+    # The failure has to be one readable line, not pip's. setup.sh is the only
+    # place that can say so, because it is the only one that knows why.
+    grep -q 'needs Python >=' "$REPO_ROOT/scripts/orca/setup.sh" \
+      || fail "setup.sh does not explain the requirement when no interpreter is new enough"
+    echo "PASS: the venv interpreter is chosen, not inherited, and a miss is explained"
+    ;;
+
   concurrent)
     make_fixture
     pids=""
@@ -89,7 +162,7 @@ case "${1:-}" in
     ;;
 
   *)
-    echo "usage: $0 concurrent|readable" >&2
+    echo "usage: $0 concurrent|readable|python" >&2
     exit 2
     ;;
 esac

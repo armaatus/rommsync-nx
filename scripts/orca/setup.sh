@@ -9,6 +9,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
+. ./scripts/orca/lib.sh
 
 echo "==> deriving isolated worktree environment"
 ./scripts/orca/env.sh
@@ -30,8 +31,30 @@ cmake --build build --parallel >/dev/null
 # The server tooling (fixture provisioner, contract probe) is python and needs
 # third-party clients; the C++ build needs none of this. A per-worktree venv
 # keeps those out of the user's system python and out of other worktrees.
-echo "==> installing server tooling into .venv"
-python3 -m venv .venv >/dev/null
+#
+# The interpreter is chosen rather than inherited -- see orca_pick_python in
+# lib.sh for why bare `python3` is the wrong one when Orca runs this hook.
+if ! PYTHON="$(orca_pick_python)"; then
+  echo "!! server/requirements.txt needs Python >= ${ORCA_PYTHON_MIN_MAJOR}.${ORCA_PYTHON_MIN_MINOR}," >&2
+  echo "   and nothing on this PATH is that new:" >&2
+  echo "     python3 -> $(command -v python3 || echo 'not found') ($(python3 -V 2>&1 || true))" >&2
+  echo "     PATH=$PATH" >&2
+  echo "   Install one (brew install python@3.13 / apt install python3.13) and make" >&2
+  echo "   sure it is on the PATH Orca runs hooks with, then re-run this script." >&2
+  exit 1
+fi
+
+# An existing .venv built by an interpreter that is now too old is not repaired
+# by running `venv` over it -- the interpreter is baked into pyvenv.cfg -- so it
+# is replaced. This is also what makes a worktree that failed here recoverable
+# by re-running setup.sh rather than by hand.
+if [ -x .venv/bin/python ] && ! orca_python_is_new_enough ./.venv/bin/python; then
+  echo "==> replacing .venv (built with $(./.venv/bin/python -V 2>&1), too old)"
+  rm -rf .venv
+fi
+
+echo "==> installing server tooling into .venv ($("$PYTHON" -V 2>&1))"
+"$PYTHON" -m venv .venv >/dev/null
 ./.venv/bin/pip install -q --disable-pip-version-check -r server/requirements.txt
 
 # Before the stack, not after it. The steps below are the ones that fail on a bad

@@ -89,3 +89,39 @@ orca_run_with_deadline() {
   done
   wait "$cli"
 }
+
+# The Python that server/requirements.txt can actually be installed with.
+#
+# Not simply `python3`. This hook runs in whatever environment Orca hands it,
+# and that is not an interactive shell: creating a worktree from the Orca UI on
+# macOS resolves `python3` to Apple's Command Line Tools build (3.9.6), while the
+# same command typed into a terminal finds Homebrew's. The difference was
+# invisible until `requests` was pinned at 2.33.0, which declares
+# `requires-python >=3.10` -- pip then filters out every candidate and reports
+# "no matching distribution", two hundred lines long, naming neither Python nor
+# the reason.
+#
+# Prints the interpreter on stdout; returns non-zero when nothing on PATH is new
+# enough, so the caller can say so in one line instead of leaving pip to.
+ORCA_PYTHON_MIN_MAJOR=3
+ORCA_PYTHON_MIN_MINOR=10
+
+orca_python_is_new_enough() {
+  "$1" -c "import sys; raise SystemExit(0 if sys.version_info >= ($ORCA_PYTHON_MIN_MAJOR, $ORCA_PYTHON_MIN_MINOR) else 1)" \
+    2>/dev/null
+}
+
+# Newest first, then bare `python3` last: a machine with only a current python3
+# and no versioned name still works, while one whose `python3` is Apple's 3.9
+# finds a real one rather than stopping at the first thing on PATH.
+orca_pick_python() {
+  local candidate
+  for candidate in python3.14 python3.13 python3.12 python3.11 python3.10 python3; do
+    command -v "$candidate" >/dev/null 2>&1 || continue
+    if orca_python_is_new_enough "$candidate"; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
