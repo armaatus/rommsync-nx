@@ -46,8 +46,15 @@ inline constexpr const char* kClientPlatform = "switch";
 /// "you denied this on the website", "the code expired, here is a new one",
 /// "your server rejected the pairing" -- and only the last is worth a bug
 /// report. Collapsing them into one "failed" is how a support thread starts.
+///
+/// `kStarting` is the other one worth having. `Begin()`'s request can take as
+/// long as `request_timeout`, and reporting `kIdle` for those thirty seconds
+/// tells the user that pressing Pair did nothing. The owning thread never
+/// observes it -- only the overlay, asking while the init is in flight, which
+/// is exactly who needs to be able to say "contacting the server".
 enum class PairingState {
   kIdle,      ///< nothing has been started, or the last attempt was discarded
+  kStarting,  ///< asking the server for a code; there is nothing to show yet
   kPending,   ///< a code is live; show it and keep polling
   kApproved,  ///< a token was granted; `PairingSession::token()` has it
   kDenied,    ///< a human refused the code in the web UI. Start over.
@@ -59,7 +66,8 @@ enum class PairingState {
 const char* ToString(PairingState state);
 
 /// Whether this state will ever change on its own. Terminal states are what a
-/// caller's loop stops on; only `Begin()` moves out of one.
+/// caller's loop stops on; only `Begin()` moves out of one. `kStarting` is not
+/// one of them.
 bool IsTerminal(PairingState state);
 
 /// Everything a pairing attempt needs to know about the console it runs on.

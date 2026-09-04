@@ -275,7 +275,9 @@ void QuotesWhatItIsGiven(checks::Checks& c) {
              "the named escapes");
   c.ExpectEq(json::Quote(std::string("a\0b", 3)), std::string("\"a\\u0000b\""),
              "a NUL, which is legal in JSON and lethal in a C string");
-  c.ExpectEq(json::Quote("\x01\x1f"), std::string("\"\\u0001\\u001f\""),
+  // Split literals on purpose: C++ hex escapes are maximal munch, so
+  // "\x01f" is one character (0x1F) rather than 0x01 followed by 'f'.
+  c.ExpectEq(json::Quote("\x01" "\x1f"), std::string("\"\\u0001\\u001f\""),
              "the other control characters");
   // UTF-8 goes through as bytes: escaping it would be lossless but unreadable,
   // and RomM speaks UTF-8 on both directions.
@@ -290,7 +292,7 @@ void QuotesWhatItIsGiven(checks::Checks& c) {
   // back to the same bytes, or a device name with a quote in it silently
   // becomes a different request.
   const std::string kAwkward[] = {"plain", "", "say \"hi\"", "a\\b", "line\nbreak",
-                                  "Pokémon", "\x01control"};
+                                  "Pokémon", "\x01" "control"};
   for (const std::string& raw : kAwkward) {
     const json::ParseResult document = json::Parse("{\"v\":" + json::Quote(raw) + "}");
     c.Expect(document.ok(), "a quoted value re-parses: " + document.error.Describe());

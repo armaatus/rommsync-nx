@@ -116,6 +116,42 @@ void WritesAndReads(checks::Checks& c) {
   c.Expect(again.ok(), "the overwritten token loads: " + again.message);
   SameToken(c, again.value, second, "after overwrite");
   c.Expect(!std::filesystem::exists(path.string() + ".tmp"), "still no temp file");
+  c.Expect(!std::filesystem::exists(path.string() + ".old"),
+           "and the record it replaced is not left lying around");
+}
+
+/// The commit is two renames, not one, because Horizon's is not a replace.
+///
+/// `fsFsRenameFile` refuses a destination that already exists -- which is every
+/// re-pair -- so `SaveToken` moves the record already in place aside first. That
+/// happens on both platforms deliberately: a fallback taken only on the console
+/// is a path no test here would ever run. What it costs is one moment where
+/// `token.dat` does not exist and `token.dat.old` holds the previous record, so
+/// `LoadToken` reads that one rather than reporting nothing was ever paired.
+void RecoversFromTheCommitWindow(checks::Checks& c) {
+  const std::filesystem::path path = ScratchDir() / "window.dat";
+  const std::filesystem::path previous = path.string() + ".old";
+  std::filesystem::remove(path);
+  std::filesystem::remove(previous);
+
+  const auth::StoredToken token = Fixture();
+  c.Expect(auth::SaveToken(path.string(), token).ok(), "the token is written");
+
+  // Exactly the state a power cut between the two renames leaves behind.
+  std::filesystem::rename(path, previous);
+  c.Expect(!std::filesystem::exists(path), "the destination is gone, as it would be mid-commit");
+
+  const auth::LoadedToken loaded = auth::LoadToken(path.string());
+  c.Expect(loaded.ok(), "the previous record is read rather than lost: " + loaded.message);
+  SameToken(c, loaded.value, token, "recovered");
+
+  // With nothing to fall back to, a missing file still reports itself as one
+  // rather than as whatever the fallback failed with.
+  std::filesystem::remove(previous);
+  const auth::LoadedToken nothing = auth::LoadToken(path.string());
+  c.Expect(!nothing.ok(), "and with no fallback there is still nothing");
+  c.ExpectEq(std::string(auth::ToString(nothing.error)), std::string("read_failed"),
+             "reported as read_failed");
 }
 
 /// The guarantee the whole file exists for: a write that cannot complete costs
@@ -180,11 +216,17 @@ void RefusesAnUnusableToken(checks::Checks& c) {
   nul.device_id = std::string("d\0evil", 6);
   auth::StoredToken no_server = Fixture();
   no_server.server_url.clear();
+  // `null` means "no expiry" and is fine; a *present* empty string is refused
+  // on the way back in, so writing one would produce a file that exists, looks
+  // paired, and cannot be read.
+  auth::StoredToken blank_expiry = Fixture();
+  blank_expiry.expires_at = "";
 
   const Case kCases[] = {
       {"a blank access_token", blank},
       {"a device_id with an embedded NUL", nul},
       {"no server_url", no_server},
+      {"a present but empty expires_at", blank_expiry},
   };
   for (const Case& one : kCases) {
     const auth::StoreResult saved = auth::SaveToken(path.string(), one.token);
@@ -258,6 +300,7 @@ int main() {
   WritesAndReads(c);
   AFailedWriteLeavesTheOldToken(c);
   NamesAMissingDirectory(c);
+  RecoversFromTheCommitWindow(c);
   RefusesAnUnusableToken(c);
   RefusesWhatIsNotAToken(c);
   CarriesTheServerItWasIssuedBy(c);

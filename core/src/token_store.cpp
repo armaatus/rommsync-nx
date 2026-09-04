@@ -15,6 +15,19 @@ namespace {
 /// The suffix the record is staged under before it is renamed into place.
 constexpr const char* kTempSuffix = ".tmp";
 
+/// Where the record already in place is moved while the new one takes its
+/// name. See `SaveToken` for why the move is unconditional.
+constexpr const char* kPreviousSuffix = ".old";
+
+bool Exists(const std::string& path) {
+  std::FILE* file = std::fopen(path.c_str(), "rb");
+  if (file == nullptr) {
+    return false;
+  }
+  std::fclose(file);
+  return true;
+}
+
 /// The bar every persisted string is held to, matching `json::Reader`: a blank
 /// value is a record that lost something, and an embedded NUL is a value that
 /// truncates the moment it reaches a C API -- so the token that would be sent
@@ -105,7 +118,11 @@ StoreResult SaveToken(const std::string& path, const StoredToken& token) {
   // Refused here rather than on the way back in: a record that cannot be read
   // is worse than no record at all, because the sysmodule would find a file,
   // believe it is paired, and 401 forever.
-  if (!Usable(token.server_url) || !Usable(token.access_token) || !Usable(token.device_id)) {
+  if (!Usable(token.server_url) || !Usable(token.access_token) || !Usable(token.device_id) ||
+      // `expires_at` is held to the same bar the reader holds it to: `null`
+      // means "no expiry", but a *present* empty string is refused on the way
+      // back in, so writing one produces a file that cannot be read.
+      (token.expires_at.has_value() && !Usable(*token.expires_at))) {
     return {StoreError::kUnusableToken,
             Describe(path, "refusing to write a token with a blank or NUL-carrying field")};
   }
@@ -130,16 +147,36 @@ StoreResult SaveToken(const std::string& path, const StoredToken& token) {
     return {StoreError::kWriteFailed, Describe(temp, "could not be written completely")};
   }
 
-  // The atomic step. Everything above touched only the temp file, so a failure
-  // up to this point leaves whatever `path` already held exactly as it was.
+  // The commit. Everything above touched only the temp file, so a failure up to
+  // this point leaves whatever `path` already held exactly as it was.
+  //
+  // `rename` replaces the destination on POSIX and does *not* on Horizon:
+  // `fsFsRenameFile` refuses a destination that already exists, which is every
+  // re-pair. So the record already in place is moved aside first -- on both
+  // platforms, deliberately, because a fallback taken only on the console is a
+  // path no host test ever runs and the v1 gate is the first thing that would
+  // see it.
+  const std::string previous = path + kPreviousSuffix;
+  std::remove(previous.c_str());
+  const bool replacing = Exists(path);
+  if (replacing && std::rename(path.c_str(), previous.c_str()) != 0) {
+    std::remove(temp.c_str());
+    return {StoreError::kCommitFailed, Describe(path, "could not be moved aside to " + previous)};
+  }
   if (std::rename(temp.c_str(), path.c_str()) != 0) {
+    if (replacing) {
+      std::rename(previous.c_str(), path.c_str());
+    }
     std::remove(temp.c_str());
     return {StoreError::kCommitFailed, Describe(path, "could not be replaced by " + temp)};
   }
+  std::remove(previous.c_str());
   return {};
 }
 
-LoadedToken LoadToken(const std::string& path) {
+namespace {
+
+LoadedToken ReadRecord(const std::string& path) {
   LoadedToken loaded;
   std::FILE* file = std::fopen(path.c_str(), "rb");
   if (file == nullptr) {
@@ -170,6 +207,22 @@ LoadedToken LoadToken(const std::string& path) {
   }
   loaded.value = std::move(parsed.value);
   return loaded;
+}
+
+}  // namespace
+
+LoadedToken LoadToken(const std::string& path) {
+  LoadedToken loaded = ReadRecord(path);
+  if (loaded.ok()) {
+    return loaded;
+  }
+  // The one moment `path` does not exist is between the two renames in
+  // `SaveToken`, and what is sitting in `.old` then is the previous complete
+  // record. Reading it is the difference between a re-pair nobody notices and
+  // one the user has to do at a browser. The original error is kept when there
+  // is nothing to fall back to, so a plain missing file still says so.
+  LoadedToken previous = ReadRecord(path + kPreviousSuffix);
+  return previous.ok() ? previous : loaded;
 }
 
 }  // namespace rommsync::auth

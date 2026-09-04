@@ -141,14 +141,19 @@ target_link_libraries(test_pairing PRIVATE rommsync::host)
 target_compile_definitions(test_pairing PRIVATE
   ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
   ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+# `starting` drives Begin() on one thread and status() on another, which is the
+# threading contract the header promises the overlay.
+target_link_libraries(test_pairing PRIVATE Threads::Threads)
 
 set(PAIR_SCENARIOS
   happy         # init -> approve -> token -> persisted
+  starting      # status() answers, and says "starting", while init is in flight
   mid_poll      # approval that lands after several polls, at the server's interval
   denied        # a human refusing it, and the re-pair that follows
   expired       # our own deadline, and a code the server considers spent
   retry         # 5xx mid-poll: back off, do not abandon a live code
   unauthorized  # a 401 from something in front of RomM: retry, then diagnose
+  rejection_streak # ...and the budget counts consecutive ones, not lifetime ones
   stall         # a poll that hangs does not wedge the state machine
   drop          # ...nor does one whose connection dies
   lost_grant    # the grant that never got home: the code is spent, so stop
@@ -163,7 +168,7 @@ foreach(scenario IN LISTS PAIR_SCENARIOS)
   # RUN_SERIAL for the same reason as http.*: the fault proxy holds one armed
   # scenario for every client. These also wait out real poll intervals, so the
   # timeout has to cover a few of them.
-  set_tests_properties(pair.${scenario} PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+  set_tests_properties(pair.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 endforeach()
 
 # --- the committed API captures still match a live RomM ----------------------
