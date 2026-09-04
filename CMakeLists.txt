@@ -11,8 +11,14 @@
 
 cmake_minimum_required(VERSION 3.20)
 
+# The version lives in a plain VERSION file rather than in this call, because the
+# devkitPro Makefiles need the same string and cannot read CMake. Both build
+# systems read that file; version.hpp.in is substituted from it either way.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" ROMMSYNC_VERSION)
+string(STRIP "${ROMMSYNC_VERSION}" ROMMSYNC_VERSION)
+
 project(rommsync-nx
-  VERSION 0.1.0
+  VERSION ${ROMMSYNC_VERSION}
   DESCRIPTION "On-device RomM sync for the modded Nintendo Switch"
   LANGUAGES CXX)
 

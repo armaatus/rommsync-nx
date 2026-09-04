@@ -22,7 +22,10 @@ build-*/
 *.nsp
 *.npdm
 *.ovl
+*.nro
 *.nacp
+*.map
+*.lst
 
 # python (server/)
 __pycache__/

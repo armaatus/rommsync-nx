@@ -32,6 +32,11 @@ cmake -S . -B build && cmake --build build      # build
 ctest --test-dir build --output-on-failure       # test
 ctest --test-dir build -R sync --output-on-failure   # one group
 
+# the two Switch targets, built by devkitPro rather than CMake. Nothing built
+# here runs anywhere before the M8-1 gate; see switch.mk.
+docker run --rm -v "$PWD:/work" -w /work devkitpro/devkita64:latest \
+  bash -lc 'make -C sysmodule && make -C overlay'
+
 ./scripts/orca/env.sh                            # regenerate .env
 ./scripts/orca/romm-browser.sh                   # open RomM signed in, if the tab is gone
 ./scripts/orca/romm-logs.sh                      # follow RomM, if the tab is missing
