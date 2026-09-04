@@ -87,7 +87,7 @@ than one running on defaults.
 
 Each report carries a severity, the line number, and the section and key:
 
-| | means |
+| severity | means |
 |---|---|
 | `notice` | taken as written, worth reading once |
 | `warning` | that line did not take effect, or it did and carries a risk |
