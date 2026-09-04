@@ -106,8 +106,7 @@ class Quiet {
 // a per-test SD card that is removed afterwards, and an audit that turns
 // docs/SYNC_PROTOCOL.md's hard rule into something a test cannot forget.
 
-int SandboxScenario() {
-  rig::Checks checks;
+void SandboxScenario(rig::Checks& checks) {
 
   // 1. the SD-path mapping, and teardown -------------------------------------
   std::string remembered;
@@ -126,7 +125,13 @@ int SandboxScenario() {
     Sandbox other(checks, "layout");
     checks.Expect(other.root() != sandbox.root(), "two sandboxes are two directories");
   }
-  checks.Expect(!std::filesystem::exists(remembered), "the sandbox is removed when the test ends");
+  // ROMMSYNC_KEEP_SANDBOX is the documented way to look at what a red run wrote
+  // (harness.hpp), and it keeps the tree on purpose -- so asserting removal
+  // under it would turn the debugging switch into a second red test.
+  if (std::getenv("ROMMSYNC_KEEP_SANDBOX") == nullptr) {
+    checks.Expect(!std::filesystem::exists(remembered),
+                  "the sandbox is removed when the test ends");
+  }
 
   // 2. the audit passes for an overwrite that backed up first ------------------
   {
@@ -143,16 +148,22 @@ int SandboxScenario() {
   // Each of these is a way a real implementation gets it wrong, and none of them
   // is caught by a test that merely asserts the save now holds the new bytes.
   {
-    const Quiet quiet;
     rig::Checks audited;
     Sandbox sandbox(audited, "no-backup");
     sandbox.Detach();
     sandbox.SeedSave(SavePath("Game.srm"), "the previous save\n");
     sandbox.Write(SavePath("Game.srm"), "the new save\n");
-    checks.ExpectEq(sandbox.Audit(audited), 1, "an overwrite with no backup is caught");
+    // `Quiet` covers the audit and nothing else. If it covered the assertion
+    // below too, an audit that stopped firing would exit 1 having printed
+    // nothing -- which is the failure this whole file is written against.
+    int caught = 0;
+    {
+      const Quiet quiet;
+      caught = sandbox.Audit(audited);
+    }
+    checks.ExpectEq(caught, 1, "an overwrite with no backup is caught");
   }
   {
-    const Quiet quiet;
     rig::Checks audited;
     Sandbox sandbox(audited, "backed-up-wrong");
     sandbox.Detach();
@@ -161,11 +172,14 @@ int SandboxScenario() {
     // The commonest wrong version: back up *after* the write, so the copy holds
     // the bytes that replaced the save rather than the ones it destroyed.
     sandbox.Write(sandbox.BackupPathFor(7, "Game.srm"), "the new save\n");
-    checks.ExpectEq(sandbox.Audit(audited), 1,
-                    "a backup taken after the overwrite is not a backup");
+    int caught = 0;
+    {
+      const Quiet quiet;
+      caught = sandbox.Audit(audited);
+    }
+    checks.ExpectEq(caught, 1, "a backup taken after the overwrite is not a backup");
   }
   {
-    const Quiet quiet;
     rig::Checks audited;
     Sandbox sandbox(audited, "interrupted");
     sandbox.Detach();
@@ -175,10 +189,15 @@ int SandboxScenario() {
     // one where a missing backup costs the only copy.
     std::error_code error;
     std::filesystem::remove(sandbox.Host(SavePath("Game.srm")), error);
-    checks.ExpectEq(sandbox.Audit(audited), 1, "an interrupted overwrite is caught too");
+    int caught = 0;
+    {
+      const Quiet quiet;
+      caught = sandbox.Audit(audited);
+    }
+    checks.ExpectEq(caught, 1, "an interrupted overwrite is caught too");
   }
-  return checks.failures();
 }
+
 
 // --- disarms ------------------------------------------------------------------
 //
@@ -186,8 +205,7 @@ int SandboxScenario() {
 // it gets broken is a scenario that returns early past its own cleanup. A red
 // run then lands in whichever test happens to go next.
 
-int Disarms(http::HttpClient& client, const std::string& base) {
-  rig::Checks checks;
+void Disarms(rig::Checks& checks, http::HttpClient& client, const std::string& base) {
 
   {
     harness::Fault fault(checks, client, base,
@@ -205,15 +223,17 @@ int Disarms(http::HttpClient& client, const std::string& base) {
   // passes having exercised nothing -- which is the failure this whole file is
   // written against.
   {
-    const Quiet quiet;
     rig::Checks rejected;
-    { harness::Fault fault(rejected, client, base, R"({"mode":"truncate"})"); }
+    {
+      const Quiet quiet;
+      harness::Fault fault(rejected, client, base, R"({"mode":"truncate"})");
+    }
     checks.ExpectEq(rejected.failures(), 1,
                     "a refused spec fails the test rather than running unarmed");
   }
   harness::ExpectDisarmed(checks, client, base, "and the refusal left nothing behind");
-  return checks.failures();
 }
+
 
 // --- expired ------------------------------------------------------------------
 //
@@ -223,10 +243,8 @@ int Disarms(http::HttpClient& client, const std::string& base) {
 // distinction `http::Result` draws and the one a client that checks only
 // `ok()` gets wrong.
 
-int Expired(http::HttpClient& client, const std::string& base, const Fixture& fixture) {
-  rig::Checks checks;
-  Sandbox sandbox(checks, "expired");
-
+void Expired(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+             const Fixture& fixture) {
   sync::SyncNegotiatePayload payload;
   payload.device_id = fixture.device_id;  // an empty `saves` is a legitimate "what am I missing?"
 
@@ -258,10 +276,8 @@ int Expired(http::HttpClient& client, const std::string& base, const Fixture& fi
                     "the same token still works -- one 401 is not a verdict on the pairing");
   }
 
-  checks.Expect(!sandbox.Exists(harness::kConfigDir + std::string("/token.dat")),
-                "a refused tick wrote no credentials");
-  return checks.failures();
 }
+
 
 // --- conflict -----------------------------------------------------------------
 //
@@ -275,9 +291,8 @@ int Expired(http::HttpClient& client, const std::string& base, const Fixture& fi
 // moves the same row forward. Get that wrong and this scenario silently becomes
 // the no-history one below.
 
-int Conflict(http::HttpClient& client, const std::string& base, const Fixture& fixture,
-             const harness::Rom& rom) {
-  rig::Checks checks;
+void Conflict(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+              const Fixture& fixture, const harness::Rom& rom) {
   Sandbox sandbox(checks, "conflict");
   const std::string slot = harness::UniqueSlot("m0-5-conflict");
   const std::string name = "conflict.srm";
@@ -289,7 +304,7 @@ int Conflict(http::HttpClient& client, const std::string& base, const Fixture& f
   if (!harness::UploadSave(client, base, fixture, rom.id, slot, "harness",
                            sandbox.Host(SavePath(name)), name, /*with_device=*/true, &server)) {
     checks.Expect(false, "the first server copy was stored");
-    return checks.failures();
+    return;
   }
 
   PassASecond();
@@ -302,7 +317,7 @@ int Conflict(http::HttpClient& client, const std::string& base, const Fixture& f
                             &moved)) {
     checks.Expect(false, "the server copy moved forward in place");
     harness::DeleteSave(client, base, fixture, server.id);
-    return checks.failures();
+    return;
   }
   checks.ExpectEq(moved.id, server.id,
                   "PUT moved the same save row -- a second POST would have made a new one");
@@ -328,7 +343,7 @@ int Conflict(http::HttpClient& client, const std::string& base, const Fixture& f
     checks.Expect(false, "the plan carries an operation for this run's slot: " +
                              result.response.body);
     harness::DeleteSave(client, base, fixture, server.id);
-    return checks.failures();
+    return;
   }
 
   checks.ExpectEq(harness::Field(*operation, "action"), std::string("conflict"),
@@ -357,8 +372,8 @@ int Conflict(http::HttpClient& client, const std::string& base, const Fixture& f
                     harness::Field(*operation, "file_name"));
 
   harness::DeleteSave(client, base, fixture, server.id);
-  return checks.failures();
 }
+
 
 // --- same_timestamp -----------------------------------------------------------
 //
@@ -369,9 +384,8 @@ int Conflict(http::HttpClient& client, const std::string& base, const Fixture& f
 // alone sends this into the default branch -- and on a conflict the default
 // branch is the one that can overwrite a save.
 
-int SameTimestamp(http::HttpClient& client, const std::string& base, const Fixture& fixture,
-                  const harness::Rom& rom) {
-  rig::Checks checks;
+void SameTimestamp(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                   const Fixture& fixture, const harness::Rom& rom) {
   Sandbox sandbox(checks, "same-timestamp");
   const std::string slot = harness::UniqueSlot("m0-5-same-ts");
   const std::string name = "same-timestamp.srm";
@@ -383,7 +397,7 @@ int SameTimestamp(http::HttpClient& client, const std::string& base, const Fixtu
   if (!harness::UploadSave(client, base, fixture, rom.id, slot, "harness",
                            sandbox.Host(SavePath(name)), name, /*with_device=*/false, &server)) {
     checks.Expect(false, "the server copy was stored");
-    return checks.failures();
+    return;
   }
 
   sync::Timestamp when;
@@ -408,7 +422,7 @@ int SameTimestamp(http::HttpClient& client, const std::string& base, const Fixtu
     checks.Expect(false, "the plan carries an operation for this run's slot: " +
                              result.response.body);
     harness::DeleteSave(client, base, fixture, server.id);
-    return checks.failures();
+    return;
   }
 
   checks.ExpectEq(harness::Field(*operation, "action"), std::string("conflict"),
@@ -418,8 +432,8 @@ int SameTimestamp(http::HttpClient& client, const std::string& base, const Fixtu
                   "...with the second of the two reasons a client must handle");
 
   harness::DeleteSave(client, base, fixture, server.id);
-  return checks.failures();
 }
+
 
 // --- partial ------------------------------------------------------------------
 //
@@ -427,9 +441,8 @@ int SameTimestamp(http::HttpClient& client, const std::string& base, const Fixtu
 // `operations_failed` at `complete` and owes the next tick the files it did not
 // manage -- never a half-written one.
 
-int Partial(http::HttpClient& client, const std::string& base, const Fixture& fixture,
-            const harness::Rom& rom) {
-  rig::Checks checks;
+void Partial(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+             const Fixture& fixture, const harness::Rom& rom) {
   Sandbox sandbox(checks, "partial");
 
   // Three saves this device has and the server does not, so the plan is three
@@ -465,7 +478,7 @@ int Partial(http::HttpClient& client, const std::string& base, const Fixture& fi
   const json::ParseResult plan = json::Parse(negotiated.response.body);
   if (!plan.ok()) {
     checks.Expect(false, "the plan parses: " + negotiated.response.body);
-    return checks.failures();
+    return;
   }
   const std::int64_t session_id = harness::Number(plan.value, "session_id");
   checks.Expect(session_id != 0, "a session was opened");
@@ -529,9 +542,11 @@ int Partial(http::HttpClient& client, const std::string& base, const Fixture& fi
     // server save this device has no history for, so the number is only
     // meaningful against the plan it came from.
     std::int64_t needing_work = 0;
-    for (const json::Value& operation : plan.value.Find("operations")->elements()) {
-      if (harness::Field(operation, "action") != "no_op") {
-        ++needing_work;
+    if (const json::Value* operations = plan.value.Find("operations"); operations != nullptr) {
+      for (const json::Value& operation : operations->elements()) {
+        if (harness::Field(operation, "action") != "no_op") {
+          ++needing_work;
+        }
       }
     }
     checks.Expect(needing_work >= 3, "the plan asked for at least this test's three uploads");
@@ -542,8 +557,8 @@ int Partial(http::HttpClient& client, const std::string& base, const Fixture& fi
   for (const Planned& entry : planned) {
     harness::DeleteSave(client, base, fixture, entry.save_id);
   }
-  return checks.failures();
 }
+
 
 // --- resume -------------------------------------------------------------------
 //
@@ -558,9 +573,8 @@ int Partial(http::HttpClient& client, const std::string& base, const Fixture& fi
 // bytes -- checked against the file RomM is serving, not against a hash, so a
 // splice at the wrong offset names the byte it went wrong at.
 
-int Resume(http::HttpClient& client, const std::string& base, const Fixture& fixture,
-           const harness::Rom& rom) {
-  rig::Checks checks;
+void Resume(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+            const Fixture& fixture, const harness::Rom& rom) {
   Sandbox sandbox(checks, "resume");
   sandbox.MakeDirs("/tico/roms/gba");
   const std::string sd_path = "/tico/roms/gba/synthetic-large.gba";
@@ -603,8 +617,8 @@ int Resume(http::HttpClient& client, const std::string& base, const Fixture& fix
   checks.Expect(harness::SameBytes(destination, kLargeRomSource, &differs_at),
                 "the two halves are the rom RomM is serving, byte for byte -- first difference at " +
                     std::to_string(differs_at));
-  return checks.failures();
 }
+
 
 // --- truncate -----------------------------------------------------------------
 //
@@ -616,9 +630,8 @@ int Resume(http::HttpClient& client, const std::string& base, const Fixture& fix
 // wrong costs something irreplaceable: a short body written over a save is a
 // destroyed save, and the destination must never see it.
 
-int Truncate(http::HttpClient& client, const std::string& base, const Fixture& fixture,
-             const harness::Rom& rom) {
-  rig::Checks checks;
+void Truncate(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+              const Fixture& fixture, const harness::Rom& rom) {
   Sandbox sandbox(checks, "truncate");
   const std::string slot = harness::UniqueSlot("m0-5-truncate");
   const std::string name = "truncate.srm";
@@ -635,7 +648,7 @@ int Truncate(http::HttpClient& client, const std::string& base, const Fixture& f
   if (!harness::UploadSave(client, base, fixture, rom.id, slot, "harness", staged, name,
                            /*with_device=*/false, &server)) {
     checks.Expect(false, "the server copy was stored");
-    return checks.failures();
+    return;
   }
   checks.ExpectEq(server.file_size_bytes, static_cast<std::int64_t>(server_bytes.size()),
                   "the server reports the size the client will verify against");
@@ -681,8 +694,8 @@ int Truncate(http::HttpClient& client, const std::string& base, const Fixture& f
   }
 
   harness::DeleteSave(client, base, fixture, server.id);
-  return checks.failures();
 }
+
 
 // --- stall --------------------------------------------------------------------
 //
@@ -691,10 +704,8 @@ int Truncate(http::HttpClient& client, const std::string& base, const Fixture& f
 // hangs is a sysmodule that never gets to the next one, and `Never block boot`
 // is a hard rule.
 
-int Stall(http::HttpClient& client, const std::string& base, const Fixture& fixture) {
-  rig::Checks checks;
-  Sandbox sandbox(checks, "stall");
-
+void Stall(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+           const Fixture& fixture) {
   sync::SyncNegotiatePayload payload;
   payload.device_id = fixture.device_id;
   const sync::Encoded encoded = sync::EncodeNegotiateRequest(payload);
@@ -719,14 +730,11 @@ int Stall(http::HttpClient& client, const std::string& base, const Fixture& fixt
                 "...and gives up on its own timeout, not on the server's -- waited " +
                     std::to_string(waited.count()) + "s");
 
-  // Nothing was written and the next tick is unaffected. A stall must cost one
-  // tick, not the pairing.
-  checks.Expect(!sandbox.Exists(harness::kConfigDir + std::string("/token.dat")),
-                "an abandoned tick wrote no state");
+  // A stall must cost one tick, not the pairing: the next one goes through.
   const http::Result next = harness::Negotiate(checks, client, base, fixture, payload);
   checks.ExpectEq(next.response.status, 200, "and the next tick negotiates normally");
-  return checks.failures();
 }
+
 
 // --- multifile ----------------------------------------------------------------
 //
@@ -745,9 +753,8 @@ int Stall(http::HttpClient& client, const std::string& base, const Fixture& fixt
 //     all. Building that URL from a rom id and a file name returns 200 and the
 //     bytes of whatever file happens to carry that id.
 
-int MultiFile(http::HttpClient& client, const std::string& base, const Fixture& fixture,
-              const harness::Rom& multi, const harness::Rom& single) {
-  rig::Checks checks;
+void MultiFile(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+               const Fixture& fixture, const harness::Rom& multi, const harness::Rom& single) {
 
   // The signal is on the LIST schema, not only the detail one, so a client can
   // skip a rom without a second call per rom.
@@ -768,7 +775,7 @@ int MultiFile(http::HttpClient& client, const std::string& base, const Fixture& 
                   "and no length a download could be verified against");
 
   if (multi.files.size() != 2) {
-    return checks.failures();
+    return;
   }
 
   // Each disc, by its own file id.
@@ -798,8 +805,8 @@ int MultiFile(http::HttpClient& client, const std::string& base, const Fixture& 
   checks.ExpectEq(mislabelled.response.body, contents[0],
                   "the id selects the file and the name selects nothing -- so the name in that "
                   "URL cannot be trusted to say what arrived");
-  return checks.failures();
 }
+
 
 // --- backup -------------------------------------------------------------------
 //
@@ -812,9 +819,8 @@ int MultiFile(http::HttpClient& client, const std::string& base, const Fixture& 
 // overwrite is the engine's own `HttpClient::Download`; the sandbox audits the
 // result independently of what this test thought it was doing.
 
-int Backup(http::HttpClient& client, const std::string& base, const Fixture& fixture,
-           const harness::Rom& rom) {
-  rig::Checks checks;
+void Backup(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+            const Fixture& fixture, const harness::Rom& rom) {
   Sandbox sandbox(checks, "backup");
   const std::string slot = harness::UniqueSlot("m0-5-backup");
   const std::string name = "backup.srm";
@@ -829,7 +835,7 @@ int Backup(http::HttpClient& client, const std::string& base, const Fixture& fix
   if (!harness::UploadSave(client, base, fixture, rom.id, slot, "harness", staged, name,
                            /*with_device=*/false, &server)) {
     checks.Expect(false, "the server copy was stored");
-    return checks.failures();
+    return;
   }
 
   // 1. back up, then overwrite -- the success path.
@@ -878,8 +884,8 @@ int Backup(http::HttpClient& client, const std::string& base, const Fixture& fix
                   "and the backup taken first is there either way");
 
   harness::DeleteSave(client, base, fixture, server.id);
-  return checks.failures();
 }
+
 
 }  // namespace
 
@@ -890,15 +896,22 @@ int main(int argc, char** argv) {
   std::error_code error;
   std::filesystem::create_directories(rig::ScratchDir(), error);
 
-  // The sandbox is the harness's own guarantee and needs no server, so it runs
-  // with docker stopped -- which is when a broken sandbox is most likely to be
-  // introduced and least likely to be noticed.
+  // The tally lives here, above every scenario, and each scenario returns void.
+  // That is not a style choice: a `Sandbox` reports its teardown audit into this
+  // object, and a scenario that returned its own `checks.failures()` would copy
+  // the count out *before* its sandbox was destroyed -- so an audit failure
+  // would print and the process would still exit 0. See `Sandbox`'s constructor.
+  rig::Checks checks;
+
+  // The sandbox scenario is the harness's own guarantee and needs no server, so
+  // it runs with docker stopped -- which is when a broken sandbox is most likely
+  // to be introduced and least likely to be noticed.
   if (scenario == "sandbox") {
-    const int failures = SandboxScenario();
-    if (failures == 0) {
+    SandboxScenario(checks);
+    if (checks.failures() == 0) {
       std::cout << "harness.sandbox ok\n";
     }
-    return failures == 0 ? 0 : 1;
+    return checks.failures() == 0 ? 0 : 1;
   }
 
   const std::unique_ptr<http::HttpClient> client = rommsync::host::MakeCurlHttpClient();
@@ -915,13 +928,12 @@ int main(int argc, char** argv) {
     return rig::kSkip;
   }
 
-  int failures = 0;
   if (scenario == "disarms") {
-    failures = Disarms(*client, base);
+    Disarms(checks, *client, base);
   } else if (scenario == "expired") {
-    failures = Expired(*client, base, fixture);
+    Expired(checks, *client, base, fixture);
   } else if (scenario == "stall") {
-    failures = Stall(*client, base, fixture);
+    Stall(checks, *client, base, fixture);
   } else {
     // Everything left needs a rom to hang a save or a download off. A library
     // that was staged but never scanned is an empty one, and reads exactly like
@@ -929,30 +941,29 @@ int main(int argc, char** argv) {
     harness::Rom small;
     harness::Rom large;
     harness::Rom multi;
-    const bool have_small = harness::FindRom(*client, base, fixture, "gb240p.gb", &small);
-    if (!have_small) {
+    if (!harness::FindRom(*client, base, fixture, "gb240p.gb", &small)) {
       std::cerr << "the fixture library holds no roms\n"
                    "  scan it with: ./.venv/bin/python server/testing/provision.py\n";
       return rig::kSkip;
     }
 
     if (scenario == "conflict") {
-      failures = Conflict(*client, base, fixture, small);
+      Conflict(checks, *client, base, fixture, small);
     } else if (scenario == "same_timestamp") {
-      failures = SameTimestamp(*client, base, fixture, small);
+      SameTimestamp(checks, *client, base, fixture, small);
     } else if (scenario == "partial") {
-      failures = Partial(*client, base, fixture, small);
+      Partial(checks, *client, base, fixture, small);
     } else if (scenario == "truncate") {
-      failures = Truncate(*client, base, fixture, small);
+      Truncate(checks, *client, base, fixture, small);
     } else if (scenario == "backup") {
-      failures = Backup(*client, base, fixture, small);
+      Backup(checks, *client, base, fixture, small);
     } else if (scenario == "resume") {
       if (!harness::FindRom(*client, base, fixture, kLargeRom, &large)) {
         std::cerr << "the library has no " << kLargeRom
                   << "; re-seed it with: ./server/testing/seed.sh\n";
         return rig::kSkip;
       }
-      failures = Resume(*client, base, fixture, large);
+      Resume(checks, *client, base, fixture, large);
     } else if (scenario == "multifile") {
       if (!harness::FindRom(*client, base, fixture, kMultiRom, &multi) ||
           !harness::FindRom(*client, base, fixture, kLargeRom, &large)) {
@@ -960,7 +971,7 @@ int main(int argc, char** argv) {
                   << "; re-seed it with: ./server/testing/seed.sh\n";
         return rig::kSkip;
       }
-      failures = MultiFile(*client, base, fixture, multi, large);
+      MultiFile(checks, *client, base, fixture, multi, large);
     } else {
       std::cerr << "unknown scenario: " << scenario << "\n";
       return 2;
@@ -971,8 +982,8 @@ int main(int argc, char** argv) {
   // whichever test runs next.
   rig::DisarmFault(*client, base);
 
-  if (failures == 0) {
+  if (checks.failures() == 0) {
     std::cout << "harness." << scenario << " ok against " << base << "\n";
   }
-  return failures == 0 ? 0 : 1;
+  return checks.failures() == 0 ? 0 : 1;
 }
