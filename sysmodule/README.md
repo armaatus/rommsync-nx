@@ -18,8 +18,12 @@ pulled.
 
 npdmtool prints a dozen `Failed to get <field> (field not present)` lines while
 packaging. That is its normal chatter about optional NPDM fields — devkitPro's
-own template produces the same output. It is not a warning about
-`sys-rommsync.json`.
+own template produces the same output — with one line worth reading literally:
+it says that about `process_category`, which `sys-rommsync.json` *does* set.
+This npdmtool ignores the key; the packaged NPDM is byte-identical with it set
+to 0, set to 1, or deleted. The value we want is the default, so nothing is
+wrong today, and the key stays for parity with devkitPro's template — but do not
+read that one line as noise if the process category ever has to change.
 
 ## Responsibilities
 
@@ -53,6 +57,12 @@ they are recorded here so they are not discovered on a console.
   sysmodules live by convention (ldn_mitm, sys-ftpd, sys-con); the low bytes
   spell `RMS`. Nothing verifies it is unused. Confirm it against the installed
   set before anything is loaded on real hardware.
+- **Filesystem access.** `filesystem_access.permissions` is
+  `0xffffffffffffffff` — everything — which is devkitPro's template default and
+  not a decision. It deserves the same treatment `service_access` gets below:
+  narrowed to what the engine actually opens. It is also the capability with the
+  most reach in a project whose second hard rule is about not destroying a
+  player's save.
 - **Heap and capabilities.** `main_thread_stack_size` and the inner heap in
   `source/main.cpp` are the template's numbers, sized for a skeleton. The real
   budget is one in-flight download buffer plus a TLS context

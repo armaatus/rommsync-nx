@@ -17,6 +17,13 @@ cmake_minimum_required(VERSION 3.20)
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" ROMMSYNC_VERSION)
 string(STRIP "${ROMMSYNC_VERSION}" ROMMSYNC_VERSION)
 
+# file(READ) leaves no dependency behind, so without this a version bump would
+# rebuild nothing: the sysmodule would report the new version (switch.mk makes
+# the header a real prerequisite) and the host binaries the old one -- the exact
+# drift the shared VERSION file is here to remove.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
+
 project(rommsync-nx
   VERSION ${ROMMSYNC_VERSION}
   DESCRIPTION "On-device RomM sync for the modded Nintendo Switch"

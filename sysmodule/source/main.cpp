@@ -50,15 +50,21 @@ void __appInit(void) {
   }
 
   // hosversionSet before anything version-gated is called; libnx assumes it.
+  // Aborting rather than carrying on is the point: an unset host version reads
+  // as 0, so every hosversionAtLeast() gate after this -- including the ones
+  // inside fsInitialize() below -- silently takes the pre-1.0.0 path. A wrong
+  // answer everywhere is worse than a refusal to start.
   rc = setsysInitialize();
-  if (R_SUCCEEDED(rc)) {
-    SetSysFirmwareVersion fw;
-    rc = setsysGetFirmwareVersion(&fw);
-    if (R_SUCCEEDED(rc)) {
-      hosversionSet(MAKEHOSVERSION(fw.major, fw.minor, fw.micro));
-    }
-    setsysExit();
+  if (R_FAILED(rc)) {
+    diagAbortWithResult(rc);
   }
+  SetSysFirmwareVersion fw;
+  rc = setsysGetFirmwareVersion(&fw);
+  if (R_FAILED(rc)) {
+    diagAbortWithResult(rc);
+  }
+  hosversionSet(MAKEHOSVERSION(fw.major, fw.minor, fw.micro));
+  setsysExit();
 
   // config.ini, token.dat, save staging and the download destinations all live
   // on the SD card, so fs is not optional for this process.

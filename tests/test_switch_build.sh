@@ -39,10 +39,14 @@ trap cleanup EXIT
 # --- the CI job ---------------------------------------------------------------
 
 # Everything from `  switch-build:` up to the next job at the same indentation.
-# Grepping the whole file instead would happily match a guard in another job.
+# Grepping the whole file instead would happily match a guard in another job --
+# and so would stopping on a narrower pattern than a job id can be, which is why
+# this ends on any 2-space key rather than on lowercase and dashes. A job named
+# `switch_build_hw:` appended below this one would otherwise be folded in, and
+# its upload step could satisfy an assertion switch-build had stopped meeting.
 switch_build_job() {
   awk '/^  switch-build:/ { in_job = 1; next }
-       in_job && /^  [a-z-]+:/ { in_job = 0 }
+       in_job && /^  [^ #]+:/ { in_job = 0 }
        in_job { print }' "$REPO_ROOT/.github/workflows/ci.yml"
 }
 
@@ -134,6 +138,23 @@ phase_builds() {
   # the toolchain's own demangled symbol dump of the linked ELF.
   grep -q 'rommsync::version()' "$SCRATCH/sysmodule/build/sys-rommsync.lst" ||
     fail "no core/ symbol in the linked sysmodule"
+
+  # The overlay's NACP is where a user sees a version, and switch_rules will
+  # happily bake devkitPro's 1.0.0 default in if nothing sets APP_VERSION.
+  LC_ALL=C grep -aq "$version" "$SCRATCH/overlay/ovl-rommsync.nacp" ||
+    fail "the overlay NACP does not carry $version"
+
+  # Two sources with the same basename produce one object and silently drop the
+  # other, and sysmodule/README.md plans an http/ beside core/src/http.cpp. The
+  # guard is in switch.mk; this is what says it still fires.
+  : >"$SCRATCH/sysmodule/source/json.cpp"
+  if docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work "$IMAGE" \
+        bash -lc 'make -C sysmodule' >"$log" 2>&1; then
+    fail "a source shadowing core/src/json.cpp built without complaint"
+  fi
+  grep -q 'share a basename' "$log" ||
+    { cat "$log" >&2; fail "the duplicate basename went unreported"; }
+  rm -f "$SCRATCH/sysmodule/source/json.cpp"
 
   echo "ok: .nsp and .ovl built, signed and carrying core/ $version"
 }
