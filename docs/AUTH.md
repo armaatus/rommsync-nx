@@ -314,8 +314,12 @@ key across systems. The property that protects the user is that the serial never
 leaves the console at all: only the digest is written, and only the digest is
 sent.
 
-A platform that offers nothing stable gets a random identifier instead, minted
-from at least 16 bytes of platform entropy and hashed the same way. A stable
+A platform that offers nothing stable — or that offers something too short to be
+a serial, which is what a placeholder looks like — gets a random identifier
+instead, minted from at least 16 bytes of platform entropy and hashed the same
+way. A seed provider must **fail rather than substitute**: a placeholder shared
+across consoles derives one identifier for all of them, and RomM would let one
+console's saves overwrite another's. A stable
 value is preferred when there is one, because a *derived* identifier survives
 losing `device.dat` — a wiped `config/` folder re-derives the same value and RomM
 still recognises the console, where a random one would not.
@@ -403,9 +407,10 @@ code, and the output is searched for both.
 
 - The overlay offers "Re-pair" → discards the token and restarts the flow.
   `DiscardToken` removes `token.dat` **and** the `.tmp`/`.old` an interrupted
-  commit leaves beside it, overwriting each first: unlinking only the obvious
-  file would leave the same bearer token under a name nobody looks at. It does
-  not touch `device.dat` — see [Client identifier](#client-identifier).
+  commit leaves beside it: unlinking only the obvious file would leave the same
+  bearer token under a name nobody looks at. Each is zeroed first, which claims
+  nothing on flash — see [SECURITY.md](SECURITY.md#token-at-rest-on-the-sd). It
+  does not touch `device.dat` — see [Client identifier](#client-identifier).
 - Revoking on the server (`DELETE /api/client-tokens/{id}`) invalidates it; the
   sysmodule detects `401`, marks itself unauthenticated, and prompts re-pair via
   the overlay status screen.

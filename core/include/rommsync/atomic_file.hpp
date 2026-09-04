@@ -16,12 +16,20 @@
 
 namespace rommsync::io {
 
-/// Why a write did not complete. Every value leaves the destination untouched.
+/// Why a write did not complete.
+///
+/// `kOpenFailed` and `kWriteFailed` leave the destination exactly as it was --
+/// that is the guarantee `WriteAtomically` exists for. `kCommitFailed` is the
+/// one that can cost something: the commit moves the record already in place
+/// aside first, and if putting it back fails too, the destination is gone and
+/// the previous record is under `PreviousPathFor(path)`. The `message` says so
+/// when it happens, and a reader that consults the previous name -- as both
+/// callers here do -- finds it.
 enum class WriteError {
   kNone,
   kOpenFailed,    ///< the temp file could not be created -- usually a missing directory
   kWriteFailed,   ///< the bytes did not all reach the disk
-  kCommitFailed,  ///< the rename onto the destination failed
+  kCommitFailed,  ///< the rename onto the destination failed; see above
 };
 
 /// Stable, log-friendly name. Never null.
@@ -40,8 +48,8 @@ struct WriteResult {
 /// Why a read did not produce contents.
 enum class ReadError {
   kNone,
-  kMissing,     ///< it could not be opened: no such file, or nothing may open it
-  kUnreadable,  ///< it opened, and the bytes could not be got out of it
+  kMissing,     ///< there is no such file (ENOENT/ENOTDIR), and nothing was ever written
+  kUnreadable,  ///< it exists, and the bytes could not be got out of it
 };
 
 /// Stable, log-friendly name. Never null.
@@ -88,21 +96,19 @@ std::string PreviousPathFor(std::string_view path);
 /// is that no reader ever sees a partial record.
 WriteResult WriteAtomically(const std::string& path, std::string_view contents);
 
-/// Read a whole file. A file that could not be opened is `kMissing`, which is a
-/// different thing from one that opened and then failed to read -- only the
-/// first is consistent with "nothing was ever written here", and only the first
-/// is safe to answer by creating something new. A read that fails half way
-/// yields no contents at all rather than the prefix that did arrive.
-ReadResult ReadFile(const std::string& path);
-
-/// The same, falling back to `PreviousPathFor(path)`.
+/// Read a whole file.
 ///
-/// The one moment `path` does not exist is between `WriteAtomically`'s two
-/// renames, and what is sitting under the other name then is the previous
-/// complete record. Reading it is the difference between an interruption nobody
-/// notices and one that costs the user a re-pair. A missing file with nothing
-/// to fall back to still reports itself as missing.
-ReadResult ReadCommitted(const std::string& path);
+/// **`kMissing` means ENOENT, and nothing else.** A file that exists and refuses
+/// to open -- a full handle table, `sdmc:` not mounted yet, a permission -- is
+/// `kUnreadable`, because a caller answers "there is nothing here" by creating
+/// something, and creating a `device.dat` over an identifier that was merely
+/// unreachable for a moment registers the console in RomM a second time. Only
+/// the first is safe to answer by writing.
+///
+/// A read that fails half way yields no contents at all rather than the prefix
+/// that did arrive: half a record read as a whole one is the failure this
+/// module exists to rule out.
+ReadResult ReadFile(const std::string& path);
 
 /// Remove `path` and the `.tmp`/`.old` an interrupted commit can leave beside
 /// it, overwriting each with zeroes first.
