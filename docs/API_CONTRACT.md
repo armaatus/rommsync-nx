@@ -231,6 +231,29 @@ saves are compared on MD5 alone, so a SHA1 here makes every unchanged save look
 changed. A `null` slot is never paired with a slotted server save, so a
 null-slot client save always negotiates as `upload`.
 
+The client does not build this body by hand: `core/include/rommsync/sync.hpp`
+types it (M2-1), and `sync.payload` compares that struct against the
+`ClientSaveState` schema in the committed snapshot on every run, in both
+directions — a field the snapshot grows and a field the encoder invents are both
+red.
+
+**Verified — only half a typo is loud.** Rename a *required* field and RomM
+answers **422** naming it (`sync.required` sends `size` for `file_size_bytes`).
+Rename an *optional* one and RomM answers **200**: the unknown key is ignored,
+the field defaults to `null`, and only the plan changes. `sync.understood` sends
+one identical save twice, differing in nothing but `content_hash` vs `hash`:
+
+| sent as | plan |
+|---|---|
+| `content_hash` | `no_op` — `Content is identical` |
+| `hash` | `upload` — `Client save is newer than last sync` |
+
+Nothing in the response says a field was dropped, so a client that guesses this
+name re-uploads every save on every tick and never learns why. `updated_at`
+tolerates the same kind of near-miss: an offsetless `2026-09-04 11:36:27` is
+accepted rather than refused, and what the server then takes it to mean is its
+business, not the client's — so send the offset. `FormatTimestamp` writes `Z`.
+
 `SyncNegotiateResponse` (`captures/sync-negotiate-upload.json`):
 ```json
 {
