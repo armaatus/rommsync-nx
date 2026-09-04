@@ -24,6 +24,38 @@ real certificate on a hostname you control, e.g. `https://romm.example.com`.
 
 A sample Caddyfile lives in `server/README.md`.
 
+## A self-signed certificate on a home server
+
+A home RomM behind a proxy with a certificate no public CA signed is a case this
+client has to answer for, because the wrong answer is one line and it is the line
+everyone reaches for: turning certificate verification off.
+
+M0-1 established what the console actually offers here
+([DEVELOPMENT.md](DEVELOPMENT.md#m0-1-the-measurement-and-the-decision)). The
+Horizon `ssl` service verifies against the console's own CertStore, with
+`PeerCa | HostName` set by default, and there are two ways past it:
+
+- **Import the certificate** (`sslContextImportServerPki`). Verification stays
+  **on** — the server is checked, against a CA the user chose. Hostname checking
+  stays on too: set SNI to a name the certificate carries and the server may
+  still be addressed by IP. This is the supported path, and it is what
+  `ClientOptions::ca_bundle_path` in
+  [`core/include/rommsync/http.hpp`](../core/include/rommsync/http.hpp) is for.
+- **Turn verification off** (`SslOptionType_SkipDefaultVerify`, then
+  `SetVerifyOption(0)`). This is not "trust this one server": it is trust
+  *anything* on that connection, so a machine on the same network can be RomM as
+  far as the console is concerned — and the bearer token goes to whoever
+  answers. `ClientOptions::verify_peer = false` is this. There is no
+  `config.ini` key for it today ([CONFIG.md](CONFIG.md)); if one is ever added it
+  has to be an opt-in a user typed — never a default, and never inferred from a
+  handshake that failed.
+
+The test fixture takes the first path deliberately, even though it is the more
+awkward one for a throwaway certificate: `scripts/orca/tls-fixture.sh` mints a
+certificate with a `subjectAltName`, and `tls.cert` fails if it ever stops doing
+so. A harness that got used to running with verification off is how a client
+ships with it off.
+
 ## Tokens & scopes
 
 - Create a **dedicated RomM user** for the Switch (or at least a dedicated client

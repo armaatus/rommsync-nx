@@ -72,12 +72,14 @@ Climb it in order. You do not go up a rung until the one below is green.
 | Rung | Environment | Proves | Console? |
 |---|---|---|---|
 | 1 | **Host build + real docker RomM (+ fault proxy)** | Engine logic against a genuine RomM, plus every forced edge case: 401, conflict, partial failure, `Range` resume, multi-file skip. Runs in CI. | No |
-| 2 | **Ryujinx NRO + docker RomM** | The real Horizon path (`ssl`/`fs`/`socket`) via a manually-launched NRO built from the same core lib. The only pre-hardware place Horizon code actually runs. | No (emulator) |
+| 2 | **NRO + docker RomM, in an emulator** | The real Horizon path (`ssl`/`fs`/`socket`) via a manually-launched NRO — [`tlsprobe/`](../tlsprobe/README.md). The only pre-hardware place Horizon code actually runs, and the one rung this environment cannot climb: see [rung 2](#rung-2--the-manually-launched-nro). | No (emulator) |
 | 3 | **Real hardware (M8)** | Final bring-up, on a backup SD/emuMMC, NRO first then a disabled sysmodule. | Yes — last, gated |
 
-Rung 1 is the day-to-day loop. Rung 2 is where the M0-1 `ssl` question gets
-answered without hardware. Rung 3 is a single gated milestone, not part of normal
-development.
+Rung 1 is the day-to-day loop. Rung 2 is where the M0-1 `ssl` question was
+*meant* to be answered without hardware; M0-1 built the NRO and the TLS fixture
+for it and could not run them, for reasons that turned out to be about the
+emulator rather than about us — [rung 2](#rung-2--the-manually-launched-nro).
+Rung 3 is a single gated milestone, not part of normal development.
 
 ## The M0 exit gate
 
@@ -544,13 +546,35 @@ The gap that remains: a *separate clone* whose stack has been reduced to volumes
 alone leaves nothing pointing at its directory, so it looks stale. Run the
 dry-run first if more than one clone of this repo is in play.
 
-## Rung 2 — Ryujinx NRO
+## Rung 2 — the manually-launched NRO
 
 - A standalone **NRO** (manually launched, *not* a sysmodule, *not* on the boot
-  path) built from the same core lib, run in Ryujinx against docker RomM.
-- Confirms the `ssl`-service backend and libnx `fs`/socket behavior on Horizon.
-- If Ryujinx's `ssl`/`bsd` support turns out to be insufficient, the same NRO is
-  the fallback experiment on a **backup SD** — still never an auto-boot sysmodule.
+  path) that exercises the Horizon `ssl`/`bsd` path against a real RomM. It
+  exists: [`tlsprobe/`](../tlsprobe/README.md), built by CI on every push and by
+  `ctest -R switch.tlsprobe`.
+- The rig speaks plain HTTP, so the probe cannot use it as-is. The compose file
+  carries a `tls` profile — an nginx terminator in front of RomM with a
+  throwaway self-signed certificate — that nothing else starts:
+
+  ```bash
+  ./scripts/orca/tls-fixture.sh up      # mint the cert, start the terminator
+  ./scripts/orca/tls-fixture.sh ini     # the probe's ini for this worktree
+  ./scripts/orca/tls-fixture.sh check   # a verified 200, and again over TLS 1.2
+  ```
+
+  `tls.isolated`, `tls.cert` and `tls.serves` are what keep that honest — in
+  particular that the profile stays out of every other test's way and that the
+  port stays bound to `127.0.0.1`.
+- **The emulator itself is the part that is not available here.** Ryujinx was
+  discontinued in October 2024, its GitHub mirrors answer HTTP 451, and running
+  any title in a surviving fork still needs `prod.keys` and a firmware dump from
+  a console — which hard rule 1 forbids this project from having. So this rung
+  is available in principle and not executable in this environment; the honest
+  status of the `ssl` answer, and what an emulator run would and would not have
+  proven, is recorded in
+  [DEVELOPMENT.md](DEVELOPMENT.md#m0-1-the-measurement-and-the-decision).
+- Whichever way that resolves, the same NRO is what runs first on a **backup SD**
+  at M8 — still never an auto-boot sysmodule.
 
 ## Rung 3 — the v1 gate and real hardware (M8)
 
@@ -558,7 +582,8 @@ Do not begin M8 until **M8-1** is fully checked:
 
 - Sync (M2), downloads (M3), auth (M1), config+IPC (M5) all green on host +
   docker RomM.
-- `ssl` backend proven on Ryujinx (or isolated NRO on backup SD).
+- `ssl` backend proven in an emulator or on an isolated NRO on a backup SD —
+  `tlsprobe/` is the thing to run, and M0-1 left it built and unrun.
 - Backups verified by tests; a tagged v1 build (M6); a known-good NAND/SD backup.
 
 Then **M8-2**: on a spare/backup SD or emuMMC, run the NRO first, install the
@@ -571,7 +596,11 @@ sysmodule **disabled**, and only sync against a **disposable** collection with
   handling, downloads + resume + hash verify, config parsing, `state.db`, backup
   guarantees, the IPC command/response protocol.
 - **Emulator (rung 2):** the `ssl`-service TLS path and libnx fs/socket calls —
-  as far as Ryujinx implements them.
+  as far as the emulator implements them, which for the certificate half of the
+  TLS design is *not at all*: Ryujinx stubs `ImportServerPki` and
+  `SetVerifyOption` and validates against the host's trust store instead
+  ([DEVELOPMENT.md](DEVELOPMENT.md#m0-1-the-measurement-and-the-decision)). The
+  transport half is genuinely exercisable there; the PKI half is hardware-only.
 - **Only real hardware (M8):** sysmodule heap behavior under Atmosphère, boot-time
   scheduling, ovl-sysmodules toggling, and the Tesla/Ultrahand overlay UI itself
   (emulators don't load overlays). These are deliberately the *last* things

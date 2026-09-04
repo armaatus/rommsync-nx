@@ -18,6 +18,13 @@
 #                                  a failed run leaves no half-built objects
 #                                  behind and no root-owned files in the
 #                                  worktree.
+#   test_switch_build.sh tlsprobe  ...and the M0-1 probe builds as a real NRO,
+#                                  reporting the footprint it costs. Separate
+#                                  from `builds` because it is a spike, not a
+#                                  shipped target: it may be retired when M8
+#                                  lands the real backend, and retiring it
+#                                  should not touch the assertions about the two
+#                                  targets that ship (tlsprobe/README.md).
 #
 # `ci` needs nothing but the checkout, so it runs everywhere. `builds` needs
 # Docker and the devkitpro/devkita64 image, which the host CI runner does not
@@ -55,14 +62,14 @@ phase_ci() {
   job="$(switch_build_job)"
   [ -n "$job" ] || fail "no switch-build job in .github/workflows/ci.yml"
 
-  for target in sysmodule overlay; do
+  for target in sysmodule overlay tlsprobe; do
     [ -f "$REPO_ROOT/$target/Makefile" ] || fail "$target/Makefile is missing"
     grep -q -- "make -C $target" <<<"$job" || fail "switch-build does not build $target"
   done
 
   # The guard, in any of the shapes it could come back as: a conditional on the
   # Makefile's existence, or the ::notice:: that stood in for a real build.
-  if grep -qE '\[ *-f +(sysmodule|overlay)/Makefile' <<<"$job"; then
+  if grep -qE '\[ *-f +(sysmodule|overlay|tlsprobe)/Makefile' <<<"$job"; then
     fail "switch-build still guards the build on the Makefile existing"
   fi
   if grep -q '::notice::' <<<"$job"; then
@@ -74,7 +81,7 @@ phase_ci() {
   grep -q 'if-no-files-found: error' <<<"$job" ||
     fail "switch-build would publish an empty artifact set"
 
-  echo "ok: switch-build builds both targets and requires their artifacts"
+  echo "ok: switch-build builds all three targets and requires their artifacts"
 }
 
 # --- the real cross-compile ---------------------------------------------------
@@ -159,8 +166,69 @@ phase_builds() {
   echo "ok: .nsp and .ovl built, signed and carrying core/ $version"
 }
 
+
+# --- the M0-1 probe ------------------------------------------------------------
+
+phase_tlsprobe() {
+  command -v docker >/dev/null 2>&1 || skip "no docker"
+  docker info >/dev/null 2>&1 || skip "docker daemon not running"
+  docker image inspect "$IMAGE" >/dev/null 2>&1 ||
+    skip "$IMAGE not pulled (docker pull $IMAGE)"
+
+  SCRATCH="$(mktemp -d)"
+  cp "$REPO_ROOT/VERSION" "$REPO_ROOT/switch.mk" "$SCRATCH/"
+  cp -R "$REPO_ROOT/core" "$REPO_ROOT/tlsprobe" "$SCRATCH/"
+  rm -rf "$SCRATCH/tlsprobe/build"
+  rm -f "$SCRATCH"/tlsprobe/rommsync-tlsprobe.*
+
+  local log="$SCRATCH/build.log"
+  if ! docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work "$IMAGE" \
+        bash -lc 'make -C tlsprobe -j"$(nproc)"' >"$log" 2>&1; then
+    cat "$log" >&2
+    fail "the tlsprobe build failed"
+  fi
+
+  local nro="$SCRATCH/tlsprobe/rommsync-tlsprobe.nro"
+  [ -s "$nro" ] || fail "no rommsync-tlsprobe.nro"
+  # NRO0 sits at 0x10; the first 16 bytes are the entry branch and the mod0
+  # offset. A .nro without it is a file hbmenu will not launch.
+  [ "$(dd if="$nro" bs=1 skip=16 count=4 2>/dev/null)" = "NRO0" ] ||
+    fail "rommsync-tlsprobe.nro has no NRO0 magic"
+
+  # The probe asks for version.hpp without compiling core/ (ROMMSYNC_WANT_VERSION
+  # in tlsprobe/Makefile). If that knob stops working the probe still builds and
+  # still runs -- it just reports a version it did not get from VERSION, which is
+  # the one thing a heap measurement must not do.
+  local version
+  version="$(cat "$REPO_ROOT/VERSION")"
+  grep -q "kVersion = \"$version\"" "$SCRATCH/tlsprobe/build/rommsync/version.hpp" ||
+    fail "the probe's version.hpp was not generated from VERSION ($version)"
+
+  # ...and core/ is NOT in it. The measurement is only attributable if the image
+  # holds the TLS path and nothing else (tlsprobe/Makefile).
+  #
+  # The listing's existence is asserted first, because this is a *negative*
+  # check: an absent file makes grep exit 1, which reads as "no core symbol
+  # found" and passes. The path comes from devkitPro's base_rules rather than
+  # from switch.mk, so it can move without anything in this repo changing.
+  local lst="$SCRATCH/tlsprobe/build/rommsync-tlsprobe.lst"
+  [ -s "$lst" ] || fail "no symbol listing at $lst; the core/ check would pass vacuously"
+  if grep -q 'rommsync::version()' "$lst"; then
+    fail "core/ was linked into the probe; its footprint no longer means what it says"
+  fi
+
+  # The number this target exists to produce, printed on every run so a change
+  # in it is visible in the log rather than only on someone's console.
+  docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work "$IMAGE" \
+    bash -lc '/opt/devkitpro/devkitA64/bin/aarch64-none-elf-size \
+      tlsprobe/rommsync-tlsprobe.elf'
+
+  echo "ok: the M0-1 probe builds as an NRO carrying $version, without core/"
+}
+
 case "${1:-}" in
-  ci)     phase_ci ;;
-  builds) phase_builds ;;
-  *)      echo "usage: $0 {ci|builds}" >&2; exit 2 ;;
+  ci)       phase_ci ;;
+  builds)   phase_builds ;;
+  tlsprobe) phase_tlsprobe ;;
+  *)        echo "usage: $0 {ci|builds|tlsprobe}" >&2; exit 2 ;;
 esac

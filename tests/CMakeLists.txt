@@ -419,6 +419,16 @@ add_test(NAME orca.teardown_stops_watcher
          COMMAND "${BASH_PROGRAM}" "${ORCA_TEARDOWN_TEST}" watcher)
 set_tests_properties(orca.teardown_stops_watcher PROPERTIES TIMEOUT 60)
 
+# `down` only removes services whose profile is active, so the TLS terminator --
+# behind the `tls` profile, and `restart: unless-stopped` like everything else
+# here -- is invisible to a teardown that does not name it: it survives, comes
+# back on the next docker start, holds that worktree's TLS_PORT, and blocks the
+# network removal behind it. Reads the compose file and the two scripts, so it
+# needs no docker.
+add_test(NAME orca.teardown_covers_profiles
+         COMMAND "${BASH_PROGRAM}" "${ORCA_TEARDOWN_TEST}" profiles)
+set_tests_properties(orca.teardown_covers_profiles PROPERTIES TIMEOUT 60)
+
 add_test(NAME orca.reap_spares_live_worktrees
          COMMAND "${BASH_PROGRAM}" "${ORCA_TEARDOWN_TEST}" reap)
 if(NOT ROMMSYNC_REQUIRE_RIG)
@@ -458,6 +468,36 @@ set_tests_properties(switch.ci_requires_artifacts PROPERTIES TIMEOUT 60)
 add_test(NAME switch.builds
          COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" builds)
 set_tests_properties(switch.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+# The M0-1 probe (tlsprobe/README.md). Same image, same reason it may skip as
+# switch.builds above -- and the same enforcement elsewhere: the `switch-build`
+# job builds it on every push and checks the NRO magic there.
+add_test(NAME switch.tlsprobe
+         COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" tlsprobe)
+set_tests_properties(switch.tlsprobe PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+# --- the TLS terminator the M0-1 probe aims at -------------------------------
+# The rig is plain HTTP because the host suite reaches it over loopback; the
+# probe needs a real handshake to complete, so server/testing/docker-compose.yml
+# has a `tls` profile that nothing else starts. `isolated` and `cert` read the
+# compose file and mint a certificate, so they never skip -- and `isolated` is
+# the one that matters: it is what keeps this out of every other test's way.
+set(TLS_FIXTURE_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_tls_fixture.sh")
+
+add_test(NAME tls.isolated COMMAND "${BASH_PROGRAM}" "${TLS_FIXTURE_TEST}" isolated)
+add_test(NAME tls.cert COMMAND "${BASH_PROGRAM}" "${TLS_FIXTURE_TEST}" cert)
+add_test(NAME tls.serves COMMAND "${BASH_PROGRAM}" "${TLS_FIXTURE_TEST}" serves)
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  # `cert` skips on a machine with no openssl, which is the same 77 `serves`
+  # uses for a stopped Docker -- without this it would be a hard red there. In
+  # CI both are failures, which is the point of the option.
+  set_tests_properties(tls.cert tls.serves PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+# `cert` re-mints the certificate the running terminator is serving (and
+# restarts it onto the new one), so it must not run while `serves` is asking
+# that terminator for a verified 200.
+set_tests_properties(tls.isolated tls.cert tls.serves
+                     PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 
 # --- the M0 exit gate's mechanical clauses -----------------------------------
 # "No test in the suite requires a console or a production server"

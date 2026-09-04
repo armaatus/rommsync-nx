@@ -120,8 +120,10 @@ for project in $stale; do
 
   # This repo's compose file describes every rmx-* stack -- only the project
   # name differs -- so it can tear down a stack whose own worktree is long gone.
+  # --profile tls for the same reason as archive.sh: an inactive profile's
+  # containers are invisible to `down`, and the TLS terminator restarts itself.
   docker compose -p "$project" -f server/testing/docker-compose.yml \
-    down -v --remove-orphans || echo "!! down failed for $project"
+    --profile tls down -v --remove-orphans || echo "!! down failed for $project"
 
   # `down` only removes what it recognises as its own: a stack that was
   # half-dismantled by hand keeps its network, and sometimes a stray container,
