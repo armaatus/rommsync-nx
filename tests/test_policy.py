@@ -26,7 +26,8 @@ Three phases, run as separate CTest entries so a red run names which clause brok
              the internet from inside its own code -- `loopback` covers the
              configured URLs and code review covers the rest -- but it does
              catch the shape the policy is actually at risk from: a test that
-             shells out to a console, an emulator, or a real server.
+             shells out to a console, an emulator, or a real server. Building or
+             inspecting a .nsp/.ovl on the host is fine; running one is not.
 """
 import argparse
 import json
@@ -199,9 +200,16 @@ def phase_guards(args) -> int:
 # Things a test command may not name. Not a blocklist of everything dangerous --
 # it is the set of ways a test would reach off this machine, which is what the
 # gate forbids.
+#
+# Deliberately NOT here: .nsp, .ovl and .nro. Building a Switch artifact on the
+# host and asserting something about the file is host-local work, and M0-3 is
+# going to want exactly that when it finishes the devkitPro job. What the gate
+# forbids is *dispatching* to a device or an emulator, which is what the names
+# below catch -- and a test whose argv[0] is itself a Horizon binary is already
+# caught by the "not an executable on this machine" check.
 FORBIDDEN = re.compile(
     r"(?:^|[/\s])(?:ssh|scp|adb|nxlink|nxdumptool|ryujinx|yuzu|sudachi|qemu[\w-]*)(?:$|[\s])"
-    r"|/dev/tty|/dev/cu\.|\.nro\b|\.nsp\b|\.ovl\b",
+    r"|/dev/tty|/dev/cu\.",
     re.IGNORECASE,
 )
 
