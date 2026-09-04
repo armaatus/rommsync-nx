@@ -25,10 +25,9 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
-#include <random>
 #include <string>
 
-#include "rig.hpp"
+#include "harness.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/sync.hpp"
 
@@ -79,39 +78,13 @@ std::int64_t FirstRomId(http::HttpClient& client, const std::string& base, const
   return id != nullptr && id->is_integer() ? id->integer() : 0;
 }
 
-/// The operation the server planned for `slot`, or nullptr. Negotiate also
-/// reports saves this test never mentioned -- anything the fixture device has no
-/// history for -- so every assertion is scoped to the slot this run created.
-const json::Value* OperationFor(const json::Value& plan, const std::string& slot) {
-  const json::Value* operations = plan.Find("operations");
-  if (operations == nullptr) {
-    return nullptr;
-  }
-  for (const json::Value& operation : operations->elements()) {
-    const json::Value* value = operation.Find("slot");
-    if (value != nullptr && value->is_string() && value->string() == slot) {
-      return &operation;
-    }
-  }
-  return nullptr;
-}
-
-std::string Field(const json::Value& object, const char* key) {
-  const json::Value* value = object.Find(key);
-  return value != nullptr && value->is_string() ? value->string() : std::string();
-}
-
-/// A slot nobody else is using. RomM pairs saves on `(rom_id, slot)`, so a
-/// constant would make one run's leftovers another run's sync history -- and a
-/// run that failed before its cleanup does leave one behind. A timestamp alone
-/// is not enough: `understood` finishes in a tenth of a second, so
-/// `ctest --repeat until-fail:N` puts several runs inside the same second.
-std::string UniqueSlot(const char* scenario) {
-  std::random_device entropy;
-  const std::int64_t now = sync::UnixSeconds(std::chrono::system_clock::now());
-  return std::string("m2-1-") + scenario + "-" + std::to_string(now) + "-" +
-         std::to_string(entropy());
-}
+// Reading a plan, and naming a slot nobody else is using, are the harness's
+// (tests/harness.hpp): every scenario that negotiates needs them, and two
+// copies of "find the operation for my slot" is two places for the same
+// mistake.
+using harness::Field;
+using harness::OperationFor;
+using harness::UniqueSlot;
 
 /// The client's own view of one save, as the sysmodule will build it.
 sync::ClientSaveState LocalSave(const Fixture& fixture, const std::string& slot,
@@ -151,7 +124,7 @@ std::string Rename(std::string body, const std::string& from, const std::string&
 
 int Accepted(http::HttpClient& client, const std::string& base, const Fixture& fixture) {
   rig::Checks checks;
-  const std::string slot = UniqueSlot("accepted");
+  const std::string slot = UniqueSlot("m2-1-accepted");
 
   sync::SyncNegotiatePayload payload;
   payload.device_id = fixture.device_id;
@@ -192,7 +165,7 @@ int Accepted(http::HttpClient& client, const std::string& base, const Fixture& f
 
 int Required(http::HttpClient& client, const std::string& base, const Fixture& fixture) {
   rig::Checks checks;
-  const std::string slot = UniqueSlot("required");
+  const std::string slot = UniqueSlot("m2-1-required");
 
   sync::SyncNegotiatePayload payload;
   payload.device_id = fixture.device_id;
@@ -212,7 +185,7 @@ int Required(http::HttpClient& client, const std::string& base, const Fixture& f
 
 int Understood(http::HttpClient& client, const std::string& base, const Fixture& fixture) {
   rig::Checks checks;
-  const std::string slot = UniqueSlot("understood");
+  const std::string slot = UniqueSlot("m2-1-understood");
   const std::string bytes = "m2-1 probe save\n";
   const std::string path = rig::ScratchDir() + "/m2-1-probe.srm";
   if (!rig::WriteFile(path, bytes)) {

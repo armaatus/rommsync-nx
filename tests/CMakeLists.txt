@@ -306,6 +306,53 @@ foreach(scenario IN LISTS SYNC_SCENARIOS)
   set_tests_properties(sync.${scenario} PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 endforeach()
 
+# --- the host harness, and the edge cases only the fault proxy can force -----
+# M0-5. One CTest entry per scenario, same shape as the rest of this file, so a
+# red run names the behaviour rather than "the harness tests".
+#
+# `harness.sandbox` is deliberately NOT in the skippable list: it is the
+# harness's own guarantee -- a per-test SD card that is torn down, and the
+# backup-before-overwrite audit built into it -- and it needs no server, so it
+# must stay checked with Docker stopped. That is exactly when a change to the
+# sandbox is most likely to go in unnoticed.
+add_executable(test_harness test_harness.cpp)
+target_link_libraries(test_harness PRIVATE rommsync::host)
+target_include_directories(test_harness PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_harness PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env"
+  # The seeded library RomM serves, so a resumed 120 MiB download is compared
+  # against the bytes on the other side of the proxy rather than a hash of them.
+  ROMMSYNC_FIXTURE_LIBRARY="${CMAKE_SOURCE_DIR}/server/testing/library")
+
+add_test(NAME harness.sandbox COMMAND test_harness sandbox)
+set_tests_properties(harness.sandbox PROPERTIES TIMEOUT 60)
+
+set(HARNESS_SCENARIOS
+  disarms         # an armed fault cannot outlive the scope that armed it
+  expired         # 401 mid-flow: a response, not a transport error, and not a verdict
+  conflict        # both sides moved past the last sync
+  same_timestamp  # ...and the no-history conflict a switch on one reason drops
+  partial         # the Nth operation fails; the session records it accurately
+  resume          # a TCP reset mid-rom, then Range resume, byte for byte
+  truncate        # a clean short body, caught only by the caller's expected size
+  stall           # a server that says nothing: one tick lost, nothing else
+  multifile       # the two-disc fixture, and the two traps around it
+  backup          # back up FIRST, proven by interrupting the overwrite
+)
+
+foreach(scenario IN LISTS HARNESS_SCENARIOS)
+  add_test(NAME harness.${scenario} COMMAND test_harness ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(harness.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  # RUN_SERIAL for the same reason as http.* and pair.*: the fault proxy holds
+  # one armed scenario for every client. These also upload and delete saves on
+  # the shared fixture, so two at once would read each other's library.
+  set_tests_properties(harness.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+endforeach()
+
 # --- the committed API captures still match a live RomM ----------------------
 # server/contract/captures/ is what the docs quote and what M1/M2 will be coded
 # against. Re-running the probe here is what stops a RomM upgrade from being
