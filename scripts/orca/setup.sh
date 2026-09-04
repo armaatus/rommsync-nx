@@ -41,6 +41,10 @@ echo "==> starting RomM ($COMPOSE_PROJECT_NAME on :$ROMM_PORT)"
 echo "==> provisioning the fixture (scan, collection, client token)"
 ./.venv/bin/python server/testing/provision.py --base-url "$ROMM_BASE_URL"
 
+# Last, because it reports on the tab that shows everything above: creating it
+# earlier would only prove the tab exists, not that there was a stack to follow.
+./scripts/orca/ensure-romm-tab.sh
+
 echo
 echo "worktree ready."
 echo "  RomM        $ROMM_BASE_URL"

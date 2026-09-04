@@ -20,6 +20,16 @@ cd "$REPO_ROOT"
 COMPOSE="./scripts/orca/compose.sh"
 POLL_SECONDS="${ROMM_LOGS_POLL_SECONDS:-2}"
 
+# A pidfile, so setup.sh can answer "is a tab already following?" without having
+# to guess at Orca's terminal state -- see ensure-romm-tab.sh. Overridable so a
+# test can run a follower without disturbing the real tab's file.
+PIDFILE="${ROMM_LOGS_PIDFILE:-$REPO_ROOT/.orca/romm-logs.pid}"
+mkdir -p "$(dirname "$PIDFILE")" 2>/dev/null
+echo $$ >"$PIDFILE"
+# Compared against $$ rather than removed outright: a follower started after this
+# one owns the file now, and must not have it deleted out from under it.
+trap '[ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$PIDFILE"' EXIT
+
 # One running container is enough to attach. `up -d` creates romm-db first and
 # only creates romm once the database is healthy, so waiting for all three would
 # show nothing at all when a bring-up stops half way -- an image pull failing

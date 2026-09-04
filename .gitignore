@@ -10,6 +10,7 @@ token.dat
 server/testing/library/
 server/testing/fixture-auth.env
 .venv/
+.orca/
 TASK.md
 
 # build output
