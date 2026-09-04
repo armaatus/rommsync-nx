@@ -1,10 +1,11 @@
 // Shared helpers for tests that talk to this worktree's RomM through the fault
 // proxy. See docs/TESTING.md; the ports come from .env via tests/CMakeLists.txt.
 //
-// There is no JSON library here on purpose (CLAUDE.md: minimal dependencies).
-// These tests assert on HTTP behaviour, and the few fields they read out of a
-// RomM response are read with a substring scan that fails loudly rather than
-// silently returning something plausible.
+// These tests assert on HTTP behaviour, not on payload shapes, and the few
+// fields they read out of a RomM response are read with a substring scan that
+// fails loudly rather than silently returning something plausible. Anything
+// that cares about a *response shape* uses rommsync::json instead -- see
+// tests/test_auth_shapes.cpp.
 #pragma once
 
 #include <algorithm>
@@ -16,6 +17,7 @@
 #include <string>
 #include <string_view>
 
+#include "checks.hpp"
 #include "rommsync/host/curl_http_client.hpp"
 #include "rommsync/http.hpp"
 
@@ -45,46 +47,24 @@ inline std::string BaseUrl() {
 
 inline std::string ScratchDir() { return ROMMSYNC_TEST_SCRATCH; }
 
-// --- a very small assertion harness -----------------------------------------
+// --- assertions ---------------------------------------------------------------
 
-class Checks {
+/// The shared harness (tests/checks.hpp) plus the two HTTP-shaped assertions
+/// only the rig tests need.
+class Checks : public ::checks::Checks {
  public:
-  void Expect(bool condition, std::string_view what) {
-    if (!condition) {
-      std::cerr << "  FAIL: " << what << "\n";
-      ++failures_;
-    }
-  }
-
-  template <typename T, typename U>
-  void ExpectEq(const T& actual, const U& expected, std::string_view what) {
-    if (!(actual == expected)) {
-      std::cerr << "  FAIL: " << what << " -- expected " << expected << ", got " << actual
-                << "\n";
-      ++failures_;
-    }
-  }
-
   void ExpectOk(const http::Result& result, std::string_view what) {
     if (!result.ok()) {
-      std::cerr << "  FAIL: " << what << " -- " << http::ToString(result.error) << ": "
-                << result.message << "\n";
-      ++failures_;
+      Fail(std::string(what) + " -- " + http::ToString(result.error) + ": " + result.message);
     }
   }
 
   void ExpectError(const http::Result& result, http::Error expected, std::string_view what) {
     if (result.error != expected) {
-      std::cerr << "  FAIL: " << what << " -- expected " << http::ToString(expected) << ", got "
-                << http::ToString(result.error) << " (" << result.message << ")\n";
-      ++failures_;
+      Fail(std::string(what) + " -- expected " + http::ToString(expected) + ", got " +
+           http::ToString(result.error) + " (" + result.message + ")");
     }
   }
-
-  int failures() const { return failures_; }
-
- private:
-  int failures_ = 0;
 };
 
 // --- json-ish scraping -------------------------------------------------------
