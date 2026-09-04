@@ -140,7 +140,8 @@ set_tests_properties(orca.romm_tab_pidfile orca.romm_tab_pidfile_streaming
 # workspace, so they never skip.
 set(ORCA_BROWSER_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_orca_browser.sh")
 
-foreach(phase opens reuses foreign no_romm submits no_draft unstable)
+foreach(phase opens reuses foreign no_romm submits no_draft unstable
+              watch_needs_issue watch_late_draft watch_grace watch_submits watch_single)
   add_test(NAME orca.browser_${phase}
            COMMAND "${BASH_PROGRAM}" "${ORCA_BROWSER_TEST}" ${phase})
   set_tests_properties(orca.browser_${phase} PROPERTIES TIMEOUT 60)
@@ -169,6 +170,12 @@ set(ORCA_TEARDOWN_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_orca_teardown.sh")
 add_test(NAME orca.teardown_derives_project
          COMMAND "${BASH_PROGRAM}" "${ORCA_TEARDOWN_TEST}" derives)
 set_tests_properties(orca.teardown_derives_project PROPERTIES TIMEOUT 60)
+
+# The autostart watcher outlives setup.sh on purpose, so removal has to stop it
+# -- and must not signal a pid the watcher merely left behind.
+add_test(NAME orca.teardown_stops_watcher
+         COMMAND "${BASH_PROGRAM}" "${ORCA_TEARDOWN_TEST}" watcher)
+set_tests_properties(orca.teardown_stops_watcher PROPERTIES TIMEOUT 60)
 
 add_test(NAME orca.reap_spares_live_worktrees
          COMMAND "${BASH_PROGRAM}" "${ORCA_TEARDOWN_TEST}" reap)
