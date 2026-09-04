@@ -263,6 +263,47 @@ void ReaderReportsTheField(checks::Checks& c) {
   }
 }
 
+/// The writer half. Building a request body or a line of `token.dat` by
+/// concatenation is the one way to turn a value into syntax, so the assertions
+/// here are all about characters that would escape their quotes.
+void QuotesWhatItIsGiven(checks::Checks& c) {
+  c.ExpectEq(json::Quote("plain"), std::string("\"plain\""), "an ordinary string");
+  c.ExpectEq(json::Quote(""), std::string("\"\""), "an empty string");
+  c.ExpectEq(json::Quote("say \"hi\""), std::string("\"say \\\"hi\\\"\""), "embedded quotes");
+  c.ExpectEq(json::Quote("a\\b"), std::string("\"a\\\\b\""), "a backslash");
+  c.ExpectEq(json::Quote("one\ntwo\ttab\r"), std::string("\"one\\ntwo\\ttab\\r\""),
+             "the named escapes");
+  c.ExpectEq(json::Quote(std::string("a\0b", 3)), std::string("\"a\\u0000b\""),
+             "a NUL, which is legal in JSON and lethal in a C string");
+  // Split literals on purpose: C++ hex escapes are maximal munch, so
+  // "\x01f" is one character (0x1F) rather than 0x01 followed by 'f'.
+  c.ExpectEq(json::Quote("\x01" "\x1f"), std::string("\"\\u0001\\u001f\""),
+             "the other control characters");
+  // UTF-8 goes through as bytes: escaping it would be lossless but unreadable,
+  // and RomM speaks UTF-8 on both directions.
+  c.ExpectEq(json::Quote("Pokémon"), std::string("\"Pokémon\""), "multi-byte UTF-8");
+
+  c.ExpectEq(json::QuoteArray({}), std::string("[]"), "an empty array");
+  c.ExpectEq(json::QuoteArray({"me.read"}), std::string(R"(["me.read"])"), "one element");
+  c.ExpectEq(json::QuoteArray({"me.read", "roms.read"}), std::string(R"(["me.read","roms.read"])"),
+             "several");
+
+  // The round trip is what actually matters: whatever comes out has to parse
+  // back to the same bytes, or a device name with a quote in it silently
+  // becomes a different request.
+  const std::string kAwkward[] = {"plain", "", "say \"hi\"", "a\\b", "line\nbreak",
+                                  "Pokémon", "\x01" "control"};
+  for (const std::string& raw : kAwkward) {
+    const json::ParseResult document = json::Parse("{\"v\":" + json::Quote(raw) + "}");
+    c.Expect(document.ok(), "a quoted value re-parses: " + document.error.Describe());
+    const json::Value* value = document.value.Find("v");
+    c.Expect(value != nullptr && value->is_string(), "and is still a string");
+    if (value != nullptr) {
+      c.ExpectEq(value->string(), raw, "and is unchanged");
+    }
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -270,5 +311,6 @@ int main() {
   Accepts(c);
   Rejects(c);
   ReaderReportsTheField(c);
+  QuotesWhatItIsGiven(c);
   return c.failures() == 0 ? 0 : 1;
 }

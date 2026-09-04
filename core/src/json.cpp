@@ -485,6 +485,67 @@ ParseResult Parse(std::string_view text) {
   return parser.Run();
 }
 
+std::string Quote(std::string_view value) {
+  static const char kHex[] = "0123456789abcdef";
+  std::string out;
+  out.reserve(value.size() + 2);
+  out.push_back('"');
+  for (const char raw : value) {
+    const unsigned char byte = static_cast<unsigned char>(raw);
+    switch (byte) {
+      case '"':
+        out += "\\\"";
+        break;
+      case '\\':
+        out += "\\\\";
+        break;
+      case '\b':
+        out += "\\b";
+        break;
+      case '\f':
+        out += "\\f";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        // Everything below 0x20 is forbidden raw inside a JSON string, NUL
+        // included -- and NUL is the one that matters, because a value carrying
+        // one is exactly what `Reader::UsableString` refuses on the way back in.
+        // Escaping it keeps the file readable by our own parser rather than
+        // making it a syntax error nobody can diagnose.
+        if (byte < 0x20) {
+          out += "\\u00";
+          out.push_back(kHex[(byte >> 4) & 0xF]);
+          out.push_back(kHex[byte & 0xF]);
+        } else {
+          out.push_back(raw);
+        }
+        break;
+    }
+  }
+  out.push_back('"');
+  return out;
+}
+
+std::string QuoteArray(const std::vector<std::string>& values) {
+  std::string out("[");
+  for (std::size_t at = 0; at < values.size(); ++at) {
+    if (at != 0) {
+      out.push_back(',');
+    }
+    out += Quote(values[at]);
+  }
+  out.push_back(']');
+  return out;
+}
+
 bool Reader::UsableString(Reader& reader, std::string_view key, const std::string& value) {
   if (value.empty()) {
     return reader.Fail(key, "is empty");

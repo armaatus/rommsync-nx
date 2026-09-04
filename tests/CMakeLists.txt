@@ -42,6 +42,16 @@ target_compile_definitions(test_auth_shapes PRIVATE
   ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures")
 add_test(NAME auth.shapes COMMAND test_auth_shapes)
 
+# token.dat. Pure filesystem and parsing, so this never skips either -- and the
+# guarantee it exists for (a failed write costs the new token, never the working
+# one) is checkable with no server at all.
+add_executable(test_token_store test_token_store.cpp)
+target_link_libraries(test_token_store PRIVATE rommsync::core)
+target_include_directories(test_token_store PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_token_store PRIVATE
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+add_test(NAME core.token_store COMMAND test_token_store)
+
 # --- rig smoke test: proves docker RomM + fault proxy + ctest all work -------
 # Uses libcurl directly on purpose. It tests the RIG, not our code, and must
 # keep working while M0-2 replaces it as the way production code speaks HTTP.
@@ -119,6 +129,46 @@ foreach(scenario IN LISTS HTTP_SCENARIOS)
   # The fault proxy is a single armed scenario shared by every client, so two of
   # these running at once would inject each other's faults.
   set_tests_properties(http.${scenario} PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
+endforeach()
+
+# --- the device-code pairing flow against the real rig -----------------------
+# Same shape as the http.* tests: one CTest entry per scenario, so a red run
+# names the behaviour. Every code is one RomM issued, and the approvals go
+# through RomM's own /api/auth/device/approve -- the endpoint that lets a test
+# be the human the grant assumes (docs/TESTING.md).
+add_executable(test_pairing test_pairing.cpp)
+target_link_libraries(test_pairing PRIVATE rommsync::host)
+target_compile_definitions(test_pairing PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+# `starting` drives Begin() on one thread and status() on another, which is the
+# threading contract the header promises the overlay.
+target_link_libraries(test_pairing PRIVATE Threads::Threads)
+
+set(PAIR_SCENARIOS
+  happy         # init -> approve -> token -> persisted
+  starting      # status() answers, and says "starting", while init is in flight
+  mid_poll      # approval that lands after several polls, at the server's interval
+  denied        # a human refusing it, and the re-pair that follows
+  expired       # our own deadline, and a code the server considers spent
+  retry         # 5xx mid-poll: back off, do not abandon a live code
+  unauthorized  # a 401 from something in front of RomM: retry, then diagnose
+  rejection_streak # ...and the budget counts consecutive ones, not lifetime ones
+  stall         # a poll that hangs does not wedge the state machine
+  drop          # ...nor does one whose connection dies
+  lost_grant    # the grant that never got home: the code is spent, so stop
+  payload       # the IPC payload the overlay decodes, and what it must not carry
+)
+
+foreach(scenario IN LISTS PAIR_SCENARIOS)
+  add_test(NAME pair.${scenario} COMMAND test_pairing ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(pair.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  # RUN_SERIAL for the same reason as http.*: the fault proxy holds one armed
+  # scenario for every client. These also wait out real poll intervals, so the
+  # timeout has to cover a few of them.
+  set_tests_properties(pair.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 endforeach()
 
 # --- the committed API captures still match a live RomM ----------------------
