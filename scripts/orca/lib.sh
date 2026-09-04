@@ -73,19 +73,27 @@ orca_project_remnants() {
 # than whatever it was trying to arrange. macOS ships no `timeout`, hence the
 # manual watchdog.
 #
+# Polled in 50ms ticks rather than whole seconds, which is not a micro-
+# optimisation: a child that has already exited is a zombie until bash reaps it,
+# and `kill -0` succeeds on a zombie. With a one-second sleep every call
+# therefore cost a full second even when the CLI answered instantly. setup.sh
+# makes dozens of these, and `agent-autostart.sh --watch` alone makes two per
+# poll -- which is what turned a test of it into a 21-second one, close enough
+# to its 60s ctest timeout to go red on a loaded machine.
+#
 # Returns the command's status, or 124 when the deadline was hit.
 orca_run_with_deadline() {
   local seconds="$1" out="$2"; shift 2
   "$@" >"$out" 2>/dev/null &
-  local cli=$! waited=0
+  local cli=$! ticks=0 limit=$((seconds * 20))
   while kill -0 "$cli" 2>/dev/null; do
-    if [ "$waited" -ge "$seconds" ]; then
+    if [ "$ticks" -ge "$limit" ]; then
       kill "$cli" 2>/dev/null
       wait "$cli" 2>/dev/null
       return 124
     fi
-    sleep 1
-    waited=$((waited + 1))
+    sleep 0.05
+    ticks=$((ticks + 1))
   done
   wait "$cli"
 }
