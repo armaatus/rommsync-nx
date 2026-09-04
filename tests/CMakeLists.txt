@@ -50,7 +50,35 @@ target_link_libraries(test_token_store PRIVATE rommsync::core)
 target_include_directories(test_token_store PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(test_token_store PRIVATE
   ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+if(UNIX)
+  # "kill the process mid-write" is an acceptance criterion, and forcing it needs
+  # fork() and RLIMIT_FSIZE. The host rig is POSIX (docs/TESTING.md); on anything
+  # else the scenario fails loudly rather than quietly not running.
+  target_compile_definitions(test_token_store PRIVATE ROMMSYNC_CAN_FORK=1)
+endif()
 add_test(NAME core.token_store COMMAND test_token_store)
+
+# The stable client_device_identifier, and the SHA-256 under it. Known-answer
+# vectors, a parser and the filesystem, so this never skips either -- and the
+# thing it guards (one console, one identifier, across a re-pair) is checkable
+# with no server at all.
+add_executable(test_device_identity test_device_identity.cpp)
+target_link_libraries(test_device_identity PRIVATE rommsync::core)
+target_include_directories(test_device_identity PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_device_identity PRIVATE
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+add_test(NAME core.device_identity COMMAND test_device_identity)
+
+# Least privilege, pinned to the document rather than to a second copy of the
+# list: the scopes this client asks for are read out of
+# docs/API_CONTRACT.md#scopes-to-request and compared. Reads one file, so it
+# never skips.
+add_executable(test_scopes test_scopes.cpp)
+target_link_libraries(test_scopes PRIVATE rommsync::core)
+target_include_directories(test_scopes PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_scopes PRIVATE
+  ROMMSYNC_API_CONTRACT="${CMAKE_SOURCE_DIR}/docs/API_CONTRACT.md")
+add_test(NAME auth.scopes COMMAND test_scopes)
 
 # --- rig smoke test: proves docker RomM + fault proxy + ctest all work -------
 # Uses libcurl directly on purpose. It tests the RIG, not our code, and must
@@ -150,6 +178,7 @@ set(PAIR_SCENARIOS
   starting      # status() answers, and says "starting", while init is in flight
   mid_poll      # approval that lands after several polls, at the server's interval
   denied        # a human refusing it, and the re-pair that follows
+  repair        # re-pair with the same identifier: one device in RomM, not two
   expired       # our own deadline, and a code the server considers spent
   retry         # 5xx mid-poll: back off, do not abandon a live code
   unauthorized  # a 401 from something in front of RomM: retry, then diagnose
@@ -290,6 +319,39 @@ if(NOT ROMMSYNC_REQUIRE_RIG)
   set_tests_properties(orca.reap_spares_live_worktrees PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 set_tests_properties(orca.reap_spares_live_worktrees PROPERTIES TIMEOUT 60)
+
+# --- the Switch targets: sysmodule/, overlay/ and switch.mk ------------------
+# The devkitPro Makefiles are not driven by this build -- CMake builds the host
+# half and devkitA64 builds the console half (docs/DEVELOPMENT.md#toolchain) --
+# but the guarantee that they still produce something loadable belongs with
+# every other guarantee, in `ctest`.
+set(SWITCH_BUILD_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_switch_build.sh")
+
+# Reads .github/workflows/ci.yml and the two Makefiles, so it never skips: the
+# guards that let the job stay green over a Switch build that never happened
+# must not be able to come back unnoticed.
+add_test(NAME switch.ci_requires_artifacts
+         COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" ci)
+set_tests_properties(switch.ci_requires_artifacts PROPERTIES TIMEOUT 60)
+
+# The real cross-compile, in the same devkitpro/devkita64 image CI uses. It needs
+# that image, which the CI host runner does not have and will not pull for 2.7GB.
+#
+# Read the next line before changing it: this is the ONLY test in this file whose
+# SKIP_RETURN_CODE is not wrapped in if(NOT ROMMSYNC_REQUIRE_RIG). Every other
+# skippable test flips to a failure under that option precisely so CI cannot go
+# green on a skip -- and that is the right default, so the exception needs its
+# reason recorded rather than inferred. The reason is that this one's enforcement
+# lives in a different CI job: `switch-build` in .github/workflows/ci.yml runs
+# the same build, in the same image, on every push, and fails there. This entry
+# is its local equivalent, not its enforcement.
+#
+# So do not "fix" it by wrapping it like the others. That would fail the
+# host-tests job on a runner that has no devkitpro image -- which is every runner
+# the host job uses.
+add_test(NAME switch.builds
+         COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" builds)
+set_tests_properties(switch.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 
 # --- the M0 exit gate's mechanical clauses -----------------------------------
 # "No test in the suite requires a console or a production server"

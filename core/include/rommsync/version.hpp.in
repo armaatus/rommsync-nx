@@ -1,9 +1,10 @@
-// Generated from version.hpp.in by CMake. Do not edit the generated copy.
+// Generated from version.hpp.in into the build tree -- by CMake for the host
+// build, by switch.mk for the devkitPro ones. Do not edit the generated copy.
 #pragma once
 
 namespace rommsync {
 
-/// Project version, single-sourced from the top-level CMakeLists.txt.
+/// Project version, single-sourced from the VERSION file at the repo root.
 inline constexpr const char* kVersion = "@PROJECT_VERSION@";
 
 /// User agent sent on every request to RomM. RomM records the client string, so

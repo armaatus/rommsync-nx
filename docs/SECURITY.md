@@ -31,19 +31,73 @@ A sample Caddyfile lives in `server/README.md`.
 - The device-code flow issues a scoped bearer token. Request only the scopes in
   [API_CONTRACT.md](API_CONTRACT.md#scopes-to-request).
 - Revoke via RomM's client-tokens UI / `DELETE /api/client-tokens/{id}`; the
-  sysmodule handles the resulting `401` by prompting re-pair.
+  sysmodule handles the resulting `401` by prompting re-pair. This is the only
+  way to make a token that has been on an SD card stop working — deleting the
+  file is not.
 
 ## Token at rest on the SD
 
 The SD card is readable by any homebrew on the console and by anyone who pulls
-the card. Therefore:
+the card, and Horizon's FAT32 has **no permission bits** — there is nothing to
+restrict, and a client that claimed to restrict them would be claiming a
+mitigation it does not have. So the token is at rest in the clear, and that is
+a fact to design around rather than one to hide:
 
-- Store `token.dat` under `sdmc:/config/rommsync/` and keep it minimal.
-- Treat the token as a **bearer secret**: its blast radius is exactly the scopes
-  granted to one dedicated user — that's the mitigation, not filesystem secrecy.
-- Never log the token. Never commit a real `config.ini`/`token.dat` (see
-  `.gitignore`).
-- On "Re-pair" or factory reset, delete `token.dat`.
+- Its blast radius is exactly the scopes granted to one dedicated user. That is
+  the mitigation, not filesystem secrecy — which is why the requested scopes are
+  the documented minimum, checked by a test
+  ([API_CONTRACT.md](API_CONTRACT.md#scopes-to-request)) rather than asserted in
+  a comment, and why `me.write` is requested by nobody.
+- It is revocable. `DELETE /api/client-tokens/{id}` ends it, and the sysmodule
+  treats the resulting `401` as revoked rather than retrying it.
+- Store `token.dat` under `sdmc:/config/rommsync/` and keep it minimal: no
+  refresh token to store, and nothing in the record that RomM did not issue.
+
+What the client owes the user is that the secret never leaves that file by
+accident:
+
+- **Never logged.** Not by the store, not by the parser, not by the pairing
+  state machine, and not in the IPC payload the overlay renders. `json::Error`
+  never quotes a value; `DescribeStoredToken` is the one supported way to
+  summarise a pairing for a log or a diagnostics screen, and it reports the
+  token by length only. `core.token_store` asserts this with a needle rather
+  than leaving it to inspection.
+- **Genuinely discarded.** "Re-pair" and factory reset remove `token.dat` *and*
+  the `.tmp`/`.old` an interrupted commit can leave beside it. The **sweep** is
+  the part that does the work: unlinking only `token.dat` while `token.dat.old`
+  still held the same bearer token would have discarded nothing, and that is
+  what the test checks. Each file is zeroed before it is unlinked, but that
+  overwrite claims nothing — there is no `fsync` reachable from the standard
+  library, so a filesystem may drop the zeroed pages of an inode it is about to
+  unlink and never write them, and wear levelling can preserve the original
+  blocks regardless. Treat a token that has ever been on a card as recoverable
+  from that card, and **revoke it on the server** if that matters.
+- Never commit a real `config.ini`/`token.dat` (see `.gitignore`).
+
+## The console identifier
+
+RomM needs a value that is the same on every pairing of this console and
+different on another one. It does **not** need to know which console that is, so
+what it gets is `nx-` + the first 128 bits of a salted SHA-256 of the serial —
+never the serial itself, which identifies the hardware and, through a warranty
+record, a person. Details and the fallback for a platform with no stable value
+are in [AUTH.md](AUTH.md#client-identifier).
+
+The salt is domain separation, not secrecy: this repository is public, so the
+derivation is reproducible by anyone holding a serial to try. The property that
+protects the user is that the serial never leaves the console — not in a request
+body, not in `device.dat`, not in a log.
+
+The identifier survives a re-pair on purpose. Discarding it with the token would
+register the console in RomM a second time and give every save an empty sync
+history, which is a data problem dressed as a privacy improvement.
+
+The opposite mistake is worse, and the platform layer is where it would happen:
+a seed provider that substitutes a placeholder when it cannot read the serial
+gives *every affected console the same identifier*, so RomM treats them as one
+device and one console's saves overwrite another's. It must fail instead. The
+engine refuses a stable value too short to be a serial, which catches the shape
+that mistake usually takes but cannot catch a plausible-looking constant.
 
 ## What we never do
 

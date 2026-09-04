@@ -5,16 +5,22 @@
 // read back, so the two failure modes it has to rule out are a half-written file
 // and a record that parses into something unusable.
 //
-// The write is atomic: the record goes to `<path>.tmp` and is renamed onto
-// `path` only once it is complete, so a reader sees either the previous token or
-// the new one and never a splice of the two. That is the same reasoning as the
-// backup-before-overwrite rule for saves (docs/SYNC_PROTOCOL.md) and as
-// `DownloadTarget`'s `.part` file, applied to the one file that cannot be
-// re-fetched without a human at a browser.
+// The write is atomic, through `io::WriteAtomically`: the record goes to
+// `<path>.tmp` and is committed onto `path` only once it is complete, so a
+// reader sees either the previous token or the new one and never a splice of
+// the two. That is the same reasoning as the backup-before-overwrite rule for
+// saves (docs/SYNC_PROTOCOL.md) and as `DownloadTarget`'s `.part` file, applied
+// to the one file that cannot be re-fetched without a human at a browser.
 //
-// What it is *not*: hardened. Permissions, and whether the token should be at
-// rest in plaintext at all on an SD card anything on the console can read, are
-// M1-5's question (docs/SECURITY.md).
+// What it is *not*: secret. The SD card is readable by anything on the console
+// and by anyone who pulls it, so the token is at rest in the clear and no
+// arrangement of this file changes that -- Horizon's FAT32 has no permission
+// bits to restrict either. What limits the damage is elsewhere: a dedicated
+// RomM user, the minimum scopes (`MinimumScopes`, pairing.hpp), and a token
+// that can be revoked. What this file owes the user is that the secret never
+// leaves it by accident -- never into a log, never into a diagnostics line
+// (`DescribeStoredToken`), and genuinely gone on a re-pair (`DiscardToken`).
+// docs/SECURITY.md is the threat model.
 #pragma once
 
 #include <optional>
@@ -98,6 +104,29 @@ struct StoreResult {
 /// here is that no reader ever sees a partial token.
 StoreResult SaveToken(const std::string& path, const StoredToken& token);
 
+/// The record as one line for a log or a diagnostics screen: which server,
+/// which device, which scopes, and that a token exists -- never the token.
+///
+/// It exists so that there is an obvious right answer when something needs to
+/// report the pairing state. The wrong answer is a caller reaching into
+/// `StoredToken` and formatting it themselves, which is how a token reaches a
+/// log exactly once and stays there.
+std::string DescribeStoredToken(const StoredToken& token);
+
+/// Discard the credentials at `path`. What "Re-pair" does before it starts over.
+///
+/// Removes the record *and* the `.tmp`/`.old` an interrupted commit leaves
+/// beside it, overwriting each first: unlinking `token.dat` while
+/// `token.dat.old` still held the same bearer token would have discarded
+/// nothing. What the overwrite is worth on a wear-levelling SD card, which is
+/// less than it sounds, is in docs/SECURITY.md.
+///
+/// This does **not** touch `device.dat`. The identifier has to survive a
+/// re-pair or RomM registers the console twice -- see device_identity.hpp.
+///
+/// True when nothing is left, including when there was nothing to begin with.
+bool DiscardToken(const std::string& path);
+
 struct LoadedToken {
   StoredToken value{};
   StoreError error = StoreError::kNone;
@@ -108,6 +137,13 @@ struct LoadedToken {
 /// Read `path` back. A missing file is `kReadFailed`, not an empty token: "not
 /// paired yet" and "paired, and the file is gone" are the same recovery, but
 /// only one of them should be reported as though nothing happened.
+///
+/// A record that is missing, or that is there and is not a token, falls back to
+/// the `.old` an interrupted commit leaves behind — that window is the one
+/// moment `path` legitimately does not exist. A `token.dat` that *exists* and
+/// will not open does not, because answering a transient failure with the
+/// previous token hands back one the user may have just revoked, and a `401` on
+/// the next tick sends them to a re-pair screen for no reason.
 LoadedToken LoadToken(const std::string& path);
 
 }  // namespace rommsync::auth
