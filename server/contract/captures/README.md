@@ -30,7 +30,8 @@ with the one string that separates "keep polling" from "this pairing is dead".
 | `auth-device-init.json` | `POST /api/auth/device/init` |
 | `auth-device-token.json` | `POST /api/auth/device/token` (after approval) |
 | `auth-device-token-pending.json` | `POST /api/auth/device/token` **before** approval — the `400` the pairing screen sees on every tick, and a shape the OpenAPI snapshot does not declare |
-| `devices-create.json` | `POST /api/devices` |
+| `devices-get.json` | `GET /api/devices/{id}` — the `DeviceSchema` for the device **pairing** created, which is the one the client reads. The id field is `id` here |
+| `devices-create.json` | `POST /api/devices` — the shape of a call this client deliberately never makes ([API_CONTRACT.md](../../../docs/API_CONTRACT.md#why-post-apidevices-is-the-wrong-call)); the id field is `device_id` |
 | `roms-list.json` | `GET /api/roms?limit=1` |
 | `saves-post.json` | `POST /api/saves` — one uploaded save (`SaveSchema`) |
 | `sync-negotiate-empty.json` | `POST /api/sync/negotiate` with `saves: []` |
