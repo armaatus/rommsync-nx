@@ -13,6 +13,8 @@ cd "$REPO_ROOT"
 echo "==> deriving isolated worktree environment"
 ./scripts/orca/env.sh
 set -a; . ./.env; set +a
+# The hooks' own scratch space -- pidfiles and the autostart log. Gitignored, and
+# created here so nothing later has to check whether it exists.
 mkdir -p "$REPO_ROOT/.orca"
 
 echo "==> seeding ROM fixtures (shared cache: $ROM_CACHE)"
@@ -54,7 +56,6 @@ echo "==> provisioning the fixture (scan, collection, client token)"
 # see what it actually scanned, which is the question that comes up while
 # implementing against the API.
 ./scripts/orca/romm-browser.sh
-set -a; . ./server/testing/fixture-auth.env; set +a
 
 # Detached, and last: `setupAgentStartupPolicy: wait-for-setup` in orca.yaml
 # holds the agent's tab until this script returns, so the draft this watches for
@@ -67,9 +68,12 @@ if [ "${ROMMSYNC_AGENT_AUTOSTART:-1}" != "0" ]; then
   echo "==> watching for the agent's issue prompt to submit it"
 fi
 
+# For the summary below only: provision.py wrote the account it created here.
+set -a; . ./server/testing/fixture-auth.env; set +a
+
 echo
 echo "worktree ready."
-echo "  RomM        $ROMM_BASE_URL  ($ROMM_FIXTURE_USER, open in a browser tab)"
+echo "  RomM        $ROMM_BASE_URL  (browser tab, signed in as $ROMM_FIXTURE_USER)"
 echo "  fault proxy $PROXY_BASE_URL"
 echo "  fixture     server/testing/fixture-auth.env"
 echo "  tests       ctest --test-dir build --output-on-failure"
