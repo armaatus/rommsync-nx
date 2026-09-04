@@ -1,0 +1,20 @@
+{
+  "session_id": 141,
+  "operations": [
+    {
+      "action": "conflict",
+      "rom_id": 4,
+      "save_id": 58,
+      "file_name": "probe [2026-09-04_11-36-26].srm",
+      "slot": "probe-4bb29c6c-b",
+      "emulator": "probe-emulator",
+      "reason": "Both sides changed since last sync",
+      "server_updated_at": "2026-09-04T11:36:27+00:00",
+      "server_content_hash": "de4145ae0f69d760f9b57981a5e82a64"
+    }
+  ],
+  "total_upload": 0,
+  "total_download": 0,
+  "total_conflict": 1,
+  "total_no_op": 0
+}

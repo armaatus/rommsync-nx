@@ -154,6 +154,25 @@ and they only agree because the constants are kept identical.
 Both are needed: the first passed throughout the entire period the library was
 empty.
 
+### Keeping the captured contract honest
+
+`contract.captures` re-runs `probe_contract.py --auth --negotiate
+--sync-scenarios` against the fixture and compares the result with the committed
+`server/contract/captures/` — the responses [API_CONTRACT.md](API_CONTRACT.md),
+[AUTH.md](AUTH.md) and [SYNC_PROTOCOL.md](SYNC_PROTOCOL.md) quote and that M1/M2
+are coded against. It compares field names, nesting and JSON types, plus the
+`action`/`reason` pairs each scenario is named for; ids, timestamps and the
+per-run slot names differ every run and are ignored.
+
+The scenarios upload throwaway saves — an empty-save negotiate returns an empty
+`operations` array, so `upload`, `download`, `no_op` and `conflict` cannot be
+observed without state on the server. Every save they create is deleted again,
+and the probe refuses a non-loopback URL. `RUN_SERIAL`, because they mutate the
+library other tests read.
+
+A red run here means RomM changed under the docs, not that a test is flaky:
+re-capture, read the diff, and fix whatever the docs claimed.
+
 The Python tooling lives in a per-worktree `.venv` built from
 `server/requirements.txt` by `setup.sh`. The C++ build needs none of it.
 
