@@ -25,9 +25,15 @@ POLL_SECONDS="${ROMM_LOGS_POLL_SECONDS:-2}"
 # test can run a follower without disturbing the real tab's file.
 PIDFILE="${ROMM_LOGS_PIDFILE:-$REPO_ROOT/.orca/romm-logs.pid}"
 mkdir -p "$(dirname "$PIDFILE")" 2>/dev/null
+# Claimed whenever the file is absent, not just at startup. Two followers can be
+# running at once -- the hint in ensure-romm-tab.sh tells operators to start one
+# by hand -- and whichever exits first takes the file with it. Without reclaiming
+# it, the survivor keeps streaming while looking to setup.sh like nothing is
+# there, and the next run opens a duplicate tab beside a working one.
+claim_pidfile() { [ -e "$PIDFILE" ] || echo $$ >"$PIDFILE"; }
 echo $$ >"$PIDFILE"
-# Compared against $$ rather than removed outright: a follower started after this
-# one owns the file now, and must not have it deleted out from under it.
+# Compared against $$ rather than removed outright: a follower that claimed the
+# file after this one owns it now, and must not have it deleted out from under it.
 trap '[ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$PIDFILE"' EXIT
 
 # One running container is enough to attach. `up -d` creates romm-db first and
@@ -41,6 +47,7 @@ stack_is_up() {
 }
 
 while :; do
+  claim_pidfile
   if stack_is_up; then
     echo "==> following $(basename "$REPO_ROOT")"
     # --tail keeps a tab opened long after startup from replaying the entire
@@ -55,6 +62,6 @@ while :; do
     sleep "$POLL_SECONDS"
   else
     echo "==> waiting for RomM (scripts/orca/setup.sh brings it up last)"
-    while ! stack_is_up; do sleep "$POLL_SECONDS"; done
+    while ! stack_is_up; do sleep "$POLL_SECONDS"; claim_pidfile; done
   fi
 done
