@@ -279,7 +279,7 @@ snapshot does not model.
 | says nothing about the order of `scopes` | returns them sorted alphabetically, not in the order requested | Read as a set (`DeviceTokenResponse::HasScope`), never by index. |
 | says nothing about `scopes` being a subset | really does return only the subset that was approved | Read back and used to disable features, per the note above. |
 | says nothing about the `user_code` alphabet | draws from `ABCDEFGHJKMNPQRSTUVWXYZ23456789` | Displayed verbatim. The confusable characters are already excluded upstream, so nothing "corrects" them. |
-| gives `DeviceCreatePayload.allow_existing` a default of `true` and no other description | matches an existing device on `hostname` or `mac_address` only, so the flag deduplicates nothing on its own — and never matches on `client_device_identifier` | The client does not call `POST /api/devices` at all. [Device registration](#device-registration). |
+| gives `DeviceCreatePayload.allow_existing` a default of `true` and no other description, and declares only `200` and `422` on `POST /api/devices` | deduplicates on a *fingerprint* that is `hostname` or `mac_address` and never `client_device_identifier`; answers `201` when it creates, `200` when it matches, and `409 device_exists` when it matches under `allow_existing: false` | The client does not call `POST /api/devices` at all — a console has no stable hostname or MAC, and its identifier is not consulted. [Device registration](#device-registration). |
 
 One thing the snapshot got right and an earlier draft of this page got wrong:
 `POST /api/auth/device/init` answers **`201`**, which the snapshot declares and

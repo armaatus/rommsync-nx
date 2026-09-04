@@ -700,11 +700,43 @@ int NeverPost(http::HttpClient& client, const std::string& base) {
   const std::vector<auth::DeviceRecord> devices = Devices(client, base, checks);
   checks.ExpectEq(CountFor(devices, identifier), std::size_t{1},
                   "none of them carries the console's identifier, so none of them is findable");
+  checks.ExpectEq(created.size(), std::size_t{2},
+                  "two calls, two devices: registration is not idempotent");
+
+  // The finding at its strongest. RomM's dedup is real -- give it the
+  // `hostname` it actually matches on and it refuses the second call with a
+  // 409 naming the device it matched. What it never matches on is
+  // `client_device_identifier`, so the row it protects is one of the
+  // duplicates above and never the device pairing made. A console has no
+  // stable hostname or MAC to offer anyway, which is why none of this is a
+  // route back to its own device.
+  http::Request fingerprinted = request;
+  fingerprinted.body = std::string("{\"name\":\"rommsync-nx ") + identifier +
+                       "\",\"platform\":\"" + auth::kClientPlatform + "\",\"client\":\"" +
+                       auth::kClientName + "\",\"hostname\":" + json::Quote(identifier) +
+                       ",\"allow_existing\":false}";
+  const http::Result minted = client.Send(fingerprinted);
+  ExpectSucceeded(checks, minted, "a payload RomM can fingerprint is accepted once");
+  const std::string fingerprint_id = rig::JsonString(minted.response.body, "device_id");
+  checks.Expect(!fingerprint_id.empty(), "and names a device");
+  if (!fingerprint_id.empty()) {
+    created.push_back(fingerprint_id);
+  }
+
+  const http::Result refused = client.Send(fingerprinted);
+  checks.ExpectOk(refused, "the same payload again");
+  checks.ExpectEq(refused.response.status, 409,
+                  "which RomM refuses as a duplicate: " + refused.response.body.substr(0, 200));
+  checks.ExpectEq(rig::JsonString(refused.response.body, "error"), std::string("device_exists"),
+                  "naming the reason");
+  checks.ExpectEq(rig::JsonString(refused.response.body, "device_id"), fingerprint_id,
+                  "and the device it matched -- which is one of the duplicates above");
+  checks.Expect(rig::JsonString(refused.response.body, "device_id") != token.device_id,
+                "and never the device pairing created");
+
   for (const std::string& id : created) {
     DeleteDevice(client, base, id);
   }
-  checks.ExpectEq(created.size(), std::size_t{2},
-                  "two calls, two devices: registration is not idempotent");
 
   // And the console is unharmed: it still confirms the device it was paired to.
   ExpectError(checks, auth::ConfirmRegistration(client, token), auth::RegistrationError::kNone,

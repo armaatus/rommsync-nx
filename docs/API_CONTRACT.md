@@ -121,27 +121,30 @@ the *same* `device_id` — that is the mechanism the whole thing rests on, and
 
 ### Why `POST /api/devices` is the wrong call
 
-**Verified — it never matches on `client_device_identifier`.** RomM matches an
-existing device on `mac_address` *or* `hostname` and on nothing else. `name`,
-`platform`, `client` and `client_device_identifier` play no part, `allow_existing`
-on its own deduplicates nothing, and calling it with the device-bound client
-token *of the very device being described* does not change that. One console,
-six calls, five extra rows:
+**Verified — it never matches on `client_device_identifier`.** RomM deduplicates
+on what it calls a device's *fingerprint*, which is `hostname` **or**
+`mac_address` and nothing else. `name`, `platform`, `client` and
+`client_device_identifier` are not part of it, and calling this with the
+device-bound client token *of the very device being described* does not change
+that. Every row below was run against a live 5.2.0 as the paired console:
 
 | Call, as the paired console | Result |
 |---|---|
-| `{name, platform, client, allow_existing: true}` | **201**, a new `device_id`, every single time |
-| `{…, allow_existing: false}` | **201** as well — the flag is not a dedup switch |
-| `{…, hostname}` first call | **201**, a new `device_id` |
-| `{…, hostname}` again | **200**, the *same* `device_id` (even under a different `name`) |
-| `{…, hostname, allow_duplicate: true}` | **201** — a new row, matching suppressed |
-| `{…, mac_address}` | same as `hostname`, keyed on the MAC |
+| `{name, platform, client}`, any `allow_existing` | **201**, a new `device_id`, every single time — with no fingerprint there is nothing to match, so the flag has nothing to act on |
+| `{…, hostname}` / `{…, mac_address}` first call | **201**, a new `device_id` |
+| …again | **200**, the *same* `device_id` — even under a different `name` |
+| …again with `allow_existing: false` | **409** `{"detail": {"error": "device_exists", "message": "A device with this fingerprint already exists", "device_id": "…"}}` |
+| …again with `allow_duplicate: true` | **201** — a new row, matching suppressed |
 
-The status code is the signal: `201` created, `200` matched. But none of the
-rows it creates carries a `client_device_identifier`, so none of them is the row
-pairing made and none of them can be found again by this console. And a new
-device has no sync history, which makes every save look like a first encounter
-([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md)).
+The status code is the signal: `201` created, `200` matched, `409` matched and
+refused. So the mechanism works — it is simply keyed on the wrong thing. A
+Switch sysmodule has no stable hostname or MAC to offer, and the identifier it
+*does* have is not consulted, so every call creates a row that carries no
+`client_device_identifier`: not the row pairing made, and not one this console
+can ever find again. A new device also has no sync history, which makes every
+save look like a first encounter ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md)). Even
+RomM's own dedup, working exactly as designed, cannot reach the paired device —
+`device.never_post` asserts that against the `409`.
 
 `DeviceCreateResponse` — note the id field is **`device_id`**, not `id`:
 
