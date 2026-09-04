@@ -92,7 +92,7 @@ that demonstrates it. A box checked because someone believes it is not checked.
 
 | # | The claim | What demonstrates it |
 |---|---|---|
-| 1 | The engine builds on a laptop with warnings as errors, and the same `core/` sources still build for Horizon. | `cmake --build build`; CI `switch-build` → *Portable core compiles for devkitA64* |
+| 1 | The engine builds on a laptop with warnings as errors, and the same `core/` sources still build for Horizon — compiled and linked, not just parsed. | `cmake --build build`; CI `switch-build` (a real devkitA64 build of both targets, checked to be a PFS0 and an `ULTR`-signed `.ovl`); `switch.builds`, `switch.ci_requires_artifacts` |
 | 2 | One command brings up a real RomM 5.2.0 on a throwaway volume, isolated per worktree. | `scripts/orca/compose.sh up -d`; `rig.smoke`; `orca.env_*` |
 | 3 | That fixture is *usable*, not merely running: library scanned, collection created, client token minted with no human in the loop. | `rig.provisioned`; [`provision.py`](../server/testing/provision.py) |
 | 4 | The failure paths a healthy RomM will not produce on demand can be forced, deterministically, in CI. | `http.status`, `http.truncate`, `http.drop`, `http.stall`, `pair.stall`, `pair.drop` |
@@ -166,10 +166,6 @@ which were watched taking ~50s. Time the test yourself.
 - **M0-1's answer.** The `ssl` spike is de-risking, not a dependency. Everything
   in M1–M5 is written against `HttpClient`, so holding five milestones behind one
   emulator question would buy nothing. It is a gate — for **M8**.
-- **The devkitPro artifact half of M0-3.** There is no `sysmodule/Makefile` or
-  `overlay/Makefile` to build until M4 and M6 exist. The half of that job that
-  can run today — `core/` compiling under devkitA64 — does, and the rest reports
-  that it is not there yet rather than pretending to have built something.
 - **The engine edge cases in M0-5's wording.** Conflict, partial failure and
   multi-file skip are behaviours of code M2 and M3 have not written yet. What M0
   owes is the *mechanism* that forces them and proof the mechanism works
@@ -180,9 +176,14 @@ which were watched taking ~50s. Time the test yourself.
 
 All nine rows hold as this page is written: the full suite green, CI green on
 `main`, and row 8 newly machine-checked rather than asserted. That is what M1
-started on. M0-1, M0-3 and M0-5 are still open, and that is the section above
-rather than a hole in the gate — they are exactly the parts it does not wait
-for.
+started on. M0-1 and M0-5 are still open, and that is the section above rather
+than a hole in the gate — they are exactly the parts it does not wait for.
+
+Row 1 got stronger while this page was in review. M0-3 landed the two devkitPro
+Makefiles, so `switch-build` now compiles and links both Switch targets for real
+and checks the artifacts are loadable, in place of the `-fsyntax-only` check that
+stood in for it. The gate did not wait for that — and it did not have to, which
+was the point of listing it as something the gate does not require.
 
 The gate is re-asked, not signed off once. Rows 1–8 are each somebody's test or
 CI step, so a change that breaks one goes red at the moment it lands rather than
@@ -234,16 +235,44 @@ ctest --test-dir build --output-on-failure
   a rate-limited init out rather than failing on it. The wait is bounded, so an
   init broken for any other reason still goes red.
 - `core.token_store` covers `token.dat`: the atomic write, and specifically what
-  survives a write that cannot complete. No network and no rig, so it never
-  skips.
+  survives a write that cannot complete. The interesting one is the process
+  being **killed mid-write** — forced with `fork()` and `RLIMIT_FSIZE`, so a
+  child asked to write a record far larger than its file-size limit is killed by
+  `SIGXFSZ` inside the write, at a byte offset the kernel picks, with no cleanup
+  on the way out. That is a power cut, deterministically, and without the timing
+  race a sleep-then-kill would have. It also asserts that no token, refresh
+  token or device code appears in any message this code can produce, by running
+  every failure path with a distinctive needle in the record and searching the
+  output for it.
+- `core.device_identity` covers `device.dat` and the `client_device_identifier`
+  under it: the SHA-256 against FIPS 180-4's published vectors and against the
+  block-boundary lengths the padding gets wrong, and then the property that
+  actually matters — the identifier is the *same* identifier across a restart, a
+  re-pair, a different seed, an interrupted commit and a corrupt record.
+- `auth.scopes` reads the scope list out of
+  [API_CONTRACT.md](API_CONTRACT.md#scopes-to-request) and compares it to
+  `MinimumScopes()`. Editing the document without editing the code, or the other
+  way round, fails here — including adding a scope marked "only if…" to the set
+  the client actually requests.
+- None of those three touches the network, so they never skip.
 - The `policy.*` tests re-ask row 8 of [the M0 exit gate](#the-m0-exit-gate) on
   every run: the suite is configured for loopback only, the scripts that write
-  refuse anything else, and no registered test reaches off this machine. No
-  network and no rig either, so they never skip.
+  refuse anything else, and no registered test reaches off this machine. They
+  need no network and no rig either, so they never skip.
 - With Docker stopped, `rig.smoke` reports **Skipped** rather than failing, so a
   local `ctest` is still useful. CI configures with `-DROMMSYNC_REQUIRE_RIG=ON`,
   which turns the same condition into a failure — a green CI run always means the
   tests actually ran.
+- The `switch.*` pair covers the console half of the build, which CMake does not
+  drive. `switch.ci_requires_artifacts` reads the workflow and never skips: the
+  `switch-build` job must build both targets unconditionally and refuse to
+  publish an empty artifact set, which is what it did *not* do while the
+  Makefiles were missing. `switch.builds` runs the real devkitA64 build in the
+  same `devkitpro/devkita64` image CI uses and checks that the `.nsp` is a PFS0
+  archive, that the `.ovl` carries its `ULTR` signature, and that every `core/`
+  translation unit produced an aarch64 object. It skips when that image is not
+  pulled — including under `ROMMSYNC_REQUIRE_RIG`, since the host CI runner does
+  not have it and the `switch-build` job is the enforcement there.
 
 ### Provisioning the fixture
 

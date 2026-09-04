@@ -8,18 +8,28 @@
 //
 // No network and no rig: this is the filesystem and a parser, so it never
 // skips.
+#ifdef ROMMSYNC_CAN_FORK
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 #include <cstddef>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include "checks.hpp"
+#include "rommsync/atomic_file.hpp"
+#include "rommsync/pairing.hpp"
 #include "rommsync/token_store.hpp"
 
 namespace auth = rommsync::auth;
+namespace io = rommsync::io;
 
 namespace {
 
@@ -42,6 +52,11 @@ auth::StoredToken Fixture() {
 std::string ReadWhole(const std::filesystem::path& path) {
   std::ifstream in(path, std::ios::binary);
   return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+void WriteWhole(const std::string& path, const std::string& text) {
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  out.write(text.data(), static_cast<std::streamsize>(text.size()));
 }
 
 void SameToken(checks::Checks& c, const auth::StoredToken& got, const auth::StoredToken& want,
@@ -152,6 +167,42 @@ void RecoversFromTheCommitWindow(checks::Checks& c) {
   c.Expect(!nothing.ok(), "and with no fallback there is still nothing");
   c.ExpectEq(std::string(auth::ToString(nothing.error)), std::string("read_failed"),
              "reported as read_failed");
+}
+
+/// ...but only for the window. A `token.dat` that *exists* and will not open is
+/// a bad moment, and answering it with `.old` hands back a token the user may
+/// have just revoked -- so the next sync tick 401s and the overlay asks for a
+/// re-pair that was never needed.
+void DoesNotFallBackOverATransientFailure(checks::Checks& c) {
+  const std::filesystem::path path = ScratchDir() / "transient.dat";
+  std::error_code ignored;
+  std::filesystem::remove(path, ignored);
+  std::filesystem::remove(io::PreviousPathFor(path.string()), ignored);
+
+  const auth::StoredToken token = Fixture();
+  WriteWhole(io::PreviousPathFor(path.string()), auth::SerializeStoredToken(token));
+
+  // A symlink loop: the one way to make `fopen` fail with something other than
+  // ENOENT without depending on who is running the test. On Horizon the same
+  // shape is a full handle table, or `sdmc:` not mounted yet at boot.
+  std::filesystem::create_symlink(path.filename(), path, ignored);
+  if (ignored) {
+    c.Expect(false, "the test can create a symlink loop: " + ignored.message());
+    return;
+  }
+
+  const auth::LoadedToken loaded = auth::LoadToken(path.string());
+  c.Expect(!loaded.ok(), "a token file that will not open is an error");
+  c.Expect(loaded.value.access_token != token.access_token,
+           "and not the previous token quietly handed back");
+  std::filesystem::remove(path, ignored);
+
+  // With the file genuinely gone, the same `.old` *is* read: that is the commit
+  // window, and the two cases must not be answered the same way.
+  const auth::LoadedToken window = auth::LoadToken(path.string());
+  c.Expect(window.ok(), "a missing record still recovers from the window: " + window.message);
+  SameToken(c, window.value, token, "recovered");
+  std::filesystem::remove(io::PreviousPathFor(path.string()), ignored);
 }
 
 /// The guarantee the whole file exists for: a write that cannot complete costs
@@ -292,6 +343,205 @@ void CarriesTheServerItWasIssuedBy(checks::Checks& c) {
   c.Expect(!token.expires_at.has_value(), "a null expiry stays null");
 }
 
+
+/// The acceptance criterion, taken literally: kill the process mid-write.
+///
+/// A directory in the way of the temp file (above) proves the *first* step can
+/// fail safely. It does not prove anything about a write that has already put
+/// bytes on the card and then stops -- which is the case a power cut produces,
+/// and the only one where a truncated record could plausibly reach `token.dat`.
+///
+/// The kill is `RLIMIT_FSIZE` rather than a timer. A child that may write only
+/// a few hundred bytes, asked to write a record far larger than that, is killed
+/// by `SIGXFSZ` *inside* the write, at a byte offset the kernel picks -- no
+/// sleeping, no racing, and no cleanup on the way out: no destructor runs, no
+/// `remove` of the temp file, exactly what a console losing power does. A timing
+/// based kill would pass on a fast machine by never landing in the window.
+void SurvivesTheProcessBeingKilledMidWrite(checks::Checks& c) {
+#ifdef ROMMSYNC_CAN_FORK
+  const std::filesystem::path path = ScratchDir() / "killed.dat";
+  std::filesystem::remove(path);
+  std::filesystem::remove(io::TempPathFor(path.string()));
+  std::filesystem::remove(io::PreviousPathFor(path.string()));
+
+  const auth::StoredToken original = Fixture();
+  c.Expect(auth::SaveToken(path.string(), original).ok(), "the working token is written");
+  const std::string before = ReadWhole(path);
+
+  // Big enough that the write cannot fit under the limit, and cannot be
+  // buffered whole either: the bytes have to reach the card before the record
+  // is complete, which is the state being forced.
+  auth::StoredToken huge = original;
+  huge.access_token = "rmm_" + std::string(64, 'e');
+  huge.scopes.assign(20000, "roms.read");
+
+  std::fflush(nullptr);  // nothing of ours may be flushed twice by the child
+  const pid_t child = fork();
+  if (child < 0) {
+    // Without a child there is nothing to reap, and `waitpid(-1, ...)` would
+    // wait for *any* child -- so every assertion after this would fail with a
+    // message about the token rather than about the fork that did not happen.
+    c.Expect(false, "the test can fork");
+    return;
+  }
+  if (child == 0) {
+    // No core dump: the kill is the point of the test, and a crash dump per run
+    // is noise in CI and megabytes on a laptop.
+    const rlimit no_core{0, 0};
+    setrlimit(RLIMIT_CORE, &no_core);
+    const rlimit limit{4096, 4096};
+    if (setrlimit(RLIMIT_FSIZE, &limit) != 0) {
+      _exit(2);
+    }
+    auth::SaveToken(path.string(), huge);
+    _exit(0);  // reached only if the kill did not happen; the parent checks
+  }
+
+  int status = 0;
+  c.Expect(waitpid(child, &status, 0) == child, "the child is reaped");
+  c.Expect(WIFSIGNALED(status) != 0,
+           "the child was killed by a signal rather than returning -- otherwise this test is "
+           "checking a completed write");
+
+  // The guarantee. Whatever is on the card, it is the token that was working
+  // before the child died, complete and readable.
+  c.Expect(std::filesystem::exists(path), "the destination still exists");
+  c.ExpectEq(ReadWhole(path), before, "and still holds the previous token, byte for byte");
+  const auth::LoadedToken loaded = auth::LoadToken(path.string());
+  c.Expect(loaded.ok(), "which still loads: " + loaded.message);
+  SameToken(c, loaded.value, original, "the survivor of a killed write");
+  c.Expect(loaded.value.access_token != huge.access_token,
+           "and it is not the token the killed write was carrying");
+
+  // The debris a killed write leaves is a truncated temp file. It must not stop
+  // the next write from succeeding, and it must not be read as a token.
+  const auth::LoadedToken debris = auth::LoadToken(io::TempPathFor(path.string()));
+  c.Expect(!debris.ok(), "the truncated temp file is not a token record");
+
+  auth::StoredToken next = original;
+  next.access_token = "rmm_" + std::string(64, 'f');
+  const auth::StoreResult recovered = auth::SaveToken(path.string(), next);
+  c.Expect(recovered.ok(), "and the next write goes through anyway: " + recovered.message);
+  const auth::LoadedToken after = auth::LoadToken(path.string());
+  c.Expect(after.ok(), "leaving the new token in place: " + after.message);
+  SameToken(c, after.value, next, "after recovery");
+  c.Expect(!std::filesystem::exists(io::TempPathFor(path.string())),
+           "and the debris is gone");
+#else
+  c.Expect(false, "this test needs fork(); it is not built on a platform without one");
+#endif
+}
+
+/// "Re-pair" has to genuinely discard the old credentials.
+///
+/// The trap is `token.dat.old`. It is what the commit leaves behind for a
+/// moment, and a re-pair that unlinked only `token.dat` would leave the same
+/// bearer token sitting next to it under a name nobody looks at.
+void DiscardingLeavesNothingBehind(checks::Checks& c) {
+  const std::filesystem::path directory = ScratchDir() / "discard";
+  std::filesystem::remove_all(directory);
+  std::filesystem::create_directories(directory);
+  const std::filesystem::path path = directory / "token.dat";
+
+  const auth::StoredToken token = Fixture();
+  c.Expect(auth::SaveToken(path.string(), token).ok(), "a token is written");
+  // Every piece of debris a commit can leave, all holding the same secret.
+  WriteWhole(io::TempPathFor(path.string()), auth::SerializeStoredToken(token));
+  WriteWhole(io::PreviousPathFor(path.string()), auth::SerializeStoredToken(token));
+
+  c.Expect(auth::DiscardToken(path.string()), "discarding reports that nothing is left");
+  c.Expect(!std::filesystem::exists(path), "the record is gone");
+  c.Expect(!std::filesystem::exists(io::TempPathFor(path.string())), "the temp file is gone");
+  c.Expect(!std::filesystem::exists(io::PreviousPathFor(path.string())),
+           "and so is the one the commit parks the previous record in");
+
+  // The check that would have caught unlinking only the obvious file: nothing
+  // anywhere in the directory still carries the token.
+  for (const std::filesystem::directory_entry& entry :
+       std::filesystem::directory_iterator(directory)) {
+    c.Expect(ReadWhole(entry.path()).find(token.access_token) == std::string::npos,
+             "no file beside it carries the token: " + entry.path().filename().string());
+  }
+
+  const auth::LoadedToken loaded = auth::LoadToken(path.string());
+  c.Expect(!loaded.ok(), "and the client reads itself as unpaired");
+  c.Expect(auth::DiscardToken(path.string()), "discarding nothing succeeds too");
+}
+
+/// The acceptance criterion, asserted rather than eyeballed: no secret reaches
+/// a log or an error message.
+///
+/// Every string this module can hand to a caller for printing is produced with
+/// a fixture whose secrets are distinctive needles, and searched for them. That
+/// shape is the point -- a test that checked one known-bad message would go
+/// green the day someone adds a message that quotes the body.
+void NoSecretReachesALogLine(checks::Checks& c) {
+  const std::string kToken = "rmm_needle0000000000000000000000000000000000000000000000000000tok";
+  const std::string kDeviceCode = "needle1111111111111111111111111111111111111111111111111111111code";
+
+  auth::StoredToken token = Fixture();
+  token.access_token = kToken;
+
+  std::vector<std::string> printed;
+  printed.push_back(auth::DescribeStoredToken(token));
+
+  // Every failure path that produces a message, with the needle in the record.
+  const std::filesystem::path directory = ScratchDir() / "quiet";
+  std::filesystem::remove_all(directory);
+  std::filesystem::create_directories(directory);
+  const std::filesystem::path path = directory / "token.dat";
+
+  auth::StoredToken unusable = token;
+  unusable.device_id.clear();
+  printed.push_back(auth::SaveToken(path.string(), unusable).message);
+  printed.push_back(auth::SaveToken((directory / "gone" / "token.dat").string(), token).message);
+  std::filesystem::create_directories(io::TempPathFor(path.string()));
+  printed.push_back(auth::SaveToken(path.string(), token).message);
+  std::filesystem::remove_all(io::TempPathFor(path.string()));
+  printed.push_back(auth::LoadToken(path.string()).message);
+
+  // A file that holds the token and is not a record: the parser has to name
+  // what is wrong with it without quoting any of it.
+  WriteWhole(path, auth::SerializeStoredToken(token).substr(0, 40));
+  printed.push_back(auth::LoadToken(path.string()).message);
+  WriteWhole(path, R"({"server_url":"http://x","access_token":")" + kToken +
+                       R"(","device_id":"d","scopes":[],"expires_at":7})");
+  printed.push_back(auth::LoadToken(path.string()).message);
+
+  // And the two response bodies that carry a secret, rejected. A device init
+  // body holds the `device_code`; a token body holds the token.
+  printed.push_back(
+      auth::ParseDeviceTokenResponse(R"({"access_token":")" + kToken + R"(","device_id":7})")
+          .error.Describe());
+  printed.push_back(auth::ParseDeviceInitResponse(R"({"device_code":")" + kDeviceCode +
+                                                  R"(","user_code":"ABCD1234"})")
+                        .error.Describe());
+  printed.push_back(auth::ParseDeviceInitResponse(R"({"device_code":")" + kDeviceCode + R"("})" +
+                                                  "trailing rubbish")
+                        .error.Describe());
+
+  // The pairing payload the overlay decodes and anything may render.
+  auth::PairingStatus status;
+  status.state = auth::PairingState::kFailed;
+  status.user_code = "ABCD1234";
+  status.message = "device token response: field device_id: expected a string, got a number";
+  printed.push_back(auth::SerializePairingStatus(status));
+
+  for (const std::string& line : printed) {
+    c.Expect(!line.empty(), "every message says something");
+    c.Expect(line.find(kToken) == std::string::npos, "no access token in: " + line);
+    c.Expect(line.find(kDeviceCode) == std::string::npos, "no device code in: " + line);
+  }
+
+  // ...and the summary still says the things a support thread actually needs.
+  const std::string described = auth::DescribeStoredToken(token);
+  c.Expect(described.find(token.server_url) != std::string::npos, "the summary names the server");
+  c.Expect(described.find(token.device_id) != std::string::npos, "and the device");
+  c.Expect(described.find("me.read") != std::string::npos, "and the scopes");
+  c.Expect(described.find(std::to_string(kToken.size())) != std::string::npos,
+           "and that there is a token, by length only");
+}
+
 }  // namespace
 
 int main() {
@@ -301,8 +551,12 @@ int main() {
   AFailedWriteLeavesTheOldToken(c);
   NamesAMissingDirectory(c);
   RecoversFromTheCommitWindow(c);
+  DoesNotFallBackOverATransientFailure(c);
   RefusesAnUnusableToken(c);
   RefusesWhatIsNotAToken(c);
   CarriesTheServerItWasIssuedBy(c);
+  SurvivesTheProcessBeingKilledMidWrite(c);
+  DiscardingLeavesNothingBehind(c);
+  NoSecretReachesALogLine(c);
   return c.failures() == 0 ? 0 : 1;
 }

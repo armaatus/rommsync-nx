@@ -1,6 +1,9 @@
 # secrets / per-user state — never commit
 config.ini
-token.dat
+# ...and the .tmp/.old an interrupted commit leaves beside it, which hold the
+# same bearer token and which a bare `token.dat` line does not match.
+token.dat*
+device.dat*
 *.token
 .env
 .env.tmp*
@@ -22,7 +25,10 @@ build-*/
 *.nsp
 *.npdm
 *.ovl
+*.nro
 *.nacp
+*.map
+*.lst
 
 # python (server/)
 __pycache__/

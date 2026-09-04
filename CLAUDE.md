@@ -17,7 +17,9 @@ for the shape.
 3. **The server is the source of truth** for sync conflicts.
 4. **Nothing in `core/` may include a host-only or libnx header.** Platform
    details live behind interfaces so the engine stays testable natively.
-5. **No secrets in the tree.** `config.ini`, `token.dat`, `.env` are ignored.
+5. **No secrets in the tree.** `config.ini`, `token.dat`, `device.dat` and
+   `.env` are ignored, together with the `.tmp`/`.old` an interrupted commit
+   leaves beside them.
 
 ## Environment
 
@@ -31,6 +33,11 @@ hardcode one, and never assume `8080` or `1515`.
 cmake -S . -B build && cmake --build build      # build
 ctest --test-dir build --output-on-failure       # test
 ctest --test-dir build -R sync --output-on-failure   # one group
+
+# the two Switch targets, built by devkitPro rather than CMake. Nothing built
+# here runs anywhere before the M8-1 gate; see switch.mk.
+docker run --rm -v "$PWD:/work" -w /work devkitpro/devkita64:latest \
+  bash -lc 'make -C sysmodule && make -C overlay'
 
 ./scripts/orca/env.sh                            # regenerate .env
 ./scripts/orca/romm-browser.sh                   # open RomM signed in, if the tab is gone

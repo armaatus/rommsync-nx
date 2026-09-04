@@ -34,9 +34,8 @@ whole engine on a laptop/CI before a single line runs on real hardware.
 M0 is done — and M1 may begin — when [the M0 exit
 gate](docs/TESTING.md#the-m0-exit-gate) holds. It is a list of claims, each
 paired with the test or command that demonstrates it, and it also records what it
-deliberately does *not* require: M0-1's answer, the devkitPro artifact half of
-M0-3, and the engine edge cases in M0-5's wording that belong to the milestone
-writing that engine.
+deliberately does *not* require: M0-1's answer, and the engine edge cases in
+M0-5's wording that belong to the milestone writing that engine.
 
 - **M0-0** `test-harness` `packaging` `docs` **Project scaffolding — make the
   repo buildable, testable and agent-ready.** CMake+CTest host build, the real
