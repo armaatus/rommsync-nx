@@ -35,6 +35,7 @@ ctest --test-dir build -R sync --output-on-failure   # one group
 ./server/testing/seed.sh                         # re-seed ROM fixtures
 ./scripts/orca/compose.sh up -d                  # start RomM
 ./scripts/orca/compose.sh logs -f                # follow it; tab 2 shows this
+./scripts/orca/reap.sh                           # list RomM stacks whose worktree is gone (--yes removes)
 ```
 
 If `ctest` reports `rig.smoke` as **Skipped**, RomM is not running — start it
