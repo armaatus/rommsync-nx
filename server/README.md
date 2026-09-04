@@ -11,10 +11,16 @@ machine hosting RomM — the Switch components live in `../sysmodule` and
   ```bash
   curl -s http://localhost:1515/openapi.json -o contract/romm-openapi-<version>.json
   ```
+- **`contract/captures/`** — the real responses behind those docs, produced by
+  `probe_contract.py --capture` against the docker fixture. The snapshot says
+  what RomM declares; these say what it does. `ctest -R contract` re-captures and
+  compares, so a RomM upgrade cannot leave the docs quietly wrong.
 - **`probe_contract.py`** — validates the sync contract against a *live* RomM and
   prints real response shapes. See its header for usage. Run the read-only check
   any time; run `--auth --negotiate` to exercise the full flow (safe: sends an
-  empty save list and never calls `/complete`).
+  empty save list and never calls `/complete`). `--sync-scenarios` additionally
+  uploads throwaway saves so all four negotiate actions can be captured — it
+  writes, and refuses a non-loopback URL for that reason.
 
 ## Preparing RomM for the Switch client
 

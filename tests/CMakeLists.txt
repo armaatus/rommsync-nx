@@ -102,6 +102,25 @@ foreach(scenario IN LISTS HTTP_SCENARIOS)
   set_tests_properties(http.${scenario} PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 endforeach()
 
+# --- the committed API captures still match a live RomM ----------------------
+# server/contract/captures/ is what the docs quote and what M1/M2 will be coded
+# against. Re-running the probe here is what stops a RomM upgrade from being
+# discovered on a console: the shapes are compared, not the ids and timestamps.
+# Python, because the probe it drives is python and shares its redaction rules.
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+
+add_test(NAME contract.captures
+         COMMAND ${Python3_EXECUTABLE}
+                 "${CMAKE_CURRENT_SOURCE_DIR}/test_contract_captures.py"
+                 --repo "${CMAKE_SOURCE_DIR}"
+                 --scratch "${CMAKE_CURRENT_BINARY_DIR}/captures")
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(contract.captures PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+# Uploads throwaway saves to the fixture, so it must not interleave with another
+# test reading the same library.
+set_tests_properties(contract.captures PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+
 # --- worktree environment: the `romm` tab in orca.yaml -----------------------
 # Shell, not C++, because the thing under test is a shell script. Splitting the
 # two phases keeps the regression (`waits`) meaningful with Docker stopped --

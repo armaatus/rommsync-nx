@@ -128,7 +128,11 @@ went away without the hook running, `scripts/orca/reap.sh` lists them and
 The **server contract** is testable off-console: `server/probe_contract.py`
 exercises auth + negotiate + saves against a RomM and prints the real response
 shapes — run it against the docker fixture (never production) to confirm any
-schema before implementing.
+schema before implementing. Its `--capture` output is committed under
+`server/contract/captures/`, which is what [API_CONTRACT.md](API_CONTRACT.md),
+[AUTH.md](AUTH.md) and [SYNC_PROTOCOL.md](SYNC_PROTOCOL.md) quote; `ctest -R
+contract` re-captures and fails on drift, so those pages cannot quietly go
+stale.
 
 ## Coding standards
 
