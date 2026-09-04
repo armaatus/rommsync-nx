@@ -22,12 +22,14 @@ of being discovered on a console.
 `romm-openapi-5.2.0.json` next door says what RomM *declares*. These say what it
 *does*, which is not always the same: the OpenAPI schema does not tell you that
 `content_hash` is an MD5, that an uploaded save comes back under a different
-file name, or that `expires_at` is null.
+file name, that `expires_at` is null, or that an unapproved poll answers `400`
+with the one string that separates "keep polling" from "this pairing is dead".
 
 | File | Call |
 |---|---|
 | `auth-device-init.json` | `POST /api/auth/device/init` |
 | `auth-device-token.json` | `POST /api/auth/device/token` (after approval) |
+| `auth-device-token-pending.json` | `POST /api/auth/device/token` **before** approval — the `400` the pairing screen sees on every tick, and a shape the OpenAPI snapshot does not declare |
 | `devices-create.json` | `POST /api/devices` |
 | `roms-list.json` | `GET /api/roms?limit=1` |
 | `saves-post.json` | `POST /api/saves` — one uploaded save (`SaveSchema`) |

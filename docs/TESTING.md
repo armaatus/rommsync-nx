@@ -173,6 +173,16 @@ library other tests read.
 A red run here means RomM changed under the docs, not that a test is flaky:
 re-capture, read the diff, and fix whatever the docs claimed.
 
+That is only half the guarantee. `contract.captures` pins the captures to the
+server; `auth.shapes` pins the **structs** to the captures, by parsing the
+committed files through `rommsync::auth` rather than restating them as literals.
+A field RomM renames therefore fails twice — once as drift, once as a struct
+that can no longer read its own capture — and a struct that quietly guessed a
+name cannot pass. Neither `auth.shapes` nor `core.json` (the JSON reader itself,
+mostly a list of bodies that must be *refused*) touches the network, so neither
+ever skips: a body that should have been rejected is a bug with or without a
+server to have sent it.
+
 The Python tooling lives in a per-worktree `.venv` built from
 `server/requirements.txt` by `setup.sh`. The C++ build needs none of it.
 

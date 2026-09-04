@@ -23,6 +23,25 @@ add_executable(test_version test_version.cpp)
 target_link_libraries(test_version PRIVATE rommsync::core)
 add_test(NAME core.version COMMAND test_version)
 
+# The JSON reader every response shape is read through. Pure parsing, so this
+# never skips -- a body that should have been refused is a bug with or without
+# a server to have sent it.
+add_executable(test_json test_json.cpp)
+target_link_libraries(test_json PRIVATE rommsync::core)
+target_include_directories(test_json PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+add_test(NAME core.json COMMAND test_json)
+
+# The auth structs against the committed captures in server/contract/captures/.
+# It reads those files rather than restating them, so the structs are pinned to
+# the same bytes the docs quote and contract.captures re-checks against a live
+# RomM. No network, so it never skips either.
+add_executable(test_auth_shapes test_auth_shapes.cpp)
+target_link_libraries(test_auth_shapes PRIVATE rommsync::core)
+target_include_directories(test_auth_shapes PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_auth_shapes PRIVATE
+  ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures")
+add_test(NAME auth.shapes COMMAND test_auth_shapes)
+
 # --- rig smoke test: proves docker RomM + fault proxy + ctest all work -------
 # Uses libcurl directly on purpose. It tests the RIG, not our code, and must
 # keep working while M0-2 replaces it as the way production code speaks HTTP.
