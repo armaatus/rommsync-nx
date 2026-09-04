@@ -139,6 +139,22 @@ struct ParseResult {
 /// so a truncated body followed by a second one cannot be read as the first.
 ParseResult Parse(std::string_view text);
 
+/// `value` as a JSON string literal, quotes included.
+///
+/// The engine has to *write* JSON as well as read it -- a device-init request
+/// body, a line of `token.dat` -- and the one way to get that wrong is to build
+/// it by concatenation: a device name holding a quote, or a server URL holding a
+/// backslash, turns a request body into something the server parses as a
+/// different object. Every character RFC 8259 requires escaping is escaped here,
+/// control characters included, so a value is carried rather than interpreted.
+///
+/// Bytes at or above 0x80 pass through unchanged: the input is assumed to be
+/// UTF-8, which is what the rest of the engine handles.
+std::string Quote(std::string_view value);
+
+/// `["a","b"]` -- each element quoted by `Quote`, `[]` when empty.
+std::string QuoteArray(const std::vector<std::string>& values);
+
 /// Reads named fields off an object, remembering the first thing that was
 /// wrong with it.
 ///
