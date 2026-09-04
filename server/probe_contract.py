@@ -30,9 +30,10 @@ re-checks against a live server.
 Every mode past the read-only one WRITES, and none of them may point at a server
 someone cares about. --auth registers a device and burns a device code;
 --sync-scenarios additionally uploads synthetic saves under a per-run slot name.
-All of them clean up after themselves, and all of them refuse a non-loopback URL
-without --i-know-this-is-disposable (CLAUDE.md hard rule 1). The bare read-only
-mode is left open on purpose: it fetches /openapi.json and creates nothing.
+All of them delete what they created on the way out, including when they leave
+by exception, and all of them refuse a non-loopback URL without
+--i-know-this-is-disposable (CLAUDE.md hard rule 1). The bare read-only mode is
+left open on purpose: it fetches /openapi.json and creates nothing.
 
 --sync-scenarios exists because an empty-save negotiate pins the envelope and
 nothing else, so the four SyncOperationSchema actions (upload, download, no_op,
@@ -609,29 +610,33 @@ def main():
     # behind is not.
     probe_devices = [device_id]
 
-    hr("roms sample (shape the client needs)")
-    roms_r = s.get(f"{base}/api/roms", params={"limit": 1}, timeout=30)
-    # Checked before recording: the documented re-capture command writes straight
-    # into server/contract/captures/, so an unchecked 401 would replace the
-    # committed roms-list.json with a FastAPI error body -- a capture that looks
-    # like a shape and is a failure.
-    roms_r.raise_for_status()
-    roms = roms_r.json()
-    cap.record("roms-list", roms)
-    items = roms.get("items", roms) if isinstance(roms, dict) else roms
-    rom_id = None
-    if items:
-        show_shape(items[0], "rom")
-        rom_id = items[0]["id"]
-
-    if args.negotiate or args.sync_scenarios:
-        hr("no-op negotiate (empty saves -> all noop, /complete NOT called)")
-        neg = negotiate(s, base, cap, device_id, [], "sync-negotiate-empty")
-        show_shape(neg, "negotiate response")
-        print(json.dumps(neg, indent=2)[:800])
-        print("\nSession left open (not completed) on purpose.")
-
+    # The try opens here, not further down: everything between registering the
+    # device and deleting it can raise -- an unchecked 401 on /api/roms, a
+    # negotiate against a library that moved -- and each of those used to leave
+    # the device row behind on the way out.
     try:
+        hr("roms sample (shape the client needs)")
+        roms_r = s.get(f"{base}/api/roms", params={"limit": 1}, timeout=30)
+        # Checked before recording: the documented re-capture command writes
+        # straight into server/contract/captures/, so an unchecked 401 would
+        # replace the committed roms-list.json with a FastAPI error body -- a
+        # capture that looks like a shape and is a failure.
+        roms_r.raise_for_status()
+        roms = roms_r.json()
+        cap.record("roms-list", roms)
+        items = roms.get("items", roms) if isinstance(roms, dict) else roms
+        rom_id = None
+        if items:
+            show_shape(items[0], "rom")
+            rom_id = items[0]["id"]
+
+        if args.negotiate or args.sync_scenarios:
+            hr("no-op negotiate (empty saves -> all noop, /complete NOT called)")
+            neg = negotiate(s, base, cap, device_id, [], "sync-negotiate-empty")
+            show_shape(neg, "negotiate response")
+            print(json.dumps(neg, indent=2)[:800])
+            print("\nSession left open (not completed) on purpose.")
+
         if args.sync_scenarios:
             if rom_id is None:
                 print("\n!! the library is empty, so no save can be attached to a rom.",

@@ -309,7 +309,13 @@ add_test(NAME policy.loopback_only
 add_test(NAME policy.writes_refuse_remote
          COMMAND ${Python3_EXECUTABLE} "${POLICY_TEST}" guards
                  --repo "${CMAKE_SOURCE_DIR}")
-set_tests_properties(policy.writes_refuse_remote PROPERTIES SKIP_RETURN_CODE 77)
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  # It skips when no interpreter can import the scripts it runs -- a plain clone
+  # that has not run setup.sh. CI always has the venv, so there the same
+  # condition is a failure: this is the check that keeps a writing script from
+  # reaching a real RomM, and it must never quietly not run.
+  set_tests_properties(policy.writes_refuse_remote PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 
 add_test(NAME policy.tests_are_host_local
          COMMAND ${Python3_EXECUTABLE} "${POLICY_TEST}" host_only

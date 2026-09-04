@@ -108,14 +108,22 @@ whose phases need Docker, a network or Orca:
 
 - `policy.loopback_only` — every base URL the suite is *configured* with is
   loopback: the one compiled into the test binaries, the two `env.sh` derives,
-  the fallback in `tests/CMakeLists.txt`, and this worktree's `.env`. It
-  deliberately does not scan for URL *literals*: `auth.shapes` and
-  `core.token_store` parse `http://romm.lan:8080` as data and never dial it.
+  the fallback in `tests/CMakeLists.txt`, this worktree's `.env`, and
+  `$PROXY_BASE_URL`/`$ROMM_BASE_URL` if the shell exports them — that last pair
+  beats all the rest, because `rig::BaseUrl()` prefers the environment over its
+  compiled-in default. It also checks the fault proxy's `UPSTREAM`, which is
+  where the traffic actually lands: a proxy still bound to `127.0.0.1` forwarding
+  to somewhere else would pass every other check. It deliberately does *not*
+  scan for URL literals: `auth.shapes` and `core.token_store` parse
+  `http://romm.lan:8080` as data and never dial it.
 - `policy.writes_refuse_remote` — the two scripts that take a base URL and write
-  to it (`provision.py`, `probe_contract.py`) refuse a non-loopback one. It
+  to it (`provision.py`, `probe_contract.py`) refuse a non-loopback one, tried
+  once per writing mode, because the probe's guard is a condition over three
+  flags and any one of them dropped from it would otherwise go unnoticed. It
   asserts on the *refusal*, not on a non-zero exit, because a probe that reaches
   for a production RomM and merely fails to connect also exits non-zero — and
-  that is the opposite of the guarantee.
+  that is the opposite of the guarantee. In CI it may not skip (row 7's rule
+  applies to it too).
 - `policy.tests_are_host_local` — every registered CTest command is an
   executable on this machine and names no emulator, console or remote transport.
   It cannot prove a test never opens a socket of its own; it catches the shape
@@ -139,10 +147,11 @@ whose phases need Docker, a network or Orca:
 
 ### Where it stands
 
-All nine rows hold today, on `main`, with the full suite green and CI green —
-which is why M1 was allowed to start. M0-1, M0-3 and M0-5 are still open, and
-that is the section above rather than a hole in the gate: they are exactly the
-parts it does not wait for.
+All nine rows hold as this page is written: the full suite green, CI green on
+`main`, and row 8 newly machine-checked rather than asserted. That is what M1
+started on. M0-1, M0-3 and M0-5 are still open, and that is the section above
+rather than a hole in the gate — they are exactly the parts it does not wait
+for.
 
 The gate is re-asked, not signed off once. Rows 1–8 are each somebody's test or
 CI step, so a change that breaks one goes red at the moment it lands rather than
