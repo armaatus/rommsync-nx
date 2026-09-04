@@ -50,7 +50,35 @@ target_link_libraries(test_token_store PRIVATE rommsync::core)
 target_include_directories(test_token_store PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(test_token_store PRIVATE
   ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+if(UNIX)
+  # "kill the process mid-write" is an acceptance criterion, and forcing it needs
+  # fork() and RLIMIT_FSIZE. The host rig is POSIX (docs/TESTING.md); on anything
+  # else the scenario fails loudly rather than quietly not running.
+  target_compile_definitions(test_token_store PRIVATE ROMMSYNC_CAN_FORK=1)
+endif()
 add_test(NAME core.token_store COMMAND test_token_store)
+
+# The stable client_device_identifier, and the SHA-256 under it. Known-answer
+# vectors, a parser and the filesystem, so this never skips either -- and the
+# thing it guards (one console, one identifier, across a re-pair) is checkable
+# with no server at all.
+add_executable(test_device_identity test_device_identity.cpp)
+target_link_libraries(test_device_identity PRIVATE rommsync::core)
+target_include_directories(test_device_identity PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_device_identity PRIVATE
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+add_test(NAME core.device_identity COMMAND test_device_identity)
+
+# Least privilege, pinned to the document rather than to a second copy of the
+# list: the scopes this client asks for are read out of
+# docs/API_CONTRACT.md#scopes-to-request and compared. Reads one file, so it
+# never skips.
+add_executable(test_scopes test_scopes.cpp)
+target_link_libraries(test_scopes PRIVATE rommsync::core)
+target_include_directories(test_scopes PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_scopes PRIVATE
+  ROMMSYNC_API_CONTRACT="${CMAKE_SOURCE_DIR}/docs/API_CONTRACT.md")
+add_test(NAME auth.scopes COMMAND test_scopes)
 
 # --- rig smoke test: proves docker RomM + fault proxy + ctest all work -------
 # Uses libcurl directly on purpose. It tests the RIG, not our code, and must
@@ -150,6 +178,7 @@ set(PAIR_SCENARIOS
   starting      # status() answers, and says "starting", while init is in flight
   mid_poll      # approval that lands after several polls, at the server's interval
   denied        # a human refusing it, and the re-pair that follows
+  repair        # re-pair with the same identifier: one device in RomM, not two
   expired       # our own deadline, and a code the server considers spent
   retry         # 5xx mid-poll: back off, do not abandon a live code
   unauthorized  # a 401 from something in front of RomM: retry, then diagnose

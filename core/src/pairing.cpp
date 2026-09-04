@@ -33,6 +33,18 @@ constexpr PairingState kAllStates[] = {
     PairingState::kFailed,
 };
 
+}  // namespace
+
+std::vector<std::string> MinimumScopes() {
+  // Kept in the order docs/API_CONTRACT.md lists them, so a diff of either one
+  // against the other reads straight down. `auth.scopes` checks that it is the
+  // same set.
+  return {"me.read",      "roms.read",    "roms.user.read",  "roms.user.write", "assets.read",
+          "assets.write", "devices.read", "devices.write",   "collections.read"};
+}
+
+namespace {
+
 std::string InitBody(const PairingConfig& config) {
   std::string body("{\"client_device_identifier\":");
   body += json::Quote(config.client_device_identifier);

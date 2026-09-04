@@ -96,6 +96,10 @@ assets.read assets.write devices.read devices.write collections.read
 me.write            # only if recording play sessions
 ```
 
+This block is not prose: the `auth.scopes` test parses it and compares it to
+`MinimumScopes()`, so editing one without the other goes red. Anything qualified
+with a `#` comment is documented and *not* requested.
+
 All authed requests send `Authorization: Bearer <token>`.
 
 ## Device registration
