@@ -138,6 +138,17 @@ void Rejects(checks::Checks& c) {
              std::string("rejecting ") + bad.what + " says why");
   }
 
+  // The one deliberate narrowing, and the reason it is not in kBad above: these
+  // are well-formed JSON that no double can hold. Refusing beats saturating to
+  // an infinity or a zero that would then be read as a size or a timestamp.
+  for (const char* unrepresentable : {"1e400", "-1e400", "1e-400", "[1e400]"}) {
+    const json::ParseResult result = json::Parse(unrepresentable);
+    c.Expect(!result.ok(), std::string("refuses the unrepresentable ") + unrepresentable);
+  }
+  // ...but the merely large is fine, so the narrowing stays narrow.
+  c.Expect(json::Parse("1e308").ok(), "a large-but-representable double parses");
+  c.Expect(json::Parse("1e-308").ok(), "and a small one");
+
   // Deep nesting is refused rather than recursed into: this parser runs on a
   // sysmodule thread whose stack a hostile body must not be able to walk off.
   const std::string ok_depth(json::kMaxDepth - 1, '[');
@@ -150,8 +161,9 @@ void Rejects(checks::Checks& c) {
 
 void ReaderReportsTheField(checks::Checks& c) {
   const json::ParseResult doc = json::Parse(
-      R"({"name": "x", "count": 3, "tags": ["a","b"], "note": null, "blank": "",
-          "fraction": 1.5, "mixed": ["a", 2]})");
+      "{\"name\": \"x\", \"count\": 3, \"tags\": [\"a\",\"b\"], \"note\": null,"
+      " \"blank\": \"\", \"nul\": \"a\\u0000b\", \"fraction\": 1.5,"
+      " \"mixed\": [\"a\", 2]}");
   c.Expect(doc.ok(), "reader fixture parses");
 
   {
@@ -181,6 +193,7 @@ void ReaderReportsTheField(checks::Checks& c) {
       {"count", "count", "a number where a string belongs"},
       {"note", "note", "a null where a string belongs"},
       {"blank", "blank", "an empty string"},
+      {"nul", "nul", "a string with an embedded NUL"},
       {"tags", "tags", "an array where a string belongs"},
   };
   for (const Case& bad : kString) {
@@ -211,6 +224,23 @@ void ReaderReportsTheField(checks::Checks& c) {
     std::optional<std::string> out;
     c.Expect(!reader.RequiredNullable("absent", &out),
              "a nullable field still has to be present");
+  }
+  {
+    // `null` and `""` are not the same answer. Every caller reads "has a value"
+    // as "has a value to use", so a blank one has to be refused here rather
+    // than handed on to whatever would try to parse it.
+    json::Reader reader(doc.value, "fixture");
+    std::optional<std::string> out;
+    c.Expect(!reader.RequiredNullable("blank", &out),
+             "a nullable field refuses a blank string, same as Required");
+    c.ExpectEq(reader.error().field, std::string("blank"), "names blank");
+    c.Expect(!out.has_value(), "and carries nothing");
+  }
+  {
+    json::Reader reader(doc.value, "fixture");
+    std::optional<std::string> out;
+    c.Expect(!reader.RequiredNullable("nul", &out),
+             "a nullable field refuses an embedded NUL too");
   }
   {
     // The first failure is the one reported: a reader that kept overwriting

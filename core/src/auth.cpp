@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -32,7 +33,18 @@ std::string_view Origin(std::string_view server_url) {
   return server_url;
 }
 
+/// A path that already carries a scheme is a URL, not a path to join onto.
+/// 5.2.0 never sends one; a RomM that moved to RFC 8628's `verification_uri`
+/// would, and prefixing an origin onto it yields a link nobody can follow.
+bool IsAbsolute(const std::string& path) {
+  const std::size_t scheme = path.find("://");
+  return scheme != std::string::npos && scheme > 0 && path.find('/') > scheme;
+}
+
 std::string Join(std::string_view server_url, const std::string& path) {
+  if (IsAbsolute(path)) {
+    return path;
+  }
   std::string url(Origin(server_url));
   if (!path.empty() && path.front() != '/') {
     url.push_back('/');
@@ -43,12 +55,17 @@ std::string Join(std::string_view server_url, const std::string& path) {
 
 }  // namespace
 
-std::chrono::seconds DeviceInitResponse::poll_interval() const {
-  return Clamp(interval, kMinPollInterval, kMaxPollInterval);
+std::chrono::seconds DeviceInitResponse::lifetime() const {
+  return Clamp(expires_in, kMinPairingLifetime, kMaxPairingLifetime);
 }
 
-std::chrono::seconds DeviceInitResponse::lifetime() const {
-  return Clamp(expires_in, kMinPollInterval, kMaxPairingLifetime);
+std::chrono::seconds DeviceInitResponse::poll_interval() const {
+  // Only ever slower than asked, never faster: RomM restarts its pacing window
+  // on every poll it answers `slow_down`, so a loop that undercuts `interval`
+  // earns `slow_down` forever and the code expires under it. The ceiling is the
+  // code's own lifetime, past which there is nothing left to poll for.
+  const std::chrono::seconds asked = Clamp(interval, kMinPollInterval, kMaxPairingLifetime);
+  return asked < lifetime() ? asked : lifetime();
 }
 
 std::string DeviceInitResponse::VerificationUrl(std::string_view server_url) const {
@@ -138,6 +155,8 @@ const char* ToString(TokenPoll poll) {
       return "slow_down";
     case TokenPoll::kRateLimited:
       return "rate_limited";
+    case TokenPoll::kServerError:
+      return "server_error";
     case TokenPoll::kAccessDenied:
       return "access_denied";
     case TokenPoll::kExpiredToken:
@@ -150,7 +169,7 @@ const char* ToString(TokenPoll poll) {
 
 bool ShouldKeepPolling(TokenPoll poll) {
   return poll == TokenPoll::kAuthorizationPending || poll == TokenPoll::kSlowDown ||
-         poll == TokenPoll::kRateLimited;
+         poll == TokenPoll::kRateLimited || poll == TokenPoll::kServerError;
 }
 
 TokenPoll ClassifyTokenPoll(int status, std::string_view body) {
@@ -161,6 +180,12 @@ TokenPoll ClassifyTokenPoll(int status, std::string_view body) {
   // status is the contract here, so the body is not read.
   if (status == 429) {
     return TokenPoll::kRateLimited;
+  }
+  // A gateway restarting, or RomM itself, says nothing about the device_code:
+  // it is still good for the rest of its `expires_in`. Abandoning the pairing
+  // screen over a 502 throws away minutes of a perfectly live code.
+  if (status >= 500 && status < 600) {
+    return TokenPoll::kServerError;
   }
   if (status != 400) {
     return TokenPoll::kUnrecognized;

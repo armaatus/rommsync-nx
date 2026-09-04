@@ -157,7 +157,13 @@ def device_auth(s, base, cap, approver):
         "client_version": "0.0.0",
         "requested_scopes": REQUESTED_SCOPES,
     }, timeout=30)
-    init.raise_for_status()
+    # 201, not 200 -- the OpenAPI snapshot declares it and docs/AUTH.md now says
+    # so, which is only worth writing down if something checks it.
+    # `raise_for_status()` would wave any 2xx through.
+    if init.status_code != 201:
+        print(f"!! init answered {init.status_code}, not the documented 201: "
+              f"{init.text[:200]}", file=sys.stderr)
+        sys.exit(1)
     init = init.json()
     show_shape(init, "init response")
     device_code = cap.secret(init.get("device_code"), "<device_code>")

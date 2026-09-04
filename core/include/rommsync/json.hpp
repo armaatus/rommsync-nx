@@ -4,8 +4,13 @@
 // only standard headers and rommsync/ ones (core/AGENTS.md, enforced by the
 // `static` CI job), and a sysmodule has no room for a general-purpose library
 // anyway. This is the smallest thing that can parse a RomM response *safely*:
-// it accepts RFC 8259 and nothing else, so a truncated or hostile body is a
-// named error rather than a plausible-looking value.
+// it accepts RFC 8259 and almost nothing else, so a truncated or hostile body
+// is a named error rather than a plausible-looking value.
+//
+// The one deliberate narrowing: a number whose magnitude no `double` can hold
+// (`1e400`, `1e-400`) is refused rather than saturated to infinity or to zero.
+// Both are well-formed JSON. Neither is a value RomM has any way to mean, and
+// a silent +inf in a size or a timestamp is worse than a rejected body.
 //
 // Strict on purpose, because every relaxation here is a way for a broken
 // response to look fine:
@@ -149,9 +154,14 @@ class Reader {
   /// used in the error when `value` is not an object at all.
   Reader(const Value& value, std::string_view context);
 
-  /// A required, non-empty string. Empty is refused because every string RomM
-  /// is documented to send here is an identifier or a path: a blank one is a
-  /// server that has lost it, not a value worth carrying.
+  /// A required string that is non-empty and free of embedded NULs.
+  ///
+  /// Empty is refused because every string RomM is documented to send here is
+  /// an identifier or a path: a blank one is a server that has lost it, not a
+  /// value worth carrying. A NUL is refused because `"a\u0000b"` is legal JSON
+  /// and every C API downstream -- a `Authorization:` header, a URL, a line
+  /// written to `token.dat` -- stops at the NUL, so the value that gets used
+  /// would not be the value that was validated.
   bool Required(std::string_view key, std::string* out);
 
   /// A required integer -- rejected if written with a fraction or exponent, or
@@ -162,8 +172,11 @@ class Reader {
   /// scopes is a real answer, and one the caller has to see.
   bool Required(std::string_view key, std::vector<std::string>* out);
 
-  /// A required field that is documented as `string | null`. Must be present;
-  /// `null` yields an empty optional rather than an error.
+  /// A required field documented as `string | null`. Must be present; `null`
+  /// yields an empty optional rather than an error. A *string* is held to the
+  /// same bar as `Required`: `""` is refused rather than carried, because every
+  /// caller reads "has a value" as "has a value to use", and an empty one would
+  /// reach a timestamp parser as though it meant something.
   bool RequiredNullable(std::string_view key, std::optional<std::string>* out);
 
   bool ok() const { return error_.ok(); }
@@ -172,6 +185,10 @@ class Reader {
  private:
   const Value* Lookup(std::string_view key);
   bool Fail(std::string_view key, std::string message);
+
+  /// The bar every string field is held to, shared by `Required` and
+  /// `RequiredNullable` so the two cannot drift apart.
+  static bool UsableString(Reader& reader, std::string_view key, const std::string& value);
 
   const Value* object_ = nullptr;
   Error error_;

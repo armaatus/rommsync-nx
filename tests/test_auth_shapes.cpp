@@ -88,6 +88,14 @@ void InitCapture(checks::Checks& c) {
              "...however many there are");
   c.Expect(init.poll_interval() == std::chrono::seconds{5}, "poll_interval");
   c.Expect(init.lifetime() == std::chrono::seconds{600}, "lifetime");
+
+  // 5.2.0 sends a path. A RomM that moved to RFC 8628's absolute
+  // `verification_uri` must not have an origin glued onto the front of it.
+  auth::DeviceInitResponse absolute = init;
+  absolute.verification_path = "https://romm.example/pair/device";
+  c.ExpectEq(absolute.VerificationUrl("http://romm.lan:8080"),
+             std::string("https://romm.example/pair/device"),
+             "an already-absolute verification path is left alone");
 }
 
 void TokenCapture(checks::Checks& c) {
@@ -195,6 +203,13 @@ void PartialsAreRejected(checks::Checks& c) {
        "a token response without expires_at"},
       {R"({"access_token":"","device_id":"d","scopes":[],"expires_at":null})", "access_token",
        "a blank access_token"},
+      // Legal JSON, and std::string carries it faithfully -- but every C API
+      // downstream stops at the NUL, so the token that gets sent would not be
+      // the token that was checked.
+      {"{\"access_token\":\"rmm_a\\u0000EVIL\",\"device_id\":\"d\",\"scopes\":[],\"expires_at\":null}",
+       "access_token", "an access_token with an embedded NUL"},
+      {R"({"access_token":"t","device_id":"d","scopes":[],"expires_at":""})", "expires_at",
+       "an expires_at that is blank rather than null"},
       {R"({"access_token":"t","device_id":null,"scopes":[],"expires_at":null})", "device_id",
        "a null device_id"},
       {R"({"access_token":"t","device_id":"d","scopes":"roms.read","expires_at":null})",
@@ -268,7 +283,11 @@ void PollStates(checks::Checks& c) {
       {400, "<html>bad gateway</html>", auth::TokenPoll::kUnrecognized, false},
       {422, R"({"detail":[{"type":"missing","loc":["body","device_code"]}]})",
        auth::TokenPoll::kUnrecognized, false},
-      {500, "", auth::TokenPoll::kUnrecognized, false},
+      // A gateway having a bad minute says nothing about the device_code, which
+      // still has most of its 600s left. Giving up on a 502 throws that away.
+      {500, "", auth::TokenPoll::kServerError, true},
+      {502, "<html>502 Bad Gateway</html>", auth::TokenPoll::kServerError, true},
+      {503, R"({"detail":"restarting"})", auth::TokenPoll::kServerError, true},
       // A 401 does not mean "pending": nothing may read a status other than
       // 400 as one of the device-grant reasons.
       {401, R"({"detail":"authorization_pending"})", auth::TokenPoll::kUnrecognized, false},
@@ -282,20 +301,39 @@ void PollStates(checks::Checks& c) {
   }
 }
 
-/// The interval and lifetime a poll loop is handed are clamped, because both
-/// arrive over the network: a zero interval would spin the sysmodule against
-/// RomM's rate limiter, and a huge one would leave the pairing screen looking
-/// hung past the point the code had died anyway.
-void DurationsAreClamped(checks::Checks& c) {
+/// The interval and lifetime a poll loop is handed are bounded, because both
+/// arrive over the network. The direction matters: polling *slower* than asked
+/// wastes time, polling *faster* wedges the pairing, so the interval may only
+/// ever be raised.
+void DurationsAreBounded(checks::Checks& c) {
   auth::DeviceInitResponse init;
   init.interval = 0;
   init.expires_in = 0;
   c.Expect(init.poll_interval() == auth::kMinPollInterval, "a zero interval is floored");
-  c.Expect(init.lifetime() == auth::kMinPollInterval, "a zero lifetime is floored");
+  c.Expect(init.lifetime() == auth::kMinPairingLifetime, "a zero lifetime is floored");
 
-  init.interval = 100'000;
+  init.interval = 5;
+  init.expires_in = 600;
+  c.Expect(init.poll_interval() == std::chrono::seconds{5}, "5.2.0's interval passes through");
+  c.Expect(init.lifetime() == std::chrono::seconds{600}, "...and its lifetime");
+
+  // The regression that matters: RomM restarts its pacing window on every poll
+  // it answers `slow_down`, so a client polling inside `interval` never
+  // recovers. An interval larger than any cap we might have invented must
+  // therefore still be honoured in full.
+  init.interval = 300;
+  init.expires_in = 600;
+  c.Expect(init.poll_interval() == std::chrono::seconds{300},
+           "a long interval is honoured, not clamped down");
+
+  // Waiting past the code's own expiry is the one pointless direction.
+  init.interval = 900;
+  init.expires_in = 600;
+  c.Expect(init.poll_interval() == std::chrono::seconds{600},
+           "an interval past the lifetime is capped at it");
+
+  init.interval = 5;
   init.expires_in = 100'000;
-  c.Expect(init.poll_interval() == auth::kMaxPollInterval, "a huge interval is capped");
   c.Expect(init.lifetime() == auth::kMaxPairingLifetime, "a huge lifetime is capped");
 }
 
@@ -308,6 +346,6 @@ int main() {
   PendingCapture(c);
   PartialsAreRejected(c);
   PollStates(c);
-  DurationsAreClamped(c);
+  DurationsAreBounded(c);
   return c.failures() == 0 ? 0 : 1;
 }
