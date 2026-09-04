@@ -407,6 +407,14 @@ void RefusesWhatItCannotSendFaithfully(checks::Checks& c) {
                "...and the error names which entry");
   }
 
+  // The payload's own field, which no `saves[i].` prefix belongs on.
+  sync::SyncNegotiatePayload blank;
+  blank.device_id = "";
+  blank.saves.push_back(SampleSave());
+  const sync::Encoded encoded = sync::EncodeNegotiateRequest(blank);
+  c.Expect(!encoded.ok(), "refused: a blank device_id, which negotiates as nobody");
+  c.ExpectEq(encoded.error.field, std::string("device_id"), "...and named the field");
+
   // The SHA1 case is the one a reader has to be told about by name, since the
   // server accepts it and only the sync results look wrong.
   sync::ClientSaveState sha1 = SampleSave();

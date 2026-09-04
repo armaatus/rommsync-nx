@@ -175,6 +175,15 @@ json::Error Validate(const ClientSaveState& save) {
 
 Encoded EncodeNegotiateRequest(const SyncNegotiatePayload& payload) {
   Encoded encoded;
+  // A blank device_id is the one that has to be caught here rather than by the
+  // server: it is what a token store that lost its device leaves behind, and
+  // RomM would read the whole negotiation as belonging to no device -- every
+  // save with no sync history, every plan a first encounter.
+  if (const json::Error error = ValidateNullable(payload.device_id, "device_id"); !error.ok()) {
+    encoded.error = error;
+    return encoded;
+  }
+
   std::string body("{\"device_id\":");
   body += payload.device_id.has_value() ? json::Quote(*payload.device_id) : "null";
   body += ",\"saves\":[";
