@@ -576,6 +576,37 @@ int Impostor(http::HttpClient& client, const std::string& base) {
   ExpectError(checks, nonsense, auth::RegistrationError::kMalformed,
               "a 200 that is not a device is not a device");
 
+  // The list has its own version of this: RomM has no uniqueness constraint on
+  // `client_device_identifier`, so two rows carrying one is a state it can be
+  // in -- and one no amount of pairing gets a console out of, because pairing
+  // again would find the same two. It cannot be produced by asking RomM for it,
+  // which is exactly what the fault proxy is for.
+  const std::string twin =
+      R"({"id":"22222222-2222-2222-2222-222222222222","name":"a","platform":"switch",)"
+      R"("client":"rommsync-nx","client_device_identifier":)" +
+      json::Quote(identifier) + R"(,"sync_enabled":true})";
+  const std::string other_twin =
+      R"({"id":"33333333-3333-3333-3333-333333333333","name":"b","platform":"switch",)"
+      R"("client":"rommsync-nx","client_device_identifier":)" +
+      json::Quote(identifier) + R"(,"sync_enabled":true})";
+  ExpectSucceeded(checks,
+                  rig::ArmFault(client, base,
+                                std::string(R"({"mode":"status","status":200,"body":)") +
+                                    json::Quote("[" + twin + "," + other_twin + "]") +
+                                    R"(,"path":"/api/devices","count":1})"),
+                  "arming a list with two rows for one console");
+  auth::StoredToken orphan = token;
+  orphan.device_id.clear();
+  const auth::Registration ambiguous =
+      auth::FindRegistration(client, orphan, identifier);
+  rig::DisarmFault(client, base);
+  ExpectError(checks, ambiguous, auth::RegistrationError::kAmbiguous,
+              "two devices for one console is reported, not guessed between");
+  checks.Expect(!auth::NeedsPairing(ambiguous.error),
+                "and pairing again would only find the same two");
+  checks.Expect(ambiguous.message.find("2") != std::string::npos,
+                "the message says how many (" + ambiguous.message + ")");
+
   ExpectError(checks, auth::ConfirmRegistration(client, token), auth::RegistrationError::kNone,
               "and the real device still confirms once the faults are gone");
   return checks.failures();
