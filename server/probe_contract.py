@@ -144,7 +144,10 @@ def main():
     interval = init.get("interval", 5)
     approver = None
     if args.approve_as:
-        user, _, password = args.approve_as.partition(":")
+        user, sep, password = args.approve_as.partition(":")
+        if not sep or not user or not password:
+            print("--approve-as wants USER:PASS", file=sys.stderr)
+            sys.exit(2)
         approver = (user, password)
     else:
         approver = fixture_credentials(args.fixture_auth)

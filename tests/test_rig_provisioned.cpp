@@ -77,8 +77,13 @@ int main() {
 
   const std::string token = FixtureValue(fixture, "ROMM_FIXTURE_TOKEN");
   const std::string collection_id = FixtureValue(fixture, "ROMM_FIXTURE_COLLECTION_ID");
+  const std::string device_id = FixtureValue(fixture, "ROMM_FIXTURE_DEVICE_ID");
   checks.Expect(!token.empty(), "a client token was minted");
   checks.Expect(!collection_id.empty(), "a collection id was recorded");
+  // Every sync call is scoped by device_id. An empty one here surfaces much
+  // later, inside whichever sync test negotiates with it, looking like that
+  // test's own bug.
+  checks.Expect(!device_id.empty(), "a device_id was registered");
 
   if (token.empty()) {
     std::cerr << "\nno token, so nothing below can be checked; the device-code flow "
@@ -109,6 +114,17 @@ int main() {
   checks.ExpectOk(collections, "GET /api/collections");
   checks.Expect(collections.response.body.find("\"Handheld\"") != std::string::npos,
                 "the curated `Handheld` collection exists");
+
+  // Existing-and-empty is the failure mode a name check cannot see: the point
+  // of the collection is what is in it.
+  if (!collection_id.empty()) {
+    const http::Result curated =
+        GetAuthed(client, base + "/api/roms?collection_id=" + collection_id + "&limit=1", token);
+    checks.ExpectOk(curated, "GET /api/roms?collection_id");
+    const std::string curated_total = rig::JsonNumber(curated.response.body, "total");
+    checks.Expect(!curated_total.empty() && curated_total != "0",
+                  "the `Handheld` collection actually holds roms");
+  }
 
   if (checks.failures() == 0) {
     std::cout << "fixture provisioned: " << total << " rom(s), Handheld collection, "
