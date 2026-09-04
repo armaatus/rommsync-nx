@@ -52,8 +52,12 @@ overlay.
 ### 3. Shared state on SD
 
 - `sdmc:/config/rommsync/config.ini` — user config ([CONFIG.md](CONFIG.md)).
-- `sdmc:/config/rommsync/token.dat` — bearer token + device_id (perms-restricted;
-  see [SECURITY.md](SECURITY.md)).
+- `sdmc:/config/rommsync/token.dat` — bearer token + device_id. In the clear:
+  Horizon's FAT32 has no permission bits, so the mitigation is minimum scopes
+  and revocability, not secrecy ([SECURITY.md](SECURITY.md)).
+- `sdmc:/config/rommsync/device.dat` — the `client_device_identifier`, derived
+  once and kept for the life of the SD. Separate from `token.dat` because it has
+  to survive a re-pair ([AUTH.md](AUTH.md#client-identifier)).
 - `sdmc:/config/rommsync/state.db` — last-synced hash/mtime per (rom, slot) so the
   client can tell which side changed. Small SQLite or a flat file.
 - `sdmc:/config/rommsync/queue.json` — pending downloads.

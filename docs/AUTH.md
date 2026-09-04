@@ -293,10 +293,53 @@ the loop unattended. Details in [TESTING.md](TESTING.md).
 
 ## Client identifier
 
-`client_device_identifier` must be stable per console (so re-pairing recognizes
-the same device). Derive it from a stable value (e.g. SHA1 of the console serial
-or a random id generated once and stored next to the token). Never send anything
-that identifies the *user* beyond what RomM needs.
+`client_device_identifier` must be stable per console, because RomM keys a
+device on it: send a different value on a re-pair and RomM does not recognise
+the console — it registers a *second* device, and every save on it starts with
+an empty sync history. [`device_identity.hpp`](../core/include/rommsync/device_identity.hpp)
+is the derivation and both directions of the record.
+
+It is **not** the console serial. The serial identifies the hardware and,
+through a warranty record, a person; RomM needs neither. What it is:
+
+```
+nx-<32 lowercase hex>   = "nx-" + first 128 bits of
+                          SHA-256("rommsync-nx/client-device-identifier/v1" \0 <serial>)
+```
+
+The salt is domain separation, not a secret — this repository is public, so
+anyone holding a list of serials can hash them. What it buys is that the same
+serial hashed for another purpose is a different string, so this is not a join
+key across systems. The property that protects the user is that the serial never
+leaves the console at all: only the digest is written, and only the digest is
+sent.
+
+A platform that offers nothing stable gets a random identifier instead, minted
+from at least 16 bytes of platform entropy and hashed the same way. A stable
+value is preferred when there is one, because a *derived* identifier survives
+losing `device.dat` — a wiped `config/` folder re-derives the same value and RomM
+still recognises the console, where a random one would not.
+
+**It lives in its own file, `sdmc:/config/rommsync/device.dat`, not in
+`token.dat`.** "Re-pair" discards the token, and an identifier discarded with it
+would be re-derived as a new one on the next pairing — exactly the duplicate this
+exists to prevent. Written once, atomically, and after that **the file wins over
+the seed, always**: a console that gains a stable serial after having been given
+a random identifier keeps the random one. A file that cannot be *read* is an
+error rather than a reason to mint, because a card having a bad moment is not
+evidence that no identifier exists and minting over one cannot be undone. A file
+that reads back and is not a record is replaced, since there is nothing left in
+it to preserve.
+
+## Scopes
+
+`MinimumScopes()` in [`pairing.hpp`](../core/include/rommsync/pairing.hpp) is
+what the client requests, and it is exactly the unconditional list in
+[API_CONTRACT.md](API_CONTRACT.md#scopes-to-request) — pinned to that document by
+the `auth.scopes` test, so the two cannot drift. Every `.write` in it is one the
+client performs; `me.write` is documented for recording play sessions, which
+this client does not do, so it is not requested. RomM may approve a subset, which
+is why the granted set is read back off the token response rather than assumed.
 
 ## Token storage
 
@@ -348,9 +391,21 @@ expiry", `""` is refused rather than handed to a timestamp parser. See
 [SECURITY.md](SECURITY.md) for the threat model — the SD is readable by anything
 on the console, so treat the token as sensitive and scope it minimally.
 
+**Nothing here reaches a log.** `json::Error` never quotes a value, the store's
+messages name the path and the failure and never the record, and
+`DescribeStoredToken` is the one right way to summarise a pairing for a log or a
+diagnostics screen: which server, which device, which scopes, and that a token
+exists, by length only. `core.token_store` asserts it rather than trusting it —
+every failure path is run with a distinctive needle for the token and the device
+code, and the output is searched for both.
+
 ## Re-pairing / revocation
 
 - The overlay offers "Re-pair" → discards the token and restarts the flow.
+  `DiscardToken` removes `token.dat` **and** the `.tmp`/`.old` an interrupted
+  commit leaves beside it, overwriting each first: unlinking only the obvious
+  file would leave the same bearer token under a name nobody looks at. It does
+  not touch `device.dat` — see [Client identifier](#client-identifier).
 - Revoking on the server (`DELETE /api/client-tokens/{id}`) invalidates it; the
   sysmodule detects `401`, marks itself unauthenticated, and prompts re-pair via
   the overlay status screen.

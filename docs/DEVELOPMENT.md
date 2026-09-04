@@ -147,5 +147,7 @@ stale.
 
 - C++20, warnings-as-errors everywhere (`-Wall -Wextra -Wpedantic -Werror`),
   not just in CI.
-- No secrets in the tree; `config.ini`/`token.dat` are git-ignored.
+- No secrets in the tree; `config.ini`, `token.dat` and `device.dat` are
+  git-ignored, together with the `.tmp`/`.old` an interrupted commit leaves
+  beside them.
 - Every network call: timeout, offline-safe, ret/backoff. Never block boot.
