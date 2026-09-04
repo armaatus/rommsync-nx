@@ -97,7 +97,7 @@ that demonstrates it. A box checked because someone believes it is not checked.
 | 3 | That fixture is *usable*, not merely running: library scanned, collection created, client token minted with no human in the loop. | `rig.provisioned`; [`provision.py`](../server/testing/provision.py) |
 | 4 | The failure paths a healthy RomM will not produce on demand can be forced, deterministically, in CI. | `http.status`, `http.truncate`, `http.drop`, `http.stall`, `pair.stall`, `pair.drop` |
 | 5 | Nothing in the engine names a transport: every network call goes through `HttpClient`. | CI `static` → *core/ includes nothing platform-specific* |
-| 6 | The response shapes the docs quote are the ones a live RomM returns, and the structs read those same bytes. | `contract.captures`, `auth.shapes` |
+| 6 | The response shapes the docs quote are the ones a live RomM returns, and the structs read those same bytes. | `contract.captures`, `auth.shapes`, `device.shapes` |
 | 7 | An unreachable fixture turns CI red rather than skipping it. | `-DROMMSYNC_REQUIRE_RIG=ON` in [`ci.yml`](../.github/workflows/ci.yml) |
 | 8 | No test in the suite needs a console, an emulator, or a server anyone would miss. | `policy.tests_are_host_local`, `policy.loopback_only`, `policy.writes_refuse_remote` |
 | 9 | The one hardware-ish unknown is isolated: M1–M5 include `HttpClient`, never `ssl`. | rows 5 and 8, plus the fact that the `ssl` answer sits in **M8-1**'s gate and not in this one |
@@ -114,8 +114,8 @@ whose phases need Docker, a network or Orca:
   compiled-in default. It also checks the fault proxy's `UPSTREAM`, which is
   where the traffic actually lands: a proxy still bound to `127.0.0.1` forwarding
   to somewhere else would pass every other check. It deliberately does *not*
-  scan for URL literals: `auth.shapes` and `core.token_store` parse
-  `http://romm.lan:8080` as data and never dial it.
+  scan for URL literals: `auth.shapes`, `core.token_store` and `device.shapes`
+  parse `http://romm.lan:8080` as data and never dial it.
 - `policy.writes_refuse_remote` — the two scripts that take a base URL and write
   to it (`provision.py`, `probe_contract.py`) refuse a non-loopback one, tried
   once per writing mode, because the probe's guard is a condition over three
@@ -234,6 +234,25 @@ ctest --test-dir build --output-on-failure
   pairs once; the suite opens a dozen codes from one address, so `pair.*` waits
   a rate-limited init out rather than failing on it. The wait is bounded, so an
   init broken for any other reason still goes red.
+- The `device.*` tests cover registering the console (M1-3): `shapes`,
+  `registered`, `repair`, `recovers`, `deleted`, `revoked`, `sync_disabled`,
+  `offline`, `impostor`, `never_post`. All but `shapes` need the rig, and they
+  need it for a reason no client-side test can substitute for: "pairing twice
+  leaves one device, not two" is a claim about what RomM does with a
+  `client_device_identifier`, so they list `GET /api/devices` **as the fixture
+  user** and count the rows carrying this console's. `never_post` is the same
+  argument in reverse — it holds the finding that `POST /api/devices` creates a
+  duplicate however it is called, so a change back to it goes red here instead
+  of accreting a device per boot on a console. `impostor` and `offline` use the
+  fault proxy for the answers a healthy RomM will not give: a `200` about a
+  different device, a body that is not JSON, a stall, a `503`, and a connection
+  that dies mid-body. They are `RUN_SERIAL` for the fault proxy, for the
+  ten-inits-a-minute limit below, and because two of them at once would count
+  each other's device rows.
+- `device.shapes` is the no-network half: `DeviceSchema` parsed out of
+  `captures/devices-get.json`, and the classification the sysmodule acts on —
+  registered / paired-but-not / unpaired, and whether a failure is worth
+  retrying or worth a trip to the pairing screen. It never skips.
 - `core.token_store` covers `token.dat`: the atomic write, and specifically what
   survives a write that cannot complete. The interesting one is the process
   being **killed mid-write** — forced with `fork()` and `RLIMIT_FSIZE`, so a
@@ -267,8 +286,9 @@ ctest --test-dir build --output-on-failure
   `MinimumScopes()`. Editing the document without editing the code, or the other
   way round, fails here — including adding a scope marked "only if…" to the set
   the client actually requests.
-- Neither `auth.scopes`, `core.token_store`, `core.device_identity` nor
-  `sync.payload` touches the network, so none of them ever skips.
+- None of `auth.scopes`, `core.token_store`, `core.device_identity`,
+  `device.shapes` or `sync.payload` touches the network, so none of them ever
+  skips.
 - The `policy.*` tests re-ask row 8 of [the M0 exit gate](#the-m0-exit-gate) on
   every run: the suite is configured for loopback only, the scripts that write
   refuse anything else, and no registered test reaches off this machine. They
@@ -355,14 +375,16 @@ A red run here means RomM changed under the docs, not that a test is flaky:
 re-capture, read the diff, and fix whatever the docs claimed.
 
 That is only half the guarantee. `contract.captures` pins the captures to the
-server; `auth.shapes` pins the **structs** to the captures, by parsing the
-committed files through `rommsync::auth` rather than restating them as literals.
-A field RomM renames therefore fails twice — once as drift, once as a struct
-that can no longer read its own capture — and a struct that quietly guessed a
-name cannot pass. Neither `auth.shapes` nor `core.json` (the JSON reader itself,
-mostly a list of bodies that must be *refused*) touches the network, nor does
-`core.token_store`, so none of them ever skips: a body that should have been rejected is a bug with or without a
-server to have sent it.
+server; `auth.shapes` and `device.shapes` pin the **structs** to the captures, by
+parsing the committed files through `rommsync::auth` rather than restating them
+as literals. A field RomM renames therefore fails twice — once as drift, once as
+a struct that can no longer read its own capture — and a struct that quietly
+guessed a name cannot pass. `device.shapes` goes one step further and lists
+`DeviceSchema`'s *unread* fields too, so a RomM that grows one the client should
+be acting on is noticed rather than ignored. None of these touches the network,
+nor does `core.json` (the JSON reader itself, mostly a list of bodies that must
+be *refused*) or `core.token_store`, so none of them ever skips: a body that
+should have been rejected is a bug with or without a server to have sent it.
 
 The Python tooling lives in a per-worktree `.venv` built from
 `server/requirements.txt` by `setup.sh`. The C++ build needs none of it.

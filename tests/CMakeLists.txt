@@ -81,6 +81,18 @@ target_compile_definitions(test_device_identity PRIVATE
   ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
 add_test(NAME core.device_identity COMMAND test_device_identity)
 
+# `DeviceSchema` against the committed capture, and the states the sysmodule
+# acts on around it: registered / paired-but-not / unpaired, and whether a
+# failure is worth retrying or worth a trip to the pairing screen. Reads one
+# capture and the filesystem, so it never skips.
+add_executable(test_device_shapes test_device_shapes.cpp)
+target_link_libraries(test_device_shapes PRIVATE rommsync::core)
+target_include_directories(test_device_shapes PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_device_shapes PRIVATE
+  ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+add_test(NAME device.shapes COMMAND test_device_shapes)
+
 # Least privilege, pinned to the document rather than to a second copy of the
 # list: the scopes this client asks for are read out of
 # docs/API_CONTRACT.md#scopes-to-request and compared. Reads one file, so it
@@ -225,6 +237,43 @@ foreach(scenario IN LISTS PAIR_SCENARIOS)
   # scenario for every client. These also wait out real poll intervals, so the
   # timeout has to cover a few of them.
   set_tests_properties(pair.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+endforeach()
+
+# --- registering the console against the real rig ----------------------------
+# Same shape as pair.*: one CTest entry per scenario. These assert on what the
+# SERVER holds -- they list /api/devices as the fixture user and count the rows
+# carrying this console's identifier -- because "pairing twice leaves one device,
+# not two" is a claim about RomM that no amount of client-side testing can check.
+# `never_post` holds the finding the client is built on: POST /api/devices never
+# matches on client_device_identifier, so it always creates a duplicate.
+add_executable(test_device_registration test_device_registration.cpp)
+target_link_libraries(test_device_registration PRIVATE rommsync::host)
+target_compile_definitions(test_device_registration PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+
+set(DEVICE_SCENARIOS
+  registered     # a fresh pairing registers one device, and the id it cached is it
+  repair         # pairing again is the same device: the list does not grow
+  recovers       # a token with no device id finds its device rather than making one
+  deleted        # the device removed in RomM's UI, caught before a sync scopes by it
+  revoked        # a 401 stays a 401 and does not become "no such device"
+  sync_disabled  # the user's own switch, reported as itself
+  offline        # a dropped connection is not a verdict on the pairing
+  impostor       # a 200 about a different device confirms nothing
+  never_post     # POST /api/devices duplicates, whatever it is given
+)
+
+foreach(scenario IN LISTS DEVICE_SCENARIOS)
+  add_test(NAME device.${scenario} COMMAND test_device_registration ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(device.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  # RUN_SERIAL for the same reasons as pair.*: one armed fault proxy for every
+  # client, and RomM's ten-inits-a-minute limit is per IP, which is the whole
+  # suite. These also mutate the fixture's device list, so two at once would
+  # count each other's rows.
+  set_tests_properties(device.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 endforeach()
 
 # --- the negotiate payload against the real rig ------------------------------
