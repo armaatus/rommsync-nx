@@ -170,13 +170,19 @@ def expected_roms_on_disk(library: str) -> int:
     """
     roms = os.path.join(library, "roms")
     if not os.path.isdir(roms):
-        return 0
+        raise ProvisionError(
+            f"no rom library at {os.path.abspath(roms)}. Run ./server/testing/seed.sh, "
+            f"or pass --library. Treating this as 'expect nothing' would make the "
+            f"readiness check below pass against the very empty library it exists to catch."
+        )
     total = 0
     for platform in os.listdir(roms):
         pdir = os.path.join(roms, platform)
         if not os.path.isdir(pdir) or platform.startswith("."):
             continue
         total += sum(1 for e in os.listdir(pdir) if not e.startswith("."))
+    if total == 0:
+        raise ProvisionError(f"{os.path.abspath(roms)} holds no roms; run ./server/testing/seed.sh")
     return total
 
 
@@ -284,15 +290,15 @@ def wait_for_roms(romm: Romm, expected: int, timeout: int) -> int:
     certainly not on /api/heartbeat -- is the difference between a fixture that
     is up and one that is ready.
     """
+    if expected <= 0:
+        raise ProvisionError("refusing to check readiness against an expected count of 0")
     deadline = time.monotonic() + timeout
     seen = 0
     while time.monotonic() < deadline:
         r = romm.get("/api/roms", params={"limit": 1})
         if r.status_code == 200:
             seen = r.json().get("total", 0)
-            if seen >= expected > 0:
-                return seen
-            if expected == 0:
+            if seen >= expected:
                 return seen
         time.sleep(1)
     raise ProvisionError(
@@ -306,34 +312,53 @@ def ensure_collection(romm: Romm) -> int | None:
     existing = romm.get("/api/collections")
     if existing.status_code != 200:
         raise ProvisionError(f"GET /api/collections: {existing.status_code}")
-    for c in existing.json():
-        if c.get("name") == COLLECTION_NAME:
-            print(f"  collection '{COLLECTION_NAME}' already exists (id {c['id']})")
-            return c["id"]
 
-    # multipart, not json: Body_add_collection_api_collections_post is a form.
-    r = romm.post(
-        "/api/collections",
-        files={
-            "name": (None, COLLECTION_NAME),
-            "description": (None, "Handheld platforms — the fixture's curated collection (M0-6)."),
-        },
-    )
-    if r.status_code not in (200, 201):
-        raise ProvisionError(f"could not create the collection: {r.status_code} {r.text[:200]}")
-    collection_id = r.json()["id"]
+    collection = next((c for c in existing.json() if c.get("name") == COLLECTION_NAME), None)
+    if collection is None:
+        # multipart, not json: Body_add_collection_api_collections_post is a form.
+        r = romm.post(
+            "/api/collections",
+            files={
+                "name": (None, COLLECTION_NAME),
+                "description": (None, "Handheld platforms — the fixture's curated collection (M0-6)."),
+            },
+        )
+        if r.status_code not in (200, 201):
+            raise ProvisionError(f"could not create the collection: {r.status_code} {r.text[:200]}")
+        collection = r.json()
+    collection_id = collection["id"]
 
+    # Membership is reconciled every run, not just when the collection is new.
+    # Stopping at "a collection by that name exists" is what makes re-running
+    # unable to repair anything: add a rom to roms.manifest and the rescan
+    # imports it while the collection silently stays as it was.
     roms = romm.get("/api/roms", params={"limit": 500})
-    ids = [
+    if roms.status_code != 200:
+        raise ProvisionError(f"GET /api/roms: {roms.status_code} {roms.text[:200]}")
+    want = {
         rom["id"]
         for rom in roms.json().get("items", [])
         if (rom.get("platform_fs_slug") or rom.get("platform_slug")) in HANDHELD_SLUGS
-    ]
-    if ids:
-        add = romm.post(f"/api/collections/{collection_id}/roms", json={"rom_ids": ids})
+    }
+
+    current = romm.get("/api/roms", params={"collection_id": collection_id, "limit": 500})
+    if current.status_code != 200:
+        raise ProvisionError(f"GET /api/roms?collection_id: {current.status_code}")
+    have = {rom["id"] for rom in current.json().get("items", [])}
+
+    missing = sorted(want - have)
+    if missing:
+        add = romm.post(f"/api/collections/{collection_id}/roms", json={"rom_ids": missing})
         if add.status_code not in (200, 201):
             raise ProvisionError(f"could not add roms to the collection: {add.status_code} {add.text[:200]}")
-    print(f"  collection '{COLLECTION_NAME}' (id {collection_id}) with {len(ids)} rom(s)")
+
+    if not want:
+        raise ProvisionError(
+            f"no handheld roms to put in '{COLLECTION_NAME}'; the library has "
+            f"{roms.json().get('total', 0)} rom(s) but none on {sorted(HANDHELD_SLUGS)}"
+        )
+    print(f"  collection '{COLLECTION_NAME}' (id {collection_id}): {len(want)} rom(s)"
+          + (f", added {len(missing)}" if missing else ""))
     return collection_id
 
 
@@ -391,7 +416,7 @@ def issue_client_token(romm: Romm) -> dict:
     raise ProvisionError("device code was approved but no token was issued within 60s")
 
 
-def register_device(romm: Romm, token: str) -> str | None:
+def register_device(romm: Romm, token: str) -> str:
     """Register the fixture as a device and return its device_id.
 
     Sync calls are scoped by device_id (docs/API_CONTRACT.md#device-registration),
@@ -415,9 +440,28 @@ def register_device(romm: Romm, token: str) -> str | None:
         if device_id is None:
             raise ProvisionError(f"device response has no device_id: {sorted(body)}")
         return device_id
-    # Not fatal: M1-3 owns device registration, and a fixture without a device
-    # is still enough for auth and library work.
-    print(f"  note: device registration returned {r.status_code}; continuing without a device_id")
+    # Fatal. Every sync call is scoped by device_id, so a fixture without one
+    # fails later, inside whichever sync test negotiates with an empty id --
+    # exactly the "looks like a bug in the test's own code" failure this whole
+    # change exists to remove.
+    raise ProvisionError(f"device registration failed: {r.status_code} {r.text[:200]}")
+
+
+def base_url_from_env_file() -> str | None:
+    """Read ROMM_BASE_URL out of the worktree's .env.
+
+    So that the command in CLAUDE.md works in a fresh shell, the way compose.sh
+    and seed.sh do -- they source .env themselves rather than requiring the
+    caller to have done it.
+    """
+    env = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".env")
+    try:
+        with open(env, encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("ROMM_BASE_URL="):
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
     return None
 
 
@@ -433,7 +477,7 @@ def write_env(path: str, values: dict) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--base-url", default=os.environ.get("ROMM_BASE_URL"))
+    ap.add_argument("--base-url", default=os.environ.get("ROMM_BASE_URL") or base_url_from_env_file())
     ap.add_argument("--out", default="server/testing/fixture-auth.env")
     ap.add_argument("--wait", type=int, default=180, help="seconds to wait for RomM to answer")
     ap.add_argument("--scan-timeout", type=int, default=600)
@@ -480,7 +524,7 @@ def main() -> int:
                 "ROMM_FIXTURE_PASSWORD": FIXTURE_PASSWORD,
                 "ROMM_FIXTURE_TOKEN": creds["token"],
                 "ROMM_FIXTURE_DEVICE_IDENTIFIER": creds["device_identifier"],
-                "ROMM_FIXTURE_DEVICE_ID": device_id if device_id is not None else "",
+                "ROMM_FIXTURE_DEVICE_ID": device_id,
                 "ROMM_FIXTURE_COLLECTION_ID": collection_id if collection_id is not None else "",
                 "ROMM_FIXTURE_ROM_COUNT": found,
             },
@@ -489,6 +533,13 @@ def main() -> int:
         return 0
     except ProvisionError as exc:
         print(f"provisioning failed: {exc}", file=sys.stderr)
+        return 1
+    except (requests.RequestException, json.JSONDecodeError) as exc:
+        # setup.sh runs under `set -e`, so an unhandled exception here aborts
+        # worktree creation with a traceback where this module is otherwise
+        # careful to say what went wrong and what to do about it.
+        print(f"provisioning failed talking to {args.base_url}: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
         return 1
 
 

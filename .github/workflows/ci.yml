@@ -79,6 +79,24 @@ jobs:
           curl -fsS --retry 20 --retry-delay 2 --retry-all-errors --retry-connrefused \
             -o /dev/null -w 'proxy: %{http_code}\n' "$PROXY_BASE_URL/api/heartbeat"
 
+      # A running RomM is not a usable one: the staged roms are not imported
+      # until something drives the socket.io scan, and rig.provisioned fails on
+      # the empty library that leaves behind. Mirrors scripts/orca/setup.sh.
+      - name: Provision the fixture
+        run: |
+          set -a; . ./.env; set +a
+          python3 -m venv .venv
+          ./.venv/bin/pip install -q --disable-pip-version-check -r server/requirements.txt
+          ./.venv/bin/python server/testing/provision.py --base-url "$ROMM_BASE_URL"
+
+      # The contract probe is the tool M0-4 captures response shapes with, and
+      # it now runs unattended. Exercising it here means contract drift after a
+      # RomM bump shows up as a red build rather than at the next capture.
+      - name: Contract probe (full flow, no browser)
+        run: |
+          set -a; . ./.env; set +a
+          ./.venv/bin/python server/probe_contract.py --url "$ROMM_BASE_URL" --auth --negotiate
+
       - name: Build
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DROMMSYNC_REQUIRE_RIG=ON
