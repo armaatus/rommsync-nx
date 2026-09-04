@@ -5,5 +5,5 @@
 #
 # Pinned, because these talk to a RomM pinned at 5.2.0 and a silent client
 # upgrade would change what the fixture proves.
-requests==2.32.3
+requests==2.33.0
 python-socketio[client]==5.16.2
