@@ -330,11 +330,11 @@ Registration FindRegistration(http::HttpClient& client, const StoredToken& token
     return Accept(*found);
   }
 
-  // Two very different situations, and the message is the only thing that
-  // separates them for whoever reads the log: nothing carries the identifier
-  // (this console was never paired against this server, or its device was
-  // deleted), or several do (a state RomM allows and this client will not guess
-  // its way out of).
+  // `FindByIdentifier` answers nullptr to two very different situations, and
+  // they get different errors because they have different remedies: nothing
+  // carries the identifier (pair again), or several rows do (a state RomM
+  // allows, which only the user can tidy up -- pairing again would just find
+  // the same two).
   std::size_t matches = 0;
   for (const DeviceRecord& device : parsed.value) {
     if (device.client_device_identifier == client_device_identifier) {
