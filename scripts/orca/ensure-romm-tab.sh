@@ -24,6 +24,8 @@ HINT="    open a tab and run: ./scripts/orca/romm-logs.sh"
 # How long to wait for a created tab to actually start following. Short in tests.
 WAIT_SECONDS="${ROMM_TAB_WAIT_SECONDS:-10}"
 CLI_SECONDS=20
+CLI_OUT="$(mktemp)"
+trap 'rm -f "$CLI_OUT"' EXIT
 
 # `kill -0` alone would accept any process that inherited a dead follower's pid,
 # and the whole point here is to not report a tab that is not there.
@@ -42,7 +44,7 @@ follower_is_running() {
 # watchdog.
 run_with_deadline() {
   local seconds="$1"; shift
-  "$@" >/dev/null 2>&1 &
+  "$@" >"$CLI_OUT" 2>/dev/null &
   local cli=$! waited=0
   while kill -0 "$cli" 2>/dev/null; do
     if [ "$waited" -ge "$seconds" ]; then
@@ -70,6 +72,18 @@ follower_appears() {
   return 1
 }
 
+# Orca titles a tab after the command it was given and ignores --title on create,
+# so the tab arrives called `/Users/.../romm-logs.sh`. Renaming is what actually
+# makes it findable as `romm`; best effort, since a tab with an ugly name still
+# shows the logs and is not worth failing over.
+name_tab() {
+  local handle
+  handle="$(sed -n 's/.*"handle"[[:space:]]*:[[:space:]]*"\(term_[^"]*\)".*/\1/p' \
+              "$CLI_OUT" | head -1)"
+  [ -n "$handle" ] || return 1
+  run_with_deadline "$CLI_SECONDS" orca terminal rename --terminal "$handle" --title romm
+}
+
 if follower_is_running; then
   echo "==> romm tab is following (pid $(cat "$PIDFILE"))"
   exit 0
@@ -87,16 +101,23 @@ echo "==> orca.yaml's romm tab never started; creating it"
 # unquoted worktree path containing a space would be split into two words and
 # leave behind exactly the dead tab this is here to prevent. Single quotes cover
 # every path git will hand us bar one containing a quote of its own.
+# --json for the handle in the reply, which is the only way to name the tab
+# afterwards; --title is passed too in case a future Orca honours it on create.
 if ! run_with_deadline "$CLI_SECONDS" \
-       orca terminal create --worktree "path:$REPO_ROOT" --title romm \
+       orca terminal create --json --worktree "path:$REPO_ROOT" --title romm \
        --command "'$FOLLOWER'"; then
   echo "    the orca CLI did not create it -- is the runtime reachable?"
   echo "$HINT"
-elif follower_appears; then
-  echo "    created; following in a tab titled romm"
 else
-  echo "    the CLI accepted the tab but nothing is following it"
-  echo "$HINT"
+  # Before waiting on the follower: the tab exists either way, and a named tab is
+  # worth having even if what is in it turns out to be wrong.
+  name_tab || echo "    (could not rename it; Orca names a tab after its command)"
+  if follower_appears; then
+    echo "    created; the romm tab is following"
+  else
+    echo "    the CLI accepted the tab but nothing is following it"
+    echo "$HINT"
+  fi
 fi
 
 exit 0

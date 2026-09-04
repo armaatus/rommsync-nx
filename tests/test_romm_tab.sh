@@ -104,6 +104,12 @@ stub_orca() {
   cat >"$dir/orca" <<STUB
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >>"$1/orca-calls.log"
+# A create answers with the runtime's JSON, because the handle in it is what the
+# tab has to be renamed by. No backticks in here: the heredoc is unquoted, so
+# they would run as a command substitution while the stub is being written.
+if [ "\${1:-}" = "terminal" ] && [ "\${2:-}" = "create" ]; then
+  printf '{\n  "ok": true,\n  "result": {\n    "handle": "term_stub0001"\n  }\n}\n'
+fi
 STUB
   chmod +x "$dir/orca"
   : >"$1/orca-calls.log"
@@ -230,6 +236,9 @@ case "${1:-}" in
     calls="$(cat "$tmp/orca-calls.log")"
     grep -q "terminal create" <<<"$calls" || fail "asked the CLI for no tab; got: ${calls:-<nothing>} / $out"
     grep -q -- "--title romm" <<<"$calls" || fail "tab would be untitled -- the state we cannot tell apart: $calls"
+    # Without --json the reply carries no handle, the rename below cannot happen,
+    # and the tab keeps the absolute-path name Orca gives it.
+    grep -q -- "terminal create --json" <<<"$calls" || fail "create asked for no handle to rename by: $calls"
     grep -q -- "path:$tmp" <<<"$calls" || fail "tab would land in the wrong worktree: $calls"
     grep -q "romm-logs.sh" <<<"$calls" || fail "tab would run no follower: $calls"
     # The stub exits 0 without starting anything -- which is also how Orca
@@ -238,6 +247,11 @@ case "${1:-}" in
     # rebuilds the silent state this script exists to remove.
     grep -q "nothing is following it" <<<"$out" \
       || fail "claimed a tab that is following nothing; got: $out"
+    # Orca names a commanded tab after its command and ignores --title on create,
+    # so without the follow-up rename the tab arrives as an absolute path -- which
+    # is the "I cannot see romm" complaint this all started from.
+    grep -q -- "terminal rename --terminal term_stub0001 --title romm" <<<"$calls" \
+      || fail "created tab was never renamed to romm: $calls"
 
     # A live pid that is not a follower: `kill -0` alone accepts it, and the tab
     # would then be silently skipped for whatever recycled that pid.
