@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Orca issueCommand hook — resolves a linked GitHub issue into a full spec.
+# Resolves a linked GitHub issue into a full spec.
 #
-# Orca runs this to build the agent's initial prompt, so an issue picked from
-# the Tasks tab arrives as its complete body rather than a bare URL. Accepts an
-# issue number or a github.com issue URL as $1; falls back to this worktree's
-# linked issue when called with no argument.
+# orca.yaml's `issueCommand` points the agent's opening prompt at this script, so
+# an issue picked from the Tasks tab is read as its complete body rather than as
+# the bare URL Orca prefills by default. Orca substitutes {{issue}} into that
+# prompt, so the agent invokes this with the number; the no-argument form falls
+# back to this worktree's linked issue, which is what a human running it by hand
+# will want.
 set -euo pipefail
 
 ref="${1:-}"
