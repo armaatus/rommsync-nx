@@ -127,10 +127,10 @@ discovering it as a `403` mid-sync.
 
 ## Polling the token endpoint
 
-Every state below was observed against a live 5.2.0, and four of the six are the
-same `400`. `auth::ClassifyTokenPoll(status, body)` maps a response to one of
-them and `auth::ShouldKeepPolling()` says whether the loop continues; nothing
-else in the engine branches on the raw string.
+Every `400` state below was observed against a live 5.2.0, and four different
+meanings share that one status. `auth::ClassifyTokenPoll(status, body)` maps a
+response to one of them and `auth::ShouldKeepPolling()` says whether the loop
+continues; nothing else in the engine branches on the raw string.
 
 | Status | `detail` | Means | Poll again? |
 |---|---|---|---|
@@ -140,9 +140,18 @@ else in the engine branches on the raw string.
 | `400` | `access_denied` | a human denied it in the web UI | **no** — restart the flow |
 | `400` | `expired_token` | the code expired, was never valid, or has already been redeemed | **no** — restart the flow |
 | `429` | prose, not a code | more than 60 polls in a minute from this IP | yes, after backing off |
+| `5xx` | anything | RomM or something in front of it is unwell | yes — the code is still good |
+| anything else | | not a shape this client knows | **no** — surface the failure |
 
-Three of those matter more than they look:
+Four of those matter more than they look:
 
+- **Never poll faster than `interval`, whatever it says.** RomM restarts its
+  pacing window on *every* poll it answers, `slow_down` included — so a client
+  that undercuts the interval gets `slow_down` for every poll after the first
+  and never recovers, until the code expires under it. That is why
+  `DeviceInitResponse::poll_interval()` has a floor and no ceiling below the
+  code's own lifetime: clamping the server's value *down* is the one adjustment
+  that can stop a pairing from ever completing.
 - **`slow_down` is per `device_code`, `429` is per IP.** Honour `interval` and
   neither happens. The `429` body is an English sentence
   (`"Too many polling attempts. Try again later."`), not a machine-readable
@@ -151,10 +160,12 @@ Three of those matter more than they look:
   by the poll that redeems it, so polling once more after a successful pairing
   is indistinguishable from polling a code that never existed. Stop polling the
   moment a token arrives; do not re-poll to confirm.
-- **An unrecognised answer stops the loop.** A status or a `detail` this code
-  has never seen is not something to hammer — polling a dead code until the
-  rate limiter answers is a worse failure than surfacing "pairing failed" to
-  the overlay.
+- **A `5xx` is retried; an unrecognised `4xx` is not.** A restarting container
+  or a proxy having a bad minute says nothing about the `device_code`, which
+  still has most of its 600 seconds — abandoning the pairing screen over a `502`
+  throws that away. A status or a `detail` this client has never seen is the
+  opposite case: polling a code that may already be dead until the rate limiter
+  answers is worse than telling the user pairing failed.
 
 ## Where the OpenAPI snapshot and the running server disagree
 
@@ -195,7 +206,13 @@ that identifies the *user* beyond what RomM needs.
 ## Token storage
 
 Persist `{access_token, device_id, scopes, expires_at, server_url}` to
-`sdmc:/config/rommsync/token.dat`. There is no refresh token to store. See
+`sdmc:/config/rommsync/token.dat`. There is no refresh token to store.
+
+The parser refuses a token or a `device_id` that is blank, or that carries an
+embedded NUL — `"rmm_a\u0000EVIL"` is legal JSON that `std::string` holds
+faithfully and every C API downstream truncates, so the value that would be sent
+is not the value that was checked. `expires_at` is the same: `null` means "no
+expiry", `""` is refused rather than handed to a timestamp parser. See
 [SECURITY.md](SECURITY.md) for the threat model — the SD is readable by anything
 on the console, so treat the token as sensitive and scope it minimally.
 

@@ -485,6 +485,20 @@ ParseResult Parse(std::string_view text) {
   return parser.Run();
 }
 
+bool Reader::UsableString(Reader& reader, std::string_view key, const std::string& value) {
+  if (value.empty()) {
+    return reader.Fail(key, "is empty");
+  }
+  // `"a\u0000b"` is legal JSON, and `std::string` carries it faithfully -- but
+  // everything downstream is a C API that stops at the NUL, so the value that
+  // would get used is not the value that was checked. Refuse it here rather
+  // than let a truncated token reach an Authorization header.
+  if (value.find('\0') != std::string::npos) {
+    return reader.Fail(key, "contains an embedded NUL");
+  }
+  return true;
+}
+
 Reader::Reader(const Value& value, std::string_view context) {
   if (value.is_object()) {
     object_ = &value;
@@ -522,8 +536,8 @@ bool Reader::Required(std::string_view key, std::string* out) {
   if (!member->is_string()) {
     return Fail(key, std::string("expected a string, got ") + ToString(member->type()));
   }
-  if (member->string().empty()) {
-    return Fail(key, "is empty");
+  if (!UsableString(*this, key, member->string())) {
+    return false;
   }
   *out = member->string();
   return true;
@@ -576,6 +590,9 @@ bool Reader::RequiredNullable(std::string_view key, std::optional<std::string>* 
   }
   if (!member->is_string()) {
     return Fail(key, std::string("expected a string or null, got ") + ToString(member->type()));
+  }
+  if (!UsableString(*this, key, member->string())) {
+    return false;
   }
   *out = member->string();
   return true;

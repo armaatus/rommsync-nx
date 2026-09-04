@@ -48,28 +48,39 @@ struct DeviceInitResponse {
   /// Seconds RomM asks the client to wait between polls. 5 on 5.2.0.
   std::int64_t interval = 0;
 
-  /// `interval` clamped into a range a poll loop survives. The server's value
-  /// is a hint that arrives over the network: a 0 would spin the sysmodule
-  /// against RomM's rate limiter, and a very large one would leave a pairing
-  /// screen looking hung until the code expired anyway.
+  /// How long to wait between polls. **Never faster than the server asked.**
+  ///
+  /// RomM restarts its per-`device_code` pacing window on every poll, including
+  /// one it answers `slow_down` — so a client that polls inside `interval` gets
+  /// `slow_down` for every poll after the first and never recovers, until the
+  /// code expires under it. That makes clamping this value *down* the one thing
+  /// a poll loop must not do, whatever the server asks for. The only bounds are
+  /// a floor for a `0` (which would spin against the per-IP rate limiter) and a
+  /// ceiling at `lifetime()`, past which there is nothing left to poll for.
   std::chrono::seconds poll_interval() const;
 
-  /// How long polling may go on before the code is dead. Clamped the same way
-  /// and for the same reason.
+  /// How long polling may go on before the code is dead. Bounded only against a
+  /// server asking for something absurd; `ParseDeviceInitResponse` has already
+  /// refused anything that is not positive.
   std::chrono::seconds lifetime() const;
 
   /// The absolute URL to put in front of the user, `server_url` being the
   /// origin they configured (`http://romm.lan:8080`). Trailing slashes on
-  /// `server_url` are dropped so the join never doubles one.
+  /// `server_url` are dropped so the join never doubles one, and a
+  /// `verification_path` that is *already* absolute is returned untouched --
+  /// that is what a future RomM aligning with RFC 8628's `verification_uri`
+  /// would send, and joining it would produce a URL nobody can visit.
   std::string VerificationUrl(std::string_view server_url) const;
 
   /// The same, with the user code already in the query string.
   std::string VerificationUrlComplete(std::string_view server_url) const;
 };
 
-/// Bounds for `poll_interval()` / `lifetime()`.
+/// Bounds for `poll_interval()` / `lifetime()`. There is deliberately no
+/// *maximum* poll interval: see `poll_interval()` for why capping it is the one
+/// clamp that can stop a pairing from ever completing.
 inline constexpr std::chrono::seconds kMinPollInterval{1};
-inline constexpr std::chrono::seconds kMaxPollInterval{60};
+inline constexpr std::chrono::seconds kMinPairingLifetime{1};
 inline constexpr std::chrono::seconds kMaxPairingLifetime{3600};
 
 /// `POST /api/auth/device/token` -> **200**, once the code has been approved.
@@ -120,13 +131,15 @@ Parsed<DeviceTokenResponse> ParseDeviceTokenResponse(std::string_view body);
 /// The status code alone cannot tell "keep polling" from "this pairing is
 /// dead": RomM answers both with `400`, and only the `detail` string separates
 /// them. None of it is in the OpenAPI snapshot, which declares `200` and `422`
-/// and no error body at all -- see docs/AUTH.md. All five states below were
-/// observed against a live 5.2.0.
+/// and no error body at all -- see docs/AUTH.md. Every state below except
+/// `kServerError` was observed against a live 5.2.0; that one is what a proxy
+/// or a restarting container in front of it produces.
 enum class TokenPoll {
   kGranted,               ///< 200 -- read the body with ParseDeviceTokenResponse
   kAuthorizationPending,  ///< 400 `authorization_pending` -- nobody has approved yet
   kSlowDown,              ///< 400 `slow_down` -- polled inside `interval`, per device_code
   kRateLimited,           ///< 429 -- more than 60 polls in a minute, per IP
+  kServerError,           ///< 5xx -- RomM or something in front of it is unwell
   kAccessDenied,          ///< 400 `access_denied` -- the human refused. Stop.
   kExpiredToken,          ///< 400 `expired_token` -- expired, unknown, or already spent. Stop.
   kUnrecognized,          ///< anything else, including a body that is not JSON
@@ -137,9 +150,12 @@ const char* ToString(TokenPoll poll);
 
 /// Whether a poll in this state should be tried again rather than abandoned.
 ///
-/// The three retryable states are the ones where the pairing is still alive and
-/// the server is only asking for patience. `kUnrecognized` is not among them: a
-/// status this code does not understand is not something to hammer.
+/// The retryable states are the ones where the `device_code` is still alive and
+/// only the moment is wrong: the server asking for patience, or a gateway
+/// having a bad minute. `kUnrecognized` is not among them -- a `4xx` this code
+/// does not understand is not something to hammer -- but a `5xx` is, because
+/// abandoning a pairing over a proxy restart throws away a code that had
+/// minutes left (CLAUDE.md: every network call retries with backoff).
 bool ShouldKeepPolling(TokenPoll poll);
 
 /// Classify one poll response. `body` is read only for a `400`, the one status
