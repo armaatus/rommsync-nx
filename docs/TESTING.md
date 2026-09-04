@@ -109,6 +109,54 @@ ctest --test-dir build --output-on-failure
   which turns the same condition into a failure — a green CI run always means the
   tests actually ran.
 
+### Provisioning the fixture
+
+`compose up` gives you a RomM that is *running*. It does not give you one that is
+*usable*, and the difference is easy to miss: `seed.sh` stages ROMs on disk, but
+nothing imports them, so `/api/heartbeat` stays green while `/api/roms` reports
+an empty library — and whichever test needed a ROM fails looking like a bug in
+its own code.
+
+`server/testing/provision.py` closes that gap, and `setup.sh` runs it after the
+stack is up:
+
+```bash
+./.venv/bin/python server/testing/provision.py --base-url "$ROMM_BASE_URL"
+```
+
+It is idempotent, so re-running it is how you repair a fixture rather than
+rebuild it. In order it:
+
+1. creates the fixture admin — `POST /api/users` is unauthenticated *only* while
+   no user exists, so a second run gets a 403 and treats it as "already done"
+2. registers every platform folder on disk
+3. **scans the library, and waits for the scan to finish.** The scan is not a
+   REST call: `POST /api/tasks/run/scan_library` refuses, because the task is
+   declared `manual_run: False`. It is driven over socket.io (`scan` →
+   `scan:done`), and authorization comes from the session cookie captured at
+   connect, not from the payload
+4. creates the curated `Handheld` collection
+5. mints a client token **through the real device-code flow, with no human**
+
+Step 5 is the one that matters beyond this issue. The device-code grant is built
+around a person approving a code in a browser, which CI and an agent cannot do —
+but `/api/auth/device/approve` is an ordinary authenticated endpoint, so the
+provisioner approves its own code and the flow closes itself. `probe_contract.py
+--auth --negotiate` now runs unattended for the same reason.
+
+Credentials land in `server/testing/fixture-auth.env` (gitignored):
+`ROMM_FIXTURE_TOKEN`, `ROMM_FIXTURE_DEVICE_ID`, `ROMM_FIXTURE_COLLECTION_ID`,
+`ROMM_FIXTURE_ROM_COUNT`. The account matches `rig::kUser`/`kPassword` in
+`tests/rig.hpp`, which creates the same user itself — whichever runs first wins,
+and they only agree because the constants are kept identical.
+
+`rig.smoke` asks whether RomM is up; `rig.provisioned` asks whether it is usable.
+Both are needed: the first passed throughout the entire period the library was
+empty.
+
+The Python tooling lives in a per-worktree `.venv` built from
+`server/requirements.txt` by `setup.sh`. The C++ build needs none of it.
+
 ### Worktree isolation
 
 Several agents work in parallel worktrees, and sync tests mutate saves by design.

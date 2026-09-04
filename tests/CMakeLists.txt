@@ -40,6 +40,23 @@ if(NOT ROMMSYNC_REQUIRE_RIG)
   # -DROMMSYNC_REQUIRE_RIG=ON turns the same condition into a failure.
   set_tests_properties(rig.smoke PROPERTIES SKIP_RETURN_CODE 77)
 endif()
+
+# --- the fixture is provisioned, not just running ---------------------------
+# rig.smoke asks "is RomM up?"; this asks "is it usable?". Staged roms that were
+# never scanned leave a green health check over an empty library, which then
+# fails whichever test needs a rom and looks like a bug in that test's code.
+add_executable(test_rig_provisioned test_rig_provisioned.cpp)
+target_link_libraries(test_rig_provisioned PRIVATE rommsync::host)
+target_compile_definitions(test_rig_provisioned PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+
+add_test(NAME rig.provisioned COMMAND test_rig_provisioned)
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(rig.provisioned PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+set_tests_properties(rig.provisioned PROPERTIES TIMEOUT 120)
 set_tests_properties(rig.smoke PROPERTIES TIMEOUT 120)
 
 # --- the native HttpClient against the real rig ------------------------------

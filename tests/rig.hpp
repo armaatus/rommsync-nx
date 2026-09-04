@@ -259,10 +259,12 @@ inline std::string Login(http::HttpClient& client, const std::string& base) {
 ///
 /// The streaming tests need a resource that is big enough to interrupt half way
 /// through and that nginx serves with real `Range` support. The library's roms
-/// would be the natural choice, but reaching them needs RomM to have scanned the
-/// library, and a scan is only triggerable over RomM's socket.io channel -- rig
-/// work that belongs to M0-5. The bundle is a genuine ~1.6 MB file served by the
-/// same nginx over the same proxy, which is what these tests are actually about.
+/// would be the natural choice, and since M0-6 they are actually available:
+/// server/testing/provision.py drives the socket.io scan, so a provisioned
+/// worktree has a scanned library rather than an empty one. Switching these
+/// tests onto a real rom is M0-5's call, not a rig helper's -- the bundle is a
+/// genuine ~1.6 MB file served by the same nginx over the same proxy, which is
+/// what these tests are actually about, and it needs no auth.
 /// It is discovered rather than hardcoded so a RomM bump does not break them.
 inline std::string DiscoverLargeAsset(http::HttpClient& client, const std::string& base) {
   http::Request request;
