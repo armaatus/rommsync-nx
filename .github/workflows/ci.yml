@@ -85,7 +85,19 @@ jobs:
       - name: Provision the fixture
         run: |
           set -a; . ./.env; set +a
-          python3 -m venv .venv
+          # Through the same picker setup.sh uses, not a bare `python3`. The
+          # runner's default interpreter satisfies the floor today, so this is
+          # not load-bearing yet -- but the moment a pin needs a Python newer
+          # than ubuntu-latest ships, a bare `python3` here reproduces the
+          # exact failure setup.sh now guards against, in CI, where the whole
+          # point is to catch it first.
+          . ./scripts/orca/lib.sh
+          PYTHON="$(orca_pick_python)" || {
+            echo "no Python >= ${ORCA_PYTHON_MIN_MAJOR}.${ORCA_PYTHON_MIN_MINOR} on this runner; tried:"
+            orca_python_rejections
+            exit 1
+          }
+          "$PYTHON" -m venv .venv
           ./.venv/bin/pip install -q --disable-pip-version-check -r server/requirements.txt
           ./.venv/bin/python server/testing/provision.py --base-url "$ROMM_BASE_URL"
 

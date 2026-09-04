@@ -100,28 +100,98 @@ orca_run_with_deadline() {
 # `requires-python >=3.10` -- pip then filters out every candidate and reports
 # "no matching distribution", two hundred lines long, naming neither Python nor
 # the reason.
-#
-# Prints the interpreter on stdout; returns non-zero when nothing on PATH is new
-# enough, so the caller can say so in one line instead of leaving pip to.
 ORCA_PYTHON_MIN_MAJOR=3
 ORCA_PYTHON_MIN_MINOR=10
 
-orca_python_is_new_enough() {
-  "$1" -c "import sys; raise SystemExit(0 if sys.version_info >= ($ORCA_PYTHON_MIN_MAJOR, $ORCA_PYTHON_MIN_MINOR) else 1)" \
-    2>/dev/null
+# Usable means three things, not one: it runs, it is new enough, and it can
+# actually build a venv. On Debian and Ubuntu `python3.13` and `python3.13-venv`
+# are separate packages, so a version check alone can pick an interpreter whose
+# `-m venv` then dies with "ensurepip is not available" -- which would be this
+# same class of opaque failure, moved one step later.
+#
+# Sets orca_python_reject to a one-line reason when it returns non-zero, so a
+# caller can say which interpreters it turned down and why, rather than
+# reporting "nothing is new enough" about one that will not start at all.
+orca_python_reject=""
+orca_python_is_usable() {
+  local out
+  orca_python_reject=""
+  out="$("$1" -c "
+import sys
+if sys.version_info < ($ORCA_PYTHON_MIN_MAJOR, $ORCA_PYTHON_MIN_MINOR):
+    raise SystemExit('too old: %d.%d' % sys.version_info[:2])
+import ensurepip, venv
+" 2>&1)" && return 0
+  # Last line only: an ImportError arrives as a traceback whose final line is
+  # the part worth showing.
+  orca_python_reject="$(printf '%s' "$out" | tail -1)"
+  [ -n "$orca_python_reject" ] || orca_python_reject="will not run"
+  return 1
 }
 
-# Newest first, then bare `python3` last: a machine with only a current python3
-# and no versioned name still works, while one whose `python3` is Apple's 3.9
-# finds a real one rather than stopping at the first thing on PATH.
+# Every python3.N on PATH, newest first, then bare `python3` as the fallback for
+# a machine that has only that.
+#
+# Discovered rather than hardcoded: a written-out list ends at whatever was
+# current the day it was written, and would tell a machine whose only new-enough
+# interpreter is python3.15 to go and install a Python it already has.
+orca_python_candidates() {
+  local dir name
+  {
+    # Split on ":" only, so a PATH entry containing a space still resolves.
+    local IFS=:
+    for dir in $PATH; do
+      [ -n "$dir" ] || continue
+      for name in "$dir"/python3.[0-9] "$dir"/python3.[0-9][0-9]; do
+        [ -x "$name" ] && printf '%s\n' "${name##*/}"
+      done
+    done
+  } | sort -t. -k2 -nr -u
+  printf 'python3\n'
+}
+
+# The first usable candidate, on stdout. Non-zero when there is none, so the
+# caller can say so in one line instead of leaving pip to.
 orca_pick_python() {
   local candidate
-  for candidate in python3.14 python3.13 python3.12 python3.11 python3.10 python3; do
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
     command -v "$candidate" >/dev/null 2>&1 || continue
-    if orca_python_is_new_enough "$candidate"; then
-      echo "$candidate"
+    if orca_python_is_usable "$candidate"; then
+      printf '%s\n' "$candidate"
       return 0
     fi
-  done
+  done <<EOF
+$(orca_python_candidates)
+EOF
   return 1
+}
+
+# What was tried and why each was turned down, one per line. Only ever called on
+# the failure path -- orca_pick_python runs in a command substitution, so the
+# reasons it collects cannot escape the subshell, and re-deriving them here
+# costs nothing when the alternative is an unexplained stop.
+orca_python_rejections() {
+  local candidate
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    command -v "$candidate" >/dev/null 2>&1 || continue
+    orca_python_is_usable "$candidate" \
+      || printf '     %s (%s): %s\n' "$candidate" "$(command -v "$candidate")" "$orca_python_reject"
+  done <<EOF
+$(orca_python_candidates)
+EOF
+}
+
+# Whether an existing .venv can still be used.
+#
+# `[ -x .venv/bin/python ]` is NOT this test. A venv's bin/python is a symlink to
+# the interpreter that built it, and a Homebrew minor upgrade -- or picking a
+# different interpreter than last time -- leaves it dangling. `-x` is false for a
+# dangling link, so the venv reads as absent, and `python -m venv` over it then
+# exits 1 on the broken link rather than repairing it: setup.sh dies there under
+# `set -e` and every re-run does the same thing forever. Asking the venv's own
+# interpreter to answer covers missing, dangling and too-old in one question.
+orca_venv_is_usable() {
+  orca_python_is_usable "$1/bin/python" 2>/dev/null
 }
