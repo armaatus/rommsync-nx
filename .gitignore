@@ -3,13 +3,14 @@ config.ini
 token.dat
 *.token
 .env
-.env.tmp
+.env.tmp*
 
 # generated per-worktree environment / fixtures — never shared, never committed
 .cache/
 server/testing/library/
 server/testing/fixture-auth.env
 .venv/
+.orca/
 TASK.md
 
 # build output
