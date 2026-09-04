@@ -121,6 +121,14 @@ The sysmodule heap behavior under Atmosphère, boot scheduling, and the
 Tesla/Ultrahand overlay UI are the only things that truly need a console — they're
 deliberately the last things touched. Everything else is proven before then.
 
+Two gates hold that shape in place, and neither is prose alone.
+[The M0 exit gate](TESTING.md#the-m0-exit-gate) is what M1 waits for: nine claims
+about the harness, each naming the test or command that demonstrates it, and the
+one that would rot silently — *no test needs a console, an emulator, or a server
+anyone would miss* — is re-checked on every `ctest` by the `policy.*` tests. The
+[v1 gate](TESTING.md#rung-3--the-v1-gate-and-real-hardware-m8) is what hardware
+waits for, and lives in issue **M8-1**.
+
 ### Worktree isolation
 
 Agents work in parallel worktrees and sync tests mutate saves by design, so each

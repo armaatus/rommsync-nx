@@ -79,6 +79,119 @@ Rung 1 is the day-to-day loop. Rung 2 is where the M0-1 `ssl` question gets
 answered without hardware. Rung 3 is a single gated milestone, not part of normal
 development.
 
+## The M0 exit gate
+
+M0 is finished when the harness can *prove* things, not when its issues are
+closed. The difference is the whole reason this page exists: scaffolding is the
+easiest work in a repo to declare done — the build works, CI is green, everyone
+moves on — and the green can mean nothing at all, because the fixture was
+unreachable and every test that mattered skipped.
+
+So the gate is a list of claims, each one paired with the command or the test
+that demonstrates it. A box checked because someone believes it is not checked.
+
+| # | The claim | What demonstrates it |
+|---|---|---|
+| 1 | The engine builds on a laptop with warnings as errors, and the same `core/` sources still build for Horizon — compiled and linked, not just parsed. | `cmake --build build`; CI `switch-build` (a real devkitA64 build of both targets, checked to be a PFS0 and an `ULTR`-signed `.ovl`); `switch.builds`, `switch.ci_requires_artifacts` |
+| 2 | One command brings up a real RomM 5.2.0 on a throwaway volume, isolated per worktree. | `scripts/orca/compose.sh up -d`; `rig.smoke`; `orca.env_*` |
+| 3 | That fixture is *usable*, not merely running: library scanned, collection created, client token minted with no human in the loop. | `rig.provisioned`; [`provision.py`](../server/testing/provision.py) |
+| 4 | The failure paths a healthy RomM will not produce on demand can be forced, deterministically, in CI. | `http.status`, `http.truncate`, `http.drop`, `http.stall`, `pair.stall`, `pair.drop` |
+| 5 | Nothing in the engine names a transport: every network call goes through `HttpClient`. | CI `static` → *core/ includes nothing platform-specific* |
+| 6 | The response shapes the docs quote are the ones a live RomM returns, and the structs read those same bytes. | `contract.captures`, `auth.shapes` |
+| 7 | An unreachable fixture turns CI red rather than skipping it. | `-DROMMSYNC_REQUIRE_RIG=ON` in [`ci.yml`](../.github/workflows/ci.yml) |
+| 8 | No test in the suite needs a console, an emulator, or a server anyone would miss. | `policy.tests_are_host_local`, `policy.loopback_only`, `policy.writes_refuse_remote` |
+| 9 | The one hardware-ish unknown is isolated: M1–M5 include `HttpClient`, never `ssl`. | rows 5 and 8, plus the fact that the `ssl` answer sits in **M8-1**'s gate and not in this one |
+
+Row 8 is the one that would otherwise rot silently, so it is machine-checked on
+every `ctest` by [`tests/test_policy.py`](../tests/test_policy.py) — none of
+whose phases need Docker, a network or Orca:
+
+- `policy.loopback_only` — every base URL the suite is *configured* with is
+  loopback: the one compiled into the test binaries, the two `env.sh` derives,
+  the fallback in `tests/CMakeLists.txt`, this worktree's `.env`, and
+  `$PROXY_BASE_URL`/`$ROMM_BASE_URL` if the shell exports them — that last pair
+  beats all the rest, because `rig::BaseUrl()` prefers the environment over its
+  compiled-in default. It also checks the fault proxy's `UPSTREAM`, which is
+  where the traffic actually lands: a proxy still bound to `127.0.0.1` forwarding
+  to somewhere else would pass every other check. It deliberately does *not*
+  scan for URL literals: `auth.shapes` and `core.token_store` parse
+  `http://romm.lan:8080` as data and never dial it.
+- `policy.writes_refuse_remote` — the two scripts that take a base URL and write
+  to it (`provision.py`, `probe_contract.py`) refuse a non-loopback one, tried
+  once per writing mode, because the probe's guard is a condition over three
+  flags and any one of them dropped from it would otherwise go unnoticed. It
+  asserts on the *refusal*, not on a non-zero exit, because a probe that reaches
+  for a production RomM and merely fails to connect also exits non-zero — and
+  that is the opposite of the guarantee. In CI it may not skip (row 7's rule
+  applies to it too).
+- `policy.tests_are_host_local` — every registered CTest command is an
+  executable on this machine and names no emulator, console or remote transport.
+  It cannot prove a test never opens a socket of its own; it catches the shape
+  the policy is actually at risk from, which is a test that shells out to
+  something off this machine.
+
+### A test that got faster is a claim too
+
+Everything above is aimed at one failure: a green signal that checked nothing. A
+test going red announces itself. A test getting *faster* does not, and it is the
+same failure wearing a friendlier face.
+
+While this page was being written, `orca.browser_watch_single` was taking ~50s of
+its 60s timeout on an idle machine — six consecutive runs, 45–50s each, so a run
+under any real load timed out. A one-line change cut it to ~9s and the test still
+passed. That looked like a fix and was not: the saving came from short-circuiting
+the watcher's deadline loop into an early-exit path, so the test went green
+sooner *because* it had stopped exercising the thing it exists for. The real
+costs were elsewhere and were two — a full second burned per CLI call in
+`orca_run_with_deadline` (`kill -0` succeeds on a child that has exited but not
+been reaped, so the watchdog always slept its first whole second, on every
+`setup.sh` path in every worktree), and an orphaned background process holding
+ctest's stdout open, which is why the same test measured 21s under `bash` and 50s
+under `ctest`.
+
+Neither was the timeout, and "still passes, and faster" was true throughout.
+
+So when a test speeds up, ask what it stopped doing. `ctest` cannot ask that
+question for you, and neither can this page — but the number that made the whole
+thing visible was two measurements of the same test that could not both be right.
+A duration that surprises you is evidence, in either direction. Observed
+2026-09-04, on the change that wrote this paragraph.
+
+Note that `CTestCostData.txt` is no help here: it is not a mean of wall-clock
+durations, and it reported 3.0s for the same test across fifteen runs, six of
+which were watched taking ~50s. Time the test yourself.
+
+### What the gate deliberately does not require
+
+- **M0-1's answer.** The `ssl` spike is de-risking, not a dependency. Everything
+  in M1–M5 is written against `HttpClient`, so holding five milestones behind one
+  emulator question would buy nothing. It is a gate — for **M8**.
+- **The engine edge cases in M0-5's wording.** Conflict, partial failure and
+  multi-file skip are behaviours of code M2 and M3 have not written yet. What M0
+  owes is the *mechanism* that forces them and proof the mechanism works
+  (`http.*`, `pair.*`); each edge case is then covered by the milestone that
+  implements the behaviour.
+
+### Where it stands
+
+All nine rows hold as this page is written: the full suite green, CI green on
+`main`, and row 8 newly machine-checked rather than asserted. That is what M1
+started on. M0-1 and M0-5 are still open, and that is the section above rather
+than a hole in the gate — they are exactly the parts it does not wait for.
+
+Row 1 got stronger while this page was in review. M0-3 landed the two devkitPro
+Makefiles, so `switch-build` now compiles and links both Switch targets for real
+and checks the artifacts are loadable, in place of the `-fsyntax-only` check that
+stood in for it. The gate did not wait for that — and it did not have to, which
+was the point of listing it as something the gate does not require.
+
+The gate is re-asked, not signed off once. Rows 1–8 are each somebody's test or
+CI step, so a change that breaks one goes red at the moment it lands rather than
+at the moment somebody re-reads this page.
+
+And it opens M1 only. It does not open M8 — that is the v1 gate below, and
+nothing here shortens it.
+
 ## Rung 1 — host + docker RomM (primary)
 
 ```bash
@@ -142,6 +255,10 @@ ctest --test-dir build --output-on-failure
   way round, fails here — including adding a scope marked "only if…" to the set
   the client actually requests.
 - None of those three touches the network, so they never skip.
+- The `policy.*` tests re-ask row 8 of [the M0 exit gate](#the-m0-exit-gate) on
+  every run: the suite is configured for loopback only, the scripts that write
+  refuse anything else, and no registered test reaches off this machine. They
+  need no network and no rig either, so they never skip.
 - With Docker stopped, `rig.smoke` reports **Skipped** rather than failing, so a
   local `ctest` is still useful. CI configures with `-DROMMSYNC_REQUIRE_RIG=ON`,
   which turns the same condition into a failure — a green CI run always means the
@@ -215,8 +332,10 @@ per-run slot names differ every run and are ignored.
 The scenarios upload throwaway saves — an empty-save negotiate returns an empty
 `operations` array, so `upload`, `download`, `no_op` and `conflict` cannot be
 observed without state on the server. Every save they create is deleted again,
-and the probe refuses a non-loopback URL. `RUN_SERIAL`, because they mutate the
-library other tests read.
+and every mode of the probe that writes — `--auth` registers a device and burns
+a device code, not only `--sync-scenarios` — refuses a non-loopback URL before
+its first request, which `policy.writes_refuse_remote` re-checks. `RUN_SERIAL`,
+because they mutate the library other tests read.
 
 A red run here means RomM changed under the docs, not that a test is flaky:
 re-capture, read the diff, and fix whatever the docs claimed.

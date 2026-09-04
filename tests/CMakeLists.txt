@@ -352,3 +352,39 @@ set_tests_properties(switch.ci_requires_artifacts PROPERTIES TIMEOUT 60)
 add_test(NAME switch.builds
          COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" builds)
 set_tests_properties(switch.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+# --- the M0 exit gate's mechanical clauses -----------------------------------
+# "No test in the suite requires a console or a production server"
+# (docs/TESTING.md#the-m0-exit-gate) is a claim about every test, so it can only
+# stay true if something re-asks it on every run. None of these three need
+# Docker, Orca or a network, so none of them ever skips -- except `guards`,
+# which needs an interpreter that can import the scripts it is running.
+set(POLICY_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_policy.py")
+
+add_test(NAME policy.loopback_only
+         COMMAND ${Python3_EXECUTABLE} "${POLICY_TEST}" loopback
+                 --repo "${CMAKE_SOURCE_DIR}"
+                 --proxy-url "${PROXY_BASE_URL}")
+
+# Asserted on the refusal itself, not on a non-zero exit: a probe that reaches
+# for a production RomM and merely fails to connect also exits non-zero.
+add_test(NAME policy.writes_refuse_remote
+         COMMAND ${Python3_EXECUTABLE} "${POLICY_TEST}" guards
+                 --repo "${CMAKE_SOURCE_DIR}")
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  # It skips when no interpreter can import the scripts it runs -- a plain clone
+  # that has not run setup.sh. CI always has the venv, so there the same
+  # condition is a failure: this is the check that keeps a writing script from
+  # reaching a real RomM, and it must never quietly not run.
+  set_tests_properties(policy.writes_refuse_remote PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
+add_test(NAME policy.tests_are_host_local
+         COMMAND ${Python3_EXECUTABLE} "${POLICY_TEST}" host_only
+                 --repo "${CMAKE_SOURCE_DIR}"
+                 --build "${CMAKE_BINARY_DIR}"
+                 --ctest "${CMAKE_CTEST_COMMAND}")
+
+set_tests_properties(policy.loopback_only policy.writes_refuse_remote
+                     policy.tests_are_host_local
+                     PROPERTIES TIMEOUT 120)
