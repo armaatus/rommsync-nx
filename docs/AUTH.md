@@ -379,6 +379,11 @@ The four outcomes are deliberately not collapsed, because the remedies differ:
 | `sync_disabled`, `ambiguous` | no | no — neither waiting nor re-pairing turns the switch back on |
 | `malformed` | no | no — an answer this client cannot read is not one to hammer |
 
+`server_error` covers the `429` and `408` a rate limiter or a reverse proxy
+answers with, not only a `5xx`. They belong there because their remedy is
+"wait", and the alternative is `malformed`, which has no remedy at all — a
+rate-limited boot would wedge registration until the console was rebooted.
+
 **Recovery is a search, not a registration.** A token with no `device_id` is
 resolved by listing `GET /api/devices` and matching on
 `client_device_identifier` — the row is already there, and that field is the only
@@ -386,12 +391,29 @@ thing pointing back at this console. Two rows carrying one identifier is a state
 RomM permits and this client refuses to guess its way out of (`ambiguous`):
 picking one would send this console's saves to whichever sorted first.
 
+That listing returns **every** device the user owns, which sets how strictly a
+neighbour's fields can be read. RomM stores `""` for `name`, `platform` and
+`client` — `POST /api/devices {"name":""}` answers `201` with `"name":""` — so
+holding those to the bar `expires_at` is held to would let one row written by a
+browser session stop this console finding its own. They are read as "blank and
+absent mean the same thing"; `id` and `sync_enabled`, which are acted on rather
+than displayed, stay strict, and a value that is not a string or that carries an
+embedded NUL is still refused.
+
+Confirming does not prove the device is this *console's*: the returned
+`client_device_identifier` says that, and it is handed back rather than checked,
+because a device RomM created some other way legitimately carries none. It would
+not catch a cloned SD card either — `device.dat` travels with `token.dat`, so
+both consoles present the same identifier.
+
 `ResolveRegistration` falls back to that search only when the cached id names no
 device. Widening it inverts a diagnosis — a console that could not reach its
 server would be told by a second, luckier request that its device is fine.
 
 Caching the resolved id writes `token.dat` only when it actually changed, which
-is never after the first boot.
+is never after the first boot — and leaves the in-memory record untouched when
+the write fails, so a retry writes instead of short-circuiting on an id that
+never reached the disk.
 
 ## Scopes
 

@@ -322,6 +322,25 @@ int Recovers(http::HttpClient& client, const std::string& base) {
   ExpectError(checks, missing, auth::RegistrationError::kNoSuchDevice,
               "an unknown identifier finds nothing");
   checks.Expect(auth::NeedsPairing(missing.error), "and the remedy is to pair");
+
+  // The search reads *every* device the user owns, so it is only as robust as
+  // the strangest row among them -- and RomM really will store a blank name:
+  // this posts one and gets a 201 back. A parse that held a neighbour's blank
+  // field to the bar a timestamp is held to would answer `malformed` here,
+  // which is neither retryable nor re-pairable: a permanent dead end for a
+  // console whose own row is right there and well-formed.
+  const http::Result blank = AsTheUser(
+      client, base, http::Method::kPost, "/api/devices",
+      R"({"name":"","platform":"","client":"","allow_existing":true})");
+  ExpectSucceeded(checks, blank, "RomM accepts a device with blank text fields");
+  const std::string blank_id = rig::JsonString(blank.response.body, "device_id");
+  checks.Expect(!blank_id.empty(), "and names it");
+
+  const auth::Registration past_it = auth::ResolveRegistration(client, orphan, identifier);
+  DeleteDevice(client, base, blank_id);
+  ExpectError(checks, past_it, auth::RegistrationError::kNone,
+              "a neighbour with blank fields does not stop this console finding its own");
+  checks.ExpectEq(past_it.device.id, paired.device_id, "which is still the device pairing made");
   return checks.failures();
 }
 
@@ -513,6 +532,26 @@ int Offline(http::HttpClient& client, const std::string& base) {
   checks.Expect(auth::ShouldRetry(unwell.error), "which is also worth trying again");
   checks.Expect(!auth::NeedsPairing(unwell.error),
                 "and a restarting container is not a reason to re-pair");
+
+  // Being told to slow down is a remedy, and it is "wait". RomM rate limits,
+  // and a self-hosted one behind a reverse proxy answers 429 and 408 on any
+  // path -- so these must not land wherever the unclassifiable 4xx go, which is
+  // a state with nothing to do about it. A rate-limited boot would then wedge
+  // registration until the console was rebooted.
+  for (const int status : {429, 408}) {
+    ExpectSucceeded(checks,
+                    rig::ArmFault(client, base,
+                                  R"({"mode":"status","status":)" + std::to_string(status) +
+                                      R"(,"path":"/api/devices","count":1})"),
+                    "arming an HTTP " + std::to_string(status));
+    const auth::Registration busy = auth::ConfirmRegistration(client, token);
+    rig::DisarmFault(client, base);
+    checks.Expect(auth::ShouldRetry(busy.error),
+                  "an HTTP " + std::to_string(status) + " is worth trying again, not a dead end (" +
+                      auth::ToString(busy.error) + ": " + busy.message + ")");
+    checks.Expect(!auth::NeedsPairing(busy.error),
+                  "and is not a reason to throw the pairing away");
+  }
 
   // Nothing a failed confirm can do may cost the console its credentials.
   auth::StoredToken record = token;
