@@ -124,9 +124,12 @@ set_tests_properties(orca.romm_tab_follows PROPERTIES TIMEOUT 60)
 # fixture with nothing showing it. These never skip: they stub the orca CLI and
 # need neither Docker nor a workspace, so the guarantee stays checked in CI.
 add_test(NAME orca.romm_tab_pidfile COMMAND "${BASH_PROGRAM}" "${ROMM_TAB_TEST}" pidfile)
+add_test(NAME orca.romm_tab_pidfile_streaming
+         COMMAND "${BASH_PROGRAM}" "${ROMM_TAB_TEST}" pidfile_streaming)
 add_test(NAME orca.romm_tab_kept COMMAND "${BASH_PROGRAM}" "${ROMM_TAB_TEST}" ensure_noop)
 add_test(NAME orca.romm_tab_created COMMAND "${BASH_PROGRAM}" "${ROMM_TAB_TEST}" ensure_creates)
-set_tests_properties(orca.romm_tab_pidfile orca.romm_tab_kept orca.romm_tab_created
+set_tests_properties(orca.romm_tab_pidfile orca.romm_tab_pidfile_streaming
+                     orca.romm_tab_kept orca.romm_tab_created
                      PROPERTIES TIMEOUT 60)
 
 # --- worktree environment: scripts/orca/env.sh -------------------------------

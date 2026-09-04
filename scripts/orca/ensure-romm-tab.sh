@@ -19,7 +19,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
 PIDFILE="${ROMM_LOGS_PIDFILE:-$REPO_ROOT/.orca/romm-logs.pid}"
-FOLLOWER="$REPO_ROOT/scripts/orca/romm-logs.sh"
+FOLLOWER_REL="./scripts/orca/romm-logs.sh"
 HINT="    open a tab and run: ./scripts/orca/romm-logs.sh"
 # How long to wait for a created tab to actually start following. Short in tests.
 WAIT_SECONDS="${ROMM_TAB_WAIT_SECONDS:-10}"
@@ -72,10 +72,11 @@ follower_appears() {
   return 1
 }
 
-# Orca titles a tab after the command it was given and ignores --title on create,
-# so the tab arrives called `/Users/.../romm-logs.sh`. Renaming is what actually
-# makes it findable as `romm`; best effort, since a tab with an ugly name still
-# shows the logs and is not worth failing over.
+# Orca titles a tab after the command it was given, and re-derives that title from
+# the running process afterwards, so a rename races it and does not reliably
+# stick -- it lands sometimes and is overwritten other times. Try anyway, because
+# when it wins the tab reads `romm`; the command below is what makes the tab
+# recognisable when it loses.
 name_tab() {
   local handle
   handle="$(sed -n 's/.*"handle"[[:space:]]*:[[:space:]]*"\(term_[^"]*\)".*/\1/p' \
@@ -97,21 +98,22 @@ if ! command -v orca >/dev/null 2>&1; then
 fi
 
 echo "==> orca.yaml's romm tab never started; creating it"
-# --command is shell text Orca runs in the tab, not an argv element, so an
-# unquoted worktree path containing a space would be split into two words and
-# leave behind exactly the dead tab this is here to prevent. Single quotes cover
-# every path git will hand us bar one containing a quote of its own.
-# --json for the handle in the reply, which is the only way to name the tab
-# afterwards; --title is passed too in case a future Orca honours it on create.
+# The command is relative, and identical to the one orca.yaml asks for. It runs
+# in the worktree root, it becomes the tab's title when the rename loses its
+# race -- `./scripts/orca/romm-logs.sh` reads as the romm tab, an absolute path
+# does not -- and being a fixed literal it cannot be word-split by a worktree
+# path containing a space.
+# --json for the handle in the reply, which is the only way to rename the tab;
+# --title is passed too in case a future Orca honours it on create.
 if ! run_with_deadline "$CLI_SECONDS" \
        orca terminal create --json --worktree "path:$REPO_ROOT" --title romm \
-       --command "'$FOLLOWER'"; then
+       --command "$FOLLOWER_REL"; then
   echo "    the orca CLI did not create it -- is the runtime reachable?"
   echo "$HINT"
 else
   # Before waiting on the follower: the tab exists either way, and a named tab is
   # worth having even if what is in it turns out to be wrong.
-  name_tab || echo "    (could not rename it; Orca names a tab after its command)"
+  name_tab >/dev/null 2>&1 || true
   if follower_appears; then
     echo "    created; the romm tab is following"
   else

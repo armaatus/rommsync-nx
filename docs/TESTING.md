@@ -181,12 +181,19 @@ have come up with the tabs created, untitled, and running none of their commands
 while the fixture was live and serving. A running fixture nothing is showing
 looks exactly like one that failed to start.
 
-So `setup.sh` ends with `scripts/orca/ensure-romm-tab.sh`. `romm-logs.sh`
-publishes a pidfile while it follows; if one is live, Orca honoured the request
-and the script does nothing, and if not, it asks the `orca` CLI for the tab
-itself and waits for a follower to actually appear before claiming success. It
-never fails setup, and it no-ops on a plain clone or in CI where there is no CLI
-and no tabs to create.
+So `setup.sh` runs `scripts/orca/ensure-romm-tab.sh` — before it brings the stack
+up, because a failure there is exactly when you need the tab and `set -e` would
+otherwise skip the check. `romm-logs.sh` publishes a pidfile while it follows; if
+one is live, Orca honoured the request and the script does nothing, and if not,
+it asks the `orca` CLI for the tab itself and waits for a follower to actually
+appear before claiming success. It never fails setup, and it no-ops on a plain
+clone or in CI where there is no CLI and no tabs to create.
+
+Do not expect the tab to be called `romm`. Orca titles a tab after the command it
+was given and re-derives that title from the running process, so a rename races
+it and lands only sometimes. The tab is therefore created with exactly the
+command `orca.yaml` asks for, so that when the rename loses, the title still
+reads `./scripts/orca/romm-logs.sh`.
 
 Removing a worktree runs `scripts/orca/archive.sh`, which takes that worktree's
 stack and volumes down with it. It derives the project name from the worktree
