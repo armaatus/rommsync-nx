@@ -51,12 +51,12 @@ All authed requests send `Authorization: Bearer <token>`.
 | Method | Path | Body → Response |
 |---|---|---|
 | GET | `/api/devices` | list this user's devices |
-| POST | `/api/devices` | `DeviceCreatePayload` → `DeviceSchema` (has `id` = device_id) |
+| POST | `/api/devices` | `DeviceCreatePayload` → `{device_id, name, created_at}` — the id field is **`device_id`**, not `id` (verified live, 5.2.0) |
 | GET/PUT/DELETE | `/api/devices/{device_id}` | manage one |
 
 `DeviceCreatePayload` (key fields): `name, platform, client, client_version,
 hostname, mac_address, sync_mode, sync_config, allow_existing, allow_duplicate`.
-Cache the returned `id` — it's the `device_id` used in every sync call.
+Cache the returned `device_id` — it's a UUID string, and it's what every sync call is scoped by.
 
 ## Save sync — negotiate → execute → complete
 
