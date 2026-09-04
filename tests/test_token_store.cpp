@@ -340,6 +340,10 @@ void SurvivesTheProcessBeingKilledMidWrite(checks::Checks& c) {
   const pid_t child = fork();
   c.Expect(child >= 0, "the test can fork");
   if (child == 0) {
+    // No core dump: the kill is the point of the test, and a crash dump per run
+    // is noise in CI and megabytes on a laptop.
+    const rlimit no_core{0, 0};
+    setrlimit(RLIMIT_CORE, &no_core);
     const rlimit limit{4096, 4096};
     if (setrlimit(RLIMIT_FSIZE, &limit) != 0) {
       _exit(2);
