@@ -183,9 +183,11 @@ export NROFLAGS += --nacp=$(CURDIR)/$(TARGET).nacp
 # half only ever finds it complete.
 VERSION_HEADER := $(CURDIR)/$(BUILD)/rommsync/version.hpp
 
-# Only the targets that compile core/ generate it, so the overlay does not grow
-# a dependency on the engine's version header just by existing.
-ifneq ($(strip $(ROMMSYNC_USE_CORE)),)
+# Only the targets that ask for it generate it, so the overlay does not grow a
+# dependency on the engine's version header just by existing. Compiling core/
+# implies asking, since core/version.cpp includes it; ROMMSYNC_WANT_VERSION is
+# for a target that wants the string without the engine (tlsprobe/Makefile).
+ifneq ($(strip $(ROMMSYNC_USE_CORE))$(strip $(ROMMSYNC_WANT_VERSION)),)
 GENERATED := $(VERSION_HEADER)
 endif
 

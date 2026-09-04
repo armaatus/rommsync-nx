@@ -9,7 +9,8 @@ exactly what makes it look fine.
 Three phases, run as separate CTest entries so a red run names which clause broke:
 
   loopback   every base URL the suite is CONFIGURED with is loopback -- the one
-             compiled into the test binaries, the one env.sh derives, the
+             compiled into the test binaries, the ones env.sh derives (RomM, the
+             fault proxy, and the TLS terminator the M0-1 probe aims at), the
              fallback in tests/CMakeLists.txt, and this worktree's .env. Not a
              scan for URL literals: test_auth_shapes and test_token_store parse
              `http://romm.lan:8080` as data and never dial it, so the literal is
@@ -69,7 +70,7 @@ def phase_loopback(args) -> int:
     # and test_rig_smoke.cpp both prefer $PROXY_BASE_URL, so a shell that
     # exported a remote one would point every http.*, pair.* and rig.* test at
     # it while every file this function reads still said 127.0.0.1.
-    for var in ("PROXY_BASE_URL", "ROMM_BASE_URL"):
+    for var in ("PROXY_BASE_URL", "ROMM_BASE_URL", "TLS_BASE_URL"):
         value = os.environ.get(var)
         if value:
             checks.append((f"${var} in this environment", value))
@@ -80,7 +81,7 @@ def phase_loopback(args) -> int:
         with open(env_file, encoding="utf-8") as fh:
             for line in fh:
                 key, sep, value = line.strip().partition("=")
-                if sep and key in ("ROMM_BASE_URL", "PROXY_BASE_URL"):
+                if sep and key in ("ROMM_BASE_URL", "PROXY_BASE_URL", "TLS_BASE_URL"):
                     checks.append((f".env {key}", value))
 
     # ...and the two places a .env comes from, so a fresh worktree is covered
@@ -88,7 +89,7 @@ def phase_loopback(args) -> int:
     # Matched on the variable, not on "any URL on the line": these files carry
     # comments with links in them, and a doc link failing the policy check would
     # teach people to delete the check.
-    assignment = re.compile(r'(?:ROMM|PROXY)_BASE_URL[=\s"]+(https?://[^\s"\')]*)')
+    assignment = re.compile(r'(?:ROMM|PROXY|TLS)_BASE_URL[=\s"]+(https?://[^\s"\')]*)')
     for path in ("scripts/orca/env.sh", "tests/CMakeLists.txt"):
         full = os.path.join(args.repo, path)
         found = 0
@@ -101,10 +102,11 @@ def phase_loopback(args) -> int:
             return fail(f"{path} no longer assigns a base URL this check can see; "
                         "the check has stopped checking, which is worse than a red one")
 
-    # And the far end of the proxy, which is where the suite's traffic actually
-    # lands. Its host is a compose service name rather than an address, so
-    # is_loopback() cannot judge it: what makes it safe is that it names the
-    # `romm` service in this project's own compose file, and nothing else.
+    # And the far end of every UPSTREAM in the compose file -- the fault proxy's,
+    # and the TLS terminator's -- which is where the traffic actually lands. The
+    # host is a compose service name rather than an address, so is_loopback()
+    # cannot judge it: what makes it safe is that it names the `romm` service in
+    # this project's own compose file, and nothing else.
     compose = os.path.join(args.repo, "server/testing/docker-compose.yml")
     upstreams = re.findall(r"^\s*UPSTREAM:\s*(\S+)", open(compose, encoding="utf-8").read(),
                            re.MULTILINE)

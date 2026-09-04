@@ -75,8 +75,15 @@ for project in $projects; do
   # caller's environment, which is right for every other command but would
   # resolve both passes below to whatever .env happens to say. `-p` names the
   # stack outright, which is what teardown needs and what reap.sh does too.
+  # --profile tls, because `down` only touches services whose profile is
+  # active: the TLS terminator (server/testing/docker-compose.yml) would
+  # otherwise survive teardown, and `restart: unless-stopped` would bring it
+  # back on every Docker start, holding this worktree's TLS_PORT with no
+  # directory left to identify it by -- the exact orphan this hook exists to
+  # prevent. It also blocks the network removal, so the rest of the teardown
+  # fails behind it.
   if ! docker compose -p "$project" -f server/testing/docker-compose.yml \
-        down -v --remove-orphans; then
+        --profile tls down -v --remove-orphans; then
     echo "!! compose down failed for $project"
   fi
 
