@@ -54,15 +54,15 @@ issue "M0-1: Sysmodule TLS feasibility via ssl service — Ryujinx-first, off th
 issue "M0-2: HttpClient interface + native (libcurl) backend for the host harness" "M0 - Foundations & de-risking" "sysmodule,test-harness,docs" \
   "GET/POST/multipart, streaming download-to-file, timeouts, cancellation, Range. Swappable TLS backend; ship the native (libcurl) backend so all networked logic is testable off-console."
 issue "M0-3: CI builds host harness (runs tests) + Switch skeleton (artifacts)" "M0 - Foundations & de-risking" "packaging,test-harness" \
-  "Two jobs: native build runs the test suite against the mock RomM; devkitpro build compiles empty sysmodule + overlay to artifacts (not run). Wire .github/workflows/ci.yml."
+  "Two jobs: native build runs the test suite against the docker RomM rig; devkitpro build compiles sysmodule + overlay to artifacts (not run). Wire .github/workflows/ci.yml."
 issue "M0-4: Capture real RomM auth/sync response shapes (docker RomM, never production)" "M0 - Foundations & de-risking" "server,docs,test-harness" \
-  "Run server/probe_contract.py --auth --negotiate against a docker RomM (never production); paste real init/token/negotiate JSON into docs/API_CONTRACT.md and AUTH.md; feed the mock fixtures."
-issue "M0-5: Host test harness + mock RomM server (fully offline)" "M0 - Foundations & de-risking" "server,test-harness,sync" \
-  "Native rig wiring the core engine to a scriptable mock RomM that forces every edge case (401, conflict, partial failure, Range resume, multi-file skip). Backbone of proving v1 before hardware."
+  "Run server/probe_contract.py --auth --negotiate against a docker RomM (never production); paste real init/token/negotiate JSON into docs/API_CONTRACT.md and AUTH.md; pin them as typed structs."
+issue "M0-5: Host test harness + fault-injection scenarios (real docker RomM)" "M0 - Foundations & de-risking" "server,test-harness,sync" \
+  "Native rig wiring the core engine to the real docker RomM through the fault proxy, forcing every edge case (401, conflict, partial failure, Range resume, multi-file skip). Backbone of proving v1 before hardware."
 issue "M0-6: docker-compose RomM fixture for integration/fidelity tests" "M0 - Foundations & de-risking" "server,test-harness" \
-  "One-command real RomM 5.2.0 on a throwaway volume, seeded with sample roms/saves; used to capture shapes, confirm the mock matches reality, and back the Ryujinx tier. Never a production DB."
+  "One-command real RomM 5.2.0 on a throwaway volume, seeded with homebrew roms; used to capture shapes and to back the Ryujinx tier. Never a production DB."
 issue "M0-7: No real hardware / no production data until proven v1 policy + M0 exit gate" "M0 - Foundations & de-risking" "docs,risk,test-harness" \
-  "Write docs/TESTING.md, update DEVELOPMENT.md, define the v1 gate M8 depends on. M0 done = every component below the Horizon glue proven on host + mock + docker in CI, no console/production needed."
+  "Write docs/TESTING.md, update DEVELOPMENT.md, define the v1 gate M8 depends on and the M0 exit gate M1 waits for. M0 done = every component below the Horizon glue proven on host + docker RomM in CI, no console and no production server needed."
 # --- M1
 issue "M1-1: Device-code init/poll/token" "M1 - Authentication" "auth,sysmodule" "Implement init -> show code via IPC -> poll token. Persist token+expiry."
 issue "M1-2: Verify & code against init/token response fields" "M1 - Authentication" "auth,docs" "Depends on M0-4."
