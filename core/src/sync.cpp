@@ -43,6 +43,22 @@ bool LowercaseHex(std::string_view value) {
   return true;
 }
 
+/// True for a string RomM can use as one segment of a storage path.
+///
+/// `saves-post.json` shows where these land:
+/// `users/<user>/saves/<platform>/<rom>/<emulator>/<file_name>`. Both the
+/// emulator and the file name are pasted into that path, so a `/` in either is a
+/// client asking the server to write somewhere else, and `.` or `..` is the same
+/// request without a separator in it. A directory scan is the intended producer
+/// of these values (SYNC_PROTOCOL.md step 0) and `readdir` hands out `.` and
+/// `..` for free, so this is a mistake to make by accident, not only in anger.
+///
+/// Backslash is deliberately allowed: RomM joins POSIX paths, and a save on a
+/// FAT volume is entitled to a backslash in its name.
+bool PathComponent(std::string_view value) {
+  return value.find('/') == std::string_view::npos && value != "." && value != "..";
+}
+
 /// A `T | null` field: absent is fine, present and unusable is not.
 json::Error ValidateNullable(const std::optional<std::string>& value, std::string_view field) {
   if (!value.has_value()) {
@@ -122,9 +138,7 @@ json::Error Validate(const ClientSaveState& save) {
   if (!Printable(save.file_name)) {
     return Fail("file_name", "contains a control character");
   }
-  // Only `/`: RomM joins this into a POSIX path, and a backslash is a character
-  // a save file on a FAT volume is entitled to have in its name.
-  if (save.file_name.find('/') != std::string::npos) {
+  if (!PathComponent(save.file_name)) {
     return Fail("file_name", "is a path, not a file name; the server joins it into one");
   }
 
@@ -133,6 +147,10 @@ json::Error Validate(const ClientSaveState& save) {
   }
   if (const json::Error error = ValidateNullable(save.emulator, "emulator"); !error.ok()) {
     return error;
+  }
+  // The emulator is a directory in the save's stored path, not just a label.
+  if (save.emulator.has_value() && !PathComponent(*save.emulator)) {
+    return Fail("emulator", "is a path segment on the server; it may not name a directory");
   }
   if (const json::Error error = ValidateNullable(save.content_hash, "content_hash"); !error.ok()) {
     return error;

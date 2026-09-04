@@ -9,9 +9,7 @@
 // so a RomM that renames or re-types a field goes red here rather than on a
 // console.
 //
-// Three of the seven fields are not what an obvious guess produces, and each
-// wrong guess fails *quietly* -- the server takes the body, plans something
-// reasonable-looking, and the client loses saves to it:
+// Three of the seven fields are not what an obvious guess produces:
 //
 //   - `content_hash`, not `hash`, and an **MD5**: roms carry sha1/md5/crc, saves
 //     are compared on MD5 alone. A SHA1 here matches nothing, so every
@@ -21,6 +19,13 @@
 //     manual upload" and is never paired with a slotted server save, so it
 //     negotiates as `upload` on every tick even when the identical bytes are
 //     already there.
+//
+// Only one of those mistakes announces itself. `file_size_bytes` is required, so
+// guessing `size` is a 422 that names the field. `content_hash` is optional, so
+// guessing `hash` is a **200**: RomM ignores the unknown key, reads the hash as
+// absent, falls back to timestamps, and plans an `upload` for a save it already
+// has -- on this tick and every tick after it. `sync.understood` demonstrates
+// exactly that against a live server.
 //
 // So nothing here is built by concatenation and nothing is sent unchecked:
 // `EncodeNegotiateRequest` refuses a save it cannot express faithfully and
