@@ -32,6 +32,7 @@ ctest --test-dir build --output-on-failure       # test
 ctest --test-dir build -R sync --output-on-failure   # one group
 
 ./scripts/orca/env.sh                            # regenerate .env
+./scripts/orca/romm-logs.sh                      # follow RomM, if the tab is missing
 ./server/testing/seed.sh                         # re-seed ROM fixtures
 ./.venv/bin/python server/testing/provision.py   # scan the library, mint a fixture token
 ./scripts/orca/compose.sh up -d                  # start RomM
