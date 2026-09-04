@@ -20,10 +20,21 @@ scripts:
 # go chasing it. The few seconds this costs buys away that whole failure mode.
 setupAgentStartupPolicy: wait-for-setup
 
-# Turns a task picked from the Tasks tab into a full spec. Orca often prefills
-# only an issue URL; this resolves it to the issue body, labels and milestone,
-# which is the sole channel design intent travels through on this project.
-issueCommand: ./scripts/orca/issue-command.sh
+# The prompt an agent starts with when the workspace is created from a linked
+# issue. Orca treats this as a TEMPLATE, not as argv: it substitutes {{issue}}
+# and {{artifact_url}} and nothing else -- there is no $1 -- and with an empty
+# composer the result becomes the agent's opening prompt. Left unset, Orca's own
+# default is `Complete {{artifact_url}}`, which is how an agent ends up starting
+# work from a bare URL and never reads the spec. So this points the agent at
+# issue-command.sh, which resolves the issue to its body, labels and milestone --
+# the sole channel design intent travels through on this project.
+issueCommand: |
+  Run `GH_PAGER=cat ./scripts/orca/issue-command.sh {{issue}}` first: it prints the
+  full spec for issue #{{issue}} ({{artifact_url}}), which is the only place this
+  project's design intent is written down. Then implement that issue end to end
+  following CLAUDE.md -- ctest green with a test that would have failed before your
+  change, `/code-review` on your own branch with the findings in the PR body, and a
+  PR carrying `Closes #{{issue}}`. Do not merge it yourself.
 
 defaultTabs:
   # Tab 1 is the agent, opened by Orca itself.
