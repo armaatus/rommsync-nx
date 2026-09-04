@@ -118,6 +118,24 @@ compose project name and two ports from the worktree path and writes them to
 things are shared between worktrees — the checksum-pinned ROM downloads and the
 content-addressed ccache, declared in [`orca.yaml`](../orca.yaml).
 
+Removing a worktree runs `scripts/orca/archive.sh`, which takes that worktree's
+stack and volumes down with it. It derives the project name from the worktree
+path rather than reading `.env` back, so a worktree whose `.env` never got
+written still tears down cleanly, and it checks afterwards that docker holds
+nothing under that project instead of assuming `down` worked.
+
+Stacks can still outlive their worktree — one deleted with `rm -rf`, or removed
+while Docker was stopped. The fixture restarts `unless-stopped`, so those come
+back on every docker start and hold two ports each. Sweep them up with:
+
+```bash
+./scripts/orca/reap.sh          # list stacks with no worktree, change nothing
+./scripts/orca/reap.sh --yes    # remove them, volumes included
+```
+
+It derives every live worktree's project name the same way `env.sh` did and
+protects those, so it can never take down a worktree still in use.
+
 ## Rung 2 — Ryujinx NRO
 
 - A standalone **NRO** (manually launched, *not* a sysmodule, *not* on the boot
