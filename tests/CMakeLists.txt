@@ -42,6 +42,18 @@ target_compile_definitions(test_auth_shapes PRIVATE
   ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures")
 add_test(NAME auth.shapes COMMAND test_auth_shapes)
 
+# The negotiate request payload, against the pinned OpenAPI snapshot rather than
+# against a second copy of the field names. server/contract/romm-openapi-5.2.0.json
+# is what M0-4 pinned; this keeps `ClientSaveState` honest against it in both
+# directions -- a field the snapshot grew, and a field the encoder invented, are
+# both red. No network, so it never skips.
+add_executable(test_sync_payload test_sync_payload.cpp)
+target_link_libraries(test_sync_payload PRIVATE rommsync::core)
+target_include_directories(test_sync_payload PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_sync_payload PRIVATE
+  ROMMSYNC_OPENAPI="${CMAKE_SOURCE_DIR}/server/contract/romm-openapi-5.2.0.json")
+add_test(NAME sync.payload COMMAND test_sync_payload)
+
 # token.dat. Pure filesystem and parsing, so this never skips either -- and the
 # guarantee it exists for (a failed write costs the new token, never the working
 # one) is checkable with no server at all.
@@ -213,6 +225,36 @@ foreach(scenario IN LISTS PAIR_SCENARIOS)
   # scenario for every client. These also wait out real poll intervals, so the
   # timeout has to cover a few of them.
   set_tests_properties(pair.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+endforeach()
+
+# --- the negotiate payload against the real rig ------------------------------
+# sync.payload pins ClientSaveState to the committed snapshot; these ask the
+# running server, which is the only thing that can show what a *misnamed*
+# optional field costs -- RomM answers 200 and plans something else. One CTest
+# entry per scenario, so a red run names the behaviour.
+add_executable(test_sync_negotiate test_sync_negotiate.cpp)
+target_link_libraries(test_sync_negotiate PRIVATE rommsync::host)
+target_compile_definitions(test_sync_negotiate PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+
+set(SYNC_SCENARIOS
+  accepted    # a live 5.2.0 takes the encoded body and echoes the entry back
+  required    # a renamed REQUIRED field is a 422 that names it
+  understood  # a renamed OPTIONAL one is a silent 200 with a different plan
+)
+
+foreach(scenario IN LISTS SYNC_SCENARIOS)
+  add_test(NAME sync.${scenario} COMMAND test_sync_negotiate ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(sync.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  # `understood` uploads a throwaway save and deletes it again, so it must not
+  # interleave with another test reading the same library -- and every scenario
+  # here goes through the fault proxy, which holds one armed scenario for all
+  # clients.
+  set_tests_properties(sync.${scenario} PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 endforeach()
 
 # --- the committed API captures still match a live RomM ----------------------

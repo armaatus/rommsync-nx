@@ -25,23 +25,6 @@ namespace {
 
 namespace http = rommsync::http;
 
-/// Read one `KEY=value` out of the file provision.py writes.
-std::string FixtureValue(const std::string& contents, const std::string& key) {
-  const std::string needle = key + "=";
-  std::size_t at = contents.rfind("\n" + needle);
-  if (at == std::string::npos) {
-    if (contents.rfind(needle, 0) != 0) {
-      return {};
-    }
-    at = 0;
-  } else {
-    ++at;  // step over the newline
-  }
-  at += needle.size();
-  const std::size_t end = contents.find('\n', at);
-  return contents.substr(at, end == std::string::npos ? std::string::npos : end - at);
-}
-
 http::Result GetAuthed(http::HttpClient& client, const std::string& url,
                        const std::string& token) {
   http::Request request;
@@ -75,9 +58,9 @@ int main() {
                 "server/testing/fixture-auth.env exists -- the fixture was provisioned "
                 "(run ./.venv/bin/python server/testing/provision.py)");
 
-  const std::string token = FixtureValue(fixture, "ROMM_FIXTURE_TOKEN");
-  const std::string collection_id = FixtureValue(fixture, "ROMM_FIXTURE_COLLECTION_ID");
-  const std::string device_id = FixtureValue(fixture, "ROMM_FIXTURE_DEVICE_ID");
+  const std::string token = rig::FixtureValue(fixture, "ROMM_FIXTURE_TOKEN");
+  const std::string collection_id = rig::FixtureValue(fixture, "ROMM_FIXTURE_COLLECTION_ID");
+  const std::string device_id = rig::FixtureValue(fixture, "ROMM_FIXTURE_DEVICE_ID");
   checks.Expect(!token.empty(), "a client token was minted");
   checks.Expect(!collection_id.empty(), "a collection id was recorded");
   // Every sync call is scoped by device_id. An empty one here surfaces much

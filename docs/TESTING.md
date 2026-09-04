@@ -249,12 +249,26 @@ ctest --test-dir build --output-on-failure
   block-boundary lengths the padding gets wrong, and then the property that
   actually matters — the identifier is the *same* identifier across a restart, a
   re-pair, a different seed, an interrupted commit and a corrupt record.
+- `sync.payload` pins `ClientSaveState` (M2-1) to the committed OpenAPI snapshot
+  rather than to a second copy of the field names: one table in the test is
+  checked against `server/contract/romm-openapi-5.2.0.json` *and* against a body
+  `EncodeNegotiateRequest` actually produced, so drift on either side is red.
+- The `sync.*` rig scenarios ask the running server what the snapshot cannot.
+  `accepted` proves a live 5.2.0 takes the encoded body and echoes the entry's
+  `file_name`, `slot` and `emulator` back. `required` proves a renamed *required*
+  field is a 422 that names it. `understood` is the one worth reading: it uploads
+  one save and negotiates it twice, changing nothing but `content_hash` →
+  `hash`, and gets `no_op / Content is identical` and then `upload` — both with a
+  200 and no hint that a field was ignored. That is the failure the typed struct
+  exists to prevent, and it is the reason these are rig tests and not unit tests.
+  `understood` deletes the save it made, so the fixture is left as it was found.
 - `auth.scopes` reads the scope list out of
   [API_CONTRACT.md](API_CONTRACT.md#scopes-to-request) and compares it to
   `MinimumScopes()`. Editing the document without editing the code, or the other
   way round, fails here — including adding a scope marked "only if…" to the set
   the client actually requests.
-- None of those three touches the network, so they never skip.
+- Neither `auth.scopes`, `core.token_store`, `core.device_identity` nor
+  `sync.payload` touches the network, so none of them ever skips.
 - The `policy.*` tests re-ask row 8 of [the M0 exit gate](#the-m0-exit-gate) on
   every run: the suite is configured for loopback only, the scripts that write
   refuse anything else, and no registered test reaches off this machine. They
