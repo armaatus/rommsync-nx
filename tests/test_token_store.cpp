@@ -8,9 +8,11 @@
 //
 // No network and no rig: this is the filesystem and a parser, so it never
 // skips.
+#ifdef ROMMSYNC_CAN_FORK
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #include <cstddef>
 #include <cstdio>
@@ -18,6 +20,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include "checks.hpp"
@@ -164,6 +167,42 @@ void RecoversFromTheCommitWindow(checks::Checks& c) {
   c.Expect(!nothing.ok(), "and with no fallback there is still nothing");
   c.ExpectEq(std::string(auth::ToString(nothing.error)), std::string("read_failed"),
              "reported as read_failed");
+}
+
+/// ...but only for the window. A `token.dat` that *exists* and will not open is
+/// a bad moment, and answering it with `.old` hands back a token the user may
+/// have just revoked -- so the next sync tick 401s and the overlay asks for a
+/// re-pair that was never needed.
+void DoesNotFallBackOverATransientFailure(checks::Checks& c) {
+  const std::filesystem::path path = ScratchDir() / "transient.dat";
+  std::error_code ignored;
+  std::filesystem::remove(path, ignored);
+  std::filesystem::remove(io::PreviousPathFor(path.string()), ignored);
+
+  const auth::StoredToken token = Fixture();
+  WriteWhole(io::PreviousPathFor(path.string()), auth::SerializeStoredToken(token));
+
+  // A symlink loop: the one way to make `fopen` fail with something other than
+  // ENOENT without depending on who is running the test. On Horizon the same
+  // shape is a full handle table, or `sdmc:` not mounted yet at boot.
+  std::filesystem::create_symlink(path.filename(), path, ignored);
+  if (ignored) {
+    c.Expect(false, "the test can create a symlink loop: " + ignored.message());
+    return;
+  }
+
+  const auth::LoadedToken loaded = auth::LoadToken(path.string());
+  c.Expect(!loaded.ok(), "a token file that will not open is an error");
+  c.Expect(loaded.value.access_token != token.access_token,
+           "and not the previous token quietly handed back");
+  std::filesystem::remove(path, ignored);
+
+  // With the file genuinely gone, the same `.old` *is* read: that is the commit
+  // window, and the two cases must not be answered the same way.
+  const auth::LoadedToken window = auth::LoadToken(path.string());
+  c.Expect(window.ok(), "a missing record still recovers from the window: " + window.message);
+  SameToken(c, window.value, token, "recovered");
+  std::filesystem::remove(io::PreviousPathFor(path.string()), ignored);
 }
 
 /// The guarantee the whole file exists for: a write that cannot complete costs
@@ -338,7 +377,13 @@ void SurvivesTheProcessBeingKilledMidWrite(checks::Checks& c) {
 
   std::fflush(nullptr);  // nothing of ours may be flushed twice by the child
   const pid_t child = fork();
-  c.Expect(child >= 0, "the test can fork");
+  if (child < 0) {
+    // Without a child there is nothing to reap, and `waitpid(-1, ...)` would
+    // wait for *any* child -- so every assertion after this would fail with a
+    // message about the token rather than about the fork that did not happen.
+    c.Expect(false, "the test can fork");
+    return;
+  }
   if (child == 0) {
     // No core dump: the kill is the point of the test, and a crash dump per run
     // is noise in CI and megabytes on a laptop.
@@ -506,6 +551,7 @@ int main() {
   AFailedWriteLeavesTheOldToken(c);
   NamesAMissingDirectory(c);
   RecoversFromTheCommitWindow(c);
+  DoesNotFallBackOverATransientFailure(c);
   RefusesAnUnusableToken(c);
   RefusesWhatIsNotAToken(c);
   CarriesTheServerItWasIssuedBy(c);

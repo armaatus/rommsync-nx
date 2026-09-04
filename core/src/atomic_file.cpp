@@ -1,5 +1,6 @@
 #include "rommsync/atomic_file.hpp"
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdio>
 #include <string>
@@ -24,8 +25,12 @@ std::string Describe(const std::string& path, std::string_view what) {
   return path + ": " + std::string(what);
 }
 
-/// Overwrite whatever is at `path` with zeroes, then unlink it. See `Shred` for
-/// what that does and does not buy on an SD card.
+/// Overwrite whatever is at `path` with zeroes, then unlink it.
+///
+/// Best-effort, and `Shred` says how little that is worth: without an `fsync`
+/// the standard library does not expose, the zeroes may never reach the card at
+/// all, since a filesystem is free to drop dirty pages belonging to an inode
+/// that is about to be unlinked. The unlink is the part that does the work.
 bool ShredOne(const std::string& path) {
   std::FILE* file = std::fopen(path.c_str(), "r+b");
   if (file != nullptr) {
@@ -122,11 +127,16 @@ WriteResult WriteAtomically(const std::string& path, std::string_view contents) 
     }
   }
   if (std::rename(temp.c_str(), path.c_str()) != 0) {
-    if (replacing) {
-      std::rename(previous.c_str(), path.c_str());
+    std::string detail = "could not be replaced by " + temp;
+    // Putting the previous record back is the whole reason a caller can treat a
+    // failed write as costing only the new record. When even *that* fails the
+    // destination is gone, and saying so is the difference between a caller
+    // reading `.old` deliberately and one wondering why its file vanished.
+    if (replacing && std::rename(previous.c_str(), path.c_str()) != 0) {
+      detail += ", and the previous record could not be put back -- it is at " + previous;
     }
     std::remove(temp.c_str());
-    return {WriteError::kCommitFailed, Describe(path, "could not be replaced by " + temp)};
+    return {WriteError::kCommitFailed, Describe(path, detail)};
   }
   std::remove(previous.c_str());
   return {};
@@ -134,10 +144,19 @@ WriteResult WriteAtomically(const std::string& path, std::string_view contents) 
 
 ReadResult ReadFile(const std::string& path) {
   ReadResult result;
+  errno = 0;
   std::FILE* file = std::fopen(path.c_str(), "rb");
   if (file == nullptr) {
-    result.error = ReadError::kMissing;
-    result.message = Describe(path, "could not be opened");
+    // The distinction is load-bearing, not tidiness: a caller answers "there is
+    // no file" by creating one, and `device.dat` is a file that must never be
+    // created over an existing identifier. Only ENOENT and ENOTDIR mean the
+    // path cannot name anything; every other refusal -- a handle table that is
+    // full, `sdmc:` not mounted yet at boot, a permission -- is a bad moment,
+    // and a bad moment is not evidence that nothing was ever written here.
+    const int why = errno;
+    const bool absent = why == ENOENT || why == ENOTDIR;
+    result.error = absent ? ReadError::kMissing : ReadError::kUnreadable;
+    result.message = Describe(path, absent ? "does not exist" : "could not be opened");
     return result;
   }
 
@@ -154,15 +173,6 @@ ReadResult ReadFile(const std::string& path) {
     result.message = Describe(path, "could not be read");
   }
   return result;
-}
-
-ReadResult ReadCommitted(const std::string& path) {
-  ReadResult result = ReadFile(path);
-  if (result.ok()) {
-    return result;
-  }
-  ReadResult previous = ReadFile(PreviousPathFor(path));
-  return previous.ok() ? previous : result;
 }
 
 bool Shred(const std::string& path) {

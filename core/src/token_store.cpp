@@ -165,9 +165,10 @@ bool DiscardToken(const std::string& path) {
 
 namespace {
 
-LoadedToken ReadRecord(const std::string& path) {
+LoadedToken ReadRecord(const std::string& path, io::ReadError* how) {
   LoadedToken loaded;
   const io::ReadResult read = io::ReadFile(path);
+  *how = read.error;
   if (!read.ok()) {
     loaded.error = StoreError::kReadFailed;
     loaded.message = read.message;
@@ -187,16 +188,26 @@ LoadedToken ReadRecord(const std::string& path) {
 }  // namespace
 
 LoadedToken LoadToken(const std::string& path) {
-  LoadedToken loaded = ReadRecord(path);
+  io::ReadError how = io::ReadError::kNone;
+  LoadedToken loaded = ReadRecord(path, &how);
   if (loaded.ok()) {
     return loaded;
   }
-  // The one moment `path` does not exist is between the two renames in
-  // `SaveToken`, and what is sitting in `.old` then is the previous complete
-  // record. Reading it is the difference between a re-pair nobody notices and
-  // one the user has to do at a browser. The original error is kept when there
-  // is nothing to fall back to, so a plain missing file still says so.
-  LoadedToken previous = ReadRecord(io::PreviousPathFor(path));
+  // A `token.dat` that *exists* and would not open is a bad moment, not a
+  // commit window. Falling back then would answer a transient failure with the
+  // previous token -- which may be the one the user just revoked, so the next
+  // sync tick 401s and the overlay asks for a re-pair that was never needed.
+  if (how == io::ReadError::kUnreadable) {
+    return loaded;
+  }
+  // Missing or unreadable-as-a-record, on the other hand, is exactly what the
+  // moment between `WriteAtomically`'s two renames looks like, and what is
+  // sitting in `.old` then is the previous complete record. Reading it is the
+  // difference between an interruption nobody notices and a re-pair at a
+  // browser. The original error is kept when there is nothing to fall back to,
+  // so a plain missing file still says so.
+  io::ReadError ignored = io::ReadError::kNone;
+  LoadedToken previous = ReadRecord(io::PreviousPathFor(path), &ignored);
   return previous.ok() ? previous : loaded;
 }
 

@@ -31,7 +31,9 @@ A sample Caddyfile lives in `server/README.md`.
 - The device-code flow issues a scoped bearer token. Request only the scopes in
   [API_CONTRACT.md](API_CONTRACT.md#scopes-to-request).
 - Revoke via RomM's client-tokens UI / `DELETE /api/client-tokens/{id}`; the
-  sysmodule handles the resulting `401` by prompting re-pair.
+  sysmodule handles the resulting `401` by prompting re-pair. This is the only
+  way to make a token that has been on an SD card stop working — deleting the
+  file is not.
 
 ## Token at rest on the SD
 
@@ -61,12 +63,15 @@ accident:
   token by length only. `core.token_store` asserts this with a needle rather
   than leaving it to inspection.
 - **Genuinely discarded.** "Re-pair" and factory reset remove `token.dat` *and*
-  the `.tmp`/`.old` an interrupted commit can leave beside it, overwriting each
-  first. The overwrite is worth what it is worth: it removes the bytes any
-  reader of the file system can see, and on a wear-levelling SD card it does not
-  promise the old sectors are gone. Unlinking only `token.dat` while
-  `token.dat.old` still held the same token would have discarded nothing, which
-  is the failure the overwrite is incidental to and the sweep is the point of.
+  the `.tmp`/`.old` an interrupted commit can leave beside it. The **sweep** is
+  the part that does the work: unlinking only `token.dat` while `token.dat.old`
+  still held the same bearer token would have discarded nothing, and that is
+  what the test checks. Each file is zeroed before it is unlinked, but that
+  overwrite claims nothing — there is no `fsync` reachable from the standard
+  library, so a filesystem may drop the zeroed pages of an inode it is about to
+  unlink and never write them, and wear levelling can preserve the original
+  blocks regardless. Treat a token that has ever been on a card as recoverable
+  from that card, and **revoke it on the server** if that matters.
 - Never commit a real `config.ini`/`token.dat` (see `.gitignore`).
 
 ## The console identifier
@@ -86,6 +91,13 @@ body, not in `device.dat`, not in a log.
 The identifier survives a re-pair on purpose. Discarding it with the token would
 register the console in RomM a second time and give every save an empty sync
 history, which is a data problem dressed as a privacy improvement.
+
+The opposite mistake is worse, and the platform layer is where it would happen:
+a seed provider that substitutes a placeholder when it cannot read the serial
+gives *every affected console the same identifier*, so RomM treats them as one
+device and one console's saves overwrite another's. It must fail instead. The
+engine refuses a stable value too short to be a serial, which catches the shape
+that mistake usually takes but cannot catch a plausible-looking constant.
 
 ## What we never do
 

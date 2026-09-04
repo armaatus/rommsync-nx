@@ -137,6 +137,13 @@ struct LoadedToken {
 /// Read `path` back. A missing file is `kReadFailed`, not an empty token: "not
 /// paired yet" and "paired, and the file is gone" are the same recovery, but
 /// only one of them should be reported as though nothing happened.
+///
+/// A record that is missing, or that is there and is not a token, falls back to
+/// the `.old` an interrupted commit leaves behind — that window is the one
+/// moment `path` legitimately does not exist. A `token.dat` that *exists* and
+/// will not open does not, because answering a transient failure with the
+/// previous token hands back one the user may have just revoked, and a `401` on
+/// the next tick sends them to a re-pair screen for no reason.
 LoadedToken LoadToken(const std::string& path);
 
 }  // namespace rommsync::auth

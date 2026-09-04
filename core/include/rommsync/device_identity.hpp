@@ -45,7 +45,12 @@ inline constexpr const char* kIdentitySalt = "rommsync-nx/client-device-identifi
 /// what wrote the row.
 inline constexpr const char* kDeviceIdentifierPrefix = "nx-";
 inline constexpr std::size_t kDeviceIdentifierHexChars = 32;
-inline constexpr std::size_t kDeviceIdentifierLength = 3 + kDeviceIdentifierHexChars;
+/// Derived, not written out: a prefix of a different length with a hardcoded 3
+/// here would make `IsDeviceIdentifier` reject every value this module
+/// produces, which reads back as "every `device.dat` in the field is corrupt"
+/// and mints a new identifier on every console.
+inline constexpr std::size_t kDeviceIdentifierLength =
+    std::string_view(kDeviceIdentifierPrefix).size() + kDeviceIdentifierHexChars;
 
 /// Where an identifier came from. Recorded because it is the first thing worth
 /// knowing when a console shows up twice in RomM, and it is the one field of
@@ -79,6 +84,15 @@ struct DeviceIdentity {
 struct IdentitySeed {
   /// The same on every boot of this console, different on another one. Never
   /// sent anywhere and never stored: only its hash leaves this function.
+  ///
+  /// At least `kMinimumStableChars`, or the derivation is refused. That floor
+  /// is not a quality check and cannot be one -- this module cannot tell a
+  /// serial from a placeholder -- but it does catch the shape the mistake
+  /// usually takes: a platform layer that hands over `""`, a truncated value,
+  /// or a short constant when `setsysGetSerialNumber` failed. Every console
+  /// affected would derive the *same* identifier, and RomM would treat them as
+  /// one device and let one console's saves overwrite another's. **The platform
+  /// layer must fail rather than substitute.**
   std::string stable;
 
   /// Unpredictable bytes, used only when there is no stable value. At least
@@ -90,10 +104,15 @@ struct IdentitySeed {
 /// Below this, `entropy` is not entropy.
 inline constexpr std::size_t kMinimumEntropyBytes = 16;
 
+/// Below this, `stable` is a placeholder rather than a console value. A Switch
+/// serial is fourteen characters; this is well under it, so a real one is never
+/// refused.
+inline constexpr std::size_t kMinimumStableChars = 8;
+
 /// Why deriving or persisting the identifier did not work.
 enum class IdentityError {
   kNone,
-  kNoSeed,         ///< no stable value and not enough entropy: nothing to derive from
+  kNoSeed,         ///< no usable stable value and not enough entropy: nothing to derive from
   kMalformed,      ///< the text read back is not an identity record
   kPersistFailed,  ///< it was derived and could not be written; see `message`
   kUnreadable,     ///< the file exists and could not be read -- do *not* mint over it
@@ -104,7 +123,8 @@ const char* ToString(IdentityError error);
 
 /// Derive an identifier without touching the disk.
 ///
-/// Prefers `stable` when there is one, because a derived identifier survives
+/// Prefers `stable` when there is one long enough to be a console value,
+/// because a derived identifier survives
 /// losing `device.dat` -- a wiped `config/` folder re-derives the same value and
 /// RomM still recognises the console, where a random one would not. Falls back
 /// to `entropy`, which is unlinkable to the hardware but only as durable as the

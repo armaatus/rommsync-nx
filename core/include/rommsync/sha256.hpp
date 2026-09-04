@@ -7,8 +7,9 @@
 // written honestly without a real hash. A stand-in that "looks hashed" would be
 // reversible, which is the whole thing being avoided.
 //
-// It is not a security boundary on its own: see `DeviceIdentifierFrom` for what
-// hashing a low-entropy value does and does not buy.
+// It is not a security boundary on its own: see `DeriveDeviceIdentity` in
+// device_identity.hpp for what hashing a low-entropy value does and does not
+// buy.
 #pragma once
 
 #include <cstddef>

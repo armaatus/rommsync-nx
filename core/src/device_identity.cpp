@@ -75,16 +75,20 @@ bool IsDeviceIdentifier(std::string_view text) {
 
 DerivedIdentity DeriveDeviceIdentity(const IdentitySeed& seed) {
   DerivedIdentity derived;
-  if (!seed.stable.empty()) {
+  if (seed.stable.size() >= kMinimumStableChars) {
     derived.value.client_device_identifier = Wear(seed.stable);
     derived.value.source = IdentitySource::kDerived;
     return derived;
   }
   if (seed.entropy.size() < kMinimumEntropyBytes) {
+    // Neither number quotes the value, only its length: `stable` is the console
+    // serial, and the point of this whole module is that it does not leave.
     derived.error = IdentityError::kNoSeed;
-    derived.message = "no stable console value, and " + std::to_string(seed.entropy.size()) +
-                      " bytes of entropy is below the " +
-                      std::to_string(kMinimumEntropyBytes) + " required to mint one";
+    derived.message = "a stable console value of " + std::to_string(seed.stable.size()) +
+                      " characters is below the " + std::to_string(kMinimumStableChars) +
+                      " a real one has, and " + std::to_string(seed.entropy.size()) +
+                      " bytes of entropy is below the " + std::to_string(kMinimumEntropyBytes) +
+                      " needed to mint one instead";
     return derived;
   }
   // Hashed rather than used raw for the same reason the serial is: whatever the

@@ -20,6 +20,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <system_error>
 
 #include "checks.hpp"
 #include "rommsync/atomic_file.hpp"
@@ -185,6 +186,28 @@ void MintsFromEntropyWhenThereIsNoSerial(checks::Checks& c) {
   c.Expect(!nothing.ok(), "and an empty seed is refused");
   c.ExpectEq(std::string(auth::ToString(nothing.error)), std::string("no_seed"), "as no_seed");
 
+  // The failure that would be worse than a duplicate device: a platform layer
+  // substituting a short placeholder for a serial it could not read. Every
+  // console doing that derives the *same* identifier, RomM treats them as one
+  // device, and one console's saves overwrite another's. A real serial is
+  // fourteen characters, so nothing legitimate is caught here.
+  auth::IdentitySeed placeholder;
+  placeholder.stable = std::string(auth::kMinimumStableChars - 1, 'X');
+  const auth::DerivedIdentity refused_stable = auth::DeriveDeviceIdentity(placeholder);
+  c.Expect(!refused_stable.ok(), "a stable value too short to be a serial is refused");
+  c.ExpectEq(std::string(auth::ToString(refused_stable.error)), std::string("no_seed"),
+             "as no_seed");
+  c.Expect(refused_stable.message.find(placeholder.stable) == std::string::npos,
+           "and the message does not quote it, because it is the serial");
+
+  // ...and a short stable value does not silently poison an otherwise fine
+  // entropy seed either: the entropy is used, and the result is a random one.
+  auth::IdentitySeed fallback = EntropySeed('e');
+  fallback.stable = std::string(auth::kMinimumStableChars - 1, 'X');
+  const auth::DerivedIdentity fell_back = auth::DeriveDeviceIdentity(fallback);
+  c.Expect(fell_back.ok(), "a short stable value falls back to entropy: " + fell_back.message);
+  c.Expect(fell_back.value.source == auth::IdentitySource::kRandom, "recorded as random");
+
   // A stable value wins when there is one, because a derived identifier
   // survives losing the file and a random one does not.
   auth::IdentitySeed both = EntropySeed('x');
@@ -304,6 +327,41 @@ void ReplacesRubbishButNotAnUnreadableFile(checks::Checks& c) {
   c.ExpectEq(std::string(auth::ToString(refused.error)), std::string("unreadable"), "as unreadable");
   c.Expect(refused.value.client_device_identifier.empty(), "and hands back no identifier");
   std::filesystem::remove_all(unreadable);
+
+  // The other half, and the one that actually bites: a path that *exists* and
+  // whose `fopen` fails. On Horizon that is a full handle table or `sdmc:` not
+  // mounted yet at boot; here it is a symlink loop, which is the one way to get
+  // a non-ENOENT open failure without depending on who is running the test.
+  // Reporting this as "there is no file" would mint over a perfectly good
+  // identifier and register the console in RomM a second time.
+  const std::filesystem::path loop = FreshPath("loop.dat");
+  std::error_code ignored;
+  std::filesystem::create_symlink(loop.filename(), loop, ignored);
+  if (ignored) {
+    c.Expect(false, "the test can create a symlink loop: " + ignored.message());
+  } else {
+    const io::ReadResult read = io::ReadFile(loop.string());
+    c.Expect(!read.ok(), "a path that will not open is an error");
+    c.ExpectEq(std::string(io::ToString(read.error)), std::string("unreadable"),
+               "reported as unreadable, not as missing");
+
+    const auth::IdentityResult unopenable =
+        auth::LoadOrCreateDeviceIdentity(loop.string(), SerialSeed());
+    c.Expect(!unopenable.ok(), "and it is not answered by minting either");
+    c.ExpectEq(std::string(auth::ToString(unopenable.error)), std::string("unreadable"),
+               "as unreadable");
+  }
+  std::filesystem::remove(loop, ignored);
+
+  // ...while a genuinely absent file is still `kMissing`, which is what keeps
+  // first boot working at all.
+  const io::ReadResult absent = io::ReadFile((ScratchDir() / "nothing-here.dat").string());
+  c.ExpectEq(std::string(io::ToString(absent.error)), std::string("missing"),
+             "a file that is not there is missing");
+  const io::ReadResult nowhere =
+      io::ReadFile((ScratchDir() / "no-such-directory" / "device.dat").string());
+  c.ExpectEq(std::string(io::ToString(nowhere.error)), std::string("missing"),
+             "and so is one under a directory that is not there");
 }
 
 /// An identifier that was not persisted is a different identifier next boot, so
