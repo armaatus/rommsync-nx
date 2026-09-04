@@ -12,7 +12,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 . ./scripts/orca/lib.sh
 
-orca_derive_env "$REPO_ROOT"
+orca_derive_env "$REPO_ROOT" \
+  || { echo "no sha1 tool (shasum/sha1sum/python3); cannot name this worktree's stack" >&2; exit 1; }
 
 # Shared across worktrees on purpose: immutable, expensive to refetch. These are
 # worktree-relative because Orca shares them via worktree.sharedDirectories in

@@ -23,8 +23,14 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 FIXTURE=""
 ORPHAN=""
+SPACED=""
 cleanup() {
   [ -n "$FIXTURE" ] && rm -rf "$FIXTURE"
+  if [ -n "$SPACED" ]; then
+    git -C "$REPO_ROOT" worktree remove --force "$SPACED" >/dev/null 2>&1
+    git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1
+    rm -rf "$(dirname "$SPACED")"
+  fi
   # Never leave the fabricated stack behind -- that would be this test
   # committing the exact leak it exists to catch.
   if [ -n "$ORPHAN" ]; then
@@ -47,13 +53,14 @@ case "${1:-}" in
     expected="$("$FIXTURE/scripts/orca/env.sh" | sed -n 's/.*project=\([^ ]*\).*/\1/p')"
     [ -n "$expected" ] || fail "env.sh printed no project name; fixture is broken"
 
-    # Stand in for docker and record which project each call was aimed at. The
-    # name travels in the environment, not the argument list, so that is what
-    # gets logged.
+    # Stand in for docker and record every call, so the assertions can be about
+    # which stack teardown actually named rather than whether it looked willing
+    # to. `info` must succeed: archive.sh treats an unreachable daemon as "leave
+    # it for reap" and would otherwise never reach the teardown under test.
     mkdir -p "$FIXTURE/bin"
     cat >"$FIXTURE/bin/docker" <<'FAKE'
 #!/usr/bin/env bash
-echo "PROJECT=${COMPOSE_PROJECT_NAME:-<unset>} ARGS=$*" >> "$DOCKER_CALL_LOG"
+echo "$*" >> "$DOCKER_CALL_LOG"
 exit 0
 FAKE
     chmod +x "$FIXTURE/bin/docker"
@@ -62,6 +69,11 @@ FAKE
     # env.sh finished, or it died inside env.sh's write. Both must still tear
     # down, and neither is hypothetical -- .env is generated, gitignored, and
     # written by a hook that is itself allowed to fail.
+    #
+    # `truncated` is the regression: it is the state the previous archive.sh
+    # died in. `missing` is a weaker assertion by construction -- compose.sh
+    # regenerates an absent .env on its own -- but it pins the behaviour so a
+    # future change to that fallback cannot silently take teardown with it.
     for state in truncated missing; do
       log="$FIXTURE/docker-$state.log"
       : > "$log"
@@ -77,12 +89,14 @@ FAKE
       # Assert on what was torn down before what the script returned: the
       # failure that matters is a stack left running, and reporting the exit
       # status first would name the mechanism instead of the leak.
-      grep -q 'ARGS=compose .* down -v --remove-orphans' "$log" \
+      grep -q 'down -v --remove-orphans' "$log" \
         || fail "[$state] archive.sh tore nothing down; docker calls: $(cat "$log")"
-      grep -q "PROJECT=$expected .*down" "$log" \
+      grep -q -- "-p $expected .*down -v" "$log" \
         || fail "[$state] teardown targeted the wrong project; expected $expected, calls: $(cat "$log")"
-      grep -q 'PROJECT=<unset>' "$log" \
-        && fail "[$state] teardown ran with no project name -- compose falls back to rmx-local"
+      # The failure this guards is teardown running with no project named at
+      # all, which compose resolves to `rmx-local` and which removes nothing.
+      grep 'down -v' "$log" | grep -qv -- '-p rmx-' \
+        && fail "[$state] a teardown ran with no project name: $(cat "$log")"
       [ "$rc" -eq 0 ] \
         || fail "[$state] archive.sh exited $rc against a stubbed docker"
     done
@@ -92,6 +106,9 @@ FAKE
 
   reap)
     docker info >/dev/null 2>&1 || { echo "SKIP: docker is not running"; exit $SKIP; }
+
+    live="$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' "$REPO_ROOT/.env")"
+    [ -n "$live" ] || fail "no COMPOSE_PROJECT_NAME in .env; run ./scripts/orca/env.sh"
 
     # A stack with no worktree, built by hand out of the pieces compose leaves
     # behind when a worktree is deleted with `rm -rf`.
@@ -103,18 +120,58 @@ FAKE
 
     out="$("$REPO_ROOT/scripts/orca/reap.sh" 2>&1)" \
       || fail "reap.sh exited non-zero; got: $out"
-
     grep -q "$ORPHAN" <<<"$out" \
       || fail "reap.sh did not flag a stack with no worktree; got: $out"
 
     # The dangerous failure is the opposite one. This worktree is live and its
     # database is in use; reap must derive its project name and leave it alone.
-    live="$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' "$REPO_ROOT/.env")"
-    [ -n "$live" ] || fail "no COMPOSE_PROJECT_NAME in .env; run ./scripts/orca/env.sh"
     grep -q "^== $live" <<<"$out" \
       && fail "reap.sh listed the live worktree's own stack ($live) as stale"
 
-    echo "PASS: reap.sh flags $ORPHAN and protects $live"
+    # A worktree whose path contains a space is still a live worktree. Parsing
+    # that path with `awk '"'"'{print $2}'"'"' truncates it, derives some other name, and
+    # drops the real stack out of the protected set -- so `--yes` deletes a
+    # database that is in use.
+    SPACED="$(mktemp -d)/a worktree with spaces"
+    git -C "$REPO_ROOT" worktree add -q --detach "$SPACED" HEAD \
+      || fail "could not create the spaced worktree fixture"
+    spaced_project="$( . "$REPO_ROOT/scripts/orca/lib.sh"; \
+                       orca_derive_env "$SPACED" && echo "$orca_project" )"
+    [ -n "$spaced_project" ] || fail "could not derive the spaced worktree's project name"
+    out="$("$REPO_ROOT/scripts/orca/reap.sh" 2>&1)" || fail "reap.sh failed: $out"
+    grep -q "^== $spaced_project" <<<"$out" \
+      && fail "a worktree path with a space was left unprotected ($spaced_project)"
+
+    # With no trustworthy list of live worktrees, everything looks stale. Refusing
+    # is the only safe answer; classifying is how a live database gets deleted.
+    stub="$(mktemp -d)"
+    printf '#!/usr/bin/env bash\nexit 128\n' > "$stub/git"
+    chmod +x "$stub/git"
+    if out="$(PATH="$stub:$PATH" "$REPO_ROOT/scripts/orca/reap.sh" 2>&1)"; then
+      rm -rf "$stub"
+      fail "reap.sh succeeded with no usable worktree list; got: $out"
+    fi
+    grep -q "^== " <<<"$out" \
+      && { rm -rf "$stub"; fail "reap.sh classified stacks as stale without a worktree list"; }
+    rm -rf "$stub"
+
+    # Only sweep for real when the fixture is the single stale stack, so the
+    # test can never destroy an orphan that belongs to someone else's work.
+    listed="$("$REPO_ROOT/scripts/orca/reap.sh" 2>&1 | grep -c '^== ')"
+    if [ "$listed" -ne 1 ]; then
+      echo "SKIP: $listed stale stacks present; --yes would sweep more than the fixture"
+      exit $SKIP
+    fi
+    "$REPO_ROOT/scripts/orca/reap.sh" --yes >/dev/null 2>&1 \
+      || fail "reap.sh --yes exited non-zero"
+
+    remaining="$(docker volume ls -q --filter "label=com.docker.compose.project=$ORPHAN"; \
+                 docker network ls -q --filter "label=com.docker.compose.project=$ORPHAN")"
+    [ -z "$remaining" ] || fail "--yes left the orphan behind: $remaining"
+    [ -n "$(docker ps -q --filter "label=com.docker.compose.project=$live")" ] \
+      || fail "--yes took down the live worktree's stack ($live)"
+
+    echo "PASS: reap.sh sweeps $ORPHAN, spares $live, and refuses to guess"
     ;;
 
   *)
