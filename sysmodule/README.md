@@ -48,10 +48,10 @@ Planned as the engine lands: `http/` (the `ssl`-service HttpClient backend),
 download workers need. The portable half of all of that belongs in `core/`,
 where it is testable without a console.
 
-## Two things in `sys-rommsync.json` to settle before hardware
+## Three things in `sys-rommsync.json` to settle before hardware
 
-Neither matters before the **M8-1** gate, and both are wrong to guess at now —
-they are recorded here so they are not discovered on a console.
+None of them matters before the **M8-1** gate, and all of them are wrong to
+guess at now — they are recorded here so they are not discovered on a console.
 
 - **Title id `0x4200000000524D53`.** The `0x42…` range is where homebrew
   sysmodules live by convention (ldn_mitm, sys-ftpd, sys-con); the low bytes
@@ -75,8 +75,9 @@ they are recorded here so they are not discovered on a console.
 
 ## Where the work is
 
-The core engine is built and proven natively (host build + docker RomM) before
-any of it runs on a Switch — see [`../docs/TESTING.md`](../docs/TESTING.md).
+The core engine is built and proven natively (host build + a real RomM in
+docker, never a mock) before any of it runs on a Switch — see
+[`../docs/TESTING.md`](../docs/TESTING.md).
 
 - **M0-1** — the sysmodule `ssl`-service TLS question, a *de-risking spike*
   (Ryujinx-first, off the boot path).
