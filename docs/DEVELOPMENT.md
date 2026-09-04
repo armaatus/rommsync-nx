@@ -120,10 +120,19 @@ worktree creation and tears the stack down on removal. Only immutable, expensive
 things are shared across worktrees — the checksum-pinned ROM cache and the
 content-addressed ccache. Never hardcode a port; read `.env`.
 
+Setup finishes by putting the environment where you can see it: a log tab
+following the stack, a browser tab on this worktree's RomM already signed in as
+the fixture admin (`scripts/orca/romm-browser.sh`), and — for a worktree created
+from an issue — the spec submitted to the agent rather than left drafted in its
+composer (`scripts/orca/agent-autostart.sh`). Both are conveniences and neither
+can fail setup. See [TESTING.md](TESTING.md#the-romm-browser-tab).
+
 Removal is the reverse: `scripts/orca/archive.sh` drops that worktree's stack and
-volumes, leaving the shared caches alone. For stacks orphaned by a worktree that
-went away without the hook running, `scripts/orca/reap.sh` lists them and
-`--yes` removes them; it errs towards keeping anything it cannot prove stale. See [TESTING.md](TESTING.md#worktree-isolation).
+volumes, leaving the shared caches alone. Note that only the Orca UI runs that
+hook by itself — `orca worktree rm` skips `orca.yaml` hooks unless `--run-hooks`
+is passed. For stacks orphaned that way, or by a worktree deleted with `rm -rf`,
+`scripts/orca/reap.sh` lists them and `--yes` removes them; it errs towards
+keeping anything it cannot prove stale. See [TESTING.md](TESTING.md#worktree-isolation).
 
 The **server contract** is testable off-console: `server/probe_contract.py`
 exercises auth + negotiate + saves against a RomM and prints the real response
