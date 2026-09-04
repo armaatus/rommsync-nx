@@ -27,8 +27,20 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 . ./scripts/orca/lib.sh
 
+# Guarded, because this script promises never to fail setup and `set -u` would
+# break that promise loudly: a missing .env whose regeneration also failed leaves
+# ROMM_BASE_URL unbound, and the first reference to it would exit non-zero --
+# aborting worktree provisioning under setup.sh's `set -e`, after the build and
+# the RomM bring-up, over a browser tab.
 [ -f .env ] || ./scripts/orca/env.sh >/dev/null 2>&1
-set -a; . ./.env; set +a
+if [ -f .env ]; then
+  set -a; . ./.env; set +a
+fi
+if [ -z "${ROMM_BASE_URL:-}" ]; then
+  echo "==> no .env for this worktree; not opening a browser tab"
+  echo "    regenerate it with: ./scripts/orca/env.sh"
+  exit 0
+fi
 
 # These MUST match provision.py's FIXTURE_USER/FIXTURE_PASSWORD and rig::kUser/
 # kPassword in tests/rig.hpp. fixture-auth.env is the provisioner's own record of
@@ -46,6 +58,14 @@ CLI_SECONDS="${ROMM_BROWSER_CLI_SECONDS:-25}"
 # opening onto a connection error.
 UP_SECONDS="${ROMM_BROWSER_WAIT_SECONDS:-60}"
 HINT="    open it yourself: $ROMM_BASE_URL  ($ROMM_FIXTURE_USER / $ROMM_FIXTURE_PASSWORD)"
+
+# How setup.sh knows whether to promise a signed-in tab in its summary. Written
+# only on success, and cleared first, so a stale one from an earlier run cannot
+# make the next run's summary lie. The exit code cannot carry this: the whole
+# contract of this script is that it always succeeds.
+STATE_FILE="${ROMM_BROWSER_STATE:-$REPO_ROOT/.orca/romm-browser.state}"
+mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null
+rm -f "$STATE_FILE"
 
 CLI_OUT="$(mktemp)"
 trap 'rm -f "$CLI_OUT"' EXIT
@@ -174,6 +194,7 @@ if authenticate "$page"; then
   orca_run_with_deadline "$CLI_SECONDS" "$CLI_OUT" \
     orca goto --page "$page" --url "$ROMM_BASE_URL/" --json >/dev/null 2>&1
   echo "    signed in as $ROMM_FIXTURE_USER"
+  printf 'signed-in %s\n' "$ROMM_FIXTURE_USER" >"$STATE_FILE"
 else
   echo "    the tab is open but could not be signed in"
   echo "$HINT"

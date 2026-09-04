@@ -89,6 +89,11 @@ case "$1" in
       read) cat "$ORCA_READ" ;;
       *)    printf '{"ok":true,"result":{}}\n' ;;
     esac ;;
+  worktree)
+    # `worktree current` is how --watch decides whether a draft is even
+    # expected here; ORCA_WORKTREE is the file holding the answer.
+    cat "${ORCA_WORKTREE:-/dev/null}" 2>/dev/null \
+      || printf '{"ok":true,"result":{"worktree":{}}}\n' ;;
   *) printf '{"ok":true,"result":{}}\n' ;;
 esac
 STUB
@@ -123,8 +128,20 @@ run_autostart() {
   ORCA_CALLS="$TMPDIR_FIXTURE/orca-calls.log" \
   ORCA_TERMINALS="$TMPDIR_FIXTURE/terminals.json" \
   ORCA_READ="$TMPDIR_FIXTURE/read.json" \
+  ORCA_WORKTREE="$TMPDIR_FIXTURE/worktree.json" \
   AGENT_AUTOSTART_PIDFILE="$TMPDIR_FIXTURE/autostart.pid" \
+  AGENT_AUTOSTART_POLL_SECONDS="${AGENT_AUTOSTART_POLL_SECONDS:-1}" \
+  AGENT_AUTOSTART_DEADLINE_SECONDS="${AGENT_AUTOSTART_DEADLINE_SECONDS:-6}" \
     bash "$TMPDIR_FIXTURE/scripts/orca/agent-autostart.sh" "$@" 2>&1
+}
+
+# `orca worktree current` answering with ($1=issue) or without ($1=none) a link.
+write_worktree() {
+  if [ "$1" = issue ]; then
+    echo '{"ok":true,"result":{"worktree":{"linkedIssue":4}}}' >"$TMPDIR_FIXTURE/worktree.json"
+  else
+    echo '{"ok":true,"result":{"worktree":{"linkedIssue":null}}}' >"$TMPDIR_FIXTURE/worktree.json"
+  fi
 }
 
 # `orca terminal list` with one agent terminal in $1 and one in another worktree.
@@ -290,8 +307,170 @@ STUB
     echo "PASS: a draft still being pasted is left to settle"
     ;;
 
+  watch_needs_issue)
+    # Without a linked issue Orca drafts nothing, so anything in that composer
+    # was typed by a person. Watching there is how a half-written prompt gets
+    # submitted for them, which is far worse than the Return being replaced.
+    make_fixture
+    stub_orca "$TMPDIR_FIXTURE" >/dev/null
+    write_terminals "$TMPDIR_FIXTURE"
+    write_worktree none
+    cat >"$TMPDIR_FIXTURE/read.json" <<'JSON'
+{"ok":true,"result":{"terminal":{"draft":"a prompt a human is halfway through typ"}}}
+JSON
+
+    out="$(run_autostart --watch)"
+    calls="$(cat "$TMPDIR_FIXTURE/orca-calls.log")"
+    grep -q "terminal send" <<<"$calls" \
+      && fail "submitted a human's typing on a worktree with no issue: $calls"
+    grep -q "no linked issue" <<<"$out" || fail "did not say why it is not watching; got: $out"
+    [ -e "$TMPDIR_FIXTURE/autostart.pid" ] \
+      && fail "left a pidfile behind for a watcher that never ran"
+    echo "PASS: no linked issue means no watching, so no typing is submitted"
+    ;;
+
+  watch_late_draft)
+    # The grace window has closed on an empty composer, so Orca's paste is not
+    # coming -- text appearing after that is someone typing into it. Grace is
+    # forced to one poll here so the phase is about what happens AFTER it, not
+    # about how long it is.
+    make_fixture
+    stub_orca "$TMPDIR_FIXTURE" >/dev/null
+    write_terminals "$TMPDIR_FIXTURE"
+    write_worktree issue
+    cat >"$TMPDIR_FIXTURE/stub-bin/orca" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$ORCA_CALLS"
+case "$1" in
+  worktree) cat "$ORCA_WORKTREE" ;;
+  terminal)
+    case "${2:-}" in
+      list) cat "$ORCA_TERMINALS" ;;
+      read)
+        n=$(( $(cat "$ORCA_READ_COUNT" 2>/dev/null || echo 0) + 1 ))
+        echo "$n" >"$ORCA_READ_COUNT"
+        # Empty at first -- the agent came up with nothing drafted -- then a
+        # steady string, exactly as a person typing and pausing would look.
+        if [ "$n" -le 2 ]; then
+          printf '{"ok":true,"result":{"terminal":{}}}\n'
+        else
+          printf '{"ok":true,"result":{"terminal":{"draft":"typed by a human"}}}\n'
+        fi ;;
+      *) printf '{"ok":true,"result":{}}\n' ;;
+    esac ;;
+  *) printf '{"ok":true,"result":{}}\n' ;;
+esac
+STUB
+    chmod +x "$TMPDIR_FIXTURE/stub-bin/orca"
+
+    out="$(ORCA_READ_COUNT="$TMPDIR_FIXTURE/read-count" \
+           AGENT_AUTOSTART_GRACE_SECONDS=1 run_autostart --watch)"
+    grep -q "terminal send" "$TMPDIR_FIXTURE/orca-calls.log" \
+      && fail "submitted text that appeared after the grace window closed: $(cat "$TMPDIR_FIXTURE/orca-calls.log")"
+    grep -q "empty composer" <<<"$out" || fail "did not stop at the empty baseline; got: $out"
+    echo "PASS: a draft appearing after the grace window is left alone"
+    ;;
+
+  watch_grace)
+    # The other side of it. Orca delivers the draft either as a launch argument
+    # or by pasting once the agent is ready, and the second of those lands after
+    # the watcher's first poll -- a zero-length window would miss every one of
+    # them and quietly hand the Return back to a human.
+    make_fixture
+    stub_orca "$TMPDIR_FIXTURE" >/dev/null
+    write_terminals "$TMPDIR_FIXTURE"
+    write_worktree issue
+    cat >"$TMPDIR_FIXTURE/stub-bin/orca" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$ORCA_CALLS"
+case "$1" in
+  worktree) cat "$ORCA_WORKTREE" ;;
+  terminal)
+    case "${2:-}" in
+      list) cat "$ORCA_TERMINALS" ;;
+      read)
+        n=$(( $(cat "$ORCA_READ_COUNT" 2>/dev/null || echo 0) + 1 ))
+        echo "$n" >"$ORCA_READ_COUNT"
+        # Empty on the first look, pasted by the second: the agent was up
+        # before Orca finished handing it the spec.
+        if [ "$n" -le 1 ]; then
+          printf '{"ok":true,"result":{"terminal":{}}}\n'
+        else
+          printf '{"ok":true,"result":{"terminal":{"draft":"# 43: v1 gate"}}}\n'
+        fi ;;
+      *) printf '{"ok":true,"result":{}}\n' ;;
+    esac ;;
+  *) printf '{"ok":true,"result":{}}\n' ;;
+esac
+STUB
+    chmod +x "$TMPDIR_FIXTURE/stub-bin/orca"
+
+    out="$(ORCA_READ_COUNT="$TMPDIR_FIXTURE/read-count" run_autostart --watch)"
+    grep -q -- "terminal send --terminal term_agent --enter" "$TMPDIR_FIXTURE/orca-calls.log" \
+      || fail "gave up before Orca had pasted the draft; got: $out"
+    echo "PASS: a draft that lands just after the agent starts is still sent"
+    ;;
+
+  watch_submits)
+    # The case the whole thing exists for: an issue-linked worktree whose agent
+    # comes up with Orca's paste already in the composer.
+    make_fixture
+    stub_orca "$TMPDIR_FIXTURE" >/dev/null
+    write_terminals "$TMPDIR_FIXTURE"
+    write_worktree issue
+    cat >"$TMPDIR_FIXTURE/read.json" <<'JSON'
+{"ok":true,"result":{"terminal":{"draft":"# 4: Capture real RomM auth shapes"}}}
+JSON
+
+    out="$(run_autostart --watch)"
+    calls="$(cat "$TMPDIR_FIXTURE/orca-calls.log")"
+    grep -q -- "terminal send --terminal term_agent --enter" <<<"$calls" \
+      || fail "did not submit the drafted issue: ${calls:-<nothing>} / $out"
+    [ "$(grep -c "terminal send" <<<"$calls")" -eq 1 ] \
+      || fail "pressed Return more than once: $calls"
+    # The watcher owns a pidfile while it runs and takes it away when it stops,
+    # or archive.sh has nothing to signal and the next setup run stacks a second
+    # watcher on the first.
+    [ -e "$TMPDIR_FIXTURE/autostart.pid" ] \
+      && fail "pidfile outlived the watcher; teardown would signal a stale pid"
+    echo "PASS: an issue-linked worktree gets its drafted prompt sent, once"
+    ;;
+
+  watch_single)
+    # Two watchers racing into one composer. The guard has to survive a pid
+    # being recycled, or a watcher never starts again after one is killed -9.
+    make_fixture
+    stub_orca "$TMPDIR_FIXTURE" >/dev/null
+    write_terminals "$TMPDIR_FIXTURE"
+    write_worktree issue
+    echo '{"ok":true,"result":{"terminal":{}}}' >"$TMPDIR_FIXTURE/read.json"
+
+    # A live pid that is not a watcher, exactly as a recycled one would look.
+    sleep 30 & impostor=$!
+    echo "$impostor" >"$TMPDIR_FIXTURE/autostart.pid"
+    out="$(run_autostart --watch)"
+    kill "$impostor" 2>/dev/null; wait "$impostor" 2>/dev/null
+    grep -q "already running" <<<"$out" \
+      && fail "a recycled pid stopped the watcher from ever starting again; got: $out"
+
+    # And a real one is respected.
+    # No `exec`: the identity check reads the process's own command line, and
+    # exec would replace it with `sleep` -- which is what a recycled pid looks
+    # like, not what a live watcher does.
+    printf '#!/usr/bin/env bash\nsleep 30\n' >"$TMPDIR_FIXTURE/agent-autostart-fake"
+    chmod +x "$TMPDIR_FIXTURE/agent-autostart-fake"
+    "$TMPDIR_FIXTURE/agent-autostart-fake" & real=$!
+    echo "$real" >"$TMPDIR_FIXTURE/autostart.pid"
+    out="$(run_autostart --watch)"
+    kill "$real" 2>/dev/null; wait "$real" 2>/dev/null
+    grep -q "already running" <<<"$out" \
+      || fail "started a second watcher beside a live one; got: $out"
+    echo "PASS: one watcher per worktree, and a recycled pid does not lock it out"
+    ;;
+
   *)
     echo "usage: $0 opens|reuses|foreign|no_romm|submits|no_draft|unstable" >&2
+    echo "       watch_needs_issue|watch_late_draft|watch_grace|watch_submits|watch_single" >&2
     exit 2
     ;;
 esac

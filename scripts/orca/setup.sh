@@ -71,9 +71,18 @@ fi
 # For the summary below only: provision.py wrote the account it created here.
 set -a; . ./server/testing/fixture-auth.env; set +a
 
+# Only claimed when it happened. romm-browser.sh always exits 0 -- a browser tab
+# must not fail a worktree -- so it reports through this file instead, and a
+# plain clone or an unreachable runtime gets an honest summary.
+if [ -s "$REPO_ROOT/.orca/romm-browser.state" ]; then
+  romm_note="  (browser tab, signed in as $ROMM_FIXTURE_USER)"
+else
+  romm_note="  ($ROMM_FIXTURE_USER / see server/testing/fixture-auth.env)"
+fi
+
 echo
 echo "worktree ready."
-echo "  RomM        $ROMM_BASE_URL  (browser tab, signed in as $ROMM_FIXTURE_USER)"
+echo "  RomM        $ROMM_BASE_URL$romm_note"
 echo "  fault proxy $PROXY_BASE_URL"
 echo "  fixture     server/testing/fixture-auth.env"
 echo "  tests       ctest --test-dir build --output-on-failure"

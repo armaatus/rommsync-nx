@@ -18,6 +18,21 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 . ./scripts/orca/lib.sh
 
+# First, before any path that can exit -- including the bail-out below when no
+# project name can be derived, which is exactly when a watcher would be left
+# polling the Orca runtime from a directory Orca is deleting.
+#
+# `|| true` because this runs under `set -e` and a missing pidfile, the normal
+# case, would otherwise abort teardown before it removed anything. The identity
+# check because a pidfile outlives a `kill -9` and a reboot, and signalling a
+# recycled pid means signalling an unrelated process of the user's.
+watcher="$(cat .orca/agent-autostart.pid 2>/dev/null || true)"
+if [ -n "$watcher" ] && kill -0 "$watcher" 2>/dev/null \
+   && ps -o command= -p "$watcher" 2>/dev/null | grep -q 'agent-autostart'; then
+  echo "==> stopping the agent autostart watcher (pid $watcher)"
+  kill "$watcher" 2>/dev/null || true
+fi
+
 env_project=""
 [ -f .env ] && env_project="$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' .env | tail -1)"
 
@@ -41,18 +56,6 @@ esac
 if [ -z "${projects// /}" ]; then
   echo "!! no project name from either the worktree path or .env; nothing can be torn down safely" >&2
   exit 1
-fi
-
-# Before docker, because it needs nothing from it and the paths below all end in
-# an `exit`. The watcher is bounded and would expire on its own, but it polls the
-# Orca runtime from a working directory that is about to be deleted, and a
-# process reading a worktree Orca is removing is worth not having.
-# `|| true` because this runs under `set -e` and a missing pidfile -- the normal
-# case -- would otherwise abort teardown before it removed anything.
-watcher="$(cat .orca/agent-autostart.pid 2>/dev/null || true)"
-if [ -n "$watcher" ] && kill -0 "$watcher" 2>/dev/null; then
-  echo "==> stopping the agent autostart watcher (pid $watcher)"
-  kill "$watcher" 2>/dev/null || true
 fi
 
 if ! orca_docker_ready; then
