@@ -63,3 +63,29 @@ orca_project_remnants() {
   docker volume ls  --filter "$filter" --format "volume${tab}{{.Name}}"     2>/dev/null || true
   docker network ls --filter "$filter" --format "network${tab}{{.Name}}"    2>/dev/null || true
 }
+
+# Run an `orca` CLI call with a hard deadline, capturing its stdout in $2.
+#
+# Every hook that talks to the Orca runtime needs this. The runtime can accept a
+# connection and then never answer, and `setupAgentStartupPolicy: wait-for-setup`
+# in orca.yaml holds the agent's tab until setup.sh returns -- so a hook that
+# blocks forever on the CLI costs the whole worktree, which is strictly worse
+# than whatever it was trying to arrange. macOS ships no `timeout`, hence the
+# manual watchdog.
+#
+# Returns the command's status, or 124 when the deadline was hit.
+orca_run_with_deadline() {
+  local seconds="$1" out="$2"; shift 2
+  "$@" >"$out" 2>/dev/null &
+  local cli=$! waited=0
+  while kill -0 "$cli" 2>/dev/null; do
+    if [ "$waited" -ge "$seconds" ]; then
+      kill "$cli" 2>/dev/null
+      wait "$cli" 2>/dev/null
+      return 124
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  wait "$cli"
+}

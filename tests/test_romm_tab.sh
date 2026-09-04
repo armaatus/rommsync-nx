@@ -68,7 +68,8 @@ trap cleanup EXIT
 make_fixture() {
   TMPDIR_FIXTURE="$(mktemp -d)"
   mkdir -p "$TMPDIR_FIXTURE/scripts/orca" "$TMPDIR_FIXTURE/server/testing"
-  cp "$REPO_ROOT"/scripts/orca/{romm-logs.sh,compose.sh,env.sh,ensure-romm-tab.sh} \
+  # lib.sh included: ensure-romm-tab.sh sources it for the shared CLI watchdog.
+  cp "$REPO_ROOT"/scripts/orca/{romm-logs.sh,compose.sh,env.sh,ensure-romm-tab.sh,lib.sh} \
      "$TMPDIR_FIXTURE/scripts/orca/"
   cp "$REPO_ROOT/server/testing/docker-compose.yml" "$TMPDIR_FIXTURE/server/testing/"
   cat >"$TMPDIR_FIXTURE/.env" <<ENV

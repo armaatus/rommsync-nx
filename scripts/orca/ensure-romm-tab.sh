@@ -17,6 +17,7 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
+. ./scripts/orca/lib.sh
 
 PIDFILE="${ROMM_LOGS_PIDFILE:-$REPO_ROOT/.orca/romm-logs.pid}"
 FOLLOWER_REL="./scripts/orca/romm-logs.sh"
@@ -37,25 +38,13 @@ follower_is_running() {
   ps -o command= -p "$pid" 2>/dev/null | grep -q 'romm-logs'
 }
 
-# `orca` talks to a runtime that can accept the connection and then never answer.
-# setup.sh runs under `set -e` and orca.yaml holds the agent's tab until it
-# returns, so hanging here costs the whole worktree -- strictly worse than the
-# missing tab this is guarding against. macOS has no `timeout`, hence the manual
-# watchdog.
+# `orca` talks to a runtime that can accept the connection and then never answer,
+# and hanging here costs the whole worktree -- see orca_run_with_deadline in
+# lib.sh. Wrapped so the calls below stay readable and keep writing to $CLI_OUT,
+# which name_tab reads the created tab's handle out of.
 run_with_deadline() {
   local seconds="$1"; shift
-  "$@" >"$CLI_OUT" 2>/dev/null &
-  local cli=$! waited=0
-  while kill -0 "$cli" 2>/dev/null; do
-    if [ "$waited" -ge "$seconds" ]; then
-      kill "$cli" 2>/dev/null
-      wait "$cli" 2>/dev/null
-      return 124
-    fi
-    sleep 1
-    waited=$((waited + 1))
-  done
-  wait "$cli"
+  orca_run_with_deadline "$seconds" "$CLI_OUT" "$@"
 }
 
 # The CLI exiting 0 is not the outcome we want -- a tab that follows nothing is

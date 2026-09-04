@@ -23,7 +23,8 @@ for the shape.
 
 Your worktree provisioned itself when it was created (`orca.yaml` →
 `scripts/orca/setup.sh`): it derived isolated ports, seeded ROM fixtures,
-configured the build, and started its own RomM. Ports live in `.env` — never
+configured the build, started its own RomM, opened it in a browser tab already
+signed in, and submitted your issue to this agent. Ports live in `.env` — never
 hardcode one, and never assume `8080` or `1515`.
 
 ```bash
@@ -32,6 +33,7 @@ ctest --test-dir build --output-on-failure       # test
 ctest --test-dir build -R sync --output-on-failure   # one group
 
 ./scripts/orca/env.sh                            # regenerate .env
+./scripts/orca/romm-browser.sh                   # open RomM signed in, if the tab is gone
 ./scripts/orca/romm-logs.sh                      # follow RomM, if the tab is missing
 ./server/testing/seed.sh                         # re-seed ROM fixtures
 ./.venv/bin/python server/testing/provision.py   # scan the library, mint a fixture token
@@ -39,6 +41,15 @@ ctest --test-dir build -R sync --output-on-failure   # one group
 ./scripts/orca/compose.sh logs -f                # follow it; tab 2 shows this
 ./scripts/orca/reap.sh                           # list RomM stacks whose worktree is gone (--yes removes)
 ```
+
+There is a browser tab on this worktree's RomM, logged in as the fixture admin.
+Use it — a scan result, a platform slug or a rom's real metadata is one glance
+away there and several API calls away otherwise. `romm-browser.sh` reopens it.
+
+Removing a worktree from the **Orca UI** runs the teardown hook. Removing it with
+`orca worktree rm` does **not** unless you pass `--run-hooks`, and the stack it
+leaves behind restarts `unless-stopped` and holds two ports forever. Either pass
+the flag or sweep afterwards with `./scripts/orca/reap.sh --yes`.
 
 If `ctest` reports `rig.smoke` as **Skipped**, RomM is not running — start it
 rather than working around it.
