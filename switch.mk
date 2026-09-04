@@ -49,6 +49,12 @@ ifeq ($(ROMMSYNC_VERSION),)
 $(error could not read a version from $(ROMMSYNC_ROOT)/VERSION)
 endif
 
+# The version in the NACP, which is what the overlay list shows. switch_rules
+# has already defaulted it to devkitPro's 1.0.0 by this point, so this overrides
+# rather than fills in -- otherwise the half of the build a user can see would
+# be the one half not tracking VERSION.
+APP_VERSION := $(ROMMSYNC_VERSION)
+
 #---------------------------------------------------------------------------------
 # TARGET is the name of the output
 # BUILD is the directory where object files & intermediate files will be placed
@@ -83,8 +89,14 @@ CFLAGS := -g -Wall -Wextra -Wpedantic -Werror -O2 -ffunction-sections -fdata-sec
 CFLAGS += $(INCLUDE) -D__SWITCH__
 
 # -std=c++20, not gnu++20: core/ is compiled here and by CMake (which sets
-# CXX_EXTENSIONS OFF), and the one thing that must not differ between the two is
-# the dialect the portable engine is held to.
+# CXX_EXTENSIONS OFF), so the dialect the portable engine is held to is the same
+# in both builds.
+#
+# -fno-exceptions is a real divergence, and worth knowing about: core/ throws
+# nothing today, but a standard-library path that would raise on the host
+# (bad_alloc, bad_optional_access, length_error) calls std::terminate here
+# instead. Host tests stay green while the sysmodule dies, so keep core/ free of
+# anything that can throw rather than relying on the tests to notice.
 CXXFLAGS := $(CFLAGS) -std=c++20 -fno-rtti -fno-exceptions
 
 ASFLAGS := -g $(ARCH)
@@ -120,6 +132,18 @@ export DEPSDIR := $(CURDIR)/$(BUILD)
 CFILES   := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
 CPPFILES := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cpp)))
 SFILES   := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.s)))
+
+# ...which is why this is an error rather than a comment. The sysmodule builds
+# two source directories, and sysmodule/README.md plans an `http/` next to the
+# core/src/http.cpp that already exists. VPATH resolves the first match, so the
+# loser is not compiled at all -- and if it holds only internal-linkage symbols
+# the link still succeeds, quietly dropping a translation unit from the image.
+DUPLICATE_BASENAMES := $(strip $(shell printf '%s\n' $(CFILES) $(CPPFILES) $(SFILES) \
+			| sort | uniq -d))
+ifneq ($(DUPLICATE_BASENAMES),)
+$(error two sources share a basename ($(DUPLICATE_BASENAMES)); objects are named \
+	by basename, so one would shadow the other -- rename one)
+endif
 
 #---------------------------------------------------------------------------------
 # use CXX for linking C++ projects, CC for standard C
