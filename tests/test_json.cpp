@@ -163,7 +163,8 @@ void ReaderReportsTheField(checks::Checks& c) {
   const json::ParseResult doc = json::Parse(
       "{\"name\": \"x\", \"count\": 3, \"tags\": [\"a\",\"b\"], \"note\": null,"
       " \"blank\": \"\", \"nul\": \"a\\u0000b\", \"fraction\": 1.5,"
-      " \"mixed\": [\"a\", 2]}");
+      " \"mixed\": [\"a\", 2], \"on\": true, \"off\": false,"
+      " \"truthy\": \"true\"}");
   c.Expect(doc.ok(), "reader fixture parses");
 
   {
@@ -176,7 +177,13 @@ void ReaderReportsTheField(checks::Checks& c) {
     reader.Required("count", &count);
     reader.Required("tags", &tags);
     reader.RequiredNullable("note", &note);
+    bool on = false;
+    bool off = true;
+    reader.Required("on", &on);
+    reader.Required("off", &off);
     c.Expect(reader.ok(), "every good field reads: " + reader.error().Describe());
+    c.Expect(on, "a true reads back true");
+    c.Expect(!off, "and a false reads back false");
     c.ExpectEq(name, std::string("x"), "name");
     c.ExpectEq(count, std::int64_t{3}, "count");
     c.ExpectEq(tags.size(), std::size_t{2}, "tags");
@@ -211,6 +218,26 @@ void ReaderReportsTheField(checks::Checks& c) {
     std::int64_t out = -1;
     c.Expect(!reader.Required("fraction", &out), "refuses a fraction as an integer");
     c.ExpectEq(reader.error().field, std::string("fraction"), "names fraction");
+  }
+  // A flag is `true` or `false` and nothing else. `1` and `"true"` are the two
+  // shapes a lenient reader would wave through, and both would turn a RomM
+  // field the client acts on -- `sync_enabled` -- into whichever answer the
+  // coercion happened to give.
+  {
+    const Case kBool[] = {
+        {"missing", "missing", "a missing boolean"},
+        {"count", "count", "a 3 where a boolean belongs"},
+        {"truthy", "truthy", "the string \"true\""},
+        {"note", "note", "a null where a boolean belongs"},
+    };
+    for (const Case& bad : kBool) {
+      json::Reader reader(doc.value, "fixture");
+      bool out = true;
+      c.Expect(!reader.Required(bad.key, &out), std::string("refuses ") + bad.what);
+      c.ExpectEq(reader.error().field, std::string(bad.field),
+                 std::string("names the field for ") + bad.what);
+      c.Expect(out, std::string("leaves the output alone for ") + bad.what);
+    }
   }
   {
     json::Reader reader(doc.value, "fixture");

@@ -153,7 +153,13 @@ def fixture_credentials(path):
 
 
 def device_auth(s, base, cap, approver):
-    """Run the device-code flow and return the access token."""
+    """Run the device-code flow and return `(access token, paired device id)`.
+
+    The device id comes back with the token because pairing is what registers
+    the console: RomM creates the row from `client_device_identifier` and hands
+    back its id. Nothing has to call `POST /api/devices` to get one, and calling
+    it would produce a *second* device -- see `register_device` below.
+    """
     hr("device auth: init")
     init = s.post(f"{base}/api/auth/device/init", json={
         "client_device_identifier": "probe-contract-script",
@@ -221,6 +227,7 @@ def device_auth(s, base, cap, approver):
 
     hr("device auth: poll token")
     token = None
+    paired_device_id = None
     # Bounded well below the code's own lifetime (5.2.0 sends expires_in: 600).
     # tests/test_contract_captures.py runs under a CTest timeout, and a script
     # that outlives it is killed with a bare "Timeout" instead of printing the
@@ -232,6 +239,7 @@ def device_auth(s, base, cap, approver):
             tok = r.json()
             show_shape(tok, "token response")
             token = tok.get("access_token") or tok.get("token")
+            paired_device_id = tok.get("device_id")
             cap.secret(token, "<access_token>")
             cap.record("auth-device-token", tok)
             print("token acquired")
@@ -241,14 +249,39 @@ def device_auth(s, base, cap, approver):
     if not token:
         print(f"!! not approved within {POLL_LIMIT_SECONDS}s", file=sys.stderr)
         sys.exit(1)
-    return token
+    if not paired_device_id:
+        print("!! the token response named no device_id", file=sys.stderr)
+        sys.exit(1)
+    return token, paired_device_id
+
+
+def paired_device(s, base, cap, device_id):
+    """`GET /api/devices/{id}` for the device pairing created.
+
+    This is `DeviceSchema`, which is a different shape from the
+    `DeviceCreateResponse` next door -- the id is `id` here and `device_id`
+    there -- and it is the one the client reads: it is how the console confirms,
+    on every boot, that the device it caches still exists, is still its own
+    (`client_device_identifier`) and still has `sync_enabled` set.
+    """
+    r = s.get(f"{base}/api/devices/{device_id}", timeout=30)
+    if r.status_code != 200:
+        print(f"!! the paired device could not be read back: {r.status_code} "
+              f"{r.text[:200]}", file=sys.stderr)
+        sys.exit(1)
+    device = r.json()
+    cap.record("devices-get", device)
+    return device
 
 
 def register_device(s, base, cap, name="probe device", capture_as="devices-create"):
     # No mac_address or hostname on purpose: those are the fields RomM matches
     # on, and without one every call creates a new device -- which is how each
     # scenario below gets a device with no sync history. `allow_existing` alone
-    # deduplicates nothing.
+    # deduplicates nothing, and neither does calling this with the device-bound
+    # token of the device above: `client_device_identifier` is not a match key
+    # here (docs/API_CONTRACT.md#device-registration). That is why the client
+    # never calls this, and why this script deletes what it creates.
     dev = s.post(f"{base}/api/devices", json={
         "name": name, "platform": "switch", "client": "rommsync-nx-probe",
         "allow_existing": True,
@@ -597,8 +630,14 @@ def main():
     else:
         approver = fixture_credentials(args.fixture_auth)
 
-    token = device_auth(s, base, cap, approver)
+    token, paired_device_id = device_auth(s, base, cap, approver)
     s.headers["Authorization"] = f"Bearer {token}"
+
+    hr("the device pairing registered (DeviceSchema)")
+    paired = paired_device(s, base, cap, paired_device_id)
+    show_shape(paired, "device")
+    print("paired device_id:", paired_device_id,
+          "| client_device_identifier:", paired.get("client_device_identifier"))
 
     hr("register device")
     device_id, dev = register_device(s, base, cap)

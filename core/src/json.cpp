@@ -619,6 +619,18 @@ bool Reader::Required(std::string_view key, std::int64_t* out) {
   return true;
 }
 
+bool Reader::Required(std::string_view key, bool* out) {
+  const Value* member = Lookup(key);
+  if (member == nullptr) {
+    return false;
+  }
+  if (!member->is_bool()) {
+    return Fail(key, std::string("expected a boolean, got ") + ToString(member->type()));
+  }
+  *out = member->boolean();
+  return true;
+}
+
 bool Reader::Required(std::string_view key, std::vector<std::string>* out) {
   const Value* member = Lookup(key);
   if (member == nullptr) {

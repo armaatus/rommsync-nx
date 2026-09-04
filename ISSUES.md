@@ -83,8 +83,10 @@ M0-5's wording that belong to the milestone writing that engine.
   → poll `token`. Persist token + expiry.
 - **M1-2** `auth` `docs` Verify and document the **init/token response fields**
   (from M0-4) and code against them.
-- **M1-3** `auth` `sysmodule` Register device (`POST /api/devices`), cache
-  `device_id`. Handle `allow_existing`.
+- **M1-3** `auth` `sysmodule` Resolve and cache the `device_id` every sync call
+  is scoped by. Pairing is the registration; `POST /api/devices` never matches on
+  `client_device_identifier` and `allow_existing` deduplicates nothing, so the
+  client confirms the id it has and searches by identifier when it has none.
 - **M1-4** `auth` Token refresh + `401` handling → mark unauthenticated, signal
   overlay to re-pair.
 - **M1-5** `auth` `config` Stable `client_device_identifier` derivation + secure
