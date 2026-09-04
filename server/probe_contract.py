@@ -7,12 +7,17 @@ the sysmodule will use and prints the real response shapes, so the on-console
 code can be written against verified fields instead of guesses.
 
 Usage:
-    pip install requests
-    python probe_contract.py --url http://localhost:1515
+    ./.venv/bin/python server/probe_contract.py --url "$ROMM_BASE_URL"
+
+(The venv is created by scripts/orca/setup.sh from server/requirements.txt.)
 
 By default it runs the read-only checks. Add --auth to run the device-code
-pairing flow interactively (you approve the code in RomM's web UI), then
---negotiate to do a no-op sync negotiation.
+pairing flow, then --negotiate to do a no-op sync negotiation.
+
+--auth approves its own code using the fixture credentials written by
+server/testing/provision.py, so it needs no human at a browser. Against a server
+that is not the fixture, pass --approve-as USER:PASS, or nothing at all to fall
+back to approving by hand in the web UI.
 
 Nothing is written to your library: the negotiate call sends an empty save list,
 which yields an all-noop plan, and we do NOT call /complete.
@@ -39,11 +44,38 @@ def show_shape(obj, name):
         print(f"{name}: {type(obj).__name__}")
 
 
+def fixture_credentials(path):
+    """Read the fixture's user/password, or None if this is not the fixture.
+
+    The device-code grant is designed around a human at a browser, which is
+    exactly the wrong shape for CI and for an agent: the flow simply never
+    completes. /api/auth/device/approve is an ordinary authenticated endpoint,
+    so anyone who can log in can approve their own code and the flow closes
+    itself.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            env = dict(
+                line.rstrip("\n").split("=", 1)
+                for line in fh
+                if "=" in line and not line.startswith("#")
+            )
+    except OSError:
+        return None
+    user, password = env.get("ROMM_FIXTURE_USER"), env.get("ROMM_FIXTURE_PASSWORD")
+    return (user, password) if user and password else None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://localhost:1515")
     ap.add_argument("--auth", action="store_true", help="run device-code pairing")
     ap.add_argument("--negotiate", action="store_true", help="run a no-op negotiate (implies --auth)")
+    ap.add_argument("--approve-as", metavar="USER:PASS",
+                    help="approve the device code over the API as this user "
+                         "(default: the fixture credentials, if present)")
+    ap.add_argument("--fixture-auth", default="server/testing/fixture-auth.env",
+                    help="where provision.py wrote the fixture credentials")
     args = ap.parse_args()
     base = args.url.rstrip("/")
     s = requests.Session()
@@ -82,17 +114,20 @@ def main():
 
     # ---- device-code pairing ----
     hr("device auth: init")
+    # Kept in a variable because /api/auth/device/init does NOT echo the scopes
+    # back, and /approve rejects an empty approved_scopes list.
+    requested_scopes = [
+        "me.read", "roms.read", "roms.user.read", "roms.user.write",
+        "assets.read", "assets.write", "devices.read", "devices.write",
+        "collections.read",
+    ]
     init = s.post(f"{base}/api/auth/device/init", json={
         "client_device_identifier": "probe-contract-script",
         "name": "probe_contract.py",
         "client": "rommsync-nx-probe",
         "platform": "switch",
         "client_version": "0.0.0",
-        "requested_scopes": [
-            "me.read", "roms.read", "roms.user.read", "roms.user.write",
-            "assets.read", "assets.write", "devices.read", "devices.write",
-            "collections.read",
-        ],
+        "requested_scopes": requested_scopes,
     }, timeout=30)
     init.raise_for_status()
     init = init.json()
@@ -101,9 +136,31 @@ def main():
 
     device_code = init.get("device_code")
     user_code = init.get("user_code")
-    verify = init.get("verification_uri") or init.get("verification_uri_complete")
+    # 5.2.0 returns `verification_path` / `verification_path_complete` -- a path,
+    # not the absolute `verification_uri` the OAuth spec names and AUTH.md drew.
+    verify = init.get("verification_path_complete") or init.get("verification_path") or ""
+    if verify.startswith("/"):
+        verify = base + verify
     interval = init.get("interval", 5)
-    print(f"\n>>> Approve this in RomM's web UI: code = {user_code}  at  {verify}")
+    approver = None
+    if args.approve_as:
+        user, _, password = args.approve_as.partition(":")
+        approver = (user, password)
+    else:
+        approver = fixture_credentials(args.fixture_auth)
+
+    if approver:
+        hr("device auth: approve (no browser)")
+        ap_r = s.post(f"{base}/api/auth/device/approve",
+                      json={"user_code": user_code,
+                            "approved_scopes": requested_scopes},
+                      auth=approver, timeout=30)
+        if ap_r.status_code not in (200, 201):
+            print(f"!! approve failed: {ap_r.status_code} {ap_r.text[:200]}")
+            sys.exit(1)
+        print(f"  approved {user_code} as {approver[0]}")
+    else:
+        print(f"\n>>> Approve this in RomM's web UI: code = {user_code}  at  {verify}")
 
     hr("device auth: poll token")
     token = None
@@ -129,7 +186,8 @@ def main():
     }, timeout=30)
     dev.raise_for_status(); dev = dev.json()
     show_shape(dev, "device")
-    device_id = dev.get("id")
+    # `device_id`, not `id` -- verified against a live 5.2.0 (docs/API_CONTRACT.md).
+    device_id = dev.get("device_id") or dev.get("id")
     print("device_id:", device_id)
 
     hr("roms sample (shape the client needs)")

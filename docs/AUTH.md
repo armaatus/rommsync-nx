@@ -15,7 +15,8 @@ sys-rommsync                         RomM server                 you (browser)
      │   requested_scopes:[...]}          │                           │
      │ ─────────────────────────────────▶│                           │
      │  ◀── {device_code, user_code,      │                           │
-     │        verification_uri,           │                           │
+     │        verification_path,          │                           │
+     │        verification_path_complete, │                           │
      │        interval, expires_in}       │                           │
      │                                    │                           │
   overlay shows: "Go to <uri>,           │                           │
@@ -26,8 +27,8 @@ sys-rommsync                         RomM server                 you (browser)
      │   `interval`s until approved)      │                           │
      │ ─────────────────────────────────▶│                           │
      │  ◀── {access_token (rmm_...),      │                           │
-     │        token_type, expires_in,     │                           │
-     │        refresh?}                   │                           │
+     │        device_id, scopes,          │                           │
+     │        expires_at}                 │                           │
      │                                    │                           │
      │  POST /api/devices  {name,         │                           │
      │   platform, client}                │                           │
@@ -36,10 +37,14 @@ sys-rommsync                         RomM server                 you (browser)
      └── persist {token, device_id} ──────┘
 ```
 
-> Confirm the exact field names in the init/token *responses* from the live
-> snapshot (`server/probe_contract.py` prints them) — the OpenAPI lists request
-> bodies precisely but response bodies should be verified before coding. Tracked
-> as issue **M1-2**.
+> The response fields above were read off a live 5.2.0 by
+> `server/probe_contract.py --auth`, which now approves its own code and so runs
+> unattended. Three differ from what this file drew before it could be checked:
+> the verification target is a **path** (`verification_path`), not an absolute
+> `verification_uri`; the token response carries **`expires_at`**, not
+> `expires_in`, and no `token_type` or refresh token; and it already includes a
+> **`device_id`**. Pinning the full set — every field, every type — is issue
+> **M1-2**; this is only what the fixture had to get right to authenticate.
 
 ## Client identifier
 

@@ -33,6 +33,7 @@ ctest --test-dir build -R sync --output-on-failure   # one group
 
 ./scripts/orca/env.sh                            # regenerate .env
 ./server/testing/seed.sh                         # re-seed ROM fixtures
+./.venv/bin/python server/testing/provision.py   # scan the library, mint a fixture token
 ./scripts/orca/compose.sh up -d                  # start RomM
 ./scripts/orca/compose.sh logs -f                # follow it; tab 2 shows this
 ./scripts/orca/reap.sh                           # list RomM stacks whose worktree is gone (--yes removes)

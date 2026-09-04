@@ -1,0 +1,9 @@
+# Python dependencies for the server-side developer tooling: the fixture
+# provisioner (server/testing/provision.py) and the contract probe
+# (server/probe_contract.py). Installed into a per-worktree .venv by
+# scripts/orca/setup.sh; never needed by the C++ build or by core/.
+#
+# Pinned, because these talk to a RomM pinned at 5.2.0 and a silent client
+# upgrade would change what the fixture proves.
+requests==2.32.3
+python-socketio[client]==5.11.4
