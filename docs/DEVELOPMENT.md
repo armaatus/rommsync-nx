@@ -21,7 +21,14 @@ Both consume the same `core/` sources.
 cmake -S . -B build && cmake --build build      # host
 ctest --test-dir build --output-on-failure       # host tests
 make -C sysmodule                                # devkitPro (in the container)
+make -C overlay                                  # ...and the overlay
 ```
+
+The two devkitPro Makefiles are thin: each sets its target's variables and
+includes [`../switch.mk`](../switch.mk), which holds devkitPro's own template
+once instead of twice. The version both builds compile in comes from the
+`VERSION` file at the repo root -- CMake reads it with `file(READ)`, `switch.mk`
+with `cat`, and both substitute the same `version.hpp.in`.
 
 - [devkitPro](https://devkitpro.org/wiki/Getting_Started) with the **switch-dev**
   group: `devkitA64`, `libnx`, and portlibs.
@@ -39,6 +46,8 @@ Recommended: build in the official devkitpro docker image
 
 ```
 CMakeLists.txt       # host build entry point
+switch.mk            # shared devkitPro rules, included by both Makefiles below
+VERSION              # the one version string; read by CMake and by switch.mk
 core/                # portable engine, host- and devkitPro-compatible
   include/rommsync/  # http.hpp -- the one HTTP surface the engine may use
   src/
@@ -48,12 +57,12 @@ host/                # host-only backends for core/'s interfaces; never built
 tests/               # CTest suites
 sysmodule/
   Makefile
+  sys-rommsync.json  # NPDM: title id, heap, service and syscall capabilities
   source/            # engine: auth, http(tls), sync, downloads, ipc, scheduler
-  include/
 overlay/
   Makefile
   source/            # gui screens, ipc client
-  lib/libultrahand/  # submodule
+  lib/libultrahand/  # submodule, from M4-1
 ```
 
 ## TLS in a sysmodule
@@ -78,7 +87,8 @@ mbedTLS/OpenSSL stack is heavy.
   cancellation. The native backend is `host/src/curl_http_client.cpp`, the only
   file in the tree that names a transport library. Two CI checks keep it that
   way: `static` rejects any include in `core/` that is not a standard or
-  `rommsync/` header, and `switch-build` syntax-checks `core/` with devkitA64.
+  `rommsync/` header, and `switch-build` compiles every `core/` translation unit
+  with devkitA64 and links them into the sysmodule.
 
 Budget note: sysmodules declare their heap in `config.json`/`npdm`; size it for
 one in-flight download buffer + TLS context, stream to file rather than buffering
