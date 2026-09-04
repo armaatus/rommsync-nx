@@ -32,11 +32,12 @@ include/
 ## First task
 
 Start with the **off-console harness**, not hardware. The core engine here is
-built and proven natively (host build + mock/docker RomM) before any of it runs on
-a Switch — see [`../docs/TESTING.md`](../docs/TESTING.md).
+built and proven natively (host build + a real RomM in docker) before any of it
+runs on a Switch — see [`../docs/TESTING.md`](../docs/TESTING.md).
 
 - **M0-2** — `HttpClient` interface + native (libcurl) backend.
-- **M0-5** — host harness + mock RomM to run the engine end-to-end offline.
+- **M0-5** — host harness + fault-injection scenarios to run the engine
+  end-to-end against the docker RomM.
 - **M0-1** — the sysmodule `ssl`-service TLS question is a *de-risking spike*
   (Ryujinx-first, off the boot path), not a prerequisite for the logic above.
 
