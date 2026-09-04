@@ -130,6 +130,37 @@ whose phases need Docker, a network or Orca:
   the policy is actually at risk from, which is a test that shells out to
   something off this machine.
 
+### A test that got faster is a claim too
+
+Everything above is aimed at one failure: a green signal that checked nothing. A
+test going red announces itself. A test getting *faster* does not, and it is the
+same failure wearing a friendlier face.
+
+While this page was being written, `orca.browser_watch_single` was taking ~50s of
+its 60s timeout on an idle machine — six consecutive runs, 45–50s each, so a run
+under any real load timed out. A one-line change cut it to ~9s and the test still
+passed. That looked like a fix and was not: the saving came from short-circuiting
+the watcher's deadline loop into an early-exit path, so the test went green
+sooner *because* it had stopped exercising the thing it exists for. The real
+costs were elsewhere and were two — a full second burned per CLI call in
+`orca_run_with_deadline` (`kill -0` succeeds on a child that has exited but not
+been reaped, so the watchdog always slept its first whole second, on every
+`setup.sh` path in every worktree), and an orphaned background process holding
+ctest's stdout open, which is why the same test measured 21s under `bash` and 50s
+under `ctest`.
+
+Neither was the timeout, and "still passes, and faster" was true throughout.
+
+So when a test speeds up, ask what it stopped doing. `ctest` cannot ask that
+question for you, and neither can this page — but the number that made the whole
+thing visible was two measurements of the same test that could not both be right.
+A duration that surprises you is evidence, in either direction. Observed
+2026-09-04, on the change that wrote this paragraph.
+
+Note that `CTestCostData.txt` is no help here: it is not a mean of wall-clock
+durations, and it reported 3.0s for the same test across fifteen runs, six of
+which were watched taking ~50s. Time the test yourself.
+
 ### What the gate deliberately does not require
 
 - **M0-1's answer.** The `ssl` spike is de-risking, not a dependency. Everything
