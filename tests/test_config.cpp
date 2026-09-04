@@ -294,6 +294,8 @@ void DuplicatesResolveToTheLastLine(checks::Checks& c) {
   c.Expect(Complaint(cased, "sync", "interval_min") != nullptr,
            "the section is reported under one canonical name");
   c.Expect(Mentions(cased, "set more than once"), "...and the duplicate is seen across the two");
+  c.Expect(Mentions(cased, "appears more than once"),
+           "a repeated [sync] is reported like a repeated platform, not silently");
 }
 
 // --- the folder map --------------------------------------------------------------
@@ -327,6 +329,50 @@ void PlatformSectionsReplaceTheBuiltInEntry(checks::Checks& c) {
   c.Expect(emptied.value.Platform("psp") == nullptr, "a section that maps nothing unmaps it");
   c.Expect(emptied.value.RomTarget("psp").empty(), "so there is nowhere to download psp to");
   c.Expect(Mentions(emptied, "skipped entirely"), "...and that is reported");
+
+  // A single typo'd key empties the section, because the header already
+  // replaced the built-in entry -- which is the same end state as a deliberate
+  // removal and must not read like one.
+  const config::LoadResult typo = config::ParseConfig(WithServer("[platform.snes]\nrom = /x\n"));
+  c.Expect(typo.value.Platform("snes") == nullptr, "a typo'd key leaves snes unmapped");
+  const config::Diagnostic* wiped = Complaint(typo, "platform.snes", "");
+  c.Expect(wiped != nullptr, "and that is reported");
+  if (wiped != nullptr) {
+    c.Expect(wiped->severity == config::Severity::kWarning,
+             "as a warning, not the notice a deliberate removal gets");
+  }
+  const config::Diagnostic* deliberate = Complaint(emptied, "platform.psp", "");
+  c.Expect(deliberate != nullptr && deliberate->severity == config::Severity::kNotice,
+           "...and emptying a section on purpose stays a notice");
+
+  // The map is bounded like the diagnostic list is: a corrupt card region full
+  // of section headers is well inside the byte limit and still builds tens of
+  // thousands of entries on a heap that does not have them.
+  std::string many;
+  for (std::size_t i = 0; i < config::kMaxPlatformSections + 50; ++i) {
+    many += "[platform.p" + std::to_string(i) + "]\nroms = /r/" + std::to_string(i) + "\n";
+  }
+  const config::LoadResult flood = config::ParseConfig(WithServer(many));
+  c.Expect(flood.value.Platform("p10") != nullptr, "the platforms up to the cap are mapped");
+  c.Expect(flood.value.Platform("p300") == nullptr, "and the ones past it are not");
+  c.Expect(flood.value.platforms.size() <=
+               config::kMaxPlatformSections + config::DefaultPlatforms().size(),
+           "so the map cannot be grown without bound by a corrupt file");
+  // The cap message itself is one of the diagnostics the *diagnostic* cap has
+  // already dropped by then, which is the right order: sixty-four reports and a
+  // count of the rest is what a user can act on.
+  c.Expect(Mentions(flood, "further problems"), "...and the report is bounded too");
+
+  std::string wide = "[platform.gba]\nroms = ";
+  for (std::size_t i = 0; i < config::kMaxPathsPerKey + 20; ++i) {
+    wide += (i == 0 ? "" : ", ");
+    wide += "/d/" + std::to_string(i);
+  }
+  const config::LoadResult long_list = config::ParseConfig(WithServer(wide + "\n"));
+  const config::PlatformFolders* gba = long_list.value.Platform("gba");
+  c.Expect(gba != nullptr && gba->roms.size() == config::kMaxPathsPerKey,
+           "so is one key's directory list");
+  c.Expect(Mentions(long_list, "directories; the rest are ignored"), "...and says so");
 
   // A slug the build ships no default for is used as written. Dropping it would
   // silently discard a mapping for a platform RomM knows about and we do not,
@@ -452,6 +498,47 @@ void TheServerUrlIsAnOriginOrNothing(checks::Checks& c) {
   c.ExpectEq(insecure.value.server.url, std::string("http://romm.lan:8080"), "and is used");
   c.Expect(Mentions(insecure, "clear"), "but the risk is named: " + insecure.DescribeDiagnostics());
 
+  // A URL that never reaches ApplyServer at all: a colon instead of an equals
+  // is an ordinary slip, and the line is then reported as "not a key = value"
+  // -- quoted, because quoting it is what makes the report useful. So the
+  // credential is removed rather than the quote.
+  const config::LoadResult mistyped =
+      config::ParseConfig("[server]\nurl: https://me:hunter2@romm.lan\n");
+  c.Expect(!Mentions(mistyped, "hunter2"), "a credential in an unparseable line is redacted too");
+  c.Expect(Mentions(mistyped, "romm.lan"), "...and the rest of the line still reaches the user");
+
+  // A host is not the same thing as a non-empty authority. Each of these
+  // normalises cleanly, would report configured(), and reaches nothing.
+  for (const char* raw : {"https://:8080", "https://host:", "https://host:80x", "https://.",
+                          "https://[::1", "https://[::1]x"}) {
+    why.clear();
+    c.Expect(!config::NormalizeServerUrl(raw, &url, &why),
+             std::string("'") + raw + "' names no host");
+  }
+  c.Expect(config::NormalizeServerUrl("http://[::1]:8080", &url, &why) &&
+               url == "http://[::1]:8080",
+           "...but a bracketed IPv6 literal is a host: " + why);
+  c.Expect(config::NormalizeServerUrl("http://10.0.0.2", &url, &why), "and so is an address");
+
+  // A stale duplicate line must not idle a console that has a working server.
+  // Every other key keeps its previous value on a bad line, with a warning;
+  // this one is no different, and reporting "there is no server" while holding
+  // a good one would be false.
+  const config::LoadResult stale = config::ParseConfig(
+      "[server]\nurl = https://good.example.com\nurl = ftp://bad\n");
+  c.ExpectEq(stale.value.server.url, std::string("https://good.example.com"),
+             "the usable URL stands");
+  c.Expect(stale.value.configured(), "so the client is configured");
+  c.Expect(stale.ok(), "and it is a warning, not an error: " + stale.DescribeDiagnostics());
+  c.Expect(Mentions(stale, "does not configure a server"), "...saying which line was dropped");
+
+  // ...and the same the other way round: a bad first line that a good second
+  // one replaces leaves a configured client, so it cannot leave an error behind.
+  const config::LoadResult fixed = config::ParseConfig(
+      "[server]\nurl = ftp://bad\nurl = https://good.example.com\n");
+  c.ExpectEq(fixed.value.server.url, std::string("https://good.example.com"), "the later one wins");
+  c.Expect(fixed.ok(), "and no error survives it: " + fixed.DescribeDiagnostics());
+
   // No server at all is the one thing with no sensible default, so it is an
   // error rather than a warning -- and exactly one, not one per cause.
   const config::LoadResult none = config::ParseConfig("[sync]\nenabled = true\n");
@@ -490,6 +577,21 @@ void LoadingFromDisk(checks::Checks& c) {
   const config::LoadResult loaded = config::LoadConfig(path);
   c.Expect(loaded.ok(), "a real file loads: " + loaded.DescribeDiagnostics());
   c.ExpectEq(loaded.value.sync.interval_min, 7, "and its values are in force");
+
+  // The one moment config.ini legitimately does not exist: io::WriteAtomically
+  // moves the record already in place to `.old` before renaming the new one on,
+  // so a sysmodule interrupted there leaves the user's settings one filename
+  // away. token_store and device_identity recover from the same window.
+  std::filesystem::remove(path);
+  {
+    std::ofstream out(path + ".old", std::ios::binary);
+    out << "[server]\nurl = https://recovered.example.com\n";
+  }
+  const config::LoadResult recovered = config::LoadConfig(path);
+  c.ExpectEq(recovered.value.server.url, std::string("https://recovered.example.com"),
+             "an interrupted write is read from the record it moved aside");
+  c.Expect(Mentions(recovered, "was interrupted"), "...and the user is told it happened");
+  std::filesystem::remove(path + ".old");
 
   // A card that was pulled mid-write hands this a file of whatever was in those
   // sectors. It is refused by size before it is read into a sysmodule heap that

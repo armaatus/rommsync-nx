@@ -1,5 +1,7 @@
 #include "rommsync/config.hpp"
 
+#include "rommsync/atomic_file.hpp"
+
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
@@ -57,6 +59,39 @@ std::string_view StripInlineComment(std::string_view text) {
     }
   }
   return text;
+}
+
+/// `text` with any `user:password@` in a URL replaced by `***@`.
+///
+/// Every diagnostic that quotes a line the parser could not use goes through
+/// this. `ApplyServer` is careful never to echo a URL, but a user who writes
+/// `url: https://me:hunter2@romm.lan` -- a colon instead of an equals, the most
+/// ordinary slip there is -- never reaches `ApplyServer` at all: the line is not
+/// a `key = value` and is reported as one. Quoting it is what makes that report
+/// useful, so the credential is removed rather than the quote.
+std::string Redact(std::string_view text) {
+  std::string redacted;
+  std::size_t begin = 0;
+  while (true) {
+    const std::size_t scheme = text.find("://", begin);
+    if (scheme == std::string_view::npos) {
+      redacted.append(text.substr(begin));
+      return redacted;
+    }
+    const std::size_t authority = scheme + 3;
+    std::size_t end = text.find('/', authority);
+    if (end == std::string_view::npos) {
+      end = text.size();
+    }
+    const std::size_t at = text.substr(authority, end - authority).find('@');
+    redacted.append(text.substr(begin, authority - begin));
+    if (at == std::string_view::npos) {
+      begin = authority;
+      continue;
+    }
+    redacted.append("***");
+    begin = authority + at;  // keep the '@' itself, so the shape is still legible
+  }
 }
 
 // --- diagnostics -----------------------------------------------------------
@@ -158,6 +193,52 @@ std::vector<std::string_view> SplitList(std::string_view text) {
   }
 }
 
+/// `authority` is `host`, `host:port`, or `[v6]:port` with a host that could
+/// name something.
+///
+/// "Could name something" is one alphanumeric character, which is as far as a
+/// client can check without a resolver: `romm.lan`, `10.0.0.2` and `[::1]` pass,
+/// `:8080`, `.` and `host:` do not.
+bool HasRealHost(std::string_view authority) {
+  std::string_view host = authority;
+  if (!host.empty() && host.front() == '[') {
+    const std::size_t close = host.find(']');
+    if (close == std::string_view::npos) {
+      return false;
+    }
+    const std::string_view after = host.substr(close + 1);
+    if (!after.empty() && (after.front() != ':' || after.size() == 1)) {
+      return false;
+    }
+    for (std::size_t i = 1; i < after.size(); ++i) {
+      if (after[i] < '0' || after[i] > '9') {
+        return false;
+      }
+    }
+    host = host.substr(1, close - 1);
+  } else {
+    const std::size_t colon = host.find(':');
+    if (colon != std::string_view::npos) {
+      const std::string_view port = host.substr(colon + 1);
+      if (port.empty()) {
+        return false;
+      }
+      for (const char c : port) {
+        if (c < '0' || c > '9') {
+          return false;
+        }
+      }
+      host = host.substr(0, colon);
+    }
+  }
+  for (const char c : host) {
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // --- the built-in folder map ------------------------------------------------
 
 PlatformFolders TicoAndRetroArch(const std::string& slug) {
@@ -243,10 +324,8 @@ struct ParseState {
   std::string slug;
 };
 
-/// `url_diagnosed` is set when this said something about `[server] url`, so the
-/// end of the parse does not add a second, vaguer complaint about the same line.
 void ApplyServer(const ParseState& state, int line, std::string_view key, std::string_view value,
-                 Config* config, Diagnostics* diags, bool* url_diagnosed) {
+                 Config* config, Diagnostics* diags) {
   if (key != "url") {
     diags->Add(Severity::kWarning, line, state.section, key, "unknown key, ignored");
     return;
@@ -254,11 +333,16 @@ void ApplyServer(const ParseState& state, int line, std::string_view key, std::s
   std::string url;
   std::string why;
   if (!NormalizeServerUrl(value, &url, &why)) {
+    // A warning, like every other rejected line: this one did not take effect,
+    // and whether that leaves the client with no server at all is a question
+    // only the end of the file can answer. Saying "there is no server" here
+    // would be false for `url = good` followed by a stale `url = ftp://bad`,
+    // and saying nothing would be false the other way round.
+    //
     // The message never quotes `value`: someone will write
     // `https://me:hunter2@romm.lan`, and this string reaches a log.
-    diags->Add(Severity::kError, line, state.section, key,
-               why + " -- there is no server to sync with until it is fixed");
-    *url_diagnosed = true;
+    diags->Add(Severity::kWarning, line, state.section, key,
+               why + " -- this line does not configure a server");
     return;
   }
   config->server.url = url;
@@ -349,8 +433,12 @@ void ApplyDownloads(const ParseState& state, int line, std::string_view key,
   *target = flag;
 }
 
+/// `rejected` collects slugs whose section had a line the parser could not use,
+/// so the end-of-parse sweep can tell a platform emptied on purpose from one
+/// emptied by a typo.
 void ApplyPlatform(const ParseState& state, int line, std::string_view key,
-                   std::string_view value, Config* config, Diagnostics* diags) {
+                   std::string_view value, Config* config, Diagnostics* diags,
+                   std::set<std::string>* rejected) {
   std::vector<std::string>* target = nullptr;
   PlatformFolders& folders = config->platforms[state.slug];
   if (key == "roms") {
@@ -362,22 +450,39 @@ void ApplyPlatform(const ParseState& state, int line, std::string_view key,
   }
   if (target == nullptr) {
     diags->Add(Severity::kWarning, line, state.section, key, "unknown key, ignored");
+    rejected->insert(state.slug);
     return;
   }
 
   std::vector<std::string> paths;
+  if (Trim(value).empty()) {
+    // `roms =` is not a list with an empty element in it; it is the way a user
+    // says "nowhere". Emptying every key of a section is how a built-in mapping
+    // is removed, so this has to be silent -- warning about it would make the
+    // documented way to unmap a platform look like a mistake.
+    *target = std::move(paths);
+    return;
+  }
   for (std::string_view piece : SplitList(value)) {
     const std::string_view raw = Trim(piece);
     if (raw.empty()) {
       diags->Add(Severity::kWarning, line, state.section, key,
                  "empty entry in the list, ignored");
+      rejected->insert(state.slug);
       continue;
+    }
+    if (paths.size() >= kMaxPathsPerKey) {
+      diags->Add(Severity::kWarning, line, state.section, key,
+                 "lists more than " + std::to_string(kMaxPathsPerKey) +
+                     " directories; the rest are ignored");
+      break;
     }
     std::string path;
     std::string why;
     if (!NormalizeSdPath(raw, &path, &why)) {
       diags->Add(Severity::kWarning, line, state.section, key,
-                 "'" + std::string(raw) + "' " + why + ", ignored");
+                 "'" + Redact(raw) + "' " + why + ", ignored");
+      rejected->insert(state.slug);
       continue;
     }
     bool duplicate = false;
@@ -568,6 +673,14 @@ bool NormalizeServerUrl(std::string_view raw, std::string* out, std::string* why
     *why = "has a query or a fragment; this is a server address, not a link to a page";
     return false;
   }
+  if (!HasRealHost(authority)) {
+    // A non-empty authority is not a host: `https://:8080` normalises cleanly,
+    // reports `configured()`, and reaches nothing -- a healthy-looking config
+    // over a client that quietly does something else, which is the one outcome
+    // this module exists to prevent.
+    *why = "names no host (a port or a bare ':' is not a server)";
+    return false;
+  }
 
   // Scheme and host are case-insensitive and are lowercased so two spellings of
   // one server are one string -- `token.dat` records the server a token was
@@ -667,9 +780,11 @@ LoadResult ParseConfig(std::string_view text) {
   }
 
   ParseState state;
-  std::set<std::string> platform_sections;  // which slugs the file has already claimed
-  std::set<std::string> assigned;           // "section\x1fkey" pairs already set
-  bool url_diagnosed = false;
+  std::set<std::string> sections_seen;       // canonical section names already opened
+  std::set<std::string> platform_sections;   // which slugs the file has claimed
+  std::set<std::string> platform_rejected;   // ...and which had a line that was dropped
+  std::set<std::string> assigned;            // "section\x1fkey" pairs already set
+  bool platform_cap_reported = false;
 
   int line_number = 0;
   std::size_t begin = 0;
@@ -692,7 +807,7 @@ LoadResult ParseConfig(std::string_view text) {
     if (content.front() == '[') {
       if (content.back() != ']' || content.size() < 3) {
         diags.Add(Severity::kWarning, line_number, "", "",
-                  "'" + std::string(content) + "' is not a section header; everything under it "
+                  "'" + Redact(content) + "' is not a section header; everything under it "
                   "is ignored until the next one");
         state = ParseState{};
         state.kind = SectionKind::kUnknown;
@@ -727,10 +842,21 @@ LoadResult ParseConfig(std::string_view text) {
           continue;
         }
         state.kind = SectionKind::kPlatform;
-        if (!platform_sections.insert(state.slug).second) {
-          diags.Add(Severity::kWarning, line_number, state.section, "",
-                    "appears more than once; the later entries win");
-        } else {
+        if (platform_sections.find(state.slug) == platform_sections.end()) {
+          if (platform_sections.size() >= kMaxPlatformSections) {
+            // The same bound `kMaxDiagnostics` puts on what a corrupt file can
+            // make this allocate, applied to the map: a card region full of
+            // `[platform.a1]` headers is well inside the byte limit.
+            if (!platform_cap_reported) {
+              diags.Add(Severity::kWarning, line_number, state.section, "",
+                        "is past the " + std::to_string(kMaxPlatformSections) +
+                            " platforms a configuration may map; it and any after it are ignored");
+              platform_cap_reported = true;
+            }
+            state.kind = SectionKind::kUnknown;
+            continue;
+          }
+          platform_sections.insert(state.slug);
           if (DefaultPlatforms().find(state.slug) == DefaultPlatforms().end()) {
             diags.Add(Severity::kNotice, line_number, state.section, "",
                       "is not a platform this build maps by default; it is used as written -- "
@@ -751,6 +877,14 @@ LoadResult ParseConfig(std::string_view text) {
                   "is not a section this client knows; everything under it is ignored");
         state.kind = SectionKind::kUnknown;
       }
+      // Every section, not only a platform one: `[sync]` written twice is the
+      // same shadowing hazard, and reporting one and not the other is how a
+      // reader concludes the other is fine.
+      if (state.kind != SectionKind::kUnknown && !sections_seen.insert(state.section).second) {
+        diags.Add(Severity::kWarning, line_number, state.section, "",
+                  "appears more than once; the sections are merged, and a key set in both "
+                  "takes its later value");
+      }
       continue;
     }
 
@@ -758,7 +892,7 @@ LoadResult ParseConfig(std::string_view text) {
     const std::size_t equals = content.find('=');
     if (equals == std::string_view::npos) {
       diags.Add(Severity::kWarning, line_number, state.section, "",
-                "'" + std::string(content) + "' is not a 'key = value' line, ignored");
+                "'" + Redact(content) + "' is not a 'key = value' line, ignored");
       continue;
     }
     const std::string_view key_text = Trim(content.substr(0, equals));
@@ -781,12 +915,12 @@ LoadResult ParseConfig(std::string_view text) {
     const std::string pair = state.section + "\x1f" + key;
     if (!assigned.insert(pair).second) {
       diags.Add(Severity::kWarning, line_number, state.section, key,
-                "is set more than once; this line wins");
+                "is set more than once; the last usable line wins");
     }
 
     switch (state.kind) {
       case SectionKind::kServer:
-        ApplyServer(state, line_number, key, value, &result.value, &diags, &url_diagnosed);
+        ApplyServer(state, line_number, key, value, &result.value, &diags);
         break;
       case SectionKind::kSync:
         ApplySync(state, line_number, key, value, &result.value, &diags);
@@ -795,7 +929,8 @@ LoadResult ParseConfig(std::string_view text) {
         ApplyDownloads(state, line_number, key, value, &result.value, &diags);
         break;
       case SectionKind::kPlatform:
-        ApplyPlatform(state, line_number, key, value, &result.value, &diags);
+        ApplyPlatform(state, line_number, key, value, &result.value, &diags,
+                      &platform_rejected);
         break;
       case SectionKind::kNone:
       case SectionKind::kUnknown:
@@ -815,12 +950,17 @@ LoadResult ParseConfig(std::string_view text) {
     const std::string section = "platform." + slug;
     const PlatformFolders& now = result.value.platforms[slug];
     if (now.empty()) {
-      // Not a mistake to correct: emptying a section is how a user removes a
-      // built-in mapping for a system they do not have. Erased below, so
-      // `Platform()` answers nullptr and the engine skips it exactly as it does
-      // for a platform nobody ever mapped.
-      diags.Add(Severity::kNotice, 0, section, "",
-                "maps no folders, so " + slug + " is skipped entirely");
+      // Emptying a section on purpose is how a user removes a built-in mapping
+      // for a system they do not have, so on its own that is a notice. A section
+      // the parser had to drop a line from is a different thing wearing the same
+      // shape: `rom = /x` for `roms` unmaps snes entirely, and reporting that as
+      // calmly as a deliberate removal is how it goes unnoticed.
+      const bool by_accident = platform_rejected.find(slug) != platform_rejected.end();
+      diags.Add(by_accident ? Severity::kWarning : Severity::kNotice, 0, section, "",
+                by_accident
+                    ? "maps no folders because every line in it was dropped, so " + slug +
+                          " is skipped entirely -- see the warnings above for which"
+                    : "maps no folders, so " + slug + " is skipped entirely");
       continue;
     }
     const auto defaults = DefaultPlatforms().find(slug);
@@ -845,9 +985,12 @@ LoadResult ParseConfig(std::string_view text) {
     it = it->second.empty() ? result.value.platforms.erase(it) : std::next(it);
   }
 
-  if (!result.value.configured() && !url_diagnosed) {
+  // Exactly one error for "no server", whatever the cause: absent, or present
+  // and unusable. The line that was unusable already has its own warning, and a
+  // second error repeating it is how a user stops reading them.
+  if (!result.value.configured()) {
     diags.Add(Severity::kError, 0, "server", "url",
-              "is not set, so there is no RomM to sync with");
+              "has no usable value, so there is no RomM to sync with");
   }
 
   result.diagnostics = diags.Take();
@@ -859,6 +1002,27 @@ LoadResult LoadConfig(const std::string& path) {
   const ReadOutcome outcome = ReadBounded(path, &contents);
   if (outcome == ReadOutcome::kOk) {
     return ParseConfig(contents);
+  }
+
+  if (outcome == ReadOutcome::kMissing) {
+    // The one moment `config.ini` legitimately does not exist is the window
+    // `io::WriteAtomically` opens: the record already in place is renamed to
+    // `.old` before the new one is renamed on. `token_store` and
+    // `device_identity` recover from it the same way, and only from a *missing*
+    // file -- answering a transient failure with the previous record is a
+    // different and worse thing (see atomic_file.hpp).
+    std::string previous;
+    if (ReadBounded(io::PreviousPathFor(path), &previous) == ReadOutcome::kOk) {
+      LoadResult recovered = ParseConfig(previous);
+      Diagnostics diags;
+      diags.Add(Severity::kWarning, 0, "", "",
+                path + " is missing and was read from " + io::PreviousPathFor(path) +
+                    " instead -- a write of it was interrupted");
+      std::vector<Diagnostic> all = diags.Take();
+      all.insert(all.end(), recovered.diagnostics.begin(), recovered.diagnostics.end());
+      recovered.diagnostics = std::move(all);
+      return recovered;
+    }
   }
 
   LoadResult result;
@@ -885,7 +1049,8 @@ LoadResult LoadConfig(const std::string& path) {
     case ReadOutcome::kOk:
       break;
   }
-  diags.Add(Severity::kError, 0, "server", "url", "is not set, so there is no RomM to sync with");
+  diags.Add(Severity::kError, 0, "server", "url",
+            "has no usable value, so there is no RomM to sync with");
   result.diagnostics = diags.Take();
   return result;
 }

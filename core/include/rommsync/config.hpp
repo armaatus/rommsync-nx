@@ -45,6 +45,18 @@ inline constexpr const char* kConfigFileName = "config.ini";
 /// platform RomM knows is a few kilobytes.
 inline constexpr std::size_t kMaxConfigBytes = 256 * 1024;
 
+/// How many `[platform.<slug>]` sections are honoured, and how many directories
+/// one `roms`/`saves`/`states` key may list.
+///
+/// The same reasoning as `kMaxConfigBytes` and `kMaxDiagnostics`, applied to what
+/// the parse *builds* rather than what it reads: a corrupt card region full of
+/// `[platform.a1]` headers is well under the byte bound and still turns into tens
+/// of thousands of map entries on a heap that does not have them. RomM ships
+/// around two hundred platforms and no folder needs sixty-four directories, so
+/// neither bound can be reached by a file anyone wrote on purpose.
+inline constexpr std::size_t kMaxPlatformSections = 256;
+inline constexpr std::size_t kMaxPathsPerKey = 64;
+
 /// The longest SD path accepted in the folder map. Horizon's `FS_MAX_PATH` is
 /// 0x301 including the terminator, and a path longer than that cannot be opened
 /// on the console however well-formed it looks here.
@@ -267,6 +279,14 @@ LoadResult ParseConfig(std::string_view text);
 /// `kMaxConfigBytes`, is a `kError`: something is there and the user's settings
 /// are not being honoured, which they have to be told rather than left to infer
 /// from a client that quietly does something else.
+///
+/// A *missing* file falls back to `io::PreviousPathFor(path)` first, the same
+/// recovery `token_store` and `device_identity` make and for the same reason:
+/// `io::WriteAtomically` moves the record already in place aside before renaming
+/// the new one on, so the one moment `config.ini` legitimately does not exist is
+/// the moment the user's settings are sitting intact under `config.ini.old`.
+/// Only a missing file takes it -- a file that exists and will not open is a bad
+/// moment, not evidence that the previous record is the current one.
 LoadResult LoadConfig(const std::string& path);
 
 /// Normalise one SD path from the folder map, or fail.
@@ -286,7 +306,11 @@ bool NormalizeSdPath(std::string_view raw, std::string* out, std::string* why);
 
 /// Normalise the `[server] url`, or fail.
 ///
-/// Requires `http://` or `https://` and a non-empty host; drops a trailing
+/// Requires `http://` or `https://` and a real host -- `https://:8080` and
+/// `https://host:` are refused, since both are `configured()` and reach nothing,
+/// which is precisely the "quietly does something else" failure this module is
+/// written against. A bracketed IPv6 literal (`http://[::1]:8080`) is a host.
+/// Drops a trailing
 /// slash; keeps a path prefix, because RomM behind a reverse proxy at `/romm`
 /// is a normal deployment. Refuses a query or a fragment (this is an origin,
 /// not a link) and refuses `user:password@` outright -- RomM authenticates with

@@ -100,26 +100,38 @@ Each report carries a severity, the line number, and the section and key:
 - Section names and keys are case-insensitive; a `platform_fs_slug` is **not**,
   because it is a directory name on the server.
 - A UTF-8 BOM, CRLF line endings and a missing final newline are all fine.
-- A key set twice: the last line wins, `warning`. A section repeated: the two
-  are merged, `warning`.
+- A key set twice: the last **usable** line wins, `warning` — a later value the
+  parser rejects leaves the earlier one in force, the same as anywhere else.
+  A section repeated: the two are merged, `warning`.
 - A section this client does not know → `warning`, and everything under it is
   ignored without a second complaint per line.
 - Larger than 256 KiB → `error`, and the built-in defaults are used. It is read
-  at boot into a sysmodule heap that a corrupt card could otherwise exhaust.
+  at boot into a sysmodule heap that a corrupt card could otherwise exhaust. For
+  the same reason at most 256 platform sections, 64 directories per key and 64
+  reports are honoured; past any of those the rest are counted, not kept.
+- If `config.ini` is **missing** but `config.ini.old` is there, the `.old` is
+  read with a `warning`. That is the window an interrupted write leaves: the
+  sysmodule moves the live file aside before renaming the new one on, so the one
+  moment the file legitimately does not exist is the moment your settings are
+  sitting intact under the other name.
 
 **`[server]`**
 
-- `url` must be `http://` or `https://` with a host. A trailing slash is
+- `url` must be `http://` or `https://` with a real host. A trailing slash is
   dropped; a path prefix is kept, so RomM behind a reverse proxy at `/romm`
   works. A query or a fragment is refused — this is a server address, not a link.
+  `https://:8080` and `https://host:` are refused too: both parse, and both would
+  report a configured client that reaches nothing. `http://[::1]:8080` is fine.
 - `https://user:password@host` is **refused**, not stripped: RomM authenticates
   with a bearer token, so credentials there are never sent anywhere and would
   only follow the server's name into every log line. No message ever quotes the
   URL, for the same reason.
 - Plain `http://` is accepted with a `warning`: the token and every save cross
   the network in the clear.
-- No usable `url` → `error`, and the client stays idle. It is the one setting
-  with no sensible default.
+- A `url` line the parser cannot use is a `warning`, like any other rejected
+  line. Ending the file with no usable `url` at all is the `error` — one of them,
+  whether the setting was absent or present and rejected. It is the one setting
+  with no sensible default, and the client stays idle without it.
 
 **`[sync]` / `[downloads]`**
 
@@ -148,6 +160,10 @@ Each report carries a severity, the line number, and the section and key:
   files by name across the library.
 - A platform with `roms` but no `saves` → downloads work, saves are skipped
   for it.
+- A section left with no folders at all is skipped entirely. Doing that on
+  purpose (every key set to nothing) is a `notice`; arriving there because every
+  line in the section was dropped — `rom` for `roms`, say — is a `warning`, since
+  one typo silently unmapping a platform looks exactly like removing it.
 
 ## Precedence
 
