@@ -100,3 +100,20 @@ if(NOT ROMMSYNC_REQUIRE_RIG)
   set_tests_properties(orca.romm_tab_follows PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 set_tests_properties(orca.romm_tab_follows PROPERTIES TIMEOUT 60)
+
+# --- worktree teardown: the archive hook in orca.yaml -------------------------
+# `derives` needs no docker, so the regression it guards -- teardown falling back
+# to the compose default and removing nothing -- stays checkable with Docker
+# stopped. Only `reap` touches the daemon, so only it can skip.
+set(ORCA_TEARDOWN_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_orca_teardown.sh")
+
+add_test(NAME orca.teardown_derives_project
+         COMMAND "${BASH_PROGRAM}" "${ORCA_TEARDOWN_TEST}" derives)
+set_tests_properties(orca.teardown_derives_project PROPERTIES TIMEOUT 60)
+
+add_test(NAME orca.reap_spares_live_worktrees
+         COMMAND "${BASH_PROGRAM}" "${ORCA_TEARDOWN_TEST}" reap)
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(orca.reap_spares_live_worktrees PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+set_tests_properties(orca.reap_spares_live_worktrees PROPERTIES TIMEOUT 60)
