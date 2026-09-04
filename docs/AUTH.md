@@ -167,6 +167,87 @@ Four of those matter more than they look:
   opposite case: polling a code that may already be dead until the rate limiter
   answers is worse than telling the user pairing failed.
 
+## Running the flow: the pairing state machine
+
+`auth.hpp` says what an answer *means*; [`pairing.hpp`](../core/include/rommsync/pairing.hpp)
+runs the conversation. `PairingSession` is a state machine, not a loop, and both
+halves of that matter:
+
+- the overlay asks for the pairing state every time it redraws (`GetPairState`,
+  [DEVELOPMENT.md](DEVELOPMENT.md#ipc)) and must never wait on a socket to get
+  an answer — `status()` never touches the network and never blocks behind a
+  poll that is in flight;
+- a sysmodule may not park a thread in a ten-minute poll loop when *never block
+  boot* is a hard rule. `Poll()` performs at most one request, returns
+  immediately when the next one is not due, and leaves the scheduling to the
+  caller.
+
+```
+      Begin()                approve in browser
+idle ─────────▶ pending ──────────────────────▶ approved   token(), then persist
+                  │  ▲                                      to token.dat
+                  │  └── poll every `interval`, backing off on a transient failure
+                  ├──────▶ denied     a human refused it
+                  ├──────▶ expired    the code ran out, or was already spent
+                  └──────▶ failed     the exchange could not be completed
+```
+
+Four terminal states rather than one, because "you refused this on the website",
+"the code ran out, here is a new one" and "your server rejected the pairing" are
+three different sentences on the pairing screen, and only the last is worth a bug
+report.
+
+`PairingStatus` is the whole IPC payload: state, `user_code`, both verification
+URLs, the countdown, the poll count and a log-safe message. It never carries the
+`device_code` and never carries the token, so whatever renders it can be as
+careless as a UI usually is.
+
+### Retry policy
+
+| What came back | What the session does |
+|---|---|
+| `authorization_pending` | poll again after `interval` |
+| `slow_down` | back off — we already waited `interval`, so the server's window is wider than the number it sent |
+| `429`, `5xx` | back off; the `device_code` is still good |
+| no response at all — offline, a stall the timeout caught, a connection dropped | back off; the exchange never happened |
+| `401`/`403` | back off, up to `max_rejected_polls` times, then fail naming the status |
+| `access_denied`, `expired_token` | stop, on the matching terminal state |
+| anything else | stop, `failed`, naming the status |
+
+Backoff is the server's `interval` doubled per consecutive failure and capped by
+`max_poll_backoff`; the interval is always the floor, never the ceiling — see
+`DeviceInitResponse::poll_interval()` for why clamping it *down* is the one
+adjustment that can stop a pairing from completing.
+
+The `401` row is the one that argues with itself. The token endpoint takes no
+credentials, so RomM has nothing to reject there: a `401` comes from something
+in *front* of it — an authenticating reverse proxy, a gateway having a bad
+minute. A blip deserves a retry. A proxy that will answer `401` every time must
+not be allowed to burn the code's whole 600 seconds and then report "expired",
+which is the one diagnosis guaranteed to send the user looking in the wrong
+place. Hence a small budget and then a named failure, rather than either
+extreme. `ClassifyTokenPoll` still calls it `kUnrecognized` — this is a policy
+the session applies, not a grant state RomM defines.
+
+### Two things a poll loop gets wrong
+
+**`POST /api/auth/device/init` is rate limited too: ten a minute, per IP.** Over
+that it answers `429`, and it is the *init* that is limited, not just the poll.
+A console pairs once, so nobody reaches it by hand — but a test suite that opens
+a dozen codes does, and so does anything that retries pairing in a loop. The
+session reports it as a distinct, transient message rather than as a generic
+refusal, because "wait a minute and press Pair again" is the whole fix.
+
+**A poll whose answer is lost has still redeemed the code.** RomM consumes an
+approved code on the poll it *receives*; if the response never gets home — a
+dropped connection, a stall the client timed out on — the token was issued into
+a response nobody read, and every later poll answers `expired_token`,
+indistinguishable from a code that never existed. There is nothing to recover
+and nothing to retry. The session ends on `expired` so the overlay offers a
+fresh code, which is why `pair.lost_grant` asserts on that ending rather than on
+a completed pairing. Retrying instead would poll a dead code until the rate
+limiter answered.
+
 ## Where the OpenAPI snapshot and the running server disagree
 
 `server/contract/romm-openapi-5.2.0.json` is what RomM *declares*; the captures
@@ -207,6 +288,29 @@ that identifies the *user* beyond what RomM needs.
 
 Persist `{access_token, device_id, scopes, expires_at, server_url}` to
 `sdmc:/config/rommsync/token.dat`. There is no refresh token to store.
+[`token_store.hpp`](../core/include/rommsync/token_store.hpp) is the record and
+both directions of it.
+
+`server_url` is in there because a token only means anything against the RomM
+that issued it: a user who repoints the sysmodule at a different server has to
+re-pair rather than send a stranger a bearer token.
+
+**The write is atomic.** The record goes to `token.dat.tmp` and is renamed onto
+`token.dat` only once it is complete, so a reader sees either the previous token
+or the new one and never a splice — the same reasoning as backup-before-overwrite
+for saves ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md)) and as `DownloadTarget`'s
+`.part` file, applied to the one file that cannot be re-fetched without a human
+at a browser. Every failure before that rename leaves whatever was already there
+completely intact: a failed write costs the *new* token, never the working one.
+What `rename` does not give is durability across a power cut, which needs an
+`fsync` the C++ standard library does not expose; the promise is that no reader
+ever sees a partial token.
+
+A record that could not be read back is refused on the way *out*, not just on
+the way in — a file that exists and holds an unusable token is worse than no
+file, because the sysmodule would find one, believe it is paired, and `401` on
+every tick. Creating `sdmc:/config/rommsync/` is the platform layer's job, not
+the portable engine's; a missing directory is a named error.
 
 The parser refuses a token or a `device_id` that is blank, or that carries an
 embedded NUL — `"rmm_a\u0000EVIL"` is legal JSON that `std::string` holds
