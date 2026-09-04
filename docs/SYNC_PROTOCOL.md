@@ -1,7 +1,9 @@
 # Save sync protocol (client side)
 
 How `sys-rommsync` implements RomM 5.2.0's negotiate → execute → complete loop.
-Endpoints and schemas: [API_CONTRACT.md](API_CONTRACT.md).
+Endpoints and schemas: [API_CONTRACT.md](API_CONTRACT.md). The payload and
+response shapes below are the ones captured from a live 5.2.0 under
+`server/contract/captures/` (issue M0-4), not a reading of the OpenAPI snapshot.
 
 ## Principle: the server is the source of truth
 
@@ -24,46 +26,108 @@ Cache the rom index (`GET /api/roms`) per tick; it's also needed by downloads.
 
 ## Step 1 — negotiate
 
-Build `SyncNegotiatePayload`:
+Build `SyncNegotiatePayload`. Each entry is a `ClientSaveState`; the field names
+are verified, and three of them are not what an obvious guess produces —
+`content_hash` (not `hash`), `file_size_bytes` (not `size`), and an **MD5**, not
+the SHA1 the rom schema uses:
+
 ```jsonc
 {
-  "device_id": "<cached device id>",
+  "device_id": "<the device_id from the token, or one cached from /api/devices>",
   "saves": [
     {
-      "rom_id": 1234,
-      "file_name": "Game (USA).srm",
-      "slot": null,
-      "emulator": "retroarch",      // or "tico"
-      "hash": "<sha1 of file bytes>",
-      "updated_at": "2026-09-03T12:00:00Z",  // from FS mtime, UTC
-      "size": 32768
+      "rom_id": 1234,                          // required
+      "file_name": "Game (USA).srm",           // required
+      "updated_at": "2026-09-03T12:00:00Z",    // required — FS mtime, UTC
+      "file_size_bytes": 32768,                // required
+      "slot": "autosave",                      // optional, but see below
+      "emulator": "retroarch",                 // or "tico"
+      "content_hash": "<MD5 of the file bytes>"
     }
     // ... one per local save
   ]
 }
 ```
-> Confirm exact entry field names against the snapshot (`SyncSaveEntry` /
-> negotiate payload `saves` item) before coding — tracked as issue **M2-1**.
+
+**Saves pair on `(rom_id, slot)`.** A stable slot name is what keeps one save in
+sync across ticks; a `null` slot means "archival, manual upload" to RomM and is
+never paired with a slotted server save, so it negotiates as `upload` every time
+even when the identical bytes are already there. Pick a slot and keep it.
 
 `POST /api/sync/negotiate` → `SyncNegotiateResponse { session_id, operations[],
-total_* }`.
+total_upload, total_download, total_conflict, total_no_op }`.
+
+The plan also covers saves the client did **not** report: any server save this
+device has no sync history for comes back as a `download`, for any rom. That is
+how the client learns a save exists at all — there is no separate "what's new"
+call to make. An empty `saves` array is a legitimate "tell me what I'm missing".
+
+A server save the device *has* synced and that has not changed since is read as
+"the client deleted it on purpose" and produces **no operation at all** — so a
+save the client loses locally is not silently restored. Untracked saves
+(`is_untracked` on the device's sync row) come back as `no_op` /
+`Save is untracked on this device`.
 
 ## Step 2 — execute the plan
 
-For each `SyncOperationSchema`:
+For each `SyncOperationSchema`. The action is `no_op` — with the underscore:
 
 | action | do |
 |---|---|
-| `noop` | nothing (hashes already match) |
-| `upload` | `POST /api/saves?rom_id=&emulator=&slot=&session_id=&overwrite=true`, multipart `saveFile` = local bytes |
-| `download` | `GET /api/saves/{save_id}/content` → **back up existing local file** → write to the file's SD path |
-| `conflict` | server sets resolution in `reason`/policy: `server_wins` (download), `device_wins` (upload), `keep_both` (write server copy alongside, keep local) — **always back up the loser first** |
+| `no_op` | nothing |
+| `upload` | `POST /api/saves?rom_id=&emulator=&slot=&session_id=&device_id=&overwrite=true`, multipart `saveFile` = local bytes |
+| `download` | `GET /api/saves/{save_id}/content` → **back up existing local file** → write to the file's SD path → `POST /api/saves/{save_id}/downloaded {device_id}` |
+| `conflict` | resolve by policy (below) — **always back up the loser first** |
 
-Pass `session_id` on uploads so the server ties them to this session. Track
-`operations_completed` / `operations_failed`.
+**`overwrite=true` is not optional on an upload.** Given a `device_id` and a
+`slot`, RomM refuses the post with `409 {"detail": "Slot has a newer save since
+your last sync"}` whenever this device has no sync row for the slot's current
+save, or one older than it. That is precisely the plan's own
+`upload` / `Client save is newer (no sync history)` case — the first upload after
+a re-pair, or from a device registered this boot. Executing a plan the server
+just issued must not be rejected by the server, so send `overwrite=true` and let
+negotiate be the arbiter.
+
+Two traps in the operation itself:
+
+- **`file_name` is the server's name, not yours.** RomM renames a save on ingest:
+  `probe.srm` is stored as `probe [2026-09-04_11-12-27].srm`, and every later
+  operation echoes that. Match the operation back to your local file on
+  `(rom_id, slot)` and keep your own path; writing the server's name to the SD
+  produces a file no emulator will load.
+- **`save_id` is null for an `upload`** when the server has nothing yet, and set
+  when it has an older copy. Don't dereference it unconditionally.
+
+Pass `session_id` on uploads so the server ties them to this session, and
+`device_id` so the sync history that the *next* negotiation arbitrates against is
+written. Track `operations_completed` / `operations_failed`.
 
 Backups go to `sdmc:/config/rommsync/.backup/<rom_id>-<ts>.<ext>`. Never destroy
 a save without a backup — this is a hard rule.
+
+### Conflicts
+
+RomM does *not* send a resolution: there is no `server_wins` / `keep_both` field
+to obey. The client picks a policy, and the safe default is **keep both**: back
+up the local file, write the server copy to the save path, and leave the backup
+where the overlay can surface it (M7-1). `server_content_hash` and
+`server_updated_at` are there to show the user what they are choosing between.
+
+**A `conflict` arrives with one of two reasons, and a client must handle both:**
+
+- `Both sides changed since last sync` — the expected case, when this device has
+  a sync record and each side moved past it.
+- `Same timestamp but different content` — **no sync history**, the two
+  timestamps are equal, and the hashes are not. RomM compares these at second
+  granularity, so this is not exotic: a save written in the same second as the
+  server's copy, seen by a device that has not synced it, lands here. Switching
+  only on the first reason drops this one into whatever the default branch does,
+  and on a conflict the default branch is the one that can overwrite a save.
+
+The arbitration is per `(device, save)`. Sync history is written by an upload
+carrying `device_id` and by `POST /api/saves/{id}/downloaded` — a download the
+client never confirms leaves the device looking like it has never seen the save,
+which puts every later comparison in the no-sync-history branch above.
 
 ## Step 3 — complete
 
@@ -71,9 +135,15 @@ a save without a backup — this is a hard rule.
 ```jsonc
 { "operations_completed": 7, "operations_failed": 0, "play_sessions": [] }
 ```
-Then persist the new per-save `{hash, mtime, server_updated_at, server_hash}` to
-`state.db`. That stored baseline is how the *next* tick knows which side changed
-(local mtime/hash differs → local changed; server hash differs → server changed).
+→ `{ "session": SyncSessionSchema, "play_session_ingest": null }`. The session's
+`operations_planned` counts operations that need *work*, so a plan of nothing but
+`no_op` reports `0` planned against however many you completed; that is not an
+error.
+
+Then persist the new per-save `{content_hash, mtime, server_updated_at,
+server_content_hash}` to `state.db`. That stored baseline is how the *next* tick
+skips work — the server arbitrates, but the client still has to know which local
+files are worth re-hashing.
 
 ## Change detection between ticks
 
@@ -96,4 +166,5 @@ Config: `sync.states = true`.
   unsynced files for next tick. Never leave a half-written save (write to temp,
   fsync, rename).
 - One backup per overwrite, always, before writing.
-- Verify downloaded save size/hash where the server provides `content_hash`.
+- Verify a downloaded save against the MD5 in `content_hash` /
+  `server_content_hash`, and its length against `file_size_bytes`.

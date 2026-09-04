@@ -89,19 +89,15 @@ jobs:
           ./.venv/bin/pip install -q --disable-pip-version-check -r server/requirements.txt
           ./.venv/bin/python server/testing/provision.py --base-url "$ROMM_BASE_URL"
 
-      # The contract probe is the tool M0-4 captures response shapes with, and
-      # it now runs unattended. Exercising it here means contract drift after a
-      # RomM bump shows up as a red build rather than at the next capture.
-      - name: Contract probe (full flow, no browser)
-        run: |
-          set -a; . ./.env; set +a
-          ./.venv/bin/python server/probe_contract.py --url "$ROMM_BASE_URL" --auth --negotiate
-
       - name: Build
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DROMMSYNC_REQUIRE_RIG=ON
           cmake --build build
 
+      # Includes contract.captures, which drives probe_contract.py through the
+      # full unattended flow and diffs the result against server/contract/captures/.
+      # That is how a RomM bump surfaces as a red build rather than as docs that
+      # quietly describe a server nobody runs any more.
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
