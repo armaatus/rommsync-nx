@@ -80,6 +80,21 @@ target_compile_definitions(test_scopes PRIVATE
   ROMMSYNC_API_CONTRACT="${CMAKE_SOURCE_DIR}/docs/API_CONTRACT.md")
 add_test(NAME auth.scopes COMMAND test_scopes)
 
+# `config.ini`: the defaults, the overrides and the rejections. Reads a file it
+# writes itself and docs/CONFIG.md, so it never skips -- and the guarantee it
+# checks is that a bad config still boots a working client, which is exactly the
+# case a rig could not help with anyway.
+add_executable(test_config test_config.cpp)
+target_link_libraries(test_config PRIVATE rommsync::core)
+target_include_directories(test_config PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_config PRIVATE
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  # The documented example is parsed rather than restated: an ```ini block a
+  # user copies and the parser rejects is the first thing they meet, and no test
+  # of a private string literal here would ever see it.
+  ROMMSYNC_CONFIG_DOC="${CMAKE_SOURCE_DIR}/docs/CONFIG.md")
+add_test(NAME core.config COMMAND test_config)
+
 # --- rig smoke test: proves docker RomM + fault proxy + ctest all work -------
 # Uses libcurl directly on purpose. It tests the RIG, not our code, and must
 # keep working while M0-2 replaces it as the way production code speaks HTTP.
