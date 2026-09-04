@@ -83,9 +83,17 @@ std::optional<Registration> Refused(const http::Result& result, std::string_view
                 std::string(what) + " was rejected: HTTP " + std::to_string(status) +
                     "; the token has been revoked");
   }
-  if (status >= 500) {
+  // 429 and 408 sit here with the 5xx rather than falling through, because they
+  // are the same kind of answer: the server would not deal with this request
+  // now, and will with the next one. RomM rate limits, and a self-hosted one
+  // behind a reverse proxy or Cloudflare can answer either on any path. Left to
+  // fall through they would land on `kMalformed`, which is neither retryable
+  // nor re-pairable -- so a rate-limited boot would wedge registration until
+  // the console was rebooted, instead of backing off for a minute.
+  if (status >= 500 || status == 429 || status == 408) {
     return Fail(RegistrationError::kServerError,
-                std::string(what) + ": HTTP " + std::to_string(status));
+                std::string(what) + ": HTTP " + std::to_string(status) +
+                    (status == 429 ? "; the server is rate limiting" : ""));
   }
   if (!result.successful()) {
     return Fail(RegistrationError::kMalformed,
@@ -94,34 +102,76 @@ std::optional<Registration> Refused(const http::Result& result, std::string_view
   return std::nullopt;
 }
 
-/// `string | null`, flattened: `null` and absent-from-our-struct are the same
-/// thing to every caller, and an empty string is refused by the reader anyway.
-std::string Flatten(const std::optional<std::string>& value) { return value.value_or(std::string()); }
+/// A `string | null` field where blank and absent mean the same thing.
+///
+/// `json::Reader::RequiredNullable` refuses `""`, and it is right to: it exists
+/// for `expires_at`, where an empty string would reach a timestamp parser as
+/// though it meant something. These four fields are not that. Three of them are
+/// text a user typed, the fourth is compared and never parsed, and RomM 5.2.0
+/// really does store `""` for them -- `POST /api/devices {"name":""}` answers
+/// `201` with `"name":""`.
+///
+/// That distinction is load-bearing rather than tidy, because of where these
+/// are read: `GET /api/devices` returns **every** device the user owns, and
+/// `ParseDeviceList` refuses a list whole. Holding a neighbour's blank name to
+/// the timestamp bar would make one row written by some other client -- a
+/// browser session, a script, a future RomM UI -- the thing that stops this
+/// console from ever finding its own perfectly good row, with `kMalformed`,
+/// which is neither retryable nor re-pairable. A dead end, over a name.
+///
+/// What is still refused is a value that is not a string, and one carrying an
+/// embedded NUL: those are not something a server stores by accident, and the
+/// NUL rule is the house one (json.hpp) -- a value that truncates at the first
+/// C API is not the value that was checked.
+bool ReadText(const json::Value& object, std::string_view key, std::string* out,
+              json::Error* error) {
+  const json::Value* found = object.Find(key);
+  if (found == nullptr) {
+    error->field = std::string(key);
+    error->message = "is missing";
+    return false;
+  }
+  if (found->is_null()) {
+    out->clear();
+    return true;
+  }
+  if (!found->is_string()) {
+    error->field = std::string(key);
+    error->message = std::string("expected a string or null, got ") + json::ToString(found->type());
+    return false;
+  }
+  if (found->string().find('\0') != std::string::npos) {
+    error->field = std::string(key);
+    error->message = "contains an embedded NUL";
+    return false;
+  }
+  *out = found->string();
+  return true;
+}
 
 Parsed<DeviceRecord> ReadDevice(const json::Value& value) {
   Parsed<DeviceRecord> parsed;
   DeviceRecord device;
-  std::optional<std::string> name;
-  std::optional<std::string> platform;
-  std::optional<std::string> client;
-  std::optional<std::string> identifier;
 
+  // `id` and `sync_enabled` go through the strict reader, because those two are
+  // acted on: the id is pasted into a URL and scopes every sync call, and the
+  // flag decides whether to start one at all. The rest is description.
   json::Reader reader(value, "device record");
   reader.Required("id", &device.id);
-  reader.RequiredNullable("name", &name);
-  reader.RequiredNullable("platform", &platform);
-  reader.RequiredNullable("client", &client);
-  reader.RequiredNullable("client_device_identifier", &identifier);
   reader.Required("sync_enabled", &device.sync_enabled);
   if (!reader.ok()) {
     parsed.error = reader.error();
     return parsed;
   }
 
-  device.name = Flatten(name);
-  device.platform = Flatten(platform);
-  device.client = Flatten(client);
-  device.client_device_identifier = Flatten(identifier);
+  json::Error error;
+  if (!ReadText(value, "name", &device.name, &error) ||
+      !ReadText(value, "platform", &device.platform, &error) ||
+      !ReadText(value, "client", &device.client, &error) ||
+      !ReadText(value, "client_device_identifier", &device.client_device_identifier, &error)) {
+    parsed.error = error;
+    return parsed;
+  }
   parsed.value = std::move(device);
   return parsed;
 }
@@ -366,7 +416,16 @@ Registration ResolveRegistration(http::HttpClient& client, const StoredToken& to
   // What the search returns is what gets reported either way: it is the call
   // that looked at every device rather than at one, so its answer is the better
   // description of the same failure.
-  return FindRegistration(client, token, client_device_identifier, timeout);
+  Registration found = FindRegistration(client, token, client_device_identifier, timeout);
+  if (!found.ok() && found.error != confirmed.error) {
+    // A search that failed for its own reason has just replaced a verdict.
+    // `kUnreachable` is still the right one to *act* on -- the search is what
+    // would have said whether this console has another device, and it did not
+    // get to -- but the message must not lose the fact that the cached id was
+    // already gone, or the log reads as a network problem and nothing else.
+    found.message += " (after " + confirmed.message + ")";
+  }
+  return found;
 }
 
 StoreResult CacheDeviceId(const std::string& path, StoredToken& token,
@@ -381,8 +440,19 @@ StoreResult CacheDeviceId(const std::string& path, StoredToken& token,
     // value that is already in it.
     return {};
   }
-  token.device_id = registration.device.id;
-  return SaveToken(path, token);
+
+  // Written from a copy, and adopted only once the write succeeded. Assigning
+  // first is what makes a failed write unrecoverable rather than merely failed:
+  // the caller's record would claim an id that is not on disk, and the retry it
+  // is supposed to make would hit the short-circuit above and report success
+  // having written nothing.
+  StoredToken updated = token;
+  updated.device_id = registration.device.id;
+  const StoreResult written = SaveToken(path, updated);
+  if (written.ok()) {
+    token.device_id = registration.device.id;
+  }
+  return written;
 }
 
 }  // namespace rommsync::auth

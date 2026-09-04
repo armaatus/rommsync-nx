@@ -73,11 +73,18 @@ void SchemaFields(checks::Checks& c, const std::string& body) {
 /// The capture, with one field replaced -- the only way to test a shape RomM
 /// will not produce on demand without hand-writing a second copy of the body
 /// that then drifts from the real one.
-std::string WithField(const std::string& body, const std::string& key,
+///
+/// A key it cannot find is a failure, not a body returned unchanged. Returning
+/// the input would turn every *positive* assertion below into one that passes
+/// against the original capture -- "a device with no name parses" checked
+/// against a device that has a name -- and a re-capture that reformatted a key
+/// would make them no-ops with nothing to show for it.
+std::string WithField(checks::Checks& c, const std::string& body, const std::string& key,
                       const std::string& replacement) {
   const std::string needle = "\"" + key + "\": ";
   const std::size_t at = body.find(needle);
   if (at == std::string::npos) {
+    c.Expect(false, "the capture has no " + key + " field to replace");
     return body;
   }
   const std::size_t from = at + needle.size();
@@ -113,14 +120,14 @@ void Capture(checks::Checks& c) {
   // `null` is a value RomM sends for every one of these, and it means "nobody
   // set it" -- not a parse that lost something.
   const auth::Parsed<auth::DeviceRecord> unnamed =
-      auth::ParseDeviceRecord(WithField(body, "name", "null"));
+      auth::ParseDeviceRecord(WithField(c, body, "name", "null"));
   c.Expect(unnamed.ok(), "a device with no name is a device: " + unnamed.error.Describe());
   c.Expect(unnamed.value.name.empty(), "...and its name reads back empty");
 
   // The one that matters most: a device RomM did not pair carries no
   // identifier, and that has to parse, because the *list* is full of them.
   const auth::Parsed<auth::DeviceRecord> anonymous =
-      auth::ParseDeviceRecord(WithField(body, "client_device_identifier", "null"));
+      auth::ParseDeviceRecord(WithField(c, body, "client_device_identifier", "null"));
   c.Expect(anonymous.ok(),
            "a device with no client_device_identifier parses: " + anonymous.error.Describe());
   c.Expect(anonymous.value.client_device_identifier.empty(), "...as an empty identifier");
@@ -131,14 +138,14 @@ void Capture(checks::Checks& c) {
   for (const std::string& wrong : {std::string("\"true\""), std::string("1"),
                                    std::string("null")}) {
     const auth::Parsed<auth::DeviceRecord> refused =
-        auth::ParseDeviceRecord(WithField(body, "sync_enabled", wrong));
+        auth::ParseDeviceRecord(WithField(c, body, "sync_enabled", wrong));
     c.Expect(!refused.ok(), "sync_enabled as " + wrong + " is refused");
     c.ExpectEq(refused.error.field, std::string("sync_enabled"), "...and it is named");
   }
   for (const std::string& wrong : {std::string("null"), std::string("\"\""),
                                    std::string("7")}) {
     const auth::Parsed<auth::DeviceRecord> refused =
-        auth::ParseDeviceRecord(WithField(body, "id", wrong));
+        auth::ParseDeviceRecord(WithField(c, body, "id", wrong));
     c.Expect(!refused.ok(), "an id of " + wrong + " is refused");
     c.ExpectEq(refused.error.field, std::string("id"), "...and it is named");
   }
@@ -156,7 +163,7 @@ void List(checks::Checks& c) {
   c.Expect(empty.ok(), "an empty device list parses: " + empty.error.Describe());
   c.Expect(empty.value.empty(), "...as no devices");
 
-  const std::string other = WithField(WithField(body, "id", "\"11111111-1111-1111-1111-111111111111\""),
+  const std::string other = WithField(c, WithField(c, body, "id", "\"11111111-1111-1111-1111-111111111111\""),
                                       "client_device_identifier", "null");
   const auth::Parsed<std::vector<auth::DeviceRecord>> two =
       auth::ParseDeviceList("[" + body + "," + other + "]");
@@ -186,15 +193,68 @@ void List(checks::Checks& c) {
   // console's saves to whichever sorted first.
   const auth::Parsed<std::vector<auth::DeviceRecord>> twice =
       auth::ParseDeviceList("[" + body + "," +
-                            WithField(body, "id", "\"22222222-2222-2222-2222-222222222222\"") +
+                            WithField(c, body, "id", "\"22222222-2222-2222-2222-222222222222\"") +
                             "]");
   c.Expect(twice.ok(), "a list with two rows for one console parses: " + twice.error.Describe());
   c.Expect(auth::FindByIdentifier(twice.value, "probe-contract-script") == nullptr,
            "an ambiguous identifier resolves to nothing rather than to a guess");
 
+  // The one that turns a cosmetic strictness into a dead end. RomM 5.2.0 stores
+  // `""` for these: `POST /api/devices {"name":""}` answers 201 with `"name":""`.
+  // The list is *every* device the user owns, so one row written by a browser
+  // session or a script with a blank name would otherwise stop this console
+  // finding its own perfectly good row -- with `malformed`, which is neither
+  // retryable nor re-pairable.
+  for (const std::string& blank : {std::string("name"), std::string("platform"),
+                                   std::string("client"),
+                                   std::string("client_device_identifier")}) {
+    const auth::Parsed<auth::DeviceRecord> empty_field =
+        auth::ParseDeviceRecord(WithField(c, body, blank, "\"\""));
+    c.Expect(empty_field.ok(),
+             "a device whose " + blank + " is blank still parses: " + empty_field.error.Describe());
+
+    // Someone else's row: its own id, no identifier of its own, and the field
+    // under test blank. Blanking the identifier matters -- a neighbour carrying
+    // this console's would make the list ambiguous and mask the thing being
+    // checked with an unrelated refusal.
+    const std::string other_row = WithField(
+        c,
+        WithField(c, WithField(c, body, "id", "\"44444444-4444-4444-4444-444444444444\""),
+                  "client_device_identifier", "\"\""),
+        blank, "\"\"");
+    const auth::Parsed<std::vector<auth::DeviceRecord>> neighbour =
+        auth::ParseDeviceList("[" + other_row + "," + body + "]");
+    if (!neighbour.ok()) {
+      c.Expect(false, "a neighbour with a blank " + blank + " does not sink the list: " +
+                          neighbour.error.Describe());
+      continue;
+    }
+    c.Expect(auth::FindByIdentifier(neighbour.value, "probe-contract-script") != nullptr,
+             "and this console's own device is still found past it");
+  }
+
+  // Blank is not, however, a wildcard: a row whose identifier RomM blanked must
+  // not become the row that matches everything.
+  const auth::Parsed<std::vector<auth::DeviceRecord>> blanked = auth::ParseDeviceList(
+      "[" + WithField(c, body, "client_device_identifier", "\"\"") + "]");
+  c.Expect(blanked.ok(), "a blank identifier parses: " + blanked.error.Describe());
+  c.Expect(auth::FindByIdentifier(blanked.value, "probe-contract-script") == nullptr,
+           "and matches nothing, the same as a null one");
+
+  // What is still refused, because no server stores it by accident and every C
+  // API downstream truncates at it.
+  const auth::Parsed<auth::DeviceRecord> nul =
+      auth::ParseDeviceRecord(WithField(c, body, "name", "\"a\\u0000b\""));
+  c.Expect(!nul.ok(), "a name carrying an embedded NUL is refused");
+  c.ExpectEq(nul.error.field, std::string("name"), "...and it is named");
+  const auth::Parsed<auth::DeviceRecord> wrong_type =
+      auth::ParseDeviceRecord(WithField(c, body, "platform", "7"));
+  c.Expect(!wrong_type.ok(), "a platform that is not a string is refused");
+  c.ExpectEq(wrong_type.error.field, std::string("platform"), "...and it is named");
+
   c.Expect(!auth::ParseDeviceList(body).ok(), "one device is not a device list");
   const auth::Parsed<std::vector<auth::DeviceRecord>> broken =
-      auth::ParseDeviceList("[" + body + "," + WithField(body, "sync_enabled", "\"yes\"") + "]");
+      auth::ParseDeviceList("[" + body + "," + WithField(c, body, "sync_enabled", "\"yes\"") + "]");
   c.Expect(!broken.ok(), "a list holding a row that will not parse is refused whole");
   c.ExpectEq(broken.error.field, std::string("sync_enabled"),
              "...naming the field, not the row's position");
@@ -290,6 +350,29 @@ void Caching(checks::Checks& c) {
   // And the one that must not be cached. A device id that was never confirmed
   // is exactly the "a token with no device id, silently used for sync" this
   // module exists to prevent.
+  // A write that fails must leave the record exactly as it was. Assigning first
+  // would make the failure unrecoverable rather than merely failed: the retry
+  // would find the id already in the record, take the no-op path, and report
+  // success having written nothing. The directory is removed to force it, which
+  // is what a missing `sdmc:/config/rommsync/` looks like.
+  {
+    auth::StoredToken half = Paired();
+    half.device_id.clear();
+    const std::string gone = directory + "/absent/token.dat";
+    const auth::StoreResult refused_write = auth::CacheDeviceId(gone, half, resolved);
+    c.Expect(!refused_write.ok(), "a write into a missing directory fails");
+    c.Expect(half.device_id.empty(),
+             "and the record does not claim an id that never reached the disk");
+
+    std::filesystem::create_directories(directory + "/absent", ignored);
+    c.Expect(auth::CacheDeviceId(gone, half, resolved).ok(),
+             "so the retry actually writes rather than short-circuiting");
+    c.ExpectEq(half.device_id, resolved.device.id, "and the record catches up");
+    const auth::LoadedToken retried = auth::LoadToken(gone);
+    c.Expect(retried.ok(), "with a readable record behind it: " + retried.message);
+    c.ExpectEq(retried.value.device_id, resolved.device.id, "carrying the device");
+  }
+
   auth::Registration failed;
   failed.error = auth::RegistrationError::kUnreachable;
   failed.device.id = "99999999-9999-9999-9999-999999999999";

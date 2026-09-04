@@ -111,7 +111,9 @@ enum class RegistrationError {
   kAmbiguous,      ///< more than one device names this identifier; picking one would guess
   kSyncDisabled,   ///< the device is there and the user has turned sync off for it
   kUnreachable,    ///< the exchange did not complete -- offline, stalled, dropped
-  kServerError,    ///< 5xx: RomM or something in front of it is unwell
+  /// The server would not deal with this request now, and may with the next:
+  /// a 5xx, or the 429/408 a rate limiter or a reverse proxy answers with.
+  kServerError,
   kMalformed,      ///< a 2xx that is not a device, or a cached id that cannot be a URL
 };
 
@@ -121,9 +123,11 @@ const char* ToString(RegistrationError error);
 /// Whether trying the same call again later could succeed.
 ///
 /// Only the two failures that say nothing about the pairing: no response, and a
-/// server having a bad minute. `kMalformed` is deliberately not among them, for
-/// the same reason `TokenPoll::kUnrecognized` is not retryable -- an answer this
-/// client cannot read is not something to hammer.
+/// server having a bad minute -- which includes being rate limited, because a
+/// remedy that is "wait" must not be reported as one that is not. `kMalformed`
+/// is deliberately not among them, for the same reason
+/// `TokenPoll::kUnrecognized` is not retryable -- an answer this client cannot
+/// read is not something to hammer.
 bool ShouldRetry(RegistrationError error);
 
 /// Whether the remedy is to pair again.
@@ -152,11 +156,20 @@ struct Registration {
 
 /// Confirm the device id `token` already carries. One `GET /api/devices/{id}`.
 ///
-/// This is the boot-time question: RomM still has this device, it is still ours,
-/// and sync is still on for it. Asking it costs one request and turns three
-/// things that would otherwise surface as a puzzling mid-sync failure -- a
-/// revoked token, a device deleted in the web UI, sync switched off -- into a
-/// named state before the first save is touched.
+/// This is the boot-time question: RomM still has this device, this token can
+/// still read it, and sync is still on for it. One request, and three things
+/// that would otherwise surface as a puzzling mid-sync failure -- a revoked
+/// token, a device deleted in the web UI, sync switched off -- become a named
+/// state before the first save is touched.
+///
+/// What it does **not** prove is that the device is this *console's*. The
+/// `client_device_identifier` on the returned record is what says that, and it
+/// is handed back rather than checked here, because a mismatch is not this
+/// call's to act on: a device RomM created some other way legitimately carries
+/// none, and failing a working pairing over a decorative field is the worse
+/// error. Note that it would not catch the case it looks like it should either
+/// -- a cloned SD card carries `device.dat` along with `token.dat`, so both
+/// consoles present the same identifier and agree.
 Registration ConfirmRegistration(http::HttpClient& client, const StoredToken& token,
                                  std::chrono::milliseconds timeout = http::kDefaultTimeout);
 
@@ -192,10 +205,15 @@ Registration ResolveRegistration(http::HttpClient& client, const StoredToken& to
 
 /// Write `registration`'s device id into `token` and persist the record.
 ///
-/// Does nothing, successfully, when the id is already the one on disk -- which
-/// is every boot after the first. A console that rewrote `token.dat` on each
-/// boot would be spending an SD write, and a commit window in which the file is
+/// Does nothing, successfully, when `token` already carries that id -- which is
+/// every boot after the first. A console that rewrote `token.dat` on each boot
+/// would be spending an SD write, and a commit window in which the file is
 /// briefly absent, on storing a value that did not change.
+///
+/// `token` is left untouched when the write fails, so the record and the disk
+/// never disagree: a caller whose SD card was full retries with the same record
+/// and actually writes, rather than short-circuiting on an id it only ever held
+/// in memory.
 ///
 /// A failed `registration` writes nothing and reports `kUnusableToken`: caching
 /// an id that was never confirmed is exactly the "a token with no device id,
