@@ -132,6 +132,20 @@ set_tests_properties(orca.romm_tab_pidfile orca.romm_tab_pidfile_streaming
                      orca.romm_tab_kept orca.romm_tab_created
                      PROPERTIES TIMEOUT 60)
 
+# --- the worktree lands ready to look at, and ready to work ------------------
+# `romm-browser.sh` opens RomM in a browser tab and signs it in; the log tab
+# proves the server is alive, this is where you can see what it scanned.
+# `agent-autostart.sh` sends the issue prompt Orca leaves drafted but unsent in a
+# new worktree's agent. Both stub the orca CLI and need neither Docker nor a
+# workspace, so they never skip.
+set(ORCA_BROWSER_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_orca_browser.sh")
+
+foreach(phase opens reuses foreign no_romm submits no_draft unstable)
+  add_test(NAME orca.browser_${phase}
+           COMMAND "${BASH_PROGRAM}" "${ORCA_BROWSER_TEST}" ${phase})
+  set_tests_properties(orca.browser_${phase} PROPERTIES TIMEOUT 60)
+endforeach()
+
 # --- worktree environment: scripts/orca/env.sh -------------------------------
 # setup.sh's first step, and not its only caller -- compose.sh generates a
 # missing .env too, so the romm tab writes one concurrently. Losing that race
