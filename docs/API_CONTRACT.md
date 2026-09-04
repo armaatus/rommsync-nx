@@ -106,9 +106,44 @@ All authed requests send `Authorization: Bearer <token>`.
 
 | Method | Path | Body → Response |
 |---|---|---|
-| GET | `/api/devices` | list this user's devices |
+| GET | `/api/devices` | list this user's devices → `DeviceSchema[]` |
 | POST | `/api/devices` | `DeviceCreatePayload` → `DeviceCreateResponse` |
-| GET/PUT/DELETE | `/api/devices/{device_id}` | manage one |
+| GET/PUT/DELETE | `/api/devices/{device_id}` | manage one → `DeviceSchema` |
+
+**Pairing is what registers the console. This client never calls
+`POST /api/devices`.**
+
+RomM creates the device row from the `client_device_identifier` in
+`POST /api/auth/device/init`, and the token response hands back its `device_id`
+([AUTH.md](AUTH.md)). Pair again with the same identifier and RomM answers with
+the *same* `device_id` — that is the mechanism the whole thing rests on, and
+`device.repair` checks it by counting the rows on the server.
+
+### Why `POST /api/devices` is the wrong call
+
+**Verified — it never matches on `client_device_identifier`.** RomM matches an
+existing device on `mac_address` *or* `hostname` and on nothing else. `name`,
+`platform`, `client` and `client_device_identifier` play no part, `allow_existing`
+on its own deduplicates nothing, and calling it with the device-bound client
+token *of the very device being described* does not change that. One console,
+six calls, five extra rows:
+
+| Call, as the paired console | Result |
+|---|---|
+| `{name, platform, client, allow_existing: true}` | **201**, a new `device_id`, every single time |
+| `{…, allow_existing: false}` | **201** as well — the flag is not a dedup switch |
+| `{…, hostname}` first call | **201**, a new `device_id` |
+| `{…, hostname}` again | **200**, the *same* `device_id` (even under a different `name`) |
+| `{…, hostname, allow_duplicate: true}` | **201** — a new row, matching suppressed |
+| `{…, mac_address}` | same as `hostname`, keyed on the MAC |
+
+The status code is the signal: `201` created, `200` matched. But none of the
+rows it creates carries a `client_device_identifier`, so none of them is the row
+pairing made and none of them can be found again by this console. And a new
+device has no sync history, which makes every save look like a first encounter
+([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md)).
+
+`DeviceCreateResponse` — note the id field is **`device_id`**, not `id`:
 
 ```json
 {
@@ -117,30 +152,47 @@ All authed requests send `Authorization: Bearer <token>`.
   "created_at": "2026-09-04T11:12:27.445281+00:00"
 }
 ```
-The id field is **`device_id`**, not `id`.
 
 `DeviceCreatePayload` (key fields): `name, platform, client, client_version,
 hostname, mac_address, sync_mode, sync_config, allow_existing, allow_duplicate,
 reset_syncs`.
 
-**Verified — registration is not idempotent by name.** RomM matches an existing
-device on `mac_address` *or* `hostname`; `name`, `platform` and `client` play no
-part, and `allow_existing` on its own deduplicates nothing. Post the same
-name-only payload three times and you get three devices:
+`device.never_post` holds this finding in the test suite, because a document
+cannot go red.
 
-| Payload | Result |
+### Reading the device back
+
+`GET /api/devices/{device_id}` returns `DeviceSchema`
+(`captures/devices-get.json`), where the id field is **`id`** — the same value
+the token response calls `device_id`:
+
+```json
+{
+  "id": "3e175584-2641-44bd-913b-e42d8fc64f85",
+  "user_id": 1,
+  "name": "probe_contract.py",
+  "platform": "switch",
+  "client": "rommsync-nx-probe",
+  "client_version": "0.0.0",
+  "ip_address": null, "mac_address": null, "hostname": null,
+  "client_device_identifier": "probe-contract-script",
+  "sync_mode": "api",
+  "sync_enabled": true,
+  "sync_config": null,
+  "last_seen": "…", "created_at": "…", "updated_at": "…"
+}
+```
+
+Three of these decide whether the console can sync at all, and all three are
+worth reading at boot rather than meeting mid-sync:
+
+| Observed | Meaning |
 |---|---|
-| `{name, platform, client}` | **201**, a new `device_id`, every single time |
-| `{name, …, mac_address}` first call | **201**, a new `device_id` |
-| `{name, …, mac_address}` again | **200**, the *same* `device_id` (even under a different `name`) |
-| `{name, …, hostname}` | same, keyed on hostname |
+| `404 {"detail": "Device with ID … not found"}` | deleted in the web UI. The token still works and `GET /api/devices` still lists — only this device is gone. `POST /api/sync/negotiate` answers the same 404. |
+| `sync_enabled: false` | the user's own switch. `POST /api/sync/negotiate` answers `400 {"detail": "Sync is disabled for this device"}`. |
+| `client_device_identifier` | the only field that ties a row to a console. `null` on every device RomM did not pair, so it is also the only way to search the list for one. |
 
-So the sysmodule must either reuse the `device_id` the token response gave it,
-or send a stable `mac_address`/`hostname` and cache what comes back. Registering
-on every boot with a name only accretes a device per boot, and each new device
-has no sync history — which makes every save look like a first encounter
-([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md)). The status code is the signal: `201`
-created, `200` matched.
+A `401` here is the token revoked, not expired ([AUTH.md](AUTH.md#re-pairing--revocation)).
 
 ## Save sync — negotiate → execute → complete
 

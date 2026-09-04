@@ -184,6 +184,12 @@ class Reader {
   /// if it does not fit an `int64_t`.
   bool Required(std::string_view key, std::int64_t* out);
 
+  /// A required boolean. Only `true` and `false`: a `0`, a `1` or a `"true"` is
+  /// a field that does not mean what the reader would take it to mean, and the
+  /// flags RomM sends this way -- `sync_enabled` -- decide whether the client
+  /// syncs at all.
+  bool Required(std::string_view key, bool* out);
+
   /// A required array of strings. May be empty: an approval that granted no
   /// scopes is a real answer, and one the caller has to see.
   bool Required(std::string_view key, std::vector<std::string>* out);

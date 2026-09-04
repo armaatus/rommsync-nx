@@ -115,11 +115,12 @@ first draft of this file — would have you write:
    `detail` string can — see the table below.
 
 The token response already includes a **`device_id`**. That is the paired
-device, and it is enough to negotiate with: `POST /api/devices` creates *another*
-device unless it is given a stable `mac_address` or `hostname`
-([API_CONTRACT.md](API_CONTRACT.md#device-registration)). Registering a fresh
-device on each boot gives every save an empty sync history and makes the first
-negotiation of every tick look like a first encounter.
+device, and it is the whole registration: `POST /api/devices` never matches on
+`client_device_identifier`, so it creates *another* device however it is called
+([API_CONTRACT.md](API_CONTRACT.md#why-post-apidevices-is-the-wrong-call)).
+Registering a fresh device on each boot gives every save an empty sync history
+and makes the first negotiation of every tick look like a first encounter. See
+[Device registration](#device-registration) below.
 
 `scopes` is what the user **approved**, which need not be everything requested —
 read it back and disable the features whose scope is missing rather than
@@ -278,6 +279,7 @@ snapshot does not model.
 | says nothing about the order of `scopes` | returns them sorted alphabetically, not in the order requested | Read as a set (`DeviceTokenResponse::HasScope`), never by index. |
 | says nothing about `scopes` being a subset | really does return only the subset that was approved | Read back and used to disable features, per the note above. |
 | says nothing about the `user_code` alphabet | draws from `ABCDEFGHJKMNPQRSTUVWXYZ23456789` | Displayed verbatim. The confusable characters are already excluded upstream, so nothing "corrects" them. |
+| gives `DeviceCreatePayload.allow_existing` a default of `true` and no other description | matches an existing device on `hostname` or `mac_address` only, so the flag deduplicates nothing on its own — and never matches on `client_device_identifier` | The client does not call `POST /api/devices` at all. [Device registration](#device-registration). |
 
 One thing the snapshot got right and an earlier draft of this page got wrong:
 `POST /api/auth/device/init` answers **`201`**, which the snapshot declares and
@@ -334,6 +336,62 @@ error rather than a reason to mint, because a card having a bad moment is not
 evidence that no identifier exists and minting over one cannot be undone. A file
 that reads back and is not a record is replaced, since there is nothing left in
 it to preserve.
+
+## Device registration
+
+Every sync call is scoped by a `device_id`, and pairing is what produces one.
+There is no separate registration step: RomM creates the device row from the
+`client_device_identifier` in `POST /api/auth/device/init`, and the token
+response hands back its id. `POST /api/devices` would create a *second* device —
+it matches on `hostname` or `mac_address` and on nothing else, not even for the
+device-bound token of the device it is describing
+([API_CONTRACT.md](API_CONTRACT.md#why-post-apidevices-is-the-wrong-call)).
+[`device_registration.hpp`](../core/include/rommsync/device_registration.hpp) is
+the module, and it only ever reads.
+
+So the console's three states are:
+
+| State | The record holds | What to do |
+|---|---|---|
+| `unpaired` | no token | pair |
+| `unregistered` | a token and no `device_id` | pair — but **not** an error to raise at sync time |
+| `registered` | both | confirm it, then sync |
+
+The middle one is why this is a state and not a boolean. `SaveToken` already
+refuses to write a record with a blank `device_id`, so it is not a file the
+console can end up holding — but a token that names no device must never be
+*used* either, because an empty id scopes nothing, and "not fully paired" and
+"unpaired" have the same remedy.
+
+**Confirm at boot, with one `GET /api/devices/{id}`.** It costs one request and
+turns three things that would otherwise surface as a puzzling mid-sync failure
+into a sentence before the first save is touched: a `401` (the token was
+revoked), a `404` (the device was deleted in the web UI while the token stayed
+valid), and `sync_enabled: false` (the user's own switch, which makes negotiate
+answer `400 "Sync is disabled for this device"`).
+
+The four outcomes are deliberately not collapsed, because the remedies differ:
+
+| Outcome | Retry? | Re-pair? |
+|---|---|---|
+| `unreachable`, `server_error` | yes | no — a dropped connection is not a verdict on the pairing |
+| `unauthorized`, `no_such_device`, `not_registered` | no | yes |
+| `sync_disabled`, `ambiguous` | no | no — neither waiting nor re-pairing turns the switch back on |
+| `malformed` | no | no — an answer this client cannot read is not one to hammer |
+
+**Recovery is a search, not a registration.** A token with no `device_id` is
+resolved by listing `GET /api/devices` and matching on
+`client_device_identifier` — the row is already there, and that field is the only
+thing pointing back at this console. Two rows carrying one identifier is a state
+RomM permits and this client refuses to guess its way out of (`ambiguous`):
+picking one would send this console's saves to whichever sorted first.
+
+`ResolveRegistration` falls back to that search only when the cached id names no
+device. Widening it inverts a diagnosis — a console that could not reach its
+server would be told by a second, luckier request that its device is fine.
+
+Caching the resolved id writes `token.dat` only when it actually changed, which
+is never after the first boot.
 
 ## Scopes
 

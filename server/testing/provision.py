@@ -409,42 +409,49 @@ def issue_client_token(romm: Romm) -> dict:
             token = body.get("access_token")
             if not token:
                 raise ProvisionError(f"token response has no access_token: {sorted(body)}")
-            return {"token": token, "device_identifier": device_identifier, "raw": body}
+            # The device comes back with the token because pairing is what
+            # registers the console -- RomM created the row from
+            # `client_device_identifier` above. There is nothing else to call.
+            device_id = body.get("device_id")
+            if not device_id:
+                raise ProvisionError(f"token response has no device_id: {sorted(body)}")
+            return {"token": token, "device_identifier": device_identifier,
+                    "device_id": device_id, "raw": body}
         if tok.status_code not in (400, 401, 428):
             raise ProvisionError(f"device token failed: {tok.status_code} {tok.text[:200]}")
         time.sleep(interval)
     raise ProvisionError("device code was approved but no token was issued within 60s")
 
 
-def register_device(romm: Romm, token: str) -> str:
-    """Register the fixture as a device and return its device_id.
+def confirm_device(romm: Romm, token: str, device_id: str) -> str:
+    """Read back the device pairing registered, and return its id.
 
-    Sync calls are scoped by device_id (docs/API_CONTRACT.md#device-registration),
-    so a fixture without one cannot exercise the sync loop at all.
+    A read, not a `POST /api/devices`. Pairing already created the row; posting
+    would create a *second* one, because RomM matches an existing device on
+    `hostname` or `mac_address` and never on `client_device_identifier` -- not
+    even for the device-bound token of the device being described
+    (docs/API_CONTRACT.md#why-post-apidevices-is-the-wrong-call). The fixture
+    used to do exactly that, and every provisioned worktree carried two devices
+    for one console, with the sync tests pointed at the one that had no
+    `client_device_identifier` and could never be found again.
+
+    Confirming is also what the sysmodule does at boot, so this is the same call
+    on the same path: a fixture that cannot read its own device back is a broken
+    fixture, and saying so here beats an empty `device_id` surfacing inside
+    whichever sync test negotiates with it.
     """
-    r = romm.post(
-        "/api/devices",
-        headers={"Authorization": f"Bearer {token}"},
-        json={
-            "name": "rommsync fixture",
-            "platform": "switch",
-            "client": "rommsync-nx",
-            "allow_existing": True,
-        },
-    )
-    if r.status_code in (200, 201):
-        body = r.json()
-        # The response names it `device_id`, not `id` -- API_CONTRACT.md said
-        # `id` until this fixture checked it against a live 5.2.0.
-        device_id = body.get("device_id") or body.get("id")
-        if device_id is None:
-            raise ProvisionError(f"device response has no device_id: {sorted(body)}")
-        return device_id
-    # Fatal. Every sync call is scoped by device_id, so a fixture without one
-    # fails later, inside whichever sync test negotiates with an empty id --
-    # exactly the "looks like a bug in the test's own code" failure this whole
-    # change exists to remove.
-    raise ProvisionError(f"device registration failed: {r.status_code} {r.text[:200]}")
+    r = romm.get(f"/api/devices/{device_id}", headers={"Authorization": f"Bearer {token}"})
+    if r.status_code != 200:
+        raise ProvisionError(
+            f"the paired device could not be read back: {r.status_code} {r.text[:200]}")
+    body = r.json()
+    # `id` here, `device_id` in the token response -- the same value under two
+    # names (docs/API_CONTRACT.md#reading-the-device-back).
+    if body.get("id") != device_id:
+        raise ProvisionError(f"the server answered about {body.get('id')}, not {device_id}")
+    if not body.get("sync_enabled", False):
+        raise ProvisionError(f"sync is disabled for device {device_id}")
+    return device_id
 
 
 def base_url_from_env_file() -> str | None:
@@ -515,7 +522,7 @@ def main() -> int:
 
         collection_id = ensure_collection(romm)
         creds = issue_client_token(romm)
-        device_id = register_device(romm, creds["token"])
+        device_id = confirm_device(romm, creds["token"], creds["device_id"])
 
         write_env(
             args.out,
