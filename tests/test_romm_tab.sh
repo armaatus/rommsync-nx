@@ -40,9 +40,18 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 OUT=""
 TMPDIR_FIXTURE=""
-FOLLOWER_PID=""
+FOLLOWER_PIDS=""
+stop_follower() {
+  local pid="$1"
+  pkill -P "$pid" 2>/dev/null
+  kill "$pid" 2>/dev/null
+  # Waited for, not just signalled: an unreaped follower keeps a cwd inside the
+  # fixture that cleanup is about to delete.
+  wait "$pid" 2>/dev/null
+}
 cleanup() {
-  [ -n "$FOLLOWER_PID" ] && { pkill -P "$FOLLOWER_PID" 2>/dev/null; kill "$FOLLOWER_PID" 2>/dev/null; }
+  local pid
+  for pid in $FOLLOWER_PIDS; do stop_follower "$pid"; done
   rm -f "$OUT"
   [ -n "$TMPDIR_FIXTURE" ] && rm -rf "$TMPDIR_FIXTURE"
   return 0
@@ -51,28 +60,41 @@ trap cleanup EXIT
 
 # A worktree root holding just enough of the repo to run the orca scripts, with a
 # compose project that has no containers -- the state Orca opens the tab in.
+#
+# Sets $TMPDIR_FIXTURE rather than echoing the path: called as `$(make_fixture)`
+# the assignment would happen in a subshell, cleanup would never see it, and
+# every run would leak a fixture tree.
 make_fixture() {
-  local tmp
-  tmp="$(mktemp -d)"
-  TMPDIR_FIXTURE="$tmp"
-  mkdir -p "$tmp/scripts/orca" "$tmp/server/testing"
+  TMPDIR_FIXTURE="$(mktemp -d)"
+  mkdir -p "$TMPDIR_FIXTURE/scripts/orca" "$TMPDIR_FIXTURE/server/testing"
   cp "$REPO_ROOT"/scripts/orca/{romm-logs.sh,compose.sh,env.sh,ensure-romm-tab.sh} \
-     "$tmp/scripts/orca/"
-  cp "$REPO_ROOT/server/testing/docker-compose.yml" "$tmp/server/testing/"
-  cat >"$tmp/.env" <<ENV
+     "$TMPDIR_FIXTURE/scripts/orca/"
+  cp "$REPO_ROOT/server/testing/docker-compose.yml" "$TMPDIR_FIXTURE/server/testing/"
+  cat >"$TMPDIR_FIXTURE/.env" <<ENV
 COMPOSE_PROJECT_NAME=rmx-test-no-stack-$$
 ROMM_PORT=21999
 PROXY_PORT=23999
 ENV
-  echo "$tmp"
 }
 
-# Start a follower against $1 and leave it running; its pidfile is $2.
+# Start a follower against $1 and leave it running; its pidfile is $2. The pid
+# lands in $STARTED_FOLLOWER, and every follower is reaped by cleanup.
+STARTED_FOLLOWER=""
 start_follower() {
-  OUT="$(mktemp)"
+  # One log for every follower a phase starts: a fresh mktemp per call would
+  # orphan the previous one, since cleanup only ever removes the last $OUT.
+  [ -n "$OUT" ] || OUT="$(mktemp)"
   ROMM_LOGS_POLL_SECONDS=1 ROMM_LOGS_PIDFILE="$2" \
-    bash "$1/scripts/orca/romm-logs.sh" >"$OUT" 2>&1 &
-  FOLLOWER_PID=$!
+    bash "$1/scripts/orca/romm-logs.sh" >>"$OUT" 2>&1 &
+  STARTED_FOLLOWER=$!
+  FOLLOWER_PIDS="$FOLLOWER_PIDS $STARTED_FOLLOWER"
+}
+
+# Wait up to 5s for $1 to hold a pid; 0 if it does.
+await_pidfile() {
+  local _
+  for _ in $(seq 1 50); do [ -s "$1" ] && return 0; sleep 0.1; done
+  return 1
 }
 
 # An `orca` on PATH that records its arguments instead of touching a workspace.
@@ -109,7 +131,7 @@ case "${1:-}" in
   wait)
     # A worktree root whose compose project has no containers -- exactly the
     # state Orca opens the tab in, before setup.sh reaches `compose up -d`.
-    tmp="$(make_fixture)"
+    make_fixture; tmp="$TMPDIR_FIXTURE"
 
     # Without this the phase is vacuous: stack_is_up returns 1 on ANY failure --
     # including a fixture too incomplete to run compose at all -- and the script
@@ -147,37 +169,46 @@ case "${1:-}" in
   pidfile)
     # Everything below decides "is a tab already following?" from this file, so
     # if it is not published and withdrawn accurately the rest is guesswork.
-    tmp="$(make_fixture)"
+    make_fixture; tmp="$TMPDIR_FIXTURE"
     pf="$tmp/romm-logs.pid"
-    start_follower "$tmp" "$pf"
+    start_follower "$tmp" "$pf"; first="$STARTED_FOLLOWER"
 
-    for _ in $(seq 1 50); do [ -s "$pf" ] && break; sleep 0.1; done
-    [ -s "$pf" ] || fail "follower published no pidfile at $pf"
-    [ "$(cat "$pf")" = "$FOLLOWER_PID" ] \
-      || fail "pidfile says $(cat "$pf"), follower is $FOLLOWER_PID"
+    await_pidfile "$pf" || fail "follower published no pidfile at $pf"
+    [ "$(cat "$pf")" = "$first" ] || fail "pidfile says $(cat "$pf"), follower is $first"
     kill -0 "$(cat "$pf")" 2>/dev/null || fail "pidfile names a process that is not running"
 
-    pkill -P "$FOLLOWER_PID" 2>/dev/null
-    kill "$FOLLOWER_PID" 2>/dev/null
-    wait "$FOLLOWER_PID" 2>/dev/null
-    FOLLOWER_PID=""
+    # A second follower -- exactly what the hint tells an operator to start by
+    # hand -- takes the pidfile with it when it exits first. Without the reclaim
+    # in romm-logs.sh the survivor is then invisible, and the next setup run
+    # opens a duplicate tab alongside a perfectly good one.
+    start_follower "$tmp" "$pf"; second="$STARTED_FOLLOWER"
+    await_pidfile "$pf" || fail "second follower published no pidfile"
+    stop_follower "$second"
+    reclaimed=""
+    for _ in $(seq 1 50); do
+      [ "$(cat "$pf" 2>/dev/null)" = "$first" ] && { reclaimed=yes; break; }
+      sleep 0.1
+    done
+    [ -n "$reclaimed" ] \
+      || fail "a departing follower stranded the survivor; pidfile is now: $(cat "$pf" 2>/dev/null || echo gone)"
+
+    stop_follower "$first"
     for _ in $(seq 1 50); do [ -e "$pf" ] || break; sleep 0.1; done
     [ -e "$pf" ] && fail "pidfile outlived the follower; setup would think a dead tab is live"
-    echo "PASS: follower publishes a live pidfile and withdraws it on exit"
+    echo "PASS: pidfile tracks the live follower, through a second one coming and going"
     ;;
 
   ensure_noop)
     # Orca honoured defaultTabs. Creating a second tab every setup run would be a
     # slow leak of duplicate tabs, so the fix has to recognise its own success.
-    tmp="$(make_fixture)"
+    make_fixture; tmp="$TMPDIR_FIXTURE"
     pf="$tmp/romm-logs.pid"
     stub="$(stub_orca "$tmp")"
     PATH="$stub:$PATH" command -v orca >/dev/null \
       || fail "fixture is broken: the stub orca is not on PATH, so calling it could not be detected"
 
     start_follower "$tmp" "$pf"
-    for _ in $(seq 1 50); do [ -s "$pf" ] && break; sleep 0.1; done
-    [ -s "$pf" ] || fail "follower never started; this phase would pass for the wrong reason"
+    await_pidfile "$pf" || fail "follower never started; this phase would pass for the wrong reason"
 
     out="$(PATH="$stub:$PATH" ROMM_LOGS_PIDFILE="$pf" \
            bash "$tmp/scripts/orca/ensure-romm-tab.sh" 2>&1)"
@@ -190,23 +221,29 @@ case "${1:-}" in
   ensure_creates)
     # The regression. Orca created the tabs and dispatched no commands, so no
     # follower is running and nothing but this script will ever ask for one.
-    tmp="$(make_fixture)"
+    make_fixture; tmp="$TMPDIR_FIXTURE"
     pf="$tmp/romm-logs.pid"
     stub="$(stub_orca "$tmp")"
 
-    out="$(PATH="$stub:$PATH" ROMM_LOGS_PIDFILE="$pf" \
+    out="$(PATH="$stub:$PATH" ROMM_LOGS_PIDFILE="$pf" ROMM_TAB_WAIT_SECONDS=1 \
            bash "$tmp/scripts/orca/ensure-romm-tab.sh" 2>&1)"
     calls="$(cat "$tmp/orca-calls.log")"
     grep -q "terminal create" <<<"$calls" || fail "asked the CLI for no tab; got: ${calls:-<nothing>} / $out"
     grep -q -- "--title romm" <<<"$calls" || fail "tab would be untitled -- the state we cannot tell apart: $calls"
     grep -q -- "path:$tmp" <<<"$calls" || fail "tab would land in the wrong worktree: $calls"
     grep -q "romm-logs.sh" <<<"$calls" || fail "tab would run no follower: $calls"
+    # The stub exits 0 without starting anything -- which is also how Orca
+    # behaves in the bug being worked around, and how it behaves when it falls
+    # back to a background handle the UI never adopts. Reporting "created" there
+    # rebuilds the silent state this script exists to remove.
+    grep -q "nothing is following it" <<<"$out" \
+      || fail "claimed a tab that is following nothing; got: $out"
 
     # A live pid that is not a follower: `kill -0` alone accepts it, and the tab
     # would then be silently skipped for whatever recycled that pid.
     : >"$tmp/orca-calls.log"
     echo $$ >"$pf"
-    PATH="$stub:$PATH" ROMM_LOGS_PIDFILE="$pf" \
+    PATH="$stub:$PATH" ROMM_LOGS_PIDFILE="$pf" ROMM_TAB_WAIT_SECONDS=1 \
       bash "$tmp/scripts/orca/ensure-romm-tab.sh" >/dev/null 2>&1
     grep -q "terminal create" "$tmp/orca-calls.log" \
       || fail "a stale pidfile whose pid was reused suppressed the tab"
@@ -214,7 +251,7 @@ case "${1:-}" in
     ;;
 
   *)
-    echo "usage: $0 wait|follow" >&2
+    echo "usage: $0 wait|follow|pidfile|ensure_noop|ensure_creates" >&2
     exit 2
     ;;
 esac

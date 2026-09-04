@@ -129,6 +129,20 @@ add_test(NAME orca.romm_tab_created COMMAND "${BASH_PROGRAM}" "${ROMM_TAB_TEST}"
 set_tests_properties(orca.romm_tab_pidfile orca.romm_tab_kept orca.romm_tab_created
                      PROPERTIES TIMEOUT 60)
 
+# --- worktree environment: scripts/orca/env.sh -------------------------------
+# setup.sh's first step, and not its only caller -- compose.sh generates a
+# missing .env too, so the romm tab writes one concurrently. Losing that race
+# used to abort setup under `set -e` and leave a worktree with nothing
+# provisioned. Pure shell and filesystem: no docker, so these never skip.
+set(ORCA_ENV_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_orca_env.sh")
+
+add_test(NAME orca.env_concurrent_writers
+         COMMAND "${BASH_PROGRAM}" "${ORCA_ENV_TEST}" concurrent)
+add_test(NAME orca.env_never_partial
+         COMMAND "${BASH_PROGRAM}" "${ORCA_ENV_TEST}" readable)
+set_tests_properties(orca.env_concurrent_writers orca.env_never_partial
+                     PROPERTIES TIMEOUT 60)
+
 # --- worktree teardown: the archive hook in orca.yaml -------------------------
 # `derives` needs no docker, so the regression it guards -- teardown falling back
 # to the compose default and removing nothing -- stays checkable with Docker
