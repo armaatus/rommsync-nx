@@ -83,10 +83,6 @@ std::optional<Registration> Refused(const http::Result& result, std::string_view
                 std::string(what) + " was rejected: HTTP " + std::to_string(status) +
                     "; the token has been revoked");
   }
-  if (status == 404) {
-    return Fail(RegistrationError::kNoSuchDevice,
-                std::string(what) + ": the server has no such device (HTTP 404)");
-  }
   if (status >= 500) {
     return Fail(RegistrationError::kServerError,
                 std::string(what) + ": HTTP " + std::to_string(status));
@@ -281,6 +277,14 @@ Registration ConfirmRegistration(http::HttpClient& client, const StoredToken& to
       client.Send(AuthedGet(ApiUrl(token.server_url, std::string(kDevicesPath) + "/" +
                                                          token.device_id),
                             token.access_token, timeout));
+  // Handled here rather than in `Refused`, because a 404 means two different
+  // things at the two paths this module calls: on one device it is the device
+  // being gone, which is a state to report; on the list it would be the endpoint
+  // being gone, which is not a statement about any device at all.
+  if (result.ok() && result.response.status == 404) {
+    return Fail(RegistrationError::kNoSuchDevice,
+                "the device lookup: the server has no such device (HTTP 404)");
+  }
   if (const std::optional<Registration> refused = Refused(result, "the device lookup")) {
     return *refused;
   }
