@@ -18,13 +18,19 @@ namespace {
 
 using namespace std::chrono_literals;
 
+/// Ceiling on the two numbers in the IPC payload. Generous next to a code that
+/// lives ten minutes and is polled every five seconds, and small enough that
+/// neither an `int` nor a duration can be made to wrap.
+constexpr std::int64_t kMaxCount = 1'000'000;
+
 constexpr const char* kInitPath = "/api/auth/device/init";
 constexpr const char* kTokenPath = "/api/auth/device/token";
 
 /// Every `PairingState`, so the IPC decoder and `ToString` cannot drift.
 constexpr PairingState kAllStates[] = {
-    PairingState::kIdle,   PairingState::kPending, PairingState::kApproved,
-    PairingState::kDenied, PairingState::kExpired, PairingState::kFailed,
+    PairingState::kIdle,     PairingState::kStarting, PairingState::kPending,
+    PairingState::kApproved, PairingState::kDenied,   PairingState::kExpired,
+    PairingState::kFailed,
 };
 
 std::string InitBody(const PairingConfig& config) {
@@ -83,6 +89,11 @@ bool ReadText(const json::Value& object, std::string_view key, std::string* out,
   return true;
 }
 
+/// A count that has to be a plain non-negative integer. Held to the same bar as
+/// a response off the network even though the writer is our own encoder: a
+/// negative countdown or a poll count that does not fit an `int` says the
+/// payload came from something other than `SerializePairingStatus`, and a
+/// decoder that shrugged at it would hand the overlay a number to render.
 bool ReadCount(const json::Value& object, std::string_view key, std::int64_t* out,
                json::Error* error) {
   const json::Value* found = object.Find(key);
@@ -96,6 +107,11 @@ bool ReadCount(const json::Value& object, std::string_view key, std::int64_t* ou
     error->message = std::string("expected an integer, got ") + json::ToString(found->type());
     return false;
   }
+  if (found->integer() < 0 || found->integer() > kMaxCount) {
+    error->field = std::string(key);
+    error->message = "is not a plausible count";
+    return false;
+  }
   *out = found->integer();
   return true;
 }
@@ -106,6 +122,8 @@ const char* ToString(PairingState state) {
   switch (state) {
     case PairingState::kIdle:
       return "idle";
+    case PairingState::kStarting:
+      return "starting";
     case PairingState::kPending:
       return "pending";
     case PairingState::kApproved:
@@ -240,6 +258,11 @@ PairingState PairingSession::Begin() {
     init_ = DeviceInitResponse{};
     transient_failures_ = 0;
     rejected_polls_ = 0;
+    // Both belong to the attempt being discarded. `Poll()`'s state guard means
+    // a stale one is never acted on, but `next_poll_at()` is public and would
+    // otherwise report the previous attempt's schedule after a failed re-pair.
+    deadline_ = Now();
+    next_poll_ = deadline_;
 
     // Caught here rather than as RomM's 422: the server's answer would name a
     // field of a request body, which is a long way from "nobody has configured
@@ -253,6 +276,10 @@ PairingState PairingSession::Begin() {
     if (config_.requested_scopes.empty()) {
       return Fail("no scopes were requested");
     }
+    // Published before the request goes out, so the overlay can say
+    // "contacting the server" instead of "not started" for however long an
+    // unreachable one takes to time out.
+    status_.state = PairingState::kStarting;
   }
 
   const http::Result result =
@@ -330,6 +357,7 @@ PairingState PairingSession::Poll() {
     // still has most of its ten minutes, so this backs off rather than
     // abandoning the pairing screen.
     ++transient_failures_;
+    rejected_polls_ = 0;
     BackOff();
     status_.message =
         std::string("poll did not complete: ") + http::ToString(result.error) + ", retrying";
@@ -368,18 +396,21 @@ PairingState PairingSession::Poll() {
       // that window on the poll it answered, so anything shorter would earn
       // another one.
       ++transient_failures_;
+      rejected_polls_ = 0;
       BackOff();
       status_.message = "the server asked us to poll more slowly";
       return status_.state;
 
     case TokenPoll::kRateLimited:
       ++transient_failures_;
+      rejected_polls_ = 0;
       BackOff();
       status_.message = "the server is rate limiting us; backing off";
       return status_.state;
 
     case TokenPoll::kServerError:
       ++transient_failures_;
+      rejected_polls_ = 0;
       BackOff();
       status_.message = "the server is unwell (HTTP " +
                         std::to_string(result.response.status) + "); retrying";
@@ -405,7 +436,11 @@ PairingState PairingSession::Poll() {
   // A 401 or 403 cannot be a verdict on the device_code: this endpoint takes no
   // credentials, so RomM has nothing to reject. It is something in front of it,
   // and that is worth a few retries and then a diagnosis -- see
-  // `PairingConfig::max_rejected_polls`.
+  // `PairingConfig::max_rejected_polls`. The budget counts *consecutive*
+  // rejections, which is why every other outcome above clears it: a gateway
+  // that answers 401 once every few minutes is a bad minute, not a proxy
+  // demanding credentials, and abandoning a code with eight minutes left over
+  // it would report something that did not happen.
   const int status_code = result.response.status;
   if (status_code == 401 || status_code == 403) {
     ++rejected_polls_;

@@ -105,8 +105,11 @@ ctest --test-dir build --output-on-failure
   resource the rig serves that does not first need a library scan, which is
   socket.io-driven rig work belonging to M0-5.
 - The `pair.*` tests cover the device-code flow end to end (M1-1): `happy`,
-  `mid_poll`, `denied`, `expired`, `retry`, `unauthorized`, `stall`, `drop`,
-  `lost_grant`, `payload`. Every code is one a real RomM issued, every approval
+  `starting`, `mid_poll`, `denied`, `expired`, `retry`, `unauthorized`,
+  `rejection_streak`, `stall`, `drop`, `lost_grant`, `payload`. `starting` is
+  the only one that needs two threads — it drives `Begin()` on one and
+  `status()` on the other, which is the threading contract the overlay depends
+  on. Every code is one a real RomM issued, every approval
   goes through RomM's own `/api/auth/device/approve` and every denial through
   `/api/auth/device/deny` — the endpoints that let a test be the human the grant
   assumes. They wait out real poll intervals rather than faking a clock, because

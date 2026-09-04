@@ -138,6 +138,32 @@ auth::PairingState RunUntilTerminal(
   return session.status().state;
 }
 
+/// `rig::Checks::ExpectOk` only says the exchange completed -- a 422 from
+/// `/approve` or a 400 from `/__fault` passes it. That matters here more than
+/// anywhere else in the suite: a scenario whose approval was rejected does not
+/// fail on the approval, it polls a code nobody approved for the full budget and
+/// reports "the pairing did not settle", which names the wrong thing. So every
+/// call that sets a scenario up goes through this instead.
+void ExpectSucceeded(rig::Checks& checks, const http::Result& result, const std::string& what) {
+  checks.ExpectOk(result, what);
+  if (result.ok() && !result.successful()) {
+    checks.Expect(false, what + " -- HTTP " + std::to_string(result.response.status) + ": " +
+                             result.response.body.substr(0, 200));
+  }
+}
+
+/// What the fault proxy currently has armed, or an empty string.
+///
+/// A scenario that arms a fault and then does not get it is indistinguishable
+/// from one whose code behaved differently, so the ones that depend on a fault
+/// still being live check rather than assume.
+std::string ArmedFault(http::HttpClient& client, const std::string& base) {
+  http::Request request;
+  request.url = base + "/__fault";
+  const http::Result result = client.Send(request);
+  return result.successful() ? result.response.body : std::string();
+}
+
 void ExpectState(rig::Checks& checks, auth::PairingState got, auth::PairingState want,
                  const std::string& what) {
   checks.ExpectEq(std::string(auth::ToString(got)), std::string(auth::ToString(want)), what);
@@ -157,7 +183,10 @@ std::string BeginAndShow(auth::PairingSession& session, rig::Checks& checks,
   while (state == auth::PairingState::kFailed &&
          session.status().message.find("429") != std::string::npos &&
          Clock::now() < give_up) {
-    std::this_thread::sleep_for(5s);
+    // Two seconds, not five: the limit clears on a rolling minute, so a coarse
+    // sleep overshoots it and is what makes these scenarios' wall clock vary by
+    // half a minute between runs.
+    std::this_thread::sleep_for(2s);
     state = session.Begin();
   }
   ExpectState(checks, state, auth::PairingState::kPending,
@@ -183,7 +212,7 @@ int Happy(http::HttpClient& client, const std::string& base) {
   auth::PairingSession session(client, Config(base));
   const std::string user_code = BeginAndShow(session, checks, base);
 
-  checks.ExpectOk(Approve(client, base, user_code), "approving the code");
+  ExpectSucceeded(checks, Approve(client, base, user_code), "approving the code");
   ExpectState(checks, RunUntilTerminal(session, checks), auth::PairingState::kApproved,
               "an approved code yields a token");
 
@@ -248,7 +277,7 @@ int MidPoll(http::HttpClient& client, const std::string& base) {
       RunUntilTerminal(session, checks, [&](const auth::PairingStatus& status) {
         if (!approved && status.polls >= 2) {
           approved = true;
-          checks.ExpectOk(Approve(client, base, user_code), "approving mid-poll");
+          ExpectSucceeded(checks, Approve(client, base, user_code), "approving mid-poll");
         }
       });
   ExpectState(checks, state, auth::PairingState::kApproved, "an approval mid-poll is picked up");
@@ -271,7 +300,7 @@ int Denied(http::HttpClient& client, const std::string& base) {
   auth::PairingSession session(client, Config(base));
   const std::string user_code = BeginAndShow(session, checks, base);
 
-  checks.ExpectOk(Deny(client, base, user_code), "denying the code");
+  ExpectSucceeded(checks, Deny(client, base, user_code), "denying the code");
   ExpectState(checks, RunUntilTerminal(session, checks), auth::PairingState::kDenied,
               "a denied code ends as denied, not as expired");
   checks.Expect(session.token() == nullptr, "a denied pairing carries no token");
@@ -320,7 +349,7 @@ int Expired(http::HttpClient& client, const std::string& base) {
   http::Result opened = client.Send(init);
   const Clock::time_point give_up = Clock::now() + kBudget;
   while (opened.response.status == 429 && Clock::now() < give_up) {
-    std::this_thread::sleep_for(5s);
+    std::this_thread::sleep_for(2s);
     opened = client.Send(init);
   }
   checks.ExpectOk(opened, "opening a code to redeem twice");
@@ -331,7 +360,7 @@ int Expired(http::HttpClient& client, const std::string& base) {
     checks.Expect(false, "the init response parses: " + parsed.error.Describe());
     return checks.failures();
   }
-  checks.ExpectOk(Approve(client, base, parsed.value.user_code), "approving it");
+  ExpectSucceeded(checks, Approve(client, base, parsed.value.user_code), "approving it");
 
   http::Request poll;
   poll.method = http::Method::kPost;
@@ -359,9 +388,9 @@ int Retries(http::HttpClient& client, const std::string& base) {
   rig::Checks checks;
   auth::PairingSession session(client, Config(base));
   const std::string user_code = BeginAndShow(session, checks, base);
-  checks.ExpectOk(Approve(client, base, user_code), "approving before the trouble starts");
+  ExpectSucceeded(checks, Approve(client, base, user_code), "approving before the trouble starts");
 
-  checks.ExpectOk(rig::ArmFault(client, base,
+  ExpectSucceeded(checks, rig::ArmFault(client, base,
                                 R"({"mode":"status","status":503,)"
                                 R"("path":"/api/auth/device/token","count":2})"),
                   "arming two 503s on the token endpoint");
@@ -390,20 +419,82 @@ int Unauthorized(http::HttpClient& client, const std::string& base) {
   config.max_rejected_polls = 2;
   auth::PairingSession session(client, config);
   const std::string user_code = BeginAndShow(session, checks, base);
-  checks.ExpectOk(Approve(client, base, user_code), "approving, so only the 401s can stop this");
+  ExpectSucceeded(checks, Approve(client, base, user_code), "approving, so only the 401s can stop this");
 
-  checks.ExpectOk(rig::ArmFault(client, base,
+  ExpectSucceeded(checks, rig::ArmFault(client, base,
                                 R"({"mode":"status","status":401,)"
                                 R"("path":"/api/auth/device/token","count":10})"),
                   "arming a proxy that always answers 401");
 
-  const auth::PairingState state = RunUntilTerminal(session, checks);
+  std::string armed_after_first;
+  const auth::PairingState state =
+      RunUntilTerminal(session, checks, [&](const auth::PairingStatus& status) {
+        if (armed_after_first.empty() && status.polls == 1) {
+          armed_after_first = ArmedFault(client, base);
+        }
+      });
   rig::DisarmFault(client, base);
 
+  // Without this, a fault that vanished between the two polls reads as "the
+  // state machine gave up on a 401 it should have failed on" -- the same
+  // assertion failing for the opposite reason.
+  checks.Expect(armed_after_first.find("401") != std::string::npos,
+                "the 401 was still armed for the second poll, not just the first (" +
+                    armed_after_first + ")");
   ExpectState(checks, state, auth::PairingState::kFailed, "a persistent 401 is a named failure");
   checks.ExpectEq(session.status().polls, 2, "after the retries the budget allowed");
   const std::string message = session.status().message;
   checks.Expect(message.find("401") != std::string::npos, "the message names the status");
+  return checks.failures();
+}
+
+/// One armed status on the token endpoint, for the scenarios that stage a
+/// sequence of them.
+http::Result ArmStatus(http::HttpClient& client, const std::string& base, int status) {
+  return rig::ArmFault(client, base,
+                       "{\"mode\":\"status\",\"status\":" + std::to_string(status) +
+                           ",\"path\":\"/api/auth/device/token\",\"count\":1}");
+}
+
+/// The 401 budget counts *consecutive* rejections, so anything else arriving in
+/// between clears it.
+///
+/// A gateway that answers 401 once every few minutes is having a bad minute,
+/// not demanding credentials; giving up on the second one an hour apart would
+/// abandon a code with eight minutes left and report "the server kept rejecting
+/// the poll", which is not what happened.
+int RejectionStreak(http::HttpClient& client, const std::string& base) {
+  rig::Checks checks;
+  auth::PairingConfig config = Config(base);
+  // Two consecutive rejections would end the attempt -- so if the count is not
+  // cleared in between, the second 401 below is fatal.
+  config.max_rejected_polls = 2;
+  auth::PairingSession session(client, config);
+  const std::string user_code = BeginAndShow(session, checks, base);
+
+  // The proxy holds one armed scenario at a time, so the sequence 401, 503, 401
+  // is staged a step at a time as each poll consumes the last one.
+  ExpectSucceeded(checks, ArmStatus(client, base, 401), "arming the first 401");
+  int staged = 0;
+  const auth::PairingState state =
+      RunUntilTerminal(session, checks, [&](const auth::PairingStatus& status) {
+        if (status.polls == staged) {
+          return;
+        }
+        staged = status.polls;
+        if (staged == 1) {
+          ExpectSucceeded(checks, ArmStatus(client, base, 503), "arming the 503 in between");
+        } else if (staged == 2) {
+          ExpectSucceeded(checks, ArmStatus(client, base, 401), "arming the second 401");
+        } else if (staged == 3) {
+          ExpectSucceeded(checks, Approve(client, base, user_code), "approving after the streak");
+        }
+      });
+  rig::DisarmFault(client, base);
+
+  ExpectState(checks, state, auth::PairingState::kApproved,
+              "two 401s with a 503 between them are not a streak");
+  checks.ExpectEq(session.status().polls, 4, "401, 503, 401, granted");
   return checks.failures();
 }
 
@@ -426,7 +517,7 @@ int SurvivesTransport(http::HttpClient& client, const std::string& base, const s
   config.request_timeout = 1500ms;
   auth::PairingSession session(client, config);
   const std::string user_code = BeginAndShow(session, checks, base);
-  checks.ExpectOk(rig::ArmFault(client, base, fault), "arming " + what);
+  ExpectSucceeded(checks, rig::ArmFault(client, base, fault), "arming " + what);
 
   bool saw_failure = false;
   bool approved = false;
@@ -438,7 +529,7 @@ int SurvivesTransport(http::HttpClient& client, const std::string& base, const s
         }
         if (!approved && status.polls >= 2) {
           approved = true;
-          checks.ExpectOk(Approve(client, base, user_code),
+          ExpectSucceeded(checks, Approve(client, base, user_code),
                           "approving once the flow has recovered");
         }
       });
@@ -463,8 +554,8 @@ int LostGrant(http::HttpClient& client, const std::string& base) {
   rig::Checks checks;
   auth::PairingSession session(client, Config(base));
   const std::string user_code = BeginAndShow(session, checks, base);
-  checks.ExpectOk(Approve(client, base, user_code), "approving the code");
-  checks.ExpectOk(rig::ArmFault(client, base,
+  ExpectSucceeded(checks, Approve(client, base, user_code), "approving the code");
+  ExpectSucceeded(checks, rig::ArmFault(client, base,
                                 R"({"mode":"drop","bytes":8,)"
                                 R"("path":"/api/auth/device/token","count":1})"),
                   "arming a connection that dies on the poll that redeems it");
@@ -476,6 +567,54 @@ int LostGrant(http::HttpClient& client, const std::string& base) {
               "a grant lost in transit ends the attempt rather than looping on a spent code");
   checks.Expect(session.token() == nullptr, "and carries no token");
   checks.ExpectEq(session.status().polls, 2, "after the lost poll and the one that found it spent");
+  return checks.failures();
+}
+
+/// `status()` answers while a request is in flight, and says something more
+/// useful than "not started" while it does.
+///
+/// This is the one claim in `pairing.hpp` that needs two threads to check: the
+/// overlay redraws on its own thread while the sysmodule's auth thread is
+/// blocked in `Begin()`, and if `status()` waited on the mutex the request holds
+/// -- or reported `kIdle` -- the pairing screen would be blank or wrong for as
+/// long as an unreachable server takes to time out.
+int Starting(http::HttpClient& client, const std::string& base) {
+  rig::Checks checks;
+  auth::PairingConfig config = Config(base);
+  config.request_timeout = 2000ms;
+  auth::PairingSession session(client, config);
+
+  ExpectSucceeded(checks,
+                  rig::ArmFault(client, base,
+                                R"({"mode":"stall","seconds":6,)"
+                                R"("path":"/api/auth/device/init","count":1})"),
+                  "arming an init that hangs");
+
+  std::thread owner([&session] { session.Begin(); });
+
+  bool saw_starting = false;
+  const Clock::time_point give_up = Clock::now() + 10s;
+  while (Clock::now() < give_up) {
+    const Clock::time_point asked = Clock::now();
+    const auth::PairingStatus status = session.status();
+    const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - asked);
+    checks.Expect(took < 500ms, "status() answers without waiting out the request in flight");
+    if (status.state == auth::PairingState::kStarting) {
+      saw_starting = true;
+      break;
+    }
+    if (auth::IsTerminal(status.state)) {
+      break;
+    }
+    std::this_thread::sleep_for(50ms);
+  }
+  owner.join();
+  rig::DisarmFault(client, base);
+
+  checks.Expect(saw_starting,
+                "the overlay sees 'starting' rather than 'idle' while the init is in flight");
+  ExpectState(checks, session.status().state, auth::PairingState::kFailed,
+              "and an init that never answers ends as a named failure");
   return checks.failures();
 }
 
@@ -510,6 +649,18 @@ int Payload(http::HttpClient& client, const std::string& base) {
                                R"("verification_url_complete":"","expires_in":0,"polls":0,)"
                                R"("message":""})");
   checks.Expect(!nonsense.ok(), "a state this build does not know is refused");
+
+  const auth::Parsed<auth::PairingStatus> negative =
+      auth::ParsePairingStatus(R"({"state":"pending","user_code":"ABCD2345",)"
+                               R"("verification_url":"","verification_url_complete":"",)"
+                               R"("expires_in":-1,"polls":0,"message":""})");
+  checks.Expect(!negative.ok(), "a countdown that runs backwards is refused");
+
+  const auth::Parsed<auth::PairingStatus> missing =
+      auth::ParsePairingStatus(R"({"state":"pending","user_code":"ABCD2345",)"
+                               R"("verification_url":"","verification_url_complete":"",)"
+                               R"("polls":0,"message":""})");
+  checks.Expect(!missing.ok(), "a payload missing a count is refused rather than defaulted");
   return checks.failures();
 }
 
@@ -565,6 +716,10 @@ int main(int argc, char** argv) {
                                  R"({"mode":"drop","bytes":8,)"
                                  R"("path":"/api/auth/device/token","count":1})",
                                  "a dropped poll");
+  } else if (scenario == "rejection_streak") {
+    failures = RejectionStreak(*client, base);
+  } else if (scenario == "starting") {
+    failures = Starting(*client, base);
   } else if (scenario == "lost_grant") {
     failures = LostGrant(*client, base);
   } else if (scenario == "payload") {

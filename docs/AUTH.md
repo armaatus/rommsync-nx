@@ -183,19 +183,28 @@ halves of that matter:
   caller.
 
 ```
-      Begin()                approve in browser
-idle ─────────▶ pending ──────────────────────▶ approved   token(), then persist
-                  │  ▲                                      to token.dat
-                  │  └── poll every `interval`, backing off on a transient failure
-                  ├──────▶ denied     a human refused it
-                  ├──────▶ expired    the code ran out, or was already spent
-                  └──────▶ failed     the exchange could not be completed
+      Begin()               init answers        approve in browser
+idle ─────────▶ starting ───────────────▶ pending ─────────────────▶ approved
+                                            │  ▲                     token(), then
+                                            │  └── poll every         persist to
+                                            │      `interval`,        token.dat
+                                            │      backing off on
+                                            │      a transient failure
+                                            ├──────▶ denied   a human refused it
+                                            ├──────▶ expired  ran out, or was spent
+                                            └──────▶ failed   could not be completed
 ```
 
 Four terminal states rather than one, because "you refused this on the website",
 "the code ran out, here is a new one" and "your server rejected the pairing" are
 three different sentences on the pairing screen, and only the last is worth a bug
 report.
+
+`starting` is there for the same reason from the other end: the init request can
+take as long as `request_timeout`, and reporting `idle` — "nothing has been
+started" — for thirty seconds after the user pressed Pair is indistinguishable
+from not having registered the press. The owning thread never sees it; the
+overlay, asking while the request is in flight, is exactly who does.
 
 `PairingStatus` is the whole IPC payload: state, `user_code`, both verification
 URLs, the countdown, the poll count and a log-safe message. It never carries the
@@ -210,7 +219,7 @@ careless as a UI usually is.
 | `slow_down` | back off — we already waited `interval`, so the server's window is wider than the number it sent |
 | `429`, `5xx` | back off; the `device_code` is still good |
 | no response at all — offline, a stall the timeout caught, a connection dropped | back off; the exchange never happened |
-| `401`/`403` | back off, up to `max_rejected_polls` times, then fail naming the status |
+| `401`/`403` | back off, up to `max_rejected_polls` **consecutive** times, then fail naming the status |
 | `access_denied`, `expired_token` | stop, on the matching terminal state |
 | anything else | stop, `failed`, naming the status |
 
@@ -228,6 +237,11 @@ which is the one diagnosis guaranteed to send the user looking in the wrong
 place. Hence a small budget and then a named failure, rather than either
 extreme. `ClassifyTokenPoll` still calls it `kUnrecognized` — this is a policy
 the session applies, not a grant state RomM defines.
+
+The budget counts *consecutive* rejections, which is why every other outcome
+clears it: a gateway that answers `401` once every few minutes is having a bad
+minute, not demanding credentials, and abandoning a code with eight minutes left
+over two of them an hour apart would report something that did not happen.
 
 ### Two things a poll loop gets wrong
 
@@ -295,7 +309,7 @@ both directions of it.
 that issued it: a user who repoints the sysmodule at a different server has to
 re-pair rather than send a stranger a bearer token.
 
-**The write is atomic.** The record goes to `token.dat.tmp` and is renamed onto
+**The write is atomic.** The record goes to `token.dat.tmp` and is committed onto
 `token.dat` only once it is complete, so a reader sees either the previous token
 or the new one and never a splice — the same reasoning as backup-before-overwrite
 for saves ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md)) and as `DownloadTarget`'s
@@ -306,8 +320,22 @@ What `rename` does not give is durability across a power cut, which needs an
 `fsync` the C++ standard library does not expose; the promise is that no reader
 ever sees a partial token.
 
+**The commit is two renames, because Horizon's is not a replace.** POSIX
+`rename` replaces the destination atomically; `fsFsRenameFile`, which libnx's
+`fsdev` maps it to, refuses a destination that already exists — and on a re-pair
+the destination always exists. So the record already in place is moved to
+`token.dat.old` first, on *both* platforms deliberately: a fallback taken only
+on the console is a path no host test ever runs, and the v1 gate would be the
+first thing to see it. The cost is one moment where `token.dat` does not exist
+and `token.dat.old` holds the previous record, so `LoadToken` reads that one
+rather than reporting that nothing was ever paired. `core.token_store` covers
+the recovery; the rename behaviour itself is a property of the platform, not
+something a host test can force.
+
 A record that could not be read back is refused on the way *out*, not just on
-the way in — a file that exists and holds an unusable token is worse than no
+the way in — every field, `expires_at` included: `null` means "no expiry" and is
+fine, but a *present* empty string is refused on the way back in, so writing one
+would produce a file that exists, looks paired, and cannot be read — a file that exists and holds an unusable token is worse than no
 file, because the sysmodule would find one, believe it is paired, and `401` on
 every tick. Creating `sdmc:/config/rommsync/` is the platform layer's job, not
 the portable engine's; a missing directory is a named error.
