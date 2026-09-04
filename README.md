@@ -68,8 +68,9 @@ Full detail in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 | Path | What |
 |------|------|
 | `docs/` | Architecture, the pinned RomM API contract, auth & sync protocol, config, security, dev environment |
-| `sysmodule/` | `sys-rommsync` — the background engine (to be built) |
-| `overlay/` | `ovl-rommsync` — the libultrahand overlay (to be built) |
+| `sysmodule/` | `sys-rommsync` — the background engine. Skeleton: builds and packages, does nothing yet |
+| `overlay/` | `ovl-rommsync` — the libultrahand overlay. Skeleton: builds and packages, draws nothing yet |
+| `switch.mk` | Shared devkitPro rules for both Switch targets |
 | `core/` | The portable engine — auth, sync, downloads, config, state. Builds and is tested natively. |
 | `server/` | API snapshot (source of truth), contract-probe script, and the docker RomM test fixture |
 | `orca.yaml` | Per-worktree provisioning: isolated RomM, seeded fixtures, ready-to-run build |
@@ -93,6 +94,15 @@ Quick start once a worktree exists:
 cmake -S . -B build && cmake --build build
 ./scripts/orca/compose.sh up -d
 ctest --test-dir build --output-on-failure
+```
+
+The two Switch targets are built separately, with devkitPro rather than CMake
+(see [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md#toolchain)); nothing built there
+is ever run before the hardware gate in M8:
+
+```bash
+docker run --rm -v "$PWD:/work" -w /work devkitpro/devkita64:latest \
+  bash -lc 'make -C sysmodule && make -C overlay'
 ```
 
 ## Credit / prior art

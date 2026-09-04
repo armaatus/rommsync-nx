@@ -454,10 +454,20 @@ JSON
       && fail "a recycled pid stopped the watcher from ever starting again; got: $out"
 
     # And a real one is respected.
-    # No `exec`: the identity check reads the process's own command line, and
-    # exec would replace it with `sleep` -- which is what a recycled pid looks
-    # like, not what a live watcher does.
-    printf '#!/usr/bin/env bash\nsleep 30\n' >"$TMPDIR_FIXTURE/agent-autostart-fake"
+    #
+    # `exec -a`, so this is ONE process and not a wrapper around a sleep. The
+    # identity check reads the process's own command line, so a plain `exec
+    # sleep 30` would show as `sleep` -- what a recycled pid looks like, not
+    # what a live watcher does -- and `-a` is what keeps the name while still
+    # leaving nothing behind the kill below cannot reach.
+    #
+    # A wrapper with a background sleep is what this used to be, and the sleep
+    # survived: `kill` reaches the wrapper only, so the child was reparented to
+    # init and went on holding the stdout ctest reads to decide the test has
+    # finished. A TERM trap does not close it either -- the kill races the trap
+    # being installed, which leaked on 3 runs in 6.
+    printf '#!/usr/bin/env bash\nexec -a agent-autostart-fake sleep 30\n' \
+      >"$TMPDIR_FIXTURE/agent-autostart-fake"
     chmod +x "$TMPDIR_FIXTURE/agent-autostart-fake"
     "$TMPDIR_FIXTURE/agent-autostart-fake" & real=$!
     echo "$real" >"$TMPDIR_FIXTURE/autostart.pid"
