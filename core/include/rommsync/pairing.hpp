@@ -38,6 +38,21 @@ namespace rommsync::auth {
 inline constexpr const char* kClientName = "rommsync-nx";
 inline constexpr const char* kClientPlatform = "switch";
 
+/// The scopes this client asks for, and the complete list of them.
+///
+/// Least privilege, and pinned to docs/API_CONTRACT.md#scopes-to-request by
+/// `auth.scopes` so the code and the document cannot drift. Every `.write` here
+/// is one the client actually performs: `roms.user.write` and `assets.write`
+/// are how a save gets uploaded, `devices.write` is how the console registers
+/// itself (M1-3). `me.write` is in the document and deliberately *not* here --
+/// it exists only for recording play sessions, which this client does not do,
+/// and a scope that is granted and never used is blast radius bought for
+/// nothing (docs/SECURITY.md).
+///
+/// RomM may approve a subset of these, which is why the granted set is read
+/// back off the token response rather than assumed.
+std::vector<std::string> MinimumScopes();
+
 /// Where a pairing attempt has got to.
 ///
 /// The three terminal failures are deliberately distinct. A human who refused
@@ -77,16 +92,20 @@ struct PairingConfig {
   std::string server_url;
 
   /// Stable per console, so re-pairing is recognised as the same device rather
-  /// than accumulating a new one every time. Deriving it is M1-5; whatever
-  /// derives it, it must not identify the *user* (docs/AUTH.md).
+  /// than accumulating a new one every time, and never a value that identifies
+  /// the *user* or the hardware. `LoadOrCreateDeviceIdentity` in
+  /// device_identity.hpp is what produces one.
   std::string client_device_identifier;
 
   /// What the user will see in RomM's device list.
   std::string device_name = "rommsync-nx on Switch";
 
-  /// Least privilege, per docs/API_CONTRACT.md#scopes-to-request. RomM may
-  /// approve a subset, which is why `DeviceTokenResponse::scopes` is read back.
-  std::vector<std::string> requested_scopes;
+  /// Least privilege by default, and the default is the whole answer: see
+  /// `MinimumScopes`. A caller that narrows this further is fine; one that
+  /// widens it is asking for a token that can do more than this client ever
+  /// does. RomM may approve a subset, which is why
+  /// `DeviceTokenResponse::scopes` is read back.
+  std::vector<std::string> requested_scopes = MinimumScopes();
 
   /// Ceiling on one init or one poll. A poll that hangs must not hold the
   /// pairing screen: it fails, gets counted, and the next one is scheduled.

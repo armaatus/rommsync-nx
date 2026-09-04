@@ -122,8 +122,26 @@ ctest --test-dir build --output-on-failure
   a rate-limited init out rather than failing on it. The wait is bounded, so an
   init broken for any other reason still goes red.
 - `core.token_store` covers `token.dat`: the atomic write, and specifically what
-  survives a write that cannot complete. No network and no rig, so it never
-  skips.
+  survives a write that cannot complete. The interesting one is the process
+  being **killed mid-write** — forced with `fork()` and `RLIMIT_FSIZE`, so a
+  child asked to write a record far larger than its file-size limit is killed by
+  `SIGXFSZ` inside the write, at a byte offset the kernel picks, with no cleanup
+  on the way out. That is a power cut, deterministically, and without the timing
+  race a sleep-then-kill would have. It also asserts that no token, refresh
+  token or device code appears in any message this code can produce, by running
+  every failure path with a distinctive needle in the record and searching the
+  output for it.
+- `core.device_identity` covers `device.dat` and the `client_device_identifier`
+  under it: the SHA-256 against FIPS 180-4's published vectors and against the
+  block-boundary lengths the padding gets wrong, and then the property that
+  actually matters — the identifier is the *same* identifier across a restart, a
+  re-pair, a different seed, an interrupted commit and a corrupt record.
+- `auth.scopes` reads the scope list out of
+  [API_CONTRACT.md](API_CONTRACT.md#scopes-to-request) and compares it to
+  `MinimumScopes()`. Editing the document without editing the code, or the other
+  way round, fails here — including adding a scope marked "only if…" to the set
+  the client actually requests.
+- None of those three touches the network, so they never skip.
 - With Docker stopped, `rig.smoke` reports **Skipped** rather than failing, so a
   local `ctest` is still useful. CI configures with `-DROMMSYNC_REQUIRE_RIG=ON`,
   which turns the same condition into a failure — a green CI run always means the

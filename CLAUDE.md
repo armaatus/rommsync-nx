@@ -17,7 +17,9 @@ for the shape.
 3. **The server is the source of truth** for sync conflicts.
 4. **Nothing in `core/` may include a host-only or libnx header.** Platform
    details live behind interfaces so the engine stays testable natively.
-5. **No secrets in the tree.** `config.ini`, `token.dat`, `.env` are ignored.
+5. **No secrets in the tree.** `config.ini`, `token.dat`, `device.dat` and
+   `.env` are ignored, together with the `.tmp`/`.old` an interrupted commit
+   leaves beside them.
 
 ## Environment
 

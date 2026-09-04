@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "rig.hpp"
+#include "rommsync/device_identity.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/pairing.hpp"
 #include "rommsync/token_store.hpp"
@@ -44,9 +45,14 @@ namespace json = rommsync::json;
 using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
 
-/// Least privilege, and enough of it that the approved set is worth reading
+/// What the client asks for in production, not a convenient subset.
+///
+/// `auth.scopes` already checks this list against the document; running the real
+/// pairing with it is the other half — proof that a live RomM 5.2.0 accepts
+/// every one of them. A scope the server does not know is the kind of thing that
+/// otherwise surfaces on a console. The approved set is still worth reading
 /// back: RomM returns what the user approved, sorted, not what was asked for.
-const std::vector<std::string> kScopes = {"me.read", "roms.read", "assets.read"};
+const std::vector<std::string> kScopes = auth::MinimumScopes();
 
 /// How long a scenario may spend waiting for a state machine to settle. Every
 /// scenario here should finish in well under this; it exists so a wedged one
@@ -106,8 +112,9 @@ http::Result Deny(http::HttpClient& client, const std::string& base,
 auth::PairingConfig Config(const std::string& base) {
   auth::PairingConfig config;
   config.server_url = base;
-  // Stable per console in production (M1-5); per scenario here, so two runs do
-  // not fight over one device registration.
+  // `LoadOrCreateDeviceIdentity` derives this on a console; a fixed literal
+  // here, so two runs do not fight over one device registration and so a failure
+  // is never about which identifier the scenario happened to mint.
   config.client_device_identifier = "rommsync-nx-test";
   config.device_name = "rommsync-nx test";
   config.requested_scopes = kScopes;
@@ -310,6 +317,88 @@ int Denied(http::HttpClient& client, const std::string& base) {
   const std::string second = BeginAndShow(session, checks, base);
   checks.Expect(second != user_code, "re-pairing asks for a fresh code");
   checks.Expect(session.token() == nullptr, "and drops whatever the last attempt held");
+  return checks.failures();
+}
+
+/// Re-pair, end to end, against a real RomM: the same console, not a second one.
+///
+/// This is the acceptance criterion M1-5 exists for, and it is not checkable
+/// without a server — only RomM can say whether the device it just paired is the
+/// device it paired before. The chain under test is the whole one: derive an
+/// identifier, persist it, pair, throw the token away the way "Re-pair" does,
+/// and pair again. If the identifier had been kept inside `token.dat`, or the
+/// second `LoadOrCreateDeviceIdentity` had preferred its seed, RomM would answer
+/// with a different `device_id` here and every save on the console would start
+/// again with an empty sync history.
+int RePair(http::HttpClient& client, const std::string& base) {
+  rig::Checks checks;
+
+  const std::string directory = rig::ScratchDir() + "/pair-repair";
+  std::error_code ignored;
+  std::filesystem::remove_all(directory, ignored);
+  std::filesystem::create_directories(directory, ignored);
+  const std::string identity_path = directory + "/" + auth::kDeviceIdentityFileName;
+  const std::string token_path = directory + "/token.dat";
+
+  // Synthetic, and per scenario so this run does not adopt another scenario's
+  // device. On a console this is the serial.
+  auth::IdentitySeed seed;
+  seed.stable = "pair-repair-scenario";
+
+  const auth::IdentityResult first = auth::LoadOrCreateDeviceIdentity(identity_path, seed);
+  checks.Expect(first.ok(), "an identifier is derived and persisted: " + first.message);
+  checks.Expect(first.created, "on the first boot it is minted");
+  checks.Expect(auth::IsDeviceIdentifier(first.value.client_device_identifier),
+                "and it is the documented shape");
+
+  auth::PairingConfig config = Config(base);
+  config.client_device_identifier = first.value.client_device_identifier;
+
+  auth::PairingSession session(client, config);
+  const std::string first_code = BeginAndShow(session, checks, base);
+  ExpectSucceeded(checks, Approve(client, base, first_code), "approving the first code");
+  ExpectState(checks, RunUntilTerminal(session, checks), auth::PairingState::kApproved,
+              "the first pairing completes");
+  const auth::DeviceTokenResponse* first_grant = session.token();
+  if (first_grant == nullptr) {
+    checks.Expect(false, "the first pairing carries a token");
+    return checks.failures();
+  }
+  const std::string device_id = first_grant->device_id;
+  const std::string first_token = first_grant->access_token;
+  checks.Expect(auth::SaveToken(token_path, auth::StoredTokenFrom(base, *first_grant)).ok(),
+                "and it is persisted");
+
+  // "Re-pair": the credentials go, the identifier stays.
+  checks.Expect(auth::DiscardToken(token_path), "re-pair discards the token");
+  checks.Expect(!auth::LoadToken(token_path).ok(), "the console reads itself as unpaired");
+  checks.Expect(std::filesystem::exists(identity_path),
+                "and the identifier is still there to pair with");
+
+  const auth::IdentityResult second = auth::LoadOrCreateDeviceIdentity(identity_path, seed);
+  checks.Expect(!second.created, "the re-pair reads the identifier rather than minting one");
+  checks.ExpectEq(second.value.client_device_identifier, first.value.client_device_identifier,
+                  "so the same value goes to the server");
+
+  auth::PairingConfig again_config = Config(base);
+  again_config.client_device_identifier = second.value.client_device_identifier;
+  auth::PairingSession again(client, again_config);
+  const std::string second_code = BeginAndShow(again, checks, base);
+  checks.Expect(second_code != first_code, "re-pairing asks for a fresh code");
+  ExpectSucceeded(checks, Approve(client, base, second_code), "approving the second code");
+  ExpectState(checks, RunUntilTerminal(again, checks), auth::PairingState::kApproved,
+              "the second pairing completes");
+  const auth::DeviceTokenResponse* second_grant = again.token();
+  if (second_grant == nullptr) {
+    checks.Expect(false, "the second pairing carries a token");
+    return checks.failures();
+  }
+
+  // The whole point.
+  checks.ExpectEq(second_grant->device_id, device_id,
+                  "RomM recognises the console rather than registering a second device");
+  checks.Expect(second_grant->access_token != first_token,
+                "and it is genuinely a new token, not the discarded one coming back");
   return checks.failures();
 }
 
@@ -698,6 +787,8 @@ int main(int argc, char** argv) {
     failures = Happy(*client, base);
   } else if (scenario == "mid_poll") {
     failures = MidPoll(*client, base);
+  } else if (scenario == "repair") {
+    failures = RePair(*client, base);
   } else if (scenario == "denied") {
     failures = Denied(*client, base);
   } else if (scenario == "expired") {

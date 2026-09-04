@@ -1,32 +1,16 @@
 #include "rommsync/token_store.hpp"
 
 #include <cstddef>
-#include <cstdio>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include "rommsync/atomic_file.hpp"
 #include "rommsync/json.hpp"
 
 namespace rommsync::auth {
 namespace {
-
-/// The suffix the record is staged under before it is renamed into place.
-constexpr const char* kTempSuffix = ".tmp";
-
-/// Where the record already in place is moved while the new one takes its
-/// name. See `SaveToken` for why the move is unconditional.
-constexpr const char* kPreviousSuffix = ".old";
-
-bool Exists(const std::string& path) {
-  std::FILE* file = std::fopen(path.c_str(), "rb");
-  if (file == nullptr) {
-    return false;
-  }
-  std::fclose(file);
-  return true;
-}
 
 /// The bar every persisted string is held to, matching `json::Reader`: a blank
 /// value is a record that lost something, and an embedded NUL is a value that
@@ -127,79 +111,70 @@ StoreResult SaveToken(const std::string& path, const StoredToken& token) {
             Describe(path, "refusing to write a token with a blank or NUL-carrying field")};
   }
 
-  const std::string temp = path + kTempSuffix;
-  const std::string text = SerializeStoredToken(token) + "\n";
-
-  std::FILE* file = std::fopen(temp.c_str(), "wb");
-  if (file == nullptr) {
-    return {StoreError::kOpenFailed,
-            Describe(temp, "could not be created (does the directory exist?)")};
+  // The atomicity, the two-rename commit and the reasoning behind both live in
+  // `io::WriteAtomically` -- `device.dat` needs exactly the same guarantee, and
+  // a second copy of that commit is the kind of thing that gets fixed in one
+  // place and not the other.
+  const io::WriteResult written = io::WriteAtomically(path, SerializeStoredToken(token) + "\n");
+  switch (written.error) {
+    case io::WriteError::kNone:
+      return {};
+    case io::WriteError::kOpenFailed:
+      return {StoreError::kOpenFailed, written.message};
+    case io::WriteError::kWriteFailed:
+      return {StoreError::kWriteFailed, written.message};
+    case io::WriteError::kCommitFailed:
+      return {StoreError::kCommitFailed, written.message};
   }
+  return {StoreError::kCommitFailed, written.message};
+}
 
-  const std::size_t written = std::fwrite(text.data(), 1, text.size(), file);
-  // The flush has to happen while the handle is still open: fclose reports a
-  // failed flush too, but by then there is nothing left to distinguish "the
-  // bytes never left the buffer" from "the close itself failed".
-  const bool flushed = written == text.size() && std::fflush(file) == 0;
-  const bool closed = std::fclose(file) == 0;
-  if (!flushed || !closed) {
-    std::remove(temp.c_str());
-    return {StoreError::kWriteFailed, Describe(temp, "could not be written completely")};
-  }
-
-  // The commit. Everything above touched only the temp file, so a failure up to
-  // this point leaves whatever `path` already held exactly as it was.
-  //
-  // `rename` replaces the destination on POSIX and does *not* on Horizon:
-  // `fsFsRenameFile` refuses a destination that already exists, which is every
-  // re-pair. So the record already in place is moved aside first -- on both
-  // platforms, deliberately, because a fallback taken only on the console is a
-  // path no host test ever runs and the v1 gate is the first thing that would
-  // see it.
-  const std::string previous = path + kPreviousSuffix;
-  std::remove(previous.c_str());
-  const bool replacing = Exists(path);
-  if (replacing && std::rename(path.c_str(), previous.c_str()) != 0) {
-    std::remove(temp.c_str());
-    return {StoreError::kCommitFailed, Describe(path, "could not be moved aside to " + previous)};
-  }
-  if (std::rename(temp.c_str(), path.c_str()) != 0) {
-    if (replacing) {
-      std::rename(previous.c_str(), path.c_str());
+std::string DescribeStoredToken(const StoredToken& token) {
+  // Everything here is either a server the user typed or an identifier RomM
+  // shows in its own device list. The token itself is reduced to the two facts
+  // a support thread ever needs -- that there is one, and how long it is --
+  // because a log line is forever and an SD card is readable by anything.
+  std::string out("server=");
+  out += token.server_url;
+  out += " device=";
+  out += token.device_id;
+  out += " scopes=[";
+  for (std::size_t at = 0; at < token.scopes.size(); ++at) {
+    if (at != 0) {
+      out += " ";
     }
-    std::remove(temp.c_str());
-    return {StoreError::kCommitFailed, Describe(path, "could not be replaced by " + temp)};
+    out += token.scopes[at];
   }
-  std::remove(previous.c_str());
-  return {};
+  out += "] token=";
+  out += token.access_token.empty()
+             ? std::string("absent")
+             : "present(" + std::to_string(token.access_token.size()) + " chars)";
+  out += " expires=";
+  out += token.expires_at.value_or("never");
+  return out;
+}
+
+bool DiscardToken(const std::string& path) {
+  // Every one of the three, not just `token.dat`. "Re-pair" that unlinked the
+  // record and left `token.dat.old` holding the same bearer token would have
+  // discarded nothing -- and `.old` is exactly what an interrupted commit
+  // leaves behind. What the overwrite inside `io::Shred` is and is not worth on
+  // an SD card is in docs/SECURITY.md.
+  return io::Shred(path);
 }
 
 namespace {
 
 LoadedToken ReadRecord(const std::string& path) {
   LoadedToken loaded;
-  std::FILE* file = std::fopen(path.c_str(), "rb");
-  if (file == nullptr) {
+  const io::ReadResult read = io::ReadFile(path);
+  if (!read.ok()) {
     loaded.error = StoreError::kReadFailed;
-    loaded.message = Describe(path, "could not be opened");
+    loaded.message = read.message;
     return loaded;
   }
 
-  std::string text;
-  char buffer[512];
-  std::size_t got = 0;
-  while ((got = std::fread(buffer, 1, sizeof(buffer), file)) > 0) {
-    text.append(buffer, got);
-  }
-  const bool failed = std::ferror(file) != 0;
-  std::fclose(file);
-  if (failed) {
-    loaded.error = StoreError::kReadFailed;
-    loaded.message = Describe(path, "could not be read");
-    return loaded;
-  }
-
-  Parsed<StoredToken> parsed = ParseStoredToken(text);
+  Parsed<StoredToken> parsed = ParseStoredToken(read.contents);
   if (!parsed.ok()) {
     loaded.error = StoreError::kMalformed;
     loaded.message = Describe(path, parsed.error.Describe());
@@ -221,7 +196,7 @@ LoadedToken LoadToken(const std::string& path) {
   // record. Reading it is the difference between a re-pair nobody notices and
   // one the user has to do at a browser. The original error is kept when there
   // is nothing to fall back to, so a plain missing file still says so.
-  LoadedToken previous = ReadRecord(path + kPreviousSuffix);
+  LoadedToken previous = ReadRecord(io::PreviousPathFor(path));
   return previous.ok() ? previous : loaded;
 }
 
