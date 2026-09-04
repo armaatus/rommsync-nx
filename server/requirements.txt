@@ -5,5 +5,11 @@
 #
 # Pinned, because these talk to a RomM pinned at 5.2.0 and a silent client
 # upgrade would change what the fixture proves.
+#
+# NEEDS PYTHON >= 3.10 (requests 2.33.0 declares requires-python >=3.10). That
+# is above macOS's Command Line Tools python3, which is 3.9.6 -- so setup.sh
+# chooses an interpreter rather than trusting `python3`; see orca_pick_python in
+# scripts/orca/lib.sh. Raising a pin past the floor is fine, but bump
+# ORCA_PYTHON_MIN_MINOR with it.
 requests==2.33.0
 python-socketio[client]==5.16.2

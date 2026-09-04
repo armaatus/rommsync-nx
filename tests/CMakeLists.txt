@@ -177,7 +177,15 @@ add_test(NAME orca.env_concurrent_writers
          COMMAND "${BASH_PROGRAM}" "${ORCA_ENV_TEST}" concurrent)
 add_test(NAME orca.env_never_partial
          COMMAND "${BASH_PROGRAM}" "${ORCA_ENV_TEST}" readable)
+
+# The venv interpreter. setup.sh used to inherit `python3`, which is macOS's
+# 3.9.6 under Orca's hook environment -- below the floor server/requirements.txt
+# needs, so provisioning died in pip with no usable explanation.
+add_test(NAME orca.env_picks_python
+         COMMAND "${BASH_PROGRAM}" "${ORCA_ENV_TEST}" python)
+
 set_tests_properties(orca.env_concurrent_writers orca.env_never_partial
+                     orca.env_picks_python
                      PROPERTIES TIMEOUT 60)
 
 # --- worktree teardown: the archive hook in orca.yaml -------------------------
