@@ -120,6 +120,11 @@ worktree creation and tears the stack down on removal. Only immutable, expensive
 things are shared across worktrees — the checksum-pinned ROM cache and the
 content-addressed ccache. Never hardcode a port; read `.env`.
 
+Removal is the reverse: `scripts/orca/archive.sh` drops that worktree's stack and
+volumes, leaving the shared caches alone. For stacks orphaned by a worktree that
+went away without the hook running, `scripts/orca/reap.sh` lists them and
+`--yes` removes them; it errs towards keeping anything it cannot prove stale. See [TESTING.md](TESTING.md#worktree-isolation).
+
 The **server contract** is testable off-console: `server/probe_contract.py`
 exercises auth + negotiate + saves against a RomM and prints the real response
 shapes — run it against the docker fixture (never production) to confirm any

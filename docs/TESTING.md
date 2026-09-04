@@ -118,6 +118,33 @@ compose project name and two ports from the worktree path and writes them to
 things are shared between worktrees — the checksum-pinned ROM downloads and the
 content-addressed ccache, declared in [`orca.yaml`](../orca.yaml).
 
+Removing a worktree runs `scripts/orca/archive.sh`, which takes that worktree's
+stack and volumes down with it. It derives the project name from the worktree
+path rather than reading `.env` back, so a worktree whose `.env` never got
+written still tears down cleanly, and it checks afterwards that docker holds
+nothing under that project instead of assuming `down` worked.
+
+Stacks can still outlive their worktree — one deleted with `rm -rf`, or removed
+while Docker was stopped. The fixture restarts `unless-stopped`, so those come
+back on every docker start and hold two ports each. Sweep them up with:
+
+```bash
+./scripts/orca/reap.sh          # list stacks with no worktree, change nothing
+./scripts/orca/reap.sh --yes    # remove them, volumes included
+```
+
+It protects two sets of stacks: those belonging to a live worktree of this repo,
+whose project names it derives the same way `env.sh` did, and those whose
+containers still point at a directory that exists — which covers a separate
+clone of this repo that `git worktree list` cannot see. Anything it cannot
+positively establish as stale is left alone, and it refuses to sweep at all
+rather than run with an incomplete idea of what is live, so a stack it cannot
+account for survives instead of being deleted.
+
+The gap that remains: a *separate clone* whose stack has been reduced to volumes
+alone leaves nothing pointing at its directory, so it looks stale. Run the
+dry-run first if more than one clone of this repo is in play.
+
 ## Rung 2 — Ryujinx NRO
 
 - A standalone **NRO** (manually launched, *not* a sysmodule, *not* on the boot
