@@ -40,9 +40,11 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <random>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <unistd.h>  // getpid: one sandbox per process, and the suite is POSIX
@@ -50,6 +52,7 @@
 #include "rig.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/sync.hpp"
+#include "rommsync/sync_execute.hpp"
 
 namespace harness {
 
@@ -67,6 +70,21 @@ namespace sync = rommsync::sync;
 inline constexpr const char* kConfigDir = "/config/rommsync";
 inline constexpr const char* kBackupDir = "/config/rommsync/.backup";
 inline constexpr const char* kSavesDir = "/retroarch/saves";
+
+/// A save path on the card. `/retroarch/saves` is a real entry in the default
+/// folder map (config.cpp), not a path invented by a test.
+inline std::string SavePath(const std::string& file_name) {
+  return std::string(kSavesDir) + "/" + file_name;
+}
+
+/// Wait long enough that two server timestamps are distinguishable.
+///
+/// RomM compares stored datetimes directly, but it also *renders* some of them
+/// to whole seconds, and `sync.hpp` sends whole seconds by design. A test that
+/// arranges "the server's copy changed after the last sync" inside one second is
+/// a test that passes or fails on how long a docker container took, so the ones
+/// that need it wait instead of racing.
+inline void PassASecond() { std::this_thread::sleep_for(std::chrono::seconds{2}); }
 
 // --- the sandbox --------------------------------------------------------------
 
@@ -209,23 +227,20 @@ class Sandbox {
   }
 
   /// Where the backup of a save goes:
-  /// `/config/rommsync/.backup/<rom_id>-<unix seconds>.<ext>`, the layout
-  /// docs/SYNC_PROTOCOL.md specifies. Here rather than in each test so the
-  /// audit and the code under test cannot disagree about where to look.
+  /// `/config/rommsync/.backup/<rom_id>-<slot>-<unix seconds>.<ext>`. Here
+  /// rather than in each test, and delegating to the engine's own
+  /// `sync::BackupFileName`, so the audit and the code under test cannot
+  /// disagree about where to look.
   ///
-  /// Note what that layout does *not* contain: the save's name or its slot. Two
-  /// saves of the same rom -- two slots, or a save and its state -- backed up in
-  /// the same second produce the same path, and the second backup destroys the
-  /// first. This helper is deliberately faithful to the documented scheme rather
-  /// than quietly fixing it, because the fix is M2-5's to make; see the note in
-  /// docs/SYNC_PROTOCOL.md.
-  std::string BackupPathFor(std::int64_t rom_id, std::string_view file_name) const {
-    const std::size_t dot = file_name.rfind('.');
-    const std::string extension =
-        dot == std::string_view::npos ? std::string() : std::string(file_name.substr(dot));
+  /// **The slot is in the name because the documented scheme was unsafe**, and
+  /// M2-5 fixed it: `<rom_id>-<ts>.<ext>` carries neither the slot nor the
+  /// save's own name, so two saves of one rom backed up in the same second --
+  /// one rom with two slots, or a save and its state -- were the same file, and
+  /// the second backup destroyed the first.
+  std::string BackupPathFor(std::int64_t rom_id, const std::optional<std::string>& slot,
+                            std::string_view file_name) const {
     const std::int64_t now = sync::UnixSeconds(std::chrono::system_clock::now());
-    return std::string(kBackupDir) + "/" + std::to_string(rom_id) + "-" + std::to_string(now) +
-           extension;
+    return std::string(kBackupDir) + "/" + sync::BackupFileName(rom_id, slot, file_name, now);
   }
 
  private:
@@ -532,11 +547,13 @@ inline bool UploadSave(http::HttpClient& client, const std::string& base, const 
 
 /// `PUT /api/saves/{id}` -- replace the bytes of a save **in place**.
 ///
-/// The difference from another `POST` matters and is not obvious: a slot upload
-/// gets a datetime tag in its file name, so a second `POST` a second later is a
-/// *new* save row with no sync history, whatever `overwrite` says. Only the PUT
-/// moves the same row forward, which is the only way to arrange "the server's
-/// copy changed since this device last synced it".
+/// The difference from another `POST` is narrower than this comment used to
+/// claim, and worth stating exactly (`execute.occupied` verifies it): a POST
+/// carrying `overwrite=true` *also* replaces the slot's row in place, tag and
+/// id included, and a POST without it creates a second row with a fresh tag.
+/// What the PUT alone gives is a move forward that names no `slot` and no
+/// `device_id` -- which is what arranges "the server's copy changed since this
+/// device last synced it" without writing a sync row on the way.
 inline bool ReplaceSave(http::HttpClient& client, const std::string& base, const Fixture& fixture,
                         std::int64_t save_id, const std::string& local_path,
                         const std::string& file_name, Save* out) {

@@ -89,20 +89,8 @@ const sync::SyncOperation* Classified(rig::Checks& checks, const std::string& bo
   return nullptr;
 }
 
-/// A save path on the card. `/retroarch/saves` is a real entry in the default
-/// folder map (config.cpp), not a path invented here.
-std::string SavePath(const std::string& file_name) {
-  return std::string(harness::kSavesDir) + "/" + file_name;
-}
-
-/// Wait long enough that two server timestamps are distinguishable.
-///
-/// RomM compares stored datetimes directly, but it also *renders* some of them
-/// to whole seconds, and `sync.hpp` sends whole seconds by design. A test that
-/// arranges "the server's copy changed after the last sync" inside one second
-/// is a test that passes or fails on how long a docker container took, so these
-/// wait instead of racing.
-void PassASecond() { std::this_thread::sleep_for(std::chrono::seconds{2}); }
+using harness::PassASecond;
+using harness::SavePath;
 
 /// Swallow `std::cerr` for the duration of a scope.
 ///
@@ -169,7 +157,7 @@ void SandboxScenario(rig::Checks& checks) {
     Sandbox sandbox(audited, "backed-up");
     sandbox.Detach();
     sandbox.SeedSave(SavePath("Game.srm"), "the previous save\n");
-    sandbox.Write(sandbox.BackupPathFor(7, "Game.srm"), "the previous save\n");
+    sandbox.Write(sandbox.BackupPathFor(7, "retroarch-srm", "Game.srm"), "the previous save\n");
     sandbox.Write(SavePath("Game.srm"), "the new save\n");
     checks.ExpectEq(sandbox.Audit(audited), 0, "backing up first satisfies the audit");
   }
@@ -201,7 +189,7 @@ void SandboxScenario(rig::Checks& checks) {
     sandbox.Write(SavePath("Game.srm"), "the new save\n");
     // The commonest wrong version: back up *after* the write, so the copy holds
     // the bytes that replaced the save rather than the ones it destroyed.
-    sandbox.Write(sandbox.BackupPathFor(7, "Game.srm"), "the new save\n");
+    sandbox.Write(sandbox.BackupPathFor(7, "retroarch-srm", "Game.srm"), "the new save\n");
     int caught = 0;
     {
       const Quiet quiet;
@@ -1033,7 +1021,7 @@ void Backup(rig::Checks& checks, http::HttpClient& client, const std::string& ba
   }
 
   // 1. back up, then overwrite -- the success path.
-  const std::string backup = sandbox.BackupPathFor(rom.id, name);
+  const std::string backup = sandbox.BackupPathFor(rom.id, slot, name);
   const io::WriteResult written =
       io::WriteAtomically(sandbox.Host(backup), sandbox.Read(SavePath(name)));
   checks.Expect(written.ok(), "the backup is written first: " + written.message);
@@ -1050,16 +1038,17 @@ void Backup(rig::Checks& checks, http::HttpClient& client, const std::string& ba
   // overwrite never lands, and the copy that would have been destroyed is
   // already safe. A backup taken after a successful write would have nothing
   // here at all.
-  // A second apart, because the documented backup path is
-  // `<rom_id>-<unix seconds>.<ext>` and both saves here belong to one rom: in
-  // the same second they would be the same file, and the second backup would
-  // destroy the first. That is a real hole in the scheme rather than a quirk of
-  // this test -- see `Sandbox::BackupPathFor` and docs/SYNC_PROTOCOL.md.
-  PassASecond();
+  //
+  // No wait between the two, deliberately: both saves belong to one rom and are
+  // backed up in the same second, which under the *documented* scheme was one
+  // file and one destroyed backup. M2-5 put the slot in the name, and this is
+  // the scenario that would notice if it came back out.
   const std::string second = "second.srm";
   const std::string second_previous = "the second save, also the only copy\n";
   sandbox.SeedSave(SavePath(second), second_previous);
-  const std::string second_backup = sandbox.BackupPathFor(rom.id, second);
+  const std::string second_backup = sandbox.BackupPathFor(rom.id, "harness-second", second);
+  checks.Expect(second_backup != backup,
+                "two slots of one rom backed up in the same second are two files");
   checks.Expect(io::WriteAtomically(sandbox.Host(second_backup), second_previous).ok(),
                 "backed up before touching the second save");
 

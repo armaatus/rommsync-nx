@@ -18,13 +18,6 @@ namespace {
 
 constexpr const char* kDevicesPath = "/api/devices";
 
-std::string ApiUrl(std::string_view server_url, std::string_view path) {
-  while (!server_url.empty() && server_url.back() == '/') {
-    server_url.remove_suffix(1);
-  }
-  return std::string(server_url) + std::string(path);
-}
-
 /// The RFC 3986 unreserved set.
 ///
 /// A device id is a value read back off the SD card and then pasted into a URL
@@ -324,7 +317,7 @@ Registration ConfirmRegistration(http::HttpClient& client, const StoredToken& to
   }
 
   const http::Result result =
-      client.Send(AuthedGet(ApiUrl(token.server_url, std::string(kDevicesPath) + "/" +
+      client.Send(AuthedGet(http::JoinUrl(token.server_url, std::string(kDevicesPath) + "/" +
                                                          token.device_id),
                             token.access_token, timeout));
   // Handled here rather than in `Refused`, because a 404 means two different
@@ -365,7 +358,7 @@ Registration FindRegistration(http::HttpClient& client, const StoredToken& token
   }
 
   const http::Result result = client.Send(
-      AuthedGet(ApiUrl(token.server_url, kDevicesPath), token.access_token, timeout));
+      AuthedGet(http::JoinUrl(token.server_url, kDevicesPath), token.access_token, timeout));
   if (const std::optional<Registration> refused = Refused(result, "the device list")) {
     return *refused;
   }

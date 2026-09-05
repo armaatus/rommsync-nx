@@ -75,7 +75,12 @@ overlay.
   file yields an empty baseline and a diagnostic, and the tick hashes
   everything.
 - `sdmc:/config/rommsync/queue.json` — pending downloads.
-- `sdmc:/config/rommsync/.backup/` — pre-overwrite copies of saves on conflict.
+- `sdmc:/config/rommsync/.backup/` — pre-overwrite copies of saves, on a
+  conflict *and* on any download that replaced a file.
+  `<rom_id>-<slot>-<unix seconds>.<ext>`, written before the overwrite by
+  `sync::ExecutePlan` (docs/SYNC_PROTOCOL.md#backups). The directory has to
+  exist: `core/` cannot create one, and a missing `.backup/` stops the
+  overwrite rather than proceeding without a copy.
 
 The overlay and sysmodule both read config; the **sysmodule owns writes** to
 token/state to avoid races — the overlay asks it to change things via IPC.
@@ -90,9 +95,12 @@ scheduler fires
   → build SyncNegotiatePayload.saves[]
   → POST /api/sync/negotiate  → {session_id, operations[]}
   → for each op:
-        upload   → POST /api/saves (multipart saveFile)
-        download → GET /api/saves/{id}/content → write to SD (backup first)
-        conflict → apply server's resolution; always backup the loser
+        upload   → POST /api/saves?...&overwrite=true (multipart saveFile)
+        download → GET /api/saves/{id} for the size
+                 → GET /api/saves/{id}/content → stage → verify MD5
+                 → back up the local file → commit → POST .../downloaded
+        conflict → the same, keep-both: RomM sends NO resolution, so the
+                   server's copy lands and the local bytes stay in .backup/
         noop     → skip
   → POST /api/sync/sessions/{session_id}/complete
   → update state.db

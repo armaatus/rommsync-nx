@@ -142,14 +142,10 @@ std::string ScanResult::DescribeSkipped() const {
 }
 
 std::string BaseName(std::string_view file_name) {
-  const std::size_t dot = file_name.rfind('.');
-  // `npos` is "no extension"; `0` is a dotfile, whose whole name is its name --
-  // stripping there turns `.DS_Store` into nothing, which matches every rom
-  // with an empty name and none with a real one.
-  if (dot == std::string_view::npos || dot == 0) {
-    return std::string(file_name);
-  }
-  return std::string(file_name.substr(0, dot));
+  // The split is `sync::ExtensionOf`'s, shared rather than restated: a dotfile
+  // is a whole name, and a second spelling of that rule is a second answer to
+  // "what is this save called".
+  return std::string(file_name.substr(0, file_name.size() - sync::ExtensionOf(file_name).size()));
 }
 
 std::string EmulatorFor(std::string_view sd_dir) {
@@ -168,10 +164,10 @@ std::string SlotFor(std::string_view emulator, std::string_view file_name) {
   // key the server stores and this client has to reproduce byte for byte on
   // every later tick -- so it is built from a narrow alphabet rather than from
   // whatever the card happened to hold.
-  const std::size_t dot = file_name.rfind('.');
+  const std::string_view suffix = sync::ExtensionOf(file_name);
   std::string extension;
-  if (dot != std::string_view::npos && dot > 0) {
-    for (const char character : file_name.substr(dot + 1)) {
+  if (!suffix.empty()) {
+    for (const char character : suffix.substr(1)) {
       const char lowered = LowerAscii(character);
       const bool keep = (lowered >= 'a' && lowered <= 'z') || (lowered >= '0' && lowered <= '9') ||
                         lowered == '-' || lowered == '_';

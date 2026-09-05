@@ -235,11 +235,7 @@ PairingSession::TimePoint PairingSession::Now() const {
 }
 
 std::string PairingSession::ApiUrl(std::string_view path) const {
-  std::string_view origin = config_.server_url;
-  while (!origin.empty() && origin.back() == '/') {
-    origin.remove_suffix(1);
-  }
-  return std::string(origin) + std::string(path);
+  return http::JoinUrl(config_.server_url, path);
 }
 
 PairingState PairingSession::Fail(std::string message) {
