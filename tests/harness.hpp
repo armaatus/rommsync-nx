@@ -561,13 +561,12 @@ inline void DeleteSave(http::HttpClient& client, const std::string& base, const 
 
 /// RomM's own MD5 of `local_path`'s bytes.
 ///
-/// A save's `content_hash` is an **MD5** (sync.hpp), and `core/` holds SHA-256
-/// and nothing else -- it is there because deriving the device identifier needs
-/// a real hash, not because the engine hashes saves. So rather than grow an MD5
-/// in the test tree, this asks the server that will do the comparing: upload the
-/// bytes under a throwaway slot, read the digest it computed, delete the save.
-/// The same trick `sync.understood` uses, and for the same reason -- what
-/// matters is the string RomM will compare against, not one we computed.
+/// The engine has had its own MD5 since M2-3 (`crypto::Md5`, `state::HashFile`),
+/// so this is no longer a stand-in for a missing digest -- it is the independent
+/// oracle that one is checked against. Upload the bytes under a throwaway slot,
+/// read the digest the server computed, delete the save. What matters is the
+/// string RomM will compare against on every later negotiation, and only RomM
+/// can say what that is; `harness.content_hash` is where the two are compared.
 inline bool ServerMd5(http::HttpClient& client, const std::string& base, const Fixture& fixture,
                       std::int64_t rom_id, const std::string& local_path, std::string* out) {
   Save scratch;

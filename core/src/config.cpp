@@ -2,9 +2,7 @@
 
 #include "rommsync/atomic_file.hpp"
 
-#include <cerrno>
 #include <cstddef>
-#include <cstdio>
 #include <iterator>
 #include <map>
 #include <set>
@@ -265,48 +263,15 @@ std::map<std::string, PlatformFolders, std::less<>> BuildDefaultPlatforms() {
 
 // --- the file ---------------------------------------------------------------
 
-enum class ReadOutcome { kOk, kMissing, kUnreadable, kTooLarge };
-
 /// Read at most `kMaxConfigBytes` of `path`.
 ///
-/// `io::ReadFile` deliberately reads whatever is there, which is right for
-/// `token.dat` and `device.dat` -- records this client wrote itself, whose size
-/// it therefore knows. `config.ini` is the one file a human and a card reader
-/// both get to touch, so this one stops instead. One byte past the bound is
-/// enough to tell "at the limit" from "over it" without holding the rest.
-ReadOutcome ReadBounded(const std::string& path, std::string* out) {
-  errno = 0;
-  std::FILE* file = std::fopen(path.c_str(), "rb");
-  if (file == nullptr) {
-    // Same distinction io::ReadFile draws, for the same reason: only ENOENT and
-    // ENOTDIR mean nothing was ever written here. A full handle table or an
-    // `sdmc:` that is not mounted yet is a bad moment, and answering one with
-    // "no config" would silently run the console on defaults.
-    const int why = errno;
-    return (why == ENOENT || why == ENOTDIR) ? ReadOutcome::kMissing : ReadOutcome::kUnreadable;
-  }
-
-  char buffer[4096];
-  std::size_t got = 0;
-  bool too_large = false;
-  while ((got = std::fread(buffer, 1, sizeof(buffer), file)) > 0) {
-    if (out->size() + got > kMaxConfigBytes) {
-      too_large = true;
-      break;
-    }
-    out->append(buffer, got);
-  }
-  const bool failed = std::ferror(file) != 0;
-  std::fclose(file);
-  if (too_large) {
-    out->clear();
-    return ReadOutcome::kTooLarge;
-  }
-  if (failed) {
-    out->clear();
-    return ReadOutcome::kUnreadable;
-  }
-  return ReadOutcome::kOk;
+/// The bound and its reasoning live in `io::ReadBounded` (atomic_file.hpp):
+/// `config.ini` is a file a human and a card reader both get to touch, so it
+/// stops at a named refusal rather than a `bad_alloc`. `state.db` needs exactly
+/// the same read for the same reason, and one copy of the "one byte past the
+/// bound" check is one place for it to drift.
+io::BoundedRead ReadBounded(const std::string& path, std::string* out) {
+  return io::ReadBounded(path, kMaxConfigBytes, out);
 }
 
 // --- the parse ---------------------------------------------------------------
@@ -999,12 +964,12 @@ LoadResult ParseConfig(std::string_view text) {
 
 LoadResult LoadConfig(const std::string& path) {
   std::string contents;
-  const ReadOutcome outcome = ReadBounded(path, &contents);
-  if (outcome == ReadOutcome::kOk) {
+  const io::BoundedRead outcome = ReadBounded(path, &contents);
+  if (outcome == io::BoundedRead::kOk) {
     return ParseConfig(contents);
   }
 
-  if (outcome == ReadOutcome::kMissing) {
+  if (outcome == io::BoundedRead::kMissing) {
     // The one moment `config.ini` legitimately does not exist is the window
     // `io::WriteAtomically` opens: the record already in place is renamed to
     // `.old` before the new one is renamed on. `token_store` and
@@ -1012,7 +977,7 @@ LoadResult LoadConfig(const std::string& path) {
     // file -- answering a transient failure with the previous record is a
     // different and worse thing (see atomic_file.hpp).
     std::string previous;
-    if (ReadBounded(io::PreviousPathFor(path), &previous) == ReadOutcome::kOk) {
+    if (ReadBounded(io::PreviousPathFor(path), &previous) == io::BoundedRead::kOk) {
       LoadResult recovered = ParseConfig(previous);
       Diagnostics diags;
       diags.Add(Severity::kWarning, 0, "", "",
@@ -1029,24 +994,24 @@ LoadResult LoadConfig(const std::string& path) {
   result.value = Defaults();
   Diagnostics diags;
   switch (outcome) {
-    case ReadOutcome::kMissing:
+    case io::BoundedRead::kMissing:
       // Not a failure: it is a console nobody has configured yet. The client
       // still has a folder map, and `configured()` is what says it has no
       // server -- reported below as the error it is, once, rather than twice.
       diags.Add(Severity::kNotice, 0, "", "",
                 path + " does not exist; the built-in defaults are in use");
       break;
-    case ReadOutcome::kUnreadable:
+    case io::BoundedRead::kUnreadable:
       diags.Add(Severity::kError, 0, "", "",
                 path + " exists and could not be read; the built-in defaults are in use and "
                        "your settings are not");
       break;
-    case ReadOutcome::kTooLarge:
+    case io::BoundedRead::kTooLarge:
       diags.Add(Severity::kError, 0, "", "",
                 path + " is larger than the " + std::to_string(kMaxConfigBytes) +
                     " bytes a configuration can be; the built-in defaults are in use");
       break;
-    case ReadOutcome::kOk:
+    case io::BoundedRead::kOk:
       break;
   }
   diags.Add(Severity::kError, 0, "server", "url",
