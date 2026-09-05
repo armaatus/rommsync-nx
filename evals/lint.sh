@@ -208,6 +208,36 @@ else
   echo "  --: actionlint is not installed (brew install actionlint); CI still checks this"
 fi
 
+# claude-code-action authenticates by exchanging a GitHub OIDC token, so a job
+# that uses it needs `id-token: write` -- at the job level, or inherited from the
+# workflow. Without it the action retries three times, fails, and submits
+# nothing. That is invisible in the way that matters: `merge-gate` then blocks
+# every PR on a review that will never arrive, and the only clue is a red job
+# nobody required. It cost the first real fleet run.
+if ls .github/workflows/*.yml >/dev/null 2>&1; then
+  if python3 - <<'PY'
+import re, sys, glob
+
+bad = []
+for path in glob.glob(".github/workflows/*.yml"):
+    text = open(path).read()
+    if "claude-code-action" not in text:
+        continue
+    # Cheap and good enough: the token is needed somewhere in scope, and these
+    # files declare permissions either at the top or on the job.
+    if "id-token: write" not in text:
+        bad.append(path)
+for path in bad:
+    print(path)
+sys.exit(1 if bad else 0)
+PY
+  then
+    ok "every workflow using claude-code-action grants id-token: write"
+  else
+    fail "a workflow uses claude-code-action without 'id-token: write'; the action cannot authenticate and will submit nothing"
+  fi
+fi
+
 echo "== the merge gate"
 # The one required check `gh pr merge --auto` waits on. Its decision lives in a
 # script rather than in the YAML precisely so it can be tested without a pull
