@@ -6,21 +6,20 @@
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/auth.hpp"
 #include "rommsync/config.hpp"
+#include "rommsync/download.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/pairing.hpp"
 #include "rommsync/token_store.hpp"
 
 namespace rommsync::sysmodule {
-namespace {
 
 /// One of this client's files, as a path the SD card understands. `core/` owns
 /// the file names and may not know an SD path (hard rule 4), so joining them is
 /// this side's job -- once, rather than at each call site.
-std::string PathTo(const char* file_name) { return std::string(kConfigDir) + file_name; }
+std::string SdEngine::PathTo(const char* file_name) const { return config_dir_ + file_name; }
 
-}  // namespace
-
-void SdEngine::Load() {
+void SdEngine::Load(const std::string& config_dir) {
+  config_dir_ = config_dir;
   const config::LoadResult loaded = config::LoadConfig(PathTo(config::kConfigFileName));
   config_ = loaded.value;
   diagnostics_ = loaded.diagnostics;
@@ -40,6 +39,39 @@ void SdEngine::Load() {
   const io::ReadResult record = io::ReadFile(PathTo(auth::kTokenFileName));
   auth_ = record.error == io::ReadError::kMissing ? ipc::AuthState::kNeverPaired
                                                   : ipc::AuthState::kPaired;
+
+  // The queue never refuses to produce one either: a corrupt or oversized
+  // `queue.json` is an empty queue plus a diagnostic, and nothing may block boot
+  // (`download.hpp`, CLAUDE.md).
+  download::LoadedQueue queued = download::LoadQueue(PathTo(download::kQueueFileName));
+  queue_.Reset(std::move(queued.entries));
+  // Carried on the config's diagnostics rather than dropped. It is not a
+  // complaint about `config.ini`, and the section says so -- but a queue that
+  // vanished with nothing anywhere saying why is the failure a diagnostic
+  // exists to prevent, and the settings screen (#26) is the one place on this
+  // console a user can read one. A field of its own is #22's to add.
+  for (std::string& complaint : queued.diagnostics) {
+    diagnostics_.push_back({config::Severity::kWarning, 0, "downloads", "", std::move(complaint)});
+  }
+}
+
+ipc::Error SdEngine::Commit(const std::function<ipc::Error()>& change) {
+  // The whole queue, so a failed write can be undone exactly. Restoring by
+  // reversing the change would not be exact: `Enqueue` erases a terminal entry
+  // to re-queue the rom, and a `Remove` that put the new row back would lose
+  // the `failed` row a user is entitled to still see.
+  std::vector<download::QueueEntry> before = queue_.Snapshot();
+  const ipc::Error refused = change();
+  if (refused != ipc::Error::kOk) {
+    return refused;
+  }
+  if (download::SaveQueue(PathTo(download::kQueueFileName), queue_).ok()) {
+    return ipc::Error::kOk;
+  }
+  // `kWriteFailed` promises the in-memory state is unchanged too, so a caller
+  // that retries is not fighting a half-applied edit (`ipc.hpp`).
+  queue_.Reset(std::move(before));
+  return ipc::Error::kWriteFailed;
 }
 
 const config::Config& SdEngine::config() const { return config_; }
@@ -51,11 +83,17 @@ const std::vector<config::Diagnostic>& SdEngine::config_diagnostics() const {
 ipc::EngineSnapshot SdEngine::Snapshot() const {
   ipc::EngineSnapshot snapshot;
   snapshot.auth = auth_;
+  // M3-2 (#19): these two come off the queue on the card rather than being the
+  // zero a console with no engine reports. `pending()` counts what the worker
+  // still has to do, so the finished rows kept for the queue screen do not
+  // inflate the depth.
+  snapshot.queue_depth = static_cast<std::int64_t>(queue_.pending());
+  snapshot.download = queue_.CurrentDownload();
   // Everything else is a default, and every default is the truthful answer for
-  // a console whose engine has not been built: never synced, nothing online,
-  // nothing queued, nothing downloading. `Status` renders each of those as its
-  // own sentence rather than as a blank (`overlay_status_view.hpp`), which is
-  // why this is safe to serve rather than something to refuse.
+  // a console whose engine has not been built: never synced, nothing online.
+  // `Status` renders each of those as its own sentence rather than as a blank
+  // (`overlay_status_view.hpp`), which is why this is safe to serve rather than
+  // something to refuse.
   return snapshot;
 }
 
@@ -80,9 +118,13 @@ ipc::Error SdEngine::StartPairing() { return ipc::Error::kUnavailable; }
 
 ipc::Error SdEngine::Unpair() { return ipc::Error::kUnavailable; }
 
-ipc::Error SdEngine::Enqueue(std::int64_t, std::int32_t*) { return ipc::Error::kUnavailable; }
+ipc::Error SdEngine::Enqueue(std::int64_t rom_id, std::int32_t* position) {
+  return Commit([&] { return queue_.Enqueue(rom_id, position); });
+}
 
-ipc::Error SdEngine::Dequeue(std::int64_t) { return ipc::Error::kUnavailable; }
+ipc::Error SdEngine::Dequeue(std::int64_t rom_id) {
+  return Commit([&] { return queue_.Remove(rom_id); });
+}
 
 ipc::Error SdEngine::ListBegin(const ipc::ListRequest&, ipc::Cursor*) {
   return ipc::Error::kUnavailable;

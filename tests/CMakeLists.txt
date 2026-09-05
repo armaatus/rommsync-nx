@@ -876,3 +876,31 @@ if(NOT ROMMSYNC_REQUIRE_RIG)
 endif()
 set_tests_properties(download.resume PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
 
+# --- the sysmodule's ipc::Engine, on the host --------------------------------
+# `sysmodule/source/engine.cpp` names no libnx type, so the only thing that tied
+# it to a console was the `sdmc:` prefix on its config directory -- and
+# `SdEngine::Load` takes that as a parameter. M3-2 is the first issue to put real
+# behaviour behind one of its commands (Enqueue/Dequeue change a file on the
+# card), which is what makes "it compiles" stop being a description of what the
+# engine does. Needs no server: what it pins is the card.
+add_executable(test_engine test_engine.cpp
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/engine.cpp")
+target_link_libraries(test_engine PRIVATE rommsync::host)
+target_include_directories(test_engine PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/sysmodule/source")
+target_compile_definitions(test_engine PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+
+set(ENGINE_SCENARIOS
+  queue     # enqueue, dequeue, and the depth the status screen reads
+  persists  # every change reaches queue.json, and a fresh engine reads it back
+  rollback  # a write that cannot happen changes neither the file nor memory
+  corrupt   # a queue.json a yanked card left behind never blocks the boot
+  commands  # what is still `kUnavailable`, so the list shrinks deliberately
+)
+foreach(scenario IN LISTS ENGINE_SCENARIOS)
+  add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
+  set_tests_properties(engine.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
