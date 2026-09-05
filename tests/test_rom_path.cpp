@@ -194,6 +194,18 @@ void Hostile(checks::Checks& c) {
   const config::Config elsewhere = Parse("[platform.gba]\nroms = /sdcard/games/gba\n");
   ExpectRefused(c, elsewhere, "../../atmosphere/x", "a traversing name under an override");
 
+  // What FAT32 and exFAT reserve. Every one of these is legal on the Linux
+  // filesystem RomM scanned, and `?` is how No-Intro spells a name, so this is
+  // the refusal a real library reaches rather than an attacker: the card cannot
+  // store it, and a skip that says so beats an `open` that fails a third of the
+  // way through a 120 MiB download.
+  for (const char reserved : std::string("?*:\"<>|")) {
+    ExpectRefused(c, defaults, "Carmen Sandiego" + std::string(1, reserved) + ".nes",
+                  std::string("a name containing '") + reserved + "'");
+  }
+  c.Expect(defaults.DestinationFor({"nes", "Where in Time (USA) [!].nes"}).ok(),
+           "...and the punctuation a rom name actually needs still resolves");
+
   // The predicate the refusals are made of, checked directly -- M3-4 has the
   // same question to ask about the files inside a disc set.
   std::string why;
@@ -234,6 +246,24 @@ void Existing(checks::Checks& c) {
   const std::vector<std::string> some = mixed.ExistingRomPaths({"gba", std::string(300, 'a')});
   c.ExpectEq(some.size(), std::size_t{1}, "a candidate that cannot be a path is dropped, not cut");
   c.ExpectEq(some.front().substr(0, 3), std::string("/g/"), "and the one that fits is kept");
+
+  // The order matters: when it is the *first* folder that overflows, this list
+  // is not empty and its `front()` is the second folder, while `DestinationFor`
+  // refuses. The two do not agree here, and a caller that took `front()` for a
+  // write target would write outside the mapped write folder -- so the header
+  // says `DestinationFor` is the only answer to that question, and this is the
+  // configuration that makes it matter.
+  const config::Config deep_first =
+      Parse("[platform.gba]\nroms = /" + std::string(700, 'x') + "/deep, /g\n");
+  // Named, because `RomFile` holds views: the header says it is an argument and
+  // never a record, and `-Wdangling-gsl` says the same thing louder.
+  const std::string big_name(300, 'a');
+  const config::RomFile big{"gba", big_name};
+  const std::vector<std::string> found = deep_first.ExistingRomPaths(big);
+  c.ExpectEq(found.size(), std::size_t{1}, "the folder that fits is still a place to look");
+  c.Expect(!deep_first.DestinationFor(big).ok(), "while the write target itself is refused");
+  c.Expect(found.front() != deep_first.DestinationFor(big).path,
+           "so these two answers are not interchangeable");
 }
 
 // --- against the real library -------------------------------------------------

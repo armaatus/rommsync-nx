@@ -98,11 +98,19 @@ platform_fs_slug = gba, fs_name = synthetic-large.gba
 - The remaining `roms` entries are where the client looks to see whether the
   rom is *already* on the card. Only the first is ever written to.
 - A `fs_name` is refused rather than repaired when it is not a plain file name:
-  a `/` or `\`, a bare `.` or `..`, a control character, a NUL, or a resolved
-  path over 768 characters, which is refused rather than truncated. That name
-  comes off someone else's disk and the folder it would land in is one you
-  mapped, so `../../atmosphere` is a refusal by name and not a path this client
-  resolves.
+  an empty one, a `/` or `\`, a bare `.` or `..`, a control character or a NUL,
+  one of the characters FAT32 and exFAT reserve (`? * : " < > |`), a name over
+  768 characters, or a resolved path over 768 characters — which is refused
+  rather than truncated. That name comes off someone else's disk and the folder
+  it would land in is one you mapped, so `../../atmosphere` is a refusal by name
+  and not a path this client resolves.
+- The reserved characters are the one refusal an ordinary library meets. RomM
+  scans a Linux filesystem where all of them are legal, and `?` is conventional
+  in a No-Intro name — `Where in Time Is Carmen Sandiego? (USA).nes`. Your SD
+  card cannot store that name, so the rom is skipped with a reason instead of
+  failing partway through the download. Renaming it in RomM is the fix; the
+  client will not rename it for you, because it also looks for the rom on the
+  card *by that name* and would download it again on every sync.
 
 ## Validation rules
 

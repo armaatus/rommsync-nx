@@ -148,6 +148,10 @@ struct RomFile {
   /// `Synthetic Two Disc Game` for a multi-file rom, where it names a
   /// directory. Never trusted -- see `ValidRomFileName`.
   std::string_view fs_name;
+
+  /// Both fields are views, which makes this an argument and never a record:
+  /// it must not outlive the parsed body they point into. A caller that keeps
+  /// a rom keeps the rom's own strings and builds one of these at the call.
 };
 
 /// Where a rom is written, or why it is not written anywhere.
@@ -214,9 +218,14 @@ struct Config {
   /// "Is it already on the card?" reads *all* of a platform's `roms` entries,
   /// while only the first is written to (docs/CONFIG.md): the later entries are
   /// exactly the folders where someone already keeps that platform's roms, and
-  /// a check that skipped them re-downloads a rom the card has. Empty for the
-  /// same reasons `DestinationFor` fails, and `front()` is that same
-  /// destination whenever both answer.
+  /// a check that skipped them re-downloads a rom the card has.
+  ///
+  /// Empty when the platform is unmapped, maps no roms folder, or the name is
+  /// one `ValidRomFileName` refuses. It is **not** a way to find the write
+  /// target: a folder whose joined path is too long drops out of this list, so
+  /// when the *first* folder is the one that overflows, `front()` here is the
+  /// second folder while `DestinationFor` refuses outright. `DestinationFor`
+  /// is the only answer to "where does this get written".
   std::vector<std::string> ExistingRomPaths(const RomFile& rom) const;
 
   /// Every save directory across every platform, deduplicated, in first-seen
@@ -375,8 +384,15 @@ bool NormalizeSdPath(std::string_view raw, std::string* out, std::string* why);
 /// that library, and nothing has checked it before it reaches a path this
 /// client writes to -- `NormalizeSdPath` validates the directories a human
 /// configured and nothing validates this. So: not empty, no path separator
-/// (`/` or `\`), not `.` or `..`, no control character or NUL, and no longer
-/// than `kMaxPathLength`.
+/// (`/` or `\`), not `.` or `..`, no control character or NUL, none of the
+/// characters FAT32 and exFAT reserve (`? * : " < > |`), and no longer than
+/// `kMaxPathLength`.
+///
+/// The reserved set is refused rather than rewritten. `?` is conventional in a
+/// No-Intro name and perfectly legal on the Linux filesystem RomM scanned, so
+/// the card is where it stops being storable -- and a rom whose name this
+/// client quietly changed would be looked for, on the next tick, under a name
+/// nothing ever wrote, and downloaded again forever.
 ///
 /// It is a *leaf*, so a separator is refused rather than normalised away. A
 /// `fs_name` with one in it is not a deeper folder anybody asked for; it is a
