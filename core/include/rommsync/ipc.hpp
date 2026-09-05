@@ -95,7 +95,15 @@ inline constexpr const char* kServiceName = "rommsync";
 /// a new one next to an old one on an SD card. An overlay that can ask "which
 /// contract are you?" can say "update the sysmodule"; one that cannot decodes
 /// garbage and blames the server.
-inline constexpr std::uint32_t kVersion = 1;
+///
+/// **2** since M4-1 (#23), which added `sync_in_progress` and
+/// `config_error_count` to `Status`. Adding a field only escapes a bump when a
+/// decoder tolerates it missing, and these decoders tolerate nothing missing by
+/// design (see the codec note below) -- so a v2 overlay reading a v1
+/// sysmodule's `Status` fails to decode. Without the bump that arrives as
+/// "sysmodule unreachable", which is the sentence this constant exists to
+/// replace with "update the sysmodule".
+inline constexpr std::uint32_t kVersion = 2;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///
@@ -161,11 +169,11 @@ bool IsCommand(std::uint32_t id, Command* out = nullptr);
 /// Portable on purpose: the sysmodule maps this onto a Horizon `Result` at the
 /// boundary (`sysmodule/source/ipc/service.cpp`) and `core/` never names one.
 ///
-/// The last four are the *transport's* errors rather than any one command's.
-/// They are here rather than folded into `kInvalid` because they say something
-/// different to whoever is reading a log: a command id this build does not know
-/// means the two halves are different releases, and that is the sentence the
-/// user needs -- not "invalid request".
+/// `kUnknownCommand` through `kInternal` are the *transport's* errors rather
+/// than any one command's. They are here rather than folded into `kInvalid`
+/// because they say something different to whoever is reading a log: a command
+/// id this build does not know means the two halves are different releases, and
+/// that is the sentence the user needs -- not "invalid request".
 enum class Error {
   kOk = 0,
 
@@ -205,6 +213,23 @@ enum class Error {
   /// The engine failed in a way it could not name. The last resort, never the
   /// first choice.
   kInternal,
+
+  /// This build has no engine behind that command yet.
+  ///
+  /// The sysmodule hosts the whole command set from M4-1 (#23) onward, because
+  /// the overlay needs a service to talk to, while the machinery behind half of
+  /// it is still being built -- the download queue is M3-2 (#19), live config
+  /// writes M5-3 (#30), list paging M5-4 (#31), the scheduler M7-2. Those
+  /// commands answer this rather than a plausible-looking refusal: an `Enqueue`
+  /// reported as `kQueueFull` sends a user looking for a full queue, and a
+  /// `SetEnabled` reported as `kWriteFailed` sends them looking at their SD
+  /// card. **Nothing was attempted and nothing changed**, exactly as for
+  /// `kInvalid`.
+  ///
+  /// It is appended rather than inserted: `sysmodule::ToResult` maps the
+  /// ordinal, so renumbering one would change what an already-built overlay
+  /// reads a `Result` as. Each of the issues above removes its own use of it.
+  kUnavailable,
 };
 
 /// Stable, log-friendly name -- `queue_full`. Never null.
@@ -300,6 +325,15 @@ struct Status {
   std::int64_t last_sync_at = 0;
   SyncResult last_sync_result = SyncResult::kNever;
 
+  /// A sync tick is running right now.
+  ///
+  /// The same fact `SyncNow` reports as `kAlreadyRunning`, carried here because
+  /// the status screen has to draw it without pressing anything: a console
+  /// mid-tick otherwise renders as an idle one whose counts are about to change
+  /// on their own. A download is not a substitute -- a tick that is uploading
+  /// saves or negotiating has no `DownloadSnapshot` at all (M4-1, #23).
+  bool sync_in_progress = false;
+
   /// The last sync's counts. Not cumulative -- a running total nobody can reset
   /// is a number that stops meaning anything after a month.
   std::int64_t uploaded = 0;
@@ -308,6 +342,21 @@ struct Status {
   std::int64_t failed = 0;
 
   std::int64_t queue_depth = 0;
+
+  /// How many `kError` diagnostics `config.ini` produced.
+  ///
+  /// A count rather than the diagnostics themselves: the whole list is
+  /// `GetConfig`'s, and the settings screen (#26) is where a user reads it. What
+  /// the status screen needs is the one bit that sends them there, and it needs
+  /// it without a second round trip -- a console whose `server.url` will not
+  /// parse otherwise renders as merely unconfigured, with nothing saying that
+  /// the file it is being told to edit is the file that is already wrong.
+  ///
+  /// `kError` only. A warning is compatible with a working client
+  /// (`config::Severity`), and a status screen that counted those would be red
+  /// on a console with nothing wrong with it.
+  std::int64_t config_error_count = 0;
+
   DownloadSnapshot download;
 };
 
@@ -653,6 +702,8 @@ struct EngineSnapshot {
   bool online = false;
   std::int64_t last_sync_at = 0;
   SyncResult last_sync_result = SyncResult::kNever;
+  /// A tick is running. See `Status::sync_in_progress`.
+  bool sync_in_progress = false;
   std::int64_t uploaded = 0;
   std::int64_t downloaded = 0;
   std::int64_t conflicts = 0;

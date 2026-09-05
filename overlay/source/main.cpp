@@ -1,14 +1,45 @@
 // ovl-rommsync entry point.
 //
-// Skeleton: it does not draw, and Ultrahand will list it and find nothing to
-// show. The real overlay is M4-1, on libultrahand; overlay UI is one of the few
-// things an emulator cannot exercise, so it is verified last, on hardware,
-// after the M8-1 gate (overlay/AGENTS.md).
+// One `tsl::Overlay` holding one session on `sys-rommsync` and, for now, one
+// screen: the status screen (M4-1, #23). The library / queue, sync and settings
+// screens are M4-2..M4-5 and are added beside it.
 //
-// What exists today is the packaging: a devkitA64 link that produces a signed
-// .ovl, so CI publishes an artifact and a broken Switch toolchain is a red
-// build rather than a discovery in M4.
+// The session is owned here rather than by a screen because every screen shares
+// it: `smGetService` per screen would be a handle per screen, and an overlay
+// that leaked one would take the sysmodule's session table with it. Opening is
+// left to the screen's own poll -- a sysmodule that is not running is a state
+// the status screen draws (`overlay_status_view.hpp`), not a reason for the
+// overlay to fail to load.
+//
+// Nothing in this directory has ever run. Overlay UI is one of the few things an
+// emulator cannot exercise, so it is verified last, on hardware, after the M8-1
+// gate; overlay/README.md carries the script that does it.
 
-#include <switch.h>
+#define TESLA_INIT_IMPL
+#include <tesla.hpp>
 
-int main(int, char**) { return 0; }
+#include <memory>
+
+#include "ipc_client.hpp"
+#include "status_screen.hpp"
+
+namespace {
+
+class RommsyncOverlay : public tsl::Overlay {
+ public:
+  std::unique_ptr<tsl::Gui> loadInitialGui() override {
+    return initially<rommsync::overlay::StatusScreen>(client_);
+  }
+
+  /// Closed here rather than in the screen: Tesla tears the gui down and
+  /// rebuilds it whenever the overlay is hidden, and a session dropped on every
+  /// hide would be re-opened on every show for no reason.
+  void exitServices() override { client_.Close(); }
+
+ private:
+  rommsync::overlay::IpcClient client_;
+};
+
+}  // namespace
+
+int main(int argc, char** argv) { return tsl::loop<RommsyncOverlay>(argc, argv); }

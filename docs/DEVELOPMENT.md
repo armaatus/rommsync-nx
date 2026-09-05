@@ -41,9 +41,21 @@ with `cat`, and both substitute the same `version.hpp.in`.
 - Relevant portlibs likely used: `switch-mbedtls` is **avoided** for the
   sysmodule -- M0-1 measured it at six times the code size of the `ssl` service
   path (see the TLS note); `switch-curl` only if it can be trimmed to fit.
+- **The overlay is the exception to that line, and it is not a reversal.**
+  `ovl-rommsync` links `-lcurl -lz -lminizip -lmbedtls -lmbedx509 -lmbedcrypto`
+  because libultrahand's own objects reference them (its updater and its package
+  handling), and `--gc-sections` cannot drop a symbol a linked object still
+  names. The overlay is a launched process with the applet's memory, not a
+  resident sysmodule in a `0x80000` heap, so the footprint M0-1 was measuring
+  does not apply to it -- and `ovl-rommsync` itself opens no socket: everything
+  it does over the network happens in `sys-rommsync` (overlay/AGENTS.md). The
+  rule for the **sysmodule** is unchanged.
 - Overlay: [libultrahand](https://github.com/ppkantorski/libultrahand) as a
-  submodule; build with its Makefile conventions and append the `ULTR` signature
-  to the `.ovl`.
+  submodule at `overlay/lib/libultrahand`, compiled from source by
+  `../switch.mk` as vendored code -- headers with `-isystem`, objects without
+  `-Wextra -Wpedantic -Werror` -- and the `ULTR` signature appended to the
+  `.ovl`. `git submodule update --init --recursive` before the first build; CI
+  checks out with `submodules: recursive`.
 
 Recommended: build in the official devkitpro docker image
 `devkitpro/devkita64` so contributors and CI match. See `.github/workflows/ci.yml`.
@@ -261,9 +273,27 @@ Three more errors belong to the transport rather than to any one command:
 different releases), `kMalformedRequest` (a request payload that did not decode)
 and `kTooLarge` (a response that would not fit the cap).
 
+A fourth, `kUnavailable`, belongs to *this stage of the project* rather than to
+the wire: the sysmodule hosts the whole command set from M4-1 on, because the
+overlay needs a service to talk to, while the machinery behind half of it is
+still being built. A command whose engine does not exist yet answers
+`kUnavailable` -- nothing attempted, nothing changed -- rather than a plausible
+refusal that would send a user looking for a full queue or a failing SD card.
+Each of M3-2, M5-3, M5-4 and M7-2 removes its own use of it, and the last one to
+go is what says the engine is finished (`sysmodule/source/engine.hpp`).
+
+`SyncNow` is the one command that cannot say it, and the reason is the seam
+rather than a choice: `ipc::Engine::RequestSync()` is a `bool`, so an engine
+that has not been built answers `false` and `ServiceCore` reports
+`already_running` -- exactly the plausible refusal the rule above exists to
+avoid. Widening `RequestSync` to an `Error` would be a contract change for one
+caller that M7-2 is about to make true anyway, so it is recorded here and in
+`engine.cpp` instead of papered over.
+
 `Status` carries the interface version and the build, the enable switch, the auth
 state (paired / unauthenticated / never paired), configured, online, the last
-sync's time, result and counts, the queue depth, and the **current download**
+sync's time, result and counts, whether a tick is running right now
+(`sync_in_progress`), the queue depth, and the **current download**
 (`rom_id`, `fs_name`, `bytes_done`, `bytes_total`, state). That last field is how
 M3-5 is served: one poll per frame, not a second round trip. Per-item queue
 progress rides on the `queue` list kind (M5-4).
@@ -274,8 +304,11 @@ progress rides on the `queue` list kind (M5-4).
 |---|---|
 | `core/include/rommsync/ipc.hpp`, `core/src/ipc.cpp` | ids, payloads, encoders and decoders |
 | `core/src/ipc_service.cpp` | `ipc::ServiceCore` -- one method per command, and every decision |
-| `sysmodule/source/ipc/` | the `cmif` binding: buffers in, buffers out, `ipc::Error` to a `Result`. No logic. |
+| `sysmodule/source/ipc/service.*` | the `cmif` binding: buffers in, buffers out, `ipc::Error` to a `Result`. No logic. |
+| `sysmodule/source/ipc/server.*` | hosting it: `smRegisterServiceCmif`, `svcAcceptSession`, the session table, `svcReplyAndReceive` |
+| `sysmodule/source/engine.*` | the `ipc::Engine` `ServiceCore` reads the console out of, as far as it is built |
 | `overlay/source/ipc_client.*` | `smGetService("rommsync")` and the *same* codecs |
+| `core/include/rommsync/overlay_status_view.hpp` | what the status screen *says*, decided off the framebuffer (`overlay.status`) |
 
 `core/` may not name a libnx type (hard rule 4), so the errors are a portable
 `ipc::Error` and the sysmodule maps them to a Horizon `Result` at the boundary.
