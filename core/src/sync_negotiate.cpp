@@ -86,22 +86,6 @@ const ReasonSpelling* SpellingOf(Reason reason) {
   return nullptr;
 }
 
-/// The shape a save's `content_hash` has to have to compare equal to anything:
-/// 32 lowercase hex digits. RomM stores `hexdigest()`, and compares the string.
-bool LowercaseMd5(std::string_view value) {
-  if (value.size() != kContentHashDigits) {
-    return false;
-  }
-  for (const char character : value) {
-    const bool digit = character >= '0' && character <= '9';
-    const bool letter = character >= 'a' && character <= 'f';
-    if (!digit && !letter) {
-      return false;
-    }
-  }
-  return true;
-}
-
 json::Error Fail(std::string_view field, std::string message) {
   json::Error error;
   error.field = std::string(field);
@@ -174,7 +158,7 @@ json::Error ReadOperation(const json::Value& value, std::size_t index, SyncOpera
   // belongs to negotiates as changed on every tick, forever, with no other
   // symptom. That is the failure the outgoing check exists to prevent, arriving
   // from the other direction (docs/API_CONTRACT.md).
-  if (out->server_content_hash.has_value() && !LowercaseMd5(*out->server_content_hash)) {
+  if (out->server_content_hash.has_value() && !IsContentHash(*out->server_content_hash)) {
     warnings->push_back(where + ": the server's content_hash is " +
                         std::to_string(out->server_content_hash->size()) +
                         " characters and not lowercase hex; saves are compared on MD5, so this "

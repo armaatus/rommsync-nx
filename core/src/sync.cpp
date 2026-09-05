@@ -66,6 +66,10 @@ void AppendMember(std::string& out, std::string_view key, const std::optional<st
 
 }  // namespace
 
+bool IsContentHash(std::string_view value) {
+  return value.size() == kContentHashDigits && LowercaseHex(value);
+}
+
 bool IsSingleFileName(std::string_view value) {
   // `saves-post.json` shows where these land:
   // `users/<user>/saves/<platform>/<rom>/<emulator>/<file_name>`. Both the

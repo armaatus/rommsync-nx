@@ -7,11 +7,16 @@
 // copies of -- see `WriteAtomically` for why the commit is two renames rather
 // than one.
 //
-// Nothing here is for a *large* file. Downloads stream to a `.part` file
-// through `http::DownloadTarget`; this reads and writes whole strings.
+// `WriteAtomically` is not for a *large* file: it takes the contents as a
+// `string_view`, so the whole record is in memory. `CopyAtomically` is the same
+// guarantee for a file that will not fit -- a save state is tens of megabytes
+// and the sysmodule's inner heap is 512 KiB -- and it streams. Downloads stage
+// through `http::DownloadTarget`'s own `.part` file and land with
+// `CommitStaged`.
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -96,6 +101,71 @@ std::string PreviousPathFor(std::string_view path);
 /// needs an `fsync` the C++ standard library does not expose. The promise here
 /// is that no reader ever sees a partial record.
 WriteResult WriteAtomically(const std::string& path, std::string_view contents);
+
+/// Move a file that is already staged on disk onto `path`, atomically.
+///
+/// `WriteAtomically`'s commit, on its own, for the bytes it cannot hold: a save
+/// arrives by download rather than as a string, and `http::DownloadTarget` has
+/// already put a complete copy of it somewhere. The rename dance is the same
+/// one and the reasoning behind it is the same one -- Horizon's rename refuses
+/// an existing destination, so a file already at `path` is moved to
+/// `PreviousPathFor(path)` first and put back if the second rename fails.
+///
+/// `staged` is consumed: it is renamed away on success and removed on failure,
+/// so a caller never has to decide what to do with a half-committed pair. That
+/// matches `WriteAtomically`, whose temp file does not survive a failed commit
+/// either -- a failure costs the new contents and never the old ones.
+///
+/// `kOpenFailed` when there is nothing at `staged`; every other outcome is a
+/// commit that did not happen, named the way `WriteAtomically` names it.
+WriteResult CommitStaged(const std::string& staged, const std::string& path);
+
+/// Why a copy did not complete.
+///
+/// The source outcomes are split from the destination ones because the caller
+/// this exists for -- backing a save up before overwriting it -- reads them
+/// differently: `kSourceMissing` means there was nothing at that path to
+/// protect and the overwrite may go ahead, while every other value means the
+/// previous bytes are *not* safe and it may not.
+enum class CopyError {
+  kNone,
+  kSourceMissing,     ///< there is no file at `from` (ENOENT/ENOTDIR)
+  kSourceUnreadable,  ///< there is, and the bytes could not be got out of it
+  kOpenFailed,        ///< the temp file could not be created -- usually a missing directory
+  kWriteFailed,       ///< the bytes did not all reach the disk
+  kCommitFailed,      ///< the rename onto the destination failed
+};
+
+/// Stable, log-friendly name. Never null.
+const char* ToString(CopyError error);
+
+struct CopyResult {
+  CopyError error = CopyError::kNone;
+
+  /// For logs. Names both paths and what went wrong, never the contents.
+  std::string message;
+
+  /// Bytes that reached the destination. Zero on every failure.
+  std::uint64_t bytes_copied = 0;
+
+  bool ok() const { return error == CopyError::kNone; }
+};
+
+/// Copy `from` onto `to` so that no reader ever sees a partial copy.
+///
+/// Streamed through a 4 KiB stack chunk rather than read whole, which is the
+/// difference between this and `WriteAtomically(to, ReadFile(from).contents)`:
+/// the file being copied is a *save*, the sysmodule's inner heap is 512 KiB,
+/// and buffering a save state would be a `bad_alloc` on the console and a green
+/// test on a laptop (core/AGENTS.md).
+///
+/// The bytes go to `TempPathFor(to)` and are committed with `CommitStaged`, so
+/// a failure part way through leaves whatever was at `to` exactly as it was.
+/// The directory must already exist, for the reason `WriteAtomically` gives.
+///
+/// It is a copy and not a move: the point of the caller is that both files
+/// exist afterwards.
+CopyResult CopyAtomically(const std::string& from, const std::string& to);
 
 /// Read a whole file.
 ///

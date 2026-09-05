@@ -188,6 +188,18 @@ struct Encoded {
 /// Values are never quoted back, matching `json::Error`.
 json::Error Validate(const ClientSaveState& save);
 
+/// True for a string that can compare equal to a RomM save digest: 32
+/// lowercase hex characters.
+///
+/// Both directions need it, and for the same reason in each: RomM stores
+/// `hexdigest()` and compares the *string*, so a SHA1 or an uppercase MD5
+/// matches nothing and makes an unchanged save look changed on every tick,
+/// forever, with no other symptom. `Validate` refuses one on the way out;
+/// `ParseNegotiateResponse` reports one on the way in -- the server's digest is
+/// whatever some other client uploaded -- and M2-5 will not verify a download
+/// against one it cannot compare.
+bool IsContentHash(std::string_view value);
+
 /// True for a string that names one file and cannot redirect a join.
 ///
 /// Both directions need it and they must not drift: the client sends a
