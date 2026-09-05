@@ -78,9 +78,13 @@ const ReasonSpelling* SpellingOf(Reason reason) {
 /// client must never join it into an SD path (sync.hpp). It is not refused --
 /// that would fail a whole tick over one save's name -- but a name that *could*
 /// escape a join is worth a line in the log rather than a surprise in M2-5.
+///
+/// Deliberately the same rule the request side applies (`sync.cpp`), backslash
+/// included: RomM joins POSIX paths and a save that came off a FAT volume is
+/// entitled to a backslash in its name. A stricter rule here would warn about
+/// names this client itself uploaded.
 bool PathComponent(std::string_view value) {
-  return value.find('/') == std::string_view::npos &&
-         value.find('\\') == std::string_view::npos && value != "." && value != "..";
+  return value.find('/') == std::string_view::npos && value != "." && value != "..";
 }
 
 json::Error Fail(std::string_view field, std::string message) {
