@@ -175,6 +175,56 @@ ReadResult ReadFile(const std::string& path) {
   return result;
 }
 
+const char* ToString(BoundedRead outcome) {
+  switch (outcome) {
+    case BoundedRead::kOk:
+      return "ok";
+    case BoundedRead::kMissing:
+      return "missing";
+    case BoundedRead::kUnreadable:
+      return "unreadable";
+    case BoundedRead::kTooLarge:
+      return "too_large";
+  }
+  return "ok";
+}
+
+BoundedRead ReadBounded(const std::string& path, std::size_t limit, std::string* out) {
+  out->clear();
+  errno = 0;
+  std::FILE* file = std::fopen(path.c_str(), "rb");
+  if (file == nullptr) {
+    // The same distinction ReadFile draws, for the same reason: only ENOENT and
+    // ENOTDIR mean nothing was ever written here. A full handle table or an
+    // `sdmc:` that is not mounted yet is a bad moment, and answering one with
+    // "no file" would silently run the console on defaults.
+    const int why = errno;
+    return (why == ENOENT || why == ENOTDIR) ? BoundedRead::kMissing : BoundedRead::kUnreadable;
+  }
+
+  char buffer[4096];
+  std::size_t got = 0;
+  bool too_large = false;
+  while ((got = std::fread(buffer, 1, sizeof(buffer), file)) > 0) {
+    if (out->size() + got > limit) {
+      too_large = true;
+      break;
+    }
+    out->append(buffer, got);
+  }
+  const bool failed = std::ferror(file) != 0;
+  std::fclose(file);
+  if (too_large) {
+    out->clear();
+    return BoundedRead::kTooLarge;
+  }
+  if (failed) {
+    out->clear();
+    return BoundedRead::kUnreadable;
+  }
+  return BoundedRead::kOk;
+}
+
 bool Shred(const std::string& path) {
   bool gone = ShredOne(path);
   gone = ShredOne(TempPathFor(path)) && gone;

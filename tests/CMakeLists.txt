@@ -119,6 +119,25 @@ target_compile_definitions(test_config PRIVATE
   ROMMSYNC_CONFIG_DOC="${CMAKE_SOURCE_DIR}/docs/CONFIG.md")
 add_test(NAME core.config COMMAND test_config)
 
+# MD5, against RFC 1321's own vectors. Pure arithmetic, so it never skips -- and
+# it must not: a wrong digest is still 32 plausible hex characters, and the only
+# symptom on a console is every unchanged save negotiating as changed forever.
+add_executable(test_md5 test_md5.cpp)
+target_link_libraries(test_md5 PRIVATE rommsync::core)
+target_include_directories(test_md5 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+add_test(NAME core.md5 COMMAND test_md5)
+
+# `state.db`: the format, the commit-window recovery, and the re-hash it skips.
+# One temp directory and no network, so it never skips either -- the guarantee
+# it checks is that a lost baseline costs a tick of hashing and never a wrong
+# comparison, which is a claim about the failures and not about a server.
+add_executable(test_state_db test_state_db.cpp)
+target_link_libraries(test_state_db PRIVATE rommsync::core)
+target_include_directories(test_state_db PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_state_db PRIVATE
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+add_test(NAME core.state_db COMMAND test_state_db)
+
 # --- rig smoke test: proves docker RomM + fault proxy + ctest all work -------
 # Uses libcurl directly on purpose. It tests the RIG, not our code, and must
 # keep working while M0-2 replaces it as the way production code speaks HTTP.
@@ -340,6 +359,7 @@ set(HARNESS_SCENARIOS
   stall           # a server that says nothing: one tick lost, nothing else
   multifile       # the two-disc fixture, and the two traps around it
   backup          # back up FIRST, proven by interrupting the overwrite
+  content_hash    # the MD5 this client computes is the one RomM compares against
 )
 
 foreach(scenario IN LISTS HARNESS_SCENARIOS)

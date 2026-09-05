@@ -11,6 +11,7 @@
 // through `http::DownloadTarget`; this reads and writes whole strings.
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <string_view>
 
@@ -109,6 +110,33 @@ WriteResult WriteAtomically(const std::string& path, std::string_view contents);
 /// that did arrive: half a record read as a whole one is the failure this
 /// module exists to rule out.
 ReadResult ReadFile(const std::string& path);
+
+/// Why a *bounded* read did not produce contents. `ReadError` plus the one
+/// outcome only a bound has.
+enum class BoundedRead {
+  kOk,
+  kMissing,     ///< there is no such file (ENOENT/ENOTDIR)
+  kUnreadable,  ///< it exists, and the bytes could not be got out of it
+  kTooLarge,    ///< it is bigger than the caller said it could be; nothing is returned
+};
+
+/// Stable, log-friendly name. Never null.
+const char* ToString(BoundedRead outcome);
+
+/// Read at most `limit` bytes of `path`, or nothing.
+///
+/// `ReadFile` deliberately reads whatever is there, which is right for
+/// `token.dat` and `device.dat` -- records this client wrote itself, whose size
+/// it therefore knows. `config.ini` is a file a human and a card reader both get
+/// to touch, and `state.db` is one a yanked card can leave pointing at anything,
+/// so those stop instead: a corrupt FAT32 directory entry claiming four
+/// gigabytes has to be a named refusal, not a `bad_alloc` before `main` gets
+/// anywhere. One byte past the bound is enough to tell "at the limit" from "over
+/// it" without holding the rest, so `out` is left empty on `kTooLarge`.
+///
+/// `kMissing` draws the same line `ReadFile` does, for the same reason: only
+/// ENOENT and ENOTDIR mean nothing was ever written here.
+BoundedRead ReadBounded(const std::string& path, std::size_t limit, std::string* out);
 
 /// Remove `path` and the `.tmp`/`.old` an interrupted commit can leave beside
 /// it, overwriting each with zeroes first.
