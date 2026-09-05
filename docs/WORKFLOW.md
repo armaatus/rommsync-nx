@@ -217,25 +217,44 @@ They run on every matching action and they block, with an explanation:
 | `guard.py` | merging a PR; force-pushing `main`; writing to `server/contract/captures/`; editing secrets or `.env`; editing `unblock.yml`; editing the hooks and settings themselves |
 | `shellcheck-edited.sh` | *(reports, never blocks)* a shell script that no longer parses |
 
-The skill makes a violation rare; the hook makes it close to impossible.
+The skill makes a violation rare; the hook makes the routine forms of it fail.
 
-Three properties of `guard.py` are deliberate and worth keeping if you touch it:
+**What the hook is not: a sandbox.** It reads a command and decides; it does not
+confine one. A session that means to get past it can — an interpreter one-liner
+that opens a file, a path assembled from a variable, an `exec` through something
+the parser does not model. What it holds is the *routine* line: the heredoc, the
+redirect, the `sed -i`, the `gh pr merge`, the shapes an agent reaches for while
+solving the problem in front of it rather than working around a rule. Past that,
+the backstops are the diff and the human who merges. Do not write documentation —
+or a commit message — that claims more than this.
+
+Four properties are deliberate and worth keeping if you touch it:
 
 - **It does not fail open.** An unreadable payload, a missing key, an
   unparseable command — all of those block. A guard that quietly stops guarding
   when something upstream changes shape is worse than no guard, because nothing
   on screen says the enforcement went away.
-- **It tokenises commands with `shlex`** rather than matching raw strings, so
-  `git -C /some/path push --force origin main` is caught while
-  `git commit -m "note about --force pushes to main"` is not.
-- **It guards itself.** `.claude/hooks/` and `.claude/settings.json` are not
-  agent-editable: an agent that can rewrite its own guards has none. Skills and
-  subagents are *not* protected — they are advisory by design, and an agent
-  improving one is the loop working.
+- **It tokenises with `shlex`** rather than matching raw strings, splits compound
+  commands on `;`, `&&`, `||` and `|`, and recurses into `bash -c`. So
+  `git -C /some/path push --force origin main` and `true && rm .env` are caught
+  while `git commit -m "note about --force pushes to main"` is not.
+- **A write is a write whichever verb performs it.** Every path a shell command
+  creates, replaces, moves or deletes — redirects, `tee`, `cp`/`mv`
+  destinations, `sed -i`, `rm`, `dd of=` — goes through the same rules an `Edit`
+  would. The first version checked paths only for the editing tools, so
+  `cat > .claude/hooks/guard.py` rewrote the guard and the guard said nothing.
+- **It guards itself.** `.claude/hooks/`, `.claude/settings.json` and the
+  gitignored `settings.local.json` are not agent-writable, from either direction:
+  an agent that can rewrite its own guards has none. Skills and subagents are
+  *not* protected — they are advisory by design, and an agent improving one is
+  the loop working.
 
-`guard.py --selftest` is the table of everything it blocks and everything it
-lets through, kept next to the code so the two cannot drift into separate files.
-`evals/lint.sh` runs it, and so does `ctest -R agent.config`.
+`guard.py --selftest` is 49 assertions kept next to the code they constrain, so
+a guard and its assertion cannot drift into separate files. It is the record of
+what has been checked — every row is either a rule this repo depends on or an
+escape somebody actually found — and it is **not** a proof that nothing else
+gets through. When a review finds a new way past, the fix and its row land
+together. `evals/lint.sh` runs it, and so does `ctest -R agent.config`.
 
 Agents run in **auto** permission mode (`permissions.defaultMode` in
 `.claude/settings.json`) so a worktree does not sit waiting for someone to approve
