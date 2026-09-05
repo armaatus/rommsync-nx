@@ -77,6 +77,41 @@ states =
 A platform that maps no folders is skipped entirely, the same as one nobody
 ever mapped.
 
+### Where a rom lands
+
+A download's destination is that platform's **first** `roms` folder with the
+rom's `fs_name` — the name the file has on RomM's own filesystem — under it:
+
+```
+platform_fs_slug = gba, fs_name = synthetic-large.gba
+  →  /tico/roms/gba/synthetic-large.gba
+```
+
+- The lookup key is `platform_fs_slug`, the directory name under RomM's
+  `library/roms/` — never `platform_slug`. The two agree on a conventional
+  library and part company on one whose PlayStation folder is called
+  `playstation`, which is the library that needs a `[platform.playstation]`
+  section rather than a `[platform.psx]` one.
+- A platform with no mapping, or one mapped with no `roms` folder, has **no
+  destination**. That rom is skipped with a reason; it is never guessed into a
+  folder.
+- The remaining `roms` entries are where the client looks to see whether the
+  rom is *already* on the card. Only the first is ever written to.
+- A `fs_name` is refused rather than repaired when it is not a plain file name:
+  an empty one, a `/` or `\`, a bare `.` or `..`, a control character or a NUL,
+  one of the characters FAT32 and exFAT reserve (`? * : " < > |`), a name over
+  768 characters, or a resolved path over 768 characters — which is refused
+  rather than truncated. That name comes off someone else's disk and the folder
+  it would land in is one you mapped, so `../../atmosphere` is a refusal by name
+  and not a path this client resolves.
+- The reserved characters are the one refusal an ordinary library meets. RomM
+  scans a Linux filesystem where all of them are legal, and `?` is conventional
+  in a No-Intro name — `Where in Time Is Carmen Sandiego? (USA).nes`. Your SD
+  card cannot store that name, so the rom is skipped with a reason instead of
+  failing partway through the download. Renaming it in RomM is the fix; the
+  client will not rename it for you, because it also looks for the rom on the
+  card *by that name* and would download it again on every sync.
+
 ## Validation rules
 
 Nothing in this file can stop the client from starting. A line the parser

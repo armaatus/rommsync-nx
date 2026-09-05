@@ -131,6 +131,52 @@ struct PlatformFolders {
   bool empty() const { return roms.empty() && saves.empty() && states.empty(); }
 };
 
+/// A rom, reduced to the two fields a destination is built from.
+///
+/// Named fields rather than two loose strings because the mistake this is
+/// written against is a silent one: `platform_slug` and `platform_fs_slug` are
+/// both on RomM's rom schema, both read `gba`, `nes`, `psx` on a conventional
+/// library, and only the second one is the directory name `platforms` is keyed
+/// by. A library whose PlayStation folder is called `playstation` downloads
+/// nothing at all the day a caller passes the wrong one, and no fixture whose
+/// slugs happen to agree would ever catch it.
+struct RomFile {
+  /// RomM's on-disk folder name for the platform. **Not `platform_slug`.**
+  std::string_view platform_fs_slug;
+
+  /// The rom's name on the *server's* filesystem: `240pee.nes`, or
+  /// `Synthetic Two Disc Game` for a multi-file rom, where it names a
+  /// directory. Never trusted -- see `ValidRomFileName`.
+  std::string_view fs_name;
+
+  /// Both fields are views, which makes this an argument and never a record:
+  /// it must not outlive the parsed body they point into. A caller that keeps
+  /// a rom keeps the rom's own strings and builds one of these at the call.
+};
+
+/// Where a rom is written, or why it is not written anywhere.
+///
+/// The two halves are exclusive: a resolved `path` carries no `reason`, and an
+/// empty one always carries one. There is no third state and no guessed folder
+/// -- an unmapped platform is a skip with a sentence, per docs/CONFIG.md.
+struct RomDestination {
+  /// Absolute SD path: the platform's first `roms` entry joined with the rom's
+  /// `fs_name`. Empty when there is no destination.
+  std::string path;
+
+  /// Why there is none, in a sentence for the log and the overlay. Empty when
+  /// `path` is set.
+  ///
+  /// **Never quotes `fs_name`.** That string comes off someone else's
+  /// filesystem, and the reasons it can be refused -- a control character, 800
+  /// characters of it -- are exactly the reasons not to paste it into a log
+  /// line or an overlay row. The caller knows the rom id and the name it
+  /// asked about; this says what was wrong with it.
+  std::string reason;
+
+  bool ok() const { return !path.empty(); }
+};
+
 /// The whole file, merged over the built-in defaults.
 struct Config {
   ServerConfig server;
@@ -153,6 +199,38 @@ struct Config {
   /// Where a download for `slug` is written: the first `roms` entry, or empty
   /// when the platform is unmapped or maps no rom folder.
   std::string RomTarget(std::string_view slug) const;
+
+  /// The absolute path one rom downloads to: the platform's first `roms` entry
+  /// -- the same folder `RomTarget()` names -- joined with the rom's `fs_name`,
+  /// or an empty path and the reason there is none.
+  ///
+  /// It does not call `RomTarget()`, which answers with a folder and nothing
+  /// else: this needs the folder *and* the reason it is missing from one
+  /// lookup, and `ExistingRomPaths()` needs the whole list from the same one.
+  ///
+  /// This is the only supported way to turn a rom into a destination. The
+  /// joining is not the interesting part -- the refusals are: an unmapped
+  /// platform, a `fs_name` `ValidRomFileName` will not have, and a joined path
+  /// past `kMaxPathLength`, which is refused rather than truncated because a
+  /// truncated path is a perfectly real file in the mapped folder holding
+  /// another rom's bytes.
+  RomDestination DestinationFor(const RomFile& rom) const;
+
+  /// Every path the rom could already occupy, in the order the map lists them,
+  /// the write target first.
+  ///
+  /// "Is it already on the card?" reads *all* of a platform's `roms` entries,
+  /// while only the first is written to (docs/CONFIG.md): the later entries are
+  /// exactly the folders where someone already keeps that platform's roms, and
+  /// a check that skipped them re-downloads a rom the card has.
+  ///
+  /// Empty when the platform is unmapped, maps no roms folder, or the name is
+  /// one `ValidRomFileName` refuses. It is **not** a way to find the write
+  /// target: a folder whose joined path is too long drops out of this list, so
+  /// when the *first* folder is the one that overflows, `front()` here is the
+  /// second folder while `DestinationFor` refuses outright. `DestinationFor`
+  /// is the only answer to "where does this get written".
+  std::vector<std::string> ExistingRomPaths(const RomFile& rom) const;
 
   /// Every save directory across every platform, deduplicated, in first-seen
   /// order.
@@ -303,6 +381,32 @@ LoadResult LoadConfig(const std::string& path);
 /// Returns false and sets `why` to a user-facing reason on refusal; `out` is
 /// left untouched.
 bool NormalizeSdPath(std::string_view raw, std::string* out, std::string* why);
+
+/// True when `fs_name` is usable as one leaf inside a mapped folder.
+///
+/// A `fs_name` is a name on the *server's* filesystem, chosen by whoever filled
+/// that library, and nothing has checked it before it reaches a path this
+/// client writes to -- `NormalizeSdPath` validates the directories a human
+/// configured and nothing validates this. So: not empty, no path separator
+/// (`/` or `\`), not `.` or `..`, no control character or NUL, none of the
+/// characters FAT32 and exFAT reserve (`? * : " < > |`), and no longer than
+/// `kMaxPathLength`.
+///
+/// The reserved set is refused rather than rewritten. `?` is conventional in a
+/// No-Intro name and perfectly legal on the Linux filesystem RomM scanned, so
+/// the card is where it stops being storable -- and a rom whose name this
+/// client quietly changed would be looked for, on the next tick, under a name
+/// nothing ever wrote, and downloaded again forever.
+///
+/// It is a *leaf*, so a separator is refused rather than normalised away. A
+/// `fs_name` with one in it is not a deeper folder anybody asked for; it is a
+/// server naming a path inside this console's SD card, and `../../atmosphere`
+/// under a mapped folder is how a download becomes a system file. The only
+/// safe answer is to refuse that rom by name.
+///
+/// Sets `why` to a user-facing reason on refusal. It never quotes `fs_name`,
+/// for the reason `RomDestination::reason` gives.
+bool ValidRomFileName(std::string_view fs_name, std::string* why);
 
 /// Normalise the `[server] url`, or fail.
 ///

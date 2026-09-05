@@ -591,6 +591,67 @@ bool NormalizeSdPath(std::string_view raw, std::string* out, std::string* why) {
   return true;
 }
 
+bool ValidRomFileName(std::string_view fs_name, std::string* why) {
+  if (fs_name.empty()) {
+    *why = "is empty";
+    return false;
+  }
+  if (fs_name.size() > kMaxPathLength) {
+    // Bounded here as well as at the join, because this predicate is asked
+    // standalone -- M3-4 has the same question about the files inside a disc
+    // set -- and a caller with no folder in hand still needs an answer.
+    //
+    // The bound is the path's, not FAT32's 255-character limit on one name
+    // component, and deliberately so: that limit counts UTF-16 characters and
+    // this counts bytes, so a 255-byte check would refuse a legal name the
+    // moment it carried an accent. Refusing what cannot be a path is this
+    // module's job; refusing what the card will not accept is the card's
+    // answer, and it comes back as a named write failure rather than a
+    // download that goes somewhere else.
+    *why = "is longer than the " + std::to_string(kMaxPathLength) + " characters a name can be";
+    return false;
+  }
+  for (const char c : fs_name) {
+    // The same two refusals `NormalizeSdPath` makes, for the same reasons: a
+    // NUL truncates the path every writer downstream opens, so the folder
+    // written to would not be the folder checked, and FAT32 has no name with a
+    // control character in it.
+    if (static_cast<unsigned char>(c) < 0x20 || c == 0x7f) {
+      *why = "contains a control character";
+      return false;
+    }
+    // Not normalised into a subdirectory: this is one leaf, and a separator in
+    // it is the server describing a path rather than naming a file.
+    if (c == '/' || c == '\\') {
+      *why = "contains a path separator, and a rom's name is one file, not a path";
+      return false;
+    }
+    // The rest of what FAT32 and exFAT reserve. RomM scans a Linux filesystem,
+    // where every one of these is a legal character and `?` is *conventional* --
+    // `Where in Time Is Carmen Sandiego? (USA).nes` is how No-Intro spells it.
+    // The card cannot hold that name, so the choice is between a skip that says
+    // why and an `open` that fails halfway through a download and leaves a
+    // `.part` behind for a retry that will fail the same way forever.
+    //
+    // Refused rather than rewritten: the name is also the key to "is it already
+    // on the card", so a client that sanitised it would re-download the rom on
+    // every tick, having looked for it under a name it never wrote.
+    if (c == '?' || c == '*' || c == ':' || c == '"' || c == '<' || c == '>' || c == '|') {
+      *why = "contains a character the SD card's filesystem cannot store in a name";
+      return false;
+    }
+  }
+  // Unreachable through a separator, since one is refused above -- but a bare
+  // `..` is still a directory this client must not name. The sentence spells
+  // neither of them out: it goes into a log beside a name it must not quote,
+  // and a reason that echoes its own subject makes that promise untestable.
+  if (fs_name == "." || fs_name == "..") {
+    *why = "is a relative directory reference rather than a file name";
+    return false;
+  }
+  return true;
+}
+
 bool NormalizeServerUrl(std::string_view raw, std::string* out, std::string* why) {
   const std::string_view url = Trim(raw);
   if (url.empty()) {
@@ -694,6 +755,90 @@ std::string Config::RomTarget(std::string_view slug) const {
     return {};
   }
   return folders->roms.front();
+}
+
+namespace {
+
+/// The `roms` folders `rom`'s platform maps, or nullptr and the reason there
+/// are none.
+///
+/// Both resolvers ask through this, so "unmapped", "mapped, but with nowhere to
+/// download to" and "a name this client will not have" cannot come to mean two
+/// different things depending on which one was called.
+const std::vector<std::string>* RomFolders(const Config& config, const RomFile& rom,
+                                           std::string* why) {
+  const PlatformFolders* folders = config.Platform(rom.platform_fs_slug);
+  if (folders == nullptr) {
+    *why = "no folder is mapped for this rom's platform";
+    return nullptr;
+  }
+  if (folders->roms.empty()) {
+    *why = "this rom's platform maps saves or states but no roms folder";
+    return nullptr;
+  }
+  std::string refusal;
+  if (!ValidRomFileName(rom.fs_name, &refusal)) {
+    *why = "the name this rom has on the server " + refusal;
+    return nullptr;
+  }
+  return &folders->roms;
+}
+
+/// `directory` (already normalised) with `leaf` under it, or false and why not.
+///
+/// The length bound is the whole point of the function. Refusing is the only
+/// answer: a truncated path is not a shorter name for the same file, it is a
+/// different file, in the mapped folder, that a verified download would then
+/// declare finished.
+bool JoinRomPath(const std::string& directory, std::string_view leaf, std::string* out,
+                 std::string* why) {
+  std::string joined = directory;
+  if (joined.empty() || joined.back() != '/') {
+    joined += '/';  // every path from the map is normalised, so only "/" ends in one
+  }
+  joined.append(leaf);
+  if (joined.size() > kMaxPathLength) {
+    *why = "would be longer than the " + std::to_string(kMaxPathLength) +
+           " characters a path can be";
+    return false;
+  }
+  *out = std::move(joined);
+  return true;
+}
+
+}  // namespace
+
+RomDestination Config::DestinationFor(const RomFile& rom) const {
+  RomDestination destination;
+  const std::vector<std::string>* folders = RomFolders(*this, rom, &destination.reason);
+  if (folders == nullptr) {
+    return destination;
+  }
+  std::string why;
+  if (!JoinRomPath(folders->front(), rom.fs_name, &destination.path, &why)) {
+    destination.reason = "the path under '" + folders->front() + "' " + why;
+  }
+  return destination;
+}
+
+std::vector<std::string> Config::ExistingRomPaths(const RomFile& rom) const {
+  std::vector<std::string> paths;
+  std::string why;
+  const std::vector<std::string>* folders = RomFolders(*this, rom, &why);
+  if (folders == nullptr) {
+    return paths;
+  }
+  paths.reserve(folders->size());
+  for (const std::string& directory : *folders) {
+    std::string joined;
+    // A candidate too long to be a path is a file the card cannot be holding,
+    // so it is dropped rather than reported: this answers "where might it
+    // already be", and `DestinationFor` is where a refusal gets its sentence.
+    if (JoinRomPath(directory, rom.fs_name, &joined, &why)) {
+      paths.push_back(std::move(joined));
+    }
+  }
+  return paths;
 }
 
 namespace {
