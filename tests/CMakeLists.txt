@@ -432,6 +432,43 @@ foreach(scenario IN LISTS SCAN_RIG_SCENARIOS)
   set_tests_properties(scan.${scenario} PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 endforeach()
 
+# --- M3-1: a rom turned into the path it downloads to ------------------------
+# The folder map is `core.config`'s; this is the join that hangs off it. Five
+# scenarios need no server and must stay checked with docker stopped, because
+# what they pin is a refusal -- a `fs_name` is a name off the *server's* disk,
+# and one carrying `../..` that this code resolved rather than refused would be
+# a write outside the mapped folder, next door to `atmosphere/`. `library` needs
+# the real RomM, because the one thing a literal here cannot be right about is
+# which field the map is keyed on: `platform_slug` and `platform_fs_slug` read
+# the same on the seeded library and only one of them is the directory name.
+add_executable(test_rom_path test_rom_path.cpp)
+target_link_libraries(test_rom_path PRIVATE rommsync::host)
+target_include_directories(test_rom_path PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_rom_path PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+
+set(ROM_UNIT_SCENARIOS
+  defaults  # the built-in map, and that the key is the fs slug
+  override  # a [platform.gba] section moves the destination with it
+  unmapped  # a skip with a reason, never a guessed folder
+  hostile   # separators, '..', control characters, NUL, 800 characters
+  existing  # "already on the card?" reads every roms entry, writes the first
+)
+foreach(scenario IN LISTS ROM_UNIT_SCENARIOS)
+  add_test(NAME rom.${scenario} COMMAND test_rom_path ${scenario})
+  set_tests_properties(rom.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
+add_test(NAME rom.library COMMAND test_rom_path library)
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(rom.library PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+# Read-only against the shared library, but it goes through the fault proxy,
+# which holds one armed scenario for all clients.
+set_tests_properties(rom.library PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
+
 # --- the host harness, and the edge cases only the fault proxy can force -----
 # M0-5. One CTest entry per scenario, same shape as the rest of this file, so a
 # red run names the behaviour rather than "the harness tests".
