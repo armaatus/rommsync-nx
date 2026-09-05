@@ -118,31 +118,52 @@ Match RomIndex::Find(std::string_view base_name, std::string_view platform_fs_sl
   // both reduce to `Game` -- so letting the fallback run alongside the exact
   // match would turn a clean hit into an ambiguity.
   for (int pass = 0; pass < 2; ++pass) {
-    std::vector<const Rom*> candidates;
+    // Counted rather than collected. This runs once per file in every save
+    // folder on the card, and the overwhelmingly common answers are none and
+    // one -- neither of which is worth a heap allocation per file per pass on a
+    // sysmodule. The candidates are gathered only on the branch that has to
+    // name them.
+    const Rom* first = nullptr;
+    std::size_t hits = 0;
     for (const Rom& rom : roms_) {
       if (!platform_fs_slug.empty() && rom.platform_fs_slug != platform_fs_slug) {
         continue;
       }
       const std::string& key = pass == 0 ? rom.fs_name_no_ext : rom.fs_name_no_tags;
-      if (key == base_name) {
-        candidates.push_back(&rom);
+      if (key != base_name) {
+        continue;
       }
+      if (first == nullptr) {
+        first = &rom;
+      }
+      ++hits;
     }
-    if (candidates.empty()) {
+    if (hits == 0) {
       continue;
     }
-    if (candidates.size() == 1) {
+    if (hits == 1) {
       match.outcome = MatchOutcome::kMatched;
-      match.rom = candidates.front();
+      match.rom = first;
       match.reason = std::string("matched \"") + std::string(base_name) + "\" to rom " +
                      std::to_string(match.rom->id) + " (" + match.rom->platform_fs_slug + ")" +
                      (pass == 0 ? "" : " by its tag-stripped name");
       return match;
     }
+
+    std::vector<const Rom*> candidates;
+    candidates.reserve(hits);
+    for (const Rom& rom : roms_) {
+      if (!platform_fs_slug.empty() && rom.platform_fs_slug != platform_fs_slug) {
+        continue;
+      }
+      if ((pass == 0 ? rom.fs_name_no_ext : rom.fs_name_no_tags) == base_name) {
+        candidates.push_back(&rom);
+      }
+    }
     match.outcome = MatchOutcome::kAmbiguous;
-    match.reason = "\"" + std::string(base_name) + "\" matches " +
-                   std::to_string(candidates.size()) + " roms" + scope + " (" +
-                   PlatformsOf(candidates) + "); map the folder to one platform to resolve it";
+    match.reason = "\"" + std::string(base_name) + "\" matches " + std::to_string(hits) +
+                   " roms" + scope + " (" + PlatformsOf(candidates) +
+                   "); map the folder to one platform to resolve it";
     return match;
   }
 
@@ -169,8 +190,25 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
   std::int64_t offset = 0;
   for (int page_number = 0; page_number < kMaxPages; ++page_number) {
     http::Request request;
+    // Three things about this URL are not decoration.
+    //
+    // `order_by=id&order_dir=asc` is a **total** order. The endpoint's default
+    // orders by name, and a name is not unique in a RomM library -- `Sonic` on
+    // `gg` and on `md` is the normal case -- so a tie straddling a page
+    // boundary returns one rom twice and another never. The one that vanished
+    // is a save that reports as unmatched and never syncs again; the one that
+    // doubled makes its own name ambiguous. An id is unique, so neither
+    // happens.
+    //
+    // The three `with_*` flags default to **true**, and each page otherwise
+    // carries the whole library's `rom_id_index` and a freshly aggregated
+    // `filter_values` -- a hundred pages each hauling a twenty-thousand-element
+    // array through a JSON parser on a sysmodule heap, all of it discarded
+    // here. Turning them off is most of what this request costs.
     request.url = options.base_url + "/api/roms?limit=" + std::to_string(page_size) +
-                  "&offset=" + std::to_string(offset);
+                  "&offset=" + std::to_string(offset) +
+                  "&order_by=id&order_dir=asc"
+                  "&with_char_index=false&with_filter_values=false&with_rom_id_index=false";
     if (!options.bearer_token.empty()) {
       request.headers.push_back({"Authorization", "Bearer " + options.bearer_token});
     }
@@ -197,7 +235,18 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
     }
 
     if (page.roms.empty()) {
-      return result;  // the library ran out
+      // An empty page short of `total` is not the library ending -- it is a rom
+      // deleted between two of these requests, leaving `offset` past the new
+      // end. Saying so matters because the alternative reads as a complete
+      // index, and every save for a rom in the missing tail then reports as
+      // unmatched with nothing anywhere saying why.
+      if (page.total > 0 && offset < page.total) {
+        result.index.set_truncated(true);
+        result.message = "the rom index ran out at " + std::to_string(offset) + " of " +
+                         std::to_string(page.total) +
+                         " roms; the library changed mid-fetch and the rest are not matched";
+      }
+      return result;
     }
     for (Rom& rom : page.roms) {
       if (result.index.size() >= options.max_roms) {

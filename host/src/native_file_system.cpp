@@ -2,6 +2,7 @@
 
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -67,6 +68,12 @@ void ReadStat(const std::filesystem::path& path, fs::Entry* entry) {
   entry->modified_unix = static_cast<std::int64_t>(info.st_mtime);
 }
 
+/// A max-heap on `name`, so the entry the heap gives up is the largest one --
+/// which is how the *smallest* `kMaxDirectoryEntries` survive.
+bool ByNameDescending(const fs::Entry& left, const fs::Entry& right) {
+  return left.name < right.name;
+}
+
 class NativeFileSystem final : public fs::FileSystem {
  public:
   explicit NativeFileSystem(std::string root) : root_(std::move(root)) {}
@@ -101,17 +108,11 @@ class NativeFileSystem final : public fs::FileSystem {
     }
 
     const std::filesystem::directory_iterator end;
+    bool truncated = false;
     for (; iterator != end; iterator.increment(error)) {
       if (error) {
         listing.error = fs::ListError::kUnreadable;
         listing.message = std::string(sd_path) + ": " + error.message();
-        return listing;
-      }
-      if (listing.entries.size() >= fs::kMaxDirectoryEntries) {
-        listing.error = fs::ListError::kTooManyEntries;
-        listing.message = std::string(sd_path) + ": more than " +
-                          std::to_string(fs::kMaxDirectoryEntries) +
-                          " entries; the rest were not read";
         return listing;
       }
       fs::Entry entry;
@@ -122,7 +123,28 @@ class NativeFileSystem final : public fs::FileSystem {
       std::error_code kind_error;
       entry.is_directory = iterator->is_directory(kind_error);
       ReadStat(iterator->path(), &entry);
+
+      // The bound is on what is *held*, not on how far the walk gets: keeping
+      // the first `kMaxDirectoryEntries` names in order costs one heap of that
+      // size, and keeping the first ones `readdir` offered would make the
+      // surviving set depend on the card's directory layout -- which
+      // `file_system.hpp` forbids, because the scanner's duplicate-slot rule
+      // then changes its mind between ticks.
       listing.entries.push_back(std::move(entry));
+      std::push_heap(listing.entries.begin(), listing.entries.end(), ByNameDescending);
+      if (listing.entries.size() > fs::kMaxDirectoryEntries) {
+        std::pop_heap(listing.entries.begin(), listing.entries.end(), ByNameDescending);
+        listing.entries.pop_back();
+        truncated = true;
+      }
+    }
+
+    if (truncated) {
+      listing.error = fs::ListError::kTooManyEntries;
+      listing.message = std::string(sd_path) + ": more than " +
+                        std::to_string(fs::kMaxDirectoryEntries) +
+                        " entries; the first " + std::to_string(fs::kMaxDirectoryEntries) +
+                        " by name were read and the rest were not";
     }
     return listing;
   }

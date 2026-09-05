@@ -46,6 +46,27 @@ std::vector<std::string_view> Segments(std::string_view sd_path) {
   return segments;
 }
 
+/// The largest whole second a `sync::Timestamp` can actually hold.
+///
+/// `sync.hpp` warns that `system_clock::time_point` cannot be relied on to hold
+/// `kMaxTimestampSeconds`, because its tick is implementation-defined and a
+/// nanosecond one runs out in 2262 -- which is libstdc++, so it is the Switch
+/// toolchain and CI, not a hypothetical. Multiplying a larger mtime into that
+/// representation is signed overflow, and the values it wraps to are the
+/// dangerous kind: a year-2600 mtime wraps to a *plausible recent* instant that
+/// `sync::Validate` accepts and the server then arbitrates as newer than its own
+/// copy. So the bound is computed from the clock rather than assumed.
+constexpr std::int64_t MaxRepresentableSeconds() {
+  return std::chrono::duration_cast<std::chrono::seconds>(sync::Timestamp::duration::max())
+      .count();
+}
+
+/// The window an mtime has to be in to mean anything: past the epoch, and
+/// spellable both by `FormatTimestamp` and by the clock underneath it.
+constexpr std::int64_t kLatestUsableMtime =
+    sync::kMaxTimestampSeconds < MaxRepresentableSeconds() ? sync::kMaxTimestampSeconds
+                                                           : MaxRepresentableSeconds();
+
 Skip MakeSkip(SkipReason reason, std::string sd_path, std::string message) {
   Skip skip;
   skip.reason = reason;
@@ -198,8 +219,15 @@ sync::ClientSaveState SaveFile::ToClientSaveState(std::optional<std::string> con
   if (content_hash.has_value() && !content_hash->empty()) {
     state.content_hash = std::move(content_hash);
   }
-  state.updated_at =
-      sync::Timestamp{} + std::chrono::seconds(modified_unix);
+  // Fails closed: an mtime outside the window above becomes the epoch, which
+  // `sync::Validate` refuses as "an unset clock rather than an mtime". The
+  // scan never reaches here with one -- it skips them by name -- but this is
+  // the conversion, so the guard against overflowing the clock belongs here
+  // rather than in the one caller that happens to check first.
+  state.updated_at = sync::Timestamp{};
+  if (modified_unix >= sync::kMinTimestampSeconds && modified_unix <= kLatestUsableMtime) {
+    state.updated_at += std::chrono::seconds(modified_unix);
+  }
   state.file_size_bytes = size_bytes;
   return state;
 }
@@ -271,6 +299,20 @@ ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
       }
       if (!match.matched()) {
         record_skip(SkipReason::kUnmatched, sd_path, match.reason);
+        continue;
+      }
+
+      // Range-checked before the record is built rather than left to
+      // `sync::Validate`, because the conversion into a `sync::Timestamp` is
+      // what overflows and it happens first. A card that reports 2600 is a
+      // clock nobody set or a directory entry nobody wrote; either way it is
+      // one file's problem, said by name.
+      if (entry.modified_unix < sync::kMinTimestampSeconds ||
+          entry.modified_unix > kLatestUsableMtime) {
+        record_skip(SkipReason::kUnusable, sd_path,
+                    "its mtime of " + std::to_string(entry.modified_unix) +
+                        " is not an instant this client can report; the card's clock is unset "
+                        "or the directory entry is wrong");
         continue;
       }
 

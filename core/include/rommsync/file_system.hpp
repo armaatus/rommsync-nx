@@ -48,7 +48,7 @@ enum class ListError {
   kMissing,        ///< there is no such path -- a mapped folder the user never created
   kNotADirectory,  ///< something is there and it is a file
   kUnreadable,     ///< it is a directory and its contents could not be got out of it
-  kTooManyEntries, ///< more than `kMaxDirectoryEntries`; what was read is in `entries`
+  kTooManyEntries, ///< more than `kMaxDirectoryEntries`; the first ones by name are in `entries`
 };
 
 /// Stable, log-friendly name. Never null.
@@ -62,6 +62,16 @@ const char* ToString(ListError error);
 /// unbounded loop. A save folder with four thousand files in it is already far
 /// past anything a human arranged.
 inline constexpr std::size_t kMaxDirectoryEntries = 4096;
+
+/// **A truncated listing keeps the lexicographically first entries, not the
+/// first ones `readdir` happened to hand over.** Which entries survive the
+/// bound has to be a property of the directory rather than of the order it is
+/// stored in: the save scanner resolves a contested `(rom_id, slot)` in favour
+/// of the first file it sees, so a *selection* that changes between ticks makes
+/// two files take turns overwriting each other through the server -- the exact
+/// failure sorting each listing was meant to rule out. A backend that cannot
+/// enumerate cheaply enough to do that must report `kUnreadable` instead.
+
 
 /// The contents of one directory, or the reason there are none.
 ///

@@ -326,6 +326,7 @@ set(SCAN_UNIT_SCENARIOS
   ambiguous    # one name on two platforms, in a hintless folder, is skipped
   walked_once  # RetroArch's flat saves/, listed under a dozen platforms
   unusable     # a record sync::Validate refuses costs one file, not the tick
+  truncated    # a directory past kMaxDirectoryEntries keeps a set that does not move
 )
 foreach(scenario IN LISTS SCAN_UNIT_SCENARIOS)
   add_test(NAME scan.${scenario} COMMAND test_save_scan ${scenario})

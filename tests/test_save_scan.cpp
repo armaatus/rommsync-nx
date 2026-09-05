@@ -18,11 +18,14 @@
 //   ambiguous    -- one name on two platforms, in a hintless folder, is skipped
 //   walked_once  -- RetroArch's flat saves/, listed under a dozen platforms
 //   unusable     -- a file sync::Validate would refuse costs one file, not the tick
+//   truncated    -- a directory past the bound keeps a set that does not move
 //   library      -- a Sandbox scanned against the docker library, end to end
 //   paging       -- limit=1 over a six-rom library still finds the last page
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
@@ -281,6 +284,50 @@ void Unusable(::checks::Checks& checks) {
   checks.ExpectEq(result.saves.size(), static_cast<std::size_t>(1),
                   "and the other save still syncs");
 
+  // The other end, and the dangerous one. `sync::Timestamp` is a
+  // `system_clock::time_point` whose tick is implementation-defined --
+  // nanoseconds on libstdc++, which is the Switch toolchain and CI, and
+  // microseconds on libc++. A second count past what that tick can hold is
+  // signed overflow, and what it wraps to is the dangerous kind: a *plausible
+  // recent* instant that `sync::Validate` accepts and the server then
+  // arbitrates as newer than its own copy.
+  //
+  // So the assertion is the invariant rather than a number, because which
+  // values overflow is a property of the toolchain: an extreme mtime is either
+  // skipped, or it survives *exactly* -- never quietly turned into a different
+  // instant.
+  const std::int64_t kExtremes[] = {
+      20196744074LL,            // year 2610; wraps to roughly 2025 in nanoseconds
+      253402300800LL,           // one second past the last instant RomM can read
+      1LL << 61,                //
+      std::numeric_limits<std::int64_t>::max(),
+      -1LL,
+  };
+  for (const std::int64_t mtime : kExtremes) {
+    FakeFileSystem extreme;
+    extreme.AddFile("/retroarch/saves", "nova.srm", 512, mtime);
+    const scan::ScanResult scanned = scan::ScanSaves(config, index, extreme);
+    if (scanned.saves.empty()) {
+      checks.Expect(SkippedFor(scanned, "/retroarch/saves/nova.srm", scan::SkipReason::kUnusable),
+                    "an mtime of " + std::to_string(mtime) + " is skipped as unusable");
+      continue;
+    }
+    const sync::ClientSaveState state = scanned.saves.front().ToClientSaveState();
+    checks.ExpectEq(sync::UnixSeconds(state.updated_at), mtime,
+                    "an mtime this client did report survived unchanged");
+  }
+
+  // The conversion itself fails closed, for a caller that did not range-check
+  // first: an instant it cannot hold becomes the epoch, which Validate refuses
+  // rather than an arbitrary recent time it would accept.
+  scan::SaveFile overflowing;
+  overflowing.rom_id = 1;
+  overflowing.file_name = "nova.srm";
+  overflowing.slot = "retroarch-srm";
+  overflowing.modified_unix = std::numeric_limits<std::int64_t>::max();
+  checks.Expect(!sync::Validate(overflowing.ToClientSaveState()).ok(),
+                "ToClientSaveState refuses to invent an instant it cannot hold");
+
   sync::SyncNegotiatePayload payload;
   for (const scan::SaveFile& save : result.saves) {
     payload.saves.push_back(save.ToClientSaveState());
@@ -326,6 +373,59 @@ void Unusable(::checks::Checks& checks) {
   const scan::ScanResult replayed = scan::ScanSaves(config, index, duplicates);
   checks.Expect(SkippedFor(replayed, "/retroarch/saves/nova.srm", scan::SkipReason::kDuplicateSlot),
                 "the same file loses the slot on the next tick, not the other one");
+}
+
+// --- truncated ----------------------------------------------------------------
+
+void Truncated(::checks::Checks& checks) {
+  // A directory past `kMaxDirectoryEntries`. The bound itself is not the
+  // interesting part -- *which* entries survive it is: the scanner resolves a
+  // contested `(rom_id, slot)` in favour of the first file it sees, so a
+  // selection that depends on the card's directory layout makes two files take
+  // turns overwriting each other through the server.
+  const std::filesystem::path root =
+      std::filesystem::path(rig::ScratchDir()) / "listing-truncation";
+  std::error_code error;
+  std::filesystem::remove_all(root, error);
+  std::filesystem::create_directories(root / "retroarch" / "saves", error);
+
+  const std::size_t kExtra = 8;
+  for (std::size_t index = 0; index < fs::kMaxDirectoryEntries + kExtra; ++index) {
+    std::string name = std::to_string(index);
+    name.insert(name.begin(), 6 - name.size(), '0');  // zero-padded, so name order is index order
+    rig::WriteFile((root / "retroarch" / "saves" / (name + ".srm")).string(), "x");
+  }
+
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(root.string());
+  const fs::Listing listing = files->List("/retroarch/saves");
+  checks.Expect(listing.error == fs::ListError::kTooManyEntries,
+                "a directory past the bound says so rather than pretending it is complete");
+  checks.ExpectEq(listing.entries.size(), fs::kMaxDirectoryEntries,
+                  "and holds exactly the bound");
+
+  std::vector<std::string> names;
+  for (const fs::Entry& entry : listing.entries) {
+    names.push_back(entry.name);
+  }
+  std::sort(names.begin(), names.end());
+  checks.ExpectEq(names.front(), std::string("000000.srm"), "the entries kept are the first by name");
+  std::string last = std::to_string(fs::kMaxDirectoryEntries - 1);
+  last.insert(last.begin(), 6 - last.size(), '0');
+  checks.ExpectEq(names.back(), last + ".srm",
+                  "and they stop exactly at the bound, not wherever readdir did");
+
+  // The same directory read twice gives the same set, which is what makes the
+  // duplicate-slot rule above it deterministic.
+  const fs::Listing again = files->List("/retroarch/saves");
+  std::vector<std::string> repeat;
+  for (const fs::Entry& entry : again.entries) {
+    repeat.push_back(entry.name);
+  }
+  std::sort(repeat.begin(), repeat.end());
+  checks.Expect(repeat == names, "and reading it again gives the same entries");
+
+  std::filesystem::remove_all(root, error);
 }
 
 // --- library ------------------------------------------------------------------
@@ -463,9 +563,32 @@ void Paging(::checks::Checks& checks, http::HttpClient& client, const std::strin
     checks.ExpectEq(found.rom->id, last.id, "and it is the same rom");
   }
 
+  // Paged by one and paged whole must be the *same library*, not merely the
+  // same count: the endpoint's default order is by name, names are not unique
+  // in a RomM library, and a tie straddling a page boundary returns one rom
+  // twice and another never. Ids are.
+  for (const roms::Rom& rom : all.index.roms()) {
+    const roms::Rom* same = one_at_a_time.index.ById(rom.id);
+    checks.Expect(same != nullptr && same->fs_name_no_ext == rom.fs_name_no_ext,
+                  "rom " + std::to_string(rom.id) + " survives being paged one at a time");
+  }
+  std::vector<std::int64_t> ids;
+  for (const roms::Rom& rom : one_at_a_time.index.roms()) {
+    checks.Expect(std::find(ids.begin(), ids.end(), rom.id) == ids.end(),
+                  "and no rom is returned twice across pages");
+    ids.push_back(rom.id);
+  }
+
+  // A page past the end of a library that shrank mid-fetch is not the library
+  // ending. `offset` beyond `total` is exactly what that leaves behind.
+  roms::Page page;
+  const rommsync::json::Error empty = roms::ParsePage(
+      "{\"items\":[],\"total\":6,\"limit\":200,\"offset\":6}", &page);
+  checks.Expect(empty.ok(), "an empty page is a shape this client reads");
+  checks.ExpectEq(page.total, static_cast<std::int64_t>(6), "and it still carries the total");
+
   // The envelope itself, because the mistake this guards is reading the body as
   // a bare array -- which parses as nothing and reads as "the library ended".
-  roms::Page page;
   const rommsync::json::Error error = roms::ParsePage("[{\"id\":1}]", &page);
   checks.Expect(!error.ok(), "a bare array is refused by name, not read as an empty library");
 }
@@ -484,13 +607,15 @@ int main(int argc, char** argv) {
   rig::Checks checks;
 
   if (scenario == "names" || scenario == "ambiguous" || scenario == "walked_once" ||
-      scenario == "unusable") {
+      scenario == "unusable" || scenario == "truncated") {
     if (scenario == "names") {
       Names(checks);
     } else if (scenario == "ambiguous") {
       Ambiguous(checks);
     } else if (scenario == "walked_once") {
       WalkedOnce(checks);
+    } else if (scenario == "truncated") {
+      Truncated(checks);
     } else {
       Unusable(checks);
     }
