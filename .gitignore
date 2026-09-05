@@ -42,3 +42,17 @@ __pycache__/
 .vscode/
 .idea/
 .DS_Store
+
+# Claude Code configuration: an allowlist, because the default has to be private.
+#
+# The committed half IS the shared workflow -- the skills, the subagents, the
+# hooks and the settings that register them steer every agent in every worktree,
+# and they are reviewed like code (see evals/). Everything else under .claude/ is
+# per-session or per-person: settings.local.json is the personal override, and a
+# worktree-scoped permission mode is exactly what must not leak into someone
+# else's checkout.
+.claude/*
+!.claude/agents/
+!.claude/hooks/
+!.claude/skills/
+!.claude/settings.json

@@ -8,6 +8,18 @@ Labels: `sysmodule`, `overlay`, `server`, `auth`, `sync`, `download`, `ipc`,
 `config`, `packaging`, `docs`, `risk`, `test-harness`, `good-first-issue`,
 `blocked`, `ready`.
 
+## How an issue becomes work
+
+[docs/WORKFLOW.md](docs/WORKFLOW.md) is the loop this backlog feeds: an idea
+filed with the **Intent** template becomes an issue carrying Goal / Scope /
+Design notes / Acceptance, a `ready` issue becomes an Orca worktree, and the
+worktree produces a plan, a diff with its tests, review findings and a PR
+carrying `Closes #N`. A human merges.
+
+The issue body is the spec — it is the only channel between three agents working
+in parallel who cannot see each other. Keeping it true as the work reveals
+things is part of the work.
+
 ## Dependencies
 
 GitHub has no native blocking relation, so an issue that cannot start yet carries

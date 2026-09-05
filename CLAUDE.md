@@ -3,7 +3,8 @@
 On-device RomM sync for a modded Nintendo Switch: a background **sysmodule**
 (`sys-rommsync`) plus an Ultrahand/Tesla **overlay** (`ovl-rommsync`). Read
 [README.md](README.md) for the product, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-for the shape.
+for the shape, and [docs/WORKFLOW.md](docs/WORKFLOW.md) for how work moves from an
+idea to a merged PR — this file is the short form of it.
 
 ## Hard rules
 
@@ -39,15 +40,17 @@ ctest --test-dir build -R sync --output-on-failure   # one group
 docker run --rm -v "$PWD:/work" -w /work devkitpro/devkita64:latest \
   bash -lc 'make -C sysmodule && make -C overlay && make -C tlsprobe'
 
+./scripts/orca/fleet.sh status                   # what the fleet is running, and what is next
+./scripts/orca/stop.sh                           # stop everything (--now also interrupts the agents)
+./evals/lint.sh                                  # the agent config still holds
 ./scripts/orca/env.sh                            # regenerate .env
-./scripts/orca/romm-browser.sh                   # open RomM signed in, if the tab is gone
-./scripts/orca/romm-logs.sh                      # follow RomM, if the tab is missing
+./scripts/orca/compose.sh up -d                  # start RomM  (logs -f to follow)
+./scripts/orca/romm-browser.sh                   # reopen the signed-in tab
+./scripts/orca/romm-logs.sh                      # reopen the log tab
 ./server/testing/seed.sh                         # re-seed ROM fixtures
 ./.venv/bin/python server/testing/provision.py   # scan the library, mint a fixture token
-./scripts/orca/compose.sh up -d                  # start RomM
-./scripts/orca/tls-fixture.sh up                 # ...and TLS in front of it, for tlsprobe
-./scripts/orca/compose.sh logs -f                # follow it; tab 2 shows this
-./scripts/orca/reap.sh                           # list RomM stacks whose worktree is gone (--yes removes)
+./scripts/orca/tls-fixture.sh up                 # TLS in front of RomM, for tlsprobe
+./scripts/orca/reap.sh                           # RomM stacks whose worktree is gone (--yes removes)
 ```
 
 There is a browser tab on this worktree's RomM, logged in as the fixture admin.
@@ -98,6 +101,14 @@ it starts, even if the labels say several things are ready. Three agents each
 inventing their own version of a shared header is the one merge conflict worth
 serialising to avoid.
 
+## Plan before you edit
+
+Start in plan mode and stay there until the plan is right: **Files that change /
+Order of work / Risks / Proof**. The bar is that someone who never saw the
+conversation could implement the change from it alone. It goes in the PR body,
+under `## Plan`, along with anything the implementation ended up doing
+differently. Departing from a plan is normal; departing silently is not.
+
 ## Code
 
 - C++20. `-Wall -Wextra -Wpedantic -Werror` — warnings are errors, including in
@@ -129,14 +140,46 @@ and say so in the PR body. Never edit them as a side effect of rewording a body.
 ## Finishing a task
 
 1. `ctest --test-dir build --output-on-failure` is green, and your change has a
-   test that would have failed before it.
+   test that would have failed before it. Run it and read the output before
+   reporting anything complete — "it should pass" is not this. For a bug fix,
+   write the failing test first and commit it before the fix.
 2. **Run `/code-review` on your own branch** and put the findings in the PR body.
    This is required, not optional — it is what makes a human review tractable.
+   [REVIEW.md](REVIEW.md) is the policy it follows: three passes, what counts as
+   Important rather than a Nit, and what not to report at all.
 3. Any issue your findings invalidated is edited, and the PR body says which and
    why.
 4. Open a PR with `Closes #N` for your issue. A workflow uses that line to
    unblock dependent issues, so the wording matters.
-5. A human merges. Do not merge your own PR.
+5. `gh pr merge --auto --squash` — that asks GitHub to merge once the required
+   checks pass, and `merge-gate` is one of them, so the rules decide. Never merge
+   directly. A PR touching `.claude/` or `.github/workflows/` never auto-merges;
+   a person merges those.
+
+## What is watching you
+
+- **Skills** ([`.claude/skills/`](.claude/skills)) load when they become
+  relevant: `save-safety` on anything that writes a save, `core-portability` on
+  anything reaching for a platform facility inside `core/`, `tracker-is-spec` on
+  anything that finds an issue to be wrong. They are advisory.
+- **Hooks** ([`.claude/hooks/guard.py`](.claude/hooks/guard.py)) are not. They
+  block, with an explanation: merging a PR, force-pushing `main`, writing to
+  `server/contract/captures/`, editing secrets, editing `unblock.yml` — from a
+  shell command as well as from an edit. Three more apply **only in a worktree
+  the fleet opened**: editing the hooks or settings, pushing before the local
+  review is recorded, and anything outward while the fleet is stopped. A block is
+  a rule you were about to break, not a bug. It is not a sandbox:
+  `guard.py --selftest` is the record of what has been checked, not a proof that
+  nothing gets through.
+- **Subagents**: [`verifier`](.claude/agents/verifier.md) gives an independent
+  build-and-test verdict from a fresh context before you open a PR;
+  [`researcher`](.claude/agents/researcher.md) answers questions about the
+  codebase without spending your context on the files it read.
+- `./evals/lint.sh` (also `ctest -R agent.config`) checks that all of the above
+  is still well-formed and still enforcing what it claims.
+
+When you get the same correction twice, it belongs in this file or in a skill —
+put it there as part of the work, not in a note to yourself.
 
 ## Layout
 
@@ -150,3 +193,6 @@ and say so in the PR body. Never edit them as a side effect of rewording a body.
 | `server/` | Pinned RomM API snapshot, contract probe, and the Docker test fixture. |
 | `tests/` | CTest suites. |
 | `scripts/orca/` | Per-worktree provisioning hooks. |
+| `evals/` | Regression tests for the agent configuration itself. |
+| `.claude/` | Skills, subagents and hooks — what steers and what blocks. |
+| `AGENTS.md` | Symlink to this file, for agent tools that look for that name. |

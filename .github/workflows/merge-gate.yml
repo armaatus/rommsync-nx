@@ -1,0 +1,95 @@
+name: merge gate
+
+# The one required check that decides whether a PR may merge itself.
+#
+# `gh pr merge --auto` waits on it, so an agent can ask GitHub to merge and only
+# a rule you set decides whether that happens. The decision itself is in
+# .github/scripts/merge_gate.py -- a plain script with its own selftest, kept out
+# of the YAML so it can be run and tested without a pull request.
+#
+# Deliberately cheap: two API calls, no checkout, seconds. It runs on every event
+# that can change the answer, so the check re-evaluates when a review lands, a
+# thread is resolved, a fix is pushed, or the body is edited.
+
+on:
+  # `review_requested` is in here because re-requesting review is what the agent
+  # does after resolving threads, and it is the only event that follows a
+  # resolution.
+  #
+  # There is NO trigger for thread resolution itself: `pull_request_review_thread`
+  # is a webhook event, not a workflow trigger, and putting it here makes the
+  # whole file invalid -- which shows up as a failed run with no jobs, named
+  # after the file. So resolving the last thread does not re-run this on its own;
+  # the push or the re-request that follows it does.
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, edited, review_requested]
+  pull_request_review:
+    types: [submitted, dismissed]
+  pull_request_review_comment:
+    types: [created, deleted]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: merge-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: merge-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # The BASE branch's copy of the gate, never the PR's. On a pull_request
+      # event actions/checkout defaults to the merge ref, which means the script
+      # deciding the required check would be the one the PR is proposing -- so a
+      # PR that replaced its body with `sys.exit(0)` would pass its own gate and
+      # `gh pr merge --auto` would land it. Listing .github/scripts/ as
+      # human-merge-only cannot help there, because the modified script is the
+      # one evaluating that list.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Gather
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          NWO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          owner="${NWO%%/*}"; name="${NWO##*/}"
+          gh api --paginate "repos/$NWO/pulls/$PR/files" --jq '.[].filename' >files.txt
+          # The query is single-quoted on purpose: $owner, $name and $pr are
+          # GraphQL variables bound by the -F flags above, and must reach the
+          # server unexpanded.
+          # shellcheck disable=SC2016
+          gh api graphql -F owner="$owner" -F name="$name" -F pr="$PR" -f query='
+            query($owner:String!,$name:String!,$pr:Int!){
+              repository(owner:$owner,name:$name){
+                pullRequest(number:$pr){
+                  body
+                  author{login}
+                  reviews(last:50){ nodes{ state submittedAt commit{oid} author{login} } }
+                  reviewThreads(first:100){ nodes{ isResolved path line } }
+                }
+              }
+            }' >pr.json
+
+      - name: Decide
+        run: |
+          set -euo pipefail
+          # The base branch may not have the gate yet -- on the pull request that
+          # introduces it, and on any PR opened from a base predating it. That is
+          # not an error to hide behind a Python traceback: it is a PR a person
+          # merges, for exactly the reason the gate exists. Say so.
+          if [ ! -f .github/scripts/merge_gate.py ]; then
+            echo "::error title=Human merge required::${{ github.event.pull_request.base.ref }} does not have .github/scripts/merge_gate.py yet, so there is no agreed rule to judge this PR by. A repository admin merges it by hand; every PR opened after it will be gated normally."
+            exit 1
+          fi
+          python3 .github/scripts/merge_gate.py \
+            "${{ github.event.pull_request.head.sha }}" pr.json files.txt

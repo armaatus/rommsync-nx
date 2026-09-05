@@ -1,0 +1,55 @@
+name: Intent
+description: An idea, a problem or an observation, in your own words. Not yet a spec.
+title: "Intent: "
+labels: ["intent"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this when you know what is wrong or what you want, but not yet what
+        should be built. The next step turns it into a proper issue carrying
+        Goal / Scope / Design notes / Acceptance — see
+        [docs/WORKFLOW.md](../../blob/main/docs/WORKFLOW.md).
+
+        If you already know the scope and the acceptance criteria, open a blank
+        issue in that shape instead; this template exists so an idea does not
+        have to wait until someone can write one.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is wrong, or what is missing, in your own words.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Proposed outcome
+      description: What would be true if this were solved? Not how.
+    validations:
+      required: true
+  - type: textarea
+    id: affected
+    attributes:
+      label: Affected users and systems
+      description: |
+        Who notices, and which part of the tree is involved — sysmodule,
+        overlay, core, server fixture, CI, the worktree tooling.
+    validations:
+      required: false
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints
+      description: |
+        Anything that bounds the answer. The five hard rules in CLAUDE.md always
+        apply; name anything beyond them.
+    validations:
+      required: false
+  - type: textarea
+    id: open
+    attributes:
+      label: Open questions
+      description: What you do not know yet. These are what the spec pass resolves.
+    validations:
+      required: false

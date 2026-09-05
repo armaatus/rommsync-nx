@@ -80,7 +80,9 @@ Full detail in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Getting started (contributors)
 
-Read, in order: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) →
+Read, in order: [`docs/WORKFLOW.md`](docs/WORKFLOW.md) (how work happens here —
+this project is built by agents in parallel worktrees, and the loop is worth
+understanding before the code) → [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) →
 [`docs/API_CONTRACT.md`](docs/API_CONTRACT.md) →
 [`docs/SYNC_PROTOCOL.md`](docs/SYNC_PROTOCOL.md) →
 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) →

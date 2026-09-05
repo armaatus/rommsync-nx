@@ -65,6 +65,23 @@ first-user bootstrap and then used via `POST /api/token`. Those are not secrets 
 this RomM is a throwaway container bound to `127.0.0.1` holding no real data,
 the same reasoning that already puts the database password in the compose file.
 
+## The agent configuration is tested too
+
+`CLAUDE.md`, `REVIEW.md`, the skills, the subagents and the hooks under
+`.claude/` steer three parallel worktrees, and every way they break is silent: a
+skill whose frontmatter does not parse never loads, a hook whose path is wrong
+never runs, a guard whose pattern stopped matching stops blocking. None of that
+shows up in a diff review or turns a build red.
+
+`ctest -R agent.config` (the same check as `./evals/lint.sh`, and the `lint`
+job in `.github/workflows/agent-config.yml`) asserts it: frontmatter parses and
+declared names match their paths, every registered hook exists and is executable,
+and the guards still return exit 2 for the things they exist to block and exit 0
+for ordinary work. Deterministic, no model, no network — it never skips.
+
+The model-driven half lives in `evals/cases/` and runs from
+`./evals/run.sh`; see [evals/README.md](../evals/README.md).
+
 ## The test ladder
 
 Climb it in order. You do not go up a rung until the one below is green.

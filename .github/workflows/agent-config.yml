@@ -1,0 +1,151 @@
+name: agent config
+
+# The configuration that steers the agents is code, and it gets the regression
+# testing code gets.
+#
+# CLAUDE.md, REVIEW.md, .claude/skills, .claude/agents and .claude/hooks decide
+# what three parallel worktrees do all day, and every way they break is silent.
+# A skill whose frontmatter does not parse never loads. A hook whose path is
+# wrong never runs. A guard whose pattern stopped matching stops blocking. None
+# of that shows up in a diff review or turns a build red -- it shows up as agents
+# quietly doing the wrong thing for a week.
+#
+# Two jobs, and the split between them is a security boundary, not a convenience:
+#
+#   lint   deterministic, no model, no token. Runs on pull requests. This is the
+#          gate, and it is the same check as `ctest -R agent.config`.
+#
+#   evals  hands those same files to an agent that has the OAuth token in its
+#          environment. On a `pull_request` trigger every one of those files is
+#          whatever the branch says it is -- so a PR could rewrite the
+#          instructions, or add a settings hook, which is plain command
+#          execution, and have the run carry the token. So this one runs on
+#          `push` to main, after review, and on demand. A PR gets `lint`.
+#
+# The eval job WARNS rather than fails. A gate that cries wolf gets ignored, and
+# the useful output is the responses in the job summary, not a red tick.
+#
+# Auth is CLAUDE_CODE_OAUTH_TOKEN (mint one with `claude setup-token`, then add
+# it under Settings > Secrets and variables > Actions). Absent, the job skips.
+
+on:
+  # No `paths:` filter on the pull_request trigger. `configuration is
+  # well-formed` is a REQUIRED check, and a required check that is filtered out
+  # never reports -- which does not read as "skipped", it reads as "pending
+  # forever", and the PR can never merge. The job is three seconds; filtering it
+  # saves nothing and costs a deadlock on every PR that happens not to touch
+  # .claude/.
+  pull_request:
+  push:
+    branches: [main]
+    paths:
+      - 'CLAUDE.md'
+      - 'REVIEW.md'
+      - '.claude/**'
+      - 'evals/**'
+  schedule:
+    # Weekly, not nightly. What a scheduled run adds over the push trigger is
+    # drift in what the model does with configuration that did NOT change, which
+    # is a slow signal and not worth a daily bill.
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-config-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: configuration is well-formed
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check
+        run: ./evals/lint.sh
+
+      # The check above comes from the branch it is auditing, so a PR that
+      # weakened a guard and adjusted the matching assertion would go green --
+      # which is exactly the failure this workflow exists to catch. So the
+      # BASE branch's assertions run against the PR's configuration too. A PR
+      # that genuinely changes what a guard should do will fail here and needs
+      # a human to say so in the body; that is the intended cost.
+      - name: ...and still passes the assertions main is asking for
+        if: github.event_name == 'pull_request'
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          if ! git cat-file -e "$base:evals/lint.sh" 2>/dev/null; then
+            echo "::notice::$base has no evals/lint.sh yet; nothing to compare against."
+            exit 0
+          fi
+          git show "$base:evals/lint.sh" >/tmp/base-lint.sh
+          chmod +x /tmp/base-lint.sh
+          if cmp -s /tmp/base-lint.sh evals/lint.sh; then
+            echo "evals/lint.sh is unchanged; the run above already covered this."
+            exit 0
+          fi
+          echo "evals/lint.sh changed in this PR; re-running the base version."
+          if ! /tmp/base-lint.sh; then
+            echo "::error title=A guard stopped holding::This PR changes evals/lint.sh AND fails the assertions on ${{ github.event.pull_request.base.ref }}. If that is deliberate, say which assertion changed and why in the PR body, and have a human confirm it."
+            exit 1
+          fi
+
+  evals:
+    name: agent still does the work
+    if: github.event_name != 'pull_request'
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # `secrets` is not available in a job-level `if`, so the gate is a step
+      # output. One cheap step beats a second job for the same answer.
+      - id: token
+        name: Is there a token to run these with?
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+            echo "have_token=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "have_token=false" >>"$GITHUB_OUTPUT"
+            echo "::notice::No CLAUDE_CODE_OAUTH_TOKEN secret; skipping the eval cases."
+            echo "::notice::Mint one with 'claude setup-token' and add it under Settings > Secrets > Actions."
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.token.outputs.have_token == 'true'
+        with:
+          node-version: '22'
+
+      - name: Install the Claude Code CLI
+        if: steps.token.outputs.have_token == 'true'
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Run the cases
+        if: steps.token.outputs.have_token == 'true'
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set +e
+          report="$(./evals/run.sh 2>&1)"
+          status=$?
+          set -e
+          {
+            echo "## Agent config evals"
+            echo
+            echo '```'
+            echo "$report"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+          echo "$report"
+          if [ "$status" -ne 0 ]; then
+            echo "::warning title=Agent config evals regressed::Read the responses in the job summary and decide. This does not block anything."
+          fi

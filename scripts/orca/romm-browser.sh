@@ -102,7 +102,7 @@ sys.exit(1)
 existing_page() {
   command -v python3 >/dev/null 2>&1 || return 1
   orca_run_with_deadline "$CLI_SECONDS" "$CLI_OUT" \
-    orca tab list --worktree all --json || return 1
+    "$ORCA_CLI" tab list --worktree all --json || return 1
   # -c rather than a heredoc on stdin: stdin is the CLI's reply, and a program
   # fed the same way would consume it before the parse ever ran.
   python3 -c "$MATCH_TAB_PY" "$REPO_ROOT" "$ROMM_BASE_URL" <"$CLI_OUT"
@@ -140,12 +140,12 @@ authenticate() {
     return "ok:" + ((await me.json()).username || "?");
   })()'
   orca_run_with_deadline "$CLI_SECONDS" "$CLI_OUT" \
-    orca eval --page "$page" --expression "$js" --json || return 1
+    "$ORCA_CLI" eval --page "$page" --expression "$js" --json || return 1
   grep -q '"ok": *true' "$CLI_OUT" || return 1
   grep -q '"result": *"ok:' "$CLI_OUT"
 }
 
-if ! command -v orca >/dev/null 2>&1; then
+if ! orca_cli_resolve; then
   # A plain clone or CI: no Orca, no tabs, nothing to do and nothing wrong.
   echo "==> no orca CLI; not opening a browser tab"
   echo "$HINT"
@@ -170,11 +170,11 @@ if [ -n "$page" ]; then
   # expired session, and the login fetch has to run against RomM's own origin
   # for the relative paths and the cookie jar to be the right ones.
   orca_run_with_deadline "$CLI_SECONDS" "$CLI_OUT" \
-    orca goto --page "$page" --url "$ROMM_BASE_URL/" --json >/dev/null 2>&1
+    "$ORCA_CLI" goto --page "$page" --url "$ROMM_BASE_URL/" --json >/dev/null 2>&1
 else
   echo "==> opening RomM ($ROMM_BASE_URL)"
   if ! orca_run_with_deadline "$CLI_SECONDS" "$CLI_OUT" \
-         orca tab create --worktree "path:$REPO_ROOT" --url "$ROMM_BASE_URL/" --json; then
+         "$ORCA_CLI" tab create --worktree "path:$REPO_ROOT" --url "$ROMM_BASE_URL/" --json; then
     echo "    the orca CLI did not open a tab -- is the runtime reachable?"
     echo "$HINT"
     exit 0
@@ -192,7 +192,7 @@ if authenticate "$page"; then
   # login happened in the background of the current document, so the page on
   # screen is still the logged-out one until it reloads.
   orca_run_with_deadline "$CLI_SECONDS" "$CLI_OUT" \
-    orca goto --page "$page" --url "$ROMM_BASE_URL/" --json >/dev/null 2>&1
+    "$ORCA_CLI" goto --page "$page" --url "$ROMM_BASE_URL/" --json >/dev/null 2>&1
   echo "    signed in as $ROMM_FIXTURE_USER"
   printf 'signed-in %s\n' "$ROMM_FIXTURE_USER" >"$STATE_FILE"
 else

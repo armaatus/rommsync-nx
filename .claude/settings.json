@@ -1,5 +1,64 @@
 {
   "enabledPlugins": {
     "mattpocock-skills@claude-plugins-official": true
+  },
+  "permissions": {
+    "defaultMode": "auto",
+    "allow": [
+      "Edit(.claude/skills/**)",
+      "Write(.claude/skills/**)",
+      "Edit(.claude/agents/**)",
+      "Write(.claude/agents/**)",
+      "Bash(cmake:*)",
+      "Bash(ctest:*)",
+      "Bash(gh issue view:*)",
+      "Bash(gh issue edit:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr diff:*)",
+      "Bash(gh pr create:*)",
+      "Bash(./evals/lint.sh:*)",
+      "Bash(./scripts/orca/compose.sh:*)",
+      "Bash(./scripts/orca/env.sh:*)",
+      "Bash(./scripts/orca/romm-logs.sh:*)",
+      "Bash(./scripts/orca/romm-browser.sh:*)",
+      "Bash(./server/testing/seed.sh:*)",
+      "Bash(./scripts/orca/fleet.sh:*)",
+      "Bash(./scripts/orca/stop.sh:*)",
+      "Bash(./scripts/orca/await-review.sh:*)",
+      "Bash(./scripts/orca/review-status.sh:*)",
+      "Bash(./scripts/orca/record-review.sh:*)",
+      "Bash(gh pr merge:*)",
+      "Bash(gh pr review:*)",
+      "Bash(gh pr comment:*)",
+      "Bash(gh issue comment:*)",
+      "Bash(orca worktree set:*)",
+      "Bash(python3 .github/scripts/merge_gate.py:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/guard.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/shell-parses.sh",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
   }
 }

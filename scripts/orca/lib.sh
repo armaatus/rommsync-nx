@@ -69,6 +69,70 @@ orca_project_remnants() {
   docker network ls --filter "$filter" --format "network${tab}{{.Name}}"    2>/dev/null || true
 }
 
+# Where the fleet keeps its state, and the file that stops it.
+#
+# Here rather than in each script because three of them need the same two paths
+# and a stop that only some of them can see is not a stop. See
+# scripts/orca/fleet.sh for what a stop actually does.
+ORCA_FLEET_DIR="${ROMMSYNC_FLEET_DIR:-$HOME/.rommsync-fleet}"
+ORCA_FLEET_STOP="$ORCA_FLEET_DIR/STOP"
+ORCA_FLEET_OWNED="$ORCA_FLEET_DIR/worktrees"
+
+orca_fleet_stopped() { [ -e "$ORCA_FLEET_STOP" ]; }
+
+# The open PR for a branch, or nothing. Also here rather than in each script:
+# two of them resolved it slightly differently, which is how "no PR for this
+# branch" and "gh failed" end up looking the same in one of them.
+orca_pr_for_branch() {
+  local branch="${1:-$(git rev-parse --abbrev-ref HEAD)}" pr
+  pr="$(GH_PAGER=cat gh pr list --head "$branch" --state open --json number \
+          --jq '.[0].number' 2>/dev/null)" || return 1
+  [ -n "$pr" ] && [ "$pr" != "null" ] || return 1
+  printf '%s\n' "$pr"
+}
+
+# The Orca CLI this machine can actually run, in $ORCA_CLI.
+#
+# `orca` on PATH is a wrapper that locates Orca.app by reading its own symlink.
+# A macOS install has shipped that symlink mode 0700 root:wheel, so the readlink
+# fails for the user Orca runs these hooks as and every call dies with "Unable to
+# determine Orca.app path from symlink". Nothing here notices a broken CLI as
+# such -- the JSON never parses -- so it surfaces one layer up as an answer:
+# `agent-autostart.sh` reports "this worktree has no linked issue", stops
+# watching, and leaves a fully provisioned worktree whose agent sits on an unsent
+# prompt forever. That is how three worktrees went idle on 2026-09-05.
+#
+# So the wrapper is verified rather than assumed, and the app's own binary is the
+# fallback. `--version` is the probe because it is the one call that needs no
+# runtime: a wrapper that cannot find Orca.app fails it, and a reachable CLI
+# answers it whether or not the app is running.
+#
+# The probe goes through orca_run_with_deadline like every other CLI call. It is
+# the FIRST call each hook makes, and `setupAgentStartupPolicy: wait-for-setup`
+# holds the agent's tab until setup.sh returns -- so a wrapper that connects and
+# then never answers would hang worktree provisioning at the one point where
+# nothing has printed a reason yet.
+#
+# Returns non-zero when nothing answers, so a caller can say so in one line
+# instead of making its first real call and reading the silence as data.
+ORCA_CLI_PROBE_SECONDS="${ORCA_CLI_PROBE_SECONDS:-10}"
+orca_cli_resolve() {
+  [ -n "${ORCA_CLI:-}" ] && return 0
+  local candidate probe_out
+  probe_out="$(mktemp)"
+  for candidate in ${ORCA_CLI_COMMAND:-} orca orca-dev orca-ide \
+      /Applications/Orca.app/Contents/Resources/bin/orca; do
+    command -v "$candidate" >/dev/null 2>&1 || continue
+    orca_run_with_deadline "$ORCA_CLI_PROBE_SECONDS" "$probe_out" \
+      "$candidate" --version || continue
+    ORCA_CLI="$candidate"
+    rm -f "$probe_out"
+    return 0
+  done
+  rm -f "$probe_out"
+  return 1
+}
+
 # Run an `orca` CLI call with a hard deadline, capturing its stdout in $2.
 #
 # Every hook that talks to the Orca runtime needs this. The runtime can accept a
