@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# PostToolUse(Edit|Write): a shell script that no longer parses, caught now.
+# PostToolUse(Edit|Write): a shell script that no longer PARSES, caught now.
+#
+# `bash -n`, not shellcheck -- the name said otherwise for a while and the
+# name was wrong. CI runs the same check across scripts/orca and
+# server/testing; this is that check, one push earlier.
 #
 # scripts/orca/*.sh provision every worktree on this project, and a syntax error
 # in one does not fail where it was typed -- it fails in the next worktree Orca

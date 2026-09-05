@@ -25,8 +25,9 @@ scarce resource.
 
 **A PR arrives reviewed, or it does not arrive.** By the time a pull request
 exists it has been through `/code-review` and `/mattpocock-skills:code-review`
-locally and the findings are in its body. This is [enforced](#guardrails), not
-asked for.
+locally and the findings are in its body. The push is gated on a local marker
+and the merge is gated on those findings being in the body — see
+[the merge gate](#the-merge-gate).
 
 **Nothing merges on trust.** The agent never merges and never approves. It asks
 GitHub to merge, and one required check — [`merge-gate`](#the-merge-gate) —
@@ -77,7 +78,8 @@ not create.
 
 ```bash
 ./scripts/orca/stop.sh          # drain: no new worktrees, running agents finish
-./scripts/orca/stop.sh --now    # ...and interrupt every agent as well
+./scripts/orca/stop.sh --now    # ...and interrupt the fleet's agents too
+./scripts/orca/stop.sh --all    # ...and every other agent Orca knows about
 ./scripts/orca/fleet.sh resume  # carry on
 ```
 
@@ -90,8 +92,9 @@ Three things read it, so it holds even when nothing cooperates:
 
 - `fleet.sh` checks it before every decision and opens nothing new.
 - `await-review.sh` checks it between polls and returns exit 3.
-- **`guard.py` refuses `git push`, `gh pr create` and every `gh … comment/edit`
-  while it exists.** So a stopped fleet produces no outward effects even from an
+- **`guard.py` refuses `git push`, `gh pr create`, every `gh … comment/edit`
+  and any `gh api` with a write method while it exists.** Reads stay open, so a
+  stopped agent can still find out what it was in the middle of. So a stopped fleet produces no outward effects even from an
   agent that is mid-thought and has not read the news. Reading, building and
   testing stay open — the point is to stop work reaching anyone, not to freeze
   the machine.
@@ -192,7 +195,10 @@ tests, then record it:
 ```
 
 That writes `.orca/reviewed-<sha>`, and **`guard.py` refuses `git push` and
-`gh pr create` from a fleet-owned worktree without it.** The marker is
+`gh pr create` from a fleet-owned worktree without it.** The marker records what
+it is given; it cannot tell whether a review really happened, so it is a
+checklist gate. What actually enforces the two passes is `merge-gate`, which
+reads the PR body — and that a human can read too. The marker is
 per-commit, so amending or adding a commit needs the review re-run — which is the
 point. A worktree you opened by hand is never gated: pushing a half-finished
 branch is normal, and a guard that argues about it is a guard people route
@@ -239,8 +245,10 @@ Resolution comes from GitHub's own state through GraphQL, not from whether a
 reply exists — the REST endpoint for PR comments cannot report it, and
 `isOutdated` is not `isResolved`.
 
-**At most three rounds.** If a third still leaves something unresolved the agent
-stops, comments saying exactly what is unresolved and why it disagrees, and flags
+**At most three rounds, counted by the script.** `await-review.sh` keeps the
+count in `.orca/review-rounds` and exits 5 on the fourth call rather than
+waiting, so this is not something an agent has to remember. When it trips, the
+agent stops, comments saying exactly what is unresolved and why it disagrees, and flags
 the card. Another lap is not what a disagreement needs; your attention is.
 
 When it is green the agent runs `gh pr merge --auto --squash`. That does **not**
@@ -265,9 +273,11 @@ would leave a PR whose findings were all addressed blocked forever. Taking the
 latest review per author instead lets a clean re-review supersede the old verdict
 on its own, with no dismissal step and nothing waiting on a person.
 
-A PR touching **`.claude/**`** or **`.github/workflows/**`** fails the gate on
-purpose. Those are the only paths that can disable the checks gating their own
-PR, so they never merge themselves. `enforce_admins` is off, so you merge them by
+A PR touching **`.claude/**`**, **`.github/workflows/**`** or
+**`.github/scripts/**`** fails the gate on purpose. Those are the paths that can
+disable the checks gating their own PR — the last one because `merge_gate.py`
+*is* the gate, and a change to what "may merge" means must not merge itself on
+the strength of its own new rules. `enforce_admins` is off, so you merge them by
 hand with the check red — which is exactly the intended shape.
 
 The decision lives in a script rather than in the YAML so it can be run and
@@ -337,6 +347,7 @@ fails if that entry disappears, because the agent brief names those skills.
 | editing secrets, `.env`, `token.dat`, `device.dat` | hard rule 5 |
 | editing `unblock.yml` | it decides what other worktrees may start |
 | editing `.claude/hooks/` and `settings.json` **in a fleet worktree** | an agent rewriting its own guards while nobody is watching has none |
+| `gh api` with `-X POST/PUT/PATCH/DELETE` while stopped | a write is outward; a read is not |
 | pushing or opening a PR from a fleet worktree with no `.orca/reviewed-<sha>` | a PR arrives reviewed or it does not arrive |
 | anything outward while `~/.rommsync-fleet/STOP` exists | a stop that depends on cooperation is not a stop |
 
@@ -369,7 +380,8 @@ Four properties are deliberate:
 - **Skills and subagents are never protected.** They are advisory by design, and
   an agent improving one is the loop working.
 
-`guard.py --selftest` is 72 assertions kept next to the code they constrain. Every
+`guard.py --selftest` is 68 assertions kept next to the code they constrain,
+and it counts what it ran rather than asserting a number kept in step by hand. Every
 row is either a rule this repo depends on or an escape somebody actually found.
 It is the record of what has been checked — **not** a proof that nothing else
 gets through.

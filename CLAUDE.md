@@ -41,7 +41,7 @@ docker run --rm -v "$PWD:/work" -w /work devkitpro/devkita64:latest \
   bash -lc 'make -C sysmodule && make -C overlay && make -C tlsprobe'
 
 ./scripts/orca/fleet.sh status                   # what the fleet is running, and what is next
-./scripts/orca/stop.sh                           # stop everything (--now interrupts the agents)
+./scripts/orca/stop.sh                           # stop everything (--now also interrupts the agents)
 ./evals/lint.sh                                  # the agent config still holds
 ./scripts/orca/env.sh                            # regenerate .env
 ./scripts/orca/compose.sh up -d                  # start RomM  (logs -f to follow)

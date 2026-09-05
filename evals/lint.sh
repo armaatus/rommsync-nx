@@ -62,39 +62,34 @@ fi
 # A skill is a folder with a SKILL.md whose frontmatter says when it triggers.
 # Both halves are load-bearing: no frontmatter and it never loads, no description
 # and it loads for nothing.
-echo "== skills"
-shopt -s nullglob
-for skill in .claude/skills/*/; do
-  name="$(basename "$skill")"
-  file="$skill/SKILL.md"
-  if [ ! -f "$file" ]; then
-    fail "$skill has no SKILL.md"
-    continue
-  fi
+# A skill and a subagent are the same shape: a markdown file whose frontmatter
+# says what it is and when it applies. Both halves are load-bearing -- no
+# frontmatter and it never loads, no description and it loads for nothing -- and
+# checking them twice in two places is how the two checks drift apart.
+check_frontmatter() {
+  local file="$1" expect_name="$2" what="$3" fm declared
+  [ -f "$file" ] || { fail "$what: $file is missing"; return; }
   [ "$(head -1 "$file")" = "---" ] \
-    || { fail "$file does not open with a --- frontmatter block"; continue; }
-  # The frontmatter is everything up to the second ---.
+    || { fail "$file does not open with a --- frontmatter block"; return; }
   fm="$(awk 'NR>1 && /^---$/{exit} NR>1' "$file")"
   grep -q '^name:' <<<"$fm" || fail "$file frontmatter has no name:"
   grep -q '^description:' <<<"$fm" || fail "$file frontmatter has no description:"
-  declared="$(grep '^name:' <<<"$fm" | head -1 | sed 's/^name:[[:space:]]*//' | tr -d '"'"'"' ')"
-  [ "$declared" = "$name" ] \
-    || fail "$file declares name '$declared' but lives in $name/ -- they must match"
-  ok "skill $name"
+  declared="$(grep '^name:' <<<"$fm" | head -1 | sed 's/^name:[[:space:]]*//' \
+              | tr -d '"'"'"' ')"
+  [ "$declared" = "$expect_name" ] \
+    || fail "$file declares name '$declared' but is filed as '$expect_name' -- they must match"
+  ok "$what $expect_name"
+}
+
+echo "== skills"
+shopt -s nullglob
+for skill in .claude/skills/*/; do
+  check_frontmatter "$skill/SKILL.md" "$(basename "$skill")" skill
 done
 
 echo "== subagents"
 for agent in .claude/agents/*.md; do
-  name="$(basename "$agent" .md)"
-  [ "$(head -1 "$agent")" = "---" ] \
-    || { fail "$agent does not open with a --- frontmatter block"; continue; }
-  fm="$(awk 'NR>1 && /^---$/{exit} NR>1' "$agent")"
-  grep -q '^name:' <<<"$fm" || fail "$agent frontmatter has no name:"
-  grep -q '^description:' <<<"$fm" || fail "$agent frontmatter has no description:"
-  declared="$(grep '^name:' <<<"$fm" | head -1 | sed 's/^name:[[:space:]]*//' | tr -d '"'"'"' ')"
-  [ "$declared" = "$name" ] \
-    || fail "$agent declares name '$declared' but the file is $name.md -- they must match"
-  ok "subagent $name"
+  check_frontmatter "$agent" "$(basename "$agent" .md)" subagent
 done
 
 echo "== settings.json"
@@ -117,7 +112,7 @@ else
       *)    bash -n "$script" || fail "hook does not parse: $script" ;;
     esac
     ok "hook $(basename "$script")"
-  done < <(python3 - <<'PY'
+  done < <(python3 -c '
 import json
 s = json.load(open(".claude/settings.json"))
 for group in s.get("hooks", {}).values():
@@ -125,8 +120,7 @@ for group in s.get("hooks", {}).values():
         for h in matcher.get("hooks", []):
             if h.get("type") == "command" and h.get("command"):
                 print(h["command"])
-PY
-  )
+')
 fi
 
 # The guards themselves. A hook that parses is not a hook that blocks: these
@@ -226,15 +220,16 @@ echo "== eval cases"
 cases=(evals/cases/*.json)
 [ "${#cases[@]}" -gt 0 ] || fail "evals/cases/ is empty; the eval job would pass by having nothing to run"
 for case_file in "${cases[@]}"; do
-  python3 -c "
-import json,sys
-c = json.load(open('$case_file'))
-for key in ('name', 'prompt', 'expect'):
+  python3 -c '
+import json, sys
+c = json.load(open(sys.argv[1]))
+for key in ("name", "prompt", "expect"):
     if key not in c:
-        sys.exit('missing key: ' + key)
-if not isinstance(c['expect'], dict) or not (c['expect'].get('contains') or c['expect'].get('absent')):
-    sys.exit(\"expect must carry 'contains' and/or 'absent'\")
-" || fail "$case_file is not a well-formed eval case"
+        sys.exit("missing key: " + key)
+e = c["expect"]
+if not isinstance(e, dict) or not (e.get("contains") or e.get("absent")):
+    sys.exit("expect must carry contains and/or absent")
+' "$case_file" || fail "$case_file is not a well-formed eval case"
   ok "$(basename "$case_file")"
 done
 

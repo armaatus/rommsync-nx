@@ -36,6 +36,9 @@ import sys
 # can turn off the very checks gating this PR. Both change rarely, and a person
 # merging them is the point. enforce_admins is off, so an admin can merge these
 # by hand with this check red; nothing else can.
+# `.github/scripts/` is in here for the same reason as the other two: this file
+# IS the gate, so a PR that changes what "may merge" means must not be able to
+# merge itself on the strength of its own new rules.
 HUMAN_ONLY_PREFIXES = (".claude/", ".github/workflows/", ".github/scripts/")
 
 # What the PR body has to show. These are the two local passes CLAUDE.md
@@ -62,13 +65,21 @@ def evaluate(head_sha, pull_request, changed_files):
                 "read them."
             )
 
-    reviews = (pull_request.get("reviews") or {}).get("nodes") or []
+    # A review by the PR's own author is not an independent review. GitHub
+    # refuses a self-`--approve` but permits a self-`--comment`, and
+    # `gh pr review` is on the agent's allowlist -- so without this the author
+    # could satisfy the independence requirement by reviewing itself.
+    pr_author = ((pull_request.get("author") or {}).get("login") or "").lower()
+    reviews = [
+        r for r in ((pull_request.get("reviews") or {}).get("nodes") or [])
+        if ((r.get("author") or {}).get("login") or "").lower() != pr_author
+    ]
     on_head = [r for r in reviews if ((r.get("commit") or {}).get("oid") == head_sha)]
     if not on_head:
         problems.append(
-            f"no review has been submitted against the current head "
+            f"no independent review has been submitted against the current head "
             f"({head_sha[:8]}). Pushing a fix invalidates the previous one -- "
-            "re-request review."
+            "re-request review. A review by this PR's own author does not count."
         )
     else:
         latest = {}
@@ -205,6 +216,36 @@ SELFTEST = [
         False,
     ),
     (
+        "a self-review does not count as independent",
+        "abc123",
+        {
+            "author": {"login": "armaatus"},
+            "body": "/code-review\nmattpocock-skills:code-review",
+            "reviews": {"nodes": [
+                {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
+                 "commit": {"oid": "abc123"}, "author": {"login": "armaatus"}},
+            ]},
+            "reviewThreads": {"nodes": []},
+        },
+        ["core/src/sync.cpp"],
+        False,
+    ),
+    (
+        "...and a review from someone else does",
+        "abc123",
+        {
+            "author": {"login": "armaatus"},
+            "body": "/code-review\nmattpocock-skills:code-review",
+            "reviews": {"nodes": [
+                {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}},
+            ]},
+            "reviewThreads": {"nodes": []},
+        },
+        ["core/src/sync.cpp"],
+        True,
+    ),
+    (
         "the enforcement layer never merges itself",
         "abc123",
         {
@@ -216,6 +257,20 @@ SELFTEST = [
             "reviewThreads": {"nodes": []},
         },
         [".claude/hooks/guard.py"],
+        False,
+    ),
+    (
+        "...nor a change to this gate itself",
+        "abc123",
+        {
+            "body": "/code-review\nmattpocock-skills:code-review",
+            "reviews": {"nodes": [
+                {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}},
+            ]},
+            "reviewThreads": {"nodes": []},
+        },
+        [".github/scripts/merge_gate.py"],
         False,
     ),
     (
@@ -255,7 +310,8 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv[1:]:
         sys.exit(selftest())
     if len(sys.argv) != 4:
-        print(__doc__.strip().splitlines()[-3], file=sys.stderr)
+        print("usage: merge_gate.py <head-sha> <pr.json> <files.txt>  [--selftest]",
+              file=sys.stderr)
         sys.exit(2)
     head_sha = sys.argv[1]
     payload = json.load(open(sys.argv[2]))

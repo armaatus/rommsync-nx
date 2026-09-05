@@ -23,10 +23,14 @@ name: claude review
 
 on:
   pull_request:
-    # Deliberately no `synchronize`. One review per PR, not one per push --
-    # against a 3000-minute budget and a paid seat, review-on-every-commit is
-    # how this gets turned off. Say `@claude review` for another pass.
-    types: [opened, ready_for_review, reopened]
+    # `synchronize` and `review_requested` are here because `merge-gate` requires
+    # a review on the CURRENT head: push a fix and the previous review no longer
+    # counts. Without a re-review on push, round two of the loop deadlocks --
+    # the agent waits for a review that nothing will ever start.
+    #
+    # That does mean one review per push. The three-round cap in the agent brief
+    # is what bounds it, not the trigger list.
+    types: [opened, ready_for_review, reopened, synchronize, review_requested]
   issue_comment:
     types: [created]
   pull_request_review_comment:
@@ -168,24 +172,30 @@ jobs:
       actions: read
     steps:
       # The default checkout for an issue_comment event is the DEFAULT BRANCH,
-      # not the PR -- and this job carries `contents: write`. Pin the PR head
-      # the same way the review job does, so what runs is what was commented on.
+      # not the PR -- and this job carries `contents: write`. Pin the PR head so
+      # what runs is what was commented on.
+      #
+      # A SHA, not `.head.ref`: a branch name is mutable, so it can move between
+      # the comment and the run, and for a fork PR it does not exist in this
+      # repo at all -- where checking it out would either fail or silently
+      # resolve a same-named branch here. `refs/pull/N/head` resolves for both.
       - id: head
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           num="${{ github.event.issue.number || github.event.pull_request.number }}"
-          ref=""
+          sha=""
           if [ -n "$num" ]; then
-            ref="$(gh api "repos/${{ github.repository }}/pulls/$num" \
-                     --jq '.head.ref' 2>/dev/null || true)"
+            sha="$(gh api "repos/${{ github.repository }}/pulls/$num" \
+                     --jq '.head.sha' 2>/dev/null || true)"
           fi
-          echo "ref=$ref" >>"$GITHUB_OUTPUT"
+          echo "num=$num" >>"$GITHUB_OUTPUT"
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ steps.head.outputs.ref || github.ref }}
+          ref: ${{ steps.head.outputs.num && format('refs/pull/{0}/head', steps.head.outputs.num) || github.ref }}
 
       - id: token
         env:

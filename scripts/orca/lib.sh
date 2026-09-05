@@ -69,6 +69,28 @@ orca_project_remnants() {
   docker network ls --filter "$filter" --format "network${tab}{{.Name}}"    2>/dev/null || true
 }
 
+# Where the fleet keeps its state, and the file that stops it.
+#
+# Here rather than in each script because three of them need the same two paths
+# and a stop that only some of them can see is not a stop. See
+# scripts/orca/fleet.sh for what a stop actually does.
+ORCA_FLEET_DIR="${ROMMSYNC_FLEET_DIR:-$HOME/.rommsync-fleet}"
+ORCA_FLEET_STOP="$ORCA_FLEET_DIR/STOP"
+ORCA_FLEET_OWNED="$ORCA_FLEET_DIR/worktrees"
+
+orca_fleet_stopped() { [ -e "$ORCA_FLEET_STOP" ]; }
+
+# The open PR for a branch, or nothing. Also here rather than in each script:
+# two of them resolved it slightly differently, which is how "no PR for this
+# branch" and "gh failed" end up looking the same in one of them.
+orca_pr_for_branch() {
+  local branch="${1:-$(git rev-parse --abbrev-ref HEAD)}" pr
+  pr="$(GH_PAGER=cat gh pr list --head "$branch" --state open --json number \
+          --jq '.[0].number' 2>/dev/null)" || return 1
+  [ -n "$pr" ] && [ "$pr" != "null" ] || return 1
+  printf '%s\n' "$pr"
+}
+
 # The Orca CLI this machine can actually run, in $ORCA_CLI.
 #
 # `orca` on PATH is a wrapper that locates Orca.app by reading its own symlink.

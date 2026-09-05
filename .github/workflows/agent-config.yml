@@ -29,15 +29,13 @@ name: agent config
 # it under Settings > Secrets and variables > Actions). Absent, the job skips.
 
 on:
+  # No `paths:` filter on the pull_request trigger. `configuration is
+  # well-formed` is a REQUIRED check, and a required check that is filtered out
+  # never reports -- which does not read as "skipped", it reads as "pending
+  # forever", and the PR can never merge. The job is three seconds; filtering it
+  # saves nothing and costs a deadlock on every PR that happens not to touch
+  # .claude/.
   pull_request:
-    paths:
-      - 'CLAUDE.md'
-      - 'REVIEW.md'
-      - '.claude/**'
-      - 'evals/**'
-      - 'orca.yaml'
-      - 'scripts/orca/**'
-      - '.github/workflows/agent-config.yml'
   push:
     branches: [main]
     paths:

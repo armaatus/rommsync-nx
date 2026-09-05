@@ -18,6 +18,11 @@ on:
     types: [submitted, dismissed]
   pull_request_review_comment:
     types: [created, deleted]
+  # Resolving a thread is its own event; without it the gate would stay red
+  # after the last thread was resolved until something else happened to re-run
+  # it.
+  pull_request_review_thread:
+    types: [resolved, unresolved]
 
 permissions:
   contents: read
@@ -33,8 +38,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # The BASE branch's copy of the gate, never the PR's. On a pull_request
+      # event actions/checkout defaults to the merge ref, which means the script
+      # deciding the required check would be the one the PR is proposing -- so a
+      # PR that replaced its body with `sys.exit(0)` would pass its own gate and
+      # `gh pr merge --auto` would land it. Listing .github/scripts/ as
+      # human-merge-only cannot help there, because the modified script is the
+      # one evaluating that list.
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.base.sha }}
           sparse-checkout: .github/scripts
           sparse-checkout-cone-mode: false
 
@@ -52,6 +65,7 @@ jobs:
               repository(owner:$owner,name:$name){
                 pullRequest(number:$pr){
                   body
+                  author{login}
                   reviews(last:50){ nodes{ state submittedAt commit{oid} author{login} } }
                   reviewThreads(first:100){ nodes{ isResolved path line } }
                 }

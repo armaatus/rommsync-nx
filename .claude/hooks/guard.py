@@ -64,6 +64,16 @@ OUTWARD = (
     ("gh", "api"),
 )
 
+# `gh api` is both halves of the API: reading a PR and merging one. Only the
+# write methods are outward, and blocking the reads would stop an agent finding
+# out what it was in the middle of.
+API_WRITE_METHODS = ("POST", "PUT", "PATCH", "DELETE")
+
+# ...and `gh api` sends POST implicitly the moment any field is present, so a
+# request with no -X can still be a write. A GraphQL mutation is the same thing
+# wearing a different hat.
+API_FIELD_FLAGS = ("-f", "-F", "--field", "--raw-field", "--input")
+
 # Files that hold a real bearer token or key. Every one is gitignored, and a
 # session with a reason to write one has a bug. `.env` is generated -- there is
 # a script for it.
@@ -204,11 +214,21 @@ def _head_sha():
         return ""
 
 
-def _current_branch():
+def _git_c_dir(words):
+    """The directory `git -C <dir>` would act in, if any."""
+    for i, w in enumerate(words):
+        if w == "-C" and i + 1 < len(words):
+            return words[i + 1]
+        if w.startswith("--git-dir="):
+            return w.split("=", 1)[1]
+    return None
+
+
+def _current_branch(cwd=None):
     try:
         out = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, cwd=cwd,
         )
         return out.stdout.strip() if out.returncode == 0 else ""
     except Exception:
@@ -327,7 +347,28 @@ def check_bash(command):
         if os.path.exists(STOP_FILE):
             for prefix in OUTWARD:
                 head = [w.rsplit("/", 1)[-1] for w in words[: len(prefix)]]
-                if head == list(prefix) or (prefix[0] == "git" and _is_git(words, prefix[1])):
+                matched = head == list(prefix) or (
+                    prefix[0] == "git" and _is_git(words, prefix[1]))
+                if matched and prefix == ("gh", "api"):
+                    # A read is not outward. A write is, however it is spelled:
+                    # an explicit method, any field flag (which makes gh POST on
+                    # its own), or a GraphQL mutation.
+                    method = ""
+                    writes = False
+                    for i, w in enumerate(words):
+                        if w in ("-X", "--method") and i + 1 < len(words):
+                            method = words[i + 1].upper()
+                        elif w.startswith("--method="):
+                            method = w.split("=", 1)[1].upper()
+                        elif w in API_FIELD_FLAGS or any(
+                            w.startswith(f + "=") for f in API_FIELD_FLAGS
+                        ):
+                            writes = True
+                        elif "mutation" in w and "graphql" in " ".join(words):
+                            writes = True
+                    if method not in API_WRITE_METHODS and not writes:
+                        continue
+                if matched:
                     deny(
                         f"Blocked: the fleet is stopped ({STOP_FILE}).\n"
                         "Nothing goes out while that file exists -- no push, no PR, no "
@@ -401,7 +442,16 @@ def check_bash(command):
                 for w in words[1:]
             )
             if forced:
-                refs = [w for w in words[1:] if not w.startswith("-")]
+                # Everything after the `push` verb. Taking "words[1:] minus
+                # flags" swept in the verb itself and the ARGUMENT of a global
+                # option, so `git -C main push --force origin HEAD` read as
+                # targeting main and `git push -f origin` read as having two
+                # refspecs and therefore not being a bare push.
+                try:
+                    after = words[words.index("push") + 1:]
+                except ValueError:
+                    after = words[1:]
+                refs = [w for w in after if not w.startswith("-")]
                 targets_main = any(
                     r == "main"
                     or r.startswith("main:")
@@ -415,12 +465,12 @@ def check_bash(command):
                 # branch, and on main it is the same rewrite.
                 if not targets_main and any(r == "HEAD" for r in refs):
                     if branch is None:
-                        branch = _current_branch()
+                        branch = _current_branch(_git_c_dir(words))
                     targets_main = branch == "main"
                 # ...and so is `git push -f` with no refspec at all.
                 if not targets_main and len(refs) <= 1:
                     if branch is None:
-                        branch = _current_branch()
+                        branch = _current_branch(_git_c_dir(words))
                     targets_main = branch == "main"
                 if targets_main:
                     deny(
@@ -555,6 +605,8 @@ SELFTEST = [
     ("Bash", {"command": "git push --force origin main"}, 2, "force-pushing main is blocked"),
     ("Bash", {"command": "git push origin main -f"}, 2, "...with the flag last"),
     ("Bash", {"command": "git push --force origin refs/heads/main"}, 2, "...spelled as a full ref"),
+    ("Bash", {"command": "git -C /w/main push --force origin some-branch"}, 0,
+     "a -C path containing 'main' is not a refspec"),
     ("Bash", {"command": "git -C /w/rommsync push --force-with-lease origin main"}, 2, "...through git's global options"),
     ("Bash", {"command": "git push --force origin armaatus/fix-main-loop"}, 0, "a branch whose name contains 'main' is fine"),
     ("Bash", {"command": "git push -u origin armaatus/thing"}, 0, "an ordinary push is fine"),
@@ -612,7 +664,7 @@ SELFTEST = [
 # The hook's own path, assembled rather than written out: this module is full of
 # rules about writing to it, and a literal makes the file its own false positive.
 HOOK_REL = ".claude/" + "hooks/" + "guard.py"
-_STATEFUL_COUNT = 21
+_stateful_ran = 0
 
 
 def _stateful_checks():
@@ -629,6 +681,8 @@ def _stateful_checks():
 
     def expect(want, tool_input, what, tool="Bash"):
         nonlocal failures
+        global _stateful_ran
+        _stateful_ran += 1
         try:
             main({"tool_name": tool, "tool_input": tool_input})
             got = 0
@@ -717,7 +771,7 @@ def selftest():
     if failures:
         print(f"{failures} guard assertion(s) failed", file=sys.stderr)
         return 1
-    print(f"{len(SELFTEST)} + {_STATEFUL_COUNT} guard assertions hold")
+    print(f"{len(SELFTEST) + _stateful_ran} guard assertions hold")
     return 0
 
 

@@ -49,9 +49,12 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 . ./scripts/orca/lib.sh
 
-STATE_DIR="${ROMMSYNC_FLEET_DIR:-$HOME/.rommsync-fleet}"
-STOP_FILE="$STATE_DIR/STOP"
-OWNED_DIR="$STATE_DIR/worktrees"
+# The state dir, the stop file and the owned-worktree registry come from
+# lib.sh: `await-review.sh` and `guard.py` read the same paths, and a stop only
+# some of them can see is not a stop.
+STATE_DIR="$ORCA_FLEET_DIR"
+STOP_FILE="$ORCA_FLEET_STOP"
+OWNED_DIR="$ORCA_FLEET_OWNED"
 STARTED_DIR="$STATE_DIR/started"
 LOG="$STATE_DIR/fleet.log"
 PIDFILE="$STATE_DIR/fleet.pid"
@@ -78,7 +81,7 @@ notify() {
   osascript -e "display notification \"$(printf '%s' "$2" | sed 's/"/\\"/g')\" with title \"rommsync fleet\" subtitle \"$1\"" >/dev/null 2>&1 || true
 }
 
-stopped() { [ -e "$STOP_FILE" ]; }
+stopped() { orca_fleet_stopped; }
 check_stop() {
   stopped || return 1
   say "stop file present ($STOP_FILE) -- not starting anything new"
@@ -105,20 +108,55 @@ card() {
     --worktree "path:$path" "$@" --json >/dev/null 2>&1 || true
 }
 
+# The agent terminal in one worktree, if it has one. The path goes in as an
+# argument rather than into the source: a worktree path can contain anything a
+# filename can.
+agent_terminal_in() {
+  orca_json terminal list | python3 -c '
+import json, sys
+for t in json.load(sys.stdin)["result"]["terminals"]:
+    if (t.get("worktreePath") == sys.argv[1] and t.get("agentIdentity")
+            and not t.get("orphaned")):
+        print(t["handle"]); break
+' "$1"
+}
+
 # --------------------------------------------------------------- the state ---
 own()          { printf '%s\n' "$2" >"$OWNED_DIR/$1"; date +%s >"$STARTED_DIR/$1"; }
 owned_path()   { cat "$OWNED_DIR/$1" 2>/dev/null; }
 disown_issue() { rm -f "$OWNED_DIR/$1" "$STARTED_DIR/$1"; }
 
+# Non-zero when the answer could not be read, which is NOT the same as "nothing
+# is running". Reading a failed CLI call as zero live worktrees is how one
+# transient hiccup turns into three duplicate worktrees for issues that already
+# have one: `in_flight` goes blind at the same moment, because it reads the same
+# list.
 live_worktrees() {
-  orca_json worktree list | python3 -c '
-import json,sys
-for w in json.load(sys.stdin)["result"]["worktrees"]:
+  local out; out="$(mktemp)"
+  orca_run_with_deadline 30 "$out" "$ORCA_CLI" worktree list --json || {
+    rm -f "$out"; return 1; }
+  python3 -c '
+import json, sys
+try:
+    worktrees = json.load(open(sys.argv[1]))["result"]["worktrees"]
+except Exception:
+    raise SystemExit(1)
+for w in worktrees:
     if not w.get("isMainWorktree") and not w.get("isArchived"):
         print(w.get("linkedIssue") or "-", w["path"], sep="\t")
-'
+' "$out"
+  local rc=$?
+  rm -f "$out"
+  return $rc
 }
-live_count() { live_worktrees | grep -c . ; }
+
+# Prints the count, or fails. A caller that cannot tell how many are running
+# must not launch anything.
+live_count() {
+  local list
+  list="$(live_worktrees)" || return 1
+  printf '%s\n' "$list" | grep -c . || true
+}
 
 # --------------------------------------------------------------- the queue ---
 # Every open issue, with how many other open issues are blocked BY it. That
@@ -146,22 +184,73 @@ for i in sorted(ready, key=lambda i: (-blocks.get(i["number"], 0), i["number"]))
 # `ready` overstates availability: the label stays until the PR merges, so an
 # issue with a PR already open still carries it.
 has_open_pr() {
+  # The issue number goes in as an ARGUMENT, not spliced into the source. A PR
+  # body is third-party text and so, in principle, is anything that reaches this
+  # regex.
   GH_PAGER=cat gh pr list --state open --json number,body --limit 100 2>/dev/null \
-    | python3 -c "
-import json,sys,re
+    | python3 -c '
+import json, re, sys
+want = re.compile(r"Closes #" + re.escape(sys.argv[1]) + r"\b")
 for p in json.load(sys.stdin):
-    if re.search(r'Closes #$1\b', p.get('body') or ''):
-        print(p['number']); break
-" | grep -q .
+    if want.search(p.get("body") or ""):
+        print(p["number"]); break
+' "$1" | grep -q .
 }
 
+# 0 = in flight, 1 = free, 2 = could not tell. The third answer matters: a
+# caller that treats "could not tell" as "free" opens a second worktree for work
+# that is already running.
 in_flight() {
-  live_worktrees | cut -f1 | grep -qx "$1" && return 0
+  local list
+  list="$(live_worktrees)" || return 2
+  printf '%s\n' "$list" | cut -f1 | grep -qx "$1" && return 0
   has_open_pr "$1" && return 0
   return 1
 }
 
 is_foundation() { printf '%s' "$1" | tr ',' '\n' | grep -qx "$FOUNDATION_LABEL"; }
+
+# Landed: the issue is closed, or a PR that closes it has merged. `ready` does
+# not answer this -- unblock.yml only relabels dependants -- and neither does
+# "no worktree", which is also true of work that never started.
+issue_is_done() {
+  local state
+  state="$(GH_PAGER=cat gh issue view "$1" --json state --jq .state 2>/dev/null)"
+  [ "$state" = "CLOSED" ] && return 0
+  GH_PAGER=cat gh pr list --state merged --limit 50 --json body 2>/dev/null \
+    | python3 -c '
+import json, re, sys
+want = re.compile(r"Closes #" + re.escape(sys.argv[1]) + r"\b")
+for p in json.load(sys.stdin):
+    if want.search(p.get("body") or ""):
+        print("done"); break
+' "$1" | grep -q .
+}
+
+# How many `ready` issues could start right now, from ONE worktree list and ONE
+# PR list. Zero also means "nothing to wait for" to the run loop, so it must not
+# silently answer zero when a lookup failed -- it returns non-zero instead.
+count_startable() {
+  local live prs
+  live="$(live_worktrees)" || return 1
+  prs="$(GH_PAGER=cat gh pr list --state open --json body --limit 100 --jq '.[].body' 2>/dev/null)" || return 1
+  ready_issues | python3 -c '
+import re, sys
+running = {line.split("\t")[0] for line in sys.argv[1].splitlines() if line.strip()}
+bodies = sys.argv[2]
+n = 0
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    issue = line.split("\t")[0]
+    if issue in running:
+        continue
+    if re.search(r"Closes #" + re.escape(issue) + r"\b", bodies):
+        continue
+    n += 1
+print(n)
+' "$live" "$prs"
+}
 
 # --------------------------------------------------------------- the launch ---
 slug() {
@@ -270,12 +359,7 @@ enforce_timebox() {
     has_open_pr "$num" && { rm -f "$f"; continue; }
 
     say "#$num: $((TIMEBOX_SECONDS / 3600))h with no PR -- stopping it and leaving the worktree for you"
-    agent="$(orca_json terminal list | python3 -c "
-import json,sys
-for t in json.load(sys.stdin)['result']['terminals']:
-    if t.get('worktreePath') == '$path' and t.get('agentIdentity') and not t.get('orphaned'):
-        print(t['handle']); break
-")"
+    agent="$(agent_terminal_in "$path")"
     [ -n "$agent" ] && orca_run_with_deadline 20 /dev/null "$ORCA_CLI" terminal send \
       --terminal "$agent" --interrupt --json >/dev/null 2>&1
     card "$path" --comment "#$num: timed out after $((TIMEBOX_SECONDS / 3600))h -- needs you"
@@ -310,28 +394,58 @@ cmd_status() {
 }
 
 cmd_stop() {
+  local mode="${1:-}"
+  # Validated first: `stop.sh --nwo` used to set the stop and then die with a
+  # usage error, which is a confusing way to be safe.
+  case "$mode" in
+    ""|--now|--all) ;;
+    *) die "usage: fleet.sh stop [--now|--all]" ;;
+  esac
   mkdir -p "$STATE_DIR"
   date '+stopped at %Y-%m-%d %H:%M:%S' >"$STOP_FILE"
   echo "stop set: $STOP_FILE"
   echo "  no new worktrees, and no agent can push, open a PR or comment."
-  if [ "${1:-}" = "--now" ]; then
-    echo "  interrupting the agents..."
-    orca_json terminal list | python3 -c '
-import json,sys
+
+  case "$mode" in
+    --now|--all)
+      # --now reaches the agents the fleet started. --all reaches every agent
+      # Orca knows about, including sessions a person opened by hand -- which is
+      # a bigger hammer than a fleet stop, so it has to be asked for by name.
+      echo "  interrupting agents..."
+      local handle path
+      if [ "$mode" = "--all" ]; then
+        orca_json terminal list | python3 -c '
+import json, sys
 for t in json.load(sys.stdin)["result"]["terminals"]:
     if t.get("agentIdentity") and not t.get("orphaned"):
         print(t["handle"])
 ' | while read -r handle; do
-      orca_run_with_deadline 20 /dev/null "$ORCA_CLI" terminal send \
-        --terminal "$handle" --interrupt --json >/dev/null 2>&1 \
-        && echo "    interrupted $handle"
-    done
-  else
-    echo "  running agents finish what they are on. Use --now to interrupt them."
-  fi
-  if [ -e "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-    kill "$(cat "$PIDFILE")" 2>/dev/null && echo "  dispatcher stopped."
-  fi
+          orca_run_with_deadline 20 /dev/null "$ORCA_CLI" terminal send \
+            --terminal "$handle" --interrupt --json >/dev/null 2>&1 \
+            && echo "    interrupted $handle"
+        done
+      else
+        for f in "$OWNED_DIR"/*; do
+          [ -e "$f" ] || continue
+          path="$(cat "$f")"
+          handle="$(agent_terminal_in "$path")"
+          [ -n "$handle" ] || continue
+          orca_run_with_deadline 20 /dev/null "$ORCA_CLI" terminal send \
+            --terminal "$handle" --interrupt --json >/dev/null 2>&1 \
+            && echo "    interrupted #$(basename "$f")"
+        done
+      fi
+      # Only here. A drain has to leave the dispatcher alive: it is what reaps a
+      # worktree once its PR merges, and killing it strands them.
+      if [ -e "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null && echo "  dispatcher stopped."
+      fi ;;
+    "")
+      echo "  running agents finish what they are on, and the dispatcher stays up to"
+      echo "  reap their worktrees when their PRs land. It exits once nothing is left."
+      echo "  Use --now to interrupt the fleet's agents, --all for every agent." ;;
+  esac
+  notify "stopped" "No new work will start."
 }
 
 cmd_resume() {
@@ -381,25 +495,53 @@ cmd_run() {
   [ -n "$max_prs" ] && say "stopping after $max_prs worktree(s) opened"
 
   local opened=0 reason="the queue is empty"
+  local draining=false
   while true; do
-    check_stop && { reason="you stopped it"; break; }
-    if [ -n "$deadline" ] && [ "$(date +%s)" -ge "$deadline" ]; then
-      reason="the deadline passed"; break
+    # A stop means "launch nothing more", not "abandon what is running". The
+    # dispatcher is what reaps a worktree once its PR merges, so killing it here
+    # would strand every in-flight stack under `restart: unless-stopped`. It
+    # keeps reaping and exits when nothing it owns is left.
+    if stopped && ! $draining; then
+      draining=true
+      say "stopped -- launching nothing more, still reaping what is in flight"
+    fi
+    if [ -n "$deadline" ] && [ "$(date +%s)" -ge "$deadline" ] && ! $draining; then
+      draining=true
+      say "deadline passed -- launching nothing more, still reaping what is in flight"
+      reason="the deadline passed"
     fi
 
     reap_merged
     enforce_timebox
 
-    local live; live="$(live_count)"
-    while [ "$live" -lt "$MAX_WORKTREES" ]; do
+    local live
+    if ! live="$(live_count)"; then
+      say "could not read the worktree list; skipping this pass rather than guessing"
+      sleep "$POLL_SECONDS"
+      continue
+    fi
+
+    while ! $draining && [ "$live" -lt "$MAX_WORKTREES" ]; do
       check_stop && { reason="you stopped it"; break 2; }
       [ -n "$max_prs" ] && [ "$opened" -ge "$max_prs" ] && { reason="it opened $opened worktree(s)"; break 2; }
 
       local picked="" title="" labels=""
       if [ "${#wanted[@]}" -gt 0 ]; then
+        # An issue leaves `wanted` only when it is DONE -- merged, or its
+        # worktree gone with a PR standing. An issue that is merely in flight
+        # stays, so it is not re-launched when its PR merges and `in_flight`
+        # goes false again, and so the termination check below can see that
+        # something is still outstanding.
         local remaining=()
+        local n rc
         for n in "${wanted[@]}"; do
-          if [ -z "$picked" ] && ! in_flight "$n"; then picked="$n"; else remaining+=("$n"); fi
+          if issue_is_done "$n"; then
+            say "#$n has landed"
+            continue
+          fi
+          in_flight "$n"; rc=$?
+          if [ -z "$picked" ] && [ "$rc" = 1 ]; then picked="$n"; fi
+          remaining+=("$n")
         done
         wanted=("${remaining[@]+"${remaining[@]}"}")
         [ -n "$picked" ] || break
@@ -408,7 +550,7 @@ cmd_run() {
       else
         $auto || break
         while IFS="$(printf '\t')" read -r n _unblocks l t; do
-          in_flight "$n" && continue
+          in_flight "$n"; [ "$?" = 1 ] || continue
           # A foundation issue defines an interface later issues include, so it
           # lands alone: three worktrees each inventing their own version of a
           # shared header is the one merge conflict worth serialising to avoid.
@@ -423,13 +565,41 @@ cmd_run() {
       [ -n "$picked" ] || break
 
       if is_foundation "$labels" && [ "$live" -gt 0 ]; then break; fi
-      launch "$picked" "$title" && opened=$((opened + 1))
-      live="$(live_count)"
+      if launch "$picked" "$title"; then
+        opened=$((opened + 1))
+      else
+        # It stays in the queue. Dropping an issue whose worktree failed to open
+        # and then reporting "every issue it was given has landed" is a lie the
+        # next poll would repeat forever.
+        say "  leaving #$picked in the queue to try again"
+        break
+      fi
+      live="$(live_count)" || break
     done
 
-    if [ "${#wanted[@]}" -eq 0 ] && ! $auto; then
-      say "every requested issue is in flight; the worktrees carry it from here"
-      reason="its list is in flight"
+    # Nothing left to launch, and nothing left to look after: done. Reaching
+    # this in --auto is how it stops on an empty backlog; reaching it in list
+    # mode is how it stops once every issue it was given has landed. Until then
+    # it keeps polling, because reaping a merged worktree and enforcing the
+    # time-box are its job in both modes.
+    local owned; owned="$(ls "$OWNED_DIR" 2>/dev/null | grep -c .)"
+    local queued=0
+    if [ "${#wanted[@]}" -gt 0 ]; then
+      queued="${#wanted[@]}"
+    elif $auto && ! $draining; then
+      # Counted from the lists already in hand rather than by asking `in_flight`
+      # per issue: that made two API calls each, and a 200-issue backlog on a
+      # 60-second poll is how you meet gh's secondary rate limit.
+      queued="$(count_startable)"
+    fi
+    if [ "$queued" -eq 0 ] && [ "${owned:-0}" -eq 0 ]; then
+      if $draining; then
+        reason="${reason:-you stopped it}; everything in flight has landed"
+      elif $auto; then
+        reason="the backlog has nothing startable left"
+      else
+        reason="every issue it was given has landed"
+      fi
       break
     fi
     sleep "$POLL_SECONDS"
