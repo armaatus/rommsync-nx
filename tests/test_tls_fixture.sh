@@ -80,9 +80,19 @@ phase_cert() {
   openssl x509 -in "$cert" -noout -text | grep -q "DNS:$CERT_NAME" ||
     fail "the fixture certificate has no subjectAltName for $CERT_NAME"
 
+  # GNU `stat` first, and the result validated rather than inferred from an exit
+  # status. `-f` is BSD's "file format" and GNU's "filesystem", so on Linux
+  # `stat -f '%Lp'` prints a filesystem report to stdout *and then* exits 1 --
+  # which means the obvious `stat -f ... || stat -c ...` runs both and the
+  # command substitution captures the report with the mode glued on the end.
+  # That is what this looked like in CI: "mode ... Type: ext2/ext3 ... 600, not
+  # 600".
   local mode
-  mode="$(stat -f '%Lp' "$key" 2>/dev/null || stat -c '%a' "$key" 2>/dev/null)"
-  [ "$mode" = "600" ] || fail "the fixture private key is mode $mode, not 600"
+  mode="$(stat -c '%a' "$key" 2>/dev/null)" || true
+  case "$mode" in
+    ''|*[!0-7]*) mode="$(stat -f '%Lp' "$key" 2>/dev/null)" || true ;;
+  esac
+  [ "$mode" = "600" ] || fail "the fixture private key is mode '$mode', not 600"
 
   git -C "$REPO_ROOT" check-ignore -q "$key" ||
     fail "the fixture private key is not gitignored (CLAUDE.md hard rule 5)"
