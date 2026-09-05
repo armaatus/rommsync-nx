@@ -45,13 +45,20 @@ esac
 # The pinned RomM snapshot. contract.captures diffs a live probe against these
 # files, so editing them to match a failing run turns the one test that can
 # notice a server change into a test that agrees with whatever happened.
-case "$cmd" in
-  *server/contract/captures/*)
-    case "$cmd" in
-      *rm\ *|*mv\ *|*">"*|*tee\ *|*sed\ -i*)
-        deny "Blocked: server/contract/captures/ is the pinned RomM 5.2.0 contract.
-Re-capture it with server/contract/probe_contract.py and say in the PR body what changed and why." ;;
-    esac ;;
-esac
+#
+# Only writes. Reading a capture is the normal way to answer "what does this
+# endpoint actually return", and blocking `cat`, `grep` or a diff whose OUTPUT
+# happens to be redirected somewhere else would make that impossible -- which is
+# how a guard stops being read as a rule and starts being read as an obstacle.
+CAPTURES='server/contract/captures/'
+if grep -Eq "(^|[|;&[:space:]])(rm|mv|cp|tee)([[:space:]]+-[^[:space:]]+)*[[:space:]]+[^|;&]*${CAPTURES}" <<<"$cmd" \
+   || grep -Eq "sed[[:space:]]+(-[^[:space:]]*[[:space:]]+)*-i[^|;&]*${CAPTURES}" <<<"$cmd" \
+   || grep -Eq ">>?[[:space:]]*[^|;&]*${CAPTURES}" <<<"$cmd"; then
+  deny "Blocked: server/contract/captures/ is the pinned RomM 5.2.0 contract, and
+contract.captures diffs a live probe against it. Rewriting a capture to match a failing
+run silences the only test that notices RomM changing.
+Re-capture with server/contract/probe_contract.py and say in the PR body what changed and why.
+Reading a capture is fine -- this only blocks writing one."
+fi
 
 exit 0

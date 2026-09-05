@@ -11,15 +11,19 @@
       "Write(plans/**)",
       "Edit(evals/**)",
       "Write(evals/**)",
-      "Bash(ctest:*)",
       "Bash(cmake:*)",
+      "Bash(ctest:*)",
       "Bash(gh issue view:*)",
       "Bash(gh issue edit:*)",
       "Bash(gh pr view:*)",
-      "Bash(gh pr create:*)",
       "Bash(gh pr diff:*)",
-      "Bash(./scripts/orca/*)",
-      "Bash(./evals/*)"
+      "Bash(gh pr create:*)",
+      "Bash(./evals/lint.sh:*)",
+      "Bash(./scripts/orca/compose.sh:*)",
+      "Bash(./scripts/orca/env.sh:*)",
+      "Bash(./scripts/orca/romm-logs.sh:*)",
+      "Bash(./scripts/orca/romm-browser.sh:*)",
+      "Bash(./server/testing/seed.sh:*)"
     ]
   },
   "hooks": {

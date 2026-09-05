@@ -146,6 +146,10 @@ assert_hook "$GB" 0 '{"tool_input":{"command":"ctest --test-dir build --output-o
   "running the tests is not blocked"
 assert_hook "$GB" 0 '{"tool_input":{"command":"gh pr create --title x --body y"}}' \
   "opening a PR is not blocked"
+assert_hook "$GB" 2 '{"tool_input":{"command":"probe.py > server/contract/captures/login.json"}}' \
+  "the pinned contract cannot be rewritten from the shell"
+assert_hook "$GB" 0 '{"tool_input":{"command":"diff server/contract/captures/login.json /tmp/new.json > /tmp/d"}}' \
+  "reading a capture is still allowed"
 assert_hook "$GE" 2 '{"tool_input":{"file_path":"/w/rommsync-nx/.env"}}' \
   "secrets are not editable"
 assert_hook "$GE" 2 '{"tool_input":{"file_path":"/w/rommsync-nx/server/contract/captures/login.json"}}' \
