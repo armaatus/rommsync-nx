@@ -80,7 +80,8 @@ Until that marker exists for the exact commit you are pushing, the guard hook
 refuses `git push` and `gh pr create` here. A PR from the fleet arrives already
 reviewed or it does not arrive.
 
-**4. Push and open the PR.** The body must carry `## Plan`, BOTH sets of findings
+**4. Push, open the PR, and queue the merge immediately** (see step 6 for why
+the order matters). The body must carry `## Plan`, BOTH sets of findings
 and what you did about them, any issue you edited and why, and `Closes #__ISSUE__`.
 The `merge-gate` check reads that body: it looks for the words `/code-review` and
 `mattpocock-skills:code-review`, and without them the PR cannot merge. Then tell
@@ -118,9 +119,18 @@ unresolved, stop: comment on the PR saying exactly what is unresolved and why yo
 disagree, set the board comment to "#__ISSUE__: needs you -- 3 review rounds", and
 stop. Another lap is not what a disagreement needs.
 
-**6. Ask GitHub to merge it, and stop.**
+**6. Ask GitHub to merge it -- and do it EARLY, right after step 4.**
 
     gh pr merge <n> --auto --squash
+
+Queue this as soon as the PR exists, not at the end. GitHub refuses to queue
+auto-merge on a pull request that is ALREADY mergeable -- `Pull request is in
+clean status` -- and you are forbidden from merging directly, so a PR that goes
+green before anything queued it has nobody left to merge it. It sits clean and
+untouched forever. #90 did exactly that.
+
+Queued early it simply waits, and fires the moment the last required check
+passes. Queue it, then carry on with step 5.
 
 That does NOT merge. It asks GitHub to merge once the required checks pass, and
 `merge-gate` is one of them -- so the rules decide, not you. You may not merge
