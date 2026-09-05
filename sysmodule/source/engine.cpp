@@ -1,6 +1,7 @@
 #include "engine.hpp"
 
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "rommsync/atomic_file.hpp"
@@ -45,33 +46,31 @@ void SdEngine::Load(const std::string& config_dir) {
   // (`download.hpp`, CLAUDE.md).
   download::LoadedQueue queued = download::LoadQueue(PathTo(download::kQueueFileName));
   queue_.Reset(std::move(queued.entries));
+  queue_trusted_ = queued.trusted;
   // Carried on the config's diagnostics rather than dropped. It is not a
   // complaint about `config.ini`, and the section says so -- but a queue that
   // vanished with nothing anywhere saying why is the failure a diagnostic
   // exists to prevent, and the settings screen (#26) is the one place on this
   // console a user can read one. A field of its own is #22's to add.
+  //
+  // **In front, not appended.** `ipc::TrimDiagnostics` keeps the first few and
+  // summarises the rest, so a `config.ini` with a handful of complaints would
+  // otherwise push the one saying the whole download queue was discarded into
+  // the "N more" line -- and that is the one a user cannot infer from anything
+  // else on the screen.
+  std::vector<config::Diagnostic> ordered;
+  ordered.reserve(queued.diagnostics.size() + diagnostics_.size());
   for (std::string& complaint : queued.diagnostics) {
-    diagnostics_.push_back({config::Severity::kWarning, 0, "downloads", "", std::move(complaint)});
+    ordered.push_back({config::Severity::kWarning, 0, "downloads", "", std::move(complaint)});
   }
+  for (config::Diagnostic& diagnostic : diagnostics_) {
+    ordered.push_back(std::move(diagnostic));
+  }
+  diagnostics_ = std::move(ordered);
 }
 
-ipc::Error SdEngine::Commit(const std::function<ipc::Error()>& change) {
-  // The whole queue, so a failed write can be undone exactly. Restoring by
-  // reversing the change would not be exact: `Enqueue` erases a terminal entry
-  // to re-queue the rom, and a `Remove` that put the new row back would lose
-  // the `failed` row a user is entitled to still see.
-  std::vector<download::QueueEntry> before = queue_.Snapshot();
-  const ipc::Error refused = change();
-  if (refused != ipc::Error::kOk) {
-    return refused;
-  }
-  if (download::SaveQueue(PathTo(download::kQueueFileName), queue_).ok()) {
-    return ipc::Error::kOk;
-  }
-  // `kWriteFailed` promises the in-memory state is unchanged too, so a caller
-  // that retries is not fighting a half-applied edit (`ipc.hpp`).
-  queue_.Reset(std::move(before));
-  return ipc::Error::kWriteFailed;
+bool SdEngine::WriteQueue() {
+  return download::SaveQueue(PathTo(download::kQueueFileName), queue_).ok();
 }
 
 const config::Config& SdEngine::config() const { return config_; }

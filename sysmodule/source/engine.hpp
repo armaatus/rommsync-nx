@@ -18,8 +18,8 @@
 // before the M8-1 gate, never on hardware (sysmodule/AGENTS.md).
 #pragma once
 
-#include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "rommsync/auth.hpp"
@@ -90,12 +90,56 @@ class SdEngine : public ipc::Engine {
   /// Apply `change` to the queue and write the file, or leave both exactly as
   /// they were. Shared by `Enqueue` and `Dequeue` so the rollback cannot be got
   /// right in one and wrong in the other.
-  ipc::Error Commit(const std::function<ipc::Error()>& change);
+  ///
+  /// A template rather than a `std::function`, which is not style: both call
+  /// sites pass a lambda capturing more than libstdc++'s small-buffer holds, so
+  /// every enqueue would allocate on an inner heap of 512 KiB (AGENTS.md's heap
+  /// discipline). It also keeps `<functional>` out of a header the console
+  /// compiles.
+  ///
+  /// The snapshot, the change and the restore are not one atomic step. That is
+  /// correct today -- nothing else touches `queue_`, because the download worker
+  /// is not started here yet -- and it is the thing to fix first when it is: a
+  /// failed write would otherwise `Reset` over a state transition the worker
+  /// persisted in between, turning a finished download back into a queued one.
+  /// The compare-and-set belongs inside `download::Queue` at that point.
+  template <typename Change>
+  ipc::Error Commit(Change&& change) {
+    if (!queue_trusted_) {
+      // The card had a bad moment and `queue.json` would not open, so the queue
+      // in memory is empty and the one on the card is probably not. Writing now
+      // would turn "empty for this boot" into the user's pending downloads gone
+      // for good (`download::LoadedQueue::trusted`). Refusing costs them one
+      // command and a reboot; the alternative costs them the queue.
+      return ipc::Error::kWriteFailed;
+    }
+    // The whole queue, so a failed write can be undone exactly -- see
+    // `download::Queue::Reset` for why reversing the change would not be.
+    std::vector<download::QueueEntry> before = queue_.Snapshot();
+    const ipc::Error refused = std::forward<Change>(change)();
+    if (refused != ipc::Error::kOk) {
+      return refused;
+    }
+    if (WriteQueue()) {
+      return ipc::Error::kOk;
+    }
+    // `kWriteFailed` promises the in-memory state is unchanged too, so a caller
+    // that retries is not fighting a half-applied edit (`ipc.hpp`).
+    queue_.Reset(std::move(before));
+    return ipc::Error::kWriteFailed;
+  }
+
+  /// Write `queue.json`. False when it did not reach the card.
+  bool WriteQueue();
 
   /// One of this client's files, under the directory `Load` was given.
   std::string PathTo(const char* file_name) const;
 
   std::string config_dir_ = kConfigDir;
+
+  /// `queue.json` was readable, so writing it back loses nothing. False only
+  /// after a read that failed on a file that is there -- see `Commit`.
+  bool queue_trusted_ = true;
 
   config::Config config_ = config::Defaults();
 

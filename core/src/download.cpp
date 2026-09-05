@@ -250,6 +250,17 @@ std::int64_t PartialBytes(const std::string& destination) {
   return FileSizeBytes(http::PartialPathFor(destination));
 }
 
+/// Remove the staging file for `destination`, if there is one.
+///
+/// Only ever called when the entry is finished with for good: a retry and a
+/// cancel both *want* those bytes, and discarding them would turn a resumable
+/// transfer into a restart. A `kFailed` entry wants nothing -- and a 120 MiB
+/// orphan beside a rom that never arrived is bytes the card does not get back
+/// until a human finds it, on a console with no file manager.
+void DiscardPartial(const std::string& destination) {
+  std::remove(http::PartialPathFor(destination).c_str());
+}
+
 /// Whole Unix seconds now. Not injected: `queued_at` is stamped once, is never
 /// compared against anything, and exists so a queue screen can say how long a
 /// rom has been waiting.
@@ -325,7 +336,15 @@ ipc::Error Queue::Enqueue(std::int64_t rom_id, std::int32_t* position) {
     // were already waiting rather than ahead of them.
     entries_.erase(existing);
   } else if (entries_.size() >= kMaxQueueEntries) {
-    return ipc::Error::kQueueFull;
+    // The file is full. A finished row is history the queue screen shows and
+    // nothing prunes, so the oldest of those makes way; only work still to do
+    // fills the queue in the sense `kQueueFull` names. See the header.
+    const auto oldest = std::find_if(entries_.begin(), entries_.end(),
+                                     [](const QueueEntry& row) { return Terminal(row.state); });
+    if (oldest == entries_.end()) {
+      return ipc::Error::kQueueFull;
+    }
+    entries_.erase(oldest);
   }
 
   QueueEntry entry;
@@ -638,8 +657,12 @@ LoadedQueue LoadQueue(const std::string& path) {
       Add(&loaded.diagnostics, Describe(path, "does not exist yet; the queue is empty"));
       break;
     case io::BoundedRead::kUnreadable:
+      // The one outcome that is not a discard: the queue on the card is
+      // probably intact and this boot simply cannot see it. See `trusted`.
+      loaded.trusted = false;
       Add(&loaded.diagnostics,
-          Describe(path, "could not be read; the queue is empty for this boot"));
+          Describe(path, "could not be read; the queue is empty for this boot, and must not be "
+                         "written over until it can be read again"));
       break;
     case io::BoundedRead::kTooLarge:
       Add(&loaded.diagnostics,
@@ -1027,6 +1050,15 @@ class Drainer {
   /// file and memory never disagree by more than one `rename` -- which is what
   /// makes a power cut resumable rather than a restart.
   Written Persist(const QueueEntry& entry, Step* step) {
+    // Taken before the change, so a write that fails can be undone exactly --
+    // `SdEngine::Commit`'s scheme, and here for two reasons beyond tidiness.
+    // The invariant this module claims is that the file and memory never
+    // disagree by more than one `rename`: memory left a transition ahead would
+    // have an entry `kDone` here and `kActive` on the card, so the rom is not
+    // retried this boot and *is* re-downloaded after a reboot. And a row the
+    // writer refuses (`kUnusableEntry`) would otherwise stay in memory and make
+    // every later write fail the same way, including one for an unrelated rom.
+    std::vector<QueueEntry> before = queue_.Snapshot();
     if (!queue_.Update(entry)) {
       return Written::kGone;
     }
@@ -1034,6 +1066,7 @@ class Drainer {
     if (stored.ok()) {
       return Written::kOk;
     }
+    queue_.Reset(std::move(before));
     step->outcome = DrainOutcome::kStoreFailed;
     step->store = stored;
     step->message = stored.message;
@@ -1075,13 +1108,24 @@ class Drainer {
     if (!destination_.empty()) {
       // What a resume will start from. Counting the staging file rather than
       // this request's bytes is the difference between a bar that carries on
-      // and one that restarts at zero (#22).
-      entry.bytes_done = PartialBytes(destination_);
+      // and one that restarts at zero (#22) -- and only when there is going to
+      // be a resume, for the reason `Transfer` gives.
+      entry.bytes_done = config_.downloads.resume ? PartialBytes(destination_) : 0;
     }
-    if (Persist(entry, &step) != Written::kFailed) {
-      step.outcome = outcome;
-      step.message = why.log;
+    const Written written = Persist(entry, &step);
+    if (written == Written::kFailed) {
+      return step;  // `kStoreFailed`, which ends the drain
     }
+    if (written == Written::kGone && outcome == DrainOutcome::kRetryable) {
+      // The user dequeued it while the transfer was in flight. There is no entry
+      // to set aside and no row to explain a deferral with, so this turn is
+      // simply over -- and the drain carries on to the next rom rather than
+      // reporting a failure against an entry that does not exist. The outcomes
+      // that are true of *every* entry still end it, below.
+      return step;
+    }
+    step.outcome = outcome;
+    step.message = why.log;
     return step;
   }
 
@@ -1116,10 +1160,26 @@ class Drainer {
                     "the server answered with a different rom than the one that was asked for");
     }
 
-    entry.platform_fs_slug = detail.platform_fs_slug;
-    entry.fs_name = detail.fs_name;
-    entry.size_bytes = detail.size_bytes;
-    entry.sha1_hash = detail.sha1_hash;
+    // The strings on a `RomDetail` came off someone else's filesystem, and they
+    // are about to become fields in a file this client has to be able to write
+    // again. `Usable` is the bar `SaveQueue` holds them to, so it is asked here
+    // -- on a copy -- rather than after: an entry recorded and *then* found
+    // unwritable would make every later write of the queue fail the same way,
+    // for every other rom, until the console rebooted.
+    QueueEntry described = entry;
+    described.platform_fs_slug = detail.platform_fs_slug;
+    described.fs_name = detail.fs_name;
+    described.size_bytes = detail.size_bytes;
+    described.sha1_hash = detail.sha1_hash;
+    std::string unwritable;
+    if (!Usable(described, &unwritable)) {
+      // `entry`, not `described`: the whole point is that the long fields do
+      // not reach the file. The reason names the field and never its value, the
+      // way `config::RomDestination::reason` does.
+      return Settle(std::move(entry), QueueState::kSkipped,
+                    "this rom cannot be recorded in the queue -- " + unwritable);
+    }
+    entry = std::move(described);
 
     // 2. The two answers that are not a download. Both are refusals with a
     // sentence rather than a transfer that fails later: a disc set served over
@@ -1217,7 +1277,11 @@ class Drainer {
 
     for (;;) {
       entry.state = QueueState::kActive;
-      entry.bytes_done = PartialBytes(destination_);
+      // Only when the bytes are going to be built on. With `resume` off the
+      // backend opens the staging file `"wb"` and truncates it, so counting a
+      // leftover `.part` would start the overlay's bar at a stale figure and
+      // then have it jump backwards (#22).
+      entry.bytes_done = target.resume ? PartialBytes(destination_) : 0;
       entry.message.clear();
       Step step;
       if (Persist(entry, &step) != Written::kOk) {
@@ -1240,6 +1304,13 @@ class Drainer {
         CountAttempt(&entry);
       }
       if (verdict == Verdict::kFatal) {
+        // Nothing will ever build on these bytes: this rom does not download as
+        // asked, however often it is tried. A retry and a cancel both want the
+        // staging file kept, which is why only this branch discards it -- and a
+        // 120 MiB orphan beside a rom that never arrived is space the card does
+        // not get back, on a console with no file manager.
+        DiscardPartial(destination_);
+        entry.bytes_done = 0;
         return Settle(std::move(entry), QueueState::kFailed, why.entry);
       }
       if (Canceled()) {

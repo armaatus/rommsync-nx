@@ -208,6 +208,15 @@ class Queue {
   /// that came back `kDuplicate` because of a `kFailed` row from last week would
   /// leave them with no way to ask. It is still one entry: the row is reset --
   /// state, attempts, bytes and message -- and moved to the tail.
+  ///
+  /// **`kQueueFull` counts what is still to do, not what has ever been done.**
+  /// Finished rows stay in the file for the queue screen, and nothing prunes
+  /// them, so counting them against the cap would mean a console that had
+  /// downloaded `kMaxQueueEntries` roms over its life could never queue another
+  /// -- with an empty queue on the screen and no way to tell why. When the file
+  /// is full, the **oldest terminal row is dropped** to make room; only a queue
+  /// full of work still to do is `kQueueFull`, which is the state the name
+  /// describes.
   ipc::Error Enqueue(std::int64_t rom_id, std::int32_t* position);
 
   /// Drop the entry for `rom_id`, whatever state it is in. `kNotQueued` when
@@ -229,8 +238,17 @@ class Queue {
   /// The entry for `rom_id`, or a default-constructed one with `rom_id == 0`.
   QueueEntry Find(std::int64_t rom_id) const;
 
-  /// Replace the whole queue -- what a load does, and nothing else should.
-  /// Entries past `kMaxQueueEntries` are dropped from the tail.
+  /// Replace the whole queue. Entries past `kMaxQueueEntries` are dropped from
+  /// the tail.
+  ///
+  /// Two callers, and no third: a **load**, and the **rollback** of a change
+  /// whose write failed (`sysmodule::SdEngine::Commit`). The second is here
+  /// rather than done by reversing the change because reversing is not exact --
+  /// `Enqueue` erases a terminal entry to re-queue a rom, and a `Remove` that
+  /// put the new row back would lose the `failed` row a user is entitled to
+  /// still see. Anything else that replaces the whole queue is a bug: the
+  /// queue is the user's list, and the only things that shorten it are `Remove`
+  /// and `Clear`.
   void Reset(std::vector<QueueEntry> entries);
 
   /// Entries the worker still has to do: everything not `Terminal`. This is the
@@ -306,6 +324,18 @@ ipc::Error EnqueueRom(Queue& queue, const roms::RomIndex& library, std::int64_t 
 /// replaces the whole queue.
 struct LoadedQueue {
   std::vector<QueueEntry> entries;
+
+  /// `entries` is what the file holds, so writing it back loses nothing.
+  ///
+  /// False in exactly one case: **the file is there and its bytes would not come
+  /// out of it.** Every other failure is a deliberate discard of contents that
+  /// can never become useful again -- a file that is not JSON, one from another
+  /// release, one past `kMaxQueueBytes` -- and rewriting those is the recovery.
+  /// A card having a bad moment is not: the queue on it is probably intact, and
+  /// a caller that wrote an empty one over it would turn "empty for this boot"
+  /// into a user's pending downloads gone for good. Such a caller must refuse to
+  /// write instead (`sysmodule::SdEngine::Commit`).
+  bool trusted = true;
 
   /// In the order they were found, bounded by `kMaxDiagnostics`. A first boot
   /// produces exactly one, saying there is no file yet.

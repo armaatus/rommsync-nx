@@ -24,6 +24,7 @@
 //   resume     -- a drop 4 MiB in leaves a resumable entry; a second drain finishes it
 //   disabled   -- `[downloads] enabled = false` drains nothing and loses nothing
 //   multifile  -- a disc set is refused with a reason and no archive reaches the card
+//   missing    -- a rom the server's library no longer holds fails with a sentence
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -210,6 +211,20 @@ void QueueApi(checks::Checks& c) {
   c.ExpectEq(full.size(), download::kMaxQueueEntries, "the queue takes its full depth");
   c.Expect(full.Enqueue(9'999, &position) == ipc::Error::kQueueFull, "and refuses one more");
   c.ExpectEq(full.size(), download::kMaxQueueEntries, "without dropping anything to make room");
+
+  // ...but only while every row is work still to do. Finished rows stay for the
+  // queue screen and nothing prunes them, so counting them against the cap
+  // would mean a console that had downloaded `kMaxQueueEntries` roms over its
+  // life could never queue another -- with an empty queue on the screen and
+  // nothing saying why.
+  QueueEntry finished = full.Find(1);
+  finished.state = QueueState::kDone;
+  full.Update(finished);
+  c.Expect(full.Enqueue(9'999, &position) == ipc::Error::kOk,
+           "a queue whose oldest row is finished has room for one more");
+  c.ExpectEq(full.size(), download::kMaxQueueEntries, "the file stays at its cap");
+  c.ExpectEq(full.Find(1).rom_id, std::int64_t{0}, "and it is the finished row that made way");
+  c.ExpectEq(full.Find(2).rom_id, std::int64_t{2}, "not one that is still waiting");
   full.Clear();
   c.ExpectEq(full.size(), std::size_t{0}, "Clear empties it");
 
@@ -974,6 +989,98 @@ void Multifile(checks::Checks& c, http::HttpClient& client, const std::string& b
   c.ExpectEq(rig.queue.pending(), std::size_t{0}, "the worker has nothing left to do");
 }
 
+/// `missing_from_fs: true` -- RomM knows the rom and its file is gone from the
+/// server's own filesystem.
+///
+/// A download would 404 a third of the way in, so the entry fails with a
+/// sentence instead. The fixture library is healthy and nothing here may make it
+/// otherwise, so the flag is forced the only way that does not touch it: the
+/// proxy answers the *detail* call with a body of this test's own, and the real
+/// worker reads it with the real parser. `count` is 1 and the path is the detail
+/// endpoint, so the content request underneath is untouched -- and never made.
+void Missing(checks::Checks& c, http::HttpClient& client, const std::string& base,
+             const harness::Fixture& fixture) {
+  Rig rig(c, "download-missing", base, fixture);
+  harness::Rom rom;
+  const std::int64_t rom_id = Queued(c, client, base, fixture, &rig.queue, "240pee.nes", &rom);
+  if (rom_id == 0) {
+    return;
+  }
+
+  const std::string gone =
+      "{\"id\":" + std::to_string(rom_id) +
+      ",\"fs_name\":\"240pee.nes\",\"platform_fs_slug\":\"nes\",\"fs_size_bytes\":65552,"
+      "\"sha1_hash\":null,\"has_multiple_files\":false,\"missing_from_fs\":true}";
+  {
+    harness::Fault fault(c, client, base,
+                         "{\"mode\":\"status\",\"status\":200,\"path\":\"/api/roms/" +
+                             std::to_string(rom_id) + "\",\"body\":" + json::Quote(gone) + "}");
+    const download::DrainResult result = rig.Drain(client);
+    c.Expect(result.outcome == download::DrainOutcome::kCompleted,
+             std::string("the drain finishes rather than retrying forever -- got ") +
+                 download::ToString(result.outcome) + " (" + result.message + ")");
+    c.ExpectEq(result.failed, 1, "the entry is written off as failed");
+    c.ExpectEq(result.downloaded, 0, "and nothing came down");
+  }
+
+  const QueueEntry entry = rig.Persisted(rom_id);
+  c.Expect(entry.state == QueueState::kFailed,
+           "a rom the server cannot serve is failed, not skipped -- a skip is a decision this "
+           "client made, and this is the server's");
+  c.Expect(!entry.message.empty(), "with a sentence saying why");
+  c.Expect(entry.message.find(rom.fs_name) == std::string::npos,
+           "that does not quote the rom's name back into the queue file");
+  c.Expect(!rig.sandbox.Exists("/tico/roms/nes/240pee.nes"),
+           "and nothing was written where a rom would have gone");
+  c.Expect(!rig.sandbox.Exists("/tico/roms/nes/240pee.nes.part"), "not even a partial one");
+  c.ExpectEq(rig.queue.pending(), std::size_t{0}, "the worker has nothing left to do");
+
+  // A rom whose `fs_name` is longer than a path may be. The fields on a
+  // `RomDetail` come off someone else's filesystem and become fields in a file
+  // this client has to be able to write *again*, so an entry recorded and only
+  // then found unwritable would make every later write of the queue fail the
+  // same way -- for every other rom, until the console rebooted. That is the
+  // failure this phase exists for, and the last two assertions are the ones
+  // that see it.
+  harness::Rom second;
+  const std::int64_t long_id = Queued(c, client, base, fixture, &rig.queue, "nova.nes", &second);
+  if (long_id == 0) {
+    return;
+  }
+  const std::string enormous =
+      "{\"id\":" + std::to_string(long_id) + ",\"fs_name\":\"" + std::string(900, 'n') +
+      "\",\"platform_fs_slug\":\"nes\",\"fs_size_bytes\":1,\"sha1_hash\":null,"
+      "\"has_multiple_files\":false,\"missing_from_fs\":false}";
+  {
+    harness::Fault fault(c, client, base,
+                         "{\"mode\":\"status\",\"status\":200,\"path\":\"/api/roms/" +
+                             std::to_string(long_id) + "\",\"body\":" + json::Quote(enormous) +
+                             "}");
+    const download::DrainResult result = rig.Drain(client);
+    c.Expect(result.outcome == download::DrainOutcome::kCompleted,
+             std::string("a rom the queue cannot record does not stop the drain -- got ") +
+                 download::ToString(result.outcome) + " (" + result.message + ")");
+    c.ExpectEq(result.skipped, 1, "it is skipped");
+  }
+  const QueueEntry refused = rig.Persisted(long_id);
+  c.Expect(refused.state == QueueState::kSkipped, "with a skip on the card");
+  c.Expect(refused.fs_name.empty(),
+           "and the name that could not be recorded was not recorded -- which is the whole point");
+  c.Expect(!refused.message.empty(), "though it says why");
+
+  // The queue is still writable, which it would not be if the over-long name
+  // had reached it: `SaveQueue` refuses a file the reader would discard, so one
+  // bad row makes every later write fail.
+  harness::Rom healthy;
+  const std::int64_t healthy_id =
+      Queued(c, client, base, fixture, &rig.queue, "gb240p.gb", &healthy);
+  const download::DrainResult after = rig.Drain(client);
+  c.Expect(after.outcome == download::DrainOutcome::kCompleted,
+           std::string("and the next rom still drains -- got ") +
+               download::ToString(after.outcome) + " (" + after.message + ")");
+  c.Expect(rig.Persisted(healthy_id).state == QueueState::kDone, "all the way to done");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1029,6 +1136,8 @@ int main(int argc, char** argv) {
     Disabled(checks, *client, base, fixture);
   } else if (scenario == "multifile") {
     Multifile(checks, *client, base, fixture);
+  } else if (scenario == "missing") {
+    Missing(checks, *client, base, fixture);
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;

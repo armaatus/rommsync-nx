@@ -856,6 +856,7 @@ set(DOWNLOAD_RIG_SCENARIOS
   retries    # a 500 leaves the entry queued with attempts up and backoff spent
   disabled   # `[downloads] enabled = false` drains nothing and loses nothing
   multifile  # a disc set is refused with a reason and no archive reaches the card
+  missing    # a rom the server's library no longer holds fails with a sentence
 )
 foreach(scenario IN LISTS DOWNLOAD_RIG_SCENARIOS)
   add_test(NAME download.${scenario} COMMAND test_download ${scenario})
