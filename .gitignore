@@ -56,3 +56,7 @@ __pycache__/
 !.claude/hooks/
 !.claude/skills/
 !.claude/settings.json
+
+# The base branch's copy of the lint, written into the repo by agent-config.yml
+# so it resolves the repo root the same way the real one does. CI-only.
+evals/.base-lint.sh

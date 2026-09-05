@@ -84,14 +84,19 @@ jobs:
             echo "::notice::$base has no evals/lint.sh yet; nothing to compare against."
             exit 0
           fi
-          git show "$base:evals/lint.sh" >/tmp/base-lint.sh
-          chmod +x /tmp/base-lint.sh
-          if cmp -s /tmp/base-lint.sh evals/lint.sh; then
+          # Into the repo, not /tmp: lint.sh derives its repo root from its own
+          # location, so a copy in /tmp resolves the root to `/` and every check
+          # reports the repo missing. That is what it did on PR #78 -- five
+          # confident FAILs about files that were plainly there.
+          git show "$base:evals/lint.sh" >evals/.base-lint.sh
+          chmod +x evals/.base-lint.sh
+          if cmp -s evals/.base-lint.sh evals/lint.sh; then
             echo "evals/lint.sh is unchanged; the run above already covered this."
+            rm -f evals/.base-lint.sh
             exit 0
           fi
           echo "evals/lint.sh changed in this PR; re-running the base version."
-          if ! /tmp/base-lint.sh; then
+          if ! ./evals/.base-lint.sh; then
             echo "::error title=A guard stopped holding::This PR changes evals/lint.sh AND fails the assertions on ${{ github.event.pull_request.base.ref }}. If that is deliberate, say which assertion changed and why in the PR body, and have a human confirm it."
             exit 1
           fi
