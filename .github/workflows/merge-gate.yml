@@ -31,6 +31,8 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  # To re-run an earlier failed gate on this same commit; see "Decide" below.
+  actions: write
 
 concurrency:
   group: merge-gate-${{ github.event.pull_request.number }}
@@ -81,6 +83,7 @@ jobs:
             }' >pr.json
 
       - name: Decide
+        id: decide
         run: |
           set -euo pipefail
           # The base branch may not have the gate yet -- on the pull request that
@@ -93,3 +96,36 @@ jobs:
           fi
           python3 .github/scripts/merge_gate.py \
             "${{ github.event.pull_request.head.sha }}" pr.json files.txt
+
+      # A gate that has failed once on a commit stays failed.
+      #
+      # This check correctly fails the first time it runs on any PR -- at that
+      # moment no independent review exists yet. When the review lands the gate
+      # re-runs and passes, but GitHub creates a NEW check run rather than
+      # superseding the old one, and branch protection goes on counting the
+      # failure. The PR then sits BLOCKED while its own latest gate says every
+      # gate holds. That is issue #84, and it wedged #81.
+      #
+      # Re-running the earlier run updates that check run in place, which is the
+      # manual workaround that unwedged #81 in seconds. So the gate does it
+      # itself, but only from a run that PASSED -- a failing gate must never
+      # clear its own earlier failure.
+      - name: Clear the stale failures this gate left behind
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NWO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SELF: ${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          stale="$(gh run list --repo "$NWO" --workflow "merge gate" --limit 30 \
+                     --json databaseId,conclusion,headSha \
+                     --jq "[.[] | select(.headSha==\"$HEAD_SHA\" and .conclusion==\"failure\" and (.databaseId|tostring)!=\"$SELF\")] | .[].databaseId" \
+                   2>/dev/null || true)"
+          [ -n "$stale" ] || { echo "no stale gate failures on $HEAD_SHA"; exit 0; }
+          for run in $stale; do
+            echo "re-running stale merge-gate run $run so its check clears"
+            gh run rerun "$run" --repo "$NWO" >/dev/null 2>&1 \
+              || echo "  could not re-run $run; clear it by hand with: gh run rerun $run"
+          done
