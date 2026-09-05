@@ -188,6 +188,19 @@ struct Encoded {
 /// Values are never quoted back, matching `json::Error`.
 json::Error Validate(const ClientSaveState& save);
 
+/// True for a string that names one file and cannot redirect a join.
+///
+/// Both directions need it and they must not drift: the client sends a
+/// `file_name` and an `emulator` that RomM pastes into a storage path
+/// (`users/<user>/saves/<platform>/<rom>/<emulator>/<file_name>`), and the
+/// server sends a `file_name` back that this client must never join into an SD
+/// path. `.` and `..` redirect a join with no separator in them, which a
+/// directory scan hands out for free.
+///
+/// Backslash is deliberately allowed: RomM joins POSIX paths, and a save that
+/// came off a FAT volume is entitled to a backslash in its name.
+bool IsSingleFileName(std::string_view value);
+
 /// The request body for `POST /api/sync/negotiate`, or a named error.
 ///
 /// The `device_id` and every save are validated first, and the first failure
@@ -377,6 +390,14 @@ enum class NegotiateError {
   kUnusablePayload,  ///< a save could not be sent faithfully; nothing was sent
   kNotRegistered,    ///< the token names no device, so there is nothing to negotiate for
   kUnauthorized,     ///< 401 -- revoked. `expires_at` is null, so there is nothing to refresh
+  /// 403 -- the token is real and was not granted what this call needs.
+  ///
+  /// Not a revocation, and kept apart from one for that reason: RomM approves
+  /// what the *user* ticked, which need not be what was requested, so a 403 here
+  /// is a scope missing from an otherwise working pairing
+  /// (docs/AUTH.md#scopes-to-request). Telling that user their token was revoked
+  /// sends them looking for something that did not happen.
+  kForbidden,
   kNoSuchDevice,     ///< 404 -- the device was deleted in RomM's web UI
   kSyncDisabled,     ///< 400 "Sync is disabled for this device" -- the user's own switch
   kRejected,         ///< another 4xx; a 422 names the field the body got wrong
@@ -396,6 +417,13 @@ bool ShouldRetry(NegotiateError error);
 /// Whether the remedy is to pair this console again. Deliberately disjoint from
 /// `ShouldRetry`: sending a user to a pairing screen over a dropped connection
 /// throws away a working pairing.
+///
+/// `kForbidden` is in it, and the sentence it earns is not the same one:
+/// re-pairing is where a user approves the scope that is missing, so the remedy
+/// really is to pair again -- but "pair again and approve the scopes sync needs"
+/// is a different instruction from "your pairing is gone", and only the second
+/// is true of a 401. The client is supposed to read `scopes` back off the token
+/// and never reach here (docs/AUTH.md); this is the branch for when it does.
 ///
 /// It classifies one answer; it is not an instruction to act on the first one.
 /// A single 401 can come from something in *front* of RomM having a bad minute,

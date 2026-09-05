@@ -86,19 +86,20 @@ const ReasonSpelling* SpellingOf(Reason reason) {
   return nullptr;
 }
 
-/// True for a string RomM can only have meant as one file name.
-///
-/// The server's `file_name` is echoed straight out of its database and this
-/// client must never join it into an SD path (sync.hpp). It is not refused --
-/// that would fail a whole tick over one save's name -- but a name that *could*
-/// escape a join is worth a line in the log rather than a surprise in M2-5.
-///
-/// Deliberately the same rule the request side applies (`sync.cpp`), backslash
-/// included: RomM joins POSIX paths and a save that came off a FAT volume is
-/// entitled to a backslash in its name. A stricter rule here would warn about
-/// names this client itself uploaded.
-bool PathComponent(std::string_view value) {
-  return value.find('/') == std::string_view::npos && value != "." && value != "..";
+/// The shape a save's `content_hash` has to have to compare equal to anything:
+/// 32 lowercase hex digits. RomM stores `hexdigest()`, and compares the string.
+bool LowercaseMd5(std::string_view value) {
+  if (value.size() != kContentHashDigits) {
+    return false;
+  }
+  for (const char character : value) {
+    const bool digit = character >= '0' && character <= '9';
+    const bool letter = character >= 'a' && character <= 'f';
+    if (!digit && !letter) {
+      return false;
+    }
+  }
+  return true;
 }
 
 json::Error Fail(std::string_view field, std::string message) {
@@ -161,10 +162,23 @@ json::Error ReadOperation(const json::Value& value, std::size_t index, SyncOpera
     warnings->push_back(where + ": unknown reason \"" + out->reason_text +
                         "\"; the action was still obeyed");
   }
-  if (!PathComponent(out->file_name)) {
+  if (!IsSingleFileName(out->file_name)) {
     warnings->push_back(where + ": the server's file_name \"" + out->file_name +
                         "\" is not a single path component; it must not be joined into a "
                         "local path");
+  }
+  // The same shape `Validate` holds an outgoing `content_hash` to, applied to the
+  // one coming back -- reported rather than refused, because this digest is
+  // whatever some *other* client uploaded and RomM stores what it is sent. A
+  // SHA1 or an uppercase digest here compares equal to nothing, so the save it
+  // belongs to negotiates as changed on every tick, forever, with no other
+  // symptom. That is the failure the outgoing check exists to prevent, arriving
+  // from the other direction (docs/API_CONTRACT.md).
+  if (out->server_content_hash.has_value() && !LowercaseMd5(*out->server_content_hash)) {
+    warnings->push_back(where + ": the server's content_hash is " +
+                        std::to_string(out->server_content_hash->size()) +
+                        " characters and not lowercase hex; saves are compared on MD5, so this "
+                        "one will match nothing");
   }
   return {};
 }
@@ -182,12 +196,22 @@ std::optional<Negotiation> Refused(const http::Result& result) {
   }
 
   const int status = result.response.status;
-  if (status == 401 || status == 403) {
+  if (status == 401) {
     // Nothing to refresh: `expires_at` is null on every 5.2.0 token, so this is
     // the token having been revoked (docs/AUTH.md#re-pairing--revocation).
     return Refuse(NegotiateError::kUnauthorized,
-                  "the negotiation was rejected: HTTP " + std::to_string(status) +
-                      "; the token has been revoked");
+                  "the negotiation was rejected: HTTP 401; the token has been revoked");
+  }
+  if (status == 403) {
+    // Deliberately not folded into the 401. RomM approves what the *user*
+    // ticked, which need not be what was requested, so a 403 is a scope missing
+    // from a pairing that is otherwise working -- and the client is meant to
+    // have read `scopes` back off the token rather than meet it here
+    // (docs/AUTH.md#scopes-to-request). Reporting it as a revocation sends the
+    // user looking for something that did not happen.
+    return Refuse(NegotiateError::kForbidden,
+                  "the negotiation was rejected: HTTP 403; this pairing was not granted the "
+                  "scopes sync needs");
   }
   if (status == 404 && result.response.body.find(kNoSuchDeviceDetail) != std::string::npos) {
     return Refuse(NegotiateError::kNoSuchDevice,
@@ -280,6 +304,8 @@ const char* ToString(NegotiateError error) {
       return "not_registered";
     case NegotiateError::kUnauthorized:
       return "unauthorized";
+    case NegotiateError::kForbidden:
+      return "forbidden";
     case NegotiateError::kNoSuchDevice:
       return "no_such_device";
     case NegotiateError::kSyncDisabled:
@@ -302,7 +328,7 @@ bool ShouldRetry(NegotiateError error) {
 
 bool NeedsPairing(NegotiateError error) {
   return error == NegotiateError::kNotRegistered || error == NegotiateError::kUnauthorized ||
-         error == NegotiateError::kNoSuchDevice;
+         error == NegotiateError::kForbidden || error == NegotiateError::kNoSuchDevice;
 }
 
 auth::Parsed<SyncPlan> ParseNegotiateResponse(std::string_view body) {
@@ -375,13 +401,36 @@ Negotiation Negotiate(http::HttpClient& client, const auth::StoredToken& token,
                   "the stored token names no device; there is nothing to negotiate for");
   }
 
+  // Checked here as well as inside the encoder, only to say *which* save. The
+  // encoder names `saves[3].updated_at`, and an index into a vector this call
+  // built is not something anyone can go and look at; the rom and the slot are.
+  // Neither is the save's own name, which is a game title a user chose and which
+  // `json::Error` would not quote back anyway.
+  for (std::size_t index = 0; index < saves.size(); ++index) {
+    const json::Error invalid = Validate(saves[index]);
+    if (invalid.ok()) {
+      continue;
+    }
+    // The whole payload is refused, not just this entry, and that is M2-1's
+    // decision rather than a shortcut here: a save dropped from the request has
+    // no `updated_at` for the server to arbitrate on, so the plan can answer
+    // `download` and overwrite the very file that could not be described. One
+    // tick lost is the cheaper failure -- but it is lost on every tick until the
+    // save is fixed, so the log line has to be enough to fix it.
+    return Refuse(NegotiateError::kUnusablePayload,
+                  "the negotiation body could not be built: rom " +
+                      std::to_string(saves[index].rom_id) + ", slot " +
+                      (saves[index].slot.has_value() ? *saves[index].slot : "<none>") + ": " +
+                      invalid.Describe());
+  }
+
   SyncNegotiatePayload payload;
   payload.device_id = token.device_id;
   payload.saves = saves;
   const Encoded encoded = EncodeNegotiateRequest(payload);
   if (!encoded.ok()) {
-    // Nothing is sent. A body missing the one save this tick was about comes
-    // back as a plan that looks complete.
+    // The payload's own fields -- a blank `device_id` -- which the loop above
+    // does not cover. Nothing is sent either way.
     return Refuse(NegotiateError::kUnusablePayload,
                   "the negotiation body could not be built: " + encoded.error.Describe());
   }
@@ -403,10 +452,9 @@ Negotiation Negotiate(http::HttpClient& client, const auth::StoredToken& token,
       options.backoff > options.max_backoff ? options.max_backoff : options.backoff;
   std::chrono::milliseconds waited{0};
 
-  Negotiation outcome;
-  for (int attempt = 1; attempt <= attempts; ++attempt) {
+  for (int attempt = 1;; ++attempt) {
     const http::Result result = client.Send(request);
-    outcome = Negotiation{};
+    Negotiation outcome;
     if (const std::optional<Negotiation> refused = Refused(result)) {
       outcome = *refused;
     } else {
@@ -424,8 +472,7 @@ Negotiation Negotiate(http::HttpClient& client, const auth::StoredToken& token,
     // Only a failure that says nothing about the pairing or the payload earns
     // another request. A 401 retried is a 401 retried forever, and a body the
     // server refused is a body it will refuse again.
-    const bool again = !outcome.ok() && ShouldRetry(outcome.error) && attempt < attempts;
-    if (!again) {
+    if (outcome.ok() || !ShouldRetry(outcome.error) || attempt >= attempts) {
       return outcome;
     }
     if (options.wait != nullptr) {
@@ -434,10 +481,8 @@ Negotiation Negotiate(http::HttpClient& client, const auth::StoredToken& token,
       std::this_thread::sleep_for(backoff);
     }
     waited += backoff;
-    outcome.waited = waited;
     backoff = backoff * 2 > options.max_backoff ? options.max_backoff : backoff * 2;
   }
-  return outcome;
 }
 
 }  // namespace rommsync::sync

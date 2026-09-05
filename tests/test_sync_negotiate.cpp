@@ -359,6 +359,10 @@ int Negotiates(http::HttpClient& client, const std::string& base, const Fixture&
   checks.ExpectEq(unusable.attempts, 0, "...and costs no request either");
   checks.Expect(unusable.message.find("rom_id") != std::string::npos,
                 "and the reason names the field: " + unusable.message);
+  // An index into a vector this call built is not something anyone can go and
+  // look at, and this failure repeats on every tick until the save is fixed.
+  checks.Expect(unusable.message.find(slot) != std::string::npos,
+                "...and which save, by the key it pairs on: " + unusable.message);
   return checks.failures();
 }
 
@@ -644,6 +648,12 @@ int Refused(http::HttpClient& client, const std::string& base, const Fixture& fi
   const Case cases[] = {
       {"a device deleted in RomM's web UI", 404, "Device with ID abc not found",
        sync::NegotiateError::kNoSuchDevice, false, true},
+      // Not a revocation, and not reported as one: RomM approves what the user
+      // ticked, so this is a scope missing from a pairing that otherwise works.
+      // Telling that user their token was revoked sends them looking for
+      // something that did not happen (docs/AUTH.md#scopes-to-request).
+      {"a scope the user did not approve", 403, "Not enough permissions",
+       sync::NegotiateError::kForbidden, false, true},
       // FastAPI's own 404, which is what a `server_url` pointing at something
       // that is not this RomM answers. Reading it as "your device was deleted"
       // would discard a working token over a typo in a URL.

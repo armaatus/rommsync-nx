@@ -88,12 +88,15 @@ things about the answer are worth stating here rather than leaving to the code:
   On a save, the default branch is the one that can overwrite it. The same goes
   for an unrecognised `reason`, except that the action there is still obeyed: the
   reason is the server's explanation, not its decision.
-- **Three failures that are not "the network".** A `404` is this device deleted
-  in RomM's web UI, a `400 Sync is disabled for this device` is the user's own
-  switch, and a `401` is the token revoked — `expires_at` is null, so there is
-  nothing to refresh. None of the three gets better by retrying, and only the
-  first and last are fixed by pairing again. Everything else — no response, a
-  `5xx`, a `429` — retries with backoff.
+- **Four failures that are not "the network".** A `404` carrying RomM's
+  `Device with ID … not found` is this device deleted in the web UI, a
+  `400 Sync is disabled for this device` is the user's own switch, a `401` is the
+  token revoked (`expires_at` is null, so there is nothing to refresh), and a
+  `403` is a scope the user did not approve — which is a working pairing, not a
+  dead one, and is why the two are separate errors. None of the four gets better
+  by retrying. Everything else — no response, a `5xx`, a `429` — retries with
+  backoff, and RomM cancels the session a retried negotiation superseded, so the
+  abandoned ones do not pile up ([API_CONTRACT.md](API_CONTRACT.md#save-sync--negotiate--execute--complete)).
 
 The plan also covers saves the client did **not** report: any server save this
 device has no sync history for comes back as a `download`, for any rom. That is

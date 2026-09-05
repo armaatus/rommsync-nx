@@ -306,7 +306,26 @@ The response is `rommsync::sync::SyncPlan`
 names no device rather than negotiating as nobody, and separates the three
 failures a bare "network error" would hide: `404` (deleted in the web UI), `400
 Sync is disabled for this device`, and `401` (revoked — there is nothing to
-refresh).
+refresh). A `403` is kept apart from that `401`: RomM approves what the *user*
+ticked, so a 403 here is a scope missing from a pairing that otherwise works,
+and reporting it as a revocation sends the user looking for something that did
+not happen. Read `scopes` back off the token instead of meeting it here.
+
+**Verified — negotiating twice cancels the first session.** Each
+`POST /api/sync/negotiate` opens a session, and RomM cancels the device's
+previous `IN_PROGRESS` one when it does: two negotiations in a row leave the
+first `CANCELLED` with a `completed_at`, and exactly one row is ever in progress
+per device. So a retried negotiation — a stall the client gave up on, a tick that
+died before `complete` — does not accumulate open sessions, and only the last
+`session_id` is worth posting uploads and `complete` against.
+
+**The `server_content_hash` is whatever some client uploaded.** RomM stores the
+digest it is given, so a save another tool put there can come back carrying a
+SHA1 or an uppercase digest — which compares equal to nothing, forever, with no
+symptom except that save negotiating as changed on every tick. It is the same
+failure `ClientSaveState.content_hash` is validated against, arriving from the
+other direction; `ParseNegotiateResponse` reports it rather than refusing the
+plan, because it is one save's problem and not the plan's.
 
 The `reason` strings are the server's arbitration. This is the **complete** set
 5.2.0 can emit — read off `endpoints/sync.py` and `handler/sync/comparison.py`,

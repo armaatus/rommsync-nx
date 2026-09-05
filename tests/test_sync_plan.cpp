@@ -334,6 +334,56 @@ void AnUnknownActionIsANoOp(checks::Checks& c) {
   c.Expect(operation->reason == sync::Reason::kContentIdentical, "...including the reason");
 }
 
+/// The server's `content_hash` held to the same shape the client's own is.
+///
+/// RomM stores whatever any client sent it, so a save uploaded by some other
+/// tool can come back carrying a SHA1 or an uppercase digest -- which compares
+/// equal to nothing, so that save negotiates as changed on every tick forever,
+/// with no other symptom. Reported rather than refused: it is one save's
+/// problem, not the plan's.
+void AServerHashThatIsNotAnMd5IsReported(checks::Checks& c) {
+  const auto plan = [](const char* hash) {
+    return std::string(
+               "{\"session_id\":1,\"operations\":[{"
+               "\"action\":\"download\",\"rom_id\":4,\"save_id\":57,"
+               "\"file_name\":\"probe.srm\",\"slot\":null,\"emulator\":null,"
+               "\"reason\":\"Content is identical\","
+               "\"server_updated_at\":null,\"server_content_hash\":") +
+           hash +
+           "}],\"total_upload\":0,\"total_download\":1,\"total_conflict\":0,"
+           "\"total_no_op\":0}";
+  };
+
+  struct Case {
+    const char* what;
+    const char* hash;
+    bool warns;
+  };
+  const Case cases[] = {
+      {"a real MD5", "\"abd8fff93894e8112c7dd17386e54a5f\"", false},
+      {"no hash at all", "null", false},
+      {"a SHA1, which the rom schema uses and saves do not",
+       "\"da39a3ee5e6b4b0d3255bfef95601890afd80709\"", true},
+      {"an uppercase digest of the same bytes", "\"ABD8FFF93894E8112C7DD17386E54A5F\"", true},
+      {"32 characters that are not hex", "\"zzd8fff93894e8112c7dd17386e54a5f\"", true},
+  };
+
+  for (const Case& scenario : cases) {
+    const auth::Parsed<sync::SyncPlan> parsed = sync::ParseNegotiateResponse(plan(scenario.hash));
+    if (!parsed.ok()) {
+      c.Expect(false, std::string("the plan still parses, for ") + scenario.what + ": " +
+                          parsed.error.Describe());
+      continue;
+    }
+    c.ExpectEq(parsed.value.warnings.size(), scenario.warns ? std::size_t{1} : std::size_t{0},
+               std::string("warned about: ") + scenario.what);
+    if (scenario.warns) {
+      c.Expect(parsed.value.warnings.front().find("MD5") != std::string::npos,
+               "...and says what it should have been: " + parsed.value.warnings.front());
+    }
+  }
+}
+
 void AnUnknownReasonIsReported(checks::Checks& c) {
   const auth::Parsed<sync::SyncPlan> parsed =
       sync::ParseNegotiateResponse(PlanWith("download", "Server save smells fresher"));
@@ -513,6 +563,7 @@ int main() {
   EveryAction(c);
   AnUnknownActionIsANoOp(c);
   AnUnknownReasonIsReported(c);
+  AServerHashThatIsNotAnMd5IsReported(c);
   APathWhereANameBelongsIsFlagged(c);
   RefusesWhatItCannotRead(c);
 

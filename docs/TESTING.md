@@ -366,7 +366,8 @@ ctest --test-dir build --output-on-failure
   covers the answers that are not "the network" at all: a 404 carrying RomM's
   `Device with ID … not found`, the plain `Not Found` a wrong `server_url`
   produces — which must **not** be read as a deleted device, since re-pairing
-  cannot fix a typo in a URL — sync switched off for the device, another 400,
+  cannot fix a typo in a URL — a 403, which is a scope the user did not approve
+  rather than a revoked token, sync switched off for the device, another 400,
   and the 503/429 that mean "not now".
 - The `harness.*` scenarios (M0-5) are the same idea applied to the *edge cases*:
   every row of that issue's table, forced deterministically against the real
