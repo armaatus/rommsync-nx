@@ -3,6 +3,9 @@
 // libcurl backend and (from M0-3) sysmodule/ for the Horizon `ssl` one.
 #include "rommsync/http.hpp"
 
+#include <string>
+#include <string_view>
+
 namespace rommsync::http {
 namespace {
 
@@ -38,6 +41,13 @@ const char* ToString(Error error) {
     case Error::kTransport:      return "transport failure";
   }
   return "unknown error";
+}
+
+std::string JoinUrl(std::string_view server_url, std::string_view path) {
+  while (!server_url.empty() && server_url.back() == '/') {
+    server_url.remove_suffix(1);
+  }
+  return std::string(server_url) + std::string(path);
 }
 
 const std::string* FindHeader(const Headers& headers, std::string_view name) {

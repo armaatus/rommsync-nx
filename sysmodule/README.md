@@ -1,7 +1,10 @@
 # sys-rommsync (sysmodule)
 
-The background engine. **Skeleton** — it builds, it is packaged, and it does
-nothing yet. Build on a devkitPro dev machine, never on the RomM server.
+The background engine. It registers the `rommsync` IPC service and answers it;
+everything behind that service is still arriving milestone by milestone, so the
+commands whose machinery does not exist yet answer `ipc::Error::kUnavailable`
+rather than a plausible refusal (see `source/engine.hpp`). Build on a devkitPro
+dev machine, never on the RomM server.
 
 ```bash
 make -C sysmodule            # -> sysmodule/sys-rommsync.nsp
@@ -40,13 +43,20 @@ read that one line as noise if the process category ever has to change.
 Makefile              # target-specific vars; the rules are in ../switch.mk
 sys-rommsync.json     # NPDM: title id, heap, service and syscall capabilities
 source/
-  main.cpp            # service loop, scheduler
+  main.cpp            # init, service registration, and the loop
+  engine.hpp/.cpp     # the ipc::Engine ServiceCore reads the console out of
+  ipc/
+    server.hpp/.cpp   # the port, the session table, svcReplyAndReceive
+    service.hpp/.cpp  # one cmif request in, one reply out. No logic.
 ```
 
-Planned as the engine lands: `http/` (the `ssl`-service HttpClient backend),
-`ipc/` (the service the overlay opens), and whatever Horizon glue the sync and
-download workers need. The portable half of all of that belongs in `core/`,
-where it is testable without a console.
+Object files are named by basename, so nothing under `source/` may share one
+with `core/src/` — `switch.mk` makes that an error rather than a silently
+dropped translation unit.
+
+Planned as the engine lands: `http/` (the `ssl`-service HttpClient backend) and
+whatever Horizon glue the sync and download workers need. The portable half of
+all of that belongs in `core/`, where it is testable without a console.
 
 ## Three things in `sys-rommsync.json` to settle before hardware
 
@@ -89,6 +99,12 @@ docker, never a mock) before any of it runs on a Switch — see
   be answered off-console: the spike is [`../tlsprobe/`](../tlsprobe/README.md),
   the decision is `ssl`, and the part that still needs a console is recorded with
   it.
-- **M1 onward** — auth, sync, downloads and the IPC service, in `core/` first.
+- **M4-1** — the IPC service is hosted here now (`source/ipc/server.*`), so the
+  overlay has something to open. None of it has run: it is exercised in Ryujinx
+  as a manually-launched build first, never as an auto-boot sysmodule and never
+  on hardware before the M8-1 gate.
+- **M1 onward** — auth, sync and downloads, in `core/` first. Each one replaces
+  its `kUnavailable` in `source/engine.cpp`; the last one to go is what says the
+  engine is finished.
 
 See milestone M0 in [`../ISSUES.md`](../ISSUES.md).

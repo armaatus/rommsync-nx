@@ -1,0 +1,10 @@
+# libultrahand -- the Ultrahand/Tesla overlay library ovl-rommsync draws with.
+#
+# Pinned as a submodule rather than vendored: it is upstream's code, it is
+# updated by moving this pointer, and `git submodule status` is the only place
+# a reviewer has to look to see which revision an .ovl was built from. CI
+# checks out with `submodules: recursive` (.github/workflows/ci.yml), which is
+# what makes the Switch build reproducible off a bare clone.
+[submodule "overlay/lib/libultrahand"]
+	path = overlay/lib/libultrahand
+	url = https://github.com/ppkantorski/libultrahand.git

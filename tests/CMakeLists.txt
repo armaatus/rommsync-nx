@@ -196,6 +196,17 @@ endif()
 # client, and RomM's ten-inits-a-minute limit is per IP, which is the whole suite.
 set_tests_properties(ipc.engine PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 
+# --- the overlay's status screen ---------------------------------------------
+# M4-1. Everything about the screen that is a decision rather than a draw call --
+# which sentence a never-paired console gets, what a download with no declared
+# length shows instead of a percentage, what goes where a timestamp would go on a
+# console that has never synced. The drawing itself waits for M8-2 (#44); none of
+# this does, and none of it needs a console.
+add_executable(test_overlay_status test_overlay_status.cpp)
+target_link_libraries(test_overlay_status PRIVATE rommsync::core)
+target_include_directories(test_overlay_status PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+add_test(NAME overlay.status COMMAND test_overlay_status)
+
 # --- rig smoke test: proves docker RomM + fault proxy + ctest all work -------
 # Uses libcurl directly on purpose. It tests the RIG, not our code, and must
 # keep working while M0-2 replaces it as the way production code speaks HTTP.
@@ -388,6 +399,55 @@ foreach(scenario IN LISTS SYNC_SCENARIOS)
   # here goes through the fault proxy, which holds one armed scenario for all
   # clients.
   set_tests_properties(sync.${scenario} PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
+endforeach()
+
+# --- step 2: executing the plan ----------------------------------------------
+# M2-5, the issue that carries the project's one hard guarantee. Every rig
+# scenario runs `sync::ExecutePlan` inside a `harness::Sandbox`, so the
+# backup-before-overwrite audit judges each one on teardown.
+#
+# `naming`, `staging` and `counting` are deliberately NOT in the skippable list:
+# the backup path that used to collide, the two `io` primitives an overwrite
+# goes through, and the counts M2-6 reports to `complete` need no server, so
+# they must stay checked with docker stopped.
+add_executable(test_sync_execute test_sync_execute.cpp)
+target_link_libraries(test_sync_execute PRIVATE rommsync::host)
+target_include_directories(test_sync_execute PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_sync_execute PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+
+set(EXECUTE_UNIT_SCENARIOS
+  naming   # the backup path carries the slot, so one rom's two saves are two files
+  staging  # the streamed copy and the two-rename commit an overwrite goes through
+  counting # no-op, a downgraded action, and the two refusals that need no server
+)
+foreach(scenario IN LISTS EXECUTE_UNIT_SCENARIOS)
+  add_test(NAME execute.${scenario} COMMAND test_sync_execute ${scenario})
+  set_tests_properties(execute.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
+set(EXECUTE_RIG_SCENARIOS
+  upload          # overwrite=true, session_id and device_id -- and no 409
+  download        # verify, back up, commit, confirm -- in that order
+  conflict        # both sides changed: keep both, lose nothing
+  same_timestamp  # ...and the no-history conflict, resolved the same way
+  truncate        # a clean short body never replaces a save
+  corrupted       # ...and neither do the right number of the wrong bytes
+  occupied        # overwrite=true, in the state it exists for: a 409 without it
+  dropped         # a TCP reset mid-download costs a tick, not a save
+  collision       # two saves of one rom, one second, two backups
+)
+foreach(scenario IN LISTS EXECUTE_RIG_SCENARIOS)
+  add_test(NAME execute.${scenario} COMMAND test_sync_execute ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(execute.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  # RUN_SERIAL for the reason every rig test needs it: the fault proxy holds one
+  # armed scenario for all clients, and these upload and delete saves on the
+  # shared fixture device.
+  set_tests_properties(execute.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 endforeach()
 
 # --- step 0: the local scan and its rom matching -----------------------------
@@ -815,3 +875,4 @@ if(NOT ROMMSYNC_REQUIRE_RIG)
   set_tests_properties(download.resume PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 set_tests_properties(download.resume PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
+

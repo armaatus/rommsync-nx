@@ -168,11 +168,13 @@ ipc::Status LoadedStatus() {
   status.online = true;
   status.last_sync_at = 1757000000;
   status.last_sync_result = ipc::SyncResult::kPartial;
+  status.sync_in_progress = true;
   status.uploaded = 3;
   status.downloaded = 5;
   status.conflicts = 1;
   status.failed = 2;
   status.queue_depth = 4;
+  status.config_error_count = 2;
   status.download.state = ipc::DownloadState::kVerifying;
   status.download.rom_id = 42;
   status.download.fs_name = "Some Game (USA).gba";
@@ -275,7 +277,10 @@ int Version() {
                   "command 0's encoding is exactly this, forever");
   checks.ExpectEq(ipc::EncodeInterfaceVersion(4294967295u),
                   std::string("{\"interface\":4294967295}"), "and holds a whole u32");
-  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{1},
+  // 2 since M4-1 (#23): `Status` gained two fields the decoder requires, and a
+  // required field is an incompatible change by this header's own rule. What is
+  // frozen is command 0's *encoding*, asserted above -- not the number in it.
+  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{2},
                   "the interface version this build speaks");
   checks.ExpectEq(static_cast<int>(ipc::Command::kGetInterfaceVersion), 0,
                   "GetInterfaceVersion is command 0");
@@ -394,11 +399,15 @@ int RoundTrip() {
     checks.ExpectEq(back.value.last_sync_at, sent.last_sync_at, "last_sync_at survives");
     checks.ExpectEq(std::string(ipc::ToString(back.value.last_sync_result)),
                     std::string(ipc::ToString(sent.last_sync_result)), "the result survives");
+    checks.ExpectEq(back.value.sync_in_progress, sent.sync_in_progress,
+                    "sync_in_progress survives");
     checks.ExpectEq(back.value.uploaded, sent.uploaded, "uploaded survives");
     checks.ExpectEq(back.value.downloaded, sent.downloaded, "downloaded survives");
     checks.ExpectEq(back.value.conflicts, sent.conflicts, "conflicts survive");
     checks.ExpectEq(back.value.failed, sent.failed, "failed survives");
     checks.ExpectEq(back.value.queue_depth, sent.queue_depth, "the queue depth survives");
+    checks.ExpectEq(back.value.config_error_count, sent.config_error_count,
+                    "config_error_count survives");
     checks.ExpectEq(std::string(ipc::ToString(back.value.download.state)),
                     std::string(ipc::ToString(sent.download.state)), "the download state survives");
     checks.ExpectEq(back.value.download.rom_id, sent.download.rom_id, "its rom_id survives");

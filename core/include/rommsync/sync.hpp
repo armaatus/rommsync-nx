@@ -188,6 +188,28 @@ struct Encoded {
 /// Values are never quoted back, matching `json::Error`.
 json::Error Validate(const ClientSaveState& save);
 
+/// True for a string that can compare equal to a RomM save digest: 32
+/// lowercase hex characters.
+///
+/// Both directions need it, and for the same reason in each: RomM stores
+/// `hexdigest()` and compares the *string*, so a SHA1 or an uppercase MD5
+/// matches nothing and makes an unchanged save look changed on every tick,
+/// forever, with no other symptom. `Validate` refuses one on the way out;
+/// `ParseNegotiateResponse` reports one on the way in -- the server's digest is
+/// whatever some other client uploaded -- and M2-5 will not verify a download
+/// against one it cannot compare.
+bool IsContentHash(std::string_view value);
+
+/// `Game (USA).srm` -> `.srm`, dot included. Empty when there is none.
+///
+/// **A leading dot is not an extension**: `.DS_Store` is a whole name, and
+/// stripping there would leave nothing -- which matches every rom with an empty
+/// name and none with a real one. Three places in the engine split a file name
+/// on that rule (the scanner's `BaseName` and `SlotFor`, and the backup name
+/// M2-5 writes) and they must not disagree about where the split is, so there
+/// is one of it.
+std::string_view ExtensionOf(std::string_view file_name);
+
 /// True for a string that names one file and cannot redirect a join.
 ///
 /// Both directions need it and they must not drift: the client sends a

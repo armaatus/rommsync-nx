@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <string_view>
@@ -11,15 +12,6 @@ namespace {
 
 constexpr const char* kTempSuffix = ".tmp";
 constexpr const char* kPreviousSuffix = ".old";
-
-bool Exists(const std::string& path) {
-  std::FILE* file = std::fopen(path.c_str(), "rb");
-  if (file == nullptr) {
-    return false;
-  }
-  std::fclose(file);
-  return true;
-}
 
 std::string Describe(const std::string& path, std::string_view what) {
   return path + ": " + std::string(what);
@@ -86,9 +78,53 @@ const char* ToString(ReadError error) {
   return "none";
 }
 
+bool Exists(const std::string& path) {
+  std::FILE* file = std::fopen(path.c_str(), "rb");
+  if (file == nullptr) {
+    return false;
+  }
+  std::fclose(file);
+  return true;
+}
+
 std::string TempPathFor(std::string_view path) { return std::string(path) + kTempSuffix; }
 
 std::string PreviousPathFor(std::string_view path) { return std::string(path) + kPreviousSuffix; }
+
+WriteResult CommitStaged(const std::string& staged, const std::string& path) {
+  if (!Exists(staged)) {
+    return {WriteError::kOpenFailed, Describe(staged, "is not there to commit")};
+  }
+
+  const std::string previous = PreviousPathFor(path);
+  const bool replacing = Exists(path);
+  if (replacing) {
+    // A stale one has to go first, because the rename below is the Horizon one
+    // that refuses an existing destination. Only when there is something to
+    // move aside, though: a `.old` left by an interrupted commit is the only
+    // copy of the record when `path` is missing, and removing it before the new
+    // one is committed would turn a recoverable interruption into a loss.
+    std::remove(previous.c_str());
+    if (std::rename(path.c_str(), previous.c_str()) != 0) {
+      std::remove(staged.c_str());
+      return {WriteError::kCommitFailed, Describe(path, "could not be moved aside to " + previous)};
+    }
+  }
+  if (std::rename(staged.c_str(), path.c_str()) != 0) {
+    std::string detail = "could not be replaced by " + staged;
+    // Putting the previous record back is the whole reason a caller can treat a
+    // failed write as costing only the new record. When even *that* fails the
+    // destination is gone, and saying so is the difference between a caller
+    // reading `.old` deliberately and one wondering why its file vanished.
+    if (replacing && std::rename(previous.c_str(), path.c_str()) != 0) {
+      detail += ", and the previous record could not be put back -- it is at " + previous;
+    }
+    std::remove(staged.c_str());
+    return {WriteError::kCommitFailed, Describe(path, detail)};
+  }
+  std::remove(previous.c_str());
+  return {};
+}
 
 WriteResult WriteAtomically(const std::string& path, std::string_view contents) {
   const std::string temp = TempPathFor(path);
@@ -110,36 +146,95 @@ WriteResult WriteAtomically(const std::string& path, std::string_view contents) 
     return {WriteError::kWriteFailed, Describe(temp, "could not be written completely")};
   }
 
-  // The commit. Everything above touched only the temp file, so a failure up to
-  // this point leaves whatever `path` already held exactly as it was.
-  const std::string previous = PreviousPathFor(path);
-  const bool replacing = Exists(path);
-  if (replacing) {
-    // A stale one has to go first, because the rename below is the Horizon one
-    // that refuses an existing destination. Only when there is something to
-    // move aside, though: a `.old` left by an interrupted commit is the only
-    // copy of the record when `path` is missing, and removing it before the new
-    // one is committed would turn a recoverable interruption into a loss.
-    std::remove(previous.c_str());
-    if (std::rename(path.c_str(), previous.c_str()) != 0) {
-      std::remove(temp.c_str());
-      return {WriteError::kCommitFailed, Describe(path, "could not be moved aside to " + previous)};
-    }
+  // Everything above touched only the temp file, so a failure up to this point
+  // leaves whatever `path` already held exactly as it was.
+  return CommitStaged(temp, path);
+}
+
+const char* ToString(CopyError error) {
+  switch (error) {
+    case CopyError::kNone:
+      return "none";
+    case CopyError::kSourceMissing:
+      return "source_missing";
+    case CopyError::kSourceUnreadable:
+      return "source_unreadable";
+    case CopyError::kOpenFailed:
+      return "open_failed";
+    case CopyError::kWriteFailed:
+      return "write_failed";
+    case CopyError::kCommitFailed:
+      return "commit_failed";
   }
-  if (std::rename(temp.c_str(), path.c_str()) != 0) {
-    std::string detail = "could not be replaced by " + temp;
-    // Putting the previous record back is the whole reason a caller can treat a
-    // failed write as costing only the new record. When even *that* fails the
-    // destination is gone, and saying so is the difference between a caller
-    // reading `.old` deliberately and one wondering why its file vanished.
-    if (replacing && std::rename(previous.c_str(), path.c_str()) != 0) {
-      detail += ", and the previous record could not be put back -- it is at " + previous;
+  return "none";
+}
+
+CopyResult CopyAtomically(const std::string& from, const std::string& to) {
+  CopyResult result;
+  errno = 0;
+  std::FILE* source = std::fopen(from.c_str(), "rb");
+  if (source == nullptr) {
+    // The same line `ReadFile` draws, and the caller this exists for reads it
+    // the same way: only ENOENT and ENOTDIR mean there is nothing here to
+    // preserve. A full handle table is a bad moment, and a bad moment is not
+    // permission to overwrite a save without a backup.
+    const int why = errno;
+    const bool absent = why == ENOENT || why == ENOTDIR;
+    result.error = absent ? CopyError::kSourceMissing : CopyError::kSourceUnreadable;
+    result.message = Describe(from, absent ? "does not exist" : "could not be opened");
+    return result;
+  }
+
+  const std::string temp = TempPathFor(to);
+  std::FILE* destination = std::fopen(temp.c_str(), "wb");
+  if (destination == nullptr) {
+    std::fclose(source);
+    result.error = CopyError::kOpenFailed;
+    result.message = Describe(temp, "could not be created (does the directory exist?)");
+    return result;
+  }
+
+  // 4 KiB, the convention in this directory: the main thread gets a 16 KiB
+  // stack on the console, so a buffer sized for a desktop compiles here and
+  // overflows there (core/AGENTS.md).
+  char buffer[4096];
+  std::uint64_t copied = 0;
+  bool short_write = false;
+  std::size_t got = 0;
+  while ((got = std::fread(buffer, 1, sizeof(buffer), source)) > 0) {
+    if (std::fwrite(buffer, 1, got, destination) != got) {
+      short_write = true;
+      break;
     }
+    copied += got;
+  }
+  const bool read_failed = std::ferror(source) != 0;
+  std::fclose(source);
+  const bool flushed = std::fflush(destination) == 0;
+  const bool closed = std::fclose(destination) == 0;
+
+  if (read_failed) {
     std::remove(temp.c_str());
-    return {WriteError::kCommitFailed, Describe(path, detail)};
+    result.error = CopyError::kSourceUnreadable;
+    result.message = Describe(from, "could not be read to the end");
+    return result;
   }
-  std::remove(previous.c_str());
-  return {};
+  if (short_write || !flushed || !closed) {
+    std::remove(temp.c_str());
+    result.error = CopyError::kWriteFailed;
+    result.message = Describe(temp, "could not be written completely");
+    return result;
+  }
+
+  const WriteResult committed = CommitStaged(temp, to);
+  if (!committed.ok()) {
+    result.error = committed.error == WriteError::kOpenFailed ? CopyError::kOpenFailed
+                                                              : CopyError::kCommitFailed;
+    result.message = committed.message;
+    return result;
+  }
+  result.bytes_copied = copied;
+  return result;
 }
 
 ReadResult ReadFile(const std::string& path) {

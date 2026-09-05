@@ -11,19 +11,6 @@
 #include "rommsync/ipc.hpp"
 
 namespace rommsync::overlay {
-namespace {
-
-/// A response the sysmodule answered but this build cannot read.
-///
-/// Distinct from the sysmodule's own errors on purpose: those say what the
-/// *command* could not do, and this says the two halves disagree about the
-/// payload -- which is a different sentence for the user ("update the overlay")
-/// and is what `GetInterfaceVersion` exists to diagnose.
-constexpr Result MalformedResponse() {
-  return MAKERESULT(Module_Libnx, LibnxError_InvalidCmifOutHeader);
-}
-
-}  // namespace
 
 IpcClient::IpcClient() { response_.resize(ipc::kMaxPayloadBytes); }
 

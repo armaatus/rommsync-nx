@@ -57,6 +57,18 @@ using Headers = std::vector<Header>;
 /// absent; the pointer is valid until `headers` changes.
 const std::string* FindHeader(const Headers& headers, std::string_view name);
 
+/// `https://romm.example.com/` + `/api/saves` -> `https://romm.example.com/api/saves`.
+///
+/// Every caller joins a configured origin to a path this client wrote, and the
+/// one thing that goes wrong is the trailing slash a human leaves on a
+/// `server_url`: `https://host//api/...` is a different path to some reverse
+/// proxies and a 404 from others. Here rather than in each module because there
+/// were four copies of the trimmer before this one.
+///
+/// `path` is not escaped and must not be built from server data -- it is a
+/// literal plus ids this client holds.
+std::string JoinUrl(std::string_view server_url, std::string_view path);
+
 /// One part of a `multipart/form-data` body.
 ///
 /// A part with a `file_path` is streamed from disk rather than read into memory:

@@ -42,13 +42,6 @@ constexpr const char* kSyncDisabledDetail = "Sync is disabled for this device";
 /// safer direction to be wrong in: it neither retries forever nor re-pairs.
 constexpr const char* kNoSuchDeviceDetail = "Device with ID";
 
-std::string ApiUrl(std::string_view server_url, std::string_view path) {
-  while (!server_url.empty() && server_url.back() == '/') {
-    server_url.remove_suffix(1);
-  }
-  return std::string(server_url) + std::string(path);
-}
-
 /// One mapping between an enum and the string RomM writes, in one place, so the
 /// classifier and the speller cannot drift apart.
 struct ReasonSpelling {
@@ -84,22 +77,6 @@ const ReasonSpelling* SpellingOf(Reason reason) {
     }
   }
   return nullptr;
-}
-
-/// The shape a save's `content_hash` has to have to compare equal to anything:
-/// 32 lowercase hex digits. RomM stores `hexdigest()`, and compares the string.
-bool LowercaseMd5(std::string_view value) {
-  if (value.size() != kContentHashDigits) {
-    return false;
-  }
-  for (const char character : value) {
-    const bool digit = character >= '0' && character <= '9';
-    const bool letter = character >= 'a' && character <= 'f';
-    if (!digit && !letter) {
-      return false;
-    }
-  }
-  return true;
 }
 
 json::Error Fail(std::string_view field, std::string message) {
@@ -174,7 +151,7 @@ json::Error ReadOperation(const json::Value& value, std::size_t index, SyncOpera
   // belongs to negotiates as changed on every tick, forever, with no other
   // symptom. That is the failure the outgoing check exists to prevent, arriving
   // from the other direction (docs/API_CONTRACT.md).
-  if (out->server_content_hash.has_value() && !LowercaseMd5(*out->server_content_hash)) {
+  if (out->server_content_hash.has_value() && !IsContentHash(*out->server_content_hash)) {
     warnings->push_back(where + ": the server's content_hash is " +
                         std::to_string(out->server_content_hash->size()) +
                         " characters and not lowercase hex; saves are compared on MD5, so this "
@@ -437,7 +414,7 @@ Negotiation Negotiate(http::HttpClient& client, const auth::StoredToken& token,
 
   http::Request request;
   request.method = http::Method::kPost;
-  request.url = ApiUrl(token.server_url, kNegotiatePath);
+  request.url = http::JoinUrl(token.server_url, kNegotiatePath);
   request.headers.push_back({"Accept", "application/json"});
   request.headers.push_back({"Content-Type", "application/json"});
   request.headers.push_back({"Authorization", "Bearer " + token.access_token});
