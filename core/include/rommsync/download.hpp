@@ -589,12 +589,20 @@ struct DrainResult {
 /// `verify_hash` off, or against a library that recorded no hash, the rom is
 /// fetched again rather than assumed good.
 ///
-/// **A digest that does not match is `kFailed`, and nothing reaches the
-/// destination.** The staged file and the `.part` are both discarded, so the
-/// next attempt starts clean rather than resuming bytes already known to be
-/// wrong. It is not retried inside the drain: a server whose bytes disagree
-/// with its own recorded hash answers the same way next time, and finding that
-/// out costs a whole rom's transfer each round.
+/// **A digest that does not match never reaches the destination**, and what
+/// happens next depends on where the bytes came from. Bytes fetched whole that
+/// fail their digest mean the server's own hash does not describe its own file,
+/// which asking again cannot change: `kFailed`, terminal. Bytes that included
+/// any the card already held -- a resumed prefix, or a whole body a power cut
+/// left staged -- say nothing about the server, so they are discarded and the
+/// rom is fetched clean, once, out of the same attempt budget. Either way both
+/// the staged file and the `.part` go: bytes that are not this rom's are not a
+/// prefix of it either.
+///
+/// **A staged body the digest recognises is committed without a transfer.** It
+/// is the file a power cut left between the backend's rename and the hash, its
+/// name is derived from this rom's own destination, and re-fetching 120 MiB to
+/// learn what a local hash already knows is the expensive way to be sure.
 ///
 /// **A download nothing could check still finishes, and says so.** Neither
 /// `verify_hash = false` nor a library with no `sha1_hash` and no `md5_hash` is

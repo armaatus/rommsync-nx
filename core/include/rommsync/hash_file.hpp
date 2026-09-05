@@ -55,4 +55,22 @@ bool StreamFile(const std::string& path, Hasher& hasher, bool* opened) {
   return !failed;
 }
 
+/// `StreamFile` plus `FinishHex`: the digest of `path` as lowercase hex, or
+/// **empty** when the file could not be read to the end.
+///
+/// Empty is a value no digest collides with -- they are all a fixed even number
+/// of hex characters -- so a caller that only wants the digest needs no second
+/// return channel. `crypto::Md5FileHex` and `crypto::Sha1FileHex` are this with
+/// their hasher filled in, and exist so a caller names an algorithm rather than
+/// a template.
+template <class Hasher>
+std::string FileHex(const std::string& path) {
+  Hasher hasher;
+  bool opened = false;
+  if (!StreamFile(path, hasher, &opened)) {
+    return {};
+  }
+  return hasher.FinishHex();
+}
+
 }  // namespace rommsync::crypto

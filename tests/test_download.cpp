@@ -26,6 +26,7 @@
 //   fallback   -- md5_hash when there is no sha1; unverified when there is neither
 //   truncate   -- a body that ends early, caught by the caller's own expected size
 //   stall      -- the client's own stall_timeout ends it, and the entry is retried
+//   staging    -- what an interrupted attempt leaves behind: salvaged, or discarded
 //   disabled   -- `[downloads] enabled = false` drains nothing and loses nothing
 //   multifile  -- a disc set is refused with a reason and no archive reaches the card
 //   missing    -- a rom the server's library no longer holds fails with a sentence
@@ -48,6 +49,7 @@
 #include "rommsync/ipc.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/rom_index.hpp"
+#include "rommsync/sha1.hpp"
 
 namespace config = rommsync::config;
 namespace download = rommsync::download;
@@ -56,6 +58,7 @@ namespace http = rommsync::http;
 namespace io = rommsync::io;
 namespace ipc = rommsync::ipc;
 namespace json = rommsync::json;
+namespace crypto = rommsync::crypto;
 namespace roms = rommsync::roms;
 
 namespace {
@@ -719,10 +722,14 @@ void Drain(checks::Checks& c, http::HttpClient& client, const std::string& base,
   c.ExpectEq(entry.size_bytes, static_cast<std::int64_t>(expected.size()),
              "matching the size the server declared");
   c.Expect(!entry.sha1_hash.empty(), "the hash M3-3 will check is recorded");
+  c.ExpectEq(crypto::Sha1FileHex(rig.sandbox.Host("/tico/roms/nes/240pee.nes")), entry.sha1_hash,
+             "and the file on the card hashes to it");
   c.ExpectEq(entry.attempts, 0, "and it took no failed attempts");
 
-  c.Expect(!rig.sandbox.Exists("/tico/roms/nes/240pee.nes.part"),
+  c.Expect(!rig.sandbox.Exists("/tico/roms/nes/240pee.nes.tmp.part"),
            "no .part is left beside the finished rom");
+  c.Expect(!rig.sandbox.Exists("/tico/roms/nes/240pee.nes.tmp"),
+           "nor the staging file the hash was taken over");
   c.ExpectEq(rig.queue.pending(), std::size_t{0}, "nothing is left to do");
   c.ExpectEq(rig.queue.size(), std::size_t{1},
              "and the finished entry stays, for the queue screen");
@@ -880,6 +887,8 @@ void Retries(checks::Checks& c, http::HttpClient& client, const std::string& bas
     c.Expect(rig.Persisted(nova_id).state == QueueState::kQueued, "and the entry is still queued");
     c.Expect(!rig.sandbox.Exists("/tico/roms/nes/nova.nes"),
              "with no short file where a complete rom is expected");
+    c.Expect(!rig.sandbox.Exists("/tico/roms/nes/nova.nes.tmp"),
+             "and nothing staged, because no body ever completed");
   }
 }
 
@@ -961,6 +970,15 @@ void Resume(checks::Checks& c, http::HttpClient& client, const std::string& base
   c.Expect(done.state == QueueState::kDone, "the entry on the card is done");
   c.Expect(done.message.find("verified") != std::string::npos,
            "and says the bytes were checked against the server's own digest");
+  // The acceptance criterion in full: not "some SHA-1 matched" but "the SHA-1 of
+  // the file on the card equals the one RomM recorded for this rom". Recomputed
+  // here rather than trusted from the message, and compared against the value
+  // the *server* gave -- the entry's own `sha1_hash`, resolved from
+  // `GET /api/roms/{id}` and persisted.
+  c.Expect(!done.sha1_hash.empty(), "the entry carries the hash the server recorded");
+  c.ExpectEq(crypto::Sha1FileHex(rig.sandbox.Host("/tico/roms/gba/synthetic-large.gba")),
+             done.sha1_hash,
+             "and the 120 MiB rom on the card hashes to exactly that");
 
   // The assertions above are all satisfied by a second drain that *restarted*
   // from zero, so on their own they do not pin the property the issue names --
@@ -970,8 +988,10 @@ void Resume(checks::Checks& c, http::HttpClient& client, const std::string& base
   //
   // Under M3-2 what happened was a file of the right *length* and the wrong
   // *bytes* at the destination, with the entry marked `kDone` -- the failing
-  // case this issue was written down against. Now the resume still happens, and
-  // the SHA-1 catches it: the entry fails and the destination is never written.
+  // case this issue was written down against. Now the resume still happens, the
+  // SHA-1 catches it, and because the bytes it built on came off the card rather
+  // than off the wire, the worker throws them away and fetches the rom clean.
+  // The user ends up with the rom; what they never end up with is the wrong one.
   {
     harness::Rom nova;
     const std::int64_t nova_id = Queued(c, client, base, fixture, &rig.queue, "nova.nes", &nova);
@@ -987,28 +1007,37 @@ void Resume(checks::Checks& c, http::HttpClient& client, const std::string& base
     c.Expect(result.outcome == download::DrainOutcome::kCompleted,
              std::string("the drain finishes -- got ") + download::ToString(result.outcome) + " (" +
                  result.message + ")");
-    c.ExpectEq(result.failed, 1, "with the entry written off rather than downloaded");
-    c.ExpectEq(result.downloaded, 0, "and nothing counted as a rom that arrived");
-    if (!spliced.statuses.empty()) {
+    c.ExpectEq(result.downloaded, 1, "the rom does arrive");
+    c.ExpectEq(result.failed, 0, "and the entry is not written off over a bad local file");
+
+    // Two transfers, and what each one was is the whole point. The first is the
+    // resume: 206, only the missing bytes, built on a prefix that is not this
+    // rom's. The second is the clean fetch that follows the digest saying so.
+    c.ExpectEq(spliced.statuses.size(), std::size_t{2},
+               "in two transfers -- the spliced one, and the clean one after it");
+    if (spliced.statuses.size() == 2) {
       c.ExpectEq(spliced.statuses.front(), 206,
                  "the transfer did resume -- the server answered 206 and sent only the rest");
       c.ExpectEq(spliced.received.front(),
                  static_cast<std::uint64_t>(nova.size) - seeded.size(),
                  "so the bytes that were already there were kept, and are the wrong bytes");
+      c.ExpectEq(spliced.statuses.back(), 200,
+                 "and the retry asked for the whole resource, having thrown the prefix away");
+      c.ExpectEq(spliced.received.back(), static_cast<std::uint64_t>(nova.size),
+                 "every byte of it");
     }
 
-    const QueueEntry failed = rig.Persisted(nova_id);
-    c.Expect(failed.state == QueueState::kFailed,
-             "the entry fails: a body of the right length is not the same thing as the rom");
-    c.Expect(failed.message.find("SHA-1") != std::string::npos,
-             "with a sentence naming what did not match");
-    c.Expect(!rig.sandbox.Exists("/tico/roms/nes/nova.nes"),
-             "and nothing whatsoever reaches the destination -- which is the whole of M3-3");
+    const QueueEntry landed = rig.Persisted(nova_id);
+    c.Expect(landed.state == QueueState::kDone, "the entry is done");
+    c.ExpectEq(landed.attempts, 1,
+               "with the spliced attempt counted against it -- the digest failing is a failed "
+               "attempt, not a free one");
+    c.Expect(rig.sandbox.Read("/tico/roms/nes/nova.nes") == FixtureRom("roms/nes/nova.nes"),
+             "and the rom at the destination is the fixture, byte for byte -- under M3-2 this "
+             "was the right length and the wrong bytes, marked done");
     c.Expect(!rig.sandbox.Exists("/tico/roms/nes/nova.nes.tmp"),
-             "the staged bytes are discarded rather than kept");
-    c.Expect(!rig.sandbox.Exists("/tico/roms/nes/nova.nes.tmp.part"),
-             "and so is the .part, so the next attempt starts clean rather than splicing the "
-             "same wrong prefix again");
+             "with nothing staged left over");
+    c.Expect(!rig.sandbox.Exists("/tico/roms/nes/nova.nes.tmp.part"), "nor any .part");
   }
 }
 
@@ -1301,6 +1330,100 @@ void Stall(checks::Checks& c, http::HttpClient& client, const std::string& base,
            "and the rom arrives, byte for byte");
 }
 
+/// What the worker does with files an interrupted attempt left on the card.
+///
+/// Three of them, and the rule is the same each time: **bytes this turn did not
+/// fetch are never trusted, only checked.** A staging file the digest recognises
+/// is worth a whole transfer and is committed; one it does not is discarded; and
+/// an in-flight file that cannot be a prefix of the rom is discarded before a
+/// request is even made. Without these the first is a needless 120 MiB, and the
+/// third is a request spent learning the server's 416.
+void Staging(checks::Checks& c, http::HttpClient& client, const std::string& base,
+             const harness::Fixture& fixture) {
+  Rig rig(c, "download-staging", base, fixture);
+
+  // 1. An in-flight file longer than the rom. It is another rom's, or another
+  // release's; resuming from it would ask for a range past the end.
+  {
+    harness::Rom rom;
+    const std::int64_t rom_id = Queued(c, client, base, fixture, &rig.queue, "240pee.nes", &rom);
+    if (rom_id == 0) {
+      return;
+    }
+    c.Expect(rig.sandbox.Write("/tico/roms/nes/240pee.nes.tmp.part",
+                               std::string(static_cast<std::size_t>(rom.size) + 4096, 'Q')),
+             "an over-long .part is on the card");
+    Watched watched(client);
+    const download::DrainResult result = rig.Drain(watched);
+    c.Expect(result.outcome == download::DrainOutcome::kCompleted,
+             std::string("the drain completes -- got ") + download::ToString(result.outcome) +
+                 " (" + result.message + ")");
+    c.ExpectEq(watched.statuses.size(), std::size_t{1}, "in one transfer");
+    if (watched.statuses.size() == 1) {
+      c.ExpectEq(watched.statuses.front(), 200,
+                 "which asked for the whole resource -- a 206 would mean the over-long file was "
+                 "resumed from, and the request spent finding out it could not be");
+    }
+    c.Expect(rig.sandbox.Read("/tico/roms/nes/240pee.nes") == FixtureRom("roms/nes/240pee.nes"),
+             "and the rom arrives, byte for byte");
+  }
+
+  // 2. A complete staging file holding the rom -- what a power cut in the window
+  // between the backend's rename and the hash leaves behind. The digest can say
+  // those bytes are the rom, and saying so is worth the whole transfer.
+  {
+    harness::Rom rom;
+    const std::int64_t rom_id = Queued(c, client, base, fixture, &rig.queue, "gb240p.gb", &rom);
+    if (rom_id == 0) {
+      return;
+    }
+    c.Expect(rig.sandbox.Write("/tico/roms/gb/gb240p.gb.tmp", FixtureRom("roms/gb/gb240p.gb")),
+             "a complete body is staged on the card");
+    Watched watched(client);
+    const download::DrainResult result = rig.Drain(watched);
+    c.Expect(result.outcome == download::DrainOutcome::kCompleted,
+             std::string("the drain completes -- got ") + download::ToString(result.outcome) +
+                 " (" + result.message + ")");
+    c.ExpectEq(watched.statuses.size(), std::size_t{0},
+               "with no transfer at all -- the bytes were already there and the digest said so");
+    c.ExpectEq(result.attempts, 1, "one request was spent, and it was the rom detail");
+    c.Expect(rig.sandbox.Read("/tico/roms/gb/gb240p.gb") == FixtureRom("roms/gb/gb240p.gb"),
+             "and the staged bytes were committed to the destination");
+    c.Expect(!rig.sandbox.Exists("/tico/roms/gb/gb240p.gb.tmp"),
+             "with the staging file consumed rather than left beside it");
+    const QueueEntry entry = rig.Persisted(rom_id);
+    c.Expect(entry.state == QueueState::kDone, "the entry is done");
+    c.Expect(entry.message.find("verified") != std::string::npos,
+             "and says so because it was checked, not because it was assumed");
+  }
+
+  // 3. A complete staging file of the right *length* holding something else --
+  // an interrupted transfer of a rom the server has since replaced. Discarded,
+  // and the rom fetched.
+  {
+    harness::Rom rom;
+    const std::int64_t rom_id = Queued(c, client, base, fixture, &rig.queue, "nova.nes", &rom);
+    if (rom_id == 0) {
+      return;
+    }
+    c.Expect(rig.sandbox.Write("/tico/roms/nes/nova.nes.tmp",
+                               std::string(static_cast<std::size_t>(rom.size), 'W')),
+             "a complete body of the right length and the wrong bytes is staged");
+    Watched watched(client);
+    const download::DrainResult result = rig.Drain(watched);
+    c.Expect(result.outcome == download::DrainOutcome::kCompleted,
+             std::string("the drain completes -- got ") + download::ToString(result.outcome) +
+                 " (" + result.message + ")");
+    c.ExpectEq(watched.statuses.size(), std::size_t{1},
+               "having fetched the rom rather than committing what was staged");
+    c.Expect(rig.sandbox.Read("/tico/roms/nes/nova.nes") == FixtureRom("roms/nes/nova.nes"),
+             "and the destination holds the fixture, byte for byte");
+    c.ExpectEq(rig.Persisted(rom_id).attempts, 0,
+               "with nothing counted against the entry -- a bad file on the card is not a "
+               "failed request");
+  }
+}
+
 void Disabled(checks::Checks& c, http::HttpClient& client, const std::string& base,
               const harness::Fixture& fixture) {
   Rig rig(c, "download-disabled", base, fixture);
@@ -1319,7 +1442,8 @@ void Disabled(checks::Checks& c, http::HttpClient& client, const std::string& ba
   c.ExpectEq(idle.attempts, 0, "having sent nothing");
   c.ExpectEq(idle.downloaded, 0, "and downloaded nothing");
   c.Expect(!rig.sandbox.Exists("/tico/roms/nes/240pee.nes"), "nothing reached the card");
-  c.Expect(!rig.sandbox.Exists("/tico/roms/nes/240pee.nes.part"), "not even a partial one");
+  c.Expect(!rig.sandbox.Exists("/tico/roms/nes/240pee.nes.tmp.part"), "not even a partial one");
+  c.Expect(!rig.sandbox.Exists("/tico/roms/nes/240pee.nes.tmp"), "nor a staged one");
 
   // The point of the criterion: it loses nothing. Both the queue in memory and
   // the file on the card still hold the entry, unchanged.
@@ -1389,8 +1513,10 @@ void Multifile(checks::Checks& c, http::HttpClient& client, const std::string& b
   // the rom's name.
   c.Expect(!rig.sandbox.Exists("/tico/roms/psx/Synthetic Two Disc Game"),
            "and no archive reaches the card under the rom's name");
-  c.Expect(!rig.sandbox.Exists("/tico/roms/psx/Synthetic Two Disc Game.part"),
+  c.Expect(!rig.sandbox.Exists("/tico/roms/psx/Synthetic Two Disc Game.tmp.part"),
            "nor a partial one");
+  c.Expect(!rig.sandbox.Exists("/tico/roms/psx/Synthetic Two Disc Game.tmp"),
+           "nor a staged one");
   c.ExpectEq(rig.queue.pending(), std::size_t{0}, "the worker has nothing left to do");
 }
 
@@ -1438,7 +1564,8 @@ void Missing(checks::Checks& c, http::HttpClient& client, const std::string& bas
            "that does not quote the rom's name back into the queue file");
   c.Expect(!rig.sandbox.Exists("/tico/roms/nes/240pee.nes"),
            "and nothing was written where a rom would have gone");
-  c.Expect(!rig.sandbox.Exists("/tico/roms/nes/240pee.nes.part"), "not even a partial one");
+  c.Expect(!rig.sandbox.Exists("/tico/roms/nes/240pee.nes.tmp.part"), "not even a partial one");
+  c.Expect(!rig.sandbox.Exists("/tico/roms/nes/240pee.nes.tmp"), "nor a staged one");
   c.ExpectEq(rig.queue.pending(), std::size_t{0}, "the worker has nothing left to do");
 
   // A rom whose `fs_name` is longer than a path may be. The fields on a
@@ -1546,6 +1673,8 @@ int main(int argc, char** argv) {
     Truncate(checks, *client, base, fixture);
   } else if (scenario == "stall") {
     Stall(checks, *client, base, fixture);
+  } else if (scenario == "staging") {
+    Staging(checks, *client, base, fixture);
   } else if (scenario == "disabled") {
     Disabled(checks, *client, base, fixture);
   } else if (scenario == "multifile") {

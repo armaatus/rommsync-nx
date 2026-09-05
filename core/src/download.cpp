@@ -299,6 +299,15 @@ struct Verification {
   std::string message;
 };
 
+/// True when there is anything to check a downloaded file against.
+///
+/// The same question in three places -- whether a rom already on the card can be
+/// recognised, whether a staged body left by a power cut can be salvaged, and
+/// whether a mismatch means anything -- so it is asked once.
+bool Checkable(const RomDetail& detail, bool verify_hash) {
+  return verify_hash && (!detail.sha1_hash.empty() || !detail.md5_hash.empty());
+}
+
 /// Hash `path` and compare it with what RomM recorded for the rom.
 ///
 /// SHA-1 when the library has one, MD5 when it has only that
@@ -1319,27 +1328,23 @@ class Drainer {
     // skipping the second is how a user is left with a broken rom and a queue
     // that says done -- so a library with no hash, or `verify_hash = false`,
     // downloads it again rather than assuming.
-    const Step present = AlreadyOnTheCard(&entry, detail);
-    if (present.outcome != DrainOutcome::kIdle) {
-      return present;
+    const std::optional<Step> present = AlreadyOnTheCard(&entry, detail);
+    if (present.has_value()) {
+      return *present;
     }
 
     // 5. The bytes.
     return Transfer(std::move(entry), detail);
   }
 
-  /// `kIdle` when the rom is not already on the card -- the one outcome no
-  /// finished entry produces, so it is unambiguous as "carry on".
+  /// Nothing when the rom is not already on the card, so the caller carries on.
   ///
   /// The size is checked first because it is free and a digest is not: hashing
   /// every candidate path would read a rom off the card per drain, and a file of
   /// the wrong length is already a no.
-  Step AlreadyOnTheCard(QueueEntry* entry, const RomDetail& detail) {
-    Step carry_on;
-    carry_on.outcome = DrainOutcome::kIdle;
-    if (!config_.downloads.verify_hash || detail.size_bytes <= 0 ||
-        (detail.sha1_hash.empty() && detail.md5_hash.empty())) {
-      return carry_on;
+  std::optional<Step> AlreadyOnTheCard(QueueEntry* entry, const RomDetail& detail) {
+    if (!Checkable(detail, config_.downloads.verify_hash) || detail.size_bytes <= 0) {
+      return std::nullopt;
     }
 
     for (const std::string& candidate :
@@ -1348,9 +1353,15 @@ class Drainer {
       if (real.empty() || FileSizeBytes(real) != detail.size_bytes) {
         continue;
       }
-      if (!Check(real, detail, true).verified) {
+      if (!Check(real, detail, config_.downloads.verify_hash).verified) {
         continue;
       }
+      // An earlier transfer's leftovers, which nothing else will ever clear: the
+      // skip returns before `Transfer`, which is what usually tidies them, and a
+      // 120 MiB orphan beside a rom that is already there is space the card does
+      // not get back on a console with no file manager.
+      std::remove(staging_.c_str());
+      DiscardPartial(staging_);
       // Where it actually is, which is not always where it would have been
       // written: a rom found in the platform's second `roms` folder belongs in
       // the entry as that path, so the queue screen names the file a user can
@@ -1360,7 +1371,7 @@ class Drainer {
       return Settle(std::move(*entry), QueueState::kDone,
                     "already on the card, with the bytes the server's hash describes");
     }
-    return carry_on;
+    return std::nullopt;
   }
 
   Verdict FetchDetail(QueueEntry* entry, RomDetail* out, Reason* why) {
@@ -1419,30 +1430,56 @@ class Drainer {
     // looked at the bytes -- so the destination is not a path it may be given
     // (download.hpp).
     target.path = staging_;
-    target.resume = config_.downloads.resume;
+    // A resume with nothing to check the seam against is a documented refusal
+    // (http.hpp), and a rom whose size the server does not know is exactly that
+    // case: `expected_size` would be zero. Asked as a `resume = false` here
+    // rather than as a failed request there -- the transfer still works, it just
+    // starts from the beginning.
+    target.resume = config_.downloads.resume && entry.size_bytes > 0;
     // Always. `truncate` sends no `Content-Length` at all, so the caller's own
     // expected size is the only thing that catches a body ending early
     // (fault_proxy.py), and it is what makes `Error::kTruncated` reachable.
     target.expected_size = static_cast<std::uint64_t>(entry.size_bytes);
 
-    // Two files an interrupted attempt can leave behind, and neither may be
-    // built on.
-    //
-    // A staged file is a *complete* body nothing verified -- left by a power cut
-    // between the backend's rename and this worker's hash. Nothing knows whose
-    // bytes those are, and it is also a destination the backend's own rename
-    // would have to replace, which Horizon's refuses (atomic_file.hpp).
-    std::remove(staging_.c_str());
     // An in-flight file longer than the rom cannot be a prefix of it: it is
     // another rom's, or another release's. Resuming from it asks for a range
     // past the end of the resource, which costs a request to find out -- the
-    // backend turns the 416 into `kTruncated` and starts over.
+    // backend turns the 416 into `kTruncated` and starts over. A *shorter* wrong
+    // prefix cannot be told apart by length, and is not meant to be: it is
+    // spliced, the digest catches it, and the retry below fetches it clean.
     const std::string in_flight = http::PartialPathFor(staging_);
     if (target.resume && entry.size_bytes > 0 && FileSizeBytes(in_flight) > entry.size_bytes) {
       std::remove(in_flight.c_str());
     }
 
+    // A staging file is a *complete* body nothing verified -- left by a power cut
+    // between the backend's rename and this worker's hash. Its name is derived
+    // from this rom's own destination, so the digest can say whether those bytes
+    // are the rom, which is a great deal cheaper than fetching 120 MiB again. If
+    // they are not, `Verify` discards them and the loop below starts clean.
+    //
+    // Only when there is a digest to ask: with nothing to check against, a body
+    // an interruption left behind is not something to commit under a rom's name.
+    if (Checkable(detail, config_.downloads.verify_hash) && entry.size_bytes > 0 &&
+        FileSizeBytes(staging_) == entry.size_bytes) {
+      const std::optional<Step> salvaged = Verify(&entry, detail, /*inherited=*/true);
+      if (salvaged.has_value()) {
+        return *salvaged;
+      }
+    }
+    // Whatever is left is bytes nothing will build on -- and it is also a
+    // destination the backend's own rename would have to replace, which
+    // Horizon's refuses (atomic_file.hpp).
+    std::remove(staging_.c_str());
+
     for (;;) {
+      // Bytes this attempt did not fetch. A body built on them and then failing
+      // its digest says nothing about the server, so it is worth one clean try;
+      // a body fetched whole and failing its digest says the server's own hash
+      // does not describe its own file, and asking again costs a rom's transfer
+      // to learn the same thing.
+      const bool inherited = target.resume && PartialBytes(staging_) > 0;
+
       entry.state = QueueState::kActive;
       // Only when the bytes are going to be built on. With `resume` off the
       // backend opens the in-flight file `"wb"` and truncates it, so counting a
@@ -1463,7 +1500,27 @@ class Drainer {
       Reason why;
       const Verdict verdict = Judge(result, &why);
       if (verdict == Verdict::kOk) {
-        return Verify(std::move(entry), detail);
+        const std::optional<Step> settled = Verify(&entry, detail, inherited);
+        if (settled.has_value()) {
+          return *settled;
+        }
+        // The digest said the bytes this built on were not the rom's. `Verify`
+        // has removed both files, so the next pass starts from zero.
+        CountAttempt(&entry);
+        if (Canceled()) {
+          return Requeue(std::move(entry),
+                         {"the download was stopped", "the download was stopped"},
+                         DrainOutcome::kCanceled);
+        }
+        if (!more) {
+          return Requeue(
+              std::move(entry),
+              {"the bytes already on the card were not this rom's; it will be fetched again",
+               "a resumed transfer failed its hash; the partial bytes were discarded"},
+              DrainOutcome::kRetryable);
+        }
+        Wait();
+        continue;
       }
       if (verdict != Verdict::kCanceled) {
         CountAttempt(&entry);
@@ -1490,17 +1547,31 @@ class Drainer {
     }
   }
 
-  /// The body is down and at `staging_`. Nothing has looked at it yet.
+  /// A complete body is at `staging_`. Nothing has looked at it yet.
   ///
   /// This is the whole of M3-3's guarantee in one function: the destination is
   /// written only after a digest matched, and a mismatch leaves neither a file
-  /// there nor bytes to resume from.
-  Step Verify(QueueEntry entry, const RomDetail& detail) {
-    entry.state = QueueState::kVerifying;
-    entry.bytes_done = FileSizeBytes(staging_);
-    entry.message.clear();
+  /// there nor bytes to build on.
+  ///
+  /// `inherited` says whether those bytes include any this turn did not fetch --
+  /// a resumed prefix, or a whole body a power cut left staged. It changes only
+  /// what a *mismatch* means. Bytes off the card that fail a digest say nothing
+  /// about the server, so this returns **nothing**, having discarded them, and
+  /// the caller fetches the rom clean. Bytes fetched whole that fail a digest
+  /// say the server's own hash does not describe its own file, which asking
+  /// again cannot change: that is `kFailed`.
+  ///
+  /// The hash is not interruptible. `http::CancelToken` is polled by the backend
+  /// during a transfer and by `Drain` between entries, so a stop that lands here
+  /// waits out one file -- seconds for a 120 MiB rom off a card. Making it
+  /// finer would put cancellation into `crypto::StreamFile`, which
+  /// `state::HashFile` also uses and has no cancel to offer.
+  std::optional<Step> Verify(QueueEntry* entry, const RomDetail& detail, bool inherited) {
+    entry->state = QueueState::kVerifying;
+    entry->bytes_done = FileSizeBytes(staging_);
+    entry->message.clear();
     Step step;
-    if (Persist(entry, &step) != Written::kOk) {
+    if (Persist(*entry, &step) != Written::kOk) {
       // The user dequeued it, or the queue could not be written. Either way
       // nothing will record this download, and a complete body under a name no
       // entry mentions is an orphan the console has no file manager to find.
@@ -1515,12 +1586,18 @@ class Drainer {
       // the same wrong file.
       std::remove(staging_.c_str());
       DiscardPartial(staging_);
-      entry.bytes_done = 0;
-      // Terminal rather than retried: a server whose bytes disagree with its own
-      // recorded hash answers the same way next time, and finding that out costs
-      // a whole rom's transfer per round.
-      return Settle(std::move(entry), QueueState::kFailed, checked.message);
+      entry->bytes_done = 0;
+      if (inherited) {
+        return std::nullopt;
+      }
+      return Settle(std::move(*entry), QueueState::kFailed, checked.message);
     }
+
+    // Asked before the commit, because afterwards there is no telling: this is
+    // the one failure that can cost a file the card already had, and saying so
+    // is the difference between a user looking under `.old` and one wondering
+    // where their rom went.
+    const bool replacing = io::Exists(destination_);
 
     // The two renames Horizon needs, and the reason the commit is here rather
     // than in the backend (atomic_file.hpp): `fsFsRenameFile` refuses a
@@ -1529,17 +1606,23 @@ class Drainer {
     const io::WriteResult committed = io::CommitStaged(staging_, destination_);
     if (!committed.ok()) {
       // `CommitStaged` consumes the staged file either way, so there is nothing
-      // left to resume from. A card that refuses a rename is the class of
-      // failure `Judge` already calls fatal for `http::Error::kWriteFailed`: a
-      // mapped folder that has gone away does not come back by trying again.
+      // left to build on. A card that refuses a rename is the class of failure
+      // `Judge` already calls fatal for `http::Error::kWriteFailed`: a mapped
+      // folder that has gone away does not come back by trying again.
       DiscardPartial(staging_);
-      entry.bytes_done = 0;
-      return Settle(std::move(entry), QueueState::kFailed,
-                    "the rom arrived and was checked, and could not be moved into place");
+      entry->bytes_done = 0;
+      // The sentence names no path, because `QueueEntry::message` never carries
+      // an `fs_name` and `PreviousPathFor` is built from one. It says which name
+      // to look under instead, which is what a user actually needs.
+      std::string why = "the rom arrived and was checked, and could not be moved into place";
+      if (replacing) {
+        why += "; the copy that was already there may be beside it under a .old name";
+      }
+      return Settle(std::move(*entry), QueueState::kFailed, std::move(why));
     }
 
-    entry.bytes_done = FileSizeBytes(destination_);
-    return Settle(std::move(entry), QueueState::kDone, checked.message);
+    entry->bytes_done = FileSizeBytes(destination_);
+    return Settle(std::move(*entry), QueueState::kDone, checked.message);
   }
 
   http::HttpClient& client_;

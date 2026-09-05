@@ -148,7 +148,6 @@ add_executable(test_sha1 test_sha1.cpp)
 target_link_libraries(test_sha1 PRIVATE rommsync::core)
 target_include_directories(test_sha1 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(test_sha1 PRIVATE
-  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
   ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
   ROMMSYNC_LIBRARY_DIR="${CMAKE_SOURCE_DIR}/server/testing/library")
 add_test(NAME core.sha1 COMMAND test_sha1 vectors)
@@ -877,6 +876,7 @@ set(DOWNLOAD_RIG_SCENARIOS
   fallback   # M3-3: md5_hash when there is no sha1, and unverified when neither
   truncate   # M3-3: a body that ends early, caught by the caller's expected size
   stall      # M3-3: the client's own stall_timeout ends it, and the entry retries
+  staging    # M3-3: a leftover .tmp is salvaged by its digest, or discarded
   disabled   # `[downloads] enabled = false` drains nothing and loses nothing
   multifile  # a disc set is refused with a reason and no archive reaches the card
   missing    # a rom the server's library no longer holds fails with a sentence

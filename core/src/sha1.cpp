@@ -147,13 +147,6 @@ std::string Sha1(std::string_view data) {
 
 std::string Sha1Hex(std::string_view data) { return ToHex(Sha1(data)); }
 
-std::string Sha1FileHex(const std::string& path) {
-  Sha1Hasher hasher;
-  bool opened = false;
-  if (!StreamFile(path, hasher, &opened)) {
-    return {};
-  }
-  return hasher.FinishHex();
-}
+std::string Sha1FileHex(const std::string& path) { return FileHex<Sha1Hasher>(path); }
 
 }  // namespace rommsync::crypto
