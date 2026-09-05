@@ -76,4 +76,16 @@ std::string Md5(std::string_view data);
 /// out uppercase, and an uppercase digest matches nothing on the server.
 std::string Md5Hex(std::string_view data);
 
+/// Stream `path` through MD5 and answer 32 lowercase hex characters.
+///
+/// `crypto::Sha1FileHex`'s twin, and here for the same caller: a rom whose
+/// library has no `sha1_hash` is verified against its `md5_hash` instead
+/// (download.hpp). Chunked through `crypto::StreamFile` rather than read whole,
+/// for the reason that header gives.
+///
+/// **Empty when the file could not be read to the end**, which no digest can
+/// collide with. A caller that needs to say *why* uses `crypto::StreamFile`
+/// directly -- `state::HashFile` is the one that does.
+std::string Md5FileHex(const std::string& path);
+
 }  // namespace rommsync::crypto

@@ -5,6 +5,7 @@
 #include <string>
 #include <string_view>
 
+#include "rommsync/hash_file.hpp"
 #include "rommsync/sha256.hpp"  // crypto::ToHex
 
 namespace rommsync::crypto {
@@ -164,5 +165,14 @@ std::string Md5(std::string_view data) {
 }
 
 std::string Md5Hex(std::string_view data) { return ToHex(Md5(data)); }
+
+std::string Md5FileHex(const std::string& path) {
+  Md5Hasher hasher;
+  bool opened = false;
+  if (!StreamFile(path, hasher, &opened)) {
+    return {};
+  }
+  return hasher.FinishHex();
+}
 
 }  // namespace rommsync::crypto

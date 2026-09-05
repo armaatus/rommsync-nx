@@ -17,7 +17,7 @@ conflict_show = true               ; surface conflicts in the overlay
 
 [downloads]
 enabled       = true
-verify_hash   = true               ; check sha1 after download
+verify_hash   = true               ; check sha1 (or md5) after download
 resume        = true
 
 ; Platform folder map: RomM platform_fs_slug -> SD folders.

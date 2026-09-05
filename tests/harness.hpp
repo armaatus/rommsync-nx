@@ -432,6 +432,14 @@ struct Rom {
   /// detail one, so a client can skip without a second call per rom.
   bool has_multiple_files = false;
 
+  /// The digests RomM's scan recorded, lowercase hex, or empty for a library
+  /// that has none. Both are on the list schema too. A scenario that has to hand
+  /// the worker a *wrong* hash needs the right one to build the wrong one from,
+  /// and taking it from the server rather than from a literal is what keeps this
+  /// honest when the fixture library is re-seeded.
+  std::string sha1_hash;
+  std::string md5_hash;
+
   std::vector<RomFile> files;
 
   /// `GET` path for the whole rom. For a multi-file rom this is a zip RomM
@@ -464,6 +472,8 @@ inline bool FindRom(http::HttpClient& client, const std::string& base, const Fix
     out->size = Number(item, "fs_size_bytes");
     const json::Value* multi = item.Find("has_multiple_files");
     out->has_multiple_files = multi != nullptr && multi->boolean();
+    out->sha1_hash = Field(item, "sha1_hash");
+    out->md5_hash = Field(item, "md5_hash");
     if (out->id == 0) {
       return false;
     }

@@ -139,6 +139,25 @@ target_link_libraries(test_md5 PRIVATE rommsync::core)
 target_include_directories(test_md5 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 add_test(NAME core.md5 COMMAND test_md5)
 
+# SHA-1, against RFC 3174's own vectors. The digest RomM records for a *rom*, so
+# a wrong one is 40 plausible hex characters that either refuse every download or
+# accept every corrupt one. `vectors` is pure arithmetic and never skips;
+# `fixture` streams the 126 MB seeded rom and skips when the library has not been
+# fetched, the same way every rig scenario does.
+add_executable(test_sha1 test_sha1.cpp)
+target_link_libraries(test_sha1 PRIVATE rommsync::core)
+target_include_directories(test_sha1 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_sha1 PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_LIBRARY_DIR="${CMAKE_SOURCE_DIR}/server/testing/library")
+add_test(NAME core.sha1 COMMAND test_sha1 vectors)
+add_test(NAME core.sha1_fixture COMMAND test_sha1 fixture)
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(core.sha1_fixture PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+set_tests_properties(core.sha1_fixture PROPERTIES TIMEOUT 120)
+
 # `state.db`: the format, the commit-window recovery, and the re-hash it skips.
 # One temp directory and no network, so it never skips either -- the guarantee
 # it checks is that a lost baseline costs a tick of hashing and never a wrong
@@ -854,6 +873,10 @@ endforeach()
 set(DOWNLOAD_RIG_SCENARIOS
   drain      # the seeded 240pee.nes, byte-for-byte at the mapped destination
   retries    # a 500 leaves the entry queued with attempts up and backoff spent
+  verify     # M3-3: a wrong sha1_hash fails the entry and leaves nothing behind
+  fallback   # M3-3: md5_hash when there is no sha1, and unverified when neither
+  truncate   # M3-3: a body that ends early, caught by the caller's expected size
+  stall      # M3-3: the client's own stall_timeout ends it, and the entry retries
   disabled   # `[downloads] enabled = false` drains nothing and loses nothing
   multifile  # a disc set is refused with a reason and no archive reaches the card
   missing    # a rom the server's library no longer holds fails with a sentence
