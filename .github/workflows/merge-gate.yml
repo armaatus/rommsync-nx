@@ -82,5 +82,14 @@ jobs:
 
       - name: Decide
         run: |
+          set -euo pipefail
+          # The base branch may not have the gate yet -- on the pull request that
+          # introduces it, and on any PR opened from a base predating it. That is
+          # not an error to hide behind a Python traceback: it is a PR a person
+          # merges, for exactly the reason the gate exists. Say so.
+          if [ ! -f .github/scripts/merge_gate.py ]; then
+            echo "::error title=Human merge required::${{ github.event.pull_request.base.ref }} does not have .github/scripts/merge_gate.py yet, so there is no agreed rule to judge this PR by. A repository admin merges it by hand; every PR opened after it will be gated normally."
+            exit 1
+          fi
           python3 .github/scripts/merge_gate.py \
             "${{ github.event.pull_request.head.sha }}" pr.json files.txt
