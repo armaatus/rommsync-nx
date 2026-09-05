@@ -97,7 +97,7 @@ that demonstrates it. A box checked because someone believes it is not checked.
 | 1 | The engine builds on a laptop with warnings as errors, and the same `core/` sources still build for Horizon — compiled and linked, not just parsed. | `cmake --build build`; CI `switch-build` (a real devkitA64 build of both targets, checked to be a PFS0 and an `ULTR`-signed `.ovl`); `switch.builds`, `switch.ci_requires_artifacts` |
 | 2 | One command brings up a real RomM 5.2.0 on a throwaway volume, isolated per worktree. | `scripts/orca/compose.sh up -d`; `rig.smoke`; `orca.env_*` |
 | 3 | That fixture is *usable*, not merely running: library scanned, collection created, client token minted with no human in the loop. | `rig.provisioned`; [`provision.py`](../server/testing/provision.py) |
-| 4 | The failure paths a healthy RomM will not produce on demand can be forced, deterministically, in CI. | `http.status`, `http.truncate`, `http.drop`, `http.stall`, `pair.stall`, `pair.drop` |
+| 4 | The failure paths a healthy RomM will not produce on demand can be forced, deterministically, in CI. | `http.status`, `http.truncate`, `http.drop`, `http.stall`, `pair.stall`, `pair.drop`, and the whole `harness.*` set |
 | 5 | Nothing in the engine names a transport: every network call goes through `HttpClient`. | CI `static` → *core/ includes nothing platform-specific* |
 | 6 | The response shapes the docs quote are the ones a live RomM returns, and the structs read those same bytes. | `contract.captures`, `auth.shapes`, `device.shapes` |
 | 7 | An unreachable fixture turns CI red rather than skipping it. | `-DROMMSYNC_REQUIRE_RIG=ON` in [`ci.yml`](../.github/workflows/ci.yml) |
@@ -171,15 +171,23 @@ which were watched taking ~50s. Time the test yourself.
 - **The engine edge cases in M0-5's wording.** Conflict, partial failure and
   multi-file skip are behaviours of code M2 and M3 have not written yet. What M0
   owes is the *mechanism* that forces them and proof the mechanism works
-  (`http.*`, `pair.*`); each edge case is then covered by the milestone that
-  implements the behaviour.
+  (`http.*`, `pair.*`, `harness.*`); each edge case is then covered by the
+  milestone that implements the behaviour. M0-5 has since landed on exactly that
+  line: `harness.*` produces every one of those cases on demand and pins what the
+  *server* does in each, and the client's response to them stays M2-5's and
+  M2-7's to write — against a harness that is already there to write it in.
 
 ### Where it stands
 
 All nine rows hold as this page is written: the full suite green, CI green on
 `main`, and row 8 newly machine-checked rather than asserted. That is what M1
-started on. M0-1 and M0-5 are still open, and that is the section above rather
-than a hole in the gate — they are exactly the parts it does not wait for.
+started on. M0-1 is still open, and that is the section above rather than a hole
+in the gate — it is exactly the part the gate does not wait for.
+
+Row 4 got stronger after that. M0-5 landed the host harness and the `harness.*`
+scenarios, so the row's claim is no longer demonstrated only by the transport
+tests that force a fault: every edge case in M0-5's table now has a test that
+produces it deterministically, against the real server, on every run.
 
 Row 1 got stronger while this page was in review. M0-3 landed the two devkitPro
 Makefiles, so `switch-build` now compiles and links both Switch targets for real
@@ -283,6 +291,40 @@ ctest --test-dir build --output-on-failure
   200 and no hint that a field was ignored. That is the failure the typed struct
   exists to prevent, and it is the reason these are rig tests and not unit tests.
   `understood` deletes the save it made, so the fixture is left as it was found.
+- The `harness.*` scenarios (M0-5) are the same idea applied to the *edge cases*:
+  every row of that issue's table, forced deterministically against the real
+  server. `expired` (a 401 arriving mid-flow, and that it is a response rather
+  than a transport error — and not a verdict on the pairing), `conflict` and
+  `same_timestamp` (both of the two reasons a conflict arrives with, arranged
+  for real rather than asserted from the docs), `partial` (the second of three
+  uploads fails; the session records the accurate counts and the failed one left
+  nothing behind), `resume` (a TCP reset four megabytes into the 120 MiB seeded
+  rom, then a `Range` resume, compared **byte for byte** against the file RomM
+  is serving), `truncate` (a clean short body over a save — caught only by the
+  caller's own expected size, which the scenario proves by showing the same body
+  accepted without one), `stall`, `multifile`, and `backup`.
+- Two of them are about the harness rather than the engine, and they are the
+  ones that keep the rest honest. `harness.sandbox` needs no server and never
+  skips: it covers the per-test SD card (`tests/harness.hpp`), which maps the
+  SD-root paths the engine actually names onto a temp directory, is torn down
+  when the test ends, and **audits itself** — a seeded save whose bytes changed
+  with no backup of the previous bytes under `.backup/` fails the test whether or
+  not it thought to look, including when the overwrite was interrupted half way.
+  That is the hard rule made structural instead of remembered, and the scenario
+  checks the audit fires for each way of getting it wrong, the commonest being a
+  backup taken *after* the write. `harness.disarms` covers the other one: an
+  armed fault cannot outlive the scope that armed it, and a spec the proxy
+  refuses fails the test rather than letting it run unarmed.
+- `harness.backup` is where "back up **first**" is separated from "back up
+  eventually", and the only way to tell them apart is to interrupt the
+  overwrite: the download is cut mid-body, the save is untouched because
+  `Download` stages to `.part`, and the copy that would have been destroyed is
+  already safe. Two findings came out of writing these and are recorded where
+  they matter rather than here: a slot upload gets a datetime tag, so a second
+  `POST /api/saves` is a *new* save row with no sync history whatever
+  `overwrite` says (only `PUT /api/saves/{id}` moves a row forward), and the
+  documented backup path collides for two saves of one rom in the same second
+  ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#step-2--execute-the-plan)).
 - `auth.scopes` reads the scope list out of
   [API_CONTRACT.md](API_CONTRACT.md#scopes-to-request) and compares it to
   `MinimumScopes()`. Editing the document without editing the code, or the other

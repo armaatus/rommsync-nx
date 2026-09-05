@@ -430,9 +430,9 @@ tells the client to upload. See
 |---|---|---|
 | GET | `/api/roms` | paged; filters incl. `collection_id`, `platform_ids`, `search_term`, `limit`, `offset`, `order_by` |
 | GET | `/api/roms/{id}` | `DetailedRomSchema` |
-| GET | `/api/roms/{id}/content/{file_name}` | download a single-file rom (`fs_name`) |
+| GET | `/api/roms/{id}/content/{file_name}` | download a single-file rom (`fs_name`) — a **zip** for a multi-file one, see below |
 | GET | `/api/roms/{id}/files` | list files of a multi-file rom |
-| GET | `/api/roms/{id}/files/content/{file_name}` | download one file of a multi-file rom |
+| GET | `/api/roms/{id}/files/content/{file_name}` | download one file — `{id}` is the **RomFile** id, not the rom's |
 | GET | `/api/collections` | user collections (curate a "Switch" collection to mirror) |
 | HEAD | `/api/roms/{id}/content/{file_name}` | size / resume checks |
 
@@ -447,6 +447,27 @@ has_simple_single_file, has_nested_single_file, files, name, missing_from_fs`.
 An unscanned or metadata-less library leaves most of the ~70 other fields
 `null` — the capture is from a fixture with no metadata providers, which is the
 worst case the client must survive.
+
+### Multi-file roms, and the two things that are not what they look like
+
+Verified against a live 5.2.0 by `harness.multifile`:
+
+- `GET /api/roms/{id}/content/{file_name}` on a rom with `has_multiple_files`
+  does **not** serve a rom. It serves a zip RomM builds on the fly, with
+  `Content-Type: application/zip` and **no `Content-Length`** — so a client that
+  treats it like any other rom writes an archive to the SD under the rom's name
+  and has nothing to verify its length against. This is a large part of why
+  multi-file roms are skipped rather than downloaded (M3-4).
+- In `GET /api/roms/{id}/files/content/{file_name}` the `{id}` is the
+  **`files[].id`**, not the rom id, and the `{file_name}` segment selects
+  nothing at all — it only decorates the download name. Building that URL from a
+  rom id and a file name returns `200` and the bytes of whatever file happens to
+  carry that id: the wrong disc, with no error to notice. Take the id from
+  `files[]`.
+
+`has_multiple_files` is on the **list** schema as well as the detail one, so a
+client can decide to skip without a second call per rom. `files[]` is not: it is
+present and always empty on the list, and only `GET /api/roms/{id}` fills it.
 
 ### Platform → folder mapping
 
