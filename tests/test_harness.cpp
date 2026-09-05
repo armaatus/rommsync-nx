@@ -585,8 +585,15 @@ void Partial(rig::Checks& checks, http::HttpClient& client, const std::string& b
   // for every guess, so the state goes in the failure message.
   const http::Result before = client.Send(harness::Authed(
       http::Method::kGet, base + "/api/sync/sessions/" + std::to_string(session_id), fixture));
+  // ...and every session this device has, because the only thing known to
+  // cancel one is another negotiate for the same device. Locally this scenario
+  // creates exactly ONE session and it ends COMPLETED with 2 of 3 done; if CI
+  // shows a second, the negotiate happened twice and that is the whole answer.
+  const http::Result all = client.Send(harness::Authed(
+      http::Method::kGet, base + "/api/sync/sessions", fixture));
   const std::string state = "session " + std::to_string(session_id) + " before complete: HTTP " +
-                            std::to_string(before.response.status) + " " + before.response.body;
+                            std::to_string(before.response.status) + " " + before.response.body +
+                            " | all sessions: " + all.response.body;
 
   const http::Result done = harness::Complete(client, base, fixture, session_id, completed, failed);
   checks.ExpectEq(done.response.status, 200, "the session completes -- " + state);
