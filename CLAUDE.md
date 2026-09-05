@@ -107,15 +107,36 @@ serialising to avoid.
 - Match the surrounding code's naming and comment density. Comments explain
   *why*, not *what*.
 
+## The tracker is the spec
+
+Every issue carries **Goal / Scope / Design notes / Acceptance** — #5 and #40 are
+the standard. Read yours in full before starting; it is meant to be sufficient.
+
+It stays sufficient only if you maintain it. When the work turns up something the
+issue did not know — an endpoint that differs from the pinned contract, scope a
+closed issue already shipped, a constraint the code imposes — **edit the affected
+issue as you find it**, including issues other than your own. Three agents in
+three worktrees cannot see each other's findings; these bodies are the only
+channel between them, and a stale one makes the next agent re-derive or
+contradict a decision already made.
+
+Never hand-edit the `blocked`/`ready` labels — `.github/workflows/unblock.yml`
+derives them from the `Blocked by #N` lines below the `<!-- blockers -->` marker.
+Those lines *are* editable, and a genuinely missing dependency should be added,
+but changing one changes what other agents may start: do it deliberately, alone,
+and say so in the PR body. Never edit them as a side effect of rewording a body.
+
 ## Finishing a task
 
 1. `ctest --test-dir build --output-on-failure` is green, and your change has a
    test that would have failed before it.
 2. **Run `/code-review` on your own branch** and put the findings in the PR body.
    This is required, not optional — it is what makes a human review tractable.
-3. Open a PR with `Closes #N` for your issue. A workflow uses that line to
+3. Any issue your findings invalidated is edited, and the PR body says which and
+   why.
+4. Open a PR with `Closes #N` for your issue. A workflow uses that line to
    unblock dependent issues, so the wording matters.
-4. A human merges. Do not merge your own PR.
+5. A human merges. Do not merge your own PR.
 
 ## Layout
 
