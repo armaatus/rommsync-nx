@@ -172,10 +172,12 @@ which puts every later comparison in the no-sync-history branch above.
 `no_op` reports `0` planned against however many you completed; that is not an
 error.
 
-Then persist the new per-save `{content_hash, mtime, server_updated_at,
-server_content_hash}` to `state.db`. That stored baseline is how the *next* tick
-skips work — the server arbitrates, but the client still has to know which local
-files are worth re-hashing.
+Then persist the new per-save `{content_hash, mtime, file_size_bytes,
+server_updated_at, server_content_hash}` to `state.db`. That stored baseline is
+how the *next* tick skips work — the server arbitrates, but the client still has
+to know which local files are worth re-hashing. The format, the reader and the
+writer are `core/include/rommsync/state_db.hpp`: a version line and one JSON
+object per `(rom_id, slot)`, written with `io::WriteAtomically`.
 
 ## Change detection between ticks
 
@@ -183,6 +185,20 @@ The negotiate call already computes the plan server-side, so the client can send
 all saves every tick and let the server decide. `state.db` is an optimization:
 skip re-hashing unchanged files (mtime+size match the stored baseline) to keep
 ticks cheap on large libraries.
+
+Both, not either — `state::ContentHashFor` reuses a stored digest only when the
+mtime *and* the size still match. A same-size overwrite inside one second is
+caught by neither alone, and an emulator that restores mtimes is caught only by
+the size.
+
+**Skipping the hash is not skipping the report.** A save whose file was not
+re-read still carries its stored `content_hash` into the payload. A save reported
+without one is a save the server compares on timestamps alone, which plans an
+upload for bytes it already has — every tick, forever.
+
+A `state.db` that is missing, truncated or corrupt is an empty baseline plus a
+diagnostic, and the tick hashes everything. It is never a reason to refuse to
+sync: a lost baseline costs time, not correctness.
 
 ## Save states
 

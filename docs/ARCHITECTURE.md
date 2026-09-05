@@ -59,7 +59,13 @@ overlay.
   once and kept for the life of the SD. Separate from `token.dat` because it has
   to survive a re-pair ([AUTH.md](AUTH.md#client-identifier)).
 - `sdmc:/config/rommsync/state.db` — last-synced hash/mtime per (rom, slot) so the
-  client can tell which side changed. Small SQLite or a flat file.
+  client can tell which side changed. A **flat, line-oriented file**: a version
+  line, then one JSON object per row (`core/include/rommsync/state_db.hpp`).
+  Not SQLite — `core/` may include only standard and `rommsync/` headers, so it
+  is not linkable from the portable engine, and a sysmodule heap does not want
+  it. It is an optimisation and never a gate: a missing, truncated or corrupt
+  file yields an empty baseline and a diagnostic, and the tick hashes
+  everything.
 - `sdmc:/config/rommsync/queue.json` — pending downloads.
 - `sdmc:/config/rommsync/.backup/` — pre-overwrite copies of saves on conflict.
 
@@ -72,7 +78,8 @@ token/state to avoid races — the overlay asks it to change things via IPC.
 scheduler fires
   → engine scans SD save/state dirs (per CONFIG folder map)
   → match each file to a rom_id (fs_name_no_ext, platform-scoped)
-  → hash (SHA1) each; build SyncNegotiatePayload.saves[]
+  → hash (MD5) each, reusing state.db's digest when mtime+size match
+  → build SyncNegotiatePayload.saves[]
   → POST /api/sync/negotiate  → {session_id, operations[]}
   → for each op:
         upload   → POST /api/saves (multipart saveFile)
