@@ -80,9 +80,16 @@ OUT_DIR="${OUT_DIR:-$REPO_ROOT/dist}"
 # --- what the archive is called, and what it installs as ----------------------
 
 # Read the same way CMakeLists.txt and switch.mk read it, so one file is the
-# only place a version is written down.
-VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION" 2>/dev/null || true)"
+# only place a version is written down: the first line, stripped. Stripped and
+# not squeezed -- `0.1.0 rc` would otherwise become the filename
+# rommsync-nx-0.1.0rc.zip, which is a release nobody asked for and nothing
+# reports. It is a filename component, so anything left inside it is refused.
+VERSION="$(sed -n '1{s/^[[:space:]]*//;s/[[:space:]]*$//;p;}' "$REPO_ROOT/VERSION" \
+           2>/dev/null || true)"
 [ -n "$VERSION" ] || die "could not read a version from $REPO_ROOT/VERSION"
+case "$VERSION" in
+  *[[:space:]]*|*/*) die "version '$VERSION' is not usable in a file name" ;;
+esac
 
 # `"title_id"` and not `title_id_range_min`/`_max`, which sit beside it with the
 # same value today and are a different setting. Anchored on the quoted key for
@@ -113,6 +120,20 @@ if [ "$LIST_ONLY" -eq 1 ]; then
 fi
 
 command -v zip >/dev/null 2>&1 || die "zip is not installed"
+
+mkdir -p "$OUT_DIR"
+OUT_DIR="$(cd "$OUT_DIR" && pwd)"
+ZIP="$OUT_DIR/rommsync-nx-$VERSION.zip"
+
+# Before the checks below and not after them, so a refused run leaves no archive
+# at all rather than the previous run's. A stale zip under the name this build
+# was supposed to write is the worse of the two failures: it is the file a
+# release job would pick up, and nothing about it says it is a build old enough
+# to predate whatever the refusal was about.
+#
+# It also means zip never opens an existing archive: it merges into one it can
+# read, which would keep an entry a previous layout had.
+rm -f "$ZIP"
 
 # --- refuse to ship something that is not what it claims to be ----------------
 #
@@ -162,18 +183,11 @@ sed -e "s/@VERSION@/$VERSION/g" -e "s/@TITLE_ID@/$TITLE_ID/g" \
 # every entry, including the ones copied out of the worktree.
 ( cd "$STAGE" && chmod 644 "${ENTRIES[@]}" && touch -t "$FIXED_TIMESTAMP" "${ENTRIES[@]}" )
 
-mkdir -p "$OUT_DIR"
-OUT_DIR="$(cd "$OUT_DIR" && pwd)"
-ZIP="$OUT_DIR/rommsync-nx-$VERSION.zip"
-
 # -X drops the extra fields (unix uid/gid, the high-resolution timestamp) that
 # would otherwise differ between two runs; -D writes no directory entries, so
 # there is nothing in the archive but the five files named above; and the file
 # list is given explicitly, so the order is the one above rather than whatever
-# the filesystem hands back. An existing archive is removed rather than updated
-# -- zip merges into one it can open, which would keep an entry a previous
-# layout had.
-rm -f "$ZIP"
+# the filesystem hands back.
 ( cd "$STAGE" && zip -X -D -q "$ZIP" "${ENTRIES[@]}" )
 
 # The manifest. docs/INSTALL.md (#35) is checked against these paths rather than

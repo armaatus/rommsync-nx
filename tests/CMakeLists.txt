@@ -787,9 +787,18 @@ endforeach()
 
 # The real cross-compile, packaged inside the same container #34's release job
 # will use. Same image as switch.builds, and its SKIP_RETURN_CODE is left
-# unwrapped for the same recorded reason: the CI host runner has no
-# devkitpro/devkita64 and will not pull 2.7GB for one, and the enforcement lives
-# in the `switch-build` job rather than here.
+# unwrapped for the same reason: the CI host runner has no devkitpro/devkita64
+# and will not pull 2.7GB for one, so wrapping it in if(NOT ROMMSYNC_REQUIRE_RIG)
+# like the other skippable entries would make the host-tests job red on every
+# runner it uses.
+#
+# Unlike switch.builds, this one has NO equivalent in CI yet: `switch-build`
+# builds the three targets and checks their magic bytes, but nothing there runs
+# scripts/package.sh, so today the packaging is only ever exercised here. #34
+# adds the release job that packages on a tag and carries a note asking for a
+# package step in `switch-build` too; until one of those lands, a failure that
+# is specific to packaging in the container -- a missing `zip`, say -- would
+# first appear on a tag. Read this before deciding the coverage is elsewhere.
 add_test(NAME package.builds
          COMMAND "${BASH_PROGRAM}" "${PACKAGE_TEST}" builds)
 set_tests_properties(package.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)

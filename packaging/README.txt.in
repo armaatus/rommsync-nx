@@ -13,11 +13,17 @@ INSTALL
 -------
 
 Unzip this archive onto the ROOT of your SD card, keeping the folder
-structure. It merges with what is already there and touches nothing else:
+structure. It merges with what is already there, adding five files and
+changing nothing else:
 
   atmosphere/contents/@TITLE_ID@/exefs.nsp   the sysmodule
   switch/.overlays/ovl-rommsync.ovl                the overlay
   config/rommsync/config.ini.example               a starting configuration
+  README.txt                                       this file
+  LICENSE
+
+Note the last two: they land at the ROOT of the card under those names, so an
+unrelated README.txt or LICENSE already sitting there is replaced.
 
 Then, in order:
 
@@ -34,20 +40,22 @@ Then, in order:
 UPGRADING
 ---------
 
-Unzip a newer release over the top. Only the three files above are replaced.
-config.ini, token.dat, device.dat, state.db and queue.json are not in this
-archive, so your settings, your pairing and your sync state survive.
+Unzip a newer release over the top. The only files replaced are the five
+listed above. config.ini, token.dat, device.dat, state.db and queue.json are
+not in the archive, so your settings, your pairing and your sync state
+survive.
 
 
 THE FULL GUIDE
 --------------
 
-Install, pairing, the folder map and troubleshooting:
+Start here; this page exists for every release:
+
+  https://github.com/armaatus/rommsync-nx#readme
+
+Install and pairing, step by step, and the configuration reference:
 
   https://github.com/armaatus/rommsync-nx/blob/main/docs/INSTALL.md
-
-Configuration reference:
-
   https://github.com/armaatus/rommsync-nx/blob/main/docs/CONFIG.md
 
 
