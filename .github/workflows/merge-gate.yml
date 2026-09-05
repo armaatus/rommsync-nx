@@ -49,6 +49,14 @@ jobs:
     concurrency:
       group: merge-gate-${{ github.event.pull_request.number }}
       cancel-in-progress: true
+    # Explicitly read-only, overriding the workflow block. `clear-stale` needs
+    # `actions: write`; this job does not, and it is the one that reads a pull
+    # request's contents. Without this it inherits that write scope for no
+    # reason -- and it is precisely the job whose base-ref checkout exists to
+    # keep a PR from running anything with elevated capability.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       # The BASE branch's copy of the gate, never the PR's. On a pull_request
       # event actions/checkout defaults to the merge ref, which means the script
@@ -112,7 +120,13 @@ jobs:
     needs: gate
     if: success()
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Has to cover N stale runs, not one. Most PRs arrive with two (`opened`
+    # fails with no review yet, then the body edit fails again), and the loop
+    # below waits for each to finish before starting the next. At 5 minutes
+    # total with a 5-minute per-item wait, the job could be killed by its own
+    # timeout before reaching the second -- leaving a check unclear and the PR
+    # back at the BLOCKED state this whole job exists to prevent.
+    timeout-minutes: 20
     permissions:
       contents: read
       actions: write
@@ -171,14 +185,17 @@ jobs:
               echo "::warning title=Stale gate not cleared::run $run; clear it with: gh run rerun $run"
               continue
             fi
+            # 150s per item against a 20-minute job budget: room for seven
+            # stale runs, where two is the common case and the gate itself
+            # takes seconds.
             waited=0
-            while [ "$waited" -lt 300 ]; do
+            while [ "$waited" -lt 150 ]; do
               status="$(gh run view "$run" --repo "$NWO" --json status --jq .status 2>/dev/null || echo "")"
               [ "$status" = "completed" ] && break
               sleep 10
               waited=$((waited + 10))
             done
-            if [ "$waited" -ge 300 ]; then
-              echo "::warning title=Stale gate still running::run $run did not finish in 5 minutes; the next re-run may cancel it"
+            if [ "$waited" -ge 150 ]; then
+              echo "::warning title=Stale gate still running::run $run did not finish in 150s; the next re-run may cancel it"
             fi
           done
