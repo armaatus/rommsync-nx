@@ -217,6 +217,12 @@ constexpr SyncOutcome kAllSyncOutcomes[] = {
     SyncOutcome::kUnauthenticated, SyncOutcome::kDisabled,
 };
 
+constexpr WriteOutcome kAllWriteOutcomes[] = {
+    WriteOutcome::kApplied,
+    WriteOutcome::kInvalid,
+    WriteOutcome::kWriteFailed,
+};
+
 constexpr ListKind kAllListKinds[] = {
     ListKind::kPlatforms,
     ListKind::kRoms,
@@ -467,14 +473,6 @@ std::vector<config::Diagnostic> TrimDiagnostics(
 
 // --- the command table --------------------------------------------------------
 
-const Command kAllCommands[14] = {
-    Command::kGetInterfaceVersion, Command::kGetStatus,  Command::kGetConfig,
-    Command::kSetConfig,           Command::kSetEnabled, Command::kSyncNow,
-    Command::kStartPair,           Command::kGetPairState, Command::kUnpair,
-    Command::kEnqueue,             Command::kDequeue,    Command::kListBegin,
-    Command::kListNext,            Command::kListEnd,
-};
-
 const char* ToString(Command command) {
   switch (command) {
     case Command::kGetInterfaceVersion:
@@ -613,6 +611,18 @@ const char* ToString(SyncOutcome outcome) {
       return "disabled";
   }
   return "accepted";
+}
+
+const char* ToString(WriteOutcome outcome) {
+  switch (outcome) {
+    case WriteOutcome::kApplied:
+      return "applied";
+    case WriteOutcome::kInvalid:
+      return "invalid";
+    case WriteOutcome::kWriteFailed:
+      return "write_failed";
+  }
+  return "write_failed";
 }
 
 const char* ToString(ListKind kind) {
@@ -835,19 +845,43 @@ Decoded<ConfigView> DecodeConfigView(std::string_view text) {
       });
 }
 
-std::string EncodeDiagnostics(const std::vector<config::Diagnostic>& diagnostics) {
+std::string EncodeConfigResult(const ConfigResult& result) {
   std::string out("{");
-  AppendKey(&out, "diagnostics", /*first=*/true);
-  out += EncodeDiagnosticArray(diagnostics);
+  AppendText(&out, "outcome", ToString(result.outcome), /*first=*/true);
+  AppendKey(&out, "diagnostics");
+  out += EncodeDiagnosticArray(result.diagnostics);
   out += '}';
   return out;
 }
 
-Decoded<std::vector<config::Diagnostic>> DecodeDiagnostics(std::string_view text) {
-  return DecodeObject<std::vector<config::Diagnostic>>(
-      text, "diagnostics",
-      [](const json::Value& object, std::vector<config::Diagnostic>* out, json::Error* error) {
-        ReadDiagnosticArray(object, out, error);
+Decoded<ConfigResult> DecodeConfigResult(std::string_view text) {
+  return DecodeObject<ConfigResult>(
+      text, "config result", [](const json::Value& object, ConfigResult* out, json::Error* error) {
+        if (!ReadEnum(object, "outcome", kAllWriteOutcomes, ToString, "a write outcome",
+                      &out->outcome, error)) {
+          return;
+        }
+        ReadDiagnosticArray(object, &out->diagnostics, error);
+      });
+}
+
+std::string EncodeEnabledResult(const EnabledResult& result) {
+  std::string out("{");
+  AppendText(&out, "outcome", ToString(result.outcome), /*first=*/true);
+  AppendBool(&out, "enabled", result.enabled);
+  out += '}';
+  return out;
+}
+
+Decoded<EnabledResult> DecodeEnabledResult(std::string_view text) {
+  return DecodeObject<EnabledResult>(
+      text, "enabled result", [](const json::Value& object, EnabledResult* out,
+                                 json::Error* error) {
+        if (!ReadEnum(object, "outcome", kAllWriteOutcomes, ToString, "a write outcome",
+                      &out->outcome, error)) {
+          return;
+        }
+        ReadBool(object, "enabled", &out->enabled, error);
       });
 }
 

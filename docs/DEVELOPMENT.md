@@ -235,8 +235,8 @@ A removed command leaves a hole.
 | 0 | `GetInterfaceVersion` | - -> `u32` | never fails; **shape frozen forever** |
 | 1 | `GetStatus` | - -> `Status` | never fails |
 | 2 | `GetConfig` | - -> `Config` + `Diagnostic[]` | never fails |
-| 3 | `SetConfig` | `ConfigEdit` -> `Diagnostic[]` | `kInvalid` (nothing written), `kWriteFailed` |
-| 4 | `SetEnabled` | `bool` -> `bool` (the new **effective** state) | `kWriteFailed` |
+| 3 | `SetConfig` | `ConfigEdit` -> `ConfigResult` (outcome + `Diagnostic[]`) | never fails; the outcome is `applied \| invalid \| write_failed` |
+| 4 | `SetEnabled` | `bool` -> `EnabledResult` (outcome + the new **effective** state) | never fails; same outcome set |
 | 5 | `SyncNow` | - -> `accepted \| already_running \| not_configured \| unauthenticated \| disabled` | never blocks |
 | 6 | `StartPair` | - -> `PairingStatus` | `kNotConfigured` |
 | 7 | `GetPairState` | - -> `PairingStatus` | never fails |
@@ -246,6 +246,15 @@ A removed command leaves a hole.
 | 11 | `ListBegin` | `ListRequest` -> cursor | `kBadCursor`, `kOffline` |
 | 12 | `ListNext` | cursor -> `ListPage` | `kBadCursor`, `kOffline` |
 | 13 | `ListEnd` | cursor -> - | `kBadCursor` |
+
+Rows 3 and 4 answer a `WriteOutcome` inside a successful reply rather than a
+failing `Result`, and that is forced rather than chosen: a `cmif` reply's data
+words are not delivered to a client whose `Result` says the call failed (libnx's
+`cmifParseResponse` returns before it exposes them). `SetConfig`'s diagnostics
+and `SetEnabled`'s effective state *are* those two refusals, so attaching them
+to a failure would be attaching them to something nobody can read. Commands
+whose failure carries nothing -- `Unpair`, `Enqueue`, `ListNext` -- keep
+reporting it as an `ipc::Error`, which the sysmodule maps to a `Result`.
 
 Three more errors belong to the transport rather than to any one command:
 `kUnknownCommand` (an id this build does not implement -- the two halves are
@@ -305,7 +314,16 @@ Nothing on this wire may grow with the size of the library or of `config.ini`:
 - `GetConfig` never fails, so a `[platform.*]` map too large to send is dropped
   whole and flagged (`platforms_truncated`) rather than refused or served
   half-empty, and diagnostics are trimmed to `kMaxDiagnosticsInPayload` with a
-  notice saying how many did not fit.
+  notice saying how many did not fit. That trim bounds *characters* and the wire
+  carries *bytes* -- `json::Quote` doubles a backslash and makes six of a control
+  character, both of which `config.cpp` quotes back out of a rejected path -- so
+  the command drops complaints until the payload fits rather than trusting the
+  constants.
+- The three values neither half chooses are bounded where they enter: a
+  `server.url` at `kMaxServerUrlBytes` (the same bound `NormalizeServerUrl`
+  applies), a rom's `fs_name` at `kMaxNameBytes`, and a verification URL off a
+  server response at `kMaxVerificationUrlBytes`. Each belongs to a command
+  documented never to fail.
 
 ### The two rules
 

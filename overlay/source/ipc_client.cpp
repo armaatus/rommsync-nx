@@ -3,10 +3,8 @@
 #include <switch.h>
 
 #include <cstdint>
-#include <cstring>
 #include <string>
 #include <string_view>
-#include <vector>
 
 #include "rommsync/auth.hpp"
 #include "rommsync/config.hpp"
@@ -27,7 +25,7 @@ constexpr Result MalformedResponse() {
 
 }  // namespace
 
-IpcClient::IpcClient() : buffer_(ipc::kMaxPayloadBytes) {}
+IpcClient::IpcClient() { response_.resize(ipc::kMaxPayloadBytes); }
 
 IpcClient::~IpcClient() { Close(); }
 
@@ -40,14 +38,18 @@ Result IpcClient::Open() {
 
 void IpcClient::Close() { serviceClose(&service_); }
 
-Result IpcClient::Call(ipc::Command command, std::string_view request, std::string* response) {
-  response->clear();
+Result IpcClient::Call(ipc::Command command, std::string_view request) {
+  // Grown back to the full buffer and shrunk to the answer's length below, so
+  // the allocation happens once in the constructor and never on a draw.
+  response_.resize(ipc::kMaxPayloadBytes);
   if (!serviceIsActive(&service_)) {
+    response_.clear();
     return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
   }
   if (!ipc::Fits(request)) {
     // Refused here rather than sent: the far side would refuse it anyway, and a
     // request this build cannot express is a bug on this side.
+    response_.clear();
     return MAKERESULT(Module_Libnx, LibnxError_BadInput);
   }
 
@@ -61,184 +63,102 @@ Result IpcClient::Call(ipc::Command command, std::string_view request, std::stri
           },
       .buffers = {
           {request.data(), request.size()},
-          {buffer_.data(), buffer_.size()},
+          {response_.data(), response_.size()},
       });
-  // A failing command may still have answered -- `SetConfig`'s refusal is its
-  // diagnostics -- but libnx reports the failure before the reply's data words
-  // are readable, so there is no length to trust. The caller gets the `Result`.
+  if (R_FAILED(result)) {
+    // Nothing readable came back, and that is a property of the wire rather
+    // than a shortcut: libnx's `cmifParseResponse` returns on a failing result
+    // before it exposes the reply's data words, so there is no length to trust
+    // even when the far side wrote the buffer. It is exactly why a command
+    // whose refusal has something to say answers it as an `ipc::WriteOutcome`
+    // inside a successful reply -- see `ipc::WriteOutcome`.
+    response_.clear();
+    return result;
+  }
+  if (length > response_.size()) {
+    response_.clear();
+    return MalformedResponse();
+  }
+  response_.resize(static_cast<std::size_t>(length));
+  return 0;
+}
+
+template <typename T, typename Decode>
+Result IpcClient::CallAndDecode(ipc::Command command, std::string_view request, Decode decode,
+                               T* out) {
+  const Result result = Call(command, request);
   if (R_FAILED(result)) {
     return result;
   }
-  if (length > buffer_.size()) {
+  const auto decoded = decode(std::string_view(response_));
+  if (!decoded.ok()) {
     return MalformedResponse();
   }
-  response->assign(buffer_.data(), static_cast<std::size_t>(length));
+  *out = decoded.value;
   return 0;
 }
 
 Result IpcClient::GetInterfaceVersion(std::uint32_t* out) {
-  std::string response;
-  const Result result = Call(ipc::Command::kGetInterfaceVersion, ipc::EncodeEmpty(), &response);
-  if (R_FAILED(result)) {
-    return result;
-  }
-  const ipc::Decoded<std::uint32_t> decoded = ipc::DecodeInterfaceVersion(response);
-  if (!decoded.ok()) {
-    return MalformedResponse();
-  }
-  *out = decoded.value;
-  return 0;
+  return CallAndDecode(ipc::Command::kGetInterfaceVersion, ipc::EncodeEmpty(),
+                       ipc::DecodeInterfaceVersion, out);
 }
 
 Result IpcClient::GetStatus(ipc::Status* out) {
-  std::string response;
-  const Result result = Call(ipc::Command::kGetStatus, ipc::EncodeEmpty(), &response);
-  if (R_FAILED(result)) {
-    return result;
-  }
-  const ipc::Decoded<ipc::Status> decoded = ipc::DecodeStatus(response);
-  if (!decoded.ok()) {
-    return MalformedResponse();
-  }
-  *out = decoded.value;
-  return 0;
+  return CallAndDecode(ipc::Command::kGetStatus, ipc::EncodeEmpty(), ipc::DecodeStatus, out);
 }
 
 Result IpcClient::GetConfig(ipc::ConfigView* out) {
-  std::string response;
-  const Result result = Call(ipc::Command::kGetConfig, ipc::EncodeEmpty(), &response);
-  if (R_FAILED(result)) {
-    return result;
-  }
-  const ipc::Decoded<ipc::ConfigView> decoded = ipc::DecodeConfigView(response);
-  if (!decoded.ok()) {
-    return MalformedResponse();
-  }
-  *out = decoded.value;
-  return 0;
+  return CallAndDecode(ipc::Command::kGetConfig, ipc::EncodeEmpty(), ipc::DecodeConfigView, out);
 }
 
-Result IpcClient::SetConfig(const ipc::ConfigEdit& edit,
-                            std::vector<config::Diagnostic>* diagnostics) {
-  diagnostics->clear();
-  std::string response;
-  const Result result = Call(ipc::Command::kSetConfig, ipc::EncodeConfigEdit(edit), &response);
-  const ipc::Decoded<std::vector<config::Diagnostic>> decoded = ipc::DecodeDiagnostics(response);
-  if (decoded.ok()) {
-    *diagnostics = decoded.value;
-  }
-  return result;
+Result IpcClient::SetConfig(const ipc::ConfigEdit& edit, ipc::ConfigResult* result) {
+  return CallAndDecode(ipc::Command::kSetConfig, ipc::EncodeConfigEdit(edit),
+                       ipc::DecodeConfigResult, result);
 }
 
-Result IpcClient::SetEnabled(bool enabled, bool* effective) {
-  *effective = enabled;
-  std::string response;
-  const Result result = Call(ipc::Command::kSetEnabled, ipc::EncodeEnabled(enabled), &response);
-  const ipc::Decoded<bool> decoded = ipc::DecodeEnabled(response);
-  if (decoded.ok()) {
-    // The state that took, which is what the switch is drawn as -- see #24.
-    *effective = decoded.value;
-  }
-  return result;
+Result IpcClient::SetEnabled(bool enabled, ipc::EnabledResult* result) {
+  return CallAndDecode(ipc::Command::kSetEnabled, ipc::EncodeEnabled(enabled),
+                       ipc::DecodeEnabledResult, result);
 }
 
 Result IpcClient::SyncNow(ipc::SyncOutcome* outcome) {
-  std::string response;
-  const Result result = Call(ipc::Command::kSyncNow, ipc::EncodeEmpty(), &response);
-  if (R_FAILED(result)) {
-    return result;
-  }
-  const ipc::Decoded<ipc::SyncOutcome> decoded = ipc::DecodeSyncOutcome(response);
-  if (!decoded.ok()) {
-    return MalformedResponse();
-  }
-  *outcome = decoded.value;
-  return 0;
+  return CallAndDecode(ipc::Command::kSyncNow, ipc::EncodeEmpty(), ipc::DecodeSyncOutcome,
+                       outcome);
 }
 
 Result IpcClient::StartPair(auth::PairingStatus* status) {
-  std::string response;
-  const Result result = Call(ipc::Command::kStartPair, ipc::EncodeEmpty(), &response);
-  if (R_FAILED(result)) {
-    return result;
-  }
-  const auth::Parsed<auth::PairingStatus> decoded = auth::ParsePairingStatus(response);
-  if (!decoded.ok()) {
-    return MalformedResponse();
-  }
-  *status = decoded.value;
-  return 0;
+  return CallAndDecode(ipc::Command::kStartPair, ipc::EncodeEmpty(), auth::ParsePairingStatus,
+                       status);
 }
 
 Result IpcClient::GetPairState(auth::PairingStatus* status) {
-  std::string response;
-  const Result result = Call(ipc::Command::kGetPairState, ipc::EncodeEmpty(), &response);
-  if (R_FAILED(result)) {
-    return result;
-  }
-  const auth::Parsed<auth::PairingStatus> decoded = auth::ParsePairingStatus(response);
-  if (!decoded.ok()) {
-    return MalformedResponse();
-  }
-  *status = decoded.value;
-  return 0;
+  return CallAndDecode(ipc::Command::kGetPairState, ipc::EncodeEmpty(), auth::ParsePairingStatus,
+                       status);
 }
 
-Result IpcClient::Unpair() {
-  std::string response;
-  return Call(ipc::Command::kUnpair, ipc::EncodeEmpty(), &response);
-}
+Result IpcClient::Unpair() { return Call(ipc::Command::kUnpair, ipc::EncodeEmpty()); }
 
 Result IpcClient::Enqueue(std::int64_t rom_id, std::int32_t* position) {
-  std::string response;
-  const Result result = Call(ipc::Command::kEnqueue, ipc::EncodeRomId(rom_id), &response);
-  if (R_FAILED(result)) {
-    return result;
-  }
-  const ipc::Decoded<std::int32_t> decoded = ipc::DecodeQueuePosition(response);
-  if (!decoded.ok()) {
-    return MalformedResponse();
-  }
-  *position = decoded.value;
-  return 0;
+  return CallAndDecode(ipc::Command::kEnqueue, ipc::EncodeRomId(rom_id),
+                       ipc::DecodeQueuePosition, position);
 }
 
 Result IpcClient::Dequeue(std::int64_t rom_id) {
-  std::string response;
-  return Call(ipc::Command::kDequeue, ipc::EncodeRomId(rom_id), &response);
+  return Call(ipc::Command::kDequeue, ipc::EncodeRomId(rom_id));
 }
 
 Result IpcClient::ListBegin(const ipc::ListRequest& request, ipc::Cursor* cursor) {
-  std::string response;
-  const Result result = Call(ipc::Command::kListBegin, ipc::EncodeListRequest(request), &response);
-  if (R_FAILED(result)) {
-    return result;
-  }
-  const ipc::Decoded<ipc::Cursor> decoded = ipc::DecodeCursor(response);
-  if (!decoded.ok()) {
-    return MalformedResponse();
-  }
-  *cursor = decoded.value;
-  return 0;
+  return CallAndDecode(ipc::Command::kListBegin, ipc::EncodeListRequest(request),
+                       ipc::DecodeCursor, cursor);
 }
 
 Result IpcClient::ListNext(ipc::Cursor cursor, ipc::ListPage* page) {
-  std::string response;
-  const Result result = Call(ipc::Command::kListNext, ipc::EncodeCursor(cursor), &response);
-  if (R_FAILED(result)) {
-    return result;
-  }
-  const ipc::Decoded<ipc::ListPage> decoded = ipc::DecodeListPage(response);
-  if (!decoded.ok()) {
-    return MalformedResponse();
-  }
-  *page = decoded.value;
-  return 0;
+  return CallAndDecode(ipc::Command::kListNext, ipc::EncodeCursor(cursor), ipc::DecodeListPage,
+                       page);
 }
 
 Result IpcClient::ListEnd(ipc::Cursor cursor) {
-  std::string response;
-  return Call(ipc::Command::kListEnd, ipc::EncodeCursor(cursor), &response);
+  return Call(ipc::Command::kListEnd, ipc::EncodeCursor(cursor));
 }
 
 }  // namespace rommsync::overlay

@@ -45,11 +45,18 @@
 //
 // ## What never crosses this boundary
 //
-// No `device_code`, no bearer token, and no `server.url` inside an error string
-// (docs/SECURITY.md). `config::Diagnostic` already keeps that last rule for the
-// same reason -- a URL is the one configured field that can carry a credential
-// -- and `Status` carries `configured` rather than the URL itself. `ipc.secrets`
-// asserts it over every command rather than leaving it reviewed.
+// No `device_code` and no bearer token, ever (docs/SECURITY.md, "never
+// logged"). `ipc.secrets` asserts it over every command rather than leaving it
+// reviewed.
+//
+// The `server.url` is a separate and weaker rule, and it is this header's
+// rather than SECURITY.md's: `NormalizeServerUrl` refuses `user:password@`
+// outright, so a configured URL carries no credential and the settings screen
+// (#26) exists to show and edit it. So `GetConfig` carries it, the pairing
+// payload carries the two URLs a human has to type, and nothing else does --
+// not `Status`, which reports `configured` instead, and not a `Diagnostic`
+// message, which is the rule `config::Diagnostic` already keeps because a
+// diagnostic goes to a log.
 //
 // ## What never blocks
 //
@@ -60,6 +67,7 @@
 // not park a thread at all when the rule is that nothing blocks boot.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -129,8 +137,15 @@ enum class Command : std::uint32_t {
 };
 
 /// Every command, in id order. The dispatch table and the documentation are both
-/// checked against this rather than against a second copy of the list.
-extern const Command kAllCommands[14];
+/// checked against this rather than against a second copy of the list, and the
+/// size is deduced so adding one is a single edit.
+inline constexpr std::array kAllCommands = {
+    Command::kGetInterfaceVersion, Command::kGetStatus,    Command::kGetConfig,
+    Command::kSetConfig,           Command::kSetEnabled,   Command::kSyncNow,
+    Command::kStartPair,           Command::kGetPairState, Command::kUnpair,
+    Command::kEnqueue,             Command::kDequeue,      Command::kListBegin,
+    Command::kListNext,            Command::kListEnd,
+};
 
 /// Stable, log-friendly name -- `GetStatus`. Never null; "Unknown" for an id
 /// outside the table.
@@ -195,14 +210,14 @@ enum class Error {
 /// Stable, log-friendly name -- `queue_full`. Never null.
 const char* ToString(Error error);
 
-/// A value and the reason there isn't one, matching `auth::Parsed`'s contract:
-/// `value` is default-constructed on failure and must not be used.
+/// A value and the reason there isn't one: `value` is default-constructed on
+/// failure and must not be used -- check `ok()`.
+///
+/// Spelled `auth::Parsed`, not a second struct with the same three members. The
+/// name is local because these are IPC payloads rather than server responses;
+/// the type is shared so a caller that already knows one knows the other.
 template <typename T>
-struct Decoded {
-  T value{};
-  json::Error error;
-  bool ok() const { return error.ok(); }
-};
+using Decoded = auth::Parsed<T>;
 
 // --- payloads -----------------------------------------------------------------
 
@@ -318,21 +333,41 @@ struct ConfigView {
 
 /// The longest `server.url` this contract carries.
 ///
-/// `config.ini` may hold a line of up to `config::kMaxConfigBytes`, and
-/// `NormalizeServerUrl` bounds the *shape* of a URL but not its length -- so
-/// without a bound here one absurd line could make `GetConfig` unable to answer,
-/// and `GetConfig` is documented never to fail. Generous next to a real one:
-/// RomM behind a reverse proxy at `/romm` is well inside it.
-inline constexpr std::size_t kMaxServerUrlBytes = 512;
+/// The same bound `NormalizeServerUrl` already applies, named again rather than
+/// re-chosen: a value below it would withhold a URL `config.ini` accepts, and a
+/// value above it would be a bound that never fires. It is here at all because
+/// `GetConfig` may not fail, and because a `Config` reaching this boundary need
+/// not have come from `ParseConfig` -- M5-3 (#30) builds one from an edit.
+inline constexpr std::size_t kMaxServerUrlBytes = config::kMaxPathLength;
+
+/// The longest name `Status` carries -- a rom's `fs_name`, and the build string.
+///
+/// `Status` is documented never to fail, and a `fs_name` comes off a RomM
+/// library, so its length is not this client's to assume. Truncating one costs
+/// a few characters off a label; not bounding it costs the whole status screen.
+inline constexpr std::size_t kMaxNameBytes = 256;
+
+/// The longest verification URL the pairing payload carries.
+///
+/// `auth.cpp` reads `verification_path` straight off the server's JSON with no
+/// length limit, so a RomM -- or a proxy in front of one -- answering something
+/// enormous would make `GetPairState` unable to answer, and it is documented
+/// never to fail. A real one is `/pair/device?user_code=ABCD2345`.
+inline constexpr std::size_t kMaxVerificationUrlBytes = 512;
 
 /// How many `config::Diagnostic`s one payload carries, and how long each of
 /// their three text fields may be.
 ///
 /// `config::kMaxDiagnostics` is 64 and a message may quote a path of
 /// `config::kMaxPathLength`, so an unbounded list is several times the payload
-/// cap on its own. These two numbers are what make `GetConfig` and `SetConfig`
-/// fit *without* a trimming loop -- a payload whose size depends on the user's
-/// file is a payload that is one bad `config.ini` away from not being sendable.
+/// cap on its own. These two numbers cut it to a size that ordinarily fits.
+///
+/// **They are not the guarantee.** A diagnostic quotes what the user wrote, and
+/// `json::Quote` escapes: a backslash doubles, a control character becomes six
+/// bytes -- and `config.cpp` quotes the rejected path back, which may hold
+/// exactly those, since holding them is often why it was rejected. So the
+/// encoded length is not a function of these constants, and `GetConfig` drops
+/// complaints until the payload fits rather than trusting them.
 ///
 /// Nothing is dropped silently: `TrimDiagnostics` appends a `kNotice` naming
 /// how many did not fit, and a text field that was cut ends in `...`.
@@ -395,6 +430,47 @@ enum class SyncOutcome {
   kDisabled,
 };
 const char* ToString(SyncOutcome outcome);
+
+/// What a command that writes to the SD card did.
+///
+/// The same shape as `SyncOutcome`, and for the same reason: it is an *answer*
+/// rather than a failure, so it rides in the payload where the rest of the
+/// answer is. That is not a style choice -- it is what the wire can carry. A
+/// `cmif` reply's data words are not delivered to the client when the `Result`
+/// says the call failed (libnx's `cmifParseResponse` returns before it exposes
+/// them), so a refusal reported *only* as a `Result` arrives with nothing
+/// attached. `SetConfig`'s diagnostics and `SetEnabled`'s effective state are
+/// the whole value of those two refusals, so they may not be attached to one.
+///
+/// Commands whose failure carries nothing -- `Unpair`, `Enqueue`, `ListNext` --
+/// keep reporting it as an `Error`, which the sysmodule maps to a `Result`.
+enum class WriteOutcome {
+  kApplied,      ///< it took, and the card holds it
+  kInvalid,      ///< refused; **nothing was written**. The diagnostics say why.
+  kWriteFailed,  ///< accepted, and the write did not happen. Nothing changed.
+};
+const char* ToString(WriteOutcome outcome);
+
+/// `SetConfig`'s answer.
+///
+/// The diagnostics come back whichever way it went: on `kInvalid` they *are*
+/// the refusal, and a settings screen on a console with no keyboard has nothing
+/// else to show. Already trimmed by `TrimDiagnostics`.
+struct ConfigResult {
+  WriteOutcome outcome = WriteOutcome::kApplied;
+  std::vector<config::Diagnostic> diagnostics;
+};
+
+/// `SetEnabled`'s answer.
+///
+/// `enabled` is the state as it stands **after** the attempt, read back rather
+/// than assumed -- including after a failed write, which is the case that
+/// matters: an overlay that drew the state it asked for would show a switch
+/// that did not move (#24).
+struct EnabledResult {
+  WriteOutcome outcome = WriteOutcome::kApplied;
+  bool enabled = false;
+};
 
 /// Which list `ListBegin` opens. The per-item projection for each kind is M5-4's
 /// (#31); this header owns the envelope they travel in.
@@ -526,14 +602,17 @@ Decoded<Status> DecodeStatus(std::string_view text);
 std::string EncodeConfigView(const ConfigView& view);
 Decoded<ConfigView> DecodeConfigView(std::string_view text);
 
-std::string EncodeDiagnostics(const std::vector<config::Diagnostic>& diagnostics);
-Decoded<std::vector<config::Diagnostic>> DecodeDiagnostics(std::string_view text);
+std::string EncodeConfigResult(const ConfigResult& result);
+Decoded<ConfigResult> DecodeConfigResult(std::string_view text);
+
+std::string EncodeEnabledResult(const EnabledResult& result);
+Decoded<EnabledResult> DecodeEnabledResult(std::string_view text);
 
 std::string EncodeConfigEdit(const ConfigEdit& edit);
 Decoded<ConfigEdit> DecodeConfigEdit(std::string_view text);
 
-/// `{"enabled":<bool>}` -- the request and the answer share a shape, because the
-/// answer is the same question asked of the card afterwards.
+/// `{"enabled":<bool>}` -- `SetEnabled`'s *request*. The answer is an
+/// `EnabledResult`, which carries the state that took alongside what happened.
 std::string EncodeEnabled(bool enabled);
 Decoded<bool> DecodeEnabled(std::string_view text);
 
@@ -680,14 +759,14 @@ class ServiceCore {
   /// rather than an error.
   ConfigView GetConfig() const;
 
-  /// Command 3. `kInvalid` when the edit was refused, in which case nothing was
-  /// written; `diagnostics` says which assignment and why either way.
-  Error SetConfig(const ConfigEdit& edit, std::vector<config::Diagnostic>* diagnostics);
+  /// Command 3. Never fails at the transport: what happened is `outcome` and
+  /// why is `diagnostics`, both in the answer -- see `WriteOutcome` for why that
+  /// is the only shape that works.
+  ConfigResult SetConfig(const ConfigEdit& edit);
 
-  /// Command 4. `effective` is the state as it stands **after** the attempt,
-  /// read back rather than assumed: an overlay that drew the state it asked for
-  /// would show a switch that did not move (#24).
-  Error SetEnabled(bool enabled, bool* effective);
+  /// Command 4. Same shape, same reason. `enabled` is the state read back off
+  /// the config afterwards, not the one that was asked for.
+  EnabledResult SetEnabled(bool enabled);
 
   /// Command 5. Hands work to the engine; never blocks.
   SyncOutcome SyncNow();
@@ -716,6 +795,11 @@ class ServiceCore {
   Error ListEnd(Cursor cursor);
 
  private:
+  /// A pairing status cut to what a payload carries. See the definition: the
+  /// verification URLs come off a server response, so their length is not this
+  /// client's to assume, and both commands that answer one never fail.
+  static auth::PairingStatus Bounded(auth::PairingStatus status);
+
   Engine& engine_;
 };
 
@@ -726,16 +810,15 @@ class ServiceCore {
 /// holds no logic -- the decode, the call, the encode and the size check are all
 /// here, where they run on the host under `ctest`.
 ///
-/// `response` carries whatever the command produced, and is cleared first, so a
-/// caller that reads it off a failed call gets an empty buffer rather than the
-/// previous command's answer.
+/// `response` is set on `kOk` and cleared otherwise -- no exceptions, which is
+/// what the wire can actually carry: a `cmif` reply's data words never reach a
+/// client whose `Result` says the call failed, so a payload attached to a
+/// failure is a payload nobody can read. The two commands whose refusal has
+/// something to say answer it as a `WriteOutcome` inside a successful reply
+/// instead.
 ///
-/// A failing command usually produces nothing -- but `SetConfig` is the
-/// exception and is the reason this is not "on `kOk` only": its `kInvalid` is a
-/// refusal *with* the diagnostics that explain it, and those diagnostics are the
-/// entire value of the refusal to a user editing settings on a console with no
-/// keyboard. `SetEnabled` answers the same way, with the state that did not
-/// move.
+/// Clearing first means a caller that reads the buffer off a failed call gets an
+/// empty one rather than the previous command's answer.
 Error Dispatch(ServiceCore& core, std::uint32_t command_id, std::string_view request,
                std::string* response);
 

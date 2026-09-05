@@ -37,6 +37,42 @@ config::Diagnostic Note(config::Severity severity, std::string section, std::str
   return diagnostic;
 }
 
+/// Cut `text` to `limit` bytes on a UTF-8 boundary, visibly.
+///
+/// The same job `ipc.cpp`'s `Shorten` does for a diagnostic, applied to the two
+/// other places a value the client does not control reaches a payload: a rom's
+/// `fs_name`, which comes off a RomM library, and a verification path, which
+/// comes off a server response.
+void Shorten(std::string* text, std::size_t limit) {
+  if (text->size() <= limit) {
+    return;
+  }
+  std::size_t cut = limit;
+  while (cut > 0 && (static_cast<unsigned char>((*text)[cut]) & 0xC0) == 0x80) {
+    --cut;
+  }
+  text->resize(cut);
+  *text += "...";
+}
+
+/// `WriteOutcome` for what the engine reported.
+///
+/// `kInvalid` is the only failure with a distinct meaning to a user -- the edit
+/// was refused and the file is untouched. Everything else, `kInternal` included,
+/// is reported as a write that did not happen: that is the true and actionable
+/// half of any of them, and inventing a fourth outcome for "the engine could not
+/// say" would be a screen nobody can write a sentence for.
+WriteOutcome ToOutcome(Error error) {
+  switch (error) {
+    case Error::kOk:
+      return WriteOutcome::kApplied;
+    case Error::kInvalid:
+      return WriteOutcome::kInvalid;
+    default:
+      return WriteOutcome::kWriteFailed;
+  }
+}
+
 }  // namespace
 
 ServiceCore::ServiceCore(Engine& engine) : engine_(engine) {}
@@ -50,6 +86,7 @@ Status ServiceCore::GetStatus() const {
   Status status;
   status.interface = kVersion;
   status.build = version();
+  Shorten(&status.build, kMaxNameBytes);
   // Read off the config rather than off the snapshot: the switch the overlay
   // draws is the one on the card, and `SetEnabled` is what moves it.
   status.enabled = config.sync.enabled;
@@ -64,6 +101,10 @@ Status ServiceCore::GetStatus() const {
   status.failed = snapshot.failed;
   status.queue_depth = snapshot.queue_depth;
   status.download = snapshot.download;
+  // A `fs_name` comes off a RomM library, so its length is not ours to assume,
+  // and `GetStatus` is documented never to fail. A truncated label costs a few
+  // characters; an unbounded one costs the whole status screen.
+  Shorten(&status.download.fs_name, kMaxNameBytes);
   return status;
 }
 
@@ -93,28 +134,66 @@ ConfigView ServiceCore::GetConfig() const {
   if (!Fits(EncodeConfigView(view))) {
     view.config.platforms.clear();
     view.platforms_truncated = true;
-    diagnostics.push_back(Note(config::Severity::kNotice, "", "",
-                               "the folder map is too large to send over IPC; "
-                               "read config.ini for it"));
+    // At the *front*, so the trimming below cannot be what drops the sentence
+    // explaining the gap -- which is exactly what appending it did.
+    diagnostics.insert(diagnostics.begin(),
+                       Note(config::Severity::kNotice, "", "",
+                            "the folder map is too large to send over IPC; "
+                            "read config.ini for it"));
     view.diagnostics = TrimDiagnostics(diagnostics);
+  }
+
+  // ...and now the last thing that can still overflow: the diagnostics
+  // themselves. `TrimDiagnostics` bounds them in *characters*, and `json::Quote`
+  // escapes -- a backslash doubles, a control character becomes six bytes -- and
+  // `config.cpp` quotes the rejected path back, which may hold either. So the
+  // encoded length is not a function of the trim constants, and this command may
+  // not fail. Drop complaints until it fits, and say how many went.
+  std::size_t dropped = 0;
+  while (!Fits(EncodeConfigView(view)) && !view.diagnostics.empty()) {
+    view.diagnostics.pop_back();
+    ++dropped;
+  }
+  if (dropped > 0) {
+    // Spend one more slot on the notice rather than adding to a list that only
+    // just fits -- and if even that is too much, the count is lost but the
+    // config is not, which is the trade this command exists to make.
+    if (!view.diagnostics.empty()) {
+      view.diagnostics.pop_back();
+      ++dropped;
+    }
+    view.diagnostics.push_back(
+        Note(config::Severity::kNotice, "", "",
+             std::to_string(dropped) +
+                 " diagnostics did not fit this payload; read config.ini for them"));
+    if (!Fits(EncodeConfigView(view))) {
+      view.diagnostics.clear();
+    }
   }
   return view;
 }
 
-Error ServiceCore::SetConfig(const ConfigEdit& edit, std::vector<config::Diagnostic>* diagnostics) {
+ConfigResult ServiceCore::SetConfig(const ConfigEdit& edit) {
   std::vector<config::Diagnostic> raw;
-  const Error error = engine_.ApplyConfigEdit(edit, &raw);
-  *diagnostics = TrimDiagnostics(raw);
-  return error;
+  ConfigResult result;
+  result.outcome = ToOutcome(engine_.ApplyConfigEdit(edit, &raw));
+  result.diagnostics = TrimDiagnostics(raw);
+  // The same overflow `GetConfig` guards against, from the same source: these
+  // diagnostics quote what the user just typed.
+  while (!Fits(EncodeConfigResult(result)) && !result.diagnostics.empty()) {
+    result.diagnostics.pop_back();
+  }
+  return result;
 }
 
-Error ServiceCore::SetEnabled(bool enabled, bool* effective) {
-  const Error error = engine_.SetSyncEnabled(enabled);
+EnabledResult ServiceCore::SetEnabled(bool enabled) {
+  EnabledResult result;
+  result.outcome = ToOutcome(engine_.SetSyncEnabled(enabled));
   // Read back rather than assume. A bare success would have the overlay draw the
   // state it *asked* for rather than the one that took, which is the whole
   // reason this command answers with anything at all (#24).
-  *effective = engine_.config().sync.enabled;
-  return error;
+  result.enabled = engine_.config().sync.enabled;
+  return result;
 }
 
 SyncOutcome ServiceCore::SyncNow() {
@@ -145,11 +224,31 @@ Error ServiceCore::StartPair(auth::PairingStatus* status) {
   }
   // The attempt as it stands one instant later, which is `kStarting` -- the init
   // request has not come back, and this command does not wait for it.
-  *status = engine_.pairing_status();
+  *status = Bounded(engine_.pairing_status());
   return Error::kOk;
 }
 
-auth::PairingStatus ServiceCore::GetPairState() const { return engine_.pairing_status(); }
+auth::PairingStatus ServiceCore::GetPairState() const { return Bounded(engine_.pairing_status()); }
+
+auth::PairingStatus ServiceCore::Bounded(auth::PairingStatus status) {
+  // `auth.cpp` reads `verification_path` straight off the server's JSON with no
+  // length limit, and this command is documented never to fail. A URL too long
+  // to send is withheld and named rather than sent: a pairing screen that says
+  // "your server answered something unusable" is a diagnosis, and one that
+  // cannot answer at all is a hang.
+  if (status.verification_url.size() > kMaxVerificationUrlBytes ||
+      status.verification_url_complete.size() > kMaxVerificationUrlBytes) {
+    status.verification_url.clear();
+    status.verification_url_complete.clear();
+    status.message = "the server answered a verification URL too long to show";
+  }
+  // The last resort. `message` is ours and is short, but it is the one field
+  // left that could still be carrying something unexpected.
+  if (!Fits(auth::SerializePairingStatus(status))) {
+    status.message.clear();
+  }
+  return status;
+}
 
 Error ServiceCore::Unpair() { return engine_.Unpair(); }
 
@@ -208,6 +307,30 @@ Error ServiceCore::ListEnd(Cursor cursor) {
 
 // --- the table ----------------------------------------------------------------
 
+/// True for the commands that carry an argument. The rest send `{}`, and are
+/// checked once below rather than in eight identical branches.
+bool TakesRequest(Command command) {
+  switch (command) {
+    case Command::kSetConfig:
+    case Command::kSetEnabled:
+    case Command::kEnqueue:
+    case Command::kDequeue:
+    case Command::kListBegin:
+    case Command::kListNext:
+    case Command::kListEnd:
+      return true;
+    case Command::kGetInterfaceVersion:
+    case Command::kGetStatus:
+    case Command::kGetConfig:
+    case Command::kSyncNow:
+    case Command::kStartPair:
+    case Command::kGetPairState:
+    case Command::kUnpair:
+      return false;
+  }
+  return false;
+}
+
 Error Dispatch(ServiceCore& core, std::uint32_t command_id, std::string_view request,
                std::string* response) {
   response->clear();
@@ -218,45 +341,37 @@ Error Dispatch(ServiceCore& core, std::uint32_t command_id, std::string_view req
     // this into a sentence the user can act on.
     return Error::kUnknownCommand;
   }
+  // A command that takes nothing is still sent an object, and is still held to
+  // it: a caller sending something else has misunderstood which command it is
+  // calling, and that is worth saying rather than ignoring.
+  if (!TakesRequest(command) && !DecodeEmpty(request).ok()) {
+    return Error::kMalformedRequest;
+  }
 
   std::string payload;
   Error error = Error::kOk;
 
   switch (command) {
-    case Command::kGetInterfaceVersion: {
-      if (!DecodeEmpty(request).ok()) {
-        return Error::kMalformedRequest;
-      }
+    case Command::kGetInterfaceVersion:
       payload = EncodeInterfaceVersion(core.GetInterfaceVersion());
       break;
-    }
 
-    case Command::kGetStatus: {
-      if (!DecodeEmpty(request).ok()) {
-        return Error::kMalformedRequest;
-      }
+    case Command::kGetStatus:
       payload = EncodeStatus(core.GetStatus());
       break;
-    }
 
-    case Command::kGetConfig: {
-      if (!DecodeEmpty(request).ok()) {
-        return Error::kMalformedRequest;
-      }
+    case Command::kGetConfig:
       payload = EncodeConfigView(core.GetConfig());
       break;
-    }
 
     case Command::kSetConfig: {
       const Decoded<ConfigEdit> edit = DecodeConfigEdit(request);
       if (!edit.ok()) {
         return Error::kMalformedRequest;
       }
-      std::vector<config::Diagnostic> diagnostics;
-      error = core.SetConfig(edit.value, &diagnostics);
-      // Answered even on `kInvalid`: the diagnostics *are* the refusal, and a
-      // settings screen with nothing to show would have to say "no" and stop.
-      payload = EncodeDiagnostics(diagnostics);
+      // Succeeds whatever the edit did: what happened is in the answer, because
+      // a `Result` that says the call failed takes the answer with it.
+      payload = EncodeConfigResult(core.SetConfig(edit.value));
       break;
     }
 
@@ -265,26 +380,15 @@ Error Dispatch(ServiceCore& core, std::uint32_t command_id, std::string_view req
       if (!wanted.ok()) {
         return Error::kMalformedRequest;
       }
-      bool effective = false;
-      error = core.SetEnabled(wanted.value, &effective);
-      // Answered even on `kWriteFailed`, for the same reason: the state that did
-      // not move is what the switch has to be redrawn to.
-      payload = EncodeEnabled(effective);
+      payload = EncodeEnabledResult(core.SetEnabled(wanted.value));
       break;
     }
 
-    case Command::kSyncNow: {
-      if (!DecodeEmpty(request).ok()) {
-        return Error::kMalformedRequest;
-      }
+    case Command::kSyncNow:
       payload = EncodeSyncOutcome(core.SyncNow());
       break;
-    }
 
     case Command::kStartPair: {
-      if (!DecodeEmpty(request).ok()) {
-        return Error::kMalformedRequest;
-      }
       auth::PairingStatus status;
       error = core.StartPair(&status);
       if (error == Error::kOk) {
@@ -293,24 +397,16 @@ Error Dispatch(ServiceCore& core, std::uint32_t command_id, std::string_view req
       break;
     }
 
-    case Command::kGetPairState: {
-      if (!DecodeEmpty(request).ok()) {
-        return Error::kMalformedRequest;
-      }
+    case Command::kGetPairState:
       payload = auth::SerializePairingStatus(core.GetPairState());
       break;
-    }
 
-    case Command::kUnpair: {
-      if (!DecodeEmpty(request).ok()) {
-        return Error::kMalformedRequest;
-      }
+    case Command::kUnpair:
       error = core.Unpair();
       if (error == Error::kOk) {
         payload = EncodeEmpty();
       }
       break;
-    }
 
     case Command::kEnqueue: {
       const Decoded<std::int64_t> rom_id = DecodeRomId(request);
@@ -376,14 +472,17 @@ Error Dispatch(ServiceCore& core, std::uint32_t command_id, std::string_view req
     }
   }
 
+  if (error != Error::kOk) {
+    return error;
+  }
   // The size check is here rather than in each encoder, so no encoder has to
   // remember it and no response can be one command's oversight away from
   // overrunning a buffer the sysmodule was handed.
-  if (!payload.empty() && !Fits(payload)) {
+  if (!Fits(payload)) {
     return Error::kTooLarge;
   }
   *response = std::move(payload);
-  return error;
+  return Error::kOk;
 }
 
 }  // namespace rommsync::ipc

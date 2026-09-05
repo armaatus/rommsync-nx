@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "harness.hpp"
 #include "rig.hpp"
 #include "rommsync/auth.hpp"
 #include "rommsync/config.hpp"
@@ -465,9 +466,12 @@ int RoundTrip() {
     config::Diagnostic note;
     note.severity = severity;
     note.message = "something";
-    const ipc::Decoded<std::vector<config::Diagnostic>> back =
-        ipc::DecodeDiagnostics(ipc::EncodeDiagnostics({note}));
-    checks.Expect(back.ok() && back.value.size() == 1 && back.value[0].severity == severity,
+    ipc::ConfigResult sent;
+    sent.diagnostics.push_back(note);
+    const ipc::Decoded<ipc::ConfigResult> back =
+        ipc::DecodeConfigResult(ipc::EncodeConfigResult(sent));
+    checks.Expect(back.ok() && back.value.diagnostics.size() == 1 &&
+                      back.value.diagnostics[0].severity == severity,
                   std::string("severity survives: ") + config::ToString(severity));
   }
 
@@ -502,6 +506,29 @@ int RoundTrip() {
     }
     const ipc::Decoded<ipc::ConfigEdit> none = ipc::DecodeConfigEdit(ipc::EncodeConfigEdit({}));
     checks.Expect(none.ok() && none.value.assignments.empty(), "an empty edit is a legal edit");
+  }
+
+  for (const ipc::WriteOutcome outcome : {ipc::WriteOutcome::kApplied, ipc::WriteOutcome::kInvalid,
+                                          ipc::WriteOutcome::kWriteFailed}) {
+    ipc::ConfigResult config_result;
+    config_result.outcome = outcome;
+    config_result.diagnostics = LoadedConfigView().diagnostics;
+    const ipc::Decoded<ipc::ConfigResult> config_back =
+        ipc::DecodeConfigResult(ipc::EncodeConfigResult(config_result));
+    checks.Expect(config_back.ok() && config_back.value.outcome == outcome,
+                  std::string("a config outcome survives: ") + ipc::ToString(outcome));
+    checks.Expect(config_back.ok() &&
+                      SameDiagnostics(config_back.value.diagnostics, config_result.diagnostics),
+                  "with its diagnostics -- which on a refusal are the whole answer");
+
+    for (const bool enabled : {true, false}) {
+      const ipc::EnabledResult enabled_result{outcome, enabled};
+      const ipc::Decoded<ipc::EnabledResult> enabled_back =
+          ipc::DecodeEnabledResult(ipc::EncodeEnabledResult(enabled_result));
+      checks.Expect(enabled_back.ok() && enabled_back.value.outcome == outcome &&
+                        enabled_back.value.enabled == enabled,
+                    std::string("an enabled result survives: ") + ipc::ToString(outcome));
+    }
   }
 
   {
@@ -587,8 +614,14 @@ std::vector<Decoder> AllDecoders() {
                       [](std::string_view text) { return ipc::DecodeStatus(text).ok(); }});
   decoders.push_back({"config", ipc::EncodeConfigView(LoadedConfigView()),
                       [](std::string_view text) { return ipc::DecodeConfigView(text).ok(); }});
-  decoders.push_back({"diagnostics", ipc::EncodeDiagnostics(LoadedConfigView().diagnostics),
-                      [](std::string_view text) { return ipc::DecodeDiagnostics(text).ok(); }});
+  ipc::ConfigResult config_result;
+  config_result.outcome = ipc::WriteOutcome::kInvalid;
+  config_result.diagnostics = LoadedConfigView().diagnostics;
+  decoders.push_back({"config result", ipc::EncodeConfigResult(config_result),
+                      [](std::string_view text) { return ipc::DecodeConfigResult(text).ok(); }});
+  decoders.push_back({"enabled result",
+                      ipc::EncodeEnabledResult({ipc::WriteOutcome::kWriteFailed, true}),
+                      [](std::string_view text) { return ipc::DecodeEnabledResult(text).ok(); }});
   ipc::ConfigEdit edit;
   edit.assignments.push_back({"sync", "states", "true", false});
   decoders.push_back({"config edit", ipc::EncodeConfigEdit(edit),
@@ -981,7 +1014,8 @@ int Caps() {
       checks.Expect(note.message.size() <= ipc::kMaxDiagnosticTextBytes + 3,
                     "every message is cut to the documented length");
     }
-    checks.Expect(ipc::Fits(ipc::EncodeDiagnostics(trimmed)), "and the whole list fits");
+    checks.Expect(ipc::Fits(ipc::EncodeConfigResult({ipc::WriteOutcome::kInvalid, trimmed})),
+                  "and the whole list fits a SetConfig answer");
 
     FakeEngine engine;
     engine.notes = many;
@@ -994,6 +1028,136 @@ int Caps() {
     const std::vector<config::Diagnostic> few = LoadedConfigView().diagnostics;
     checks.Expect(SameDiagnostics(ipc::TrimDiagnostics(few), few),
                   "an ordinary list is served as it is");
+  }
+
+  // **The trim constants bound characters; the wire carries bytes.**
+  // `json::Quote` doubles a backslash and turns a control character into six
+  // bytes, and `config.cpp` quotes the rejected path straight back into the
+  // message -- which may hold either, since holding one is often exactly why it
+  // was rejected. A user with Windows-style paths under `[platform.*]` is the
+  // ordinary way to reach this.
+  for (const std::string& filler :
+       {std::string("\\"), std::string("\""), std::string(1, '\x01')}) {
+    std::vector<config::Diagnostic> escaping;
+    for (std::size_t at = 0; at < config::kMaxDiagnostics; ++at) {
+      std::string user_text;
+      for (std::size_t byte = 0; byte < config::kMaxPathLength; ++byte) {
+        user_text += filler;
+      }
+      config::Diagnostic note;
+      note.severity = config::Severity::kWarning;
+      note.line = static_cast<int>(at) + 1;
+      // All three text fields, because all three carry what the user wrote: the
+      // section is `[platform.<slug>]` as they typed it, the key is the key, and
+      // the message quotes the value back (config.cpp).
+      note.section = "platform." + user_text;
+      note.key = user_text;
+      note.message = "'" + user_text + "' is not a usable path, ignored";
+      escaping.push_back(note);
+    }
+
+    // What the trim constants alone produce -- which is what this used to send.
+    // Asserting it is over the cap is what makes the next assertion a
+    // regression test rather than a coincidence.
+    ipc::ConfigView bare;
+    bare.config = config::Defaults();
+    bare.config.platforms.clear();
+    bare.platforms_truncated = true;
+    bare.diagnostics = ipc::TrimDiagnostics(escaping);
+    checks.Expect(!ipc::Fits(ipc::EncodeConfigView(bare)),
+                  "trimming to the documented character limits is not enough on its own (" +
+                      std::to_string(ipc::EncodeConfigView(bare).size()) + " bytes)");
+
+    FakeEngine engine;
+    engine.settings = PathologicalConfig();
+    engine.notes = escaping;
+    ipc::ServiceCore core(engine);
+    const std::string payload = ipc::EncodeConfigView(core.GetConfig());
+    checks.Expect(ipc::Fits(payload),
+                  "GetConfig fits with diagnostics that escape (" +
+                      std::to_string(payload.size()) + " bytes)");
+    std::string response;
+    checks.Expect(ipc::Dispatch(core, static_cast<std::uint32_t>(ipc::Command::kGetConfig),
+                                ipc::EncodeEmpty(), &response) == ipc::Error::kOk,
+                  "and the command still never fails");
+    checks.Expect(ipc::DecodeConfigView(response).ok(), "and its answer comes back whole");
+
+    ipc::ConfigResult result;
+    result.outcome = ipc::WriteOutcome::kInvalid;
+    result.diagnostics = escaping;
+    engine.apply_edit_error = ipc::Error::kInvalid;
+    engine.apply_edit_notes = escaping;
+    checks.Expect(ipc::Fits(ipc::EncodeConfigResult(core.SetConfig({}))),
+                  "and so does SetConfig's refusal");
+  }
+
+  // The sentence explaining a missing folder map must survive the trimming that
+  // the diagnostics beside it go through -- it is the one the overlay needs most.
+  {
+    std::vector<config::Diagnostic> crowd;
+    for (std::size_t at = 0; at < config::kMaxDiagnostics; ++at) {
+      config::Diagnostic note;
+      note.severity = config::Severity::kWarning;
+      note.line = static_cast<int>(at) + 1;
+      note.section = "sync";
+      note.key = "states";
+      note.message = "expected true or false";
+      crowd.push_back(note);
+    }
+    FakeEngine engine;
+    engine.settings = PathologicalConfig();
+    engine.notes = crowd;
+    ipc::ServiceCore core(engine);
+    const ipc::ConfigView view = core.GetConfig();
+    checks.Expect(view.platforms_truncated, "the map was dropped");
+    bool explained = false;
+    for (const config::Diagnostic& note : view.diagnostics) {
+      explained = explained || note.message.find("folder map") != std::string::npos;
+    }
+    checks.Expect(explained,
+                  "and the sentence saying so is not itself trimmed away by the crowd");
+  }
+
+  // `Status` and the pairing payload are the two that carry a value neither
+  // half chose: a `fs_name` off a RomM library, and a verification path off a
+  // server response. Both commands are documented never to fail.
+  {
+    FakeEngine engine;
+    engine.snapshot.download.state = ipc::DownloadState::kDownloading;
+    engine.snapshot.download.rom_id = 7;
+    engine.snapshot.download.fs_name = std::string(ipc::kMaxPayloadBytes * 2, 'n');
+    ipc::ServiceCore core(engine);
+    std::string response;
+    checks.Expect(ipc::Dispatch(core, static_cast<std::uint32_t>(ipc::Command::kGetStatus),
+                                ipc::EncodeEmpty(), &response) == ipc::Error::kOk,
+                  "GetStatus never fails, whatever the library named a file");
+    const ipc::Decoded<ipc::Status> status = ipc::DecodeStatus(response);
+    checks.Expect(status.ok(), "and answers a status: " + status.error.Describe());
+    checks.Expect(status.value.download.fs_name.size() <= ipc::kMaxNameBytes + 3,
+                  "with the name cut to what a payload carries");
+    checks.ExpectEq(status.value.download.rom_id, std::int64_t{7},
+                    "and everything else intact");
+  }
+
+  {
+    FakeEngine engine;
+    engine.settings.server.url = "http://romm.lan:8080";
+    engine.pairing.state = auth::PairingState::kPending;
+    engine.pairing.user_code = "ABCD2345";
+    engine.pairing.verification_url = "http://romm.lan:8080/" + std::string(20000, 'p');
+    engine.pairing.verification_url_complete = engine.pairing.verification_url + "?user_code=X";
+    ipc::ServiceCore core(engine);
+    std::string response;
+    checks.Expect(ipc::Dispatch(core, static_cast<std::uint32_t>(ipc::Command::kGetPairState),
+                                ipc::EncodeEmpty(), &response) == ipc::Error::kOk,
+                  "GetPairState never fails, whatever the server answered");
+    const auth::Parsed<auth::PairingStatus> state = auth::ParsePairingStatus(response);
+    checks.Expect(state.ok(), "and answers a status: " + state.error.Describe());
+    checks.Expect(state.value.verification_url.empty(),
+                  "with a URL too long to show withheld rather than sent");
+    checks.ExpectEq(state.value.user_code, std::string("ABCD2345"),
+                    "and the code the human types still there");
+    checks.Expect(!state.value.message.empty(), "and a sentence saying what happened");
   }
 
   // A message cut mid-character would travel as malformed UTF-8 for the
@@ -1009,7 +1173,9 @@ int Caps() {
     checks.ExpectEq(trimmed.size(), std::size_t{1}, "one message in, one out");
     const std::string cut = trimmed[0].message.substr(0, trimmed[0].message.size() - 3);
     checks.ExpectEq(cut.size() % 3, std::size_t{0}, "the cut lands on a character boundary");
-    checks.Expect(ipc::DecodeDiagnostics(ipc::EncodeDiagnostics(trimmed)).ok(),
+    checks.Expect(ipc::DecodeConfigResult(
+                      ipc::EncodeConfigResult({ipc::WriteOutcome::kApplied, trimmed}))
+                      .ok(),
                   "and the trimmed list still round trips");
   }
 
@@ -1147,33 +1313,48 @@ int DispatchTable() {
     checks.ExpectEq(engine.sync_requests, 2, "and the engine is only asked when it could act");
   }
 
-  // SetEnabled answers with the state that *took*.
+  // SetEnabled answers with the state that *took*, inside a successful reply.
+  //
+  // The reply is what carries the outcome because a failing `Result` takes the
+  // payload with it -- libnx's `cmifParseResponse` never exposes the reply's
+  // data words once the result says the call failed. A refusal reported only as
+  // a `Result` would reach the overlay with nothing attached, which is the one
+  // thing #24 cannot render.
   {
     FakeEngine engine;
     engine.settings.sync.enabled = false;
     ipc::ServiceCore core(engine);
 
-    bool effective = false;
-    checks.Expect(core.SetEnabled(true, &effective) == ipc::Error::kOk, "the switch moves");
-    checks.ExpectEq(effective, true, "and the answer is the new state");
+    ipc::EnabledResult moved = core.SetEnabled(true);
+    checks.Expect(moved.outcome == ipc::WriteOutcome::kApplied, "the switch moves");
+    checks.ExpectEq(moved.enabled, true, "and the answer is the new state");
 
     engine.set_enabled_error = ipc::Error::kWriteFailed;
     engine.set_enabled_applies = false;
-    checks.Expect(core.SetEnabled(false, &effective) == ipc::Error::kWriteFailed,
-                  "a failed write is named");
-    checks.ExpectEq(effective, true,
+    const ipc::EnabledResult stuck = core.SetEnabled(false);
+    checks.Expect(stuck.outcome == ipc::WriteOutcome::kWriteFailed, "a failed write is named");
+    checks.ExpectEq(stuck.enabled, true,
                     "and the answer is the state that did not move, not the one asked for");
 
     std::string response;
     checks.Expect(ipc::Dispatch(core, static_cast<std::uint32_t>(ipc::Command::kSetEnabled),
-                                ipc::EncodeEnabled(false), &response) == ipc::Error::kWriteFailed,
-                  "over the table, the failure still reaches the caller");
-    const ipc::Decoded<bool> back = ipc::DecodeEnabled(response);
-    checks.Expect(back.ok() && back.value,
-                  "with the effective state alongside it, so the switch can be redrawn (#24)");
+                                ipc::EncodeEnabled(false), &response) == ipc::Error::kOk,
+                  "over the table it is a successful call carrying a failed write");
+    const ipc::Decoded<ipc::EnabledResult> back = ipc::DecodeEnabledResult(response);
+    checks.Expect(back.ok(), "and decodes: " + back.error.Describe());
+    checks.Expect(back.ok() && back.value.outcome == ipc::WriteOutcome::kWriteFailed,
+                  "with what happened");
+    checks.Expect(back.ok() && back.value.enabled,
+                  "and the effective state, so the switch can be redrawn (#24)");
+
+    // An engine that could not name its failure is still a write that did not
+    // happen, which is the true and actionable half of it.
+    engine.set_enabled_error = ipc::Error::kInternal;
+    checks.Expect(core.SetEnabled(true).outcome == ipc::WriteOutcome::kWriteFailed,
+                  "an unnamed engine failure is reported as a write that did not happen");
   }
 
-  // SetConfig's refusal is its diagnostics. A `kInvalid` with an empty payload
+  // SetConfig's refusal is its diagnostics. A refusal with an empty payload
   // would leave a settings screen with nothing to say.
   {
     FakeEngine engine;
@@ -1190,11 +1371,13 @@ int DispatchTable() {
     edit.assignments.push_back({"server", "url", "nonsense", false});
     std::string response;
     checks.Expect(ipc::Dispatch(core, static_cast<std::uint32_t>(ipc::Command::kSetConfig),
-                                ipc::EncodeConfigEdit(edit), &response) == ipc::Error::kInvalid,
-                  "a refused edit is named");
-    const ipc::Decoded<std::vector<config::Diagnostic>> back = ipc::DecodeDiagnostics(response);
-    checks.Expect(back.ok() && back.value.size() == 1, "and answers with why: " +
-                                                           back.error.Describe());
+                                ipc::EncodeConfigEdit(edit), &response) == ipc::Error::kOk,
+                  "a refused edit is a successful call carrying the refusal");
+    const ipc::Decoded<ipc::ConfigResult> back = ipc::DecodeConfigResult(response);
+    checks.Expect(back.ok(), "and decodes: " + back.error.Describe());
+    checks.Expect(back.ok() && back.value.outcome == ipc::WriteOutcome::kInvalid,
+                  "which says nothing was written");
+    checks.Expect(back.ok() && back.value.diagnostics.size() == 1, "and says why");
     checks.ExpectEq(engine.last_edit.assignments.size(), std::size_t{1},
                     "the edit reached the engine as it was sent");
     if (!engine.last_edit.assignments.empty()) {
@@ -1503,6 +1686,12 @@ class HarnessEngine : public ipc::Engine {
     return token_;
   }
 
+  /// The session the last sync opened, or `0`. See `RunSync`.
+  std::int64_t last_session_id() const {
+    std::lock_guard<std::mutex> held(mutex_);
+    return last_session_id_;
+  }
+
  private:
   void RunPairing() {
     auth::PairingState state = session_->Begin();
@@ -1528,6 +1717,12 @@ class HarnessEngine : public ipc::Engine {
     // card makes on its first tick.
     const sync::Negotiation negotiated = sync::Negotiate(client_, token(), {});
     std::lock_guard<std::mutex> held(mutex_);
+    // RomM keeps ONE active sync session per device, and a negotiate that walks
+    // away from its session leaves the next one racing to cancel it (#76). A
+    // real engine completes the session as step 3 of the loop (M2-6); this one
+    // records the id so the scenario can, which is the same discipline every
+    // other rig test in this repo now keeps.
+    last_session_id_ = negotiated.ok() ? negotiated.plan.session_id : 0;
     snapshot_.online = negotiated.error != sync::NegotiateError::kUnreachable;
     if (negotiated.ok()) {
       snapshot_.last_sync_result = ipc::SyncResult::kOk;
@@ -1561,6 +1756,7 @@ class HarnessEngine : public ipc::Engine {
   auth::StoredToken token_;
   std::vector<std::int64_t> known_;
   std::vector<std::int64_t> queue_;
+  std::int64_t last_session_id_ = 0;
   bool starting_ = false;
 
   std::atomic<bool> sync_running_{false};
@@ -1662,9 +1858,14 @@ int EndToEnd(http::HttpClient& client, const std::string& base) {
                       auth::ToString(started.value.state));
   }
 
+  // A budget per phase, not one shared across three sequential waits: a slow
+  // pairing must not spend the sync's budget and have the last loop report "the
+  // sync landed: never" -- a timeout dressed up as a wrong answer.
+  const auto Deadline = [] { return std::chrono::steady_clock::now() + 90s; };
+
   std::string user_code;
-  const auto deadline = std::chrono::steady_clock::now() + 90s;
-  while (std::chrono::steady_clock::now() < deadline) {
+  const auto code_deadline = Deadline();
+  while (std::chrono::steady_clock::now() < code_deadline) {
     std::string response;
     checks.Expect(Call(ipc::Command::kGetPairState, ipc::EncodeEmpty(), &response) ==
                       ipc::Error::kOk,
@@ -1687,7 +1888,8 @@ int EndToEnd(http::HttpClient& client, const std::string& base) {
   checks.ExpectOk(Approve(client, base, user_code), "the human approves it in the web UI");
 
   bool paired = false;
-  while (!paired && std::chrono::steady_clock::now() < deadline) {
+  const auto paired_deadline = Deadline();
+  while (!paired && std::chrono::steady_clock::now() < paired_deadline) {
     std::this_thread::sleep_for(300ms);
     paired = StatusNow().auth == ipc::AuthState::kPaired;
   }
@@ -1697,6 +1899,13 @@ int EndToEnd(http::HttpClient& client, const std::string& base) {
   }
 
   // --- a sync, before and after -------------------------------------------------
+  // Whatever an earlier run of this scenario left open on *this* device, before
+  // negotiating on it: RomM keeps one active session per device and a leftover
+  // makes the next negotiate race its own session to a cancel (#76). The
+  // fixture's device is another binary's to tidy; this one is ours.
+  const harness::Fixture device{engine.token().access_token, engine.token().device_id};
+  harness::CloseOpenSessions(client, base, device);
+
   const std::vector<std::int64_t> ids = LibraryIds(client, base, engine.token(), checks);
   checks.Expect(!ids.empty(), "the seeded library has roms to work with");
 
@@ -1726,8 +1935,9 @@ int EndToEnd(http::HttpClient& client, const std::string& base) {
   }
 
   ipc::Status after = StatusNow();
+  const auto sync_deadline = Deadline();
   while (after.last_sync_result == ipc::SyncResult::kNever &&
-         std::chrono::steady_clock::now() < deadline) {
+         std::chrono::steady_clock::now() < sync_deadline) {
     std::this_thread::sleep_for(200ms);
     after = StatusNow();
   }
@@ -1735,8 +1945,40 @@ int EndToEnd(http::HttpClient& client, const std::string& base) {
                 std::string("the sync landed: ") + ipc::ToString(after.last_sync_result));
   checks.Expect(after.online, "and the console reports itself online");
   checks.Expect(after.last_sync_at > 0, "with a time to show for it");
-  checks.Expect(after.uploaded + after.downloaded + after.conflicts >= 0,
-                "and the server's own counts, whatever they were");
+  checks.ExpectEq(after.enabled, engine.config().sync.enabled,
+                  "and the switch on the card, not the one the engine happens to hold");
+
+  // Close the session this scenario opened. A real engine does it as step 3 of
+  // the loop (M2-6); until that exists, a scenario that negotiated and walked
+  // away is the thing that breaks the next binary's `harness.partial` (#76).
+  if (engine.last_session_id() != 0) {
+    harness::Complete(client, base, device, engine.last_session_id(), 0, 0);
+  }
+
+  // The switch, over the table, on the engine that actually persists it.
+  {
+    std::string response;
+    checks.Expect(Call(ipc::Command::kSetEnabled, ipc::EncodeEnabled(false), &response) ==
+                      ipc::Error::kOk,
+                  "SetEnabled answers");
+    const ipc::Decoded<ipc::EnabledResult> off = ipc::DecodeEnabledResult(response);
+    checks.Expect(off.ok() && off.value.outcome == ipc::WriteOutcome::kApplied,
+                  "the write took: " + off.error.Describe());
+    checks.Expect(off.ok() && !off.value.enabled, "and the answer is the state that took");
+    checks.ExpectEq(StatusNow().enabled, false, "which GetStatus agrees with");
+
+    // ...and a sync asked for while it is off is its own outcome, not a
+    // spinner that never moves (#24).
+    checks.Expect(Call(ipc::Command::kSyncNow, ipc::EncodeEmpty(), &response) == ipc::Error::kOk,
+                  "SyncNow still answers with the switch off");
+    const ipc::Decoded<ipc::SyncOutcome> refused = ipc::DecodeSyncOutcome(response);
+    checks.Expect(refused.ok() && refused.value == ipc::SyncOutcome::kDisabled,
+                  "as disabled");
+
+    checks.Expect(Call(ipc::Command::kSetEnabled, ipc::EncodeEnabled(true), &response) ==
+                      ipc::Error::kOk,
+                  "and it goes back on");
+  }
 
   // --- the queue ----------------------------------------------------------------
   engine.KnowRoms(ids);

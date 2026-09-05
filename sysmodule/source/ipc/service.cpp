@@ -55,8 +55,22 @@ Result HandleRequest(ipc::ServiceCore& core, void* message) {
     return 0;
   }
 
-  const auto* in_header =
-      static_cast<const CmifInHeader*>(cmifGetAlignedDataStart(parsed.data.data_words, message));
+  // `hipcParseRequest` validates nothing about sizes, and the message was
+  // written by another process: a `Request` declaring no data words would have
+  // the read below reach past the request's data area and take `command_id` from
+  // whatever happened to be there. Checked before the cast, the way every other
+  // bound in this file is.
+  const auto* words = reinterpret_cast<const u8*>(parsed.data.data_words);
+  const auto* aligned =
+      static_cast<const u8*>(cmifGetAlignedDataStart(parsed.data.data_words, message));
+  const size_t declared = static_cast<size_t>(parsed.meta.num_data_words) * sizeof(u32);
+  const size_t consumed = static_cast<size_t>(aligned - words) + sizeof(CmifInHeader);
+  if (aligned < words || consumed > declared) {
+    MakeReply(message, ToResult(ipc::Error::kMalformedRequest));
+    return 0;
+  }
+
+  const auto* in_header = reinterpret_cast<const CmifInHeader*>(aligned);
   if (in_header->magic != CMIF_IN_HEADER_MAGIC) {
     MakeReply(message, ToResult(ipc::Error::kMalformedRequest));
     return 0;

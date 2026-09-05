@@ -164,7 +164,11 @@ target_include_directories(test_ipc PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(test_ipc PRIVATE
   ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
   ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
-  ROMMSYNC_DEVELOPMENT_DOC="${CMAKE_SOURCE_DIR}/docs/DEVELOPMENT.md")
+  ROMMSYNC_DEVELOPMENT_DOC="${CMAKE_SOURCE_DIR}/docs/DEVELOPMENT.md"
+  # `ipc.engine` negotiates for real, so it owes the fixture the same session
+  # hygiene every other rig test does -- see harness.hpp's CloseOpenSessions and
+  # issue #76. That header reads this path.
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
 find_package(Threads REQUIRED)
 target_link_libraries(test_ipc PRIVATE Threads::Threads)
 

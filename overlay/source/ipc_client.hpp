@@ -27,7 +27,6 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
-#include <vector>
 
 #include "rommsync/auth.hpp"
 #include "rommsync/config.hpp"
@@ -67,14 +66,17 @@ class IpcClient {
   Result GetStatus(ipc::Status* out);
   Result GetConfig(ipc::ConfigView* out);
 
-  /// `diagnostics` is filled whether the edit was applied or refused -- on a
-  /// refusal it is the whole answer.
-  Result SetConfig(const ipc::ConfigEdit& edit, std::vector<config::Diagnostic>* diagnostics);
+  /// The answer says what happened (`result->outcome`) and why
+  /// (`result->diagnostics`) -- **both on a refusal**, where the diagnostics are
+  /// the entire answer. A failing `Result` here means the call did not happen;
+  /// a refused edit is a successful call with `kInvalid` in it. See
+  /// `ipc::WriteOutcome` for why it has to be that way round.
+  Result SetConfig(const ipc::ConfigEdit& edit, ipc::ConfigResult* result);
 
-  /// `effective` is the state as it stands afterwards, which is what the switch
-  /// should be drawn as -- not the state that was asked for. Filled on a failed
-  /// write too.
-  Result SetEnabled(bool enabled, bool* effective);
+  /// Same shape. `result->enabled` is the state as it stands afterwards, which
+  /// is what the switch should be drawn as -- not the state that was asked for,
+  /// and not lost when the write failed.
+  Result SetEnabled(bool enabled, ipc::EnabledResult* result);
 
   Result SyncNow(ipc::SyncOutcome* outcome);
   Result StartPair(auth::PairingStatus* status);
@@ -89,16 +91,24 @@ class IpcClient {
   Result ListEnd(ipc::Cursor cursor);
 
  private:
-  /// One command: a request payload in, a response payload out.
+  /// One command: a request payload in, `response_` out.
   ///
-  /// The response buffer is a member rather than a local: `kMaxPayloadBytes` is
-  /// 8 KiB and an overlay's draw thread does not have that to spare on the
-  /// stack, and allocating one per call would be an allocation per frame on the
-  /// status screen.
-  Result Call(ipc::Command command, std::string_view request, std::string* response);
+  /// The buffer is a member rather than a local, and is reused across calls:
+  /// `kMaxPayloadBytes` is 8 KiB, an overlay's draw thread does not have that to
+  /// spare on the stack, and the status screen polls every frame -- so an
+  /// allocation per call would be an allocation per frame.
+  Result Call(ipc::Command command, std::string_view request);
+
+  /// The shape every typed method above is: send, decode `response_`, and turn a
+  /// payload this build cannot read into one named `Result` rather than into a
+  /// half-filled struct. Written once because there are thirteen of them, and
+  /// because a fix applied to twelve is the bug this whole header exists to
+  /// prevent.
+  template <typename T, typename Decode>
+  Result CallAndDecode(ipc::Command command, std::string_view request, Decode decode, T* out);
 
   Service service_{};
-  std::vector<char> buffer_;
+  std::string response_;
 };
 
 }  // namespace rommsync::overlay
