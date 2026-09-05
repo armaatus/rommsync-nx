@@ -103,7 +103,13 @@ every check green.
 
 So after every review, whatever its verdict:
 
-    gh api repos/{owner}/{repo}/pulls/<n>/comments --jq '.[]|"\(.path):\(.line)  \(.body)"'
+    ./scripts/orca/open-threads.sh
+
+It prints only the threads that are still UNRESOLVED, each with the thread ID
+`resolveReviewThread` wants. Do NOT reach for
+`gh api repos/{owner}/{repo}/pulls/<n>/comments` instead: that endpoint cannot
+say whether a thread is resolved, so on round two it hands you every comment
+ever left with the live ones buried among them.
 
 Fix what is real; where you disagree, reply on the thread with your reasoning --
 both are acceptable, silence is not. Then RESOLVE each thread (the

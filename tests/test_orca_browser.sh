@@ -672,12 +672,81 @@ STUB
     echo "PASS: a stalled agent is reported once, on the card and in a notification"
     ;;
 
+  open_threads_hides_resolved)
+    # The brief used to list feedback with the REST comments endpoint, which
+    # cannot say whether a thread is resolved. On round two that returns every
+    # comment ever left -- the fixed ones mixed in with the live one -- and a
+    # thread lost in that noise is exactly what left #88 and #89 blocked.
+    make_fixture
+    cp "$REPO_ROOT"/scripts/orca/{open-threads.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    stub="$TMPDIR_FIXTURE/stub-bin"
+    mkdir -p "$stub"
+    cat >"$stub/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"repo view"*) printf 'armaatus/rommsync-nx\n' ;;
+  *graphql*)
+    cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[
+  {"id":"T_settled","isResolved":true,"isOutdated":false,"path":"core/src/old.cpp","line":10,
+   "comments":{"nodes":[{"author":{"login":"claude"},"body":"ALREADY FIXED LAST ROUND"}]}},
+  {"id":"T_live","isResolved":false,"isOutdated":true,"path":"core/src/sync.cpp","line":288,
+   "comments":{"nodes":[{"author":{"login":"claude"},"body":"THE ONE STILL OPEN"}]}}
+]}}}}}
+JSON
+    ;;
+  *) printf '\n' ;;
+esac
+GHSTUB
+    chmod +x "$stub/gh"
+    ( cd "$TMPDIR_FIXTURE" && git init -q . && git commit -q --allow-empty -m fixture ) 2>/dev/null
+    out="$(cd "$TMPDIR_FIXTURE" &&
+           PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$TMPDIR_FIXTURE/fleet" \
+           bash "$TMPDIR_FIXTURE/scripts/orca/open-threads.sh" 83 2>&1)"
+    rc=$?
+    [ "$rc" = 0 ] || fail "expected exit 0, got $rc: $out"
+    grep -q "THE ONE STILL OPEN" <<<"$out" \
+      || fail "did not print the unresolved thread; got: $out"
+    grep -q "ALREADY FIXED LAST ROUND" <<<"$out" \
+      && fail "printed a RESOLVED thread -- that is the REST behaviour this replaces: $out"
+    grep -q "T_live" <<<"$out" \
+      || fail "did not print the thread ID resolveReviewThread needs: $out"
+    grep -q "core/src/sync.cpp:288" <<<"$out" \
+      || fail "did not say where the thread is: $out"
+    # An outdated thread still blocks the merge, so it must still be listed.
+    grep -q "outdated -- still open" <<<"$out" \
+      || fail "an outdated-but-unresolved thread must be shown as still open: $out"
+    echo "PASS: only unresolved threads are listed, with the ID needed to resolve them"
+    ;;
+
+  brief_never_lists_threads_over_rest)
+    # The brief IS the fleet's operating instruction; a wrong command in it is a
+    # defect in the same sense a wrong line of C++ is. This pins the endpoint it
+    # must not go back to.
+    brief="$REPO_ROOT/scripts/orca/issue-command.sh"
+    grep -q "open-threads.sh" "$brief" \
+      || fail "step 5 no longer points at open-threads.sh"
+    # The REST endpoint may be NAMED (the brief warns against it) but never as
+    # the command to run: the warning line is the only place it may appear.
+    while IFS= read -r line; do
+      case "$line" in
+        *"pulls/<n>/comments"*)
+          case "$line" in
+            *"Do NOT"*|*"cannot"*) ;;
+            *) fail "the brief still tells the agent to run: $line" ;;
+          esac ;;
+      esac
+    done <"$brief"
+    echo "PASS: the brief lists threads through open-threads.sh, not the REST comments list"
+    ;;
+
   *)
     echo "usage: $0 opens|reuses|foreign|no_romm|submits|no_draft|unstable" >&2
     echo "       watch_needs_issue|watch_late_draft|watch_grace|watch_submits|watch_single" >&2
     echo "       watch_bare_url|watch_full_draft_untouched|cli_broken" >&2
     echo "       await_reports_failed_review|await_reports_a_red_build" >&2
     echo "       fleet_notices_a_stalled_agent" >&2
+    echo "       open_threads_hides_resolved|brief_never_lists_threads_over_rest" >&2
     exit 2
     ;;
 esac
