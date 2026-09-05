@@ -80,8 +80,9 @@ void OneByteAtATimeIsTheSameDigest(checks::Checks& c) {
 
 /// A body long enough to span blocks, split at every point in it.
 ///
-/// This is the property `state::HashFile` rests on: it reads 32 KiB at a time,
-/// so a save's digest depends on the read size unless the split is invisible.
+/// This is the property `state::HashFile` rests on: it reads a fixed chunk at a
+/// time, so a save's digest depends on the read size unless the split is
+/// invisible.
 /// Nothing about a save's *size* is under this client's control, so a hasher
 /// that is only correct on 64-byte multiples would be wrong on almost every
 /// real file and right on every test that hashed one string.
