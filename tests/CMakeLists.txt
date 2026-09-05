@@ -150,6 +150,52 @@ target_compile_definitions(test_state_db PRIVATE
   ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
 add_test(NAME core.state_db COMMAND test_state_db)
 
+# --- the IPC contract: payloads, dispatch table, and ServiceCore -------------
+# M5-2. One CTest entry per scenario, same shape as the rest of this file.
+#
+# Everything but `ipc.engine` needs no server and must stay checked with Docker
+# stopped: what those scenarios pin is what a decoder does with a payload written
+# by another release -- truncated, over-long, wrong-typed -- and a running RomM
+# cannot produce one of those. `ipc.commands` reads docs/DEVELOPMENT.md#ipc so
+# the published table and the enum cannot be renumbered apart.
+add_executable(test_ipc test_ipc.cpp)
+target_link_libraries(test_ipc PRIVATE rommsync::host)
+target_include_directories(test_ipc PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_ipc PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_DEVELOPMENT_DOC="${CMAKE_SOURCE_DIR}/docs/DEVELOPMENT.md"
+  # `ipc.engine` negotiates for real, so it owes the fixture the same session
+  # hygiene every other rig test does -- see harness.hpp's CloseOpenSessions and
+  # issue #76. That header reads this path.
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+find_package(Threads REQUIRED)
+target_link_libraries(test_ipc PRIVATE Threads::Threads)
+
+set(IPC_UNIT_SCENARIOS
+  version    # command 0's encoding is frozen, and this is what freezes it
+  commands   # the ids, against the table docs/DEVELOPMENT.md publishes
+  roundtrip  # every payload survives its own encoder and decoder, whole
+  refuses    # truncated, over-long, wrong-typed: named refusals, no reads past the end
+  secrets    # no credential in any payload, and the server URL only where it belongs
+  caps       # nothing on this wire grows with the library or with config.ini
+  dispatch   # the table, and the decisions ServiceCore makes on the way through it
+)
+foreach(scenario IN LISTS IPC_UNIT_SCENARIOS)
+  add_test(NAME ipc.${scenario} COMMAND test_ipc ${scenario})
+  set_tests_properties(ipc.${scenario} PROPERTIES TIMEOUT 120)
+endforeach()
+
+# ServiceCore against the live fixture: a real pairing, a real negotiate, and the
+# queue commands, driven through Dispatch rather than by calling its methods.
+add_test(NAME ipc.engine COMMAND test_ipc engine)
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(ipc.engine PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+# RUN_SERIAL for the reasons pair.* has it: one armed fault proxy for every
+# client, and RomM's ten-inits-a-minute limit is per IP, which is the whole suite.
+set_tests_properties(ipc.engine PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+
 # --- rig smoke test: proves docker RomM + fault proxy + ctest all work -------
 # Uses libcurl directly on purpose. It tests the RIG, not our code, and must
 # keep working while M0-2 replaces it as the way production code speaks HTTP.

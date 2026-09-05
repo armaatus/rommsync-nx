@@ -16,4 +16,10 @@ CONFIG_JSON := sys-rommsync.json
 # aarch64 is what stops core/ from drifting host-only between here and M2.
 ROMMSYNC_USE_CORE := 1
 
+# The IPC binding (M5-2). A separate directory because it is the one part of this
+# target that is *not* portable engine code -- it names `Result`, `HipcRequest`
+# and the tls buffer, which core/ may not (hard rule 4). Object files are named
+# by basename, so nothing in here may share one with core/src.
+SOURCES += source/ipc
+
 include $(TOPDIR)/../switch.mk

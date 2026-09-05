@@ -217,10 +217,131 @@ leaves free and have to move with it (`core/include/rommsync/state_db.hpp`).
 
 ## IPC
 
-Model on ovl-sysmodules / sys-clk: a `tipc` or `cmif` service the overlay opens.
-Commands: `GetStatus`, `SetEnabled`, `SyncNow`, `GetConfig`, `SetConfig`,
-`ListPlatforms`, `ListRoms(page)`, `Enqueue(rom_id)`, `GetQueue`, `StartPair`,
-`GetPairState`. Keep payloads small; stream large lists page-by-page.
+The one surface `ovl-rommsync` talks to `sys-rommsync` through. Modelled on
+ovl-sysmodules / sys-clk: a `cmif` service the overlay opens by name. The
+contract is `core/include/rommsync/ipc.hpp`; this section is the published
+summary of it, and `ipc.commands` reads the table below on every `ctest` so the
+two cannot be renumbered apart.
+
+### The command set
+
+Ids are **stable and never renumbered**: the overlay and the sysmodule ship as
+separate files and a user will pair an old one with a new one, so an id that
+changed meaning is a call that does something other than what the caller asked.
+A removed command leaves a hole.
+
+| id | command | in -> out | errors |
+|---|---|---|---|
+| 0 | `GetInterfaceVersion` | - -> `u32` | never fails; **shape frozen forever** |
+| 1 | `GetStatus` | - -> `Status` | never fails |
+| 2 | `GetConfig` | - -> `Config` + `Diagnostic[]` | never fails |
+| 3 | `SetConfig` | `ConfigEdit` -> `ConfigResult` (outcome + `Diagnostic[]`) | never fails; the outcome is `applied \| invalid \| write_failed` |
+| 4 | `SetEnabled` | `bool` -> `EnabledResult` (outcome + the new **effective** state) | never fails; same outcome set |
+| 5 | `SyncNow` | - -> `accepted \| already_running \| not_configured \| unauthenticated \| disabled` | never blocks |
+| 6 | `StartPair` | - -> `PairingStatus` | `kNotConfigured` |
+| 7 | `GetPairState` | - -> `PairingStatus` | never fails |
+| 8 | `Unpair` | - -> - | `kWriteFailed` |
+| 9 | `Enqueue` | `rom_id` -> position | `kUnknownRom`, `kQueueFull`, `kDuplicate`, `kMultiFile` |
+| 10 | `Dequeue` | `rom_id` -> - | `kNotQueued` |
+| 11 | `ListBegin` | `ListRequest` -> cursor | `kBadCursor`, `kOffline` |
+| 12 | `ListNext` | cursor -> `ListPage` | `kBadCursor`, `kOffline` |
+| 13 | `ListEnd` | cursor -> - | `kBadCursor` |
+
+Rows 3 and 4 answer a `WriteOutcome` inside a successful reply rather than a
+failing `Result`, and that is forced rather than chosen: a `cmif` reply's data
+words are not delivered to a client whose `Result` says the call failed (libnx's
+`cmifParseResponse` returns before it exposes them). `SetConfig`'s diagnostics
+and `SetEnabled`'s effective state *are* those two refusals, so attaching them
+to a failure would be attaching them to something nobody can read. Commands
+whose failure carries nothing -- `Unpair`, `Enqueue`, `ListNext` -- keep
+reporting it as an `ipc::Error`, which the sysmodule maps to a `Result`.
+
+Three more errors belong to the transport rather than to any one command:
+`kUnknownCommand` (an id this build does not implement -- the two halves are
+different releases), `kMalformedRequest` (a request payload that did not decode)
+and `kTooLarge` (a response that would not fit the cap).
+
+`Status` carries the interface version and the build, the enable switch, the auth
+state (paired / unauthenticated / never paired), configured, online, the last
+sync's time, result and counts, the queue depth, and the **current download**
+(`rom_id`, `fs_name`, `bytes_done`, `bytes_total`, state). That last field is how
+M3-5 is served: one poll per frame, not a second round trip. Per-item queue
+progress rides on the `queue` list kind (M5-4).
+
+### Where the halves live
+
+| Path | What |
+|---|---|
+| `core/include/rommsync/ipc.hpp`, `core/src/ipc.cpp` | ids, payloads, encoders and decoders |
+| `core/src/ipc_service.cpp` | `ipc::ServiceCore` -- one method per command, and every decision |
+| `sysmodule/source/ipc/` | the `cmif` binding: buffers in, buffers out, `ipc::Error` to a `Result`. No logic. |
+| `overlay/source/ipc_client.*` | `smGetService("rommsync")` and the *same* codecs |
+
+`core/` may not name a libnx type (hard rule 4), so the errors are a portable
+`ipc::Error` and the sysmodule maps them to a Horizon `Result` at the boundary.
+The pieces the commands drive -- the download queue (M3-2), the scheduler (M7-2),
+live config writes (M5-3), list paging (M5-4) -- sit behind the `ipc::Engine`
+interface, which is what lets the whole command set be driven end to end by the
+host harness against a real RomM today (`ipc.engine`).
+
+### The framing
+
+Every command is the same shape: **a JSON object in, a JSON object out**,
+serialised with `rommsync::json`. A command that takes nothing sends `{}`; one
+that answers nothing answers `{}`. That is what lets the sysmodule side be a pure
+dispatch -- one entry point taking a command id and two buffers -- rather than
+fourteen hand-marshalled stubs, each a place to get a length wrong on a device
+with no debugger attached.
+
+`GetInterfaceVersion` is command 0 and its encoding is frozen forever:
+`{"interface":<u32>}`, from every build there will ever be. An overlay from a
+newer release meets an older sysmodule on somebody's SD card, and this is the one
+call it makes before it knows whether it can decode anything else -- so it can
+say "update the sysmodule" instead of decoding garbage.
+
+### The bounds
+
+`ipc::kMaxPayloadBytes` (8 KiB) caps every single request and response, in both
+directions. The inner heap is `0x80000` with ~390 KiB left after the trimmed bsd
+transfer memory ([M0-1](#m0-1-the-measurement-and-the-decision)), and that budget
+already owes a download buffer and the `state.db` baseline.
+
+Nothing on this wire may grow with the size of the library or of `config.ini`:
+
+- Lists page. `kMaxPageSize` is a count cap and is *not* the binding one -- a
+  rom's name is the user's data -- so a producer fills a page with
+  `ipc::AppendIfItFits`, which stops on whichever bound comes first.
+- `GetConfig` never fails, so a `[platform.*]` map too large to send is dropped
+  whole and flagged (`platforms_truncated`) rather than refused or served
+  half-empty, and diagnostics are trimmed to `kMaxDiagnosticsInPayload` with a
+  notice saying how many did not fit. That trim bounds *characters* and the wire
+  carries *bytes* -- `json::Quote` doubles a backslash and makes six of a control
+  character, both of which `config.cpp` quotes back out of a rejected path -- so
+  the command drops complaints until the payload fits rather than trusting the
+  constants.
+- The three values neither half chooses are bounded where they enter: a
+  `server.url` at `kMaxServerUrlBytes` (the same bound `NormalizeServerUrl`
+  applies), a rom's `fs_name` at `kMaxNameBytes`, and a verification URL off a
+  server response at `kMaxVerificationUrlBytes`. Each belongs to a command
+  documented never to fail.
+
+### The two rules
+
+**No command blocks on the network.** `SyncNow` and `StartPair` hand work to the
+engine thread and return; the overlay polls. `PairingSession::status()` is
+already documented as safe from any thread and never blocking, for exactly this
+reason.
+
+**Nothing secret crosses.** No bearer token and no `device_code` appears in any
+payload -- asserted over every command by `ipc.secrets`, not reviewed. The server
+URL is a different thing: `NormalizeServerUrl` refuses `user:password@` outright,
+so a configured URL carries no credential, and the settings screen exists to show
+and edit it. It is therefore served by `GetConfig` and by the two verification
+URLs a human has to type, and by nothing else -- never in a diagnostic or an error
+string, which go to a log ([SECURITY.md](SECURITY.md)).
+
+The overlay may **read** `config.ini` directly but never writes it; the sysmodule
+owns writes ([ARCHITECTURE.md](ARCHITECTURE.md#3-shared-state-on-sd)).
 
 ## Testing without hardware
 
