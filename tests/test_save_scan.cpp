@@ -140,6 +140,12 @@ class FakeFileSystem final : public fs::FileSystem {
   }
 
   std::string Resolve(std::string_view sd_path) const override {
+    // The same refusal the interface requires and the native backend makes: a
+    // fake that resolved a `..` would let a test pass over a backend that does
+    // not.
+    if (sd_path.find("..") != std::string_view::npos || sd_path.find('\0') != std::string_view::npos) {
+      return {};
+    }
     std::string relative(sd_path);
     while (!relative.empty() && relative.front() == '/') {
       relative.erase(relative.begin());
@@ -230,6 +236,13 @@ void Names(::checks::Checks& checks) {
   checks.ExpectEq(scan::SlotFor("retroarch", "Game.SRM"), std::string("retroarch-srm"),
                   "the slot does not change with the case the card happened to use");
 
+  // The scan must not emit more saves than a baseline can hold: `SaveBaseline`
+  // *refuses* a file with more rows than `state::kMaxRecords`, so a card past
+  // that bound would write no baseline at all and re-hash the whole library on
+  // every tick, silently. The two constants move together (state_db.hpp).
+  checks.ExpectEq(scan::kMaxSaves, state::kMaxRecords,
+                  "the scan's bound is what state.db can persist");
+
   const config::Config defaults = config::Defaults();
   const std::map<std::string, std::string, std::less<>> hints = scan::PlatformHints(defaults);
   const auto flat = hints.find("/retroarch/saves");
@@ -282,6 +295,22 @@ void Ambiguous(::checks::Checks& checks) {
   }
   checks.Expect(result.DescribeSkipped().find("ambiguous") != std::string::npos,
                 "the log line says what kind of skip it was");
+
+  // A short index changes what "unmatched" means: it may be a rom that was
+  // never read rather than one the user does not have, and a scan that reported
+  // it flatly would send them hunting for a library problem that is really a
+  // client bound.
+  roms::RomIndex partial;
+  partial.Add(MakeRom(1, "Solstice", "nes"));
+  partial.set_truncated(true);
+  FakeFileSystem more("more");
+  more.AddFile("/retroarch/saves", "Rampart.srm", 64, kMtime);
+  const scan::ScanResult short_index = scan::ScanSaves(config, partial, more, kFirstTick);
+  checks.Expect(short_index.index_truncated, "the scan carries the index's truncation");
+  checks.Expect(!short_index.skipped.empty() &&
+                    short_index.skipped.front().message.find("index is incomplete") !=
+                        std::string::npos,
+                "and says so in the reason an unmatched file carries");
 }
 
 // --- walked_once --------------------------------------------------------------
@@ -512,6 +541,19 @@ void Hashing(::checks::Checks& checks) {
   checks.Expect(!unreadable.unhashed.empty() &&
                     unreadable.unhashed.front().sd_path == "/retroarch/saves/nova.srm",
                 "and the file is named");
+  checks.Expect(unreadable.unhashed.front().reason == scan::SkipReason::kUnhashed,
+                "under a reason of its own, not one that reads as a skip");
+  checks.Expect(unreadable.DescribeSkipped().find("nova.srm") != std::string::npos,
+                "and a caller that logs the skips sees it -- it is where the server "
+                "uploads bytes it may already have");
+
+  // A save whose path the backend refuses is the same case as one it cannot
+  // read, and it must be refused rather than resolved: on the host an
+  // unresolved SD path would open against the process's working directory.
+  FakeFileSystem escaping("hashing-escaping");
+  escaping.AddFile("/retroarch/saves", "nova.srm", 64, kMtime);
+  checks.ExpectEq(escaping.Resolve("/retroarch/saves/../../etc/passwd"), std::string(),
+                  "a path that walks out of the card is refused, not resolved");
 }
 
 // --- truncated ----------------------------------------------------------------
@@ -556,6 +598,18 @@ void Truncated(::checks::Checks& checks) {
 
   // The same directory read twice gives the same set, which is what makes the
   // duplicate-slot rule above it deterministic.
+  // `Resolve` is the half of this interface the *file* operations use, and its
+  // refusal is what keeps an SD path from resolving against the host's working
+  // directory. Checked on the real backend, not only on the fake.
+  checks.Expect(!files->Resolve("/retroarch/saves/000000.srm").empty(),
+                "a path on the card resolves to something openable");
+  checks.ExpectEq(files->Resolve("/retroarch/../../etc/passwd"), std::string(),
+                  "a path that walks out of the card is refused");
+  checks.ExpectEq(files->Resolve(std::string("/retroarch/sa\0ves", 17)), std::string(),
+                  "and so is one carrying a NUL, which every C API downstream stops at");
+  checks.Expect(files->Resolve("/retroarch/saves/000000.srm").rfind(root.string(), 0) == 0,
+                "and what it does resolve is under the card's root");
+
   const fs::Listing again = files->List("/retroarch/saves");
   std::vector<std::string> repeat;
   for (const fs::Entry& entry : again.entries) {
@@ -739,6 +793,42 @@ void Paging(::checks::Checks& checks, http::HttpClient& client, const std::strin
   // a bare array -- which parses as nothing and reads as "the library ended".
   const rommsync::json::Error error = roms::ParsePage("[{\"id\":1}]", &page);
   checks.Expect(!error.ok(), "a bare array is refused by name, not read as an empty library");
+
+  // One oddly named rom must not cost the whole library. RomM derives
+  // `fs_name_no_tags` by stripping `(...)` and `[...]`, so a file called
+  // `(USA).nes` reduces to nothing -- and a strict read of that field would
+  // fail the page, abort the fetch, and leave an index in which *every* save on
+  // the card is unmatched, on every tick.
+  const std::string kEmptyTags =
+      "{\"total\":1,\"limit\":200,\"offset\":0,\"items\":[{\"id\":7,\"fs_name_no_ext\":\"(USA)\","
+      "\"fs_name_no_tags\":\"\",\"platform_fs_slug\":\"nes\",\"has_multiple_files\":false}]}";
+  roms::Page tagged;
+  checks.Expect(roms::ParsePage(kEmptyTags, &tagged).ok(),
+                "a rom whose tag-stripped name is empty is read, not fatal");
+  checks.ExpectEq(tagged.roms.size(), static_cast<std::size_t>(1), "and it is in the page");
+
+  // Still a shape this client refuses when the field is the wrong *type* or
+  // absent -- lenient about empty is not lenient about missing.
+  roms::Page broken;
+  checks.Expect(!roms::ParsePage("{\"total\":1,\"limit\":1,\"offset\":0,\"items\":[{\"id\":7,"
+                                 "\"fs_name_no_ext\":42,\"fs_name_no_tags\":\"x\","
+                                 "\"platform_fs_slug\":\"nes\",\"has_multiple_files\":false}]}",
+                                 &broken)
+                     .ok(),
+                "a name that is not a string is still refused by name");
+  checks.Expect(!roms::ParsePage("{\"total\":1,\"limit\":1,\"offset\":0,\"items\":[{\"id\":7,"
+                                 "\"fs_name_no_tags\":\"x\",\"platform_fs_slug\":\"nes\","
+                                 "\"has_multiple_files\":false}]}",
+                                 &broken)
+                     .ok(),
+                "and so is a missing one");
+
+  // An empty key matches no base name, so the lenient read costs that one rom
+  // and nothing else.
+  roms::RomIndex odd;
+  odd.Add(tagged.roms.front());
+  checks.Expect(!odd.Find("nova", "").matched(), "an empty key does not match a real name");
+  checks.Expect(odd.Find("(USA)", "").matched(), "and the rom is still findable by the other");
 }
 
 }  // namespace

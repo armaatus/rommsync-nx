@@ -1,6 +1,7 @@
 #include "rommsync/rom_index.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
@@ -41,6 +42,26 @@ std::string PlatformsOf(const std::vector<const Rom*>& candidates) {
   return out;
 }
 
+/// A name field that must be present and a string, and **may be empty**.
+///
+/// Everything else about it is held to `json::Reader`'s bar: an embedded NUL is
+/// refused, because every C API downstream stops at one and the value that got
+/// used would not be the value that was checked.
+json::Error ReadName(const json::Value& item, const char* key, std::string* out) {
+  const json::Value* value = item.Find(key);
+  if (value == nullptr) {
+    return Fail(key, "missing");
+  }
+  if (!value->is_string()) {
+    return Fail(key, "expected a string");
+  }
+  if (value->string().find('\0') != std::string::npos) {
+    return Fail(key, "contains a NUL");
+  }
+  *out = value->string();
+  return {};
+}
+
 }  // namespace
 
 json::Error ParsePage(std::string_view body, Page* out) {
@@ -74,14 +95,28 @@ json::Error ParsePage(std::string_view body, Page* out) {
     json::Reader reader(item, "rom");
     Rom rom;
     reader.Required("id", &rom.id);
-    reader.Required("fs_name_no_ext", &rom.fs_name_no_ext);
-    reader.Required("fs_name_no_tags", &rom.fs_name_no_tags);
     reader.Required("platform_fs_slug", &rom.platform_fs_slug);
     reader.Required("has_multiple_files", &rom.has_multiple_files);
+    // The two match keys are read leniently, because `json::Reader::Required`
+    // refuses an empty string and these two can legitimately be one: RomM
+    // derives `fs_name_no_tags` by stripping `(...)` and `[...]`, so a rom
+    // whose whole filename is a tag -- `(USA).nes` -- reduces to nothing. Read
+    // strictly, that single oddly named file fails the page, aborts the fetch,
+    // and leaves an empty index in which *every* save on the card is
+    // unmatched, on every tick. An empty key simply matches no base name, which
+    // costs that one rom and nothing else.
     if (!reader.ok()) {
       json::Error error = reader.error();
       error.field = where + error.field;
       return error;
+    }
+    for (const auto& [key, out] :
+         {std::pair{"fs_name_no_ext", &rom.fs_name_no_ext},
+          std::pair{"fs_name_no_tags", &rom.fs_name_no_tags}}) {
+      if (json::Error error = ReadName(item, key, out); !error.ok()) {
+        error.field = where + error.field;
+        return error;
+      }
     }
     if (rom.id <= 0) {
       return Fail(where + "id", "must be a positive rom id");
@@ -102,6 +137,22 @@ const Rom* RomIndex::ById(std::int64_t id) const {
   return nullptr;
 }
 
+void RomIndex::BuildLookup() const {
+  by_no_ext_.resize(roms_.size());
+  by_no_tags_.resize(roms_.size());
+  for (std::size_t index = 0; index < roms_.size(); ++index) {
+    by_no_ext_[index] = static_cast<std::uint32_t>(index);
+    by_no_tags_[index] = static_cast<std::uint32_t>(index);
+  }
+  const auto by = [this](const std::string Rom::*key) {
+    return [this, key](std::uint32_t left, std::uint32_t right) {
+      return roms_[left].*key < roms_[right].*key;
+    };
+  };
+  std::sort(by_no_ext_.begin(), by_no_ext_.end(), by(&Rom::fs_name_no_ext));
+  std::sort(by_no_tags_.begin(), by_no_tags_.end(), by(&Rom::fs_name_no_tags));
+}
+
 Match RomIndex::Find(std::string_view base_name, std::string_view platform_fs_slug) const {
   Match match;
   if (base_name.empty()) {
@@ -117,24 +168,35 @@ Match RomIndex::Find(std::string_view base_name, std::string_view platform_fs_sl
   // routinely the exact name of another -- `Game (USA)` and `Game (Europe)`
   // both reduce to `Game` -- so letting the fallback run alongside the exact
   // match would turn a clean hit into an ambiguity.
+  if (!roms_.empty() && by_no_ext_.size() != roms_.size()) {
+    BuildLookup();
+  }
+
   for (int pass = 0; pass < 2; ++pass) {
-    // Counted rather than collected. This runs once per file in every save
-    // folder on the card, and the overwhelmingly common answers are none and
-    // one -- neither of which is worth a heap allocation per file per pass on a
+    const std::vector<std::uint32_t>& order = pass == 0 ? by_no_ext_ : by_no_tags_;
+    const std::string Rom::*key = pass == 0 ? &Rom::fs_name_no_ext : &Rom::fs_name_no_tags;
+    const auto before = [this, key](std::uint32_t left, std::string_view right) {
+      return std::string_view(roms_[left].*key) < right;
+    };
+    const auto after = [this, key](std::string_view left, std::uint32_t right) {
+      return left < std::string_view(roms_[right].*key);
+    };
+    const auto first = std::lower_bound(order.begin(), order.end(), base_name, before);
+    const auto last = std::upper_bound(first, order.end(), base_name, after);
+
+    // Counted rather than collected. The overwhelmingly common answers are none
+    // and one, and neither is worth a heap allocation per file per pass on a
     // sysmodule. The candidates are gathered only on the branch that has to
     // name them.
-    const Rom* first = nullptr;
+    const Rom* found = nullptr;
     std::size_t hits = 0;
-    for (const Rom& rom : roms_) {
+    for (auto it = first; it != last; ++it) {
+      const Rom& rom = roms_[*it];
       if (!platform_fs_slug.empty() && rom.platform_fs_slug != platform_fs_slug) {
         continue;
       }
-      const std::string& key = pass == 0 ? rom.fs_name_no_ext : rom.fs_name_no_tags;
-      if (key != base_name) {
-        continue;
-      }
-      if (first == nullptr) {
-        first = &rom;
+      if (found == nullptr) {
+        found = &rom;
       }
       ++hits;
     }
@@ -143,7 +205,7 @@ Match RomIndex::Find(std::string_view base_name, std::string_view platform_fs_sl
     }
     if (hits == 1) {
       match.outcome = MatchOutcome::kMatched;
-      match.rom = first;
+      match.rom = found;
       match.reason = std::string("matched \"") + std::string(base_name) + "\" to rom " +
                      std::to_string(match.rom->id) + " (" + match.rom->platform_fs_slug + ")" +
                      (pass == 0 ? "" : " by its tag-stripped name");
@@ -152,11 +214,9 @@ Match RomIndex::Find(std::string_view base_name, std::string_view platform_fs_sl
 
     std::vector<const Rom*> candidates;
     candidates.reserve(hits);
-    for (const Rom& rom : roms_) {
-      if (!platform_fs_slug.empty() && rom.platform_fs_slug != platform_fs_slug) {
-        continue;
-      }
-      if ((pass == 0 ? rom.fs_name_no_ext : rom.fs_name_no_tags) == base_name) {
+    for (auto it = first; it != last; ++it) {
+      const Rom& rom = roms_[*it];
+      if (platform_fs_slug.empty() || rom.platform_fs_slug == platform_fs_slug) {
         candidates.push_back(&rom);
       }
     }

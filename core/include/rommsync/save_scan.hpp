@@ -102,6 +102,7 @@ enum class SkipReason {
   kUnusable,        ///< `sync::Validate` would refuse it -- an unset mtime, say
   kDirectoryFailed, ///< a mapped folder could not be read; its files are simply absent
   kTooManySaves,    ///< the scan hit `kMaxSaves` and stopped
+  kUnhashed,        ///< reported, but with no digest: its bytes could not be read
 };
 
 /// Stable, log-friendly name. Never null.
@@ -127,7 +128,18 @@ struct Skip {
 /// holding four thousand files nobody has roms for must cost one log line and a
 /// count, not four thousand strings on a sysmodule heap. The *count* is always
 /// exact -- only the spelling out is bounded.
-inline constexpr std::size_t kMaxSaves = 4096;
+/// `kMaxSaves` is `state::kMaxRecords` and not a round number of its own.
+///
+/// `state.db` holds one row per reported save and its writer *refuses* a
+/// baseline with more rows than that (`state_db.hpp` sizes it against the
+/// sysmodule's ~390 KiB, and says the two constants and `kInnerHeapSize` move
+/// together). A scanner that emitted more would produce a tick whose baseline
+/// can never be written: the write fails, nothing is stored, and the whole
+/// library is re-hashed on the next tick and every tick after it -- silently,
+/// which is the failure that refusal exists to prevent. Stopping here costs the
+/// saves past the bound and says so; the alternative costs all of them, forever,
+/// and says nothing.
+inline constexpr std::size_t kMaxSaves = state::kMaxRecords;
 inline constexpr std::size_t kMaxSkipsReported = 64;
 
 struct ScanResult {
@@ -141,6 +153,14 @@ struct ScanResult {
 
   /// Files seen in the mapped directories, matched or not.
   std::size_t files_seen = 0;
+
+  /// The rom index did not hold the whole library (`roms::RomIndex::truncated`).
+  ///
+  /// Carried because it changes what an unmatched file *means*: with a short
+  /// index, "no rom named X" may simply be a rom that was never read, and a
+  /// caller that reported those as files-with-no-rom would send a user hunting
+  /// for a library problem that is really a client bound.
+  bool index_truncated = false;
 
   /// Saves reported with no digest because their bytes could not be read, in
   /// scan order and bounded like `skipped`.
@@ -156,6 +176,10 @@ struct ScanResult {
 
   /// One line per reported skip, plus a final line when there were more. Empty
   /// when the scan skipped nothing.
+  ///
+  /// Includes the unhashed saves: they are not skips, but a caller that logs
+  /// this and nothing else would otherwise never see them, and "reported with
+  /// no digest" is the state where the server uploads bytes it already has.
   std::string DescribeSkipped() const;
 };
 

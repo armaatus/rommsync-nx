@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -100,6 +101,8 @@ const char* ToString(SkipReason reason) {
       return "directory failed";
     case SkipReason::kTooManySaves:
       return "too many saves";
+    case SkipReason::kUnhashed:
+      return "unhashed";
   }
   return "unknown";
 }
@@ -116,7 +119,7 @@ std::string Skip::Describe() const {
 }
 
 std::string ScanResult::DescribeSkipped() const {
-  if (skipped_total == 0) {
+  if (skipped_total == 0 && unhashed_total == 0) {
     return {};
   }
   std::string out;
@@ -126,6 +129,14 @@ std::string ScanResult::DescribeSkipped() const {
   }
   if (skipped_total > skipped.size()) {
     out += "and " + std::to_string(skipped_total - skipped.size()) + " more skipped\n";
+  }
+  for (const Skip& save : unhashed) {
+    out += save.Describe();
+    out.push_back('\n');
+  }
+  if (unhashed_total > unhashed.size()) {
+    out += "and " + std::to_string(unhashed_total - unhashed.size()) +
+           " more reported with no digest\n";
   }
   return out;
 }
@@ -237,6 +248,7 @@ sync::ClientSaveState SaveFile::ToClientSaveState(std::optional<std::string> con
 ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
                      fs::FileSystem& files, const state::Baseline& baseline) {
   ScanResult result;
+  result.index_truncated = index.truncated();
   const std::map<std::string, std::string, std::less<>> hints = PlatformHints(config);
 
   // `(rom_id, slot)` is what the server pairs on, so two local files landing on
@@ -244,7 +256,7 @@ ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
   // ticks, forever. The first one in scan order keeps it and the second is
   // reported -- which is only deterministic because the directory order is the
   // config's and each directory's entries are sorted below.
-  std::vector<std::pair<std::int64_t, std::string>> claimed;
+  std::set<std::pair<std::int64_t, std::string>> claimed;
 
   const auto record_skip = [&result](SkipReason reason, std::string sd_path, std::string message) {
     ++result.skipped_total;
@@ -300,7 +312,14 @@ ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
         continue;
       }
       if (!match.matched()) {
-        record_skip(SkipReason::kUnmatched, sd_path, match.reason);
+        // With a short index "no rom named X" may be a rom that was never read,
+        // and reporting it flatly would send a user looking for a library
+        // problem that is really this client's bound.
+        record_skip(SkipReason::kUnmatched, sd_path,
+                    result.index_truncated
+                        ? match.reason + "; the rom index is incomplete, so this may be a rom "
+                                         "that was never read rather than one you do not have"
+                        : match.reason);
         continue;
       }
 
@@ -332,19 +351,20 @@ ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
       // expressed faithfully must cost one file, not the whole request body --
       // `EncodeNegotiateRequest` stops at the first bad entry, so one unreadable
       // mtime would otherwise take the tick's every other save with it.
-      if (const json::Error error = sync::Validate(save.ToClientSaveState()); !error.ok()) {
+      // Built once and reused below: it copies three strings, and the scan
+      // needs it for the validation, the slot and the mtime alike.
+      const sync::ClientSaveState negotiated = save.ToClientSaveState();
+      if (const json::Error error = sync::Validate(negotiated); !error.ok()) {
         record_skip(SkipReason::kUnusable, sd_path, error.Describe());
         continue;
       }
 
-      const auto pair = std::make_pair(save.rom_id, save.slot);
-      if (std::find(claimed.begin(), claimed.end(), pair) != claimed.end()) {
+      if (!claimed.emplace(save.rom_id, save.slot).second) {
         record_skip(SkipReason::kDuplicateSlot, sd_path,
                     "rom " + std::to_string(save.rom_id) + " already has a save in slot \"" +
                         save.slot + "\" this tick; only the first is synced");
         continue;
       }
-      claimed.push_back(pair);
 
       // Hashed last, after the record is known to be one that will be reported:
       // `ContentHashFor` reads the file when the baseline cannot answer, and
@@ -358,9 +378,8 @@ ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
           real_path.empty()
               ? state::HashOutcome{{}, state::HashError::kUnreadable, false,
                                    save.sd_path + ": not a path on this card"}
-              : state::ContentHashFor(baseline, save.rom_id, save.ToClientSaveState().slot,
-                                      real_path, save.ToClientSaveState().updated_at,
-                                      save.size_bytes);
+              : state::ContentHashFor(baseline, save.rom_id, negotiated.slot, real_path,
+                                      negotiated.updated_at, save.size_bytes);
       if (hashed.ok()) {
         save.content_hash = hashed.content_hash;
       } else {
@@ -370,7 +389,7 @@ ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
         // bytes it may already have, which is why this is counted.
         ++result.unhashed_total;
         if (result.unhashed.size() < kMaxSkipsReported) {
-          result.unhashed.push_back(MakeSkip(SkipReason::kUnusable, save.sd_path,
+          result.unhashed.push_back(MakeSkip(SkipReason::kUnhashed, save.sd_path,
                                              hashed.message.empty()
                                                  ? std::string(state::ToString(hashed.error))
                                                  : hashed.message));

@@ -101,7 +101,11 @@ struct Match {
 /// The library, as one tick sees it.
 class RomIndex {
  public:
-  void Add(Rom rom) { roms_.push_back(std::move(rom)); }
+  void Add(Rom rom) {
+    roms_.push_back(std::move(rom));
+    by_no_ext_.clear();  // the lookup below is rebuilt on the next Find
+    by_no_tags_.clear();
+  }
 
   const std::vector<Rom>& roms() const { return roms_; }
   std::size_t size() const { return roms_.size(); }
@@ -126,7 +130,19 @@ class RomIndex {
   Match Find(std::string_view base_name, std::string_view platform_fs_slug) const;
 
  private:
+  /// The two match keys, as offsets into `roms_` sorted by that key.
+  ///
+  /// Built once, on the first `Find` after the last `Add`, because the
+  /// alternative is a linear scan of the whole library per file per pass: at
+  /// this module's own bounds that is over a hundred million string
+  /// comparisons in one tick, on a console. Offsets rather than a map of
+  /// strings to pointers for the reason `kMaxIndexRoms` exists at all -- four
+  /// bytes a rom against the sysmodule's heap, not a node and a copied key.
+  void BuildLookup() const;
+
   std::vector<Rom> roms_;
+  mutable std::vector<std::uint32_t> by_no_ext_;
+  mutable std::vector<std::uint32_t> by_no_tags_;
   bool truncated_ = false;
 };
 
