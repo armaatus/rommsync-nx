@@ -210,6 +210,21 @@ target_link_libraries(test_overlay_status PRIVATE rommsync::core)
 target_include_directories(test_overlay_status PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 add_test(NAME overlay.status COMMAND test_overlay_status)
 
+# --- the overlay's pairing screen --------------------------------------------
+# M4-5. The same split, for the same reason: which of four sentences a dead
+# pairing gets, whether a code that ran out of time is still put in front of a
+# human, and that the eight characters are drawn exactly as RomM issued them.
+# The two source paths are compiled in because one criterion is about the code
+# rather than about its behaviour -- the view model may not name a
+# `PairingSession` method, and a grep is the only thing that can say so.
+add_executable(test_overlay_pairing test_overlay_pairing.cpp)
+target_link_libraries(test_overlay_pairing PRIVATE rommsync::core)
+target_include_directories(test_overlay_pairing PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_overlay_pairing PRIVATE
+  ROMMSYNC_PAIRING_VIEW_HDR="${CMAKE_SOURCE_DIR}/core/include/rommsync/overlay_pairing_view.hpp"
+  ROMMSYNC_PAIRING_VIEW_SRC="${CMAKE_SOURCE_DIR}/core/src/overlay_pairing_view.cpp")
+add_test(NAME overlay.pairing COMMAND test_overlay_pairing)
+
 # --- rig smoke test: proves docker RomM + fault proxy + ctest all work -------
 # Uses libcurl directly on purpose. It tests the RIG, not our code, and must
 # keep working while M0-2 replaces it as the way production code speaks HTTP.

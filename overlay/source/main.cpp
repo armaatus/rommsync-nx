@@ -1,8 +1,13 @@
 // ovl-rommsync entry point.
 //
 // One `tsl::Overlay` holding one session on `sys-rommsync` and, for now, one
-// screen: the status screen (M4-1, #23). The library / queue, sync and settings
-// screens are M4-2..M4-5 and are added beside it.
+// screen loaded at start: the status screen (M4-1, #23). The library / queue,
+// sync and settings screens are M4-2..M4-4 and are added beside it.
+//
+// `PairingScreen` (M4-5, #27) is built and is not loaded here. It is pushed
+// from the settings screen's "Re-pair" (M4-4, #26), which is the one place the
+// flow is reached from -- an overlay that opened on the pairing screen would be
+// asking a paired console for a code it does not need.
 //
 // The session is owned here rather than by a screen because every screen shares
 // it: `smGetService` per screen would be a handle per screen, and an overlay

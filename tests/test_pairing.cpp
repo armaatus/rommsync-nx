@@ -33,6 +33,7 @@
 #include "rig.hpp"
 #include "rommsync/device_identity.hpp"
 #include "rommsync/json.hpp"
+#include "rommsync/overlay_pairing_view.hpp"
 #include "rommsync/pairing.hpp"
 #include "rommsync/token_store.hpp"
 
@@ -41,6 +42,7 @@ namespace {
 namespace auth = rommsync::auth;
 namespace http = rommsync::http;
 namespace json = rommsync::json;
+namespace overlay = rommsync::overlay;
 
 using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
@@ -171,6 +173,26 @@ std::string ArmedFault(http::HttpClient& client, const std::string& base) {
   return result.successful() ? result.response.body : std::string();
 }
 
+/// The pairing screen, drawn the way the overlay draws it: the status is
+/// serialised, parsed back and rendered, because the overlay never sees a status
+/// that did not cross IPC first (M4-5, #27).
+overlay::PairingView RenderOverWire(rig::Checks& checks, const auth::PairingStatus& status) {
+  const auth::Parsed<auth::PairingStatus> parsed =
+      auth::ParsePairingStatus(auth::SerializePairingStatus(status));
+  checks.Expect(parsed.ok(), "the status survives the wire: " + parsed.error.Describe());
+  if (!parsed.ok()) {
+    return overlay::PairingView{};
+  }
+  return overlay::RenderPairing(parsed.value);
+}
+
+/// Every string that screen would draw, joined. What a "the screen never shows
+/// X" assertion is made against.
+std::string DrawnText(const overlay::PairingView& view) {
+  return view.headline + "\n" + view.hint + "\n" + view.code + "\n" + view.url + "\n" +
+         view.qr_payload + "\n" + view.countdown + "\n" + view.detail;
+}
+
 void ExpectState(rig::Checks& checks, auth::PairingState got, auth::PairingState want,
                  const std::string& what) {
   checks.ExpectEq(std::string(auth::ToString(got)), std::string(auth::ToString(want)), what);
@@ -268,6 +290,15 @@ int Happy(http::HttpClient& client, const std::string& base) {
     checks.Expect(member.key != "device_code" && member.key != "access_token",
                   "the IPC payload has no secret field: " + member.key);
   }
+
+  // ...and the same assertion one layer further out, over a real token. The
+  // payload carrying no secret only matters if what is *drawn* from it carries
+  // none either, and a screen is where a credential ends up in a screenshot.
+  const std::string drawn = DrawnText(RenderOverWire(checks, session.status()));
+  checks.Expect(drawn.find(granted->access_token) == std::string::npos,
+                "the pairing screen does not draw the token");
+  checks.Expect(drawn.find("rmm_") == std::string::npos,
+                "...nor anything shaped like one");
   return checks.failures();
 }
 
@@ -750,6 +781,23 @@ int Payload(http::HttpClient& client, const std::string& base) {
                                R"("verification_url":"","verification_url_complete":"",)"
                                R"("polls":0,"message":""})");
   checks.Expect(!missing.ok(), "a payload missing a count is refused rather than defaulted");
+
+  // Begin() -> status() -> serialize -> parse -> view, against a live RomM: the
+  // whole chain the overlay's pairing screen sits at the end of. What it has to
+  // yield is a code and an address a human could actually type (M4-5, #27).
+  const overlay::PairingView view = RenderOverWire(checks, status);
+  checks.ExpectEq(view.code, status.user_code, "the screen shows the code RomM issued");
+  checks.ExpectEq(view.code.size(), std::size_t{8}, "...all eight characters of it");
+  checks.Expect(view.code.find('-') == std::string::npos, "...with nothing inserted into it");
+  checks.ExpectEq(view.url, base + "/pair/device", "and an absolute address to type it into");
+  checks.Expect(view.url.rfind("http", 0) == 0, "...which is a URL rather than a path");
+  checks.Expect(view.url.find("//pair") == std::string::npos,
+                "...and was not joined onto the origin a second time");
+  checks.Expect(!view.countdown.empty(), "the code counts down");
+  checks.Expect(!view.start && !view.start_over,
+                "and a live code offers neither Pair nor Start over");
+  checks.ExpectEq(view.qr_payload, status.verification_url_complete,
+                  "the QR payload is the address with the code on it");
   return checks.failures();
 }
 

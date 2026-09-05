@@ -10,10 +10,10 @@
 # codecs it needs to do that are core/'s -- `rommsync/ipc.hpp`, shared with the
 # sysmodule so one copy of the field names serves both halves and they cannot
 # disagree about one. A second copy over here is exactly the drift M5-2 exists to
-# prevent. What else it takes from core/ is the screen's view model
-# (`rommsync/overlay_status_view.hpp`), which is the half of a screen that is a
-# decision rather than a draw call and is therefore the half a host test can
-# check. `--gc-sections` drops the engine the screens never reference; the rule
+# prevent. What else it takes from core/ is the screens' view models
+# (`rommsync/overlay_status_view.hpp`, `rommsync/overlay_pairing_view.hpp`),
+# which are the half of a screen that is a decision rather than a draw call and
+# are therefore the half a host test can check. `--gc-sections` drops the engine the screens never reference; the rule
 # that matters is unchanged, and it is about ownership rather than about the
 # link map: no sync, download or auth logic lives in this directory.
 #
