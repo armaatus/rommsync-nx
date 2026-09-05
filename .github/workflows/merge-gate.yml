@@ -34,15 +34,21 @@ permissions:
   # To re-run an earlier failed gate on this same commit; see "Decide" below.
   actions: write
 
-concurrency:
-  group: merge-gate-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
 jobs:
   gate:
     name: merge-gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # On the JOB, not the workflow. The clearing job below re-queues an older
+    # run of this same workflow, and a re-queue goes through the same
+    # concurrency arbitration as a fresh trigger -- so with the group at
+    # workflow level it would cancel the very run trying to conclude success,
+    # leaving a CANCELLED check where the SUCCESS should be. Found in review of
+    # this PR; the same class of wedge as #84, self-inflicted and with less log
+    # to explain it.
+    concurrency:
+      group: merge-gate-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     steps:
       # The BASE branch's copy of the gate, never the PR's. On a pull_request
       # event actions/checkout defaults to the merge ref, which means the script
@@ -97,6 +103,21 @@ jobs:
           python3 .github/scripts/merge_gate.py \
             "${{ github.event.pull_request.head.sha }}" pr.json files.txt
 
+  # Deliberately a separate job, and deliberately NOT in the gate's concurrency
+  # group: it re-queues an older run of this workflow, which enters that group.
+  # By the time this runs, `gate` has already concluded, so the cancellation
+  # that re-queue triggers can only land on a gate that is still in flight --
+  # never on the one whose success this job exists to preserve.
+  clear-stale:
+    name: clear stale merge-gate failures
+    needs: gate
+    if: success()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+    steps:
       # A gate that has failed once on a commit stays failed.
       #
       # This check correctly fails the first time it runs on any PR -- at that
@@ -104,14 +125,11 @@ jobs:
       # re-runs and passes, but GitHub creates a NEW check run rather than
       # superseding the old one, and branch protection goes on counting the
       # failure. The PR then sits BLOCKED while its own latest gate says every
-      # gate holds. That is issue #84, and it wedged #81.
+      # gate holds. That is issue #84, and it wedged #81 and #82.
       #
       # Re-running the earlier run updates that check run in place, which is the
-      # manual workaround that unwedged #81 in seconds. So the gate does it
-      # itself, but only from a run that PASSED -- a failing gate must never
-      # clear its own earlier failure.
-      - name: Clear the stale failures this gate left behind
-        if: success()
+      # manual workaround that unwedged both in seconds.
+      - name: Re-run them so their checks clear
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NWO: ${{ github.repository }}
@@ -119,13 +137,23 @@ jobs:
           SELF: ${{ github.run_id }}
         run: |
           set -uo pipefail
-          stale="$(gh run list --repo "$NWO" --workflow "merge gate" --limit 30 \
-                     --json databaseId,conclusion,headSha \
-                     --jq "[.[] | select(.headSha==\"$HEAD_SHA\" and .conclusion==\"failure\" and (.databaseId|tostring)!=\"$SELF\")] | .[].databaseId" \
-                   2>/dev/null || true)"
-          [ -n "$stale" ] || { echo "no stale gate failures on $HEAD_SHA"; exit 0; }
+          # Errors are reported, not swallowed. A lookup that fails for a real
+          # reason -- an auth hiccup, an API shape change -- used to print the
+          # same "nothing to do" as the true no-op, removing the one trail that
+          # would explain why the fix silently did nothing.
+          if ! listing="$(gh run list --repo "$NWO" --workflow "merge gate" --limit 40 \
+                            --json databaseId,conclusion,headSha 2>&1)"; then
+            echo "::warning title=Could not look for stale gate failures::$listing"
+            exit 0
+          fi
+          stale="$(printf '%s' "$listing" | jq -r \
+            "[.[] | select(.headSha==\"$HEAD_SHA\" and .conclusion==\"failure\" and (.databaseId|tostring)!=\"$SELF\")] | .[].databaseId")"
+          if [ -z "$stale" ]; then
+            echo "no stale gate failures on $HEAD_SHA"
+            exit 0
+          fi
           for run in $stale; do
             echo "re-running stale merge-gate run $run so its check clears"
-            gh run rerun "$run" --repo "$NWO" >/dev/null 2>&1 \
-              || echo "  could not re-run $run; clear it by hand with: gh run rerun $run"
+            gh run rerun "$run" --repo "$NWO" \
+              || echo "::warning title=Stale gate not cleared::run $run; clear it with: gh run rerun $run"
           done
