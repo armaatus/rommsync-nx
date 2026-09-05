@@ -32,7 +32,12 @@
       "Bash(gh pr comment:*)",
       "Bash(gh issue comment:*)",
       "Bash(orca worktree set:*)",
-      "Bash(python3 .github/scripts/merge_gate.py:*)"
+      "Bash(python3 .github/scripts/merge_gate.py:*)",
+      "Bash(git submodule add https://github.com/ppkantorski/libultrahand:*)",
+      "Bash(git submodule add https://github.com/ppkantorski/Ultrahand-Overlay:*)",
+      "Bash(git submodule add https://github.com/ppkantorski/ovl-sysmodules:*)",
+      "Bash(git submodule update:*)",
+      "Bash(git submodule init:*)"
     ]
   },
   "hooks": {
