@@ -42,6 +42,12 @@ permissions:
   contents: read
   pull-requests: write
   issues: write
+  # Required by claude-code-action: it exchanges a GitHub OIDC token to
+  # authenticate. Without it the action fails with "Could not fetch an OIDC
+  # token" after three attempts and submits nothing -- which is not a visible
+  # failure in the way it needs to be, because `merge-gate` then blocks every PR
+  # on a review that will never arrive.
+  id-token: write
 
 jobs:
   review:
@@ -170,6 +176,7 @@ jobs:
       pull-requests: write
       issues: write
       actions: read
+      id-token: write
     steps:
       # The default checkout for an issue_comment event is the DEFAULT BRANCH,
       # not the PR -- and this job carries `contents: write`. Pin the PR head so
