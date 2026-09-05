@@ -29,18 +29,22 @@ constexpr s32 kBarInset = 8;
 /// so this is the only place the two vocabularies meet -- and it uses
 /// libultrahand's theme variables rather than literals so a user's theme still
 /// applies.
+///
+/// Through `Renderer::a`, which folds in the overlay's fade animation alpha.
+/// Without it the frame's chrome fades on open and close while everything this
+/// file draws stays fully opaque and pops (libtesla's own convention).
 tsl::Color ColorFor(Tone tone) {
   switch (tone) {
     case Tone::kGood:
-      return tsl::healthyRamTextColor;
+      return tsl::gfx::Renderer::a(tsl::healthyRamTextColor);
     case Tone::kWarn:
-      return tsl::warningTextColor;
+      return tsl::gfx::Renderer::a(tsl::warningTextColor);
     case Tone::kBad:
-      return tsl::badRamTextColor;
+      return tsl::gfx::Renderer::a(tsl::badRamTextColor);
     case Tone::kNeutral:
       break;
   }
-  return tsl::defaultTextColor;
+  return tsl::gfx::Renderer::a(tsl::defaultTextColor);
 }
 
 }  // namespace
@@ -80,10 +84,12 @@ void StatusScreen::Poll() {
     // others (`ipc::Command`). A mismatch is "update the sysmodule", not a
     // decode failure, and telling those apart is the whole reason it exists.
     std::uint32_t sysmodule_interface = 0;
-    const Result rc = client_.GetInterfaceVersion(&sysmodule_interface);
-    if (R_FAILED(rc)) {
-      client_.Close();
-      view_ = RenderUnreachable(Link::kNotRunning);
+    const Result version_rc = client_.GetInterfaceVersion(&sysmodule_interface);
+    if (R_FAILED(version_rc)) {
+      // Not "not running": the port answered, so something is there. Which of
+      // the two sentences is true is decided the same way a failed `GetStatus`
+      // decides it, below -- by whether the port is still openable.
+      view_ = Reopen();
       return;
     }
     if (sysmodule_interface != ipc::kVersion) {
@@ -116,30 +122,54 @@ void StatusScreen::Poll() {
   }
 
   // Anything else is the transport, not the command -- `GetStatus` is
-  // documented never to fail. The session is not trusted after one of those, so
-  // it is dropped and re-opened here rather than on the next frame: whether the
-  // port is still there is exactly what decides which of the two sentences the
-  // user gets.
-  client_.Close();
-  version_checked_ = false;
-  view_ = R_SUCCEEDED(client_.Open()) ? RenderUnreachable(Link::kUnreadable)
-                                      : RenderUnreachable(Link::kNotRunning);
+  // documented never to fail.
+  view_ = Reopen();
 }
 
-void StatusScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width, s32) const {
+StatusView StatusScreen::Reopen() {
+  // The session is not trusted after a transport failure, so it is dropped and
+  // re-opened here rather than on the next frame: whether the port is still
+  // there is exactly what decides which of the two sentences the user gets, and
+  // deferring it would draw one of them for a frame on no evidence.
+  client_.Close();
+  version_checked_ = false;
+  return R_SUCCEEDED(client_.Open()) ? RenderUnreachable(Link::kUnreadable)
+                                     : RenderUnreachable(Link::kNotRunning);
+}
+
+void StatusScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
+                        s32 height) const {
+  // Nothing is drawn past the bounds `CustomDrawer` handed us. The row count is
+  // bounded and the panel is not, so this only ever fires on a layout that has
+  // to be adjusted in M8-2 (#44) -- but a row painted over the frame's chrome is
+  // the kind of thing that reads as a corrupted overlay rather than as a
+  // too-long list.
+  const s32 bottom = y + height;
+  const tsl::Color muted = tsl::gfx::Renderer::a(tsl::infoTextColor);
+  // Nothing runs off the right edge either. `drawString`'s `maxWidth` defaults
+  // to "no limit", and a value is not ours to bound: `fs_name` comes off a RomM
+  // library and `ipc::kMaxNameBytes` is 256, so a routine
+  // `Some Game (USA) (Rev 1) [!].gba` draws past a ~448px panel.
+  const s32 value_width = width > kValueColumn + kBarInset ? width - kValueColumn - kBarInset : 0;
+  const s32 full_width = width > kBarInset ? width - kBarInset : 0;
+
   s32 row = y;
-  renderer->drawString(view_.headline, false, x, row, kHeadlineFont, ColorFor(view_.tone));
+  renderer->drawString(view_.headline, false, x, row, kHeadlineFont, ColorFor(view_.tone),
+                       full_width);
   row += kHeadlineHeight;
   if (!view_.hint.empty()) {
-    renderer->drawString(view_.hint, false, x, row, kBodyFont, tsl::infoTextColor);
+    renderer->drawString(view_.hint, false, x, row, kBodyFont, muted, full_width);
     row += kHintHeight;
   }
   row += kRowHeight / 2;
 
   for (const Line& line : view_.lines) {
-    renderer->drawString(line.label, false, x, row, kBodyFont, tsl::infoTextColor);
+    if (row + kRowHeight > bottom) {
+      return;
+    }
+    renderer->drawString(line.label, false, x, row, kBodyFont, muted, kValueColumn);
     renderer->drawString(line.value, false, x + kValueColumn, row, kBodyFont,
-                         ColorFor(line.tone));
+                         ColorFor(line.tone), value_width);
     row += kRowHeight;
   }
 
@@ -147,18 +177,23 @@ void StatusScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width, s
     return;
   }
   row += kRowHeight / 2;
-  renderer->drawString(view_.progress.caption, false, x, row, kBodyFont, tsl::infoTextColor);
+  if (row + kRowHeight + kBarHeight > bottom) {
+    return;
+  }
+  renderer->drawString(view_.progress.caption, false, x, row, kBodyFont, muted, full_width);
   row += kRowHeight;
 
-  const s32 track = width > kBarInset ? width - kBarInset : width;
-  renderer->drawRect(x, row, track, kBarHeight, tsl::trackBarEmptyColor);
+  const s32 track = full_width;
+  renderer->drawRect(x, row, track, kBarHeight,
+                     tsl::gfx::Renderer::a(tsl::trackBarEmptyColor));
   if (view_.progress.kind == Progress::Kind::kFraction) {
     // Integer maths on the per mille the view model already clamped, so a bar
     // cannot be drawn past its own track by a server that under-declared a
     // length (`overlay_status_view.hpp`).
     const s32 filled = static_cast<s32>(static_cast<std::int64_t>(track) *
                                         view_.progress.permille / 1000);
-    renderer->drawRect(x, row, filled, kBarHeight, tsl::trackBarFullColor);
+    renderer->drawRect(x, row, filled, kBarHeight,
+                       tsl::gfx::Renderer::a(tsl::trackBarFullColor));
   }
 }
 

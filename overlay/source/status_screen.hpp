@@ -42,6 +42,12 @@ class StatusScreen : public tsl::Gui {
   /// Ask, and turn whatever came back -- including nothing -- into `view_`.
   void Poll();
 
+  /// Drop the session, try the port again, and answer with whichever of the two
+  /// unreachable states that establishes. Every transport failure goes through
+  /// here so that "not running" is only ever said about a port that is actually
+  /// gone.
+  StatusView Reopen();
+
   /// Draw `view_` into the bounds `CustomDrawer` hands us.
   void Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width, s32 height) const;
 

@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "rommsync/atomic_file.hpp"
 #include "rommsync/auth.hpp"
 #include "rommsync/config.hpp"
 #include "rommsync/ipc.hpp"
@@ -10,10 +11,17 @@
 #include "rommsync/token_store.hpp"
 
 namespace rommsync::sysmodule {
+namespace {
+
+/// One of this client's files, as a path the SD card understands. `core/` owns
+/// the file names and may not know an SD path (hard rule 4), so joining them is
+/// this side's job -- once, rather than at each call site.
+std::string PathTo(const char* file_name) { return std::string(kConfigDir) + file_name; }
+
+}  // namespace
 
 void SdEngine::Load() {
-  const config::LoadResult loaded =
-      config::LoadConfig(std::string(kConfigDir) + config::kConfigFileName);
+  const config::LoadResult loaded = config::LoadConfig(PathTo(config::kConfigFileName));
   config_ = loaded.value;
   diagnostics_ = loaded.diagnostics;
 
@@ -22,10 +30,16 @@ void SdEngine::Load() {
   // sends them through a flow that will overwrite a record somebody may want to
   // look at first. What the server thinks of the token is `kUnauthenticated`,
   // and only a request can decide that (`engine.hpp`).
-  const auth::LoadedToken token =
-      auth::LoadToken(std::string(kConfigDir) + auth::kTokenFileName);
-  auth_ = token.error == auth::StoreError::kReadFailed ? ipc::AuthState::kNeverPaired
-                                                       : ipc::AuthState::kPaired;
+  //
+  // The question is asked of `io::ReadFile` rather than of `LoadToken`, and that
+  // is not a shortcut: `StoreError::kReadFailed` covers "there is no such file"
+  // *and* "it is there and the bytes would not come out of it"
+  // (`token_store.cpp`), and those are the two answers that must not be
+  // collapsed. An SD card having a bad moment would otherwise draw "Not paired"
+  // over a console that is paired, which is the misdirection above.
+  const io::ReadResult record = io::ReadFile(PathTo(auth::kTokenFileName));
+  auth_ = record.error == io::ReadError::kMissing ? ipc::AuthState::kNeverPaired
+                                                  : ipc::AuthState::kPaired;
 }
 
 const config::Config& SdEngine::config() const { return config_; }

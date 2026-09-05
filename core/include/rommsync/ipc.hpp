@@ -95,7 +95,15 @@ inline constexpr const char* kServiceName = "rommsync";
 /// a new one next to an old one on an SD card. An overlay that can ask "which
 /// contract are you?" can say "update the sysmodule"; one that cannot decodes
 /// garbage and blames the server.
-inline constexpr std::uint32_t kVersion = 1;
+///
+/// **2** since M4-1 (#23), which added `sync_in_progress` and
+/// `config_error_count` to `Status`. Adding a field only escapes a bump when a
+/// decoder tolerates it missing, and these decoders tolerate nothing missing by
+/// design (see the codec note below) -- so a v2 overlay reading a v1
+/// sysmodule's `Status` fails to decode. Without the bump that arrives as
+/// "sysmodule unreachable", which is the sentence this constant exists to
+/// replace with "update the sysmodule".
+inline constexpr std::uint32_t kVersion = 2;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///
@@ -334,6 +342,21 @@ struct Status {
   std::int64_t failed = 0;
 
   std::int64_t queue_depth = 0;
+
+  /// How many `kError` diagnostics `config.ini` produced.
+  ///
+  /// A count rather than the diagnostics themselves: the whole list is
+  /// `GetConfig`'s, and the settings screen (#26) is where a user reads it. What
+  /// the status screen needs is the one bit that sends them there, and it needs
+  /// it without a second round trip -- a console whose `server.url` will not
+  /// parse otherwise renders as merely unconfigured, with nothing saying that
+  /// the file it is being told to edit is the file that is already wrong.
+  ///
+  /// `kError` only. A warning is compatible with a working client
+  /// (`config::Severity`), and a status screen that counted those would be red
+  /// on a console with nothing wrong with it.
+  std::int64_t config_error_count = 0;
+
   DownloadSnapshot download;
 };
 

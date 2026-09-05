@@ -101,6 +101,15 @@ Status ServiceCore::GetStatus() const {
   status.conflicts = snapshot.conflicts;
   status.failed = snapshot.failed;
   status.queue_depth = snapshot.queue_depth;
+  // Counted here rather than carried on the snapshot: the diagnostics are the
+  // engine's own copy of what it read (`Engine::config_diagnostics`), and a
+  // second count kept beside them is a second thing to get out of step.
+  status.config_error_count = 0;
+  for (const config::Diagnostic& diagnostic : engine_.config_diagnostics()) {
+    if (diagnostic.severity == config::Severity::kError) {
+      ++status.config_error_count;
+    }
+  }
   status.download = snapshot.download;
   // A `fs_name` comes off a RomM library, so its length is not ours to assume,
   // and `GetStatus` is documented never to fail. A truncated label costs a few

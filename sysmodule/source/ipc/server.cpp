@@ -13,8 +13,13 @@ namespace {
 /// A client closing its session: `serviceClose` sends this before dropping the
 /// handle. It carries no payload and expects no reply -- answering one would
 /// leave a reply queued for a handle that is about to go away.
-bool IsCloseRequest(const void* message) {
-  return hipcParseRequest(const_cast<void*>(message)).meta.type == CmifCommandType_Close;
+///
+/// A second parse of the same buffer, rather than a return value threaded out
+/// of `HandleRequest`: that function is the reviewed, logic-free half of this
+/// boundary (`service.hpp`) and it is worth more kept that way than the few
+/// instructions `hipcParseRequest` costs on a read-only buffer.
+bool IsCloseRequest(void* message) {
+  return hipcParseRequest(message).meta.type == CmifCommandType_Close;
 }
 
 }  // namespace
@@ -49,10 +54,12 @@ void ServiceServer::Drop(std::size_t index) {
   --handle_count_;
 }
 
-Result ServiceServer::Serve(u64 timeout_ns) {
+Result ServiceServer::Serve() {
   s32 index = 0;
+  // UINT64_MAX is libnx's "no timeout": this is the one place the process
+  // blocks, and it blocks until somebody says something.
   const Result rc =
-      svcReplyAndReceive(&index, handles_, handle_count_, reply_target_, timeout_ns);
+      svcReplyAndReceive(&index, handles_, handle_count_, reply_target_, UINT64_MAX);
 
   // Whatever happens below, the reply that was pending has been sent or has
   // failed to send. Leaving it armed would send the next pass's reply twice.
@@ -60,26 +67,29 @@ Result ServiceServer::Serve(u64 timeout_ns) {
   reply_target_ = INVALID_HANDLE;
 
   if (R_FAILED(rc)) {
-    if (rc == KERNELRESULT(TimedOut)) {
-      return 0;
-    }
     if (rc != KERNELRESULT(ConnectionClosed)) {
       // Not something this loop knows how to recover from: an invalid handle or
       // an exhausted resource is a bug rather than a client hanging up.
       return rc;
     }
-    // A session went away. Either the reply above had nowhere to go -- the
-    // kernel reports that with `index` set to -1 -- or one of the waited-on
-    // handles closed, and `index` names it.
-    if (index >= 0 && index < handle_count_) {
-      Drop(static_cast<std::size_t>(index));
+    // A session went away, and which one depends on *when*. If there was a
+    // reply pending, the send is what failed and the kernel never got as far as
+    // waiting -- so `index` was not written and must not be read. Only when
+    // there was no reply pending does `index` name a handle.
+    if (replied_to != INVALID_HANDLE) {
+      for (s32 i = 1; i < handle_count_; ++i) {
+        if (handles_[i] == replied_to) {
+          Drop(static_cast<std::size_t>(i));
+          break;
+        }
+      }
       return 0;
     }
-    for (s32 i = 1; i < handle_count_; ++i) {
-      if (handles_[i] == replied_to) {
-        Drop(static_cast<std::size_t>(i));
-        break;
-      }
+    // From 1: index 0 is the port, and a port does not close. Reading an
+    // unwritten `index` as 0 and dropping it would take the service down and
+    // leave the process running, which is the worst shape this failure has.
+    if (index >= 1 && index < handle_count_) {
+      Drop(static_cast<std::size_t>(index));
     }
     return 0;
   }
@@ -104,7 +114,7 @@ Result ServiceServer::Serve(u64 timeout_ns) {
     return 0;
   }
 
-  if (index < 0 || index >= handle_count_) {
+  if (index < 1 || index >= handle_count_) {
     return 0;
   }
 
@@ -132,7 +142,7 @@ Result ServiceServer::Serve(u64 timeout_ns) {
 }
 
 void ServiceServer::Run() {
-  while (R_SUCCEEDED(Serve(UINT64_MAX))) {
+  while (R_SUCCEEDED(Serve())) {
   }
 }
 

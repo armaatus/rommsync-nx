@@ -240,17 +240,12 @@ export VENDOR_OFILES := \
 	$(patsubst %.cpp,%.o,$(foreach dir,$(ROMMSYNC_VENDOR_SOURCES),$(notdir $(wildcard $(dir)/*.cpp)))) \
 	$(patsubst %.c,%.o,$(foreach dir,$(ROMMSYNC_VENDOR_SOURCES),$(notdir $(wildcard $(dir)/*.c))))
 
-# Ours with -I, libnx and the portlibs with -isystem. That is what lets
-# -Wpedantic stay on: libnx's headers are C headers full of anonymous structs
-# and flexible array members, none of which ISO C++ allows, and -Wpedantic
-# -Werror on them fails on the first `#include <switch.h>`. -isystem holds our
-# own code to the repo standard without holding the toolchain to it.
 # Ours with -I, vendored and toolchain headers with -isystem. That is what lets
 # -Wpedantic stay on: libnx's headers are C headers full of anonymous structs and
 # flexible array members, none of which ISO C++ allows, and -Wpedantic -Werror on
-# them fails on the first `#include <switch.h>`; libultrahand's answer 213
-# warnings. -isystem holds our own code to the repo standard without holding
-# anyone else's to it.
+# them fails on the first `#include <switch.h>`; libultrahand's headers answer it
+# with 213 warnings of their own. -isystem holds our own code to the repo
+# standard without holding anyone else's to it.
 export INCLUDE := $(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) \
 			$(foreach dir,$(ROMMSYNC_VENDOR_INCLUDES),-isystem $(CURDIR)/$(dir)) \
 			$(foreach dir,$(LIBDIRS),-isystem $(dir)/include) \

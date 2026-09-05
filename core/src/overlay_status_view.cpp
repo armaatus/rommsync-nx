@@ -90,8 +90,14 @@ void AddDownload(StatusView* view, const ipc::DownloadSnapshot& download) {
       Add(&view->lines, "Download", "Checking");
       break;
     case ipc::DownloadState::kFailed:
+      // The file is still named -- a user needs to know which one -- but there
+      // is no bar: a track frozen wherever the transfer stopped reads as a
+      // download that is still going.
       Add(&view->lines, "Download", "Failed", Tone::kBad);
-      break;
+      Add(&view->lines, "File",
+          download.fs_name.empty() ? std::string("Unnamed file") : download.fs_name,
+          Tone::kBad);
+      return;
   }
 
   // A name the sysmodule did not have is still a row with something in it.
@@ -123,6 +129,15 @@ void AddDownload(StatusView* view, const ipc::DownloadSnapshot& download) {
 /// wrong screen. Each branch names the *first* thing standing between this
 /// console and a sync.
 void SetHeadline(StatusView* view, const ipc::Status& status) {
+  if (status.config_error_count > 0) {
+    // Ahead of "No server set", because a `server.url` that would not parse is
+    // *why* there is no server, and sending that user to write one they have
+    // already written is the wrong instruction.
+    view->headline = "config.ini has errors";
+    view->hint = "Open Settings to see what the sysmodule could not read";
+    view->tone = Tone::kBad;
+    return;
+  }
   if (!status.configured) {
     view->headline = "No server set";
     view->hint = "Set server.url in config.ini";
@@ -150,16 +165,19 @@ void SetHeadline(StatusView* view, const ipc::Status& status) {
     view->tone = Tone::kNeutral;
     return;
   }
-  if (!status.enabled) {
-    view->headline = "Sync is off";
-    view->hint = "Turn sync on to start";
-    view->tone = Tone::kWarn;
-    return;
-  }
+  // Above the switch, for the same reason `sync_in_progress` is: turning
+  // auto-sync off does not stop a transfer already in flight, and "Sync is off"
+  // over a bar that is visibly moving is a screen contradicting itself.
   if (status.download.state == ipc::DownloadState::kDownloading ||
       status.download.state == ipc::DownloadState::kVerifying) {
     view->headline = "Downloading";
     view->tone = Tone::kNeutral;
+    return;
+  }
+  if (!status.enabled) {
+    view->headline = "Sync is off";
+    view->hint = "Turn sync on to start";
+    view->tone = Tone::kWarn;
     return;
   }
   if (!status.online) {
@@ -237,8 +255,18 @@ std::string FormatBytes(std::int64_t bytes) {
     return std::to_string(value) + " " + kUnits[unit];
   }
   // Tenths of the next unit up, rounded half-up, in integer arithmetic.
-  const std::int64_t tenths = (value * 10 + kUnitStep / 2) / kUnitStep;
-  return Tenths(tenths, kUnits[unit + 1]);
+  std::int64_t tenths = (value * 10 + kUnitStep / 2) / kUnitStep;
+  // ...and the unit is re-checked *after* rounding, not before. 1048525 bytes
+  // rounds to 1024.0 of the unit below, which is the one number a size is not
+  // allowed to be -- and it is reachable by any value in the top ~0.05% of a
+  // unit, so a rom of 1 GiB minus a byte would otherwise caption as
+  // "1024.0 MiB of 1.0 GiB".
+  std::size_t scaled = unit + 1;
+  if (tenths >= kUnitStep * 10 && scaled + 1 < std::size(kUnits)) {
+    tenths /= kUnitStep;
+    ++scaled;
+  }
+  return Tenths(tenths, kUnits[scaled]);
 }
 
 std::string FormatRelativeTime(std::int64_t then_unix, std::int64_t now_unix) {
@@ -303,6 +331,15 @@ StatusView Render(const ipc::Status& status, std::int64_t now_unix) {
   Add(&view.lines, "Queue",
       status.queue_depth == 0 ? std::string("Empty")
                               : std::to_string(status.queue_depth) + " waiting");
+  // Only when there is something wrong. A "Config: OK" row on every screen is a
+  // row a user learns to stop reading, which is the opposite of what the count
+  // is for -- and the whole list is `GetConfig`'s (`ipc::Status`).
+  if (status.config_error_count > 0) {
+    Add(&view.lines, "Config",
+        std::to_string(status.config_error_count) +
+            (status.config_error_count == 1 ? " problem" : " problems"),
+        Tone::kBad);
+  }
   AddDownload(&view, status.download);
   // Last, because it is the line a user reads once and a support thread reads
   // first (`ipc::Status::build`).

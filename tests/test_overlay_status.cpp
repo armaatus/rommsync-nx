@@ -246,6 +246,48 @@ void CheckSyncInProgress(Checks& checks) {
   running_off.enabled = false;
   checks.ExpectEq(RenderOverWire(checks, running_off).headline, std::string("Syncing"),
                   "a running tick outranks a switch that was just turned off");
+
+  // Same rule, and the case that is easier to get wrong because the two facts
+  // come from different fields: `SetEnabled` does not stop a transfer already in
+  // flight, so "Sync is off" over a bar that is visibly moving is the screen
+  // contradicting itself.
+  ipc::Status downloading_off = Healthy();
+  downloading_off.enabled = false;
+  downloading_off.download.state = ipc::DownloadState::kDownloading;
+  downloading_off.download.fs_name = "Some Game (USA).gba";
+  downloading_off.download.bytes_done = 1024;
+  downloading_off.download.bytes_total = 4096;
+  const overlay::StatusView still_going = RenderOverWire(checks, downloading_off);
+  checks.ExpectEq(still_going.headline, std::string("Downloading"),
+                  "a download in flight outranks a switch that was just turned off");
+  checks.Expect(still_going.progress.kind == overlay::Progress::Kind::kFraction,
+                "and the bar it contradicts is still drawn");
+}
+
+void CheckConfigErrors(Checks& checks) {
+  // A `server.url` that would not parse leaves a console that is *also*
+  // unconfigured, and "No server set" would send the user to write a URL they
+  // have already written. The count is on `Status` for exactly this, so the
+  // screen needs no second call (`ipc::Status::config_error_count`).
+  ipc::Status broken;
+  broken.config_error_count = 2;
+  const overlay::StatusView view = RenderOverWire(checks, broken);
+  ExpectNothingBlank(checks, view, "config errors");
+  checks.ExpectEq(view.headline, std::string("config.ini has errors"),
+                  "a file that would not read outranks what it failed to configure");
+  checks.ExpectEq(ValueOf(view, "Config"), std::string("2 problems"), "the count is drawn");
+  checks.ExpectEq(std::string(overlay::ToString(view.tone)), std::string("bad"), "and is bad");
+
+  ipc::Status one = Healthy();
+  one.config_error_count = 1;
+  const overlay::StatusView second = RenderOverWire(checks, one);
+  checks.ExpectEq(ValueOf(second, "Config"), std::string("1 problem"), "singular");
+
+  // A warning is compatible with a working client (`config::Severity`), so a
+  // console with nothing wrong gets no row at all rather than a green one it
+  // learns to stop reading.
+  checks.Expect(!HasLabel(RenderOverWire(checks, Healthy()), "Config"),
+                "no Config row when there is nothing wrong with the file");
 }
 
 void CheckDownloads(Checks& checks) {
@@ -293,6 +335,12 @@ void CheckDownloads(Checks& checks) {
   const overlay::StatusView fourth = RenderOverWire(checks, failed);
   ExpectNothingBlank(checks, fourth, "failed download");
   checks.ExpectEq(ValueOf(fourth, "Download"), std::string("Failed"), "a failed download");
+  checks.ExpectEq(ValueOf(fourth, "File"), std::string("Some Game (USA).gba"),
+                  "still names the file, because that is what the user needs");
+  // A track frozen wherever the transfer stopped reads as a download that is
+  // still moving.
+  checks.Expect(fourth.progress.kind == overlay::Progress::Kind::kNone,
+                "and draws no bar");
 
   // A rom the sysmodule had no name for still gets a row with something in it.
   ipc::Status unnamed = downloading;
@@ -382,6 +430,18 @@ void CheckFormatting(Checks& checks) {
   checks.ExpectEq(overlay::FormatBytes(48LL * 1024 * 1024), std::string("48.0 MiB"), "megabytes");
   checks.ExpectEq(overlay::FormatBytes(3LL * 1024 * 1024 * 1024), std::string("3.0 GiB"),
                   "and gigabytes -- a rom is not always small");
+
+  // The unit is chosen before the tenths are rounded, so anything in the top
+  // ~0.05% of a unit rolls past it. "1024.0 KiB" is the one number a size is not
+  // allowed to be, and a 1 GiB-minus-one-byte rom is how a user meets it.
+  checks.ExpectEq(overlay::FormatBytes(1048525), std::string("1.0 MiB"),
+                  "rounding up crosses the unit rather than printing 1024.0 KiB");
+  checks.ExpectEq(overlay::FormatBytes(1073741823), std::string("1.0 GiB"),
+                  "...at the megabyte boundary too");
+  checks.ExpectEq(overlay::FormatBytes(1099511627775LL), std::string("1.0 TiB"),
+                  "...and the gigabyte one");
+  checks.ExpectEq(overlay::FormatBytes(1048524), std::string("1023.9 KiB"),
+                  "and one byte below it still reads in the smaller unit");
 }
 
 }  // namespace
@@ -394,6 +454,7 @@ int main() {
   CheckOfflineAndOff(checks);
   CheckResults(checks);
   CheckSyncInProgress(checks);
+  CheckConfigErrors(checks);
   CheckDownloads(checks);
   CheckUnreachable(checks);
   CheckFormatting(checks);

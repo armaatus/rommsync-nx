@@ -12,8 +12,6 @@
 
 namespace rommsync::overlay {
 
-Result MalformedResponse() { return MAKERESULT(Module_Libnx, LibnxError_InvalidCmifOutHeader); }
-
 IpcClient::IpcClient() { response_.resize(ipc::kMaxPayloadBytes); }
 
 IpcClient::~IpcClient() { Close(); }

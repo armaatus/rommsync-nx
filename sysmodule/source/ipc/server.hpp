@@ -58,13 +58,14 @@ class ServiceServer {
   void Run();
 
   /// One pass: reply to whoever was last answered, wait, and handle whatever
-  /// arrives. Separated from `Run` because it is the unit a reader can check,
-  /// and because a shutdown path that needs to interleave something else has
-  /// somewhere to put it.
+  /// arrives. Separated from `Run` because it is the unit a reader can check --
+  /// this is the code with no test that can reach it, so it is kept to a size a
+  /// person can hold in their head.
   ///
-  /// `timeout_ns` bounds the wait; `UINT64_MAX` waits forever. A timeout is not
-  /// an error and is not reported as one.
-  Result Serve(u64 timeout_ns);
+  /// Waits indefinitely. A timeout parameter would be one more branch nothing
+  /// in this build takes; the process that wants one is the scheduler (M7-2),
+  /// and it gets a thread rather than a poll.
+  Result Serve();
 
  private:
   /// Drop the session at `index` and close its handle. The table stays dense,

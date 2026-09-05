@@ -724,6 +724,7 @@ std::string EncodeStatus(const Status& status) {
   AppendInteger(&out, "conflicts", status.conflicts);
   AppendInteger(&out, "failed", status.failed);
   AppendInteger(&out, "queue_depth", status.queue_depth);
+  AppendInteger(&out, "config_error_count", status.config_error_count);
   AppendKey(&out, "download");
   out += '{';
   AppendText(&out, "state", ToString(status.download.state), /*first=*/true);
@@ -754,7 +755,9 @@ Decoded<Status> DecodeStatus(std::string_view text) {
         !ReadInteger(object, "downloaded", &out->downloaded, 0, kMaxCount, error) ||
         !ReadInteger(object, "conflicts", &out->conflicts, 0, kMaxCount, error) ||
         !ReadInteger(object, "failed", &out->failed, 0, kMaxCount, error) ||
-        !ReadInteger(object, "queue_depth", &out->queue_depth, 0, kMaxQueueDepth, error)) {
+        !ReadInteger(object, "queue_depth", &out->queue_depth, 0, kMaxQueueDepth, error) ||
+        !ReadInteger(object, "config_error_count", &out->config_error_count, 0, kMaxCount,
+                     error)) {
       return;
     }
     out->interface = static_cast<std::uint32_t>(interface_version);

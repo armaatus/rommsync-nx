@@ -92,15 +92,18 @@ phase_builds() {
   docker image inspect "$IMAGE" >/dev/null 2>&1 ||
     skip "$IMAGE not pulled (docker pull $IMAGE)"
 
-  # A copy, not the worktree: the container builds as root, and three worktrees
-  # may be running this at once.
   # The overlay does not build without libultrahand, and an un-initialised
   # submodule is an empty directory rather than a missing one -- so this is
   # checked here, where it reads as "your checkout is incomplete", rather than
-  # left to surface as a failed cross-compile.
+  # left to surface as a failed cross-compile. A skip rather than a failure, for
+  # the same reason a missing docker image is one: it is a property of the
+  # checkout, not of the build under test. The `switch-build` CI job clones with
+  # `submodules: recursive` and has no such escape.
   [ -f "$REPO_ROOT/overlay/lib/libultrahand/ultrahand.mk" ] ||
     skip "overlay/lib/libultrahand is empty (git submodule update --init --recursive)"
 
+  # A copy, not the worktree: the container builds as root, and three worktrees
+  # may be running this at once.
   SCRATCH="$(mktemp -d)"
   cp "$REPO_ROOT/VERSION" "$REPO_ROOT/switch.mk" "$SCRATCH/"
   cp -R "$REPO_ROOT/core" "$REPO_ROOT/sysmodule" "$REPO_ROOT/overlay" "$SCRATCH/"

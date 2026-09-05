@@ -43,7 +43,9 @@ namespace rommsync::overlay {
 /// and is what `GetInterfaceVersion` exists to diagnose. Named here rather than
 /// kept private because a screen has to tell it from a transport failure to
 /// pick between "not running" and "unreachable" (`status_screen.cpp`).
-Result MalformedResponse();
+constexpr Result MalformedResponse() {
+  return MAKERESULT(Module_Libnx, LibnxError_InvalidCmifOutHeader);
+}
 
 /// A session on `sys-rommsync`.
 ///

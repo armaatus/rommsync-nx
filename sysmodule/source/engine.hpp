@@ -71,6 +71,9 @@ class SdEngine : public ipc::Engine {
   /// a token this console still holds and RomM has stopped accepting -- so it
   /// cannot be decided from the card, and reporting it from here would send a
   /// working console to the re-pair screen (`ipc::AuthState`).
+  ///
+  /// `kNeverPaired` means the file is *missing*, not that it could not be read:
+  /// an SD card having a bad moment is not a console that has never paired.
   ipc::AuthState auth_ = ipc::AuthState::kNeverPaired;
 };
 
