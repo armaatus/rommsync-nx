@@ -853,6 +853,13 @@ void Dropped(rig::Checks& checks, http::HttpClient& client, const std::string& b
   checks.ExpectEq(sandbox.Read(SavePath(name)), previous, "the save survived the reset");
   checks.Expect(!sandbox.HasBackupOf(previous),
                 "and nothing was backed up for an overwrite that never happened");
+  // What the interruption *does* leave, pinned because issue #16 has to reason
+  // about it on entry to the next tick: the backend's partial file, beside the
+  // staging path and not beside the save, and no completed staged copy.
+  checks.Expect(sandbox.Exists(io::TempPathFor(SavePath(name)) + ".part"),
+                "the partial download is left where a retry can see it");
+  checks.Expect(!sandbox.Exists(io::TempPathFor(SavePath(name))),
+                "and no completed staged copy, because none completed");
 
   // The next tick, which for this operation is the same operation: the plan is
   // still valid and nothing on the server changed. This is the whole claim --

@@ -495,9 +495,12 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   into.expected_size = described.file_size_bytes;
 
   const http::Result fetched = client.Download(request, into);
-  if (!fetched.successful()) {
+  if (const auto refused = Refused(fetched, "the download")) {
+    // The `.part` the backend left behind is deliberately not removed -- it is
+    // what a resumed transfer would continue from, and what issue #16 reasons
+    // about on entry to the next tick. The staged file is: an incomplete
+    // download is not a save.
     std::remove(staged.c_str());
-    const auto refused = Refused(fetched, "the download");
     return Fail(operation, refused->first, refused->second);
   }
 
@@ -649,6 +652,9 @@ ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
       }
     }
 
+    // Enumerated rather than defaulted: a `default` here would count whatever
+    // outcome is added next as work the client completed, which is the one
+    // direction this accounting must not be wrong in (M2-6 reports it).
     switch (result.outcome) {
       case OperationOutcome::kFailed:
         ++report.failed;
@@ -658,7 +664,10 @@ ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
         ++report.not_understood;
         report.warnings.push_back(result.message);
         break;
-      default:
+      case OperationOutcome::kNoOp:
+      case OperationOutcome::kUploaded:
+      case OperationOutcome::kDownloaded:
+      case OperationOutcome::kKeptBoth:
         ++report.completed;
         break;
     }
