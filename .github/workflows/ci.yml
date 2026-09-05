@@ -28,6 +28,15 @@ jobs:
       - name: Compose file is valid
         run: ./scripts/orca/compose.sh config --quiet
 
+      # An invalid workflow file is silent: GitHub creates a run with no jobs and
+      # the check it was meant to report never appears at all. With `merge-gate`
+      # required, that reads as "pending forever" and nothing can merge. Cheap to
+      # check, and it has already caught one.
+      - name: Workflows are valid
+        uses: docker://rhysd/actionlint:latest
+        with:
+          args: -color
+
       # core/ is the half of the tree that has to compile for Horizon as well as
       # for a laptop, and the whole point of the HttpClient interface is that no
       # sync, download or auth code names a transport. Both rules are one

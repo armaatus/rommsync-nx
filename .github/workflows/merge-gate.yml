@@ -12,17 +12,21 @@ name: merge gate
 # thread is resolved, a fix is pushed, or the body is edited.
 
 on:
+  # `review_requested` is in here because re-requesting review is what the agent
+  # does after resolving threads, and it is the only event that follows a
+  # resolution.
+  #
+  # There is NO trigger for thread resolution itself: `pull_request_review_thread`
+  # is a webhook event, not a workflow trigger, and putting it here makes the
+  # whole file invalid -- which shows up as a failed run with no jobs, named
+  # after the file. So resolving the last thread does not re-run this on its own;
+  # the push or the re-request that follows it does.
   pull_request:
-    types: [opened, reopened, synchronize, ready_for_review, edited]
+    types: [opened, reopened, synchronize, ready_for_review, edited, review_requested]
   pull_request_review:
     types: [submitted, dismissed]
   pull_request_review_comment:
     types: [created, deleted]
-  # Resolving a thread is its own event; without it the gate would stay red
-  # after the last thread was resolved until something else happened to re-run
-  # it.
-  pull_request_review_thread:
-    types: [resolved, unresolved]
 
 permissions:
   contents: read
@@ -60,6 +64,10 @@ jobs:
           set -euo pipefail
           owner="${NWO%%/*}"; name="${NWO##*/}"
           gh api --paginate "repos/$NWO/pulls/$PR/files" --jq '.[].filename' >files.txt
+          # The query is single-quoted on purpose: $owner, $name and $pr are
+          # GraphQL variables bound by the -F flags above, and must reach the
+          # server unexpanded.
+          # shellcheck disable=SC2016
           gh api graphql -F owner="$owner" -F name="$name" -F pr="$PR" -f query='
             query($owner:String!,$name:String!,$pr:Int!){
               repository(owner:$owner,name:$name){

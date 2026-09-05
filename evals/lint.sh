@@ -192,6 +192,22 @@ for named in record-review.sh await-review.sh review-status.sh; do
 done
 ok "the brief still names the review loop"
 
+echo "== the workflows parse as GitHub reads them"
+# An invalid workflow file does not fail loudly: GitHub creates a run with no
+# jobs, named after the file, and the check it was meant to report simply never
+# appears. With `merge-gate` as a required check that reads as "pending forever"
+# and nothing can merge. It happened once already --
+# `pull_request_review_thread` is a webhook event, not a workflow trigger, and
+# putting it in `on:` invalidated the whole file.
+#
+# Optional, because actionlint is not everywhere. CI has it, and says so.
+if command -v actionlint >/dev/null 2>&1; then
+  actionlint .github/workflows/*.yml || fail "actionlint rejects a workflow"
+  ok "actionlint accepts every workflow"
+else
+  echo "  --: actionlint is not installed (brew install actionlint); CI still checks this"
+fi
+
 echo "== the merge gate"
 # The one required check `gh pr merge --auto` waits on. Its decision lives in a
 # script rather than in the YAML precisely so it can be tested without a pull
