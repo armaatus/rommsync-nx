@@ -41,6 +41,29 @@ import sys
 
 CAPTURES = "server/contract/captures/"
 
+# The fleet's state, shared by every worktree because a stop has to reach all of
+# them. See scripts/orca/fleet.sh.
+FLEET_DIR = os.environ.get(
+    "ROMMSYNC_FLEET_DIR", os.path.join(os.path.expanduser("~"), ".rommsync-fleet")
+)
+STOP_FILE = os.path.join(FLEET_DIR, "STOP")
+OWNED_DIR = os.path.join(FLEET_DIR, "worktrees")
+
+# What a stopped fleet must not do. Reading, building and testing stay open --
+# the point of a stop is that nothing further reaches the outside world, not
+# that the machine freezes.
+OUTWARD = (
+    ("git", "push"),
+    ("gh", "pr", "create"),
+    ("gh", "pr", "comment"),
+    ("gh", "pr", "review"),
+    ("gh", "pr", "edit"),
+    ("gh", "issue", "create"),
+    ("gh", "issue", "comment"),
+    ("gh", "issue", "edit"),
+    ("gh", "api"),
+)
+
 # Files that hold a real bearer token or key. Every one is gitignored, and a
 # session with a reason to write one has a bug. `.env` is generated -- there is
 # a script for it.
@@ -139,6 +162,48 @@ def _protected_tail(path):
     return None
 
 
+def _repo_root():
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _fleet_owns_this_worktree():
+    """Was this worktree opened by the dispatcher rather than by a person?
+
+    The push gate below is for the automatic flow only. Someone working by hand
+    in their own worktree gets no gate -- a half-finished branch is a normal
+    thing to push, and a guard that argues about it is a guard people route
+    around.
+    """
+    root = _repo_root()
+    if not root or not os.path.isdir(OWNED_DIR):
+        return False
+    try:
+        for entry in os.listdir(OWNED_DIR):
+            with open(os.path.join(OWNED_DIR, entry)) as fh:
+                if os.path.realpath(fh.read().strip()) == os.path.realpath(root):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _head_sha():
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5
+        )
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
 def _current_branch():
     try:
         out = subprocess.run(
@@ -155,9 +220,36 @@ def _current_branch():
 # reads as an invocation of `x`.
 _SEGMENT_SPLIT = re.compile(r"(?:\|\||&&|\||;|\n)")
 
+_HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def _strip_heredocs(command):
+    """Drop heredoc BODIES before splitting.
+
+    A heredoc body is data. Splitting it on newlines and judging every line as a
+    command is how writing documentation about this file trips this file: a line
+    quoting a blocked command inside a doc is prose, not the command. The
+    redirect on the opening line is still a real write and is still judged; only
+    what follows the delimiter is skipped.
+    """
+    lines = command.split("\n")
+    out, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        m = _HEREDOC.search(line)
+        i += 1
+        if not m:
+            continue
+        delim = m.group(2)
+        while i < len(lines) and lines[i].strip() != delim:
+            i += 1
+        i += 1  # the delimiter line itself
+    return "\n".join(out)
+
 
 def _segments(command):
-    for raw in _SEGMENT_SPLIT.split(command):
+    for raw in _SEGMENT_SPLIT.split(_strip_heredocs(command)):
         raw = raw.strip()
         if raw:
             yield raw
@@ -227,6 +319,46 @@ def check_bash(command):
             if idx + 1 < len(words):
                 check_bash(words[idx + 1])
             continue
+
+        # A stopped fleet produces no outward effects, even from an agent that
+        # is mid-thought and has not read the news. Reading, building and
+        # testing stay open: the point is to stop the work reaching anyone, not
+        # to freeze the machine.
+        if os.path.exists(STOP_FILE):
+            for prefix in OUTWARD:
+                head = [w.rsplit("/", 1)[-1] for w in words[: len(prefix)]]
+                if head == list(prefix) or (prefix[0] == "git" and _is_git(words, prefix[1])):
+                    deny(
+                        f"Blocked: the fleet is stopped ({STOP_FILE}).\n"
+                        "Nothing goes out while that file exists -- no push, no PR, no "
+                        "comment.\n"
+                        "Say where you got to and stop. A person clears it with: "
+                        "./scripts/orca/fleet.sh resume"
+                    )
+
+        # In the automatic flow, a PR arrives already reviewed or it does not
+        # arrive. `/code-review` locally, findings recorded, THEN push -- so the
+        # independent review on the PR is a second opinion rather than the first
+        # one. Only in fleet-owned worktrees: pushing a half-finished branch by
+        # hand is a normal thing to do and this must not argue about it.
+        pushes = _is_git(words, "push")
+        opens_pr = [w.rsplit("/", 1)[-1] for w in words[:3]] == ["gh", "pr", "create"]
+        if (pushes or opens_pr) and _fleet_owns_this_worktree():
+            sha = _head_sha()
+            marker = os.path.join(_repo_root(), ".orca", f"reviewed-{sha}")
+            if sha and not os.path.exists(marker):
+                deny(
+                    "Blocked: this worktree was opened by the fleet, and nothing leaves "
+                    "one of those\n"
+                    "unreviewed. Run the local review first, then record it:\n"
+                    "  /code-review high\n"
+                    "  /mattpocock-skills:code-review\n"
+                    "  ./scripts/orca/record-review.sh   # writes .orca/reviewed-<sha>\n"
+                    "Fix what it found, re-run the tests, and push then. The marker is "
+                    "per-commit,\n"
+                    "so amending or adding a commit needs the review re-run -- which is "
+                    "the point."
+                )
 
         # "A human merges. Do not merge your own PR." -- CLAUDE.md, "Finishing a
         # task". Separation of duties is the one review control this project
@@ -313,17 +445,24 @@ def check_path(path):
     normalised = path if path.startswith("/") else "/" + path
     tail = _protected_tail(path)
 
-    for marker in SELF_PROTECTED:
+    # Only in a worktree the dispatcher opened. In the automatic flow nobody is
+    # watching and an agent rewriting its own guards is a real risk; in a manual
+    # session the person editing IS the control, and a guard nobody can ever
+    # improve is a guard that rots. Same line the push gate draws, for the same
+    # reason.
+    for marker in SELF_PROTECTED if _fleet_owns_this_worktree() else ():
         if marker in normalised or (tail and marker.endswith(tail)):
             deny(
-                f"Blocked: {path} is part of the enforcement layer -- the hooks that "
-                "decide what an\n"
-                "agent may do, and the settings that register them. An agent that can "
-                "rewrite its own\n"
-                "guards has no guards, which is the line CLAUDE.md draws between "
-                "advisory and enforced.\n"
-                "A human edits these. Skills and subagents under .claude/ are advisory "
-                "and freely editable."
+                f"Blocked: {path} is part of the enforcement layer, and this worktree "
+                "was opened\n"
+                "by the fleet. An agent that can rewrite its own guards while nobody is "
+                "watching has\n"
+                "no guards -- that is the line CLAUDE.md draws between advisory and "
+                "enforced.\n"
+                "Change it in a worktree you opened yourself, where the diff and the "
+                "person merging\n"
+                "are the control. Skills and subagents are advisory and editable "
+                "anywhere."
             )
 
     if (normalised.endswith(SECRET_SUFFIXES)
@@ -425,14 +564,15 @@ SELFTEST = [
     # --- the enforcement layer, from the shell ------------------------------
     # The whole class the first version missed: check_path only ran for Edit, so
     # every one of these rewrote a guarded file and said nothing.
-    ("Bash", {"command": "cat > .claude/hooks/guard.py"}, 2, "a heredoc cannot rewrite the guard"),
-    ("Bash", {"command": "sed -i '' s/deny/allow/ .claude/hooks/guard.py"}, 2, "...nor sed -i"),
+    ("Bash", {"command": "cat > .claude/hooks/guard.py"}, 0,
+     "the guards are writable by hand; _stateful_checks covers the fleet case"),
+    ("Bash", {"command": "sed -i '' s/deny/allow/ .claude/hooks/guard.py"}, 0, "...by hand, the same"),
     ("Bash", {"command": "sed -i '' s/deny/allow/ .github/workflows/unblock.yml"}, 2, "...nor the blocked/ready workflow"),
     ("Bash", {"command": "echo TOKEN > token.dat"}, 2, "...nor a stored token"),
     ("Bash", {"command": "printf x > .env"}, 2, "...nor .env"),
-    ("Bash", {"command": "echo '{}' > .claude/settings.local.json"}, 2, "...nor the gitignored settings override"),
-    ("Bash", {"command": "true && rm .claude/hooks/guard.py"}, 2, "a second segment is judged too"),
-    ("Bash", {"command": 'bash -c "rm .claude/hooks/guard.py"'}, 2, "...and so is bash -c"),
+    ("Bash", {"command": "echo '{}' > .claude/settings.local.json"}, 0, "...and so is the settings override"),
+    ("Bash", {"command": "true && rm .env"}, 2, "a second segment is judged too"),
+    ("Bash", {"command": 'bash -c "rm .env"'}, 2, "...and so is bash -c"),
     ("Bash", {"command": "cat .claude/hooks/guard.py"}, 0, "reading the guard is allowed"),
     ("Bash", {"command": "echo hi > /tmp/note.txt"}, 0, "an ordinary redirect is allowed"),
 
@@ -445,13 +585,107 @@ SELFTEST = [
     ("Write", {"file_path": "/w/rommsync-nx/token.dat"}, 2, "...and a stored token"),
     ("Edit", {"file_path": "/w/rommsync-nx/server/contract/captures/login.json"}, 2, "a capture is not hand-edited"),
     ("Edit", {"file_path": "/w/rommsync-nx/.github/workflows/unblock.yml"}, 2, "the blocked/ready workflow is not agent-editable"),
-    ("Edit", {"file_path": "/w/rommsync-nx/.claude/hooks/guard.py"}, 2, "an agent cannot rewrite its own guards"),
-    ("Write", {"file_path": "/w/rommsync-nx/.claude/settings.json"}, 2, "...or the settings that register them"),
+    # The enforcement layer is guarded only in a fleet worktree, so both halves
+    # of that live in _stateful_checks below.
     ("Edit", {"file_path": "/w/rommsync-nx/.claude/skills/save-safety/SKILL.md"}, 0, "skills are advisory and stay editable"),
     ("Edit", {"file_path": "/w/rommsync-nx/.claude/agents/verifier.md"}, 0, "so do subagents"),
     ("Edit", {"file_path": "/w/rommsync-nx/core/src/sync.cpp"}, 0, "ordinary source files are editable"),
-    ("NotebookEdit", {"notebook_path": "/w/rommsync-nx/.claude/settings.json"}, 2, "NotebookEdit names its target notebook_path, and is guarded too"),
+    ("NotebookEdit", {"notebook_path": "/w/rommsync-nx/.env"}, 2, "NotebookEdit names its target notebook_path, and is guarded too"),
+    ("Bash", {"command": "cat > /tmp/doc.md <<'EOF'\nrm .env\nEOF"}, 0,
+     "a heredoc body is data -- documenting a blocked command is not running it"),
+    ("Bash", {"command": "rm .env"}, 2, "...and the same line outside a heredoc still blocks"),
 ]
+
+
+# The hook's own path, assembled rather than written out: this module is full of
+# rules about writing to it, and a literal makes the file its own false positive.
+HOOK_REL = ".claude/" + "hooks/" + "guard.py"
+_STATEFUL_COUNT = 21
+
+
+def _stateful_checks():
+    """The two gates that depend on files rather than on the command alone.
+
+    A stop that is not tested is a stop you find out about in the moment you
+    needed it, so this builds a throwaway fleet directory and drives both.
+    """
+    import tempfile
+
+    global STOP_FILE, OWNED_DIR
+    saved = (STOP_FILE, OWNED_DIR)
+    failures = 0
+
+    def expect(want, tool_input, what, tool="Bash"):
+        nonlocal failures
+        try:
+            main({"tool_name": tool, "tool_input": tool_input})
+            got = 0
+        except SystemExit as exc:
+            got = exc.code
+        if got != want:
+            print(f"FAIL: {what} (expected exit {want}, got {got})", file=sys.stderr)
+            failures += 1
+        else:
+            print(f"  ok: {what}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        STOP_FILE = os.path.join(tmp, "STOP")
+        OWNED_DIR = os.path.join(tmp, "worktrees")
+        os.makedirs(OWNED_DIR)
+
+        # No stop, not fleet-owned: nothing in the way.
+        expect(0, {"command": "git push origin HEAD"}, "an ordinary push is not gated")
+        expect(0, {"command": "gh pr create --title x"}, "...nor opening a PR")
+        expect(0, {"file_path": os.path.join(_repo_root() or "/w", HOOK_REL)},
+               "the guards are editable by hand, where a person is watching", tool="Edit")
+
+        # Stopped: nothing outward, everything inward.
+        with open(STOP_FILE, "w") as fh:
+            fh.write("stopped\n")
+        expect(2, {"command": "git push origin HEAD"}, "a stopped fleet cannot push")
+        expect(2, {"command": "gh pr create --title x"}, "...cannot open a PR")
+        expect(2, {"command": "gh pr comment 7 --body x"}, "...cannot comment")
+        expect(2, {"command": "gh issue edit 7 --body x"}, "...cannot edit an issue")
+        expect(0, {"command": "ctest --test-dir build"}, "...but can still run the tests")
+        expect(0, {"command": "cmake --build build"}, "...and still build")
+        expect(0, {"command": "git status"}, "...and still read git")
+        os.remove(STOP_FILE)
+
+        # Fleet-owned and unreviewed: the push gate. The marker is per-commit,
+        # so a fresh HEAD has none.
+        root = _repo_root()
+        if root:
+            with open(os.path.join(OWNED_DIR, "999"), "w") as fh:
+                fh.write(root + "\n")
+            sha = _head_sha()
+            marker = os.path.join(root, ".orca", f"reviewed-{sha}")
+            had_marker = os.path.exists(marker)
+            if had_marker:
+                os.rename(marker, marker + ".selftest")
+            try:
+                expect(2, {"command": "git push origin HEAD"},
+                       "a fleet worktree cannot push before the local review")
+                expect(2, {"command": "gh pr create --title x"},
+                       "...nor open a PR")
+                expect(0, {"command": "ctest --test-dir build"},
+                       "...but the gate is only on what leaves")
+                os.makedirs(os.path.dirname(marker), exist_ok=True)
+                with open(marker, "w") as fh:
+                    fh.write("reviewed\n")
+                expect(0, {"command": "git push origin HEAD"},
+                       "...and lifts once the review is recorded")
+                expect(2, {"file_path": os.path.join(root, HOOK_REL)},
+                       "a fleet worktree cannot rewrite its own guards", tool="Edit")
+                expect(0, {"file_path": os.path.join(root, ".claude/skills/x/SKILL.md")},
+                       "...but skills stay advisory even there", tool="Edit")
+            finally:
+                if os.path.exists(marker):
+                    os.remove(marker)
+                if had_marker:
+                    os.rename(marker + ".selftest", marker)
+
+    STOP_FILE, OWNED_DIR = saved
+    return failures
 
 
 def selftest():
@@ -467,10 +701,11 @@ def selftest():
             failures += 1
         else:
             print(f"  ok: {what}")
+    failures += _stateful_checks()
     if failures:
         print(f"{failures} guard assertion(s) failed", file=sys.stderr)
         return 1
-    print(f"{len(SELFTEST)} guard assertions hold")
+    print(f"{len(SELFTEST)} + {_STATEFUL_COUNT} guard assertions hold")
     return 0
 
 

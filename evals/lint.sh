@@ -164,6 +164,40 @@ assert_hook "$G" 0 '{"tool_name":"Bash","tool_input":{"command":"ctest --test-di
 assert_hook "$G" 2 'not json at all' \
   "an unreadable payload blocks rather than failing open"
 
+echo "== the plugins the flow depends on"
+# mattpocock-skills is not decoration: the brief in issue-command.sh tells every
+# agent to run `/mattpocock-skills:code-review` (standards and spec-vs-diff,
+# which the built-in review does not cover) and `/mattpocock-skills:tdd`. It is
+# enabled in the COMMITTED settings.json, which is what makes it present in every
+# worktree; drop the entry and the brief silently asks for a skill nobody has.
+if python3 -c '
+import json, sys
+s = json.load(open(".claude/settings.json"))
+sys.exit(0 if s.get("enabledPlugins", {}).get("mattpocock-skills@claude-plugins-official") else 1)
+'; then
+  ok "mattpocock-skills is enabled for every worktree"
+else
+  fail "mattpocock-skills is not enabled in .claude/settings.json, but the agent brief calls its skills"
+fi
+
+echo "== the flow's own scripts"
+# The brief names these by path. A rename that misses the brief turns into an
+# agent halfway through a task running a command that does not exist.
+for script in fleet.sh stop.sh await-review.sh review-status.sh record-review.sh \
+              issue-command.sh agent-autostart.sh; do
+  path="scripts/orca/$script"
+  [ -x "$path" ] || { fail "$path is missing or not executable"; continue; }
+  bash -n "$path" || { fail "$path does not parse"; continue; }
+  ok "$script"
+done
+# ...and the brief must still name them.
+brief="$(sed -n "/^sed .*BRIEF/,/^BRIEF$/p" scripts/orca/issue-command.sh)"
+for named in record-review.sh await-review.sh review-status.sh; do
+  grep -q "$named" <<<"$brief" \
+    || fail "the agent brief no longer mentions $named, so the loop stops at that step"
+done
+ok "the brief still names the review loop"
+
 echo "== orca.yaml"
 if [ ! -f orca.yaml ]; then
   fail "orca.yaml is missing; new worktrees would provision nothing"

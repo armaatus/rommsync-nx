@@ -51,28 +51,57 @@ sed "s/__ISSUE__/$num/" <<'BRIEF'
 ---
 
 Implement the issue above, end to end, following CLAUDE.md and the loop in
-docs/WORKFLOW.md.
+docs/WORKFLOW.md. Work autonomously: do not stop to ask for confirmation on
+anything CLAUDE.md already decides. If a question is genuinely open, write it in
+the PR body and carry on with the rest of the scope.
 
-Plan first. Stay in plan mode until the plan is right, then commit it as
-`plans/__ISSUE__-<slug>.md` with four headings: Files that change, Order of work,
-Risks, Proof. The bar is that an engineer who has never seen this conversation
-could implement the change from it alone. If the implementation later departs
-from the plan, update the plan in the same commit.
+**1. Plan.** Stay in plan mode until the plan is right: Files that change, Order
+of work, Risks, Proof. The bar is that someone who never saw this conversation
+could implement it from the plan alone. It goes in the PR body under `## Plan`,
+not in a file.
 
-Then build it. Before you finish:
+**2. Build it, test-first where the issue is a bug.** For a bug fix, reproduce it
+as a failing test, watch it fail for the reason you expect, commit that test, and
+only then fix the code -- `/mattpocock-skills:tdd` is the loop for this.
+`ctest --test-dir build --output-on-failure` green, with a test that would have
+failed before your change. Run it and read the output.
 
-1. `ctest --test-dir build --output-on-failure` is green, and your change has a
-   test that would have failed before it. Run it and read the output. For a bug
-   fix, write the failing test first and commit it before the fix.
-2. Run `/code-review` on your own branch and put the findings in the PR body.
-   REVIEW.md is the policy it follows.
-3. Edit any issue your findings invalidated -- yours or another -- and say in the
-   PR body which and why.
-4. Open a PR whose body carries `Closes #__ISSUE__`. A workflow reads that line to
-   unblock dependent issues, so the wording matters.
-5. Do not merge it. A human does that.
+**3. Review it yourself, before anything leaves this worktree.** Two passes,
+because they look for different things and this machine has the time:
 
-Work autonomously: do not stop to ask for confirmation on anything CLAUDE.md
-already decides. If a question is genuinely open, write it in the PR body and
-carry on with the rest of the scope.
+    /code-review high                  # defects: correctness, efficiency, reuse
+    /mattpocock-skills:code-review     # conformance: standards, and spec-vs-diff
+
+REVIEW.md is the policy: three passes, Important before Nit, at most five nits,
+and a list of what not to report. Fix what is real. Re-run the tests. Then:
+
+    ./scripts/orca/record-review.sh findings.md
+
+Until that marker exists for the exact commit you are pushing, the guard hook
+refuses `git push` and `gh pr create` from this worktree. That is deliberate: a
+PR from the fleet arrives already reviewed or it does not arrive.
+
+**4. Push and open the PR.** Body carries `## Plan`, both sets of findings and
+what you did about them, any issue you edited and why, and `Closes #__ISSUE__` --
+a workflow reads that line to unblock dependent issues, so the wording matters.
+
+**5. Wait for the independent review.** One blocking call, which costs nothing
+while it waits:
+
+    ./scripts/orca/await-review.sh
+
+It returns when the review lands. Fix what is real; where you disagree, reply on
+the thread with the reason rather than silently ignoring it. Reply to and resolve
+every thread, push, and re-request review. Then:
+
+    ./scripts/orca/review-status.sh
+
+Exit 0 means every thread is resolved and every check is green. Anything else,
+go back to `await-review.sh`. Loop until it says ready.
+
+**6. Stop.** Say the PR is waiting on a human and stop. Do not merge it; the hook
+will not let you, and that is the one review control this project has.
+
+At any point, if `~/.rommsync-fleet/STOP` exists, put the work down: say where you
+got to and do nothing further. Nothing can go out while it exists.
 BRIEF

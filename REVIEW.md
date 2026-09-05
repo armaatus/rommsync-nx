@@ -50,9 +50,9 @@ Bugs, logic errors, and the failure paths this project cares about most:
 - Against the issue: does the diff do what **Scope** asked, and does it satisfy
   **Acceptance**? Name anything in the diff that is outside Scope, and anything
   in Acceptance the diff does not cover.
-- Against `plans/<issue>-<slug>.md`: where the implementation departed from the
-  committed plan, is the plan updated in the same PR? An undocumented departure
-  is Important; a documented one is fine.
+- Against the PR body's `## Plan`: where the implementation departed from it, is
+  the departure written down? An undocumented one is Important; a documented one
+  is fine.
 - Is there a test that would have failed before this change? Name it. Its
   absence is Important regardless of how green the suite is.
 - Did the work invalidate an issue -- any issue -- that has not been edited? That

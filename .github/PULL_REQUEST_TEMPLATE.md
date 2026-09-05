@@ -16,8 +16,9 @@ Closes #<!-- issue number -->
 
 ## Plan
 
-<!-- plans/<issue>-<slug>.md, and anything the implementation did differently.
-     Departing from the plan is normal; departing silently is not. -->
+<!-- Files that change / Order of work / Risks / Proof — and anything the
+     implementation ended up doing differently. Departing from a plan is normal;
+     departing silently is not. -->
 
 ## Review findings
 
@@ -36,8 +37,8 @@ Closes #<!-- issue number -->
 - [ ] Scoped to one issue; the issue is referenced in the commits (`M?-?: ...`).
 - [ ] `ctest --test-dir build --output-on-failure` is green, and there is a test
       that would have failed before this change.
-- [ ] `/code-review` ran on this branch and its findings are above.
-- [ ] `plans/<issue>-<slug>.md` matches what was built.
+- [ ] `/code-review` and `/mattpocock-skills:code-review` ran on this branch,
+      and their findings are above.
 - [ ] No secrets in the tree (`config.ini`, `token.dat`, `*.token`, `.env` stay git-ignored).
 - [ ] For network paths: timeout, offline-safe, backoff; never blocks boot.
 - [ ] Never overwrites a save without a backup (see `docs/SYNC_PROTOCOL.md`).

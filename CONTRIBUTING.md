@@ -19,8 +19,8 @@ the parts that run without a human. The short form:
    where labelled). Do not start a `blocked` one — those labels are derived, not
    hand-set.
 2. Branch from `main`: `feature/M2-2-rom-matching`.
-3. **Plan before you edit.** Commit `plans/<issue>-<slug>.md` — files that
-   change, order of work, risks, proof. See [plans/README.md](plans/README.md).
+3. **Plan before you edit.** Files that change, order of work, risks, proof —
+   it goes in the PR body under `## Plan`.
 4. Keep changes scoped to the issue. Reference it in commits (`M2-2: ...`).
 5. `ctest --test-dir build --output-on-failure` green, with a test that would
    have failed before your change.

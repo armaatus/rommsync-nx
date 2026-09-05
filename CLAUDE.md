@@ -101,15 +101,11 @@ serialising to avoid.
 
 ## Plan before you edit
 
-Start in plan mode and stay there until the plan is right. Commit it as
-`plans/<issue-number>-<slug>.md` with four headings — **Files that change**,
-**Order of work**, **Risks**, **Proof**. The bar is that an engineer who has never
-seen the conversation could implement the change from it alone. See
-[plans/README.md](plans/README.md).
-
-When the implementation departs from the plan, **update the plan in the same
-commit**. Departing is normal; departing silently is not, and the review checks
-the diff against it.
+Start in plan mode and stay there until the plan is right: **Files that change /
+Order of work / Risks / Proof**. The bar is that someone who never saw the
+conversation could implement the change from it alone. It goes in the PR body,
+under `## Plan`, along with anything the implementation ended up doing
+differently. Departing from a plan is normal; departing silently is not.
 
 ## Code
 
@@ -190,7 +186,6 @@ put it there as part of the work, not in a note to yourself.
 | `server/` | Pinned RomM API snapshot, contract probe, and the Docker test fixture. |
 | `tests/` | CTest suites. |
 | `scripts/orca/` | Per-worktree provisioning hooks. |
-| `plans/` | One committed plan per issue, written before the code. |
 | `evals/` | Regression tests for the agent configuration itself. |
 | `.claude/` | Skills, subagents and hooks — what steers and what blocks. |
 | `AGENTS.md` | Symlink to this file, for agent tools that look for that name. |
