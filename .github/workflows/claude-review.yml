@@ -37,6 +37,16 @@ on:
     types: [created]
   pull_request_review:
     types: [submitted]
+  # On demand. A review that failed for an infrastructure reason -- an expired
+  # token, a missing permission, an outage -- leaves a correct PR blocked on
+  # `merge-gate` with no way to ask for another one short of pushing a commit
+  # that exists only to fire an event. Pass the PR number.
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: The pull request to review
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -53,14 +63,15 @@ jobs:
   review:
     name: review against REVIEW.md
     if: >-
-      github.event_name == 'pull_request' &&
-      github.actor != 'dependabot[bot]' &&
-      github.event.pull_request.draft == false
+      (github.event_name == 'pull_request' &&
+       github.actor != 'dependabot[bot]' &&
+       github.event.pull_request.draft == false) ||
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     continue-on-error: true
     concurrency:
-      group: claude-review-${{ github.event.pull_request.number }}
+      group: claude-review-${{ github.event.pull_request.number || inputs.pr }}
       cancel-in-progress: true
     steps:
       # The head commit, not refs/pull/N/merge: the review should read what the
@@ -68,7 +79,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || format('refs/pull/{0}/head', inputs.pr) }}
 
       # `secrets` is not available in a job-level `if`, so the gate is a step
       # output.
