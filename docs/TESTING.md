@@ -278,10 +278,22 @@ ctest --test-dir build --output-on-failure
   block-boundary lengths the padding gets wrong, and then the property that
   actually matters — the identifier is the *same* identifier across a restart, a
   re-pair, a different seed, an interrupted commit and a corrupt record.
-- `sync.payload` pins `ClientSaveState` (M2-1) to the committed OpenAPI snapshot
-  rather than to a second copy of the field names: one table in the test is
-  checked against `server/contract/romm-openapi-5.2.0.json` *and* against a body
+- `sync.payload` pins the negotiate shapes to the committed OpenAPI snapshot
+  rather than to a second copy of the field names: tables in the test are
+  checked against `server/contract/romm-openapi-5.2.0.json` — `ClientSaveState`
+  and `SyncNegotiatePayload` going out (M2-1), `SyncOperationSchema` and
+  `SyncNegotiateResponse` coming back (M2-4), plus the four `action` values the
+  schema enumerates — *and* `ClientSaveState` is checked again against a body
   `EncodeNegotiateRequest` actually produced, so drift on either side is red.
+- `sync.plan` is the response half, read off the committed captures rather than
+  restated: every field of `SyncOperation` against the five negotiate captures,
+  including the `upload` one where `save_id`, `server_updated_at` and
+  `server_content_hash` are all null. Two things no capture can pin are checked
+  there too — the eight `reason` strings 5.2.0 can emit that no capture holds
+  (against the table in [API_CONTRACT.md](API_CONTRACT.md), in both directions),
+  and an `action` from a server newer than this client, which is downgraded to
+  `no_op`, flagged and logged rather than guessed at. That last body is the only
+  one in the file no server sent.
 - The `sync.*` rig scenarios ask the running server what the snapshot cannot.
   `accepted` proves a live 5.2.0 takes the encoded body and echoes the entry's
   `file_name`, `slot` and `emulator` back. `required` proves a renamed *required*
@@ -291,12 +303,25 @@ ctest --test-dir build --output-on-failure
   200 and no hint that a field was ignored. That is the failure the typed struct
   exists to prevent, and it is the reason these are rig tests and not unit tests.
   `understood` deletes the save it made, so the fixture is left as it was found.
+- The M2-4 scenarios run `sync::Negotiate` itself against the live server.
+  `negotiates` reads a real plan field by field and checks the two calls that
+  never reach the wire (a token naming no device, a save that matched no rom).
+  `discovers` sends an **empty** `saves` array — the "tell me what I am missing"
+  shape — and gets the server-only save back as a `download`, which is the one
+  operation where every nullable field is filled in. `revoked`, `truncated` and
+  `stalled` force the three failures a healthy RomM will not produce: a 401 is a
+  revoked token rather than a parse failure and is never retried; a clean short
+  body is a named `json` error and no plan; a stall times out, is retried, and
+  the backoff doubles. The wait is injected rather than slept, so `stalled`
+  proves the backoff without spending it.
 - The `harness.*` scenarios (M0-5) are the same idea applied to the *edge cases*:
   every row of that issue's table, forced deterministically against the real
   server. `expired` (a 401 arriving mid-flow, and that it is a response rather
   than a transport error — and not a verdict on the pairing), `conflict` and
   `same_timestamp` (both of the two reasons a conflict arrives with, arranged
-  for real rather than asserted from the docs), `partial` (the second of three
+  for real rather than asserted from the docs, and — since M2-4 — classified
+  through `sync::ParseNegotiateResponse` on the way out, because they arrive as
+  the same `action` and only the reason separates them), `partial` (the second of three
   uploads fails; the session records the accurate counts and the failed one left
   nothing behind), `resume` (a TCP reset four megabytes into the 120 MiB seeded
   rom, then a `Range` resume, compared **byte for byte** against the file RomM

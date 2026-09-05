@@ -201,6 +201,16 @@ class Reader {
   /// reach a timestamp parser as though it meant something.
   bool RequiredNullable(std::string_view key, std::optional<std::string>* out);
 
+  /// A required field documented as `integer | null`. Must be present; `null`
+  /// yields an empty optional rather than an error.
+  ///
+  /// Held to exactly the bar the integer `Required` sets -- written without a
+  /// fraction or an exponent, and inside an `int64_t`. The field this exists for
+  /// is `save_id` on a negotiate operation, which is `null` for a save the
+  /// server does not have yet and a row id otherwise; a `0` standing in for the
+  /// `null` would be a save id, and one that names no save.
+  bool RequiredNullable(std::string_view key, std::optional<std::int64_t>* out);
+
   bool ok() const { return error_.ok(); }
   const Error& error() const { return error_; }
 

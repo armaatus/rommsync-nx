@@ -59,6 +59,32 @@ constexpr const char* kMultiRom = "Synthetic Two Disc Game";
 /// comparison against what a download produced.
 constexpr const char* kLargeRomSource = ROMMSYNC_FIXTURE_LIBRARY "/roms/gba/synthetic-large.gba";
 
+/// The engine's own reading of a plan, scoped to this run's slot.
+///
+/// The scenarios below assert on the raw JSON *and* on this, and the two are
+/// not redundant: the raw fields prove what the server sent, and this proves
+/// `sync::ParseNegotiateResponse` turns it into the one thing a client acts on.
+/// The two conflict reasons are where that matters most -- they arrive as the
+/// same `action`, and a client that classified only the first would send the
+/// second down the default branch, which on a save is the branch that
+/// overwrites it.
+const sync::SyncOperation* Classified(rig::Checks& checks, const std::string& body,
+                                      const std::string& slot,
+                                      rommsync::auth::Parsed<sync::SyncPlan>* into) {
+  *into = sync::ParseNegotiateResponse(body);
+  if (!into->ok()) {
+    checks.Expect(false, "the engine reads the plan: " + into->error.Describe());
+    return nullptr;
+  }
+  for (const sync::SyncOperation& operation : into->value.operations) {
+    if (operation.slot.has_value() && *operation.slot == slot) {
+      return &operation;
+    }
+  }
+  checks.Expect(false, "the parsed plan carries an operation for this run's slot");
+  return nullptr;
+}
+
 /// A save path on the card. `/retroarch/saves` is a real entry in the default
 /// folder map (config.cpp), not a path invented here.
 std::string SavePath(const std::string& file_name) {
@@ -352,6 +378,14 @@ void Conflict(rig::Checks& checks, http::HttpClient& client, const std::string& 
                   std::string("Both sides changed since last sync"),
                   "...and says which of the two conflicts this is");
 
+  rommsync::auth::Parsed<sync::SyncPlan> read;
+  if (const sync::SyncOperation* typed = Classified(checks, result.response.body, slot, &read)) {
+    checks.Expect(typed->action == sync::Action::kConflict, "the engine reads it as a conflict");
+    checks.Expect(typed->reason == sync::Reason::kBothChanged,
+                  std::string("...and classifies the history conflict: ") + typed->reason_text);
+    checks.Expect(read.value.warnings.empty(), "with nothing unrecognised in it");
+  }
+
   // RomM sends no resolution -- there is no server_wins/keep_both field to obey
   // (docs/SYNC_PROTOCOL.md). What it sends is what the client needs to show a
   // human and to write a backup against, so their absence is worth asserting.
@@ -430,6 +464,18 @@ void SameTimestamp(rig::Checks& checks, http::HttpClient& client, const std::str
   checks.ExpectEq(harness::Field(*operation, "reason"),
                   std::string("Same timestamp but different content"),
                   "...with the second of the two reasons a client must handle");
+
+  rommsync::auth::Parsed<sync::SyncPlan> read;
+  if (const sync::SyncOperation* typed = Classified(checks, result.response.body, slot, &read)) {
+    checks.Expect(typed->action == sync::Action::kConflict, "the engine reads it as a conflict");
+    // Distinct from `harness.conflict`'s reason, and that is the whole point:
+    // one `action`, two situations, and only the reason separates them.
+    checks.Expect(typed->reason == sync::Reason::kSameTimestampDifferentContent,
+                  std::string("...and classifies the no-history conflict: ") + typed->reason_text);
+    checks.Expect(typed->reason != sync::Reason::kBothChanged,
+                  "which is NOT the reason the other conflict scenario produces");
+    checks.Expect(read.value.warnings.empty(), "with nothing unrecognised in it");
+  }
 
   harness::DeleteSave(client, base, fixture, server.id);
 }

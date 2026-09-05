@@ -75,6 +75,26 @@ may be the only copy of the save.
 `POST /api/sync/negotiate` → `SyncNegotiateResponse { session_id, operations[],
 total_upload, total_download, total_conflict, total_no_op }`.
 
+`sync::Negotiate` makes that call and `ParseNegotiateResponse` turns the answer
+into a `SyncPlan` (M2-4). Both live in the same header as the request side. Three
+things about the answer are worth stating here rather than leaving to the code:
+
+- **The plan is read whole or not at all.** One unreadable operation refuses the
+  response, because a plan with a save missing from it looks exactly like a plan
+  for a device that is already in sync — and the save that got dropped is the one
+  nobody hears about again. A truncated body is that failure in its quietest
+  form, which is why `sync.truncated` forces one.
+- **An `action` this client does not recognise becomes `no_op`, and is logged.**
+  On a save, the default branch is the one that can overwrite it. The same goes
+  for an unrecognised `reason`, except that the action there is still obeyed: the
+  reason is the server's explanation, not its decision.
+- **Three failures that are not "the network".** A `404` is this device deleted
+  in RomM's web UI, a `400 Sync is disabled for this device` is the user's own
+  switch, and a `401` is the token revoked — `expires_at` is null, so there is
+  nothing to refresh. None of the three gets better by retrying, and only the
+  first and last are fixed by pairing again. Everything else — no response, a
+  `5xx`, a `429` — retries with backoff.
+
 The plan also covers saves the client did **not** report: any server save this
 device has no sync history for comes back as a `download`, for any rom. That is
 how the client learns a save exists at all — there is no separate "what's new"
