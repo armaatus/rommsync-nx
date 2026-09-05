@@ -449,6 +449,15 @@ ctest --test-dir build --output-on-failure
   translation unit produced an aarch64 object. It skips when that image is not
   pulled — including under `ROMMSYNC_REQUIRE_RIG`, since the host CI runner does
   not have it and the `switch-build` job is the enforcement there.
+- The `package.*` group covers `scripts/package.sh`, which turns those two build
+  outputs into the zip a user unpacks onto their SD card. `package.layout`,
+  `package.refuses`, `package.deterministic` and `package.upgrade` stub the two
+  artifacts — four bytes of magic is all the script inspects — so they need no
+  toolchain and never skip. `package.builds` does the real cross-compile and
+  packages it *inside* the container, and skips on the same missing image
+  `switch.builds` does. Unlike that one it has no CI equivalent yet: nothing in
+  `.github/workflows/ci.yml` runs `scripts/package.sh`, so on a machine without
+  the image the packaging is not exercised at all (#34).
 
 ### Provisioning the fixture
 

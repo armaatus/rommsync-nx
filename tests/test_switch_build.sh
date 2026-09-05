@@ -110,9 +110,20 @@ phase_builds() {
   # Sources only. A .nsp left over from a local build is exactly what make would
   # accept as already up to date, and the assertions below would then be reading
   # the previous build's output instead of this one's.
+  #
+  # Named by extension rather than cleared with a `sys-rommsync.*` glob: that
+  # glob also matches sys-rommsync.json, the NPDM config without which npdmtool
+  # produces no .npdm and the .nsp does not link -- so a glob leaves a restoring
+  # `cp` behind it that is load-bearing and looks incidental. Nothing here
+  # deletes something it then has to put back. tests/test_package.sh does the
+  # same, in the same words.
+  local target ext
   rm -rf "$SCRATCH/sysmodule/build" "$SCRATCH/overlay/build"
-  rm -f "$SCRATCH"/sysmodule/sys-rommsync.* "$SCRATCH"/overlay/ovl-rommsync.*
-  cp "$REPO_ROOT/sysmodule/sys-rommsync.json" "$SCRATCH/sysmodule/"
+  for target in sysmodule/sys-rommsync overlay/ovl-rommsync; do
+    for ext in nsp nso npdm ovl nro nacp elf map lst; do
+      rm -f "$SCRATCH/$target.$ext"
+    done
+  done
 
   local log
   log="$SCRATCH/build.log"
@@ -212,8 +223,15 @@ phase_tlsprobe() {
   SCRATCH="$(mktemp -d)"
   cp "$REPO_ROOT/VERSION" "$REPO_ROOT/switch.mk" "$SCRATCH/"
   cp -R "$REPO_ROOT/core" "$REPO_ROOT/tlsprobe" "$SCRATCH/"
+  # By extension, for the reason phase_builds gives: a `rommsync-tlsprobe.*`
+  # glob has nothing to catch in this target today, but the rule is "nothing
+  # here deletes something it then has to put back" and the way that stays true
+  # is by not writing the glob in the first place.
+  local ext
   rm -rf "$SCRATCH/tlsprobe/build"
-  rm -f "$SCRATCH"/tlsprobe/rommsync-tlsprobe.*
+  for ext in nsp nso npdm ovl nro nacp elf map lst; do
+    rm -f "$SCRATCH/tlsprobe/rommsync-tlsprobe.$ext"
+  done
 
   local log="$SCRATCH/build.log"
   if ! docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work "$IMAGE" \

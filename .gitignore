@@ -23,6 +23,8 @@ TASK.md
 # build output
 build/
 build-*/
+# the release zip scripts/package.sh assembles
+dist/
 *.o
 *.elf
 *.nso

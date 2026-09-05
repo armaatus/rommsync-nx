@@ -128,7 +128,10 @@ target_compile_definitions(test_config PRIVATE
   # The documented example is parsed rather than restated: an ```ini block a
   # user copies and the parser rejects is the first thing they meet, and no test
   # of a private string literal here would ever see it.
-  ROMMSYNC_CONFIG_DOC="${CMAKE_SOURCE_DIR}/docs/CONFIG.md")
+  ROMMSYNC_CONFIG_DOC="${CMAKE_SOURCE_DIR}/docs/CONFIG.md"
+  # ...and the file the release zip actually ships (scripts/package.sh), which
+  # is a second copy of that example and can drift from it.
+  ROMMSYNC_CONFIG_EXAMPLE="${CMAKE_SOURCE_DIR}/packaging/config.ini.example")
 add_test(NAME core.config COMMAND test_config)
 
 # MD5, against RFC 1321's own vectors. Pure arithmetic, so it never skips -- and
@@ -738,14 +741,16 @@ set_tests_properties(switch.ci_requires_artifacts PROPERTIES TIMEOUT 60)
 # The real cross-compile, in the same devkitpro/devkita64 image CI uses. It needs
 # that image, which the CI host runner does not have and will not pull for 2.7GB.
 #
-# Read the next line before changing it: this is the ONLY test in this file whose
-# SKIP_RETURN_CODE is not wrapped in if(NOT ROMMSYNC_REQUIRE_RIG). Every other
-# skippable test flips to a failure under that option precisely so CI cannot go
-# green on a skip -- and that is the right default, so the exception needs its
-# reason recorded rather than inferred. The reason is that this one's enforcement
-# lives in a different CI job: `switch-build` in .github/workflows/ci.yml runs
-# the same build, in the same image, on every push, and fails there. This entry
-# is its local equivalent, not its enforcement.
+# Read the next line before changing it: this test's SKIP_RETURN_CODE is not
+# wrapped in if(NOT ROMMSYNC_REQUIRE_RIG). Every other skippable test flips to a
+# failure under that option precisely so CI cannot go green on a skip -- and
+# that is the right default, so each exception needs its reason recorded rather
+# than inferred. There are three, and only two of them have this one's reason:
+# `switch.builds` and `switch.tlsprobe` are enforced by a different CI job --
+# `switch-build` in .github/workflows/ci.yml runs the same builds, in the same
+# image, on every push, and fails there -- so these entries are its local
+# equivalent, not its enforcement. `package.builds` is the third and does NOT
+# have that reason; see the note on it below.
 #
 # So do not "fix" it by wrapping it like the others. That would fail the
 # host-tests job on a runner that has no devkitpro image -- which is every runner
@@ -760,6 +765,45 @@ set_tests_properties(switch.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 add_test(NAME switch.tlsprobe
          COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" tlsprobe)
 set_tests_properties(switch.tlsprobe PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+# --- the release zip: scripts/package.sh -------------------------------------
+# The install layout is the one thing about this project a user meets before
+# anything else runs, and every way it can be wrong is silent on the console: a
+# .nsp under its build name installs and does nothing, an .ovl without its
+# signature is simply not in the menu, a shipped config.ini overwrites the
+# settings an upgrade was supposed to keep.
+set(PACKAGE_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_package.sh")
+
+# All four of these stub the two Switch artifacts -- four bytes of magic is all
+# the script inspects -- so they need neither Docker nor a cross-compiler and
+# none of them ever skips.
+foreach(scenario
+        layout          # the unpacked tree is exactly #32's five paths
+        refuses         # a wrong .nsp, an unsigned .ovl, a missing input
+        deterministic   # the same inputs, the same bytes
+        upgrade)        # unzipping over an install keeps config.ini and the rest
+  add_test(NAME package.${scenario}
+           COMMAND "${BASH_PROGRAM}" "${PACKAGE_TEST}" ${scenario})
+  set_tests_properties(package.${scenario} PROPERTIES TIMEOUT 120)
+endforeach()
+
+# The real cross-compile, packaged inside the same container #34's release job
+# will use. Same image as switch.builds, and its SKIP_RETURN_CODE is left
+# unwrapped for the same reason: the CI host runner has no devkitpro/devkita64
+# and will not pull 2.7GB for one, so wrapping it in if(NOT ROMMSYNC_REQUIRE_RIG)
+# like the other skippable entries would make the host-tests job red on every
+# runner it uses.
+#
+# Unlike switch.builds, this one has NO equivalent in CI yet: `switch-build`
+# builds the three targets and checks their magic bytes, but nothing there runs
+# scripts/package.sh, so today the packaging is only ever exercised here. #34
+# adds the release job that packages on a tag and carries a note asking for a
+# package step in `switch-build` too; until one of those lands, a failure that
+# is specific to packaging in the container -- a missing `zip`, say -- would
+# first appear on a tag. Read this before deciding the coverage is elsewhere.
+add_test(NAME package.builds
+         COMMAND "${BASH_PROGRAM}" "${PACKAGE_TEST}" builds)
+set_tests_properties(package.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 
 # --- the TLS terminator the M0-1 probe aims at -------------------------------
 # The rig is plain HTTP because the host suite reaches it over loopback; the

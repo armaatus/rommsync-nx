@@ -192,6 +192,7 @@ put it there as part of the work, not in a note to yourself.
 | `tlsprobe/` | The M0-1 TLS spike: a manually-launched `.nro`, never installed. |
 | `server/` | Pinned RomM API snapshot, contract probe, and the Docker test fixture. |
 | `tests/` | CTest suites. |
+| `packaging/` | What the release zip ships beside the two artifacts; `scripts/package.sh` builds it. |
 | `scripts/orca/` | Per-worktree provisioning hooks. |
 | `evals/` | Regression tests for the agent configuration itself. |
 | `.claude/` | Skills, subagents and hooks — what steers and what blocks. |
