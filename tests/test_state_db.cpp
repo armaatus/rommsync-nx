@@ -322,9 +322,25 @@ void CorruptFilesAreAnEmptyBaselineAndADiagnostic(checks::Checks& c) {
     const state::LoadedBaseline loaded = state::ParseBaseline(scenario.text);
     c.Expect(loaded.value.empty(), std::string(scenario.what) + " yields an empty baseline");
     c.Expect(!loaded.diagnostics.empty(), std::string(scenario.what) + " is diagnosed");
-    c.Expect(loaded.diagnostics.size() <= state::kMaxDiagnostics,
+    c.Expect(loaded.diagnostics.size() <= state::kMaxDiagnostics + 1,
              std::string(scenario.what) + " is bounded");
   }
+
+  // A file bad enough to exhaust the per-row cap still says the *whole* baseline
+  // went. That sentence is the one a reader acts on, and capping it away is
+  // capping away the only diagnostic that explains the re-hash.
+  std::string flood = std::string(state::kFormatMagic) + " " +
+                      std::to_string(state::kFormatVersion) + "\n";
+  for (std::size_t at = 0; at < state::kMaxDiagnostics + 10; ++at) {
+    flood += "not a row\n";
+  }
+  const state::LoadedBaseline flooded = state::ParseBaseline(flood);
+  c.Expect(flooded.value.empty(), "a file of nothing but bad rows is an empty baseline");
+  c.Expect(flooded.diagnostics.size() <= state::kMaxDiagnostics + 1,
+           "the per-row complaints are still bounded");
+  c.Expect(flooded.DescribeDiagnostics().find("the whole baseline is discarded") !=
+               std::string::npos,
+           "and the verdict survives the cap -- " + flooded.DescribeDiagnostics());
 }
 
 /// **Not the rows that happened to parse.** A truncation leaves a prefix that is

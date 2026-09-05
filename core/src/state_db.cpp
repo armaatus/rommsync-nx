@@ -324,7 +324,10 @@ LoadedBaseline ParseBaseline(std::string_view text) {
     // tell that apart from a complete file. Dropping the lot costs one tick of
     // hashing; trusting half of it costs a comparison that is quietly wrong.
     loaded.diagnostics = std::move(complaints);
-    Add(&loaded.diagnostics,
+    // Unconditionally, not through `Add`: the per-row complaints are capped, and
+    // a file bad enough to hit the cap is exactly the one whose reader most
+    // needs to be told the *whole* baseline went, not just the rows named above.
+    loaded.diagnostics.push_back(
         "state.db is not intact; the whole baseline is discarded and every save is hashed");
     return loaded;
   }
