@@ -6,6 +6,10 @@ on:
   pull_request:
   release:
     types: [created]
+  # On demand, because the one thing you cannot do to a green run is run it
+  # again -- and an intermittent failure is diagnosed by repetition. #76 cost
+  # several pushes that existed only to make CI run once more.
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
