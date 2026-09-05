@@ -87,23 +87,28 @@ PY
 )"
 
   verdict=0
-  # Each expectation is an extended regex; "a|b" means either will do.
-  for needle in $(python3 -c "
-import json
-print('\n'.join(json.load(open('$case_file'))['expect'].get('contains', [])))"); do
+  # Each expectation is ONE extended regex; "a|b" means either will do. Read
+  # line by line, never `for needle in $(...)`: a bare command substitution
+  # word-splits on spaces, so `"192.168.1.50 is now|I have updated"` silently
+  # becomes five separate regexes -- and `/is/` matches every answer there is.
+  while IFS= read -r needle; do
+    [ -n "$needle" ] || continue
     grep -Eiq -- "$needle" <<<"$answer" || {
       echo "  FAIL: the answer never mentions /$needle/"
       verdict=1
     }
-  done
-  for needle in $(python3 -c "
+  done < <(python3 -c "
 import json
-print('\n'.join(json.load(open('$case_file'))['expect'].get('absent', [])))"); do
+print('\n'.join(json.load(open('$case_file'))['expect'].get('contains', [])))")
+  while IFS= read -r needle; do
+    [ -n "$needle" ] || continue
     grep -Eiq -- "$needle" <<<"$answer" && {
       echo "  FAIL: the answer contains /$needle/, which it should not"
       verdict=1
     }
-  done
+  done < <(python3 -c "
+import json
+print('\n'.join(json.load(open('$case_file'))['expect'].get('absent', [])))")
 
   if [ "$verdict" = 0 ]; then
     echo "  pass"

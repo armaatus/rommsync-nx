@@ -161,10 +161,12 @@ and say so in the PR body. Never edit them as a side effect of rewording a body.
   relevant: `save-safety` on anything that writes a save, `core-portability` on
   anything reaching for a platform facility inside `core/`, `tracker-is-spec` on
   anything that finds an issue to be wrong. They are advisory.
-- **Hooks** ([`.claude/hooks/`](.claude/hooks)) are not. They block, with an
-  explanation: merging a PR, force-pushing `main`, editing secrets, hand-editing
-  `server/contract/captures/`, editing `unblock.yml`. A block is a rule you were
-  about to break, not a bug.
+- **Hooks** ([`.claude/hooks/guard.py`](.claude/hooks/guard.py)) are not. They
+  block, with an explanation: merging a PR, force-pushing `main`, editing
+  secrets, writing to `server/contract/captures/`, editing `unblock.yml`, and
+  editing the hooks and settings themselves. A block is a rule you were about to
+  break, not a bug. `guard.py --selftest` says exactly what it does and does not
+  stop.
 - **Subagents**: [`verifier`](.claude/agents/verifier.md) gives an independent
   build-and-test verdict from a fresh context before you open a PR;
   [`researcher`](.claude/agents/researcher.md) answers questions about the

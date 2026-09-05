@@ -145,9 +145,25 @@ jobs:
       issues: write
       actions: read
     steps:
+      # The default checkout for an issue_comment event is the DEFAULT BRANCH,
+      # not the PR -- and this job carries `contents: write`. Pin the PR head
+      # the same way the review job does, so what runs is what was commented on.
+      - id: head
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          num="${{ github.event.issue.number || github.event.pull_request.number }}"
+          ref=""
+          if [ -n "$num" ]; then
+            ref="$(gh api "repos/${{ github.repository }}/pulls/$num" \
+                     --jq '.head.ref' 2>/dev/null || true)"
+          fi
+          echo "ref=$ref" >>"$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ steps.head.outputs.ref || github.ref }}
 
       - id: token
         env:

@@ -85,18 +85,29 @@ orca_project_remnants() {
 # runtime: a wrapper that cannot find Orca.app fails it, and a reachable CLI
 # answers it whether or not the app is running.
 #
+# The probe goes through orca_run_with_deadline like every other CLI call. It is
+# the FIRST call each hook makes, and `setupAgentStartupPolicy: wait-for-setup`
+# holds the agent's tab until setup.sh returns -- so a wrapper that connects and
+# then never answers would hang worktree provisioning at the one point where
+# nothing has printed a reason yet.
+#
 # Returns non-zero when nothing answers, so a caller can say so in one line
 # instead of making its first real call and reading the silence as data.
+ORCA_CLI_PROBE_SECONDS="${ORCA_CLI_PROBE_SECONDS:-10}"
 orca_cli_resolve() {
   [ -n "${ORCA_CLI:-}" ] && return 0
-  local candidate
+  local candidate probe_out
+  probe_out="$(mktemp)"
   for candidate in ${ORCA_CLI_COMMAND:-} orca orca-dev orca-ide \
       /Applications/Orca.app/Contents/Resources/bin/orca; do
     command -v "$candidate" >/dev/null 2>&1 || continue
-    "$candidate" --version >/dev/null 2>&1 || continue
+    orca_run_with_deadline "$ORCA_CLI_PROBE_SECONDS" "$probe_out" \
+      "$candidate" --version || continue
     ORCA_CLI="$candidate"
+    rm -f "$probe_out"
     return 0
   done
+  rm -f "$probe_out"
   return 1
 }
 

@@ -170,7 +170,7 @@ if [ -n "$page" ]; then
   # expired session, and the login fetch has to run against RomM's own origin
   # for the relative paths and the cookie jar to be the right ones.
   orca_run_with_deadline "$CLI_SECONDS" "$CLI_OUT" \
-    orca goto --page "$page" --url "$ROMM_BASE_URL/" --json >/dev/null 2>&1
+    "$ORCA_CLI" goto --page "$page" --url "$ROMM_BASE_URL/" --json >/dev/null 2>&1
 else
   echo "==> opening RomM ($ROMM_BASE_URL)"
   if ! orca_run_with_deadline "$CLI_SECONDS" "$CLI_OUT" \
@@ -192,7 +192,7 @@ if authenticate "$page"; then
   # login happened in the background of the current document, so the page on
   # screen is still the logged-out one until it reloads.
   orca_run_with_deadline "$CLI_SECONDS" "$CLI_OUT" \
-    orca goto --page "$page" --url "$ROMM_BASE_URL/" --json >/dev/null 2>&1
+    "$ORCA_CLI" goto --page "$page" --url "$ROMM_BASE_URL/" --json >/dev/null 2>&1
   echo "    signed in as $ROMM_FIXTURE_USER"
   printf 'signed-in %s\n' "$ROMM_FIXTURE_USER" >"$STATE_FILE"
 else

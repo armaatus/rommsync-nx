@@ -214,11 +214,28 @@ They run on every matching action and they block, with an explanation:
 
 | Hook | Blocks |
 |---|---|
-| `guard-bash.sh` | merging a PR; force-pushing `main`; rewriting the pinned contract from the shell |
-| `guard-edit.sh` | editing secrets or `.env`; hand-editing `server/contract/captures/`; editing `unblock.yml` |
+| `guard.py` | merging a PR; force-pushing `main`; writing to `server/contract/captures/`; editing secrets or `.env`; editing `unblock.yml`; editing the hooks and settings themselves |
 | `shellcheck-edited.sh` | *(reports, never blocks)* a shell script that no longer parses |
 
 The skill makes a violation rare; the hook makes it close to impossible.
+
+Three properties of `guard.py` are deliberate and worth keeping if you touch it:
+
+- **It does not fail open.** An unreadable payload, a missing key, an
+  unparseable command — all of those block. A guard that quietly stops guarding
+  when something upstream changes shape is worse than no guard, because nothing
+  on screen says the enforcement went away.
+- **It tokenises commands with `shlex`** rather than matching raw strings, so
+  `git -C /some/path push --force origin main` is caught while
+  `git commit -m "note about --force pushes to main"` is not.
+- **It guards itself.** `.claude/hooks/` and `.claude/settings.json` are not
+  agent-editable: an agent that can rewrite its own guards has none. Skills and
+  subagents are *not* protected — they are advisory by design, and an agent
+  improving one is the loop working.
+
+`guard.py --selftest` is the table of everything it blocks and everything it
+lets through, kept next to the code so the two cannot drift into separate files.
+`evals/lint.sh` runs it, and so does `ctest -R agent.config`.
 
 Agents run in **auto** permission mode (`permissions.defaultMode` in
 `.claude/settings.json`) so a worktree does not sit waiting for someone to approve

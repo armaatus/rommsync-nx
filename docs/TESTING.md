@@ -73,7 +73,7 @@ skill whose frontmatter does not parse never loads, a hook whose path is wrong
 never runs, a guard whose pattern stopped matching stops blocking. None of that
 shows up in a diff review or turns a build red.
 
-`ctest -R agent.config` (the same check as `./evals/lint.sh`, and the `static`
+`ctest -R agent.config` (the same check as `./evals/lint.sh`, and the `lint`
 job in `.github/workflows/agent-config.yml`) asserts it: frontmatter parses and
 declared names match their paths, every registered hook exists and is executable,
 and the guards still return exit 2 for the things they exist to block and exit 0

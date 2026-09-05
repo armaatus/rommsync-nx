@@ -5,12 +5,12 @@
   "permissions": {
     "defaultMode": "auto",
     "allow": [
-      "Edit(.claude/**)",
-      "Write(.claude/**)",
       "Edit(plans/**)",
       "Write(plans/**)",
-      "Edit(evals/**)",
-      "Write(evals/**)",
+      "Edit(.claude/skills/**)",
+      "Write(.claude/skills/**)",
+      "Edit(.claude/agents/**)",
+      "Write(.claude/agents/**)",
       "Bash(cmake:*)",
       "Bash(ctest:*)",
       "Bash(gh issue view:*)",
@@ -29,21 +29,11 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|Edit|Write|NotebookEdit",
         "hooks": [
           {
             "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/guard-bash.sh",
-            "timeout": 10
-          }
-        ]
-      },
-      {
-        "matcher": "Edit|Write|NotebookEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/guard-edit.sh",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/guard.py",
             "timeout": 10
           }
         ]

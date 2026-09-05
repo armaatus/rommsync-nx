@@ -106,11 +106,16 @@ else
   # guard that stopped guarding.
   while IFS= read -r cmd; do
     [ -n "$cmd" ] || continue
-    resolved="${cmd/\$CLAUDE_PROJECT_DIR/$REPO_ROOT}"
-    script="${resolved%% *}"
+    # The whole command is treated as one path, not split at the first space:
+    # every hook here IS a single script, and a checkout under "~/my worktrees/"
+    # would otherwise report all of them missing on a perfectly correct tree.
+    script="${cmd/\$CLAUDE_PROJECT_DIR/$REPO_ROOT}"
     [ -f "$script" ] || { fail "hook command does not exist: $cmd"; continue; }
     [ -x "$script" ] || { fail "hook command is not executable: $script"; continue; }
-    bash -n "$script" || fail "hook does not parse: $script"
+    case "$script" in
+      *.py) python3 -m py_compile "$script" || fail "hook does not parse: $script" ;;
+      *)    bash -n "$script" || fail "hook does not parse: $script" ;;
+    esac
     ok "hook $(basename "$script")"
   done < <(python3 - <<'PY'
 import json
@@ -129,6 +134,19 @@ fi
 # pattern that stops matching fails here rather than the day it lets something
 # through.
 echo "== guards actually guard"
+# The exhaustive table lives in the hook itself (`guard.py --selftest`), next to
+# the code it constrains, so a guard and its assertion cannot drift into
+# separate files. It runs here so `ctest -R agent.config` and CI both cover it.
+if [ -x .claude/hooks/guard.py ]; then
+  python3 .claude/hooks/guard.py --selftest 2>&1 | sed 's/^/  /'
+  [ "${PIPESTATUS[0]}" = 0 ] || fail "the guard selftest does not hold"
+else
+  fail ".claude/hooks/guard.py is missing or not executable"
+fi
+
+# And the wiring, end to end. The selftest calls the module's functions, which
+# proves the rules; this proves the process -- stdin in, exit code out -- which
+# is what settings.json actually depends on.
 assert_hook() {
   local script="$1" want="$2" payload="$3" what="$4"
   [ -x "$script" ] || { fail "$script is missing; cannot check '$what'"; return; }
@@ -138,26 +156,13 @@ assert_hook() {
     && ok "$what" \
     || fail "$what: expected exit $want from $(basename "$script"), got $got"
 }
-GB=.claude/hooks/guard-bash.sh
-GE=.claude/hooks/guard-edit.sh
-assert_hook "$GB" 2 '{"tool_input":{"command":"gh pr merge 42 --squash"}}' \
-  "an agent cannot merge its own PR"
-assert_hook "$GB" 0 '{"tool_input":{"command":"ctest --test-dir build --output-on-failure"}}' \
-  "running the tests is not blocked"
-assert_hook "$GB" 0 '{"tool_input":{"command":"gh pr create --title x --body y"}}' \
-  "opening a PR is not blocked"
-assert_hook "$GB" 2 '{"tool_input":{"command":"probe.py > server/contract/captures/login.json"}}' \
-  "the pinned contract cannot be rewritten from the shell"
-assert_hook "$GB" 0 '{"tool_input":{"command":"diff server/contract/captures/login.json /tmp/new.json > /tmp/d"}}' \
-  "reading a capture is still allowed"
-assert_hook "$GE" 2 '{"tool_input":{"file_path":"/w/rommsync-nx/.env"}}' \
-  "secrets are not editable"
-assert_hook "$GE" 2 '{"tool_input":{"file_path":"/w/rommsync-nx/server/contract/captures/login.json"}}' \
-  "the pinned contract is not hand-edited"
-assert_hook "$GE" 2 '{"tool_input":{"file_path":"/w/rommsync-nx/.github/workflows/unblock.yml"}}' \
-  "the blocked/ready workflow is not agent-editable"
-assert_hook "$GE" 0 '{"tool_input":{"file_path":"/w/rommsync-nx/core/src/sync.cpp"}}' \
-  "ordinary source files are editable"
+G=.claude/hooks/guard.py
+assert_hook "$G" 2 '{"tool_name":"Bash","tool_input":{"command":"gh pr merge 42"}}' \
+  "the guard blocks over stdin, not just in-process"
+assert_hook "$G" 0 '{"tool_name":"Bash","tool_input":{"command":"ctest --test-dir build"}}' \
+  "...and allows ordinary work the same way"
+assert_hook "$G" 2 'not json at all' \
+  "an unreadable payload blocks rather than failing open"
 
 echo "== orca.yaml"
 if [ ! -f orca.yaml ]; then
@@ -183,8 +188,8 @@ for key in ('name', 'prompt', 'expect'):
 if not isinstance(c['expect'], dict) or not (c['expect'].get('contains') or c['expect'].get('absent')):
     sys.exit(\"expect must carry 'contains' and/or 'absent'\")
 " || fail "$case_file is not a well-formed eval case"
+  ok "$(basename "$case_file")"
 done
-ok "${#cases[@]} eval case(s) parse"
 
 echo
 if [ "$fails" -gt 0 ]; then
