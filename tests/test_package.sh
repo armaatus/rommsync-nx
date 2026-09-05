@@ -347,9 +347,22 @@ phase_builds() {
         "$REPO_ROOT/packaging" "$SCRATCH/"
   mkdir -p "$SCRATCH/scripts"
   cp "$PACKAGE" "$SCRATCH/scripts/"
+  # Sources only. A .nsp left over from a local build is exactly what make would
+  # accept as already up to date, and the assertions below would then be reading
+  # the previous build's output rather than this one's.
+  #
+  # Named by extension rather than cleared with a `sys-rommsync.*` glob: that
+  # glob also matches sys-rommsync.json -- the NPDM config the build needs and
+  # `title_id()` reads the id out of -- so a glob leaves a restoring `cp` behind
+  # it that is load-bearing and looks incidental. Nothing here deletes something
+  # it then has to put back.
+  local target ext
   rm -rf "$SCRATCH/sysmodule/build" "$SCRATCH/overlay/build"
-  rm -f "$SCRATCH"/sysmodule/sys-rommsync.* "$SCRATCH"/overlay/ovl-rommsync.*
-  cp "$REPO_ROOT/sysmodule/sys-rommsync.json" "$SCRATCH/sysmodule/"
+  for target in sysmodule/sys-rommsync overlay/ovl-rommsync; do
+    for ext in nsp nso npdm ovl nro nacp elf map lst; do
+      rm -f "$SCRATCH/$target.$ext"
+    done
+  done
 
   local log="$SCRATCH/build.log"
   # Packaged inside the container, not on this host: #34's release job runs the
