@@ -35,7 +35,6 @@
 
 #include <chrono>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -547,12 +546,12 @@ inline bool UploadSave(http::HttpClient& client, const std::string& base, const 
 
 /// `PUT /api/saves/{id}` -- replace the bytes of a save **in place**.
 ///
-/// The difference from another `POST` is narrower than this comment used to
-/// claim, and worth stating exactly (`execute.occupied` verifies it): a POST
-/// carrying `overwrite=true` *also* replaces the slot's row in place, tag and
-/// id included, and a POST without it creates a second row with a fresh tag.
-/// What the PUT alone gives is a move forward that names no `slot` and no
-/// `device_id` -- which is what arranges "the server's copy changed since this
+/// This is the only call that reliably moves one row forward. A POST does so
+/// only by accident: RomM matches an existing slot row by a second-granularity
+/// datetime tag computed at ingest, so a POST lands on the existing row just
+/// when it shares the base name and the wall-clock second, `overwrite=true`
+/// included (docs/API_CONTRACT.md, issue #85). The PUT also names no `slot` and
+/// no `device_id`, which is what arranges "the server's copy changed since this
 /// device last synced it" without writing a sync row on the way.
 inline bool ReplaceSave(http::HttpClient& client, const std::string& base, const Fixture& fixture,
                         std::int64_t save_id, const std::string& local_path,
@@ -598,31 +597,19 @@ inline bool ServerMd5(http::HttpClient& client, const std::string& base, const F
 
 /// `2026-09-04T22:45:33.512340+00:00` -> a `sync::Timestamp`, whole seconds.
 ///
-/// Whole seconds because that is what a client may send: `FormatTimestamp`
-/// drops sub-second precision downwards, so a test that wants "the same
-/// timestamp the server holds" has to mean the same truncation the engine
-/// performs. Returns false on anything that is not that shape.
+/// The engine's own reader, not a second copy of it: `sync::ParseTimestamp` is
+/// what a baseline row's `server_updated_at` goes through (M2-6), so a test that
+/// spelled the conversion itself could agree with RomM and disagree with the
+/// code under test. Whole seconds because that is what a client may send --
+/// `FormatTimestamp` drops sub-second precision downwards, so a test that wants
+/// "the same timestamp the server holds" has to mean the same truncation.
+/// Returns false on anything that is not that shape.
 inline bool ParseServerTimestamp(std::string_view text, sync::Timestamp* out) {
-  int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
-  if (text.size() < 19 ||
-      std::sscanf(std::string(text.substr(0, 19)).c_str(), "%4d-%2d-%2dT%2d:%2d:%2d", &year, &month,
-                  &day, &hour, &minute, &second) != 6) {
+  const std::optional<sync::Timestamp> parsed = sync::ParseTimestamp(text);
+  if (!parsed.has_value()) {
     return false;
   }
-  // Howard Hinnant's days_from_civil, the inverse of the civil_from_days in
-  // sync.cpp. Spelled out here for the same reason it is spelled out there: the
-  // C library's UTC conversion is not available in the same shape on both
-  // targets, and this file is read alongside that one.
-  const std::int64_t shifted_year = year - (month <= 2 ? 1 : 0);
-  const std::int64_t era = (shifted_year >= 0 ? shifted_year : shifted_year - 399) / 400;
-  const std::int64_t year_of_era = shifted_year - era * 400;
-  const std::int64_t day_of_year =
-      (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
-  const std::int64_t day_of_era =
-      year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-  const std::int64_t days = era * 146097 + day_of_era - 719468;
-  const std::int64_t seconds = days * 86400 + hour * 3600 + minute * 60 + second;
-  *out = sync::Timestamp{} + std::chrono::seconds{seconds};
+  *out = *parsed;
   return true;
 }
 

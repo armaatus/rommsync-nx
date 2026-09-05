@@ -295,8 +295,10 @@ struct Status {
   bool online = false;
 
   /// Whole Unix seconds, `0` for never. Seconds rather than RFC 3339 for the
-  /// reason `state.db` uses them: the engine can format that and has no parser
-  /// for it, and the overlay renders a relative time anyway.
+  /// reason `state.db` uses them: a number cannot be spelled two ways, where the
+  /// string can -- this client writes `Z` and RomM writes `+00:00`
+  /// (`sync::FormatTimestamp` and `sync::ParseTimestamp` handle both) -- and the
+  /// overlay renders a relative time anyway.
   std::int64_t last_sync_at = 0;
   SyncResult last_sync_result = SyncResult::kNever;
 

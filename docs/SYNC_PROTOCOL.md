@@ -163,16 +163,21 @@ Three traps in the operation itself:
   operation echoes that. Match the operation back to your local file on
   `(rom_id, slot)` and keep your own path; writing the server's name to the SD
   produces a file no emulator will load.
-- **`overwrite=true` decides whether a second upload is a second save, and this
-  page had it wrong.** Verified against the live 5.2.0 by `execute.occupied`:
-  posting into a slot that already holds a save **with** `overwrite=true`
-  replaces that row *in place* — same `id`, same stored `file_name` (the tag
-  from the first ingest is kept), new bytes, size and `updated_at`. **Without**
-  it the same post creates a *second* row with a fresh tag, when the device's
-  sync row is current enough not to be refused. So the flag is not only how a
-  planned upload avoids the 409: it is also what keeps a slot from accreting a
-  row per tick. `PUT /api/saves/{id}` moves a row forward too, and is what
-  `harness.conflict` uses to arrange "the server's copy changed" without
+- **`overwrite=true` clears the 409 and nothing else. It does not stop a slot
+  accreting a row per upload.** This page has now had this wrong twice, in both
+  directions, so here is the mechanism rather than the conclusion: RomM stamps a
+  slot upload with a **second-granularity** datetime tag and then looks the
+  existing row up *by that tagged name* (`_apply_datetime_tag` and
+  `get_save_by_filename`, `endpoints/saves.py` in 5.2.0). Two uploads therefore
+  land on the same row only when they share a base file name **and the same
+  wall-clock second**; one second later the name RomM computes matches nothing
+  and it writes a **second** row, flag or no flag. Verified directly against the
+  live 5.2.0, and `execute.occupied` pins the deterministic half.
+  The revision that said `overwrite=true` "replaces the row in place, tag and id
+  included" was reading a same-second run — which is what made that assertion
+  pass on a fast machine and fail in CI (issue #85).
+  `PUT /api/saves/{id}` is the call that really does move one row forward, and is
+  what `harness.conflict` uses to arrange "the server's copy changed" without
   touching this device's history at all.
 - **`save_id` is null for an `upload`** when the server has nothing yet, and set
   when it has an older copy. Don't dereference it unconditionally.
@@ -213,13 +218,14 @@ preflight `GET /api/saves/{id}`. Without one, a body that ends cleanly and early
 is indistinguishable from a complete one; that is exactly what the fault proxy's
 `truncate` mode produces, and `execute.truncate` is the scenario.
 
-**There is no retry inside a tick.** A failed operation is counted, left alone,
-and picked up by the next negotiation, which is what the failure rules at the
-end of this page already say; M2-7 owns the schedule between ticks. Note the
-reason is *not* that a re-posted upload would duplicate the save — with
-`overwrite=true` it replaces the row in place (above). It is that the plan
-describes a state the server has since moved on from, and the arbiter of that is
-a fresh negotiation rather than this client.
+**There is no retry inside a tick**, and there are now two reasons rather than
+one. A re-posted upload really does duplicate the save: a retry a second later
+gets a fresh datetime tag and therefore a new row (above), which is the reason an
+earlier revision gave, then withdrew, and which turns out to have been right. And
+the plan describes a state the server may have moved on from, so the arbiter of
+that is a fresh negotiation rather than this client. A failed operation is
+counted, left alone, and picked up by the next negotiation; M2-7 owns the
+schedule between ticks.
 
 **A save the client has no local file for** (`download` /
 `Save exists on server but not on client`) needs a destination the plan cannot
@@ -294,7 +300,53 @@ server_updated_at, server_content_hash}` to `state.db`. That stored baseline is
 how the *next* tick skips work — the server arbitrates, but the client still has
 to know which local files are worth re-hashing. The format, the reader and the
 writer are `core/include/rommsync/state_db.hpp`: a version line and one JSON
-object per `(rom_id, slot)`, written with `io::WriteAtomically`.
+object per `(rom_id, slot)`, written with `io::WriteAtomically` by
+`state::SaveBaseline`.
+
+**Persist first, report second.** Complete is accounting, not the commit point:
+the uploads and downloads already landed on the server, and RomM has already
+written the sync rows the next negotiation arbitrates against. A `complete` that
+fails must therefore not take the baseline with it — do that and the next tick
+re-uploads saves the server already has, and RomM stamps each one as a new row.
+`sync::FinishTick` performs the two in that order so it cannot be forgotten, and
+reports both halves; a failed completion is a failed *tick*, retried next
+schedule.
+
+Which operations move a row:
+
+| Outcome | Row |
+|---|---|
+| `kUploaded` | advances. The local file was not touched, so the facts the tick reported are still the facts on the card. `server_content_hash` becomes the digest that was just sent — the plan's described the copy the upload replaced. |
+| `kDownloaded`, `kKeptBoth` | advances, **from the card**. The bytes changed, so the mtime, the size and the digest are all re-read; a row built from the reported ones would claim a digest for bytes nothing hashed. |
+| `kNoOp` | advances. Nothing happened and nothing stopped being true. |
+| `kFailed`, `kNotUnderstood`, `kCanceled` | keeps its previous row, so the next tick retries the save. |
+
+A save whose hash failed is not moved forward — `SaveBaseline` refuses a row
+with an empty `content_hash` anyway. Whether the row it already had survives
+depends on whether the file did: an `upload` and a `no_op` leave the card alone,
+so the stored row still describes it and is kept; a `download` whose new bytes
+could not be read back replaced them, so the stored row describes bytes that are
+gone and is **erased**, and the save is hashed again next tick.
+
+A save with no operation at all is not advanced, and does not need to be: a save
+the client reports and is already in sync with is answered with an explicit
+`no_op` / `Content is identical`, not with an absence
+([API_CONTRACT.md](API_CONTRACT.md#save-sync--negotiate--execute--complete)).
+What negotiate leaves out of a plan is a save the client never mentioned.
+
+An advancing row starts from the row that is already there, so a field the plan
+did not restate does not silently erase what the last sync knew. Which side may
+erase differs by direction: an `upload` clears `server_updated_at` because the
+stored one describes the copy it just replaced, a `download` clears what the plan
+could not supply because the bytes on the card are newer than the stored value
+describes, and a `no_op` moved nothing and keeps everything it does not restate.
+
+`core/` has no single-file stat, so the re-read for a download goes through
+`fs::FileSystem::List` of the save's directory. Only the most recent listing is
+kept — a listing may hold up to `fs::kMaxDirectoryEntries` names on a heap of
+512 KiB, so a memo per directory is unbounded in the one dimension that is
+scarce, on the tick that already downloaded the most. Keeping the last one still
+collapses the case that matters, which is several saves in one folder.
 
 ## Change detection between ticks
 
@@ -329,7 +381,10 @@ Config: `sync.states = true`.
   next schedule. Missed ticks are harmless.
 - Partial plan failure → complete with the accurate `operations_failed`; leave
   unsynced files for next tick. Never leave a half-written save (write to temp,
-  fsync, rename).
+  fsync, rename). An `action` this build does not recognise is counted with
+  `operations_failed` and not with `operations_completed`: the server planned
+  work that did not happen, and calling it completed tells RomM the client did
+  something it cannot name.
 - One backup per overwrite, always, before writing.
 - Verify a downloaded save against the MD5 in `content_hash` /
   `server_content_hash`, and its length against `file_size_bytes`.

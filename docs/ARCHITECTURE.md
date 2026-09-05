@@ -102,8 +102,9 @@ scheduler fires
         conflict → the same, keep-both: RomM sends NO resolution, so the
                    server's copy lands and the local bytes stay in .backup/
         noop     → skip
+  → update state.db  (sync::FinishTick, and in this order: complete is
+                      accounting, so a failed one must not cost the baseline)
   → POST /api/sync/sessions/{session_id}/complete
-  → update state.db
 ```
 
 ## Data flow: a download

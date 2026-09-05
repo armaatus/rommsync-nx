@@ -566,6 +566,54 @@ foreach(scenario IN LISTS HARNESS_SCENARIOS)
   set_tests_properties(harness.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 endforeach()
 
+# --- step 3: completing the session and committing the baseline --------------
+# M2-6. `complete` is accounting rather than a commit point -- the transfers
+# already landed on the server -- so what these prove is that the counts are
+# honest and that the baseline survives a completion that does not.
+#
+# `counts`, `parse`, `stamps` and `advance` are deliberately NOT in the skippable
+# list: the accounting, the response read against the committed capture, the
+# timestamp reader a row's server half goes through, and the rules about which
+# operations may move a row all need no server, so they must stay checked with
+# docker stopped.
+add_executable(test_sync_complete test_sync_complete.cpp)
+target_link_libraries(test_sync_complete PRIVATE rommsync::host)
+target_include_directories(test_sync_complete PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_sync_complete PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+
+set(COMPLETE_UNIT_SCENARIOS
+  counts   # an ExecutionReport becomes two integers, not_understood included
+  parse    # the captured SyncCompleteResponse, and the bodies that are not one
+  stamps   # the RFC 3339 a baseline row's server_updated_at is read from
+  advance  # which outcomes move a baseline row, and which keep the previous one
+)
+foreach(scenario IN LISTS COMPLETE_UNIT_SCENARIOS)
+  add_test(NAME complete.${scenario} COMMAND test_sync_complete ${scenario})
+  set_tests_properties(complete.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
+set(COMPLETE_RIG_SCENARIOS
+  session    # negotiate -> execute -> complete, and the baseline afterwards
+  unchanged  # a second tick plans no work, and is planned 0 without being an error
+  reported   # a partly failed plan sends the real counts; the failed row stands
+  refused    # a 500 on complete loses the tick, never the baseline
+  truncated  # a clean short body is a named parse error, not a half-read session
+)
+foreach(scenario IN LISTS COMPLETE_RIG_SCENARIOS)
+  add_test(NAME complete.${scenario} COMMAND test_sync_complete ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(complete.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  # RUN_SERIAL for the reasons every rig test here has: one armed fault proxy for
+  # every client, and RomM keeps ONE active sync session per device -- two of
+  # these at once would cancel each other's sessions (#76).
+  set_tests_properties(complete.${scenario} PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+endforeach()
+
 # --- the committed API captures still match a live RomM ----------------------
 # server/contract/captures/ is what the docs quote and what M1/M2 will be coded
 # against. Re-running the probe here is what stops a RomM upgrade from being

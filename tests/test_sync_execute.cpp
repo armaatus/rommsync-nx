@@ -16,6 +16,7 @@
 // includes whatever other scenarios left behind. Executing those would act on
 // saves this test knows nothing about; `PlanFor` keeps a run to the slots it
 // created, the way `harness::OperationFor` does for the raw JSON.
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -958,6 +959,11 @@ void Corrupted(rig::Checks& checks, http::HttpClient& client, const std::string&
 // answers the same POST without the flag with a 409 -- refusing the very
 // operation it just planned. The scenario asserts both halves, because a test
 // that only shows the flag working cannot tell you the flag is doing anything.
+//
+// It also pins what the flag does *not* do. It does not stop a slot accreting a
+// row per upload: RomM matches the existing row by a second-granularity datetime
+// tag it computes at ingest, so only an upload inside the same second as the
+// previous one lands on the same row (issue #85, and docs/API_CONTRACT.md).
 
 void Occupied(rig::Checks& checks, http::HttpClient& client, const std::string& base,
               const Fixture& fixture, const harness::Rom& rom) {
@@ -1036,34 +1042,93 @@ void Occupied(rig::Checks& checks, http::HttpClient& client, const std::string& 
                 "no 409 for the operation the server itself planned: " + done.message);
 
   // What `overwrite=true` actually does to the occupant, measured rather than
-  // assumed -- and it is not what docs/SYNC_PROTOCOL.md said before this issue.
-  // It replaces the row **in place**: same id, and the stored name keeps the tag
-  // from the *first* ingest. Without the flag the same post makes a second row.
-  // So a slot does not accrete a row per tick, and the reason not to retry an
-  // upload inside a tick is not duplication (see the header of
-  // `sync_execute.hpp`).
+  // assumed -- and **this scenario asserted the wrong thing until it went red in
+  // CI**. It does not reliably replace the occupying row.
+  //
+  // RomM stamps a slot upload with a second-granularity datetime tag and then
+  // looks the existing row up *by that tagged name*
+  // (`_apply_datetime_tag` and `get_save_by_filename` in `endpoints/saves.py`,
+  // 5.2.0). So a POST replaces the row in place only when it lands in the same
+  // wall-clock second as the ingest that created it, with the same base file
+  // name; one second later the name it computes matches nothing and RomM writes
+  // a **second** row. That is a race, and it is the one this scenario used to
+  // win on a fast laptop and lose in CI (issue #85).
+  //
+  // So the identity assertion is made in the only direction that is
+  // deterministic: after a second has certainly passed, a new row appears and
+  // the occupant is left alone. The same-second case is real and is what made
+  // the old assertion pass; it is deliberately not asserted, because a test that
+  // has to win a race is a test that reports the machine's speed.
+  // Every row this scenario leaves on the fixture, removed on the way out
+  // however it exits. `save_id` is best-effort on an `OperationResult` -- it is
+  // parsed for the report and decides nothing -- so an upload can succeed and
+  // still name no row, and a scenario that only deleted the ids it managed to
+  // read would leak one into a shared library.
+  std::vector<std::int64_t> planted = {occupant.id};
+  const auto sweep = [&client, &base, &fixture, &planted]() {
+    std::sort(planted.begin(), planted.end());
+    planted.erase(std::unique(planted.begin(), planted.end()), planted.end());
+    for (const std::int64_t id : planted) {
+      harness::DeleteSave(client, base, fixture, id);
+    }
+  };
+
   if (!done.save_id.has_value()) {
     checks.Expect(false, "the upload reports the save row it wrote: " + done.message);
-    harness::DeleteSave(client, base, fixture, occupant.id);
+    sweep();
     return;
   }
-  checks.ExpectEq(*done.save_id, occupant.id,
-                  "overwrite=true moved the occupying row forward rather than adding one");
-  checks.Expect(DeviceIsSynced(client, base, fixture, *done.save_id),
-                "and the row now carries this device's sync history");
+  const std::int64_t uploaded_id = *done.save_id;
+  planted.push_back(uploaded_id);
 
-  harness::Save after;
+  // What the acceptance criterion is actually about, and what does hold however
+  // the tag falls: the plan executed as issued, the bytes that went up are this
+  // device's, and the row carries the sync history the next negotiation
+  // arbitrates against.
+  harness::Save written;
   checks.Expect(harness::ReadSave(client.Send(harness::Authed(
-                                     http::Method::kGet,
-                                     base + "/api/saves/" + std::to_string(occupant.id), fixture)),
-                                 &after),
-                "the occupying row is readable afterwards");
-  checks.ExpectEq(after.file_name, occupant.file_name,
-                  "with the ingest tag it was first stored under");
-  checks.ExpectEq(after.file_size_bytes, static_cast<std::int64_t>(bytes.size()),
-                  "and this device's bytes in it");
+                                      http::Method::kGet,
+                                      base + "/api/saves/" + std::to_string(uploaded_id), fixture)),
+                                  &written),
+                "the row the upload wrote is readable");
+  checks.ExpectEq(written.file_size_bytes, static_cast<std::int64_t>(bytes.size()),
+                  "and holds this device's bytes");
+  checks.Expect(DeviceIsSynced(client, base, fixture, uploaded_id),
+                "and carries this device's sync history");
 
-  harness::DeleteSave(client, base, fixture, occupant.id);
+  // Now the part that decides whether a slot accretes a row per tick. A second
+  // has to have passed for this to be a fact rather than a coin toss, which is
+  // exactly what `PassASecond` is for: it sleeps two seconds of the same wall
+  // clock RomM stamps its tag from, so the tag it computes cannot be the one it
+  // computed above.
+  harness::PassASecond();
+  const sync::ExecutionReport again = sync::ExecutePlan(
+      client, *files, TokenFor(base, fixture), plan, targets, OptionsAt(1'757'000'012));
+  checks.ExpectEq(again.completed, 1, "the same plan re-executed is still accepted");
+  if (again.operations.empty() || !again.operations[0].save_id.has_value()) {
+    checks.Expect(false, "the re-executed upload reports the row it wrote");
+    sweep();
+    return;
+  }
+  const std::int64_t second_id = *again.operations[0].save_id;
+  planted.push_back(second_id);
+  checks.Expect(second_id != uploaded_id,
+                "a re-posted upload a second later is a SECOND row, not the same one moved "
+                "forward -- overwrite=true does not prevent that (docs/API_CONTRACT.md)");
+
+  // ...and the row it did not land on is untouched, which is the half that makes
+  // this accretion rather than a move: the bytes of the earlier row are still
+  // the bytes that were put there.
+  harness::Save earlier;
+  checks.Expect(harness::ReadSave(client.Send(harness::Authed(
+                                      http::Method::kGet,
+                                      base + "/api/saves/" + std::to_string(uploaded_id), fixture)),
+                                  &earlier),
+                "the row the first upload wrote is still there");
+  checks.ExpectEq(earlier.file_size_bytes, static_cast<std::int64_t>(bytes.size()),
+                  "with its own bytes, untouched by the second");
+
+  sweep();
 }
 
 // --- dropped ------------------------------------------------------------------

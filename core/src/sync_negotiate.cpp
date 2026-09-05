@@ -165,6 +165,14 @@ json::Error ReadOperation(const json::Value& value, std::size_t index, SyncOpera
 ///
 /// Empty when the exchange produced a body worth parsing.
 std::optional<Negotiation> Refused(const http::Result& result) {
+  if (result.error == http::Error::kCanceled) {
+    // Kept apart from `kUnreachable`, which is what a caller would otherwise
+    // read it as and retry. A cancelled call is one nobody is waiting for.
+    return Refuse(NegotiateError::kCanceled,
+                  "the negotiation was stopped: " +
+                      (result.message.empty() ? std::string("the caller cancelled")
+                                              : result.message));
+  }
   if (!result.ok()) {
     return Refuse(NegotiateError::kUnreachable,
                   std::string("the negotiation did not complete: ") +
@@ -289,6 +297,8 @@ const char* ToString(NegotiateError error) {
       return "sync_disabled";
     case NegotiateError::kRejected:
       return "rejected";
+    case NegotiateError::kCanceled:
+      return "canceled";
     case NegotiateError::kUnreachable:
       return "unreachable";
     case NegotiateError::kServerError:
@@ -420,6 +430,15 @@ Negotiation Negotiate(http::HttpClient& client, const auth::StoredToken& token,
   request.headers.push_back({"Authorization", "Bearer " + token.access_token});
   request.body = encoded.body;
   request.timeout = options.timeout;
+  request.cancel = options.cancel;
+
+  if (options.cancel != nullptr && options.cancel->canceled()) {
+    // Before the first attempt as well as between them: a tick that was
+    // cancelled while it was still scanning must not spend a request finding
+    // that out.
+    return Refuse(NegotiateError::kCanceled,
+                  "the negotiation was not attempted: the caller cancelled first");
+  }
 
   const int attempts = options.max_attempts > 0 ? options.max_attempts : 1;
   // Clamped before the first use, not after the first doubling: a caller whose
@@ -450,6 +469,15 @@ Negotiation Negotiate(http::HttpClient& client, const auth::StoredToken& token,
     // another request. A 401 retried is a 401 retried forever, and a body the
     // server refused is a body it will refuse again.
     if (outcome.ok() || !ShouldRetry(outcome.error) || attempt >= attempts) {
+      return outcome;
+    }
+    if (options.cancel != nullptr && options.cancel->canceled()) {
+      // The backoff is time a shutdown does not have, and a retryable failure is
+      // still one to stop on once the caller has given up.
+      outcome = Refuse(NegotiateError::kCanceled,
+                       "the negotiation was not retried: the caller cancelled");
+      outcome.attempts = attempt;
+      outcome.waited = waited;
       return outcome;
     }
     if (options.wait != nullptr) {
