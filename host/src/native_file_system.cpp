@@ -149,6 +149,14 @@ class NativeFileSystem final : public fs::FileSystem {
     return listing;
   }
 
+  std::string Resolve(std::string_view sd_path) const override {
+    std::filesystem::path resolved;
+    if (!ResolveUnderRoot(root_, sd_path, &resolved)) {
+      return {};
+    }
+    return resolved.string();
+  }
+
  private:
   std::filesystem::path root_;
 };

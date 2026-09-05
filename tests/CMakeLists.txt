@@ -346,6 +346,7 @@ set(SCAN_UNIT_SCENARIOS
   walked_once  # RetroArch's flat saves/, listed under a dozen platforms
   unusable     # a record sync::Validate refuses costs one file, not the tick
   truncated    # a directory past kMaxDirectoryEntries keeps a set that does not move
+  hashing      # the digest is real, reused when nothing changed, null only when unreadable
 )
 foreach(scenario IN LISTS SCAN_UNIT_SCENARIOS)
   add_test(NAME scan.${scenario} COMMAND test_save_scan ${scenario})

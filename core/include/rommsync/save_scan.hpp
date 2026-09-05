@@ -17,13 +17,15 @@
 //     -- or worse, into a save the server accepts and arbitrates as something
 //     the client did not mean.
 //
-// Hashing is not here: M2-3 owns it, and `ToClientSaveState` takes the digest
-// rather than computing one. A null hash is a documented value -- "cannot
-// compare content", fall back to timestamps -- so the records below negotiate
-// correctly until M2-3 lands, and less precisely than they should: a save
-// reported without a digest is planned as an upload the server already has, on
-// every tick. Passing the digest is therefore the caller's job and not
-// optional in practice.
+// The digest is M2-3's arithmetic and this module's responsibility. Every save
+// is handed to `state::ContentHashFor`, which reuses the baseline's digest when
+// the file's mtime *and* size still match and reads the file otherwise -- so an
+// unchanged card costs no reads and a save is never reported without a hash it
+// could have had. Null is a documented value ("cannot compare content", fall
+// back to timestamps), but it is not a shortcut: a save reported without a
+// digest is planned as an upload the server already has, on this tick and every
+// tick after it. The only ones that carry a null here are the ones whose bytes
+// genuinely could not be read, and they are counted and named.
 #pragma once
 
 #include <cstddef>
@@ -37,6 +39,7 @@
 #include "rommsync/config.hpp"
 #include "rommsync/file_system.hpp"
 #include "rommsync/rom_index.hpp"
+#include "rommsync/state_db.hpp"
 #include "rommsync/sync.hpp"
 
 namespace rommsync::scan {
@@ -70,20 +73,23 @@ struct SaveFile {
   /// The rom's platform, for callers that lay files out by it.
   std::string platform_fs_slug;
 
+  /// The save's **MD5**, 32 lowercase hex digits, from `state::ContentHashFor`
+  /// -- computed or reused from the baseline, the caller cannot tell and does
+  /// not need to. Empty only when the file's bytes could not be read, which is
+  /// reported in `ScanResult::unhashed`.
+  std::string content_hash;
+
   std::int64_t size_bytes = 0;
 
   /// mtime, whole seconds since the Unix epoch, UTC.
   std::int64_t modified_unix = 0;
 
-  /// The negotiate entry for this file.
+  /// The negotiate entry for this file, carrying `content_hash` above.
   ///
-  /// `content_hash` is a parameter rather than a field because this module does
-  /// not hash (M2-3 does) and because leaving it null is not free: the server
-  /// reads a null digest as "cannot compare content", falls back to timestamps,
-  /// and plans an `upload` for a save it already has -- on this tick and every
-  /// tick after it. So the tick assembling the payload passes
-  /// `state::ContentHashFor`'s answer here, and the default exists for the
-  /// callers that genuinely have nothing to compare with yet.
+  /// The argument overrides it, for a caller that hashed the file itself or
+  /// re-read it after writing. Passing an empty string is the same as passing
+  /// nothing: "" and `null` are different values to the server and only one of
+  /// them is a value, which is why `sync::Validate` refuses the former.
   sync::ClientSaveState ToClientSaveState(
       std::optional<std::string> content_hash = std::nullopt) const;
 };
@@ -136,6 +142,18 @@ struct ScanResult {
   /// Files seen in the mapped directories, matched or not.
   std::size_t files_seen = 0;
 
+  /// Saves reported with no digest because their bytes could not be read, in
+  /// scan order and bounded like `skipped`.
+  ///
+  /// Not skips: they are still negotiated, on timestamps, which is the right
+  /// call for a save the card would not open this once. But it is the state
+  /// where the server plans an upload for bytes it may already have, so it is
+  /// counted and named rather than silently normal.
+  std::vector<Skip> unhashed;
+
+  /// Every unhashed save, including the ones not spelled out above.
+  std::size_t unhashed_total = 0;
+
   /// One line per reported skip, plus a final line when there were more. Empty
   /// when the scan skipped nothing.
   std::string DescribeSkipped() const;
@@ -149,8 +167,12 @@ struct ScanResult {
 /// entries are sorted by name, so two runs over an unchanged card produce the
 /// same list -- which is what makes the duplicate-slot rule below deterministic
 /// rather than a race with `readdir`.
+/// `baseline` is `state.db` as the last tick left it, and it is required rather
+/// than defaulted: an empty one is a perfectly good baseline that hashes
+/// everything, and a caller that *forgot* the argument would otherwise get a
+/// scan that quietly reported no digests at all.
 ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
-                     fs::FileSystem& files);
+                     fs::FileSystem& files, const state::Baseline& baseline);
 
 // --- the pieces, exposed because they are the parts worth testing directly ----
 

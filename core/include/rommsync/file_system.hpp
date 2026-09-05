@@ -107,6 +107,21 @@ class FileSystem {
   /// output changes when a file is deleted somewhere else.
   virtual Listing List(std::string_view sd_path) = 0;
 
+  /// The platform path `sd_path` names -- `sdmc:/retroarch/saves/Game.srm` on
+  /// Horizon, a path under the card's root on the host.
+  ///
+  /// It exists because the engine's *file* operations take a real path and only
+  /// the backend knows the prefix: `io::ReadFile` and `state::HashFile` open
+  /// with `<cstdio>`, which is portable, while the mapping in front of them is
+  /// not. Without this the scanner could name a save it had no way to let
+  /// anything else open -- which is the same save reported with no digest, and
+  /// therefore uploaded on every tick.
+  ///
+  /// Empty when `sd_path` is not a path on this card. That is a refusal, not a
+  /// failure to find: a caller must not fall back to the SD path, because on
+  /// the host it would resolve against the process's working directory.
+  virtual std::string Resolve(std::string_view sd_path) const = 0;
+
  protected:
   FileSystem() = default;
 };

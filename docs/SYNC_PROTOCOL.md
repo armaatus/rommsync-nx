@@ -32,6 +32,18 @@ For each file under the configured save/state dirs:
    mtime of 0 from a console with an unset clock, a name the server would read
    as a path — is skipped with a reason, because `EncodeNegotiateRequest` stops
    at the first bad entry and would otherwise cost the tick every other save.
+7. Fill `content_hash` from `state::ContentHashFor` — the baseline's digest when
+   the file's mtime **and** size still match, a fresh read otherwise. **Never
+   leave it null to save a read**: a save reported without a digest is compared
+   on timestamps and planned as an `upload` the server already has, on this tick
+   and every tick after it. The one legitimate null is a file whose bytes could
+   not be read at all, which is still reported — less precisely — and counted.
+
+The scanner names files by their SD-root path (`/retroarch/saves/Game.srm`).
+Opening one needs the platform prefix, so it is `fs::FileSystem::Resolve` that
+turns it into something `io::ReadFile` and `state::HashFile` can open —
+`sdmc:…` on Horizon, a path under the card's root on the host. Nothing above
+that interface learns which.
 
 Cache the rom index (`GET /api/roms`) per tick; it's also needed by downloads.
 **It answers an envelope, `{items, total, limit, offset}`, not a bare array, so

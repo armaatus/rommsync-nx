@@ -19,6 +19,8 @@
 //   walked_once  -- RetroArch's flat saves/, listed under a dozen platforms
 //   unusable     -- a file sync::Validate would refuse costs one file, not the tick
 //   truncated    -- a directory past the bound keeps a set that does not move
+//   hashing      -- the digest is real, reused when the file is unchanged, and
+//                   null only when the bytes could not be read
 //   library      -- a Sandbox scanned against the docker library, end to end
 //   paging       -- limit=1 over a six-rom library still finds the last page
 #include <algorithm>
@@ -37,6 +39,7 @@
 #include "rommsync/host/native_file_system.hpp"
 #include "rommsync/rom_index.hpp"
 #include "rommsync/save_scan.hpp"
+#include "rommsync/state_db.hpp"
 #include "rommsync/sync.hpp"
 
 namespace {
@@ -46,6 +49,7 @@ namespace fs = rommsync::fs;
 namespace http = rommsync::http;
 namespace roms = rommsync::roms;
 namespace scan = rommsync::scan;
+namespace state = rommsync::state;
 namespace sync = rommsync::sync;
 
 using harness::Fixture;
@@ -65,11 +69,52 @@ constexpr std::int64_t kMtime = 1704067200;
 /// would still produce the right records -- just a dozen copies of each.
 class FakeFileSystem final : public fs::FileSystem {
  public:
+  /// The listings are made up; the *files* are real, under a temp root, because
+  /// the scan hashes what it reports and a fake that cannot be opened would
+  /// exercise only the failure path.
+  explicit FakeFileSystem(std::string_view label) {
+    static int serial = 0;
+    root_ = std::filesystem::path(rig::ScratchDir()) / "fake-fs" /
+            (std::string(label) + "-" + std::to_string(serial++));
+    std::error_code error;
+    std::filesystem::remove_all(root_, error);
+    std::filesystem::create_directories(root_, error);
+  }
+
+  ~FakeFileSystem() override {
+    std::error_code error;
+    std::filesystem::remove_all(root_, error);
+  }
+
+  FakeFileSystem(const FakeFileSystem&) = delete;
+  FakeFileSystem& operator=(const FakeFileSystem&) = delete;
+
   void AddFile(const std::string& directory, const std::string& name, std::int64_t size,
                std::int64_t modified) {
     fs::Entry entry;
     entry.name = name;
     entry.size_bytes = size;
+    entry.modified_unix = modified;
+    listings_[directory].entries.push_back(std::move(entry));
+
+    // Bytes that differ per name, so two saves never share a digest by accident.
+    std::string bytes(static_cast<std::size_t>(size < 0 ? 0 : size), '\0');
+    for (std::size_t index = 0; index < bytes.size(); ++index) {
+      bytes[index] = static_cast<char>('a' + ((index + name.size()) % 26));
+    }
+    const std::string path = Resolve(directory + "/" + name);
+    std::error_code error;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), error);
+    rig::WriteFile(path, bytes);
+  }
+
+  /// A file the listing advertises and the card will not open, which is what
+  /// makes a save reportable but unhashable.
+  void AddUnreadableFile(const std::string& directory, const std::string& name,
+                         std::int64_t modified) {
+    fs::Entry entry;
+    entry.name = name;
+    entry.size_bytes = 16;
     entry.modified_unix = modified;
     listings_[directory].entries.push_back(std::move(entry));
   }
@@ -94,15 +139,28 @@ class FakeFileSystem final : public fs::FileSystem {
     return found->second;
   }
 
+  std::string Resolve(std::string_view sd_path) const override {
+    std::string relative(sd_path);
+    while (!relative.empty() && relative.front() == '/') {
+      relative.erase(relative.begin());
+    }
+    return (root_ / relative).string();
+  }
+
   int CallsFor(const std::string& directory) const {
     const auto found = calls_.find(directory);
     return found == calls_.end() ? 0 : found->second;
   }
 
  private:
+  std::filesystem::path root_;
   std::map<std::string, fs::Listing> listings_;
   std::map<std::string, int> calls_;
 };
+
+/// A baseline with nothing in it -- a first boot, where every save is read and
+/// hashed. Scenarios that care about the *reuse* build their own.
+const state::Baseline kFirstTick;
 
 roms::Rom MakeRom(std::int64_t id, std::string name, std::string platform) {
   roms::Rom rom;
@@ -191,7 +249,7 @@ void Ambiguous(::checks::Checks& checks) {
   index.Add(MakeRom(3, "Solstice", "nes"));
 
   config::Config config = config::Defaults();
-  FakeFileSystem files;
+  FakeFileSystem files("files");
   files.AddFile("/retroarch/saves", "Rampart.srm", 32768, kMtime);
   files.AddFile("/retroarch/saves", "Solstice.srm", 8192, kMtime);
   // The same name again, this time under a folder mapped to exactly one
@@ -199,7 +257,7 @@ void Ambiguous(::checks::Checks& checks) {
   // difference, which is the point.
   files.AddFile("/tico/saves/snes", "Rampart.srm", 32768, kMtime);
 
-  const scan::ScanResult result = scan::ScanSaves(config, index, files);
+  const scan::ScanResult result = scan::ScanSaves(config, index, files, kFirstTick);
 
   checks.ExpectEq(result.files_seen, static_cast<std::size_t>(3), "three files were looked at");
   checks.Expect(SkippedFor(result, "/retroarch/saves/Rampart.srm", scan::SkipReason::kAmbiguous),
@@ -247,11 +305,11 @@ void WalkedOnce(::checks::Checks& checks) {
   }
   checks.Expect(listed_under > 1, "the fixture for this scenario: many platforms, one folder");
 
-  FakeFileSystem files;
+  FakeFileSystem files("files");
   files.AddFile("/retroarch/saves", "gb240p.srm", 512, kMtime);
   files.AddDirectory("/retroarch/saves", "RetroArch-Core-Options");
 
-  const scan::ScanResult result = scan::ScanSaves(config, index, files);
+  const scan::ScanResult result = scan::ScanSaves(config, index, files, kFirstTick);
 
   checks.ExpectEq(files.CallsFor("/retroarch/saves"), 1,
                   "a folder listed under a dozen platforms is read once");
@@ -268,7 +326,7 @@ void Unusable(::checks::Checks& checks) {
   index.Add(MakeRom(2, "nova", "nes"));
 
   const config::Config config = config::Defaults();
-  FakeFileSystem files;
+  FakeFileSystem files("files");
   // An mtime of 0 is what a console with an unset clock reports. The server
   // would read it as "very old" and answer with a download over a save that may
   // be the only copy, so `sync::Validate` refuses it -- and this scenario is
@@ -277,7 +335,7 @@ void Unusable(::checks::Checks& checks) {
   files.AddFile("/retroarch/saves", "gb240p.srm", 512, 0);
   files.AddFile("/retroarch/saves", "nova.srm", 512, kMtime);
 
-  const scan::ScanResult result = scan::ScanSaves(config, index, files);
+  const scan::ScanResult result = scan::ScanSaves(config, index, files, kFirstTick);
 
   checks.Expect(SkippedFor(result, "/retroarch/saves/gb240p.srm", scan::SkipReason::kUnusable),
                 "a save with an unset mtime is skipped with a reason");
@@ -304,9 +362,9 @@ void Unusable(::checks::Checks& checks) {
       -1LL,
   };
   for (const std::int64_t mtime : kExtremes) {
-    FakeFileSystem extreme;
+    FakeFileSystem extreme("extreme");
     extreme.AddFile("/retroarch/saves", "nova.srm", 512, mtime);
-    const scan::ScanResult scanned = scan::ScanSaves(config, index, extreme);
+    const scan::ScanResult scanned = scan::ScanSaves(config, index, extreme, kFirstTick);
     if (scanned.saves.empty()) {
       checks.Expect(SkippedFor(scanned, "/retroarch/saves/nova.srm", scan::SkipReason::kUnusable),
                     "an mtime of " + std::to_string(mtime) + " is skipped as unusable");
@@ -334,29 +392,34 @@ void Unusable(::checks::Checks& checks) {
   }
   const sync::Encoded encoded = sync::EncodeNegotiateRequest(payload);
   checks.Expect(encoded.ok(), "what the scan did emit encodes: " + encoded.error.Describe());
-  checks.Expect(!payload.saves.front().content_hash.has_value(),
-                "a record built with no digest sends null, which the server reads as "
-                "'cannot compare content'");
+  checks.Expect(payload.saves.front().content_hash.has_value(),
+                "the save the scan did emit carries a digest, not the timestamps-only null "
+                "that has the server plan an upload for bytes it already has");
 
-  // M2-3's digest goes in through the same call, because a save reported without
-  // one is planned as an upload the server already has, on every tick.
+  // An explicit digest still wins, for a caller that re-read the file itself.
   const std::string digest(sync::kContentHashDigits, 'a');
   const sync::ClientSaveState hashed = result.saves.front().ToClientSaveState(digest);
   checks.Expect(hashed.content_hash.has_value() && *hashed.content_hash == digest,
-                "a digest handed to ToClientSaveState reaches the payload");
+                "a digest handed to ToClientSaveState overrides the scanned one");
   checks.Expect(sync::Validate(hashed).ok(), "and the record is still one the encoder accepts");
-  // Not "" -- an empty string and a null are different values to the server.
-  checks.Expect(!result.saves.front().ToClientSaveState(std::string()).content_hash.has_value(),
+
+  // "" and null are different values to the server and only one is a value.
+  scan::SaveFile bare;
+  bare.rom_id = 1;
+  bare.file_name = "nova.srm";
+  bare.slot = "retroarch-srm";
+  bare.modified_unix = kMtime;
+  checks.Expect(!bare.ToClientSaveState(std::string()).content_hash.has_value(),
                 "an empty digest is null, not a blank value the server would store");
 
   // Two files for one rom in one folder land on the same `(rom_id, slot)`, which
   // the server pairs on -- so they would overwrite each other through RomM on
   // alternating ticks. The first in scan order keeps it.
-  FakeFileSystem duplicates;
+  FakeFileSystem duplicates("duplicates");
   duplicates.AddFile("/retroarch/saves", "nova.srm", 512, kMtime);
   duplicates.AddFile("/tico/saves/nes", "nova.srm", 512, kMtime);
   duplicates.AddFile("/tico/saves/nes", "nova.sav", 512, kMtime);
-  const scan::ScanResult mixed = scan::ScanSaves(config, index, duplicates);
+  const scan::ScanResult mixed = scan::ScanSaves(config, index, duplicates, kFirstTick);
   checks.ExpectEq(mixed.saves.size(), static_cast<std::size_t>(3),
                   "the same rom under two emulators, and two extensions, are three slots");
 
@@ -365,14 +428,90 @@ void Unusable(::checks::Checks& checks) {
   // (`S` sorts before `s`) and keeps the slot; which one wins matters less than
   // that the same one wins on every tick.
   duplicates.AddFile("/retroarch/saves", "nova.SRM", 512, kMtime);
-  const scan::ScanResult clashing = scan::ScanSaves(config, index, duplicates);
+  const scan::ScanResult clashing = scan::ScanSaves(config, index, duplicates, kFirstTick);
   checks.Expect(SkippedFor(clashing, "/retroarch/saves/nova.srm", scan::SkipReason::kDuplicateSlot),
                 "a second file claiming a taken (rom_id, slot) is reported, not synced");
   checks.ExpectEq(clashing.saves.size(), mixed.saves.size(),
                   "and the clash costs exactly the one file");
-  const scan::ScanResult replayed = scan::ScanSaves(config, index, duplicates);
+  const scan::ScanResult replayed = scan::ScanSaves(config, index, duplicates, kFirstTick);
   checks.Expect(SkippedFor(replayed, "/retroarch/saves/nova.srm", scan::SkipReason::kDuplicateSlot),
                 "the same file loses the slot on the next tick, not the other one");
+}
+
+// --- hashing ------------------------------------------------------------------
+
+void Hashing(::checks::Checks& checks) {
+  roms::RomIndex index;
+  index.Add(MakeRom(1, "gb240p", "gb"));
+  index.Add(MakeRom(2, "nova", "nes"));
+
+  const config::Config config = config::Defaults();
+  FakeFileSystem files("hashing");
+  files.AddFile("/retroarch/saves", "gb240p.srm", 512, kMtime);
+  files.AddFile("/retroarch/saves", "nova.srm", 1024, kMtime);
+
+  const scan::ScanResult first = scan::ScanSaves(config, index, files, kFirstTick);
+  checks.ExpectEq(first.saves.size(), static_cast<std::size_t>(2), "both saves are reported");
+  checks.ExpectEq(first.unhashed_total, static_cast<std::size_t>(0), "and both are hashed");
+  for (const scan::SaveFile& save : first.saves) {
+    checks.ExpectEq(save.content_hash, state::HashFile(files.Resolve(save.sd_path)).content_hash,
+                    "the digest is the MD5 of the file's bytes");
+  }
+  // Two files, two digests. A fake that gave every file the same bytes would
+  // pass every other check here and prove nothing.
+  checks.Expect(first.saves.front().content_hash != first.saves.back().content_hash,
+                "and two different saves do not share one");
+
+  // The baseline's job: an unchanged file is not re-read. Proved by storing a
+  // digest that is *not* the file's -- if the scan read the file, it would
+  // disagree.
+  const std::string stored(sync::kContentHashDigits, 'b');
+  state::Baseline baseline;
+  for (const scan::SaveFile& save : first.saves) {
+    state::SaveRecord row;
+    row.rom_id = save.rom_id;
+    row.slot = save.slot;
+    row.content_hash = stored;
+    row.mtime = save.ToClientSaveState().updated_at;
+    row.file_size_bytes = save.size_bytes;
+    baseline.Set(std::move(row));
+  }
+  const scan::ScanResult reused = scan::ScanSaves(config, index, files, baseline);
+  for (const scan::SaveFile& save : reused.saves) {
+    checks.ExpectEq(save.content_hash, stored,
+                    "an unchanged save reuses the baseline's digest rather than re-reading");
+  }
+
+  // ...and a file whose size moved is read again, because either half of
+  // (mtime, size) alone misses a real edit.
+  FakeFileSystem edited("hashing-edited");
+  edited.AddFile("/retroarch/saves", "gb240p.srm", 513, kMtime);
+  const scan::ScanResult rehashed = scan::ScanSaves(config, index, edited, baseline);
+  checks.ExpectEq(rehashed.saves.size(), static_cast<std::size_t>(1), "the edited save is reported");
+  if (!rehashed.saves.empty()) {
+    checks.Expect(rehashed.saves.front().content_hash != stored,
+                  "and a save whose size changed is hashed again");
+  }
+
+  // A file the listing advertises and the card will not open is still reported
+  // -- on timestamps, less precisely -- and counted, because that is the state
+  // where the server plans an upload for bytes it may already have.
+  FakeFileSystem gone("hashing-gone");
+  gone.AddUnreadableFile("/retroarch/saves", "nova.srm", kMtime);
+  const scan::ScanResult unreadable = scan::ScanSaves(config, index, gone, kFirstTick);
+  checks.ExpectEq(unreadable.saves.size(), static_cast<std::size_t>(1),
+                  "an unhashable save is still a save");
+  checks.ExpectEq(unreadable.skipped_total, static_cast<std::size_t>(0), "and not a skip");
+  checks.ExpectEq(unreadable.unhashed_total, static_cast<std::size_t>(1), "but it is counted");
+  if (!unreadable.saves.empty()) {
+    checks.Expect(unreadable.saves.front().content_hash.empty(),
+                  "with no digest rather than an invented one");
+    checks.Expect(sync::Validate(unreadable.saves.front().ToClientSaveState()).ok(),
+                  "and it still encodes -- a null hash is a documented value");
+  }
+  checks.Expect(!unreadable.unhashed.empty() &&
+                    unreadable.unhashed.front().sd_path == "/retroarch/saves/nova.srm",
+                "and the file is named");
 }
 
 // --- truncated ----------------------------------------------------------------
@@ -456,7 +595,7 @@ void Library(::checks::Checks& checks, http::HttpClient& client, const std::stri
   const std::unique_ptr<fs::FileSystem> files =
       rommsync::host::MakeNativeFileSystem(sandbox.root().string());
   const config::Config config = config::Defaults();
-  const scan::ScanResult result = scan::ScanSaves(config, fetched.index, *files);
+  const scan::ScanResult result = scan::ScanSaves(config, fetched.index, *files, kFirstTick);
 
   checks.ExpectEq(result.files_seen, static_cast<std::size_t>(5), "every file was looked at");
   checks.ExpectEq(result.saves.size(), static_cast<std::size_t>(4),
@@ -515,13 +654,22 @@ void Library(::checks::Checks& checks, http::HttpClient& client, const std::stri
   }
   const sync::Encoded encoded = sync::EncodeNegotiateRequest(payload);
   checks.Expect(encoded.ok(), "every emitted record encodes: " + encoded.error.Describe());
-  checks.Expect(encoded.body.find("\"content_hash\":null") != std::string::npos ||
-                    encoded.body.find("content_hash") == std::string::npos,
-                "the hash is left null for M2-3 rather than invented here");
+  for (const scan::SaveFile& save : result.saves) {
+    // The digest is M2-3's arithmetic, checked against M2-3's own function on
+    // the same bytes rather than against a constant this test made up.
+    const state::HashOutcome expected = state::HashFile(sandbox.Host(save.sd_path));
+    checks.Expect(expected.ok(), "the sandbox file is readable: " + expected.message);
+    checks.ExpectEq(save.content_hash, expected.content_hash,
+                    "the record carries the MD5 of the bytes on the card");
+    checks.ExpectEq(save.content_hash.size(), sync::kContentHashDigits,
+                    "which is 32 hex digits, not a SHA1");
+  }
+  checks.ExpectEq(result.unhashed_total, static_cast<std::size_t>(0),
+                  "and nothing was reported without one");
 
   // A second scan of an unchanged card must produce the same slots, or the
   // server sees a new save every tick.
-  const scan::ScanResult again = scan::ScanSaves(config, fetched.index, *files);
+  const scan::ScanResult again = scan::ScanSaves(config, fetched.index, *files, kFirstTick);
   checks.ExpectEq(again.saves.size(), result.saves.size(), "a rescan sees the same saves");
   for (const scan::SaveFile& save : again.saves) {
     const scan::SaveFile* first = FindSave(result, save.file_name);
@@ -607,7 +755,7 @@ int main(int argc, char** argv) {
   rig::Checks checks;
 
   if (scenario == "names" || scenario == "ambiguous" || scenario == "walked_once" ||
-      scenario == "unusable" || scenario == "truncated") {
+      scenario == "unusable" || scenario == "truncated" || scenario == "hashing") {
     if (scenario == "names") {
       Names(checks);
     } else if (scenario == "ambiguous") {
@@ -616,6 +764,8 @@ int main(int argc, char** argv) {
       WalkedOnce(checks);
     } else if (scenario == "truncated") {
       Truncated(checks);
+    } else if (scenario == "hashing") {
+      Hashing(checks);
     } else {
       Unusable(checks);
     }

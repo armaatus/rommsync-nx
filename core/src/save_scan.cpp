@@ -218,6 +218,8 @@ sync::ClientSaveState SaveFile::ToClientSaveState(std::optional<std::string> con
   // former outright.
   if (content_hash.has_value() && !content_hash->empty()) {
     state.content_hash = std::move(content_hash);
+  } else if (!this->content_hash.empty()) {
+    state.content_hash = this->content_hash;
   }
   // Fails closed: an mtime outside the window above becomes the epoch, which
   // `sync::Validate` refuses as "an unset clock rather than an mtime". The
@@ -233,7 +235,7 @@ sync::ClientSaveState SaveFile::ToClientSaveState(std::optional<std::string> con
 }
 
 ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
-                     fs::FileSystem& files) {
+                     fs::FileSystem& files, const state::Baseline& baseline) {
   ScanResult result;
   const std::map<std::string, std::string, std::less<>> hints = PlatformHints(config);
 
@@ -343,6 +345,38 @@ ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
         continue;
       }
       claimed.push_back(pair);
+
+      // Hashed last, after the record is known to be one that will be reported:
+      // `ContentHashFor` reads the file when the baseline cannot answer, and
+      // reading a save that is about to be skipped is the one cost of this walk
+      // that is measured in card I/O rather than in string compares.
+      //
+      // The path is resolved by the backend, not built here. `sd_path` is
+      // SD-root absolute and means nothing to `fopen` on either platform.
+      const std::string real_path = files.Resolve(save.sd_path);
+      const state::HashOutcome hashed =
+          real_path.empty()
+              ? state::HashOutcome{{}, state::HashError::kUnreadable, false,
+                                   save.sd_path + ": not a path on this card"}
+              : state::ContentHashFor(baseline, save.rom_id, save.ToClientSaveState().slot,
+                                      real_path, save.ToClientSaveState().updated_at,
+                                      save.size_bytes);
+      if (hashed.ok()) {
+        save.content_hash = hashed.content_hash;
+      } else {
+        // Reported without a digest rather than dropped. A save the card would
+        // not open this once is still the user's save, and the server compares
+        // it on timestamps -- less precisely, and it will plan an upload for
+        // bytes it may already have, which is why this is counted.
+        ++result.unhashed_total;
+        if (result.unhashed.size() < kMaxSkipsReported) {
+          result.unhashed.push_back(MakeSkip(SkipReason::kUnusable, save.sd_path,
+                                             hashed.message.empty()
+                                                 ? std::string(state::ToString(hashed.error))
+                                                 : hashed.message));
+        }
+      }
+
       result.saves.push_back(std::move(save));
     }
   }
