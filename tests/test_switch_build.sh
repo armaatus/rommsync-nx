@@ -94,6 +94,13 @@ phase_builds() {
 
   # A copy, not the worktree: the container builds as root, and three worktrees
   # may be running this at once.
+  # The overlay does not build without libultrahand, and an un-initialised
+  # submodule is an empty directory rather than a missing one -- so this is
+  # checked here, where it reads as "your checkout is incomplete", rather than
+  # left to surface as a failed cross-compile.
+  [ -f "$REPO_ROOT/overlay/lib/libultrahand/ultrahand.mk" ] ||
+    skip "overlay/lib/libultrahand is empty (git submodule update --init --recursive)"
+
   SCRATCH="$(mktemp -d)"
   cp "$REPO_ROOT/VERSION" "$REPO_ROOT/switch.mk" "$SCRATCH/"
   cp -R "$REPO_ROOT/core" "$REPO_ROOT/sysmodule" "$REPO_ROOT/overlay" "$SCRATCH/"
@@ -146,6 +153,30 @@ phase_builds() {
   grep -q 'rommsync::version()' "$SCRATCH/sysmodule/build/sys-rommsync.lst" ||
     fail "no core/ symbol in the linked sysmodule"
 
+  # The sysmodule hosts the service the overlay opens (M4-1). Nothing in this
+  # repo can run it before the M8-1 gate, so this is the only automated check
+  # that the loop is still in the image at all.
+  grep -q 'rommsync::sysmodule::ServiceServer::Serve' "$SCRATCH/sysmodule/build/sys-rommsync.lst" ||
+    fail "the sysmodule does not host the IPC service"
+  # The name it registers has to be in the NPDM's service_host or the kernel
+  # refuses the registration at boot, and the failure is a process that is not
+  # there rather than an error anyone sees.
+  grep -q '"rommsync"' "$REPO_ROOT/sysmodule/sys-rommsync.json" ||
+    fail "sys-rommsync.json does not declare the rommsync service host"
+
+  # libultrahand is linked, not merely present: the overlay draws with it, and a
+  # build that quietly stopped compiling it would still produce a signed .ovl
+  # that shows an empty panel. Checked on the linked ELF's own symbol dump.
+  local ovl_lst="$SCRATCH/overlay/build/ovl-rommsync.lst"
+  [ -s "$ovl_lst" ] || fail "no symbol listing at $ovl_lst; the checks below would pass vacuously"
+  grep -q 'tsl::gfx::Renderer::drawString' "$ovl_lst" ||
+    fail "libultrahand is not linked into the overlay"
+  # ...and so is the half of the status screen that lives in core/ and is what
+  # `ctest -R overlay.status` actually tests. A screen drawing something else
+  # would make that suite a test of nothing shipped.
+  grep -q 'rommsync::overlay::Render' "$ovl_lst" ||
+    fail "the status screen's view model is not linked into the overlay"
+
   # The overlay's NACP is where a user sees a version, and switch_rules will
   # happily bake devkitPro's 1.0.0 default in if nothing sets APP_VERSION.
   LC_ALL=C grep -aq "$version" "$SCRATCH/overlay/ovl-rommsync.nacp" ||
@@ -163,7 +194,7 @@ phase_builds() {
     { cat "$log" >&2; fail "the duplicate basename went unreported"; }
   rm -f "$SCRATCH/sysmodule/source/json.cpp"
 
-  echo "ok: .nsp and .ovl built, signed and carrying core/ $version"
+  echo "ok: .nsp and .ovl built, signed, hosting and drawing, carrying core/ $version"
 }
 
 

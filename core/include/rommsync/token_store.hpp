@@ -32,6 +32,14 @@
 
 namespace rommsync::auth {
 
+/// The file the credentials live in, relative to `sdmc:/config/rommsync/`.
+///
+/// Named for the same reason `config::kConfigFileName` and
+/// `kDeviceIdentityFileName` are: the directory is the platform's to know (hard
+/// rule 4), the file name is this header's, and a caller that spells it out is
+/// a second copy of it.
+inline constexpr const char* kTokenFileName = "token.dat";
+
 /// The record `token.dat` holds, one JSON object.
 ///
 /// `server_url` is in here because a token is only meaningful against the RomM

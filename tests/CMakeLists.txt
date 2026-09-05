@@ -196,6 +196,17 @@ endif()
 # client, and RomM's ten-inits-a-minute limit is per IP, which is the whole suite.
 set_tests_properties(ipc.engine PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 
+# --- the overlay's status screen ---------------------------------------------
+# M4-1. Everything about the screen that is a decision rather than a draw call --
+# which sentence a never-paired console gets, what a download with no declared
+# length shows instead of a percentage, what goes where a timestamp would go on a
+# console that has never synced. The drawing itself waits for M8-2 (#44); none of
+# this does, and none of it needs a console.
+add_executable(test_overlay_status test_overlay_status.cpp)
+target_link_libraries(test_overlay_status PRIVATE rommsync::core)
+target_include_directories(test_overlay_status PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+add_test(NAME overlay.status COMMAND test_overlay_status)
+
 # --- rig smoke test: proves docker RomM + fault proxy + ctest all work -------
 # Uses libcurl directly on purpose. It tests the RIG, not our code, and must
 # keep working while M0-2 replaces it as the way production code speaks HTTP.

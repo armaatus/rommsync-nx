@@ -168,6 +168,7 @@ ipc::Status LoadedStatus() {
   status.online = true;
   status.last_sync_at = 1757000000;
   status.last_sync_result = ipc::SyncResult::kPartial;
+  status.sync_in_progress = true;
   status.uploaded = 3;
   status.downloaded = 5;
   status.conflicts = 1;
@@ -394,6 +395,8 @@ int RoundTrip() {
     checks.ExpectEq(back.value.last_sync_at, sent.last_sync_at, "last_sync_at survives");
     checks.ExpectEq(std::string(ipc::ToString(back.value.last_sync_result)),
                     std::string(ipc::ToString(sent.last_sync_result)), "the result survives");
+    checks.ExpectEq(back.value.sync_in_progress, sent.sync_in_progress,
+                    "sync_in_progress survives");
     checks.ExpectEq(back.value.uploaded, sent.uploaded, "uploaded survives");
     checks.ExpectEq(back.value.downloaded, sent.downloaded, "downloaded survives");
     checks.ExpectEq(back.value.conflicts, sent.conflicts, "conflicts survive");

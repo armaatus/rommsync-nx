@@ -551,6 +551,8 @@ const char* ToString(Error error) {
       return "too_large";
     case Error::kInternal:
       return "internal";
+    case Error::kUnavailable:
+      return "unavailable";
   }
   return "internal";
 }
@@ -716,6 +718,7 @@ std::string EncodeStatus(const Status& status) {
   AppendBool(&out, "online", status.online);
   AppendInteger(&out, "last_sync_at", status.last_sync_at);
   AppendText(&out, "last_sync_result", ToString(status.last_sync_result));
+  AppendBool(&out, "sync_in_progress", status.sync_in_progress);
   AppendInteger(&out, "uploaded", status.uploaded);
   AppendInteger(&out, "downloaded", status.downloaded);
   AppendInteger(&out, "conflicts", status.conflicts);
@@ -746,6 +749,7 @@ Decoded<Status> DecodeStatus(std::string_view text) {
                      sync::kMaxTimestampSeconds, error) ||
         !ReadEnum(object, "last_sync_result", kAllSyncResults, ToString, "a sync result",
                   &out->last_sync_result, error) ||
+        !ReadBool(object, "sync_in_progress", &out->sync_in_progress, error) ||
         !ReadInteger(object, "uploaded", &out->uploaded, 0, kMaxCount, error) ||
         !ReadInteger(object, "downloaded", &out->downloaded, 0, kMaxCount, error) ||
         !ReadInteger(object, "conflicts", &out->conflicts, 0, kMaxCount, error) ||

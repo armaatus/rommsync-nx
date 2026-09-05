@@ -34,6 +34,17 @@
 
 namespace rommsync::overlay {
 
+/// The `Result` every typed method below answers when the sysmodule replied
+/// with a payload this build cannot read.
+///
+/// Distinct from the sysmodule's own errors on purpose: those say what the
+/// *command* could not do, and this says the two halves disagree about the
+/// payload -- which is a different sentence for the user ("update the overlay")
+/// and is what `GetInterfaceVersion` exists to diagnose. Named here rather than
+/// kept private because a screen has to tell it from a transport failure to
+/// pick between "not running" and "unreachable" (`status_screen.cpp`).
+Result MalformedResponse();
+
 /// A session on `sys-rommsync`.
 ///
 /// `Open` assumes `smInitialize()` has already been called -- Tesla does it

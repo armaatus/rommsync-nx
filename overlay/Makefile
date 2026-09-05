@@ -10,14 +10,17 @@
 # codecs it needs to do that are core/'s -- `rommsync/ipc.hpp`, shared with the
 # sysmodule so one copy of the field names serves both halves and they cannot
 # disagree about one. A second copy over here is exactly the drift M5-2 exists to
-# prevent. `--gc-sections` drops the engine the screens never reference; the rule
+# prevent. What else it takes from core/ is the screen's view model
+# (`rommsync/overlay_status_view.hpp`), which is the half of a screen that is a
+# decision rather than a draw call and is therefore the half a host test can
+# check. `--gc-sections` drops the engine the screens never reference; the rule
 # that matters is unchanged, and it is about ownership rather than about the
 # link map: no sync, download or auth logic lives in this directory.
 #
-# libultrahand is not a dependency yet either. It arrives with the first real
-# screen in M4-1; until then this is a libnx .nro with the ULTR signature, which
-# is what an .ovl is -- enough for CI to prove the cross-compile links and to
-# publish an artifact, and not a submodule nobody exercises for four milestones.
+# libultrahand is the library the screens are drawn with, pinned as a submodule
+# at lib/libultrahand and compiled from source -- upstream ships no library. Its
+# sources are vendored rather than ours, so ../switch.mk builds them with
+# -isystem headers and without the warning flags they were never held to.
 #---------------------------------------------------------------------------------
 TOPDIR ?= $(CURDIR)
 
@@ -26,11 +29,13 @@ TARGET := ovl-rommsync
 # Append the ULTR signature and name the result .ovl rather than .nro.
 ROMMSYNC_OVERLAY := 1
 
-# The IPC codecs. See the note above: compiled, mostly gc-sectioned away.
+# The IPC codecs and the status screen's view model. See the note above.
 ROMMSYNC_USE_CORE := 1
 
-# Tesla reads the NACP for the name in the overlay list, so these are user
-# visible even though nothing here draws a frame yet.
+# lib/libultrahand, and the vendored-source rules that come with it.
+ROMMSYNC_ULTRAHAND := 1
+
+# Tesla reads the NACP for the name in the overlay list.
 APP_TITLE  := ovl-rommsync
 APP_AUTHOR := armaatus
 

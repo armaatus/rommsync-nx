@@ -1,0 +1,348 @@
+#include "rommsync/overlay_status_view.hpp"
+
+#include <cstdint>
+#include <iterator>
+#include <string>
+#include <vector>
+
+#include "rommsync/ipc.hpp"
+
+namespace rommsync::overlay {
+namespace {
+
+/// The units `FormatBytes` steps through. Binary, because a rom's size is what
+/// the card reports and every other tool a user has open reports the same one.
+constexpr const char* kUnits[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+constexpr std::int64_t kUnitStep = 1024;
+
+/// Rounded to one decimal, without floating point: the value in tenths of a
+/// unit, then split. A `double` would render 1023.95 MiB as "1024.0 MiB", which
+/// is the one number a size is not allowed to be.
+std::string Tenths(std::int64_t tenths, const char* unit) {
+  return std::to_string(tenths / 10) + "." + std::to_string(tenths % 10) + " " +
+         std::string(unit);
+}
+
+void Add(std::vector<Line>* lines, std::string label, std::string value,
+         Tone tone = Tone::kNeutral) {
+  lines->push_back(Line{std::move(label), std::move(value), tone});
+}
+
+/// The count lines, which are the last sync's rather than a running total
+/// (`ipc::Status`). Conflicts and failures are toned even at zero-is-fine so a
+/// screen that is quiet looks quiet.
+void AddCounts(std::vector<Line>* lines, const ipc::Status& status) {
+  Add(lines, "Uploaded", std::to_string(status.uploaded));
+  Add(lines, "Downloaded", std::to_string(status.downloaded));
+  Add(lines, "Conflicts", std::to_string(status.conflicts),
+      status.conflicts > 0 ? Tone::kWarn : Tone::kNeutral);
+  Add(lines, "Failed", std::to_string(status.failed),
+      status.failed > 0 ? Tone::kBad : Tone::kNeutral);
+}
+
+std::string ResultText(ipc::SyncResult result) {
+  switch (result) {
+    case ipc::SyncResult::kNever:
+      return "Not yet";
+    case ipc::SyncResult::kOk:
+      return "Finished";
+    case ipc::SyncResult::kPartial:
+      return "Partly finished";
+    case ipc::SyncResult::kFailed:
+      return "Failed";
+  }
+  return "Unknown";
+}
+
+Tone ResultTone(ipc::SyncResult result) {
+  switch (result) {
+    case ipc::SyncResult::kNever:
+      return Tone::kNeutral;
+    case ipc::SyncResult::kOk:
+      return Tone::kGood;
+    case ipc::SyncResult::kPartial:
+      return Tone::kWarn;
+    case ipc::SyncResult::kFailed:
+      return Tone::kBad;
+  }
+  return Tone::kNeutral;
+}
+
+/// The download rows and the bar. Split out because `kIdle` is the common case
+/// and it is the one that must add a line rather than nothing -- a screen that
+/// simply omits "Download" when nothing is downloading looks like a screen that
+/// failed to read it.
+void AddDownload(StatusView* view, const ipc::DownloadSnapshot& download) {
+  switch (download.state) {
+    case ipc::DownloadState::kIdle:
+      Add(&view->lines, "Download", "None");
+      return;
+    case ipc::DownloadState::kQueued:
+      Add(&view->lines, "Download", "Waiting to start");
+      break;
+    case ipc::DownloadState::kDownloading:
+      Add(&view->lines, "Download", "Downloading");
+      break;
+    case ipc::DownloadState::kVerifying:
+      // Its own row rather than a bar at 100%: a checksum over a large rom is
+      // seconds with no bytes moving, and an unlabelled full bar reads as a
+      // hang (`ipc::DownloadState`).
+      Add(&view->lines, "Download", "Checking");
+      break;
+    case ipc::DownloadState::kFailed:
+      Add(&view->lines, "Download", "Failed", Tone::kBad);
+      break;
+  }
+
+  // A name the sysmodule did not have is still a row with something in it.
+  const std::string name = download.fs_name.empty() ? "Unnamed file" : download.fs_name;
+  Add(&view->lines, "File", name);
+
+  view->progress.label = name;
+  if (download.bytes_total > 0) {
+    view->progress.kind = Progress::Kind::kFraction;
+    view->progress.caption =
+        FormatBytes(download.bytes_done) + " of " + FormatBytes(download.bytes_total);
+    // Clamped rather than trusted: `bytes_done` is a resumed download's total
+    // on the card and a server that under-declared its length would otherwise
+    // drive a bar past its own end.
+    const std::int64_t done =
+        download.bytes_done < download.bytes_total ? download.bytes_done : download.bytes_total;
+    view->progress.permille = static_cast<int>(done * 1000 / download.bytes_total);
+  } else {
+    view->progress.kind = Progress::Kind::kIndeterminate;
+    view->progress.caption = FormatBytes(download.bytes_done);
+    view->progress.permille = 0;
+  }
+}
+
+/// The headline, in precedence order.
+///
+/// The order is the point: a console that is not configured is also not paired
+/// and also offline, and telling it the third of those sends the user to the
+/// wrong screen. Each branch names the *first* thing standing between this
+/// console and a sync.
+void SetHeadline(StatusView* view, const ipc::Status& status) {
+  if (!status.configured) {
+    view->headline = "No server set";
+    view->hint = "Set server.url in config.ini";
+    view->tone = Tone::kWarn;
+    return;
+  }
+  if (status.auth == ipc::AuthState::kNeverPaired) {
+    view->headline = "Not paired";
+    view->hint = "Pair this console from Settings";
+    view->tone = Tone::kWarn;
+    return;
+  }
+  if (status.auth == ipc::AuthState::kUnauthenticated) {
+    view->headline = "Sign-in expired";
+    view->hint = "Pair this console again";
+    view->tone = Tone::kBad;
+    return;
+  }
+  // A running tick outranks the switch: `SetEnabled` turns auto-sync off
+  // without stopping the tick already in flight, and a screen that showed "Sync
+  // is off" over a sync that is moving files is worse than one that is a few
+  // seconds out of date.
+  if (status.sync_in_progress) {
+    view->headline = "Syncing";
+    view->tone = Tone::kNeutral;
+    return;
+  }
+  if (!status.enabled) {
+    view->headline = "Sync is off";
+    view->hint = "Turn sync on to start";
+    view->tone = Tone::kWarn;
+    return;
+  }
+  if (status.download.state == ipc::DownloadState::kDownloading ||
+      status.download.state == ipc::DownloadState::kVerifying) {
+    view->headline = "Downloading";
+    view->tone = Tone::kNeutral;
+    return;
+  }
+  if (!status.online) {
+    view->headline = "Offline";
+    view->hint = "The last attempt did not reach the server";
+    view->tone = Tone::kWarn;
+    return;
+  }
+  if (status.last_sync_result == ipc::SyncResult::kFailed) {
+    view->headline = "Last sync failed";
+    view->tone = Tone::kBad;
+    return;
+  }
+  if (status.last_sync_result == ipc::SyncResult::kPartial) {
+    view->headline = "Last sync partly finished";
+    view->tone = Tone::kWarn;
+    return;
+  }
+  if (status.last_sync_result == ipc::SyncResult::kNever) {
+    // Reachable, paired and switched on, and nothing has run yet. Not an error
+    // and not "up to date" either -- the scheduler has simply not ticked.
+    view->headline = "Ready";
+    view->hint = "No sync has run yet";
+    view->tone = Tone::kNeutral;
+    return;
+  }
+  view->headline = "Up to date";
+  view->tone = Tone::kGood;
+}
+
+}  // namespace
+
+const char* ToString(Link link) {
+  switch (link) {
+    case Link::kOk:
+      return "ok";
+    case Link::kNotRunning:
+      return "not_running";
+    case Link::kUnreadable:
+      return "unreadable";
+    case Link::kIncompatible:
+      return "incompatible";
+  }
+  return "unknown";
+}
+
+const char* ToString(Tone tone) {
+  switch (tone) {
+    case Tone::kNeutral:
+      return "neutral";
+    case Tone::kGood:
+      return "good";
+    case Tone::kWarn:
+      return "warn";
+    case Tone::kBad:
+      return "bad";
+  }
+  return "unknown";
+}
+
+std::string FormatBytes(std::int64_t bytes) {
+  if (bytes < 0) {
+    // Not a size any caller should produce, and not worth a crash on a console
+    // with no debugger: it renders as nothing rather than as a negative.
+    return "0 B";
+  }
+  std::size_t unit = 0;
+  std::int64_t value = bytes;
+  while (value >= kUnitStep * kUnitStep && unit + 2 < std::size(kUnits)) {
+    value /= kUnitStep;
+    ++unit;
+  }
+  if (value < kUnitStep) {
+    // Whole bytes get no decimal: "512 B", not "512.0 B".
+    return std::to_string(value) + " " + kUnits[unit];
+  }
+  // Tenths of the next unit up, rounded half-up, in integer arithmetic.
+  const std::int64_t tenths = (value * 10 + kUnitStep / 2) / kUnitStep;
+  return Tenths(tenths, kUnits[unit + 1]);
+}
+
+std::string FormatRelativeTime(std::int64_t then_unix, std::int64_t now_unix) {
+  if (then_unix <= 0) {
+    return "Never";
+  }
+  // A clock that moved backwards is ordinary on a console that has been off the
+  // network, and "in 3 days" is not a thing a status screen may say.
+  const std::int64_t seconds = now_unix > then_unix ? now_unix - then_unix : 0;
+  if (seconds < 60) {
+    return "Just now";
+  }
+  struct Unit {
+    std::int64_t seconds;
+    const char* singular;
+    const char* plural;
+  };
+  static constexpr Unit kSpans[] = {
+      {60, "minute", "minutes"},
+      {3600, "hour", "hours"},
+      {86400, "day", "days"},
+  };
+  // Largest unit that still gives a whole number of at least one.
+  const Unit* chosen = &kSpans[0];
+  for (const Unit& unit : kSpans) {
+    if (seconds >= unit.seconds) {
+      chosen = &unit;
+    }
+  }
+  const std::int64_t count = seconds / chosen->seconds;
+  return std::to_string(count) + " " + (count == 1 ? chosen->singular : chosen->plural) + " ago";
+}
+
+StatusView Render(const ipc::Status& status, std::int64_t now_unix) {
+  StatusView view;
+  view.link = Link::kOk;
+  SetHeadline(&view, status);
+
+  Add(&view.lines, "Server", status.configured ? (status.online ? "Reachable" : "Not reached")
+                                               : "Not set",
+      status.configured ? (status.online ? Tone::kGood : Tone::kWarn) : Tone::kWarn);
+
+  switch (status.auth) {
+    case ipc::AuthState::kNeverPaired:
+      Add(&view.lines, "Pairing", "Not paired", Tone::kWarn);
+      break;
+    case ipc::AuthState::kUnauthenticated:
+      Add(&view.lines, "Pairing", "Expired", Tone::kBad);
+      break;
+    case ipc::AuthState::kPaired:
+      Add(&view.lines, "Pairing", "Paired", Tone::kGood);
+      break;
+  }
+
+  Add(&view.lines, "Auto-sync", status.enabled ? "On" : "Off",
+      status.enabled ? Tone::kGood : Tone::kNeutral);
+  Add(&view.lines, "Last sync", FormatRelativeTime(status.last_sync_at, now_unix));
+  Add(&view.lines, "Result",
+      status.sync_in_progress ? std::string("Running now") : ResultText(status.last_sync_result),
+      status.sync_in_progress ? Tone::kNeutral : ResultTone(status.last_sync_result));
+  AddCounts(&view.lines, status);
+  Add(&view.lines, "Queue",
+      status.queue_depth == 0 ? std::string("Empty")
+                              : std::to_string(status.queue_depth) + " waiting");
+  AddDownload(&view, status.download);
+  // Last, because it is the line a user reads once and a support thread reads
+  // first (`ipc::Status::build`).
+  Add(&view.lines, "Build",
+      status.build.empty() ? std::string("Unknown") : status.build);
+  return view;
+}
+
+StatusView RenderUnreachable(Link link, std::uint32_t sysmodule_interface) {
+  StatusView view;
+  view.link = link;
+  view.tone = Tone::kBad;
+  switch (link) {
+    case Link::kOk:
+      // A caller that got here has a `Status` and should have rendered it. Not
+      // an assert: a screen that draws the wrong sentence is recoverable and a
+      // sysmodule-side abort taking the overlay with it is not.
+      view.link = Link::kUnreadable;
+      view.headline = "sysmodule unreachable";
+      view.hint = "The overlay asked for a status it did not get";
+      break;
+    case Link::kNotRunning:
+      view.headline = "sys-rommsync is not running";
+      view.hint = "Enable it in the sysmodule list and reboot";
+      break;
+    case Link::kUnreadable:
+      view.headline = "sysmodule unreachable";
+      view.hint = "It answered something this overlay cannot read";
+      break;
+    case Link::kIncompatible:
+      view.headline = "sysmodule unreachable";
+      view.hint = "Update the sysmodule: it speaks version " +
+                  std::to_string(sysmodule_interface) + ", this overlay speaks " +
+                  std::to_string(ipc::kVersion);
+      break;
+  }
+  // No rows at all. Every one of them would be a number this overlay does not
+  // have, and a zero the user cannot tell from a real one is the failure the
+  // whole `Link` enum exists to avoid.
+  return view;
+}
+
+}  // namespace rommsync::overlay

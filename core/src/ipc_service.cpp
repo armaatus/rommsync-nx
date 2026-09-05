@@ -95,6 +95,7 @@ Status ServiceCore::GetStatus() const {
   status.online = snapshot.online;
   status.last_sync_at = snapshot.last_sync_at;
   status.last_sync_result = snapshot.last_sync_result;
+  status.sync_in_progress = snapshot.sync_in_progress;
   status.uploaded = snapshot.uploaded;
   status.downloaded = snapshot.downloaded;
   status.conflicts = snapshot.conflicts;
