@@ -45,13 +45,6 @@ constexpr const char* kSavesPath = "/api/saves";
 /// overwriting a save on.
 constexpr int kMaxBackupAttempts = 1000;
 
-std::string ApiUrl(std::string_view server_url, std::string_view path) {
-  while (!server_url.empty() && server_url.back() == '/') {
-    server_url.remove_suffix(1);
-  }
-  return std::string(server_url) + std::string(path);
-}
-
 /// Percent-encode one query-string value.
 ///
 /// A `slot` is derived (`retroarch-srm`) but an `emulator` is a folder name a
@@ -80,26 +73,6 @@ std::string EncodeQuery(std::string_view value) {
   return out;
 }
 
-bool Exists(const std::string& path) {
-  std::FILE* file = std::fopen(path.c_str(), "rb");
-  if (file == nullptr) {
-    return false;
-  }
-  std::fclose(file);
-  return true;
-}
-
-/// `Game (USA).srm` -> `.srm`. Empty when there is no extension, and a leading
-/// dot is not one -- `.DS_Store` is a whole name (`scan::BaseName` draws the
-/// same line, and the two must not disagree about what an extension is).
-std::string ExtensionOf(std::string_view file_name) {
-  const std::size_t dot = file_name.rfind('.');
-  if (dot == std::string_view::npos || dot == 0) {
-    return {};
-  }
-  return std::string(file_name.substr(dot));
-}
-
 /// How this operation is named in a log line: the rom and the slot, which are
 /// the pair a user can go and look at. Never the save's own name, which is a
 /// game title, and never a token.
@@ -113,7 +86,11 @@ OperationResult Fail(const SyncOperation& operation, OperationError error, std::
   result.action = operation.action;
   result.rom_id = operation.rom_id;
   result.slot = operation.slot;
-  result.outcome = OperationOutcome::kFailed;
+  // A cancellation is not a failure -- the caller stopped this, and nothing
+  // about the save went wrong. It gets its own outcome so the accounting M2-6
+  // reports cannot call it either completed or failed.
+  result.outcome = error == OperationError::kCanceled ? OperationOutcome::kCanceled
+                                                      : OperationOutcome::kFailed;
   result.error = error;
   result.message = Describe(operation) + ": " + std::move(message);
   return result;
@@ -129,22 +106,20 @@ OperationResult Fail(const SyncOperation& operation, OperationError error, std::
 std::optional<std::pair<OperationError, std::string>> Refused(const http::Result& result,
                                                               std::string_view what) {
   if (!result.ok()) {
-    return std::make_pair(OperationError::kTransferFailed,
+    // A cancelled exchange is kept apart from a failed one. The caller stopped
+    // it, so reporting it to `complete` as a failed operation (M2-6) would
+    // describe work that went wrong rather than work that was not attempted.
+    const OperationError error = result.error == http::Error::kCanceled
+                                     ? OperationError::kCanceled
+                                     : OperationError::kTransferFailed;
+    return std::make_pair(error,
                           std::string(what) + " did not complete: " + http::ToString(result.error) +
                               (result.message.empty() ? "" : " (" + result.message + ")"));
   }
   if (!result.successful()) {
-    std::string message =
-        std::string(what) + " was refused: HTTP " + std::to_string(result.response.status);
-    if (result.response.status == 409) {
-      // The one status worth spelling out: RomM answers it when this device has
-      // no sync row for the slot's current save, which is exactly the state the
-      // plan calls `Client save is newer (no sync history)`. A plan executed as
-      // issued must never draw one, so seeing this means the request went out
-      // without `overwrite=true`.
-      message += "; the slot has a newer save and the upload did not say overwrite=true";
-    }
-    return std::make_pair(OperationError::kRefused, std::move(message));
+    return std::make_pair(
+        OperationError::kRefused,
+        std::string(what) + " was refused: HTTP " + std::to_string(result.response.status));
   }
   return std::nullopt;
 }
@@ -169,6 +144,35 @@ http::Request Authed(http::Method method, std::string url, const auth::StoredTok
   request.cancel = cancel;
   return request;
 }
+
+/// The staged download, removed unless something takes it.
+///
+/// `Fetch` has five ways out between staging a body and committing it, and each
+/// one has to remove those bytes -- an unverified or unplaceable download is not
+/// a save. One branch forgetting would leave a `<save>.tmp` for the next tick to
+/// reason about, and a `.tmp` beside a save is supposed to mean "verified bytes
+/// that never landed" (issue #16).
+class StagedFile {
+ public:
+  explicit StagedFile(std::string path) : path_(std::move(path)) {}
+  ~StagedFile() {
+    if (!path_.empty()) {
+      std::remove(path_.c_str());
+    }
+  }
+
+  StagedFile(const StagedFile&) = delete;
+  StagedFile& operator=(const StagedFile&) = delete;
+
+  const std::string& path() const { return path_; }
+
+  /// `io::CommitStaged` consumes the file whether it succeeds or fails, so the
+  /// guard has nothing left to remove either way.
+  void Release() { path_.clear(); }
+
+ private:
+  std::string path_;
+};
 
 /// What the server currently holds for `save_id`: its size, for
 /// `DownloadTarget::expected_size`, and its digest.
@@ -204,6 +208,8 @@ const char* ToString(OperationOutcome outcome) {
       return "failed";
     case OperationOutcome::kNotUnderstood:
       return "not_understood";
+    case OperationOutcome::kCanceled:
+      return "canceled";
   }
   return "failed";
 }
@@ -248,18 +254,25 @@ std::string BackupFileName(std::int64_t rom_id, const std::optional<std::string>
       safe_slot.push_back(keep ? character : '_');
     }
   }
-  if (safe_slot.empty() || safe_slot == "." || safe_slot == "..") {
-    // A null slot is archival; a slot made entirely of separators reduces to
-    // one of the two names a join treats as a directory. Both need a name that
-    // is a name, and this one cannot collide with a derived slot because
-    // `scan::SlotFor` always carries an emulator and an extension.
+  if (!slot.has_value()) {
+    // Archival, which pairs with nothing. It cannot collide with a derived slot
+    // because `scan::SlotFor` always carries an emulator and an extension.
     safe_slot = "archival";
+  } else if (safe_slot.empty() || safe_slot == "." || safe_slot == "..") {
+    // A slot that survives sanitising as one of the two names a join treats as
+    // a directory still needs a name that is a name -- and a *different* one
+    // from `archival`, because a save with a `..` slot and a save with no slot
+    // at all are two different saves and must not share a backup.
+    for (char& character : safe_slot) {
+      character = '_';
+    }
+    safe_slot = safe_slot.empty() ? "slot" : safe_slot;
   }
   std::string name = std::to_string(rom_id) + "-" + safe_slot + "-" + std::to_string(unix_seconds);
   if (uniquifier > 0) {
     name += "-" + std::to_string(uniquifier);
   }
-  return name + ExtensionOf(file_name);
+  return name + std::string(ExtensionOf(file_name));
 }
 
 const SaveTarget* MatchTarget(const std::vector<SaveTarget>& targets,
@@ -292,10 +305,13 @@ OperationError BackUp(fs::FileSystem& files, const ExecuteOptions& options,
     *message = "the local save " + target.sd_path + " is not a path on this card";
     return OperationError::kUnreadableCard;
   }
-  if (!Exists(source)) {
-    return OperationError::kNone;  // nothing there to protect
-  }
 
+  // Whether there is anything to protect is `io::CopyAtomically`'s answer and
+  // not `io::Exists`'s. The two draw different lines on purpose: `Exists` is
+  // `fopen` succeeding, so a save the card would not open *this once* -- a full
+  // handle table, an emulator holding it, an EIO -- reads as absent, and
+  // "absent" here would mean overwriting the only copy with no backup. The copy
+  // reads `errno` and says `kSourceMissing` for ENOENT/ENOTDIR alone.
   const std::int64_t stamp =
       UnixSeconds(options.now != nullptr ? options.now() : std::chrono::system_clock::now());
   for (int attempt = 0; attempt < kMaxBackupAttempts; ++attempt) {
@@ -307,12 +323,20 @@ OperationError BackUp(fs::FileSystem& files, const ExecuteOptions& options,
       *message = "the backup directory " + options.backup_dir + " is not a path on this card";
       return OperationError::kUnreadableCard;
     }
-    if (Exists(destination)) {
+    if (io::Exists(destination)) {
       // A name already taken is a backup of *something*. This module does not
       // get to decide it is worthless, so it steps past rather than over.
+      // Best-effort, and it is the destination rather than the save: the worst
+      // an unopenable-but-present backup here costs is that older backup, and
+      // the standard library offers no create-if-absent to do better with.
       continue;
     }
     const io::CopyResult copied = io::CopyAtomically(source, destination);
+    if (copied.error == io::CopyError::kSourceMissing) {
+      // There is no save at that path -- a download for a save this client does
+      // not have yet. It overwrites nothing, so there is nothing to preserve.
+      return OperationError::kNone;
+    }
     if (!copied.ok()) {
       *message = "the save's previous bytes could not be preserved: " + copied.message;
       return OperationError::kBackupFailed;
@@ -335,7 +359,7 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
                 "there is no local save for this (rom_id, slot) to upload");
   }
   const std::string source = files.Resolve(target->sd_path);
-  if (source.empty() || !Exists(source)) {
+  if (source.empty() || !io::Exists(source)) {
     return Fail(operation, OperationError::kUnreadableCard,
                 "the local save " + target->sd_path + " could not be opened to upload");
   }
@@ -344,7 +368,7 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
   // upload to this negotiation and `device_id` is what writes the `device_syncs`
   // row the *next* negotiation arbitrates against -- skip either and the device
   // stays in the no-history branch forever (docs/API_CONTRACT.md).
-  std::string url = ApiUrl(token.server_url, kSavesPath) +
+  std::string url = http::JoinUrl(token.server_url, kSavesPath) +
                     "?rom_id=" + std::to_string(operation.rom_id);
   if (operation.emulator.has_value()) {
     url += "&emulator=" + EncodeQuery(*operation.emulator);
@@ -369,7 +393,16 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
 
   const http::Result result = client.Send(request);
   if (const auto refused = Refused(result, "the upload")) {
-    return Fail(operation, refused->first, refused->second);
+    std::string message = refused->second;
+    if (result.response.status == 409) {
+      // The one status worth spelling out, and only here: RomM answers it when
+      // this device has no sync row for the slot's current save, which is
+      // exactly the state the plan calls `Client save is newer (no sync
+      // history)`. A plan executed as issued must never draw one, so seeing it
+      // means the request went out without `overwrite=true`.
+      message += "; the slot has a newer save and the upload did not say overwrite=true";
+    }
+    return Fail(operation, refused->first, std::move(message));
   }
 
   OperationResult uploaded;
@@ -397,7 +430,7 @@ ServerSave DescribeServerSave(http::HttpClient& client, const auth::StoredToken&
   ServerSave described;
   const http::Result result =
       client.Send(Authed(http::Method::kGet,
-                         ApiUrl(token.server_url, std::string(kSavesPath) + "/" +
+                         http::JoinUrl(token.server_url, std::string(kSavesPath) + "/" +
                                                       std::to_string(save_id)),
                          token, options.timeout, options.cancel));
   if (!result.successful()) {
@@ -470,14 +503,14 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   // Staged beside the save rather than at it. `http::DownloadTarget` renames
   // its `.part` onto the destination the instant the body ends, and that is
   // before anything has checked that the bytes are the save the plan meant.
-  const std::string staged = io::TempPathFor(destination);
   // A stale one from an interrupted run is a destination the Horizon rename
   // refuses -- it is not a replace -- so it goes first. The bytes in it are a
   // download that never completed and belong to nothing.
-  std::remove(staged.c_str());
+  StagedFile staged(io::TempPathFor(destination));
+  std::remove(staged.path().c_str());
 
   http::Request request = Authed(http::Method::kGet,
-                                 ApiUrl(token.server_url, std::string(kSavesPath) + "/" +
+                                 http::JoinUrl(token.server_url, std::string(kSavesPath) + "/" +
                                                               std::to_string(save_id) + "/content"),
                                  token, options.timeout, options.cancel);
   // A save state is tens of megabytes on a link that may be a phone hotspot, so
@@ -487,7 +520,7 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   request.stall_timeout = options.stall_timeout;
 
   http::DownloadTarget into;
-  into.path = staged;
+  into.path = staged.path();
   // Never resumed. A save is small enough to refetch, and a resumed transfer of
   // a file whose server copy may have moved on is two different saves spliced
   // at a byte offset.
@@ -496,11 +529,13 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
 
   const http::Result fetched = client.Download(request, into);
   if (const auto refused = Refused(fetched, "the download")) {
-    // The `.part` the backend left behind is deliberately not removed -- it is
-    // what a resumed transfer would continue from, and what issue #16 reasons
-    // about on entry to the next tick. The staged file is: an incomplete
-    // download is not a save.
-    std::remove(staged.c_str());
+    // The backend leaves its partial file behind for a resume, and there is
+    // never going to be one (`into.resume` below), so it is litter beside a
+    // save rather than progress towards one -- and nothing else would ever
+    // remove it. `<path>.part` is `http::DownloadTarget`'s documented staging
+    // name, not a guess. The staged file goes with it, by the guard above: an
+    // incomplete download is not a save.
+    std::remove((staged.path() + ".part").c_str());
     return Fail(operation, refused->first, refused->second);
   }
 
@@ -511,27 +546,25 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   const std::optional<std::string>& reported =
       operation.server_content_hash.has_value() ? operation.server_content_hash
                                                 : described.content_hash;
-  if (reported.has_value() && IsContentHash(*reported)) {
-    const state::HashOutcome digest = state::HashFile(staged);
-    if (!digest.ok()) {
-      std::remove(staged.c_str());
-      return Fail(operation, OperationError::kUnreadableCard,
-                  "the downloaded bytes could not be hashed to verify them: " + digest.message);
-    }
-    if (digest.content_hash != *reported) {
-      std::remove(staged.c_str());
-      return Fail(operation, OperationError::kUnverified,
-                  "the downloaded bytes are not the save the plan described; the local file was "
-                  "not touched");
-    }
-  } else {
-    // RomM stores the digest it is given, so a save another tool uploaded can
-    // carry a SHA1 or an uppercase one -- which compares equal to nothing. That
-    // is one save's problem, not a reason to refuse it forever, and the backup
-    // below means the local copy is recoverable either way.
-    warnings->push_back(Describe(operation) +
-                        ": the server reports no comparable MD5 for this save, so the download "
-                        "could not be verified");
+  if (!reported.has_value() || !IsContentHash(*reported)) {
+    // Nothing to compare against, so the bytes are unverified -- and unverified
+    // bytes do not replace a save. RomM computes the digest on ingest, so this
+    // is a save some other tool put a SHA1 or an uppercase digest against
+    // (docs/API_CONTRACT.md); it costs that one save every tick until the digest
+    // is fixed, and it says so, which is the cheaper of the two mistakes.
+    return Fail(operation, OperationError::kUnverified,
+                "the server reports no comparable MD5 for this save, so the download could not be "
+                "verified; the local file was not touched");
+  }
+  const state::HashOutcome digest = state::HashFile(staged.path());
+  if (!digest.ok()) {
+    return Fail(operation, OperationError::kUnreadableCard,
+                "the downloaded bytes could not be hashed to verify them: " + digest.message);
+  }
+  if (digest.content_hash != *reported) {
+    return Fail(operation, OperationError::kUnverified,
+                "the downloaded bytes are not the save the plan described; the local file was "
+                "not touched");
   }
 
   OperationResult result;
@@ -545,13 +578,15 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   const OperationError backed_up =
       BackUp(files, options, operation, *target, &result.backup_sd_path, &message);
   if (backed_up != OperationError::kNone) {
-    std::remove(staged.c_str());
     OperationResult failed = Fail(operation, backed_up, std::move(message));
     failed.sd_path = target->sd_path;
     return failed;
   }
 
-  const io::WriteResult committed = io::CommitStaged(staged, destination);
+  const std::string staged_path = staged.path();
+  // Consumed by the commit whether it succeeds or fails, so the guard is done.
+  staged.Release();
+  const io::WriteResult committed = io::CommitStaged(staged_path, destination);
   if (!committed.ok()) {
     OperationResult failed =
         Fail(operation, OperationError::kCommitFailed,
@@ -566,7 +601,7 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   // falls into the no-history branch (docs/API_CONTRACT.md).
   http::Request confirm =
       Authed(http::Method::kPost,
-             ApiUrl(token.server_url,
+             http::JoinUrl(token.server_url,
                     std::string(kSavesPath) + "/" + std::to_string(save_id) + "/downloaded"),
              token, options.timeout, options.cancel);
   confirm.headers.push_back({"Content-Type", "application/json"});
@@ -664,6 +699,11 @@ ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
         ++report.not_understood;
         report.warnings.push_back(result.message);
         break;
+      case OperationOutcome::kCanceled:
+        // Counted nowhere: the caller stopped this one, and the rest are not
+        // attempted at all.
+        report.canceled = true;
+        break;
       case OperationOutcome::kNoOp:
       case OperationOutcome::kUploaded:
       case OperationOutcome::kDownloaded:
@@ -671,7 +711,11 @@ ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
         ++report.completed;
         break;
     }
+    const bool stop = result.outcome == OperationOutcome::kCanceled;
     report.operations.push_back(std::move(result));
+    if (stop) {
+      break;
+    }
   }
 
   return report;

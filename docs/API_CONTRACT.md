@@ -487,12 +487,25 @@ cleanly and early cannot be told from a complete one, because RomM's own
 `Content-Length` is what the shortening removed. That is the shape
 `server/testing/fault_proxy.py`'s `truncate` mode produces on purpose.
 
-**An upload needs `overwrite=true`.** With a `device_id` and a `slot`, `POST
-/api/saves` answers `409 {"detail": "Slot has a newer save since your last
-sync"}` when this device has no sync row for the slot's current save — which is
-exactly the state negotiate calls `Client save is newer (no sync history)` and
-tells the client to upload. See
-[SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#step-2--execute-the-plan).
+**An upload needs `overwrite=true`, and the flag does two things.** With a
+`device_id` and a `slot`, `POST /api/saves` answers `409 {"detail": "Slot has a
+newer save since your last sync"}` when this device has no sync row for the
+slot's current save — which is exactly the state negotiate calls `Client save is
+newer (no sync history)` and tells the client to upload. `execute.occupied`
+arranges that state and asserts the 409 on the flagless request, then asserts
+the same upload succeeds with the flag.
+
+**Verified — with the flag, an upload into an occupied slot replaces the row in
+place.** Same `id`, same stored `file_name` (the datetime tag from the *first*
+ingest is kept), new bytes, `file_size_bytes` and `updated_at`. Without the flag
+the same post creates a **second** row with a fresh tag, when the device's sync
+row is current enough not to be refused. Earlier revisions of this page and of
+[SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#step-2--execute-the-plan) said a second POST
+was always a second row, "`overwrite=true` included"; it is not, and the
+difference decides whether a slot accretes a row per tick.
+`PUT /api/saves/{id}` also moves a row forward, and unlike either POST it takes
+no `slot`, so it is what a test uses to change the server's copy without
+touching a device's history.
 
 ## Library & downloads (the "browse + get games" side)
 

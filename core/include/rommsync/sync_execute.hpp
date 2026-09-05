@@ -35,12 +35,15 @@
 //     writes this device's sync row; skip it and every later negotiation for
 //     that save stays in the no-history branch.
 //
-// There is no retry inside a tick, deliberately. An upload is not idempotent --
-// a slot upload gets a datetime tag, so a second `POST` is a second save row
-// with no sync history for this device, `overwrite=true` included -- and
-// docs/SYNC_PROTOCOL.md's failure rules already say what to do instead: count
-// the operation failed, leave that save alone, and let the next tick negotiate
-// again. M2-7 owns the schedule between ticks.
+// There is no retry inside a tick, deliberately, and not for the reason the
+// pinned docs used to give. A re-posted upload does *not* duplicate the save:
+// `overwrite=true` replaces the slot's row in place, tag and id included
+// (`execute.occupied` verifies it against a live 5.2.0). The reason is that the
+// plan describes a state the server may have moved on from, and the arbiter of
+// that is a fresh negotiation rather than this client -- which is what
+// docs/SYNC_PROTOCOL.md's failure rules already say: count the operation
+// failed, leave that save alone, let the next tick negotiate again. M2-7 owns
+// the schedule between ticks.
 #pragma once
 
 #include <chrono>
@@ -139,6 +142,11 @@ enum class OperationOutcome {
   /// failure: nothing was done, and the client does not know what should have
   /// been.
   kNotUnderstood,
+
+  /// The caller's `http::CancelToken` fired. Also neither completed nor failed:
+  /// the operation was stopped rather than attempted, and reporting a shutdown
+  /// to `complete` as a failed operation would describe work that went wrong.
+  kCanceled,
 };
 
 /// Stable, log-friendly name. Never null.
@@ -248,7 +256,10 @@ struct ExecutionReport {
   /// letting them vanish (docs/SYNC_PROTOCOL.md step 3).
   int not_understood = 0;
 
-  /// The `CancelToken` fired and the remaining operations were not attempted.
+  /// The `CancelToken` fired: this operation, and every one after it, was not
+  /// attempted. Counted in none of the three totals above, so
+  /// `completed + failed + not_understood` is short of `operations.size()`
+  /// exactly when this is set.
   bool canceled = false;
 
   /// One line per operation that failed or was not understood, plus anything a

@@ -200,6 +200,16 @@ json::Error Validate(const ClientSaveState& save);
 /// against one it cannot compare.
 bool IsContentHash(std::string_view value);
 
+/// `Game (USA).srm` -> `.srm`, dot included. Empty when there is none.
+///
+/// **A leading dot is not an extension**: `.DS_Store` is a whole name, and
+/// stripping there would leave nothing -- which matches every rom with an empty
+/// name and none with a real one. Three places in the engine split a file name
+/// on that rule (the scanner's `BaseName` and `SlotFor`, and the backup name
+/// M2-5 writes) and they must not disagree about where the split is, so there
+/// is one of it.
+std::string_view ExtensionOf(std::string_view file_name);
+
 /// True for a string that names one file and cannot redirect a join.
 ///
 /// Both directions need it and they must not drift: the client sends a

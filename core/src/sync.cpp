@@ -1,6 +1,7 @@
 #include "rommsync/sync.hpp"
 
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <string>
 #include <string_view>
@@ -65,6 +66,14 @@ void AppendMember(std::string& out, std::string_view key, const std::optional<st
 }
 
 }  // namespace
+
+std::string_view ExtensionOf(std::string_view file_name) {
+  const std::size_t dot = file_name.rfind('.');
+  if (dot == std::string_view::npos || dot == 0) {
+    return {};
+  }
+  return file_name.substr(dot);
+}
 
 bool IsContentHash(std::string_view value) {
   return value.size() == kContentHashDigits && LowercaseHex(value);

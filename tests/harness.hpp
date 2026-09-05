@@ -44,6 +44,7 @@
 #include <random>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <unistd.h>  // getpid: one sandbox per process, and the suite is POSIX
@@ -69,6 +70,21 @@ namespace sync = rommsync::sync;
 inline constexpr const char* kConfigDir = "/config/rommsync";
 inline constexpr const char* kBackupDir = "/config/rommsync/.backup";
 inline constexpr const char* kSavesDir = "/retroarch/saves";
+
+/// A save path on the card. `/retroarch/saves` is a real entry in the default
+/// folder map (config.cpp), not a path invented by a test.
+inline std::string SavePath(const std::string& file_name) {
+  return std::string(kSavesDir) + "/" + file_name;
+}
+
+/// Wait long enough that two server timestamps are distinguishable.
+///
+/// RomM compares stored datetimes directly, but it also *renders* some of them
+/// to whole seconds, and `sync.hpp` sends whole seconds by design. A test that
+/// arranges "the server's copy changed after the last sync" inside one second is
+/// a test that passes or fails on how long a docker container took, so the ones
+/// that need it wait instead of racing.
+inline void PassASecond() { std::this_thread::sleep_for(std::chrono::seconds{2}); }
 
 // --- the sandbox --------------------------------------------------------------
 
@@ -531,11 +547,13 @@ inline bool UploadSave(http::HttpClient& client, const std::string& base, const 
 
 /// `PUT /api/saves/{id}` -- replace the bytes of a save **in place**.
 ///
-/// The difference from another `POST` matters and is not obvious: a slot upload
-/// gets a datetime tag in its file name, so a second `POST` a second later is a
-/// *new* save row with no sync history, whatever `overwrite` says. Only the PUT
-/// moves the same row forward, which is the only way to arrange "the server's
-/// copy changed since this device last synced it".
+/// The difference from another `POST` is narrower than this comment used to
+/// claim, and worth stating exactly (`execute.occupied` verifies it): a POST
+/// carrying `overwrite=true` *also* replaces the slot's row in place, tag and
+/// id included, and a POST without it creates a second row with a fresh tag.
+/// What the PUT alone gives is a move forward that names no `slot` and no
+/// `device_id` -- which is what arranges "the server's copy changed since this
+/// device last synced it" without writing a sync row on the way.
 inline bool ReplaceSave(http::HttpClient& client, const std::string& base, const Fixture& fixture,
                         std::int64_t save_id, const std::string& local_path,
                         const std::string& file_name, Save* out) {

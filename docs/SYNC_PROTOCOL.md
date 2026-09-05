@@ -163,14 +163,17 @@ Three traps in the operation itself:
   operation echoes that. Match the operation back to your local file on
   `(rom_id, slot)` and keep your own path; writing the server's name to the SD
   produces a file no emulator will load.
-- **That rename is also why a second upload is a second save.** The datetime tag
-  is part of the stored name, so `POST /api/saves` for a slot that already has a
-  save creates a *new row* a second later — `overwrite=true` included — and the
-  new row has no sync history for this device. The next negotiation therefore
-  falls into the no-history branch and answers
-  `upload / Client save is newer (no sync history)` rather than comparing against
-  the last sync. Only `PUT /api/saves/{id}` moves an existing row forward.
-  `harness.conflict` depends on that distinction, and says so.
+- **`overwrite=true` decides whether a second upload is a second save, and this
+  page had it wrong.** Verified against the live 5.2.0 by `execute.occupied`:
+  posting into a slot that already holds a save **with** `overwrite=true`
+  replaces that row *in place* — same `id`, same stored `file_name` (the tag
+  from the first ingest is kept), new bytes, size and `updated_at`. **Without**
+  it the same post creates a *second* row with a fresh tag, when the device's
+  sync row is current enough not to be refused. So the flag is not only how a
+  planned upload avoids the 409: it is also what keeps a slot from accreting a
+  row per tick. `PUT /api/saves/{id}` moves a row forward too, and is what
+  `harness.conflict` uses to arrange "the server's copy changed" without
+  touching this device's history at all.
 - **`save_id` is null for an `upload`** when the server has nothing yet, and set
   when it has an older copy. Don't dereference it unconditionally.
 
@@ -210,10 +213,13 @@ preflight `GET /api/saves/{id}`. Without one, a body that ends cleanly and early
 is indistinguishable from a complete one; that is exactly what the fault proxy's
 `truncate` mode produces, and `execute.truncate` is the scenario.
 
-**There is no retry inside a tick.** An upload is not idempotent — the datetime
-tag makes a second `POST` a second save row with no sync history — so a failed
-operation is counted, left alone, and picked up by the next negotiation. M2-7
-owns the schedule between ticks.
+**There is no retry inside a tick.** A failed operation is counted, left alone,
+and picked up by the next negotiation, which is what the failure rules at the
+end of this page already say; M2-7 owns the schedule between ticks. Note the
+reason is *not* that a re-posted upload would duplicate the save — with
+`overwrite=true` it replaces the row in place (above). It is that the plan
+describes a state the server has since moved on from, and the arbiter of that is
+a fresh negotiation rather than this client.
 
 **A save the client has no local file for** (`download` /
 `Save exists on server but not on client`) needs a destination the plan cannot
@@ -238,6 +244,15 @@ outside `[A-Za-z0-9._-]` becomes `_` so a slot cannot carry a separator out of
 than being written over. `sync::BackupFileName` is the one spelling of that,
 and `harness::Sandbox::BackupPathFor` calls it so the audit and the code under
 test cannot disagree.
+
+**What the backup promises is ordering, not durability.** The copy is flushed
+and renamed before the save is touched, so no reader ever sees half a backup and
+no overwrite happens without one — but the `fsync` that would put the copied
+*bytes* on the card before the rename is not something `core/` can call with
+only standard headers. A console that loses power between the copy and the
+overwrite can therefore leave a backup whose data blocks never landed. Closing
+that needs a platform hook, and belongs with the rest of the power-loss
+recovery (M2-7).
 
 ### Conflicts
 

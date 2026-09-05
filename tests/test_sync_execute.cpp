@@ -45,16 +45,8 @@ namespace sync = rommsync::sync;
 using harness::Fixture;
 using harness::Sandbox;
 
-/// A save path on the card. `/retroarch/saves` is a real entry in the default
-/// folder map (config.cpp), not a path invented here.
-std::string SavePath(const std::string& file_name) {
-  return std::string(harness::kSavesDir) + "/" + file_name;
-}
-
-/// Wait long enough that two server timestamps are distinguishable. Only the
-/// conflict arrangement needs it, and it needs it for the reason
-/// `harness.conflict` documents: RomM renders these to whole seconds.
-void PassASecond() { std::this_thread::sleep_for(std::chrono::seconds{2}); }
+using harness::PassASecond;
+using harness::SavePath;
 
 /// The token the executor authenticates with. The fixture's, pointed at the
 /// proxy, so a scenario can damage one call and nothing else.
@@ -198,9 +190,15 @@ void Naming(rig::Checks& checks) {
   const std::string escaped = sync::BackupFileName(3, "../../etc/passwd", "Game.srm", kWhen);
   checks.Expect(escaped.find('/') == std::string::npos,
                 "a slot cannot carry a separator into the backup path: " + escaped);
+  // ...and a name that is *not* `archival`, because a save whose slot is `..`
+  // and a save with no slot at all are two different saves and must not share a
+  // backup.
   checks.ExpectEq(sync::BackupFileName(3, "..", "Game.srm", kWhen),
-                  std::string("3-archival-1757000000.srm"),
-                  "...and a slot that reduces to a directory name gets a name instead");
+                  std::string("3-__-1757000000.srm"),
+                  "a slot that reduces to a directory name gets a name of its own");
+  checks.Expect(sync::BackupFileName(3, "..", "Game.srm", kWhen) !=
+                    sync::BackupFileName(3, std::nullopt, "Game.srm", kWhen),
+                "which is not the archival one");
 
   // `scan::BaseName` draws the same line and the two must not disagree: a
   // leading dot is a whole name, not an extension.
@@ -326,6 +324,27 @@ class NeverCalled : public http::HttpClient {
   rig::Checks* checks_;
 };
 
+/// An `HttpClient` whose every exchange reports the caller's cancellation.
+///
+/// The real one is the backend polling `http::CancelToken` mid-transfer, which
+/// no test can time. What matters is what the executor does with the answer, and
+/// that is the same either way.
+class AlwaysCanceled : public http::HttpClient {
+ public:
+  http::Result Send(const http::Request&) override { return Canceled(); }
+  http::Result Download(const http::Request&, const http::DownloadTarget&) override {
+    return Canceled();
+  }
+
+ private:
+  static http::Result Canceled() {
+    http::Result result;
+    result.error = http::Error::kCanceled;
+    result.message = "the caller cancelled";
+    return result;
+  }
+};
+
 sync::SyncOperation OperationOf(sync::Action action, std::int64_t rom_id, std::string slot) {
   sync::SyncOperation operation;
   operation.action = action;
@@ -400,6 +419,34 @@ void Counting(rig::Checks& checks) {
   checks.Expect(stopped.canceled, "a cancelled token stops the plan");
   checks.ExpectEq(static_cast<int>(stopped.operations.size()), 0,
                   "before the first operation, since it was already cancelled");
+
+  // A cancellation that lands *during* an exchange, which is the case the token
+  // is really for. It must not be reported as a failed operation: M2-6 sends
+  // `operations_failed` to the server, and a shutdown is not work that went
+  // wrong. The rest of the plan is not attempted either.
+  AlwaysCanceled interrupted;
+  const std::string name = "canceled.srm";
+  sandbox.Write(SavePath(name), "bytes nobody gets to send\n");
+  sync::SyncPlan two;
+  two.session_id = 1;
+  two.operations.push_back(OperationOf(sync::Action::kUpload, 7, "cut-short"));
+  two.operations.push_back(OperationOf(sync::Action::kNoOp, 8, "never-reached"));
+  const std::vector<sync::SaveTarget> targets = {
+      {7, std::string("cut-short"), SavePath(name), name}};
+  const sync::ExecutionReport cut = sync::ExecutePlan(
+      interrupted, *files, token, two, targets, OptionsAt(1'757'000'000));
+  checks.Expect(cut.canceled, "a cancelled exchange cancels the plan");
+  checks.ExpectEq(cut.failed, 0, "and is not counted as a failure");
+  checks.ExpectEq(cut.completed, 0, "nor as work done");
+  checks.ExpectEq(static_cast<int>(cut.operations.size()), 1,
+                  "the operations after it are not attempted");
+  if (!cut.operations.empty()) {
+    checks.Expect(cut.operations[0].outcome == sync::OperationOutcome::kCanceled,
+                  std::string("...and it has an outcome of its own: ") +
+                      sync::ToString(cut.operations[0].outcome));
+    checks.Expect(cut.operations[0].error == sync::OperationError::kCanceled,
+                  std::string("...named: ") + sync::ToString(cut.operations[0].error));
+  }
 }
 
 // --- upload -------------------------------------------------------------------
@@ -540,6 +587,39 @@ void Download(rig::Checks& checks, http::HttpClient& client, const std::string& 
 
   checks.Expect(DeviceIsSynced(client, base, fixture, server.id),
                 "POST /api/saves/{id}/downloaded recorded that this device holds it");
+
+  // A save this client has no local file for -- the `Save exists on server but
+  // not on client` case, and the only way a client ever learns a save exists.
+  // The plan cannot say where it goes (the server's `file_name` carries the
+  // ingest tag and the directory depends on the rom's platform), so the policy
+  // is injected. Here the test plays the part M3-1's folder map will.
+  {
+    const std::string fresh = "placed.srm";
+    sync::ExecuteOptions placing = OptionsAt(1'757'000'008);
+    placing.place = [&fresh](const sync::SyncOperation&) { return SavePath(fresh); };
+    const sync::ExecutionReport placed = sync::ExecutePlan(
+        client, *files, TokenFor(base, fixture), plan, /*targets=*/{}, placing);
+    checks.ExpectEq(placed.completed, 1,
+                    "a save with no local file lands where `place` said" +
+                        (placed.warnings.empty() ? std::string() : ": " + placed.warnings[0]));
+    checks.ExpectEq(sandbox.Read(SavePath(fresh)), server_bytes, "with the server's bytes");
+    if (!placed.operations.empty()) {
+      checks.Expect(placed.operations[0].backup_sd_path.empty(),
+                    "and no backup, because it replaced nothing");
+    }
+    // Without the policy the same operation refuses rather than guessing at a
+    // path -- writing the server's tagged name would produce a file no emulator
+    // loads, and the next tick would upload it back as a second save.
+    const sync::ExecutionReport guessing = sync::ExecutePlan(
+        client, *files, TokenFor(base, fixture), plan, /*targets=*/{}, OptionsAt(1'757'000'008));
+    checks.ExpectEq(guessing.failed, 1, "with no policy it is a named failure, not a guess");
+    if (!guessing.operations.empty()) {
+      checks.Expect(guessing.operations[0].error == sync::OperationError::kNoLocalSave,
+                    std::string("...named: ") + sync::ToString(guessing.operations[0].error));
+    }
+    checks.Expect(!sandbox.Exists(SavePath(server.file_name)),
+                  "and nothing was written under the server's own name");
+  }
 
   // And the same download again with nowhere to put the backup. `core/` cannot
   // create a directory with only standard headers -- that is the platform
@@ -797,6 +877,195 @@ void Truncate(rig::Checks& checks, http::HttpClient& client, const std::string& 
   harness::DeleteSave(client, base, fixture, server.id);
 }
 
+// --- corrupted ----------------------------------------------------------------
+//
+// The other half of "verify before anything replaces a save": a body that is
+// the right *length* and the wrong bytes. `execute.truncate` proves the size
+// check refuses a short body; only this one proves the digest refuses a
+// complete one, and the digest is the check that survives a proxy, a cache or a
+// server serving the wrong row.
+
+void Corrupted(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+               const Fixture& fixture, const harness::Rom& rom) {
+  Sandbox sandbox(checks, "execute-corrupted");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const std::string slot = harness::UniqueSlot("m2-5-corrupted");
+  const std::string name = "corrupted.srm";
+  const std::string previous = "the only copy of this save, and it must survive\n";
+  const std::string server_bytes = "the server's copy, the honest bytes\n";
+  // Byte for byte the same length, so the size check cannot be what refuses it.
+  const std::string impostor = std::string(server_bytes.size(), 'X');
+
+  sandbox.SeedSave(SavePath(name), previous);
+
+  const std::string staged = sandbox.Host("/config/rommsync/server-copy.srm");
+  rig::WriteFile(staged, server_bytes);
+  harness::Save server;
+  if (!harness::UploadSave(client, base, fixture, rom.id, slot, "m2-5", staged, name,
+                           /*with_device=*/false, &server)) {
+    checks.Expect(false, "the server copy was stored");
+    return;
+  }
+
+  sync::SyncNegotiatePayload payload;
+  payload.device_id = fixture.device_id;
+  payload.saves.push_back(harness::LocalSave(
+      rom.id, name, slot, "m2-5", crypto::Md5Hex(previous),
+      std::chrono::system_clock::now() - std::chrono::hours{1},
+      static_cast<std::int64_t>(previous.size())));
+
+  sync::SyncPlan plan;
+  if (!PlanFor(checks, client, base, fixture, payload, {slot}, &plan)) {
+    harness::DeleteSave(client, base, fixture, server.id);
+    return;
+  }
+  checks.Expect(plan.operations[0].server_content_hash.has_value(),
+                "the plan carries the digest the download is judged against");
+
+  const std::vector<sync::SaveTarget> targets = {{rom.id, slot, SavePath(name), name}};
+  sync::ExecutionReport report;
+  {
+    harness::Fault fault(checks, client, base,
+                         R"({"mode":"status","status":200,"body":")" + impostor +
+                             R"(","path":")" + server.ContentPath() + R"("})");
+    report = sync::ExecutePlan(client, *files, TokenFor(base, fixture), plan, targets,
+                               OptionsAt(1'757'000'010));
+  }
+
+  checks.ExpectEq(report.failed, 1, "bytes that are not the save are refused");
+  checks.ExpectEq(report.completed, 0, "and not counted as work done");
+  if (!report.operations.empty()) {
+    checks.Expect(report.operations[0].error == sync::OperationError::kUnverified,
+                  std::string("...by the digest, which is the only thing that could: ") +
+                      sync::ToString(report.operations[0].error) + " -- " +
+                      report.operations[0].message);
+  }
+  checks.ExpectEq(sandbox.Read(SavePath(name)), previous, "the local save is untouched");
+  checks.Expect(!sandbox.HasBackupOf(previous),
+                "and nothing was backed up: a refusal is not an overwrite");
+  checks.Expect(!sandbox.Exists(io::TempPathFor(SavePath(name))),
+                "the rejected bytes are gone, not left staged beside the save");
+
+  harness::DeleteSave(client, base, fixture, server.id);
+}
+
+// --- occupied -------------------------------------------------------------------
+//
+// The state `overwrite=true` exists for, which a fresh slot never reaches: the
+// server holds a save for this `(rom_id, slot)` and this device has no sync row
+// for it. That is `upload` / `Client save is newer (no sync history)`, and RomM
+// answers the same POST without the flag with a 409 -- refusing the very
+// operation it just planned. The scenario asserts both halves, because a test
+// that only shows the flag working cannot tell you the flag is doing anything.
+
+void Occupied(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+              const Fixture& fixture, const harness::Rom& rom) {
+  Sandbox sandbox(checks, "execute-occupied");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const std::string slot = harness::UniqueSlot("m2-5-occupied");
+  const std::string name = "occupied.srm";
+  const std::string bytes = "the bytes this device wants to send\n";
+
+  // Somebody else's upload: no `device_id`, so this device has no sync row for
+  // the save now sitting in the slot.
+  const std::string staged = sandbox.Host("/config/rommsync/server-copy.srm");
+  rig::WriteFile(staged, "the copy another device left in the slot\n");
+  harness::Save occupant;
+  if (!harness::UploadSave(client, base, fixture, rom.id, slot, "m2-5", staged, name,
+                           /*with_device=*/false, &occupant)) {
+    checks.Expect(false, "the slot was occupied");
+    return;
+  }
+
+  sandbox.SeedSave(SavePath(name), bytes);
+  sync::SyncNegotiatePayload payload;
+  payload.device_id = fixture.device_id;
+  payload.saves.push_back(harness::LocalSave(
+      rom.id, name, slot, "m2-5", crypto::Md5Hex(bytes),
+      std::chrono::system_clock::now() + std::chrono::seconds{300},
+      static_cast<std::int64_t>(bytes.size())));
+
+  sync::SyncPlan plan;
+  if (!PlanFor(checks, client, base, fixture, payload, {slot}, &plan)) {
+    harness::DeleteSave(client, base, fixture, occupant.id);
+    return;
+  }
+  checks.Expect(plan.operations[0].action == sync::Action::kUpload,
+                std::string("the client's newer save is an upload: ") +
+                    sync::ToString(plan.operations[0].action));
+  checks.Expect(plan.operations[0].reason == sync::Reason::kClientNewerNoHistory,
+                std::string("...with the reason overwrite=true exists for: ") +
+                    plan.operations[0].reason_text);
+
+  // The same request the executor is about to make, minus the one flag. This is
+  // the assertion the acceptance criterion is really about: without it, nothing
+  // here would notice `overwrite=true` being dropped.
+  {
+    http::Request refused = harness::Authed(
+        http::Method::kPost,
+        base + "/api/saves?rom_id=" + std::to_string(rom.id) + "&emulator=m2-5&slot=" + slot +
+            "&device_id=" + fixture.device_id,
+        fixture);
+    http::FormPart part;
+    part.name = "saveFile";
+    part.file_path = sandbox.Host(SavePath(name));
+    part.file_name = name;
+    part.content_type = "application/octet-stream";
+    refused.form.push_back(part);
+    const http::Result answered = client.Send(refused);
+    checks.ExpectEq(answered.response.status, 409,
+                    "without overwrite=true RomM refuses the upload it just planned: " +
+                        answered.response.body);
+  }
+
+  const std::vector<sync::SaveTarget> targets = {{rom.id, slot, SavePath(name), name}};
+  const sync::ExecutionReport report = sync::ExecutePlan(
+      client, *files, TokenFor(base, fixture), plan, targets, OptionsAt(1'757'000'011));
+
+  checks.ExpectEq(report.completed, 1,
+                  "and with it the plan executes as issued" +
+                      (report.warnings.empty() ? std::string() : ": " + report.warnings[0]));
+  if (report.operations.empty()) {
+    harness::DeleteSave(client, base, fixture, occupant.id);
+    return;
+  }
+  const sync::OperationResult& done = report.operations[0];
+  checks.Expect(done.error != sync::OperationError::kRefused,
+                "no 409 for the operation the server itself planned: " + done.message);
+
+  // What `overwrite=true` actually does to the occupant, measured rather than
+  // assumed -- and it is not what docs/SYNC_PROTOCOL.md said before this issue.
+  // It replaces the row **in place**: same id, and the stored name keeps the tag
+  // from the *first* ingest. Without the flag the same post makes a second row.
+  // So a slot does not accrete a row per tick, and the reason not to retry an
+  // upload inside a tick is not duplication (see the header of
+  // `sync_execute.hpp`).
+  if (!done.save_id.has_value()) {
+    checks.Expect(false, "the upload reports the save row it wrote: " + done.message);
+    harness::DeleteSave(client, base, fixture, occupant.id);
+    return;
+  }
+  checks.ExpectEq(*done.save_id, occupant.id,
+                  "overwrite=true moved the occupying row forward rather than adding one");
+  checks.Expect(DeviceIsSynced(client, base, fixture, *done.save_id),
+                "and the row now carries this device's sync history");
+
+  harness::Save after;
+  checks.Expect(harness::ReadSave(client.Send(harness::Authed(
+                                     http::Method::kGet,
+                                     base + "/api/saves/" + std::to_string(occupant.id), fixture)),
+                                 &after),
+                "the occupying row is readable afterwards");
+  checks.ExpectEq(after.file_name, occupant.file_name,
+                  "with the ingest tag it was first stored under");
+  checks.ExpectEq(after.file_size_bytes, static_cast<std::int64_t>(bytes.size()),
+                  "and this device's bytes in it");
+
+  harness::DeleteSave(client, base, fixture, occupant.id);
+}
+
 // --- dropped ------------------------------------------------------------------
 //
 // A real TCP reset mid-download. The save must survive it, and the next tick
@@ -853,13 +1122,16 @@ void Dropped(rig::Checks& checks, http::HttpClient& client, const std::string& b
   checks.ExpectEq(sandbox.Read(SavePath(name)), previous, "the save survived the reset");
   checks.Expect(!sandbox.HasBackupOf(previous),
                 "and nothing was backed up for an overwrite that never happened");
-  // What the interruption *does* leave, pinned because issue #16 has to reason
-  // about it on entry to the next tick: the backend's partial file, beside the
-  // staging path and not beside the save, and no completed staged copy.
-  checks.Expect(sandbox.Exists(io::TempPathFor(SavePath(name)) + ".part"),
-                "the partial download is left where a retry can see it");
+  // And leaves nothing behind. The backend keeps its `.part` for a resume that
+  // this client never performs, so a handled failure clears both it and the
+  // staging path -- otherwise a save whose download is interrupted and never
+  // planned again keeps a dead `Game.srm.tmp.part` on the card forever. What
+  // issue #16 still has to sweep is the same pair after a *crash*, where no
+  // cleanup got to run.
+  checks.Expect(!sandbox.Exists(io::TempPathFor(SavePath(name)) + ".part"),
+                "the partial is cleared: it is never resumed, so it is litter");
   checks.Expect(!sandbox.Exists(io::TempPathFor(SavePath(name))),
-                "and no completed staged copy, because none completed");
+                "and no staged copy, because none completed");
 
   // The next tick, which for this operation is the same operation: the plan is
   // still valid and nothing on the server changed. This is the whole claim --
@@ -1029,6 +1301,10 @@ int main(int argc, char** argv) {
     SameTimestamp(checks, *client, base, fixture, rom);
   } else if (scenario == "truncate") {
     Truncate(checks, *client, base, fixture, rom);
+  } else if (scenario == "corrupted") {
+    Corrupted(checks, *client, base, fixture, rom);
+  } else if (scenario == "occupied") {
+    Occupied(checks, *client, base, fixture, rom);
   } else if (scenario == "dropped") {
     Dropped(checks, *client, base, fixture, rom);
   } else if (scenario == "collision") {

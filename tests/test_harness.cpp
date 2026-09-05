@@ -89,20 +89,8 @@ const sync::SyncOperation* Classified(rig::Checks& checks, const std::string& bo
   return nullptr;
 }
 
-/// A save path on the card. `/retroarch/saves` is a real entry in the default
-/// folder map (config.cpp), not a path invented here.
-std::string SavePath(const std::string& file_name) {
-  return std::string(harness::kSavesDir) + "/" + file_name;
-}
-
-/// Wait long enough that two server timestamps are distinguishable.
-///
-/// RomM compares stored datetimes directly, but it also *renders* some of them
-/// to whole seconds, and `sync.hpp` sends whole seconds by design. A test that
-/// arranges "the server's copy changed after the last sync" inside one second
-/// is a test that passes or fails on how long a docker container took, so these
-/// wait instead of racing.
-void PassASecond() { std::this_thread::sleep_for(std::chrono::seconds{2}); }
+using harness::PassASecond;
+using harness::SavePath;
 
 /// Swallow `std::cerr` for the duration of a scope.
 ///

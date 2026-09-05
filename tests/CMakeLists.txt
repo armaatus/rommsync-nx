@@ -423,6 +423,8 @@ set(EXECUTE_RIG_SCENARIOS
   conflict        # both sides changed: keep both, lose nothing
   same_timestamp  # ...and the no-history conflict, resolved the same way
   truncate        # a clean short body never replaces a save
+  corrupted       # ...and neither do the right number of the wrong bytes
+  occupied        # overwrite=true, in the state it exists for: a 409 without it
   dropped         # a TCP reset mid-download costs a tick, not a save
   collision       # two saves of one rom, one second, two backups
 )

@@ -69,6 +69,19 @@ struct ReadResult {
   bool ok() const { return error == ReadError::kNone; }
 };
 
+/// True when `path` can be opened for reading.
+///
+/// What it is: the question a caller asks before naming a file it is about to
+/// create -- is this backup name already taken, is there a save here to
+/// preserve at all. What it is *not*: a lock. Nothing stops the answer from
+/// changing before the next call, and no caller here needs it to; on a console
+/// the engine is the only writer of these paths.
+///
+/// A file that exists and refuses to open reads as absent, which is the one way
+/// this differs from `ReadFile`'s careful `kMissing`/`kUnreadable` split. Every
+/// caller of this one goes on to open the file and gets the honest answer then.
+bool Exists(const std::string& path);
+
 /// Where a write stages the new contents, and where it parks the old ones.
 ///
 /// Public because a caller that recovers from an interrupted commit has to name
@@ -165,6 +178,14 @@ struct CopyResult {
 ///
 /// It is a copy and not a move: the point of the caller is that both files
 /// exist afterwards.
+///
+/// **Atomicity, not durability**, the same limit `WriteAtomically` states and
+/// worth restating because of what this one copies. The `fsync` that would make
+/// the backup's *data* durable before the save is overwritten is not exposed by
+/// the C++ standard library, so a card yanked between the copy and the
+/// overwrite can leave the rename durable and the copied bytes not. No reader
+/// ever sees half a backup; surviving a power cut at that instant needs a
+/// platform hook, and is issue #16's (docs/SYNC_PROTOCOL.md#backups).
 CopyResult CopyAtomically(const std::string& from, const std::string& to);
 
 /// Read a whole file.

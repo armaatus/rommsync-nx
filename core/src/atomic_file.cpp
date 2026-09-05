@@ -13,15 +13,6 @@ namespace {
 constexpr const char* kTempSuffix = ".tmp";
 constexpr const char* kPreviousSuffix = ".old";
 
-bool Exists(const std::string& path) {
-  std::FILE* file = std::fopen(path.c_str(), "rb");
-  if (file == nullptr) {
-    return false;
-  }
-  std::fclose(file);
-  return true;
-}
-
 std::string Describe(const std::string& path, std::string_view what) {
   return path + ": " + std::string(what);
 }
@@ -85,6 +76,15 @@ const char* ToString(ReadError error) {
       return "unreadable";
   }
   return "none";
+}
+
+bool Exists(const std::string& path) {
+  std::FILE* file = std::fopen(path.c_str(), "rb");
+  if (file == nullptr) {
+    return false;
+  }
+  std::fclose(file);
+  return true;
 }
 
 std::string TempPathFor(std::string_view path) { return std::string(path) + kTempSuffix; }
