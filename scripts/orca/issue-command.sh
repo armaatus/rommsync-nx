@@ -94,9 +94,19 @@ while it waits:
 
     ./scripts/orca/await-review.sh
 
-It returns when the review lands. Fix what is real; where you disagree, reply on
-the thread with the reason rather than silently ignoring it. Reply to and resolve
-every thread, push, and re-request review. Then:
+It returns when the review lands. **A clean verdict is not the same as no
+findings.** A review can come back COMMENTED and still carry inline comments,
+each of which is a THREAD, and `merge-gate` refuses to merge while any thread is
+unresolved. #88 and #89 both sat blocked on exactly one unresolved thread with
+every check green.
+
+So after every review, whatever its verdict:
+
+    gh api repos/{owner}/{repo}/pulls/<n>/comments --jq '.[]|"\(.path):\(.line)  \(.body)"'
+
+Fix what is real; where you disagree, reply on the thread with your reasoning --
+both are acceptable, silence is not. Then RESOLVE each thread (the
+`resolveReviewThread` GraphQL mutation), push if you changed anything, and:
 
     ./scripts/orca/review-status.sh
 
