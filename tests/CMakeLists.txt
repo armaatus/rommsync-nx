@@ -582,7 +582,7 @@ set(HARNESS_SCENARIOS
   resume          # a TCP reset mid-rom, then Range resume, byte for byte
   truncate        # a clean short body, caught only by the caller's expected size
   stall           # a server that says nothing: one tick lost, nothing else
-  multifile       # the two-disc fixture, and the two traps around it
+  multifile       # the two-disc fixture, its traps, and the nested rom beside it
   backup          # back up FIRST, proven by interrupting the overwrite
   content_hash    # the MD5 this client computes is the one RomM compares against
 )
@@ -923,6 +923,7 @@ set(DOWNLOAD_RIG_SCENARIOS
   staging    # M3-3: a leftover .tmp is salvaged by its digest, or discarded
   disabled   # `[downloads] enabled = false` drains nothing and loses nothing
   multifile  # a disc set is refused with a reason and no archive reaches the card
+  nested     # ...and a directory holding ONE file is downloaded, not refused
   missing    # a rom the server's library no longer holds fails with a sentence
 )
 foreach(scenario IN LISTS DOWNLOAD_RIG_SCENARIOS)

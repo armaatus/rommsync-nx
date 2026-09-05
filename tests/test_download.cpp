@@ -29,6 +29,7 @@
 //   staging    -- what an interrupted attempt leaves behind: salvaged, or discarded
 //   disabled   -- `[downloads] enabled = false` drains nothing and loses nothing
 //   multifile  -- a disc set is refused with a reason and no archive reaches the card
+//   nested     -- ...and the directory-shaped rom beside it is downloaded, not refused
 //   missing    -- a rom the server's library no longer holds fails with a sentence
 #include <chrono>
 #include <cstddef>
@@ -1520,6 +1521,86 @@ void Multifile(checks::Checks& c, http::HttpClient& client, const std::string& b
   c.ExpectEq(rig.queue.pending(), std::size_t{0}, "the worker has nothing left to do");
 }
 
+/// The other half of M3-4's decision: the rom the skip must NOT fire on.
+///
+/// `Synthetic Nested Game` is a *directory* holding exactly one file, which RomM
+/// reports as `has_nested_single_file: true` with `has_multiple_files: false`.
+/// Everything that makes a disc set unsafe is absent -- the whole-rom endpoint
+/// serves the file itself with a length, and the rom-level `sha1_hash` is the
+/// digest of exactly those bytes (`harness.multifile` pins both against the live
+/// server). So it downloads like any other rom, and this is what says so: a
+/// check written against "is a directory" rather than `has_multiple_files` would
+/// refuse a rom this client handles perfectly well, and refuse it silently.
+void Nested(checks::Checks& c, http::HttpClient& client, const std::string& base,
+            const harness::Fixture& fixture) {
+  Rig rig(c, "download-nested", base, fixture);
+  harness::Rom rom;
+  const std::int64_t rom_id =
+      Queued(c, client, base, fixture, &rig.queue, "Synthetic Nested Game", &rom);
+  if (rom_id == 0) {
+    return;
+  }
+
+  // The list item this decision is made from, straight off the live server.
+  c.Expect(rom.has_nested_single_file, "GET /api/roms reports the fixture as a nested single file");
+  c.Expect(!rom.has_multiple_files, "and not as a multi-file rom");
+
+  // The door. The same index that refuses the two-disc rom with `kMultiFile`
+  // accepts this one -- so the refusal is keyed on `has_multiple_files` and not
+  // on anything the two roms share, which is everything else: both are psx, both
+  // are directories on the server, and neither has a file extension.
+  roms::FetchOptions fetch;
+  fetch.base_url = base;
+  fetch.bearer_token = fixture.token;
+  const roms::FetchResult library = roms::FetchRomIndex(client, fetch);
+  c.Expect(library.ok(), "the rom index fetches: " + library.message);
+  std::int32_t position = 0;
+  download::Queue guarded;
+  c.Expect(download::EnqueueRom(guarded, library.index, rom_id, &position) == ipc::Error::kOk,
+           "a nested single-file rom is accepted at the door, not refused as a disc set");
+  c.ExpectEq(guarded.size(), std::size_t{1}, "and is queued");
+
+  const download::DrainResult result = rig.Drain(client);
+  c.Expect(result.outcome == download::DrainOutcome::kCompleted,
+           std::string("the drain completed -- got ") + download::ToString(result.outcome) + " (" +
+               result.message + ")");
+  c.ExpectEq(result.downloaded, 1, "the rom came down");
+  c.ExpectEq(result.skipped, 0, "and nothing was skipped");
+
+  // `fs_name` is the *directory's* name, so that is what the rom is called on
+  // the card -- the inner file's `.bin` is not part of it. Pinned rather than
+  // corrected: v1 writes what RomM names the rom, and a rename would have to be
+  // the same rename on every code path that later looks for the file.
+  const std::string destination = "/tico/roms/psx/Synthetic Nested Game";
+  const std::string expected =
+      FixtureRom("roms/psx/Synthetic Nested Game/Synthetic Nested Game.bin");
+  c.Expect(!expected.empty(), "the fixture's nested file is readable");
+  c.Expect(rig.sandbox.Exists(destination), "the rom is at the destination the folder map names");
+  c.Expect(rig.sandbox.Read(destination) == expected,
+           "and its bytes are the one file inside the rom's directory, exactly");
+
+  const QueueEntry entry = rig.Persisted(rom_id);
+  c.Expect(entry.state == QueueState::kDone, "the entry is done, not skipped");
+  c.Expect(entry.message.find("disc") == std::string::npos,
+           "with no disc-set refusal recorded against it");
+  c.ExpectEq(entry.destination, destination, "and records where it went");
+  c.ExpectEq(entry.fs_name, std::string("Synthetic Nested Game"),
+             "under the name RomM gave the rom, which is the directory's");
+  c.ExpectEq(entry.platform_fs_slug, std::string("psx"), "keyed on the fs slug");
+  c.ExpectEq(entry.size_bytes, static_cast<std::int64_t>(expected.size()),
+             "for the size the server declared -- the file's, not a directory's");
+
+  // The hash M3-3 checks is the rom's own, and for a nested single-file rom it
+  // is the digest of the bytes that arrived. This is exactly what a disc set
+  // does not have, and the reason the two are treated differently.
+  c.Expect(!entry.sha1_hash.empty(), "the rom-level hash is recorded");
+  c.ExpectEq(crypto::Sha1FileHex(rig.sandbox.Host(destination)), entry.sha1_hash,
+             "and the file on the card hashes to it");
+
+  c.Expect(!rig.sandbox.Exists(destination + ".tmp"), "nothing is left staged beside it");
+  c.ExpectEq(rig.queue.pending(), std::size_t{0}, "and the worker has nothing left to do");
+}
+
 /// `missing_from_fs: true` -- RomM knows the rom and its file is gone from the
 /// server's own filesystem.
 ///
@@ -1679,6 +1760,8 @@ int main(int argc, char** argv) {
     Disabled(checks, *client, base, fixture);
   } else if (scenario == "multifile") {
     Multifile(checks, *client, base, fixture);
+  } else if (scenario == "nested") {
+    Nested(checks, *client, base, fixture);
   } else if (scenario == "missing") {
     Missing(checks, *client, base, fixture);
   } else {

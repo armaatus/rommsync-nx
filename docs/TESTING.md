@@ -231,9 +231,10 @@ ctest --test-dir build --output-on-failure
   deterministic and offline.
 - [`seed.sh`](../server/testing/seed.sh) populates the library from
   `roms.manifest` — **homebrew and freely redistributable ROMs only**,
-  checksum-pinned, since it is fetched in public CI. Two fixtures no real ROM
+  checksum-pinned, since it is fetched in public CI. Three fixtures no real ROM
   provides are generated deterministically instead: a large file for `Range`
-  resume, and a multi-file rom directory for the `has_multiple_files` skip.
+  resume, a multi-file rom directory for the `has_multiple_files` skip, and a
+  single-file rom directory for the nested rom that skip must not fire on.
 - Every save-overwrite test asserts a backup is written **first**
   ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md) hard rule).
 - The `http.*` tests cover the native `HttpClient` backend end to end: `get`,
@@ -399,7 +400,10 @@ ctest --test-dir build --output-on-failure
   rom, then a `Range` resume, compared **byte for byte** against the file RomM
   is serving), `truncate` (a clean short body over a save — caught only by the
   caller's own expected size, which the scenario proves by showing the same body
-  accepted without one), `stall`, `multifile`, `backup`, and `content_hash` (M2-3's digest, checked
+  accepted without one), `stall`, `multifile` (the two-disc fixture: the zip with
+  no length, the rom digest that is neither disc's, the unscoped `/files/content/`
+  id, the `?file_ids=` route a v2 would take, and the nested single-file rom the
+  skip must not fire on), `backup`, and `content_hash` (M2-3's digest, checked
   against the one the server computed).
 - Two of them are about the harness rather than the engine, and they are the
   ones that keep the rest honest. `harness.sandbox` needs no server and never
