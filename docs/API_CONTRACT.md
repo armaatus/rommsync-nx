@@ -400,7 +400,8 @@ empty `operations` array.
 | GET | `/api/saves` | list; filter `rom_id, platform_id, device_id, slot` |
 | POST | `/api/saves` | upload; query `rom_id*, emulator, slot, device_id, session_id, overwrite, autocleanup, autocleanup_limit`; multipart field **`saveFile`** (+ optional `screenshotFile`) |
 | PUT | `/api/saves/{id}` | replace one save's bytes in place; query `device_id` |
-| GET | `/api/saves/{id}/content` | download raw save bytes |
+| GET | `/api/saves/{id}` | one save → `SaveSchema`; query `device_id` — see `device_syncs` below |
+| GET | `/api/saves/{id}/content` | download raw save bytes; query `device_id`, `session_id` — **do not send them**, see below |
 | GET | `/api/saves/identifiers` | lightweight id/hash listing |
 | POST | `/api/saves/{id}/downloaded` | `{device_id}` — record that this device now holds this save |
 | POST | `/api/saves/delete` | `{saves: [id, …]}` |
@@ -458,6 +459,33 @@ written by **both** sides of the loop, as long as `device_id` is passed: an
 upload writes one at the save's new `updated_at` (visible in the capture above),
 and `POST /api/saves/{id}/downloaded` writes one for a save this device pulled.
 Skip either and the device stays in negotiate's no-sync-history branch forever.
+
+**Verified — reading a save back only shows `device_syncs` if the read names a
+device.** `GET /api/saves/{id}` and `GET /api/saves` answer `"device_syncs": []`
+unless the query carries `device_id`, whatever rows exist; with it, the row comes
+back. The `id` is unchanged by asking, so it is a filter and not a write — the
+`last_synced_at` it answers with is the one the upload wrote. This matters
+because an empty array reads exactly like *"this device has never synced this
+save"*, which is the state the whole arbitration hangs on: a client (or a test)
+that checks its own history without passing `device_id` concludes that every
+upload it just made wrote nothing. `execute.upload` and `execute.download` assert
+on it, and pass `device_id`.
+
+**`GET /api/saves/{id}/content` takes `device_id` and `session_id` too, and the
+client must not use them.** Passing `device_id` there records the download at the
+moment the bytes are *requested*, before anything has verified them, so a
+truncated body or one that fails its MD5 would still leave the device claiming it
+holds the save. `sync::ExecutePlan` fetches the content unadorned and calls
+`POST /api/saves/{id}/downloaded` only after the verified bytes are on the card
+(docs/SYNC_PROTOCOL.md#the-order-every-overwrite-goes-through).
+
+**A negotiate operation carries no size, so an executing client needs
+`GET /api/saves/{id}`.** `SyncOperationSchema` has nine fields and
+`file_size_bytes` is not one of them, and without a size
+`http::DownloadTarget::expected_size` is zero — which means a body that ends
+cleanly and early cannot be told from a complete one, because RomM's own
+`Content-Length` is what the shortening removed. That is the shape
+`server/testing/fault_proxy.py`'s `truncate` mode produces on purpose.
 
 **An upload needs `overwrite=true`.** With a `device_id` and a `slot`, `POST
 /api/saves` answers `409 {"detail": "Slot has a newer save since your last

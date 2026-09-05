@@ -40,6 +40,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <random>
 #include <string>
 #include <string_view>
@@ -50,6 +51,7 @@
 #include "rig.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/sync.hpp"
+#include "rommsync/sync_execute.hpp"
 
 namespace harness {
 
@@ -209,23 +211,20 @@ class Sandbox {
   }
 
   /// Where the backup of a save goes:
-  /// `/config/rommsync/.backup/<rom_id>-<unix seconds>.<ext>`, the layout
-  /// docs/SYNC_PROTOCOL.md specifies. Here rather than in each test so the
-  /// audit and the code under test cannot disagree about where to look.
+  /// `/config/rommsync/.backup/<rom_id>-<slot>-<unix seconds>.<ext>`. Here
+  /// rather than in each test, and delegating to the engine's own
+  /// `sync::BackupFileName`, so the audit and the code under test cannot
+  /// disagree about where to look.
   ///
-  /// Note what that layout does *not* contain: the save's name or its slot. Two
-  /// saves of the same rom -- two slots, or a save and its state -- backed up in
-  /// the same second produce the same path, and the second backup destroys the
-  /// first. This helper is deliberately faithful to the documented scheme rather
-  /// than quietly fixing it, because the fix is M2-5's to make; see the note in
-  /// docs/SYNC_PROTOCOL.md.
-  std::string BackupPathFor(std::int64_t rom_id, std::string_view file_name) const {
-    const std::size_t dot = file_name.rfind('.');
-    const std::string extension =
-        dot == std::string_view::npos ? std::string() : std::string(file_name.substr(dot));
+  /// **The slot is in the name because the documented scheme was unsafe**, and
+  /// M2-5 fixed it: `<rom_id>-<ts>.<ext>` carries neither the slot nor the
+  /// save's own name, so two saves of one rom backed up in the same second --
+  /// one rom with two slots, or a save and its state -- were the same file, and
+  /// the second backup destroyed the first.
+  std::string BackupPathFor(std::int64_t rom_id, const std::optional<std::string>& slot,
+                            std::string_view file_name) const {
     const std::int64_t now = sync::UnixSeconds(std::chrono::system_clock::now());
-    return std::string(kBackupDir) + "/" + std::to_string(rom_id) + "-" + std::to_string(now) +
-           extension;
+    return std::string(kBackupDir) + "/" + sync::BackupFileName(rom_id, slot, file_name, now);
   }
 
  private:

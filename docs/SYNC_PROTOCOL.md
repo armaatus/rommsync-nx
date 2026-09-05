@@ -178,14 +178,66 @@ Pass `session_id` on uploads so the server ties them to this session, and
 `device_id` so the sync history that the *next* negotiation arbitrates against is
 written. Track `operations_completed` / `operations_failed`.
 
-Backups go to `sdmc:/config/rommsync/.backup/<rom_id>-<ts>.<ext>`. Never destroy
-a save without a backup — this is a hard rule.
+### The order every overwrite goes through
 
-That name carries neither the slot nor the save's own name, so **two saves of one
-rom backed up in the same second are the same file**, and the second backup
-destroys the first — one rom with two slots, or a save and its state, is enough.
-Whatever M2-5 writes has to disambiguate them; `harness.backup` currently steps
-around the collision rather than hiding it (`Sandbox::BackupPathFor`).
+`sync::ExecutePlan`
+([`core/include/rommsync/sync_execute.hpp`](../core/include/rommsync/sync_execute.hpp))
+is the only thing that acts on a plan, and a `download` or a `conflict` is four
+steps in this order and no other:
+
+1. **fetch to `io::TempPathFor(<save>)`, never to the save.**
+   `http::DownloadTarget` renames its `.part` onto the destination the moment
+   the body ends — which is before anything has checked that the bytes are the
+   save the plan meant. Pointing it at the save file would replace it with an
+   unverified body, and the `.part` mechanism would not have caught it, because
+   the body was complete. It was just the wrong save, or a body a proxy
+   shortened without saying so.
+2. **verify** the staged bytes' MD5 against `server_content_hash`. A mismatch
+   discards them and leaves the local file untouched — a *successful* refusal.
+3. **back up** the save's current bytes, streamed with `io::CopyAtomically`
+   (`io::WriteAtomically` takes a `string_view`, and a save state does not fit
+   in the sysmodule's heap).
+4. **commit** with `io::CommitStaged`, which is `WriteAtomically`'s two-rename
+   commit for a file that arrived on disk rather than as a string.
+
+Step 4 cannot start until step 3 has succeeded, and every step before it can
+fail without the save changing at all. A missing `.backup/` therefore *stops*
+the overwrite: `core/` cannot create a directory with only standard headers —
+that is the platform layer's job — and no backup means no overwrite.
+
+**A negotiate operation carries no size**, so `expected_size` comes from a
+preflight `GET /api/saves/{id}`. Without one, a body that ends cleanly and early
+is indistinguishable from a complete one; that is exactly what the fault proxy's
+`truncate` mode produces, and `execute.truncate` is the scenario.
+
+**There is no retry inside a tick.** An upload is not idempotent — the datetime
+tag makes a second `POST` a second save row with no sync history — so a failed
+operation is counted, left alone, and picked up by the next negotiation. M2-7
+owns the schedule between ticks.
+
+**A save the client has no local file for** (`download` /
+`Save exists on server but not on client`) needs a destination the plan cannot
+supply: the server's `file_name` carries the ingest tag and the directory
+depends on the rom's platform. `ExecuteOptions::place` is where that policy is
+injected, and it needs the rom index plus the platform→folder map (M3-1); with
+none supplied the operation fails by name rather than guessing at a path.
+
+### Backups
+
+Backups go to `sdmc:/config/rommsync/.backup/<rom_id>-<slot>-<ts>.<ext>`. Never
+destroy a save without a backup — this is a hard rule.
+
+**The slot is in the name because the first scheme was unsafe.**
+`<rom_id>-<ts>.<ext>` carries neither the slot nor the save's own name, so two
+saves of one rom backed up in the same second were the same file and the second
+backup destroyed the first — one rom with two slots, or a save and its state,
+was enough. `(rom_id, slot)` is the pair RomM keys a save on, so it is the pair
+that separates two of them. A `null` slot spells itself `archival`, every byte
+outside `[A-Za-z0-9._-]` becomes `_` so a slot cannot carry a separator out of
+`.backup/`, and a name that is somehow still taken gets `-1`, `-2`, … rather
+than being written over. `sync::BackupFileName` is the one spelling of that,
+and `harness::Sandbox::BackupPathFor` calls it so the audit and the code under
+test cannot disagree.
 
 ### Conflicts
 

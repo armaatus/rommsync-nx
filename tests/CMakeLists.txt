@@ -390,6 +390,53 @@ foreach(scenario IN LISTS SYNC_SCENARIOS)
   set_tests_properties(sync.${scenario} PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 endforeach()
 
+# --- step 2: executing the plan ----------------------------------------------
+# M2-5, the issue that carries the project's one hard guarantee. Every rig
+# scenario runs `sync::ExecutePlan` inside a `harness::Sandbox`, so the
+# backup-before-overwrite audit judges each one on teardown.
+#
+# `naming`, `staging` and `counting` are deliberately NOT in the skippable list:
+# the backup path that used to collide, the two `io` primitives an overwrite
+# goes through, and the counts M2-6 reports to `complete` need no server, so
+# they must stay checked with docker stopped.
+add_executable(test_sync_execute test_sync_execute.cpp)
+target_link_libraries(test_sync_execute PRIVATE rommsync::host)
+target_include_directories(test_sync_execute PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_sync_execute PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+
+set(EXECUTE_UNIT_SCENARIOS
+  naming   # the backup path carries the slot, so one rom's two saves are two files
+  staging  # the streamed copy and the two-rename commit an overwrite goes through
+  counting # no-op, a downgraded action, and the two refusals that need no server
+)
+foreach(scenario IN LISTS EXECUTE_UNIT_SCENARIOS)
+  add_test(NAME execute.${scenario} COMMAND test_sync_execute ${scenario})
+  set_tests_properties(execute.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
+set(EXECUTE_RIG_SCENARIOS
+  upload          # overwrite=true, session_id and device_id -- and no 409
+  download        # verify, back up, commit, confirm -- in that order
+  conflict        # both sides changed: keep both, lose nothing
+  same_timestamp  # ...and the no-history conflict, resolved the same way
+  truncate        # a clean short body never replaces a save
+  dropped         # a TCP reset mid-download costs a tick, not a save
+  collision       # two saves of one rom, one second, two backups
+)
+foreach(scenario IN LISTS EXECUTE_RIG_SCENARIOS)
+  add_test(NAME execute.${scenario} COMMAND test_sync_execute ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(execute.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  # RUN_SERIAL for the reason every rig test needs it: the fault proxy holds one
+  # armed scenario for all clients, and these upload and delete saves on the
+  # shared fixture device.
+  set_tests_properties(execute.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+endforeach()
+
 # --- step 0: the local scan and its rom matching -----------------------------
 # M2-2. The first four scenarios need no server and must stay checked with
 # docker stopped: what they pin is the decision that an ambiguous name is
