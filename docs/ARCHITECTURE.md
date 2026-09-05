@@ -18,6 +18,14 @@ boot by Atmosphère. No UI. Responsibilities:
   keep the sysmodule's memory footprint viable. This is the single biggest
   technical risk; it is isolated behind an `HttpClient` interface so it can be
   swapped. ([DEVELOPMENT.md](DEVELOPMENT.md#tls-in-a-sysmodule))
+- **SD enumeration** — reading a directory is the second thing after HTTP that
+  Horizon and the host do differently (`fsdev`/`readdir` over `sdmc:` versus
+  `<filesystem>`), so it sits behind the `fs::FileSystem` interface in
+  `core/include/rommsync/file_system.hpp`. It also owns the one mapping the rest
+  of the engine cannot do for itself — `Resolve` turns an SD-root path into the
+  one `io::ReadFile` and `state::HashFile` can open. The host backend is
+  `host/native_file_system.cpp`; **the Horizon one is not written yet** and is
+  what the save scanner needs on the console.
 - **Sync engine** — the negotiate → execute → complete loop.
   ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md))
 - **Download worker** — drains a queue of rom ids, downloads (with `Range`

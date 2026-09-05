@@ -21,8 +21,35 @@ For each file under the configured save/state dirs:
    RetroArch's flat `saves/` doesn't — match by name across the library then).
 4. Ambiguous match (same base name on two platforms, no platform hint) → skip and
    log; never guess.
+5. Derive the `slot` from the emulator the folder belongs to and the save's own
+   extension (`retroarch-srm`). It pairs with `rom_id` on the server, so it has
+   to be **derived, not chosen**: a slot that changes between ticks makes the
+   same file a new save every tick. The emulator is in it because RomM pairs on
+   `(rom_id, slot)` alone — a rom whose RetroArch `.srm` and Tico `.srm` both
+   mapped to `srm` would have the two files overwrite each other through the
+   server, forever.
+6. Validate the record before emitting it. A save the encoder would refuse — an
+   mtime of 0 from a console with an unset clock, a name the server would read
+   as a path — is skipped with a reason, because `EncodeNegotiateRequest` stops
+   at the first bad entry and would otherwise cost the tick every other save.
+7. Fill `content_hash` from `state::ContentHashFor` — the baseline's digest when
+   the file's mtime **and** size still match, a fresh read otherwise. **Never
+   leave it null to save a read**: a save reported without a digest is compared
+   on timestamps and planned as an `upload` the server already has, on this tick
+   and every tick after it. The one legitimate null is a file whose bytes could
+   not be read at all, which is still reported — less precisely — and counted.
+
+The scanner names files by their SD-root path (`/retroarch/saves/Game.srm`).
+Opening one needs the platform prefix, so it is `fs::FileSystem::Resolve` that
+turns it into something `io::ReadFile` and `state::HashFile` can open —
+`sdmc:…` on Horizon, a path under the card's root on the host. Nothing above
+that interface learns which.
 
 Cache the rom index (`GET /api/roms`) per tick; it's also needed by downloads.
+**It answers an envelope, `{items, total, limit, offset}`, not a bare array, so
+it has to be paged** — a client that reads `items` and stops has whatever page
+size RomM felt like giving it, and a rom on the last page is exactly the one a
+save is going to need.
 
 ## Step 1 — negotiate
 

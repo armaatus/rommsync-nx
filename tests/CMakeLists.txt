@@ -325,6 +325,48 @@ foreach(scenario IN LISTS SYNC_SCENARIOS)
   set_tests_properties(sync.${scenario} PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 endforeach()
 
+# --- step 0: the local scan and its rom matching -----------------------------
+# M2-2. The first four scenarios need no server and must stay checked with
+# docker stopped: what they pin is the decision that an ambiguous name is
+# skipped rather than guessed, and a wrong match is not a failed tick -- it is
+# one game's save uploaded over another game's. `library` and `paging` need the
+# real RomM, because the envelope `GET /api/roms` answers and the fields it
+# sends are the two things a fake index cannot be wrong about.
+add_executable(test_save_scan test_save_scan.cpp)
+target_link_libraries(test_save_scan PRIVATE rommsync::host)
+target_include_directories(test_save_scan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_save_scan PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+
+set(SCAN_UNIT_SCENARIOS
+  names        # base names, emulators, slots, and which folder implies a platform
+  ambiguous    # one name on two platforms, in a hintless folder, is skipped
+  walked_once  # RetroArch's flat saves/, listed under a dozen platforms
+  unusable     # a record sync::Validate refuses costs one file, not the tick
+  truncated    # a directory past kMaxDirectoryEntries keeps a set that does not move
+  hashing      # the digest is real, reused when nothing changed, null only when unreadable
+)
+foreach(scenario IN LISTS SCAN_UNIT_SCENARIOS)
+  add_test(NAME scan.${scenario} COMMAND test_save_scan ${scenario})
+  set_tests_properties(scan.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
+set(SCAN_RIG_SCENARIOS
+  library  # a Sandbox scanned against the docker library, end to end
+  paging   # limit=1 over the seeded library still finds a rom on the last page
+)
+foreach(scenario IN LISTS SCAN_RIG_SCENARIOS)
+  add_test(NAME scan.${scenario} COMMAND test_save_scan ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(scan.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  # Every rig test goes through the fault proxy, which holds one armed scenario
+  # for all clients.
+  set_tests_properties(scan.${scenario} PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
+endforeach()
+
 # --- the host harness, and the edge cases only the fault proxy can force -----
 # M0-5. One CTest entry per scenario, same shape as the rest of this file, so a
 # red run names the behaviour rather than "the harness tests".
