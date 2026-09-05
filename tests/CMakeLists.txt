@@ -741,14 +741,16 @@ set_tests_properties(switch.ci_requires_artifacts PROPERTIES TIMEOUT 60)
 # The real cross-compile, in the same devkitpro/devkita64 image CI uses. It needs
 # that image, which the CI host runner does not have and will not pull for 2.7GB.
 #
-# Read the next line before changing it: this is the ONLY test in this file whose
-# SKIP_RETURN_CODE is not wrapped in if(NOT ROMMSYNC_REQUIRE_RIG). Every other
-# skippable test flips to a failure under that option precisely so CI cannot go
-# green on a skip -- and that is the right default, so the exception needs its
-# reason recorded rather than inferred. The reason is that this one's enforcement
-# lives in a different CI job: `switch-build` in .github/workflows/ci.yml runs
-# the same build, in the same image, on every push, and fails there. This entry
-# is its local equivalent, not its enforcement.
+# Read the next line before changing it: this test's SKIP_RETURN_CODE is not
+# wrapped in if(NOT ROMMSYNC_REQUIRE_RIG). Every other skippable test flips to a
+# failure under that option precisely so CI cannot go green on a skip -- and
+# that is the right default, so each exception needs its reason recorded rather
+# than inferred. There are three, and only two of them have this one's reason:
+# `switch.builds` and `switch.tlsprobe` are enforced by a different CI job --
+# `switch-build` in .github/workflows/ci.yml runs the same builds, in the same
+# image, on every push, and fails there -- so these entries are its local
+# equivalent, not its enforcement. `package.builds` is the third and does NOT
+# have that reason; see the note on it below.
 #
 # So do not "fix" it by wrapping it like the others. That would fail the
 # host-tests job on a runner that has no devkitpro image -- which is every runner

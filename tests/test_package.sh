@@ -307,7 +307,10 @@ phase_upgrade() {
   # a flags/ directory could not promise.
   local line path
   while IFS= read -r line; do
-    path="${line##* }"
+    # `cksum` prints `crc size path`, so the path is everything after the second
+    # field -- not after the last space, which would truncate a path containing
+    # one and could slip past the exemptions below.
+    path="${line#* * }"
     case "$path" in
       *"/atmosphere/contents/$tid/exefs.nsp"|*"/switch/.overlays/ovl-rommsync.ovl"| \
       ./README.txt|./LICENSE)
@@ -347,15 +350,18 @@ phase_builds() {
         "$REPO_ROOT/packaging" "$SCRATCH/"
   mkdir -p "$SCRATCH/scripts"
   cp "$PACKAGE" "$SCRATCH/scripts/"
-  # Sources only. A .nsp left over from a local build is exactly what make would
-  # accept as already up to date, and the assertions below would then be reading
-  # the previous build's output rather than this one's.
+  # Sources only, so the assertions below read this build's output and not a
+  # previous one's. Removing the object directory is what actually forces the
+  # rebuild -- `$(OUTPUT).elf: $(OFILES)` and the objects live in `build/`, so
+  # the whole link chain is already out of date once it is gone. Clearing the
+  # target's own outputs on top of that is defence in depth against a make rule
+  # that stops going through the objects.
   #
   # Named by extension rather than cleared with a `sys-rommsync.*` glob: that
-  # glob also matches sys-rommsync.json -- the NPDM config the build needs and
-  # `title_id()` reads the id out of -- so a glob leaves a restoring `cp` behind
-  # it that is load-bearing and looks incidental. Nothing here deletes something
-  # it then has to put back.
+  # glob also matches sys-rommsync.json, the NPDM config without which npdmtool
+  # produces no .npdm and the .nsp does not link -- so a glob leaves a restoring
+  # `cp` behind it that is load-bearing and looks incidental. Nothing here
+  # deletes something it then has to put back.
   local target ext
   rm -rf "$SCRATCH/sysmodule/build" "$SCRATCH/overlay/build"
   for target in sysmodule/sys-rommsync overlay/ovl-rommsync; do

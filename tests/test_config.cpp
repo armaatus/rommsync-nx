@@ -720,10 +720,17 @@ void TheShippedExampleParses(checks::Checks& c) {
   c.ExpectEq(result.value.sync.interval_min, defaults.sync.interval_min,
              "the interval is the built-in default");
   c.ExpectEq(result.value.sync.enabled, defaults.sync.enabled, "so is [sync] enabled");
+  c.ExpectEq(result.value.sync.on_boot, defaults.sync.on_boot, "so is [sync] on_boot");
   c.ExpectEq(result.value.sync.saves, defaults.sync.saves, "so is [sync] saves");
   c.ExpectEq(result.value.sync.states, defaults.sync.states, "so is [sync] states");
+  c.ExpectEq(result.value.sync.conflict_show, defaults.sync.conflict_show,
+             "so is [sync] conflict_show");
+  c.ExpectEq(result.value.downloads.enabled, defaults.downloads.enabled,
+             "so is [downloads] enabled");
   c.ExpectEq(result.value.downloads.verify_hash, defaults.downloads.verify_hash,
-             "and so is [downloads] verify_hash");
+             "so is [downloads] verify_hash");
+  c.ExpectEq(result.value.downloads.resume, defaults.downloads.resume,
+             "and so is [downloads] resume");
   // The folder map is commented out, so the built-in one survives a copy whole.
   c.ExpectEq(result.value.RomTarget("snes"), defaults.RomTarget("snes"),
              "the built-in folder map is untouched");
