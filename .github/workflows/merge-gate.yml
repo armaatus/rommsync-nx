@@ -89,7 +89,6 @@ jobs:
             }' >pr.json
 
       - name: Decide
-        id: decide
         run: |
           set -euo pipefail
           # The base branch may not have the gate yet -- on the pull request that
@@ -146,14 +145,40 @@ jobs:
             echo "::warning title=Could not look for stale gate failures::$listing"
             exit 0
           fi
+          # `cancelled` as well as `failure`. A cancelled run is just as
+          # non-passing to branch protection, and if the filter only matched
+          # failures then any run this job accidentally cancelled could never be
+          # picked up again -- permanently unclearable without a human, which is
+          # the thing this job exists to avoid.
           stale="$(printf '%s' "$listing" | jq -r \
-            "[.[] | select(.headSha==\"$HEAD_SHA\" and .conclusion==\"failure\" and (.databaseId|tostring)!=\"$SELF\")] | .[].databaseId")"
+            "[.[] | select(.headSha==\"$HEAD_SHA\" and (.conclusion==\"failure\" or .conclusion==\"cancelled\") and (.databaseId|tostring)!=\"$SELF\")] | .[].databaseId")"
           if [ -z "$stale" ]; then
-            echo "no stale gate failures on $HEAD_SHA"
+            echo "no stale gate runs on $HEAD_SHA"
             exit 0
           fi
+
+          # ONE AT A TIME, waiting for each to finish before starting the next.
+          #
+          # `gh run rerun` returns as soon as the API accepts it, and every gate
+          # run for this PR shares one concurrency group with
+          # cancel-in-progress. Firing two back to back therefore cancels the
+          # first -- and this is the ordinary case, not an edge one: `opened`
+          # fails (no review yet), then editing the body with the local-review
+          # findings fails again, so most PRs reach here with two stale runs.
           for run in $stale; do
             echo "re-running stale merge-gate run $run so its check clears"
-            gh run rerun "$run" --repo "$NWO" \
-              || echo "::warning title=Stale gate not cleared::run $run; clear it with: gh run rerun $run"
+            if ! gh run rerun "$run" --repo "$NWO"; then
+              echo "::warning title=Stale gate not cleared::run $run; clear it with: gh run rerun $run"
+              continue
+            fi
+            waited=0
+            while [ "$waited" -lt 300 ]; do
+              status="$(gh run view "$run" --repo "$NWO" --json status --jq .status 2>/dev/null || echo "")"
+              [ "$status" = "completed" ] && break
+              sleep 10
+              waited=$((waited + 10))
+            done
+            if [ "$waited" -ge 300 ]; then
+              echo "::warning title=Stale gate still running::run $run did not finish in 5 minutes; the next re-run may cancel it"
+            fi
           done
