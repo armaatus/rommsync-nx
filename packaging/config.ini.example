@@ -1,0 +1,57 @@
+; rommsync-nx -- sdmc:/config/rommsync/config.ini
+;
+; Copy this file to config.ini beside it and edit it. The client only ever
+; reads config.ini; this .example is what an upgrade replaces, so your own
+; settings are never overwritten by unzipping a newer release over the top.
+;
+; Every key below is already at its built-in default except [server] url, which
+; has none -- without a usable one the client stays idle. Deleting a line is
+; therefore safe: the default comes back. The full reference, including the
+; folder map and what happens to a line the parser cannot use, is
+; docs/CONFIG.md.
+
+[server]
+; The RomM origin. HTTPS strongly recommended: over plain http:// the bearer
+; token and every save cross your network in the clear. A path prefix is kept,
+; so RomM behind a reverse proxy at /romm works.
+url = https://romm.example.com
+
+[sync]
+enabled       = true
+interval_min  = 30                 ; minutes; 0 = only on boot and on demand
+on_boot       = true
+saves         = true
+states        = false              ; save states are core-specific; opt-in
+conflict_show = true               ; surface conflicts in the overlay
+
+[downloads]
+enabled     = true
+verify_hash = true                 ; check the hash after a download
+resume      = true
+
+; --- the platform folder map -------------------------------------------------
+;
+; A built-in map ships for the Switch-capable systems (nes, snes, gb, gbc, gba,
+; n64, genesis, psx, nds, dreamcast, psp), so this file only needs the ones you
+; want to change. Uncomment a section to override that platform.
+;
+; A [platform.<slug>] section REPLACES that platform's built-in entry rather
+; than adding to it -- list every key you want it to have. The slug is RomM's
+; platform_fs_slug, the directory name under its library/roms/.
+;
+; roms   = where downloads land; the FIRST entry is the write target
+; saves  = directories scanned for SRAM saves
+; states = directories scanned for save states
+;
+; Check these against your card before the first sync. The RetroArch paths are
+; correct; the Tico ones are best guesses.
+;
+; [platform.snes]
+; roms   = /tico/roms/snes
+; saves  = /retroarch/saves, /tico/saves/snes
+; states = /retroarch/states, /tico/states/snes
+;
+; [platform.gba]
+; roms   = /tico/roms/gba
+; saves  = /retroarch/saves, /tico/saves/gba
+; states = /retroarch/states, /tico/states/gba

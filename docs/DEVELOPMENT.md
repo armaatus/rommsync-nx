@@ -84,7 +84,51 @@ overlay/
 tlsprobe/
   Makefile           # the M0-1 spike: a manually-launched .nro, never installed
   source/
+packaging/           # what the release zip ships beside the two artifacts
+  README.txt.in      # substituted with VERSION and the title id by package.sh
+  config.ini.example
+scripts/package.sh   # the two build outputs -> dist/rommsync-nx-<VERSION>.zip
 ```
+
+## Packaging
+
+`make -C sysmodule` and `make -C overlay` produce `sys-rommsync.nsp` and
+`ovl-rommsync.ovl`, and neither of those names or locations is what Horizon
+loads. `scripts/package.sh` turns them into the install tree:
+
+```
+atmosphere/contents/<TID>/exefs.nsp    the sysmodule, RENAMED
+switch/.overlays/ovl-rommsync.ovl      the overlay
+config/rommsync/config.ini.example     a starting configuration
+README.txt
+LICENSE
+```
+
+```bash
+make -C sysmodule && make -C overlay
+./scripts/package.sh              # -> dist/rommsync-nx-<VERSION>.zip
+./scripts/package.sh --list       # the entry paths, without building anything
+```
+
+Four things about it are load-bearing, and every one of them fails silently on a
+console rather than loudly here:
+
+- **`exefs.nsp`, not `sys-rommsync.nsp`.** Atmosphère loads the former. The
+  build's own name installs cleanly, boots, and does nothing at all.
+- **`<TID>` comes out of `sysmodule/sys-rommsync.json`**, never typed. The id is
+  still unconfirmed against the installed homebrew set (`sysmodule/README.md`),
+  so it will move, and a second copy of it is how a move lands in one place only.
+- **No `flags/boot2.flag`, and no `config.ini`.** The sysmodule ships disabled
+  (#33), and an upgrade is this same zip unpacked over the top — replacing a
+  user's settings is not something a release may do. `token.dat`, `device.dat`,
+  `state.db` and `queue.json` are not in the archive either, so they survive.
+- **The archive is byte-deterministic** — fixed entry order, timestamps and
+  permissions — so the checksums a release publishes describe the build and not
+  one upload.
+
+`ctest -R package` is what holds all of it: four scenarios against stubbed
+artifacts that need no toolchain, plus `package.builds`, which packages a real
+devkitPro build inside the same container.
 
 ## TLS in a sysmodule
 

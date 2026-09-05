@@ -1,0 +1,57 @@
+=============================================================================
+rommsync-nx @VERSION@
+=============================================================================
+
+On-device RomM sync for a modded Nintendo Switch: a background sysmodule
+(sys-rommsync) that syncs your saves and runs the download queue, plus an
+Ultrahand / Tesla overlay (ovl-rommsync) to drive it.
+
+  https://github.com/armaatus/rommsync-nx
+
+
+INSTALL
+-------
+
+Unzip this archive onto the ROOT of your SD card, keeping the folder
+structure. It merges with what is already there and touches nothing else:
+
+  atmosphere/contents/@TITLE_ID@/exefs.nsp   the sysmodule
+  switch/.overlays/ovl-rommsync.ovl                the overlay
+  config/rommsync/config.ini.example               a starting configuration
+
+Then, in order:
+
+  1. The sysmodule ships DISABLED. There is no flags/boot2.flag in this
+     archive, so nothing runs until you enable it -- use ovl-sysmodules,
+     which is also how you stop it again.
+  2. Copy config/rommsync/config.ini.example to config/rommsync/config.ini
+     and set [server] url to your RomM.
+  3. Open ovl-rommsync from the Ultrahand overlay menu and pair. You type a
+     short code into RomM in a browser; no password is ever typed on the
+     console.
+
+
+UPGRADING
+---------
+
+Unzip a newer release over the top. Only the three files above are replaced.
+config.ini, token.dat, device.dat, state.db and queue.json are not in this
+archive, so your settings, your pairing and your sync state survive.
+
+
+THE FULL GUIDE
+--------------
+
+Install, pairing, the folder map and troubleshooting:
+
+  https://github.com/armaatus/rommsync-nx/blob/main/docs/INSTALL.md
+
+Configuration reference:
+
+  https://github.com/armaatus/rommsync-nx/blob/main/docs/CONFIG.md
+
+
+LICENSE
+-------
+
+See LICENSE, next to this file in the archive.

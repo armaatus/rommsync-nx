@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -687,6 +688,47 @@ void TheDocumentedExampleParses(checks::Checks& c) {
              "and the snes mapping the document shows");
 }
 
+/// ...and so does the one the release zip actually ships.
+///
+/// packaging/config.ini.example is what a user copies to config.ini on their
+/// first install (scripts/package.sh), so it is the first file this parser ever
+/// sees on a real console -- and the only one nobody will be there to fix. It
+/// is a separate file from the block in docs/CONFIG.md above, which means it can
+/// drift from it; this is what says so.
+void TheShippedExampleParses(checks::Checks& c) {
+  std::ifstream in(ROMMSYNC_CONFIG_EXAMPLE);
+  c.Expect(in.good(), "packaging/config.ini.example is readable");
+  if (!in.good()) {
+    return;
+  }
+  const std::string example((std::istreambuf_iterator<char>(in)),
+                            std::istreambuf_iterator<char>());
+
+  const config::LoadResult result = config::ParseConfig(example);
+  c.ExpectEq(CountOf(result, config::Severity::kError), std::size_t{0},
+             "the shipped example has no errors: " + result.DescribeDiagnostics());
+  c.ExpectEq(CountOf(result, config::Severity::kWarning), std::size_t{0},
+             "...and no warnings either: " + result.DescribeDiagnostics());
+  // A first boot on the shipped file has a server to talk to -- a wrong one,
+  // which the user edits, rather than the "unconfigured" state a commented-out
+  // url would leave them silently in.
+  c.Expect(result.value.configured(), "it configures a server");
+  // Every other key in it is the built-in default spelled out, so copying the
+  // file changes nothing but the URL. A value that drifted from the default
+  // would be a setting a user never chose.
+  const config::Config defaults = config::Defaults();
+  c.ExpectEq(result.value.sync.interval_min, defaults.sync.interval_min,
+             "the interval is the built-in default");
+  c.ExpectEq(result.value.sync.enabled, defaults.sync.enabled, "so is [sync] enabled");
+  c.ExpectEq(result.value.sync.saves, defaults.sync.saves, "so is [sync] saves");
+  c.ExpectEq(result.value.sync.states, defaults.sync.states, "so is [sync] states");
+  c.ExpectEq(result.value.downloads.verify_hash, defaults.downloads.verify_hash,
+             "and so is [downloads] verify_hash");
+  // The folder map is commented out, so the built-in one survives a copy whole.
+  c.ExpectEq(result.value.RomTarget("snes"), defaults.RomTarget("snes"),
+             "the built-in folder map is untouched");
+}
+
 }  // namespace
 
 int main() {
@@ -703,5 +745,6 @@ int main() {
   LoadingFromDisk(c);
   NothingCrashesOnAPartialFile(c);
   TheDocumentedExampleParses(c);
+  TheShippedExampleParses(c);
   return c.failures() == 0 ? 0 : 1;
 }
