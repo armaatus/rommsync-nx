@@ -74,7 +74,16 @@ overlay.
   it. It is an optimisation and never a gate: a missing, truncated or corrupt
   file yields an empty baseline and a diagnostic, and the tick hashes
   everything.
-- `sdmc:/config/rommsync/queue.json` — pending downloads.
+- `sdmc:/config/rommsync/queue.json` — pending downloads. One JSON object,
+  `{"format":"rommsync-queue","version":1,"entries":[…]}`, written with
+  `io::WriteAtomically` after **every** state transition
+  (`core/include/rommsync/download.hpp`): that is what lets an entry left
+  `active` by a power cut be resumed from its `.part` rather than restarted or
+  forgotten. Like `state.db` it never blocks boot — a corrupt or oversized file
+  yields an empty queue and a diagnostic — but unlike it, a queue entry is
+  something the user asked for, so the *writer* refuses rather than silently
+  dropping an entry it cannot store. Finished entries stay in the file: the
+  overlay's queue screen is served from here with the server down.
 - `sdmc:/config/rommsync/.backup/` — pre-overwrite copies of saves on conflict.
 
 The overlay and sysmodule both read config; the **sysmodule owns writes** to
