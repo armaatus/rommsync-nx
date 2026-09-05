@@ -113,7 +113,17 @@ jobs:
           # which is what the worktree on the other side polls.
           claude_args: '--allowed-tools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(gh issue view:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr review:*),Bash(gh api:*)" --max-turns 80'
           prompt: |
-            Review this pull request following REVIEW.md in the repository root.
+            Review pull request #${{ github.event.pull_request.number || inputs.pr }}
+            of ${{ github.repository }}, following REVIEW.md in the repository
+            root.
+
+            The number is stated explicitly because on a `workflow_dispatch`
+            there is no pull request in the event context. Without it the action
+            runs, finds nothing to review, exits SUCCESS and submits nothing --
+            a green job that did no work, which is the failure shape this repo
+            keeps getting bitten by. Read the PR with
+            `gh pr view <N> --json title,body` and
+            `gh pr diff <N>` rather than assuming a checkout.
             It defines the three passes, what counts as Important rather than a
             Nit, the nit cap, and an explicit list of what not to report at all.
             Read it first and follow it exactly.
