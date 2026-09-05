@@ -423,10 +423,16 @@ struct NegotiateOptions {
   /// How the caller waits between attempts.
   ///
   /// Injected rather than called directly, for the reason `PairingSession` takes
-  /// a clock: a sysmodule parks on its own primitive, and a test that had to
-  /// spend the backoff to prove there was one would be a test nobody runs. Null
-  /// means no wait at all, which is what a caller doing its own scheduling
-  /// wants -- so it is also `max_attempts = 1` unless the caller says otherwise.
+  /// a clock: a sysmodule may want to park on its own primitive, and a test that
+  /// had to spend the backoff to prove there was one would be a test nobody
+  /// runs.
+  ///
+  /// **Null means the default sleep, not "do not wait".** A caller that wants a
+  /// single attempt says so with `max_attempts`, because that is the field the
+  /// question is about -- a budget of three that quietly spends one is worse
+  /// than either honest answer, and the rule is that every network call retries
+  /// with backoff (CLAUDE.md). The wait happens on the calling thread, which is
+  /// a sync tick's worker and never boot.
   std::function<void(std::chrono::milliseconds)> wait;
 };
 

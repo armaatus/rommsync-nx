@@ -446,6 +446,11 @@ void RefusesWhatItCannotRead(checks::Checks& c) {
        "\"save_id\":null,\"file_name\":\"\",\"slot\":null,\"emulator\":null,"
        "\"reason\":\"x\",\"server_updated_at\":null,\"server_content_hash\":null}],"
        "\"total_upload\":0,\"total_download\":0,\"total_conflict\":0,\"total_no_op\":0}"},
+      // Not an object at all: the reader names the context, so there is no field
+      // to put behind the dot and `operations[0].` would name nothing.
+      {"an operation that is not an object", "operations[0]",
+       "{\"session_id\":1,\"operations\":[\"x\"],"
+       "\"total_upload\":0,\"total_download\":0,\"total_conflict\":0,\"total_no_op\":0}"},
       {"a blank slot, which is neither a slot nor archival", "operations[0].slot",
        "{\"session_id\":1,\"operations\":[{\"action\":\"upload\",\"rom_id\":4,"
        "\"save_id\":null,\"file_name\":\"a.srm\",\"slot\":\"\",\"emulator\":null,"

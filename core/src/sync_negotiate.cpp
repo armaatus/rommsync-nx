@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -27,6 +28,19 @@ constexpr const char* kNegotiatePath = "/api/sync/negotiate";
 /// and not a re-pair, so it is worth separating on the string
 /// (docs/API_CONTRACT.md#device-registration).
 constexpr const char* kSyncDisabledDetail = "Sync is disabled for this device";
+
+/// And what it answers a 404 with when the device is gone -- `Device with ID
+/// {device_id} not found`.
+///
+/// Gated on the body for the same reason the 400 is, and the cost of not gating
+/// is higher here: a `server_url` that points at something which is not this
+/// RomM -- a reverse proxy that does not route `/api/`, a path prefix the user
+/// left out -- answers 404 too, and FastAPI's own is `{"detail":"Not Found"}`.
+/// Reading that as "your device was deleted" sends the user to a pairing screen
+/// for a problem re-pairing cannot fix, and discards a working token on the way.
+/// A 404 that does not carry this falls through to `kRejected`, which is the
+/// safer direction to be wrong in: it neither retries forever nor re-pairs.
+constexpr const char* kNoSuchDeviceDetail = "Device with ID";
 
 std::string ApiUrl(std::string_view server_url, std::string_view path) {
   while (!server_url.empty() && server_url.back() == '/') {
@@ -120,7 +134,10 @@ json::Error ReadOperation(const json::Value& value, std::size_t index, SyncOpera
   reader.RequiredNullable("server_content_hash", &out->server_content_hash);
   if (!reader.ok()) {
     json::Error error = reader.error();
-    error.field = where + "." + error.field;
+    // An element that is not an object at all fails in the reader's constructor,
+    // which names the context rather than a field -- so there is nothing to put
+    // a dot in front of, and `operations[0].` would name nothing.
+    error.field = error.field.empty() ? where : where + "." + error.field;
     return error;
   }
 
@@ -172,9 +189,7 @@ std::optional<Negotiation> Refused(const http::Result& result) {
                   "the negotiation was rejected: HTTP " + std::to_string(status) +
                       "; the token has been revoked");
   }
-  if (status == 404) {
-    // Only ever this endpoint, so a 404 is the device: RomM answers the same
-    // 404 here as on `GET /api/devices/{id}` for a device deleted in its web UI.
+  if (status == 404 && result.response.body.find(kNoSuchDeviceDetail) != std::string::npos) {
     return Refuse(NegotiateError::kNoSuchDevice,
                   "the negotiation was answered 404; this device was deleted in RomM");
   }
@@ -381,7 +396,11 @@ Negotiation Negotiate(http::HttpClient& client, const auth::StoredToken& token,
   request.timeout = options.timeout;
 
   const int attempts = options.max_attempts > 0 ? options.max_attempts : 1;
-  std::chrono::milliseconds backoff = options.backoff;
+  // Clamped before the first use, not after the first doubling: a caller whose
+  // `backoff` already exceeds `max_backoff` would otherwise wait longer than the
+  // ceiling the header calls binding, exactly once.
+  std::chrono::milliseconds backoff =
+      options.backoff > options.max_backoff ? options.max_backoff : options.backoff;
   std::chrono::milliseconds waited{0};
 
   Negotiation outcome;
@@ -405,12 +424,15 @@ Negotiation Negotiate(http::HttpClient& client, const auth::StoredToken& token,
     // Only a failure that says nothing about the pairing or the payload earns
     // another request. A 401 retried is a 401 retried forever, and a body the
     // server refused is a body it will refuse again.
-    const bool again = !outcome.ok() && ShouldRetry(outcome.error) && attempt < attempts &&
-                       options.wait != nullptr;
+    const bool again = !outcome.ok() && ShouldRetry(outcome.error) && attempt < attempts;
     if (!again) {
       return outcome;
     }
-    options.wait(backoff);
+    if (options.wait != nullptr) {
+      options.wait(backoff);
+    } else {
+      std::this_thread::sleep_for(backoff);
+    }
     waited += backoff;
     outcome.waited = waited;
     backoff = backoff * 2 > options.max_backoff ? options.max_backoff : backoff * 2;

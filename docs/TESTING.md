@@ -313,7 +313,15 @@ ctest --test-dir build --output-on-failure
   revoked token rather than a parse failure and is never retried; a clean short
   body is a named `json` error and no plan; a stall times out, is retried, and
   the backoff doubles. The wait is injected rather than slept, so `stalled`
-  proves the backoff without spending it.
+  proves the backoff without spending it — and it asserts the retry as a
+  *property* (at least one, each wait double the last) rather than an exact
+  count, because the proxy's abandoned stall thread answers late and how many
+  stalls a client actually meets is a race with its own timeout. `refused`
+  covers the answers that are not "the network" at all: a 404 carrying RomM's
+  `Device with ID … not found`, the plain `Not Found` a wrong `server_url`
+  produces — which must **not** be read as a deleted device, since re-pairing
+  cannot fix a typo in a URL — sync switched off for the device, another 400,
+  and the 503/429 that mean "not now".
 - The `harness.*` scenarios (M0-5) are the same idea applied to the *edge cases*:
   every row of that issue's table, forced deterministically against the real
   server. `expired` (a 401 arriving mid-flow, and that it is a response rather

@@ -310,6 +310,7 @@ set(SYNC_SCENARIOS
   revoked     # 401 is a revoked token, not a parse failure, and nothing changes
   truncated   # a clean short body is a named json error and no plan
   stalled     # a stall times out and is retried, with the backoff doubling
+  refused     # 404 device-gone, 400 sync-disabled, and the 404 that is neither
 )
 
 foreach(scenario IN LISTS SYNC_SCENARIOS)
