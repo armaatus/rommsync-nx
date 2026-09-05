@@ -54,6 +54,18 @@ target_compile_definitions(test_sync_payload PRIVATE
   ROMMSYNC_OPENAPI="${CMAKE_SOURCE_DIR}/server/contract/romm-openapi-5.2.0.json")
 add_test(NAME sync.payload COMMAND test_sync_payload)
 
+# The other direction: the plan RomM sends back, against the captured responses
+# in server/contract/captures/ rather than against a second copy of the field
+# names. The reason table is the part no capture can pin -- only five of the
+# thirteen strings 5.2.0 emits appear in one -- so it is checked against the
+# table in docs/API_CONTRACT.md instead. No network, so it never skips.
+add_executable(test_sync_plan test_sync_plan.cpp)
+target_link_libraries(test_sync_plan PRIVATE rommsync::core)
+target_include_directories(test_sync_plan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_sync_plan PRIVATE
+  ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures")
+add_test(NAME sync.plan COMMAND test_sync_plan)
+
 # token.dat. Pure filesystem and parsing, so this never skips either -- and the
 # guarantee it exists for (a failed write costs the new token, never the working
 # one) is checkable with no server at all.
@@ -118,6 +130,25 @@ target_compile_definitions(test_config PRIVATE
   # of a private string literal here would ever see it.
   ROMMSYNC_CONFIG_DOC="${CMAKE_SOURCE_DIR}/docs/CONFIG.md")
 add_test(NAME core.config COMMAND test_config)
+
+# MD5, against RFC 1321's own vectors. Pure arithmetic, so it never skips -- and
+# it must not: a wrong digest is still 32 plausible hex characters, and the only
+# symptom on a console is every unchanged save negotiating as changed forever.
+add_executable(test_md5 test_md5.cpp)
+target_link_libraries(test_md5 PRIVATE rommsync::core)
+target_include_directories(test_md5 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+add_test(NAME core.md5 COMMAND test_md5)
+
+# `state.db`: the format, the commit-window recovery, and the re-hash it skips.
+# One temp directory and no network, so it never skips either -- the guarantee
+# it checks is that a lost baseline costs a tick of hashing and never a wrong
+# comparison, which is a claim about the failures and not about a server.
+add_executable(test_state_db test_state_db.cpp)
+target_link_libraries(test_state_db PRIVATE rommsync::core)
+target_include_directories(test_state_db PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_state_db PRIVATE
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+add_test(NAME core.state_db COMMAND test_state_db)
 
 # --- rig smoke test: proves docker RomM + fault proxy + ctest all work -------
 # Uses libcurl directly on purpose. It tests the RIG, not our code, and must
@@ -283,6 +314,7 @@ endforeach()
 # entry per scenario, so a red run names the behaviour.
 add_executable(test_sync_negotiate test_sync_negotiate.cpp)
 target_link_libraries(test_sync_negotiate PRIVATE rommsync::host)
+target_include_directories(test_sync_negotiate PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(test_sync_negotiate PRIVATE
   ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
   ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
@@ -292,6 +324,12 @@ set(SYNC_SCENARIOS
   accepted    # a live 5.2.0 takes the encoded body and echoes the entry back
   required    # a renamed REQUIRED field is a 422 that names it
   understood  # a renamed OPTIONAL one is a silent 200 with a different plan
+  negotiates  # sync::Negotiate end to end: a session and an operation, typed
+  discovers   # an empty `saves` is how a client learns what it is missing
+  revoked     # 401 is a revoked token, not a parse failure, and nothing changes
+  truncated   # a clean short body is a named json error and no plan
+  stalled     # a stall times out and is retried, with the backoff doubling
+  refused     # 404 device-gone, 400 sync-disabled, and the 404 that is neither
 )
 
 foreach(scenario IN LISTS SYNC_SCENARIOS)
@@ -304,6 +342,48 @@ foreach(scenario IN LISTS SYNC_SCENARIOS)
   # here goes through the fault proxy, which holds one armed scenario for all
   # clients.
   set_tests_properties(sync.${scenario} PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
+endforeach()
+
+# --- step 0: the local scan and its rom matching -----------------------------
+# M2-2. The first four scenarios need no server and must stay checked with
+# docker stopped: what they pin is the decision that an ambiguous name is
+# skipped rather than guessed, and a wrong match is not a failed tick -- it is
+# one game's save uploaded over another game's. `library` and `paging` need the
+# real RomM, because the envelope `GET /api/roms` answers and the fields it
+# sends are the two things a fake index cannot be wrong about.
+add_executable(test_save_scan test_save_scan.cpp)
+target_link_libraries(test_save_scan PRIVATE rommsync::host)
+target_include_directories(test_save_scan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_save_scan PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+
+set(SCAN_UNIT_SCENARIOS
+  names        # base names, emulators, slots, and which folder implies a platform
+  ambiguous    # one name on two platforms, in a hintless folder, is skipped
+  walked_once  # RetroArch's flat saves/, listed under a dozen platforms
+  unusable     # a record sync::Validate refuses costs one file, not the tick
+  truncated    # a directory past kMaxDirectoryEntries keeps a set that does not move
+  hashing      # the digest is real, reused when nothing changed, null only when unreadable
+)
+foreach(scenario IN LISTS SCAN_UNIT_SCENARIOS)
+  add_test(NAME scan.${scenario} COMMAND test_save_scan ${scenario})
+  set_tests_properties(scan.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
+set(SCAN_RIG_SCENARIOS
+  library  # a Sandbox scanned against the docker library, end to end
+  paging   # limit=1 over the seeded library still finds a rom on the last page
+)
+foreach(scenario IN LISTS SCAN_RIG_SCENARIOS)
+  add_test(NAME scan.${scenario} COMMAND test_save_scan ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(scan.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  # Every rig test goes through the fault proxy, which holds one armed scenario
+  # for all clients.
+  set_tests_properties(scan.${scenario} PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 endforeach()
 
 # --- the host harness, and the edge cases only the fault proxy can force -----
@@ -340,6 +420,7 @@ set(HARNESS_SCENARIOS
   stall           # a server that says nothing: one tick lost, nothing else
   multifile       # the two-disc fixture, and the two traps around it
   backup          # back up FIRST, proven by interrupting the overwrite
+  content_hash    # the MD5 this client computes is the one RomM compares against
 )
 
 foreach(scenario IN LISTS HARNESS_SCENARIOS)

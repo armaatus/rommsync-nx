@@ -21,8 +21,35 @@ For each file under the configured save/state dirs:
    RetroArch's flat `saves/` doesn't — match by name across the library then).
 4. Ambiguous match (same base name on two platforms, no platform hint) → skip and
    log; never guess.
+5. Derive the `slot` from the emulator the folder belongs to and the save's own
+   extension (`retroarch-srm`). It pairs with `rom_id` on the server, so it has
+   to be **derived, not chosen**: a slot that changes between ticks makes the
+   same file a new save every tick. The emulator is in it because RomM pairs on
+   `(rom_id, slot)` alone — a rom whose RetroArch `.srm` and Tico `.srm` both
+   mapped to `srm` would have the two files overwrite each other through the
+   server, forever.
+6. Validate the record before emitting it. A save the encoder would refuse — an
+   mtime of 0 from a console with an unset clock, a name the server would read
+   as a path — is skipped with a reason, because `EncodeNegotiateRequest` stops
+   at the first bad entry and would otherwise cost the tick every other save.
+7. Fill `content_hash` from `state::ContentHashFor` — the baseline's digest when
+   the file's mtime **and** size still match, a fresh read otherwise. **Never
+   leave it null to save a read**: a save reported without a digest is compared
+   on timestamps and planned as an `upload` the server already has, on this tick
+   and every tick after it. The one legitimate null is a file whose bytes could
+   not be read at all, which is still reported — less precisely — and counted.
+
+The scanner names files by their SD-root path (`/retroarch/saves/Game.srm`).
+Opening one needs the platform prefix, so it is `fs::FileSystem::Resolve` that
+turns it into something `io::ReadFile` and `state::HashFile` can open —
+`sdmc:…` on Horizon, a path under the card's root on the host. Nothing above
+that interface learns which.
 
 Cache the rom index (`GET /api/roms`) per tick; it's also needed by downloads.
+**It answers an envelope, `{items, total, limit, offset}`, not a bare array, so
+it has to be paged** — a client that reads `items` and stops has whatever page
+size RomM felt like giving it, and a rom on the last page is exactly the one a
+save is going to need.
 
 ## Step 1 — negotiate
 
@@ -74,6 +101,29 @@ may be the only copy of the save.
 
 `POST /api/sync/negotiate` → `SyncNegotiateResponse { session_id, operations[],
 total_upload, total_download, total_conflict, total_no_op }`.
+
+`sync::Negotiate` makes that call and `ParseNegotiateResponse` turns the answer
+into a `SyncPlan` (M2-4). Both live in the same header as the request side. Three
+things about the answer are worth stating here rather than leaving to the code:
+
+- **The plan is read whole or not at all.** One unreadable operation refuses the
+  response, because a plan with a save missing from it looks exactly like a plan
+  for a device that is already in sync — and the save that got dropped is the one
+  nobody hears about again. A truncated body is that failure in its quietest
+  form, which is why `sync.truncated` forces one.
+- **An `action` this client does not recognise becomes `no_op`, and is logged.**
+  On a save, the default branch is the one that can overwrite it. The same goes
+  for an unrecognised `reason`, except that the action there is still obeyed: the
+  reason is the server's explanation, not its decision.
+- **Four failures that are not "the network".** A `404` carrying RomM's
+  `Device with ID … not found` is this device deleted in the web UI, a
+  `400 Sync is disabled for this device` is the user's own switch, a `401` is the
+  token revoked (`expires_at` is null, so there is nothing to refresh), and a
+  `403` is a scope the user did not approve — which is a working pairing, not a
+  dead one, and is why the two are separate errors. None of the four gets better
+  by retrying. Everything else — no response, a `5xx`, a `429` — retries with
+  backoff, and RomM cancels the session a retried negotiation superseded, so the
+  abandoned ones do not pile up ([API_CONTRACT.md](API_CONTRACT.md#save-sync--negotiate--execute--complete)).
 
 The plan also covers saves the client did **not** report: any server save this
 device has no sync history for comes back as a `download`, for any rom. That is
@@ -172,10 +222,12 @@ which puts every later comparison in the no-sync-history branch above.
 `no_op` reports `0` planned against however many you completed; that is not an
 error.
 
-Then persist the new per-save `{content_hash, mtime, server_updated_at,
-server_content_hash}` to `state.db`. That stored baseline is how the *next* tick
-skips work — the server arbitrates, but the client still has to know which local
-files are worth re-hashing.
+Then persist the new per-save `{content_hash, mtime, file_size_bytes,
+server_updated_at, server_content_hash}` to `state.db`. That stored baseline is
+how the *next* tick skips work — the server arbitrates, but the client still has
+to know which local files are worth re-hashing. The format, the reader and the
+writer are `core/include/rommsync/state_db.hpp`: a version line and one JSON
+object per `(rom_id, slot)`, written with `io::WriteAtomically`.
 
 ## Change detection between ticks
 
@@ -183,6 +235,20 @@ The negotiate call already computes the plan server-side, so the client can send
 all saves every tick and let the server decide. `state.db` is an optimization:
 skip re-hashing unchanged files (mtime+size match the stored baseline) to keep
 ticks cheap on large libraries.
+
+Both, not either — `state::ContentHashFor` reuses a stored digest only when the
+mtime *and* the size still match. A same-size overwrite inside one second is
+caught by neither alone, and an emulator that restores mtimes is caught only by
+the size.
+
+**Skipping the hash is not skipping the report.** A save whose file was not
+re-read still carries its stored `content_hash` into the payload. A save reported
+without one is a save the server compares on timestamps alone, which plans an
+upload for bytes it already has — every tick, forever.
+
+A `state.db` that is missing, truncated or corrupt is an empty baseline plus a
+diagnostic, and the tick hashes everything. It is never a reason to refuse to
+sync: a lost baseline costs time, not correctness.
 
 ## Save states
 

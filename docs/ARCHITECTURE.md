@@ -18,6 +18,14 @@ boot by Atmosphère. No UI. Responsibilities:
   keep the sysmodule's memory footprint viable. This is the single biggest
   technical risk; it is isolated behind an `HttpClient` interface so it can be
   swapped. ([DEVELOPMENT.md](DEVELOPMENT.md#tls-in-a-sysmodule))
+- **SD enumeration** — reading a directory is the second thing after HTTP that
+  Horizon and the host do differently (`fsdev`/`readdir` over `sdmc:` versus
+  `<filesystem>`), so it sits behind the `fs::FileSystem` interface in
+  `core/include/rommsync/file_system.hpp`. It also owns the one mapping the rest
+  of the engine cannot do for itself — `Resolve` turns an SD-root path into the
+  one `io::ReadFile` and `state::HashFile` can open. The host backend is
+  `host/native_file_system.cpp`; **the Horizon one is not written yet** and is
+  what the save scanner needs on the console.
 - **Sync engine** — the negotiate → execute → complete loop.
   ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md))
 - **Download worker** — drains a queue of rom ids, downloads (with `Range`
@@ -59,7 +67,13 @@ overlay.
   once and kept for the life of the SD. Separate from `token.dat` because it has
   to survive a re-pair ([AUTH.md](AUTH.md#client-identifier)).
 - `sdmc:/config/rommsync/state.db` — last-synced hash/mtime per (rom, slot) so the
-  client can tell which side changed. Small SQLite or a flat file.
+  client can tell which side changed. A **flat, line-oriented file**: a version
+  line, then one JSON object per row (`core/include/rommsync/state_db.hpp`).
+  Not SQLite — `core/` may include only standard and `rommsync/` headers, so it
+  is not linkable from the portable engine, and a sysmodule heap does not want
+  it. It is an optimisation and never a gate: a missing, truncated or corrupt
+  file yields an empty baseline and a diagnostic, and the tick hashes
+  everything.
 - `sdmc:/config/rommsync/queue.json` — pending downloads.
 - `sdmc:/config/rommsync/.backup/` — pre-overwrite copies of saves on conflict.
 
@@ -72,7 +86,8 @@ token/state to avoid races — the overlay asks it to change things via IPC.
 scheduler fires
   → engine scans SD save/state dirs (per CONFIG folder map)
   → match each file to a rom_id (fs_name_no_ext, platform-scoped)
-  → hash (SHA1) each; build SyncNegotiatePayload.saves[]
+  → hash (MD5) each, reusing state.db's digest when mtime+size match
+  → build SyncNegotiatePayload.saves[]
   → POST /api/sync/negotiate  → {session_id, operations[]}
   → for each op:
         upload   → POST /api/saves (multipart saveFile)

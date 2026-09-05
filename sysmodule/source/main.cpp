@@ -19,7 +19,11 @@
 namespace {
 
 // Sized for the skeleton, not for the engine. The real budget is one in-flight
-// download buffer plus a TLS context, and it is set when those exist
+// download buffer, a TLS context, and the `state.db` baseline -- which is the
+// one item that grows with the library rather than being a fixed buffer: the
+// file's text plus the parsed rows, bounded by `state::kMaxStateBytes` and
+// `state::kMaxRecords`, which are sized against *this* constant and have to be
+// revisited with it. It is set when those exist
 // (docs/DEVELOPMENT.md#tls-in-a-sysmodule); streaming to file is what keeps it
 // from having to grow with the size of a rom.
 constexpr size_t kInnerHeapSize = 0x80000;

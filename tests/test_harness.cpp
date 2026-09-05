@@ -39,11 +39,15 @@
 
 #include "harness.hpp"
 #include "rommsync/atomic_file.hpp"
+#include "rommsync/md5.hpp"
+#include "rommsync/state_db.hpp"
 
 namespace {
 
+namespace crypto = rommsync::crypto;
 namespace http = rommsync::http;
 namespace io = rommsync::io;
+namespace state = rommsync::state;
 namespace json = rommsync::json;
 namespace sync = rommsync::sync;
 
@@ -58,6 +62,32 @@ constexpr const char* kMultiRom = "Synthetic Two Disc Game";
 /// The large rom as it sits in the library RomM serves, for a byte-for-byte
 /// comparison against what a download produced.
 constexpr const char* kLargeRomSource = ROMMSYNC_FIXTURE_LIBRARY "/roms/gba/synthetic-large.gba";
+
+/// The engine's own reading of a plan, scoped to this run's slot.
+///
+/// The scenarios below assert on the raw JSON *and* on this, and the two are
+/// not redundant: the raw fields prove what the server sent, and this proves
+/// `sync::ParseNegotiateResponse` turns it into the one thing a client acts on.
+/// The two conflict reasons are where that matters most -- they arrive as the
+/// same `action`, and a client that classified only the first would send the
+/// second down the default branch, which on a save is the branch that
+/// overwrites it.
+const sync::SyncOperation* Classified(rig::Checks& checks, const std::string& body,
+                                      const std::string& slot,
+                                      rommsync::auth::Parsed<sync::SyncPlan>* into) {
+  *into = sync::ParseNegotiateResponse(body);
+  if (!into->ok()) {
+    checks.Expect(false, "the engine reads the plan: " + into->error.Describe());
+    return nullptr;
+  }
+  for (const sync::SyncOperation& operation : into->value.operations) {
+    if (operation.slot.has_value() && *operation.slot == slot) {
+      return &operation;
+    }
+  }
+  checks.Expect(false, "the parsed plan carries an operation for this run's slot");
+  return nullptr;
+}
 
 /// A save path on the card. `/retroarch/saves` is a real entry in the default
 /// folder map (config.cpp), not a path invented here.
@@ -352,6 +382,14 @@ void Conflict(rig::Checks& checks, http::HttpClient& client, const std::string& 
                   std::string("Both sides changed since last sync"),
                   "...and says which of the two conflicts this is");
 
+  rommsync::auth::Parsed<sync::SyncPlan> read;
+  if (const sync::SyncOperation* typed = Classified(checks, result.response.body, slot, &read)) {
+    checks.Expect(typed->action == sync::Action::kConflict, "the engine reads it as a conflict");
+    checks.Expect(typed->reason == sync::Reason::kBothChanged,
+                  std::string("...and classifies the history conflict: ") + typed->reason_text);
+    checks.Expect(read.value.warnings.empty(), "with nothing unrecognised in it");
+  }
+
   // RomM sends no resolution -- there is no server_wins/keep_both field to obey
   // (docs/SYNC_PROTOCOL.md). What it sends is what the client needs to show a
   // human and to write a backup against, so their absence is worth asserting.
@@ -430,6 +468,18 @@ void SameTimestamp(rig::Checks& checks, http::HttpClient& client, const std::str
   checks.ExpectEq(harness::Field(*operation, "reason"),
                   std::string("Same timestamp but different content"),
                   "...with the second of the two reasons a client must handle");
+
+  rommsync::auth::Parsed<sync::SyncPlan> read;
+  if (const sync::SyncOperation* typed = Classified(checks, result.response.body, slot, &read)) {
+    checks.Expect(typed->action == sync::Action::kConflict, "the engine reads it as a conflict");
+    // Distinct from `harness.conflict`'s reason, and that is the whole point:
+    // one `action`, two situations, and only the reason separates them.
+    checks.Expect(typed->reason == sync::Reason::kSameTimestampDifferentContent,
+                  std::string("...and classifies the no-history conflict: ") + typed->reason_text);
+    checks.Expect(typed->reason != sync::Reason::kBothChanged,
+                  "which is NOT the reason the other conflict scenario produces");
+    checks.Expect(read.value.warnings.empty(), "with nothing unrecognised in it");
+  }
 
   harness::DeleteSave(client, base, fixture, server.id);
 }
@@ -808,6 +858,98 @@ void MultiFile(rig::Checks& checks, http::HttpClient& client, const std::string&
 }
 
 
+// --- content_hash -------------------------------------------------------------
+//
+// M2-3. `crypto::Md5` and `state::HashFile` compute what RomM will compare
+// against -- which is a claim about the *server*, and no vector suite can check
+// it. So this one hashes a save locally, uploads the same bytes, and asks RomM
+// what digest it computed (`harness::ServerMd5`, which does exactly that and
+// deletes the throwaway save again).
+//
+// The two failures this rules out are both silent. A SHA1 or an uppercase
+// hexdigest is 40 or 32 plausible characters that the server matches against
+// nothing, so every unchanged save negotiates as `upload` forever -- there is no
+// error, only a client that re-uploads a library every tick. `sync.understood`
+// already showed what that costs; this shows the digest is the right one.
+//
+// The bytes are many times `state::HashFile`'s 4 KiB buffer on purpose: a save
+// that fits in one read proves nothing about a save state.
+
+void ContentHash(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                 const Fixture& fixture, const harness::Rom& rom) {
+  Sandbox sandbox(checks, "content_hash");
+  const std::string name = "content-hash.srm";
+
+  std::string bytes;
+  bytes.reserve(100 * 1024);
+  for (std::size_t at = 0; at < 100 * 1024; ++at) {
+    bytes += static_cast<char>((at * 7 + 3) % 251);
+  }
+  if (!sandbox.Write(SavePath(name), bytes)) {
+    checks.Expect(false, "the sandbox took the save");
+    return;
+  }
+  const std::string path = sandbox.Host(SavePath(name));
+
+  // The engine's own streaming hash of the file on the card, not a digest of a
+  // string this test is holding: `state::HashFile` is the code the tick calls.
+  const state::HashOutcome hashed = state::HashFile(path);
+  checks.Expect(hashed.ok(), "the save hashed -- " + hashed.message);
+  checks.ExpectEq(hashed.content_hash, crypto::Md5Hex(bytes),
+                  "streaming the file gives the digest of its bytes");
+
+  std::string server_digest;
+  if (!harness::ServerMd5(client, base, fixture, rom.id, path, &server_digest)) {
+    checks.Expect(false, "RomM computed a digest for the uploaded save");
+    return;
+  }
+
+  // The whole point. RomM stores `hexdigest()` of the bytes it received, and
+  // this is the string every later negotiation compares against.
+  checks.ExpectEq(hashed.content_hash, server_digest,
+                  "the local digest is the one RomM computed");
+
+  // ...and it survives the validation the encoder puts every save through, which
+  // is where a 40-digit or uppercase digest would have been caught.
+  sync::ClientSaveState save;
+  save.rom_id = rom.id;
+  save.file_name = name;
+  save.slot = "autosave";
+  save.content_hash = hashed.content_hash;
+  save.updated_at = sync::Timestamp{} + std::chrono::seconds{1757000000};
+  save.file_size_bytes = static_cast<std::int64_t>(bytes.size());
+  const json::Error refused = sync::Validate(save);
+  checks.Expect(refused.ok(), "sync::Validate accepts it -- " + refused.Describe());
+
+  // A round trip through the baseline does not change the digest either: what
+  // `state.db` stores is what the next tick reports.
+  state::Baseline baseline;
+  state::SaveRecord row;
+  row.rom_id = rom.id;
+  row.slot = "autosave";
+  row.content_hash = hashed.content_hash;
+  row.mtime = save.updated_at;
+  row.file_size_bytes = save.file_size_bytes;
+  baseline.Set(row);
+
+  const std::string state_path = sandbox.Host(std::string(harness::kConfigDir) + "/state.db");
+  const state::StoreResult stored = state::SaveBaseline(state_path, baseline);
+  checks.Expect(stored.ok(), "the baseline was written -- " + stored.message);
+
+  const state::LoadedBaseline reloaded = state::LoadBaseline(state_path);
+  checks.Expect(reloaded.diagnostics.empty(),
+                "and read back clean -- " + reloaded.DescribeDiagnostics());
+
+  // The second tick: nothing moved, so the file is not opened again -- and the
+  // digest that goes into the payload is still the one the server holds.
+  const state::HashOutcome reused = state::ContentHashFor(
+      reloaded.value, rom.id, std::optional<std::string>("autosave"), path, row.mtime,
+      row.file_size_bytes);
+  checks.Expect(reused.reused, "an unchanged save is not re-hashed on the second tick");
+  checks.ExpectEq(reused.content_hash, server_digest,
+                  "and it still reports the digest RomM computed");
+}
+
 // --- backup -------------------------------------------------------------------
 //
 // docs/SYNC_PROTOCOL.md's hard rule, on both paths: back up *first*, then
@@ -957,6 +1099,8 @@ int main(int argc, char** argv) {
       Truncate(checks, *client, base, fixture, small);
     } else if (scenario == "backup") {
       Backup(checks, *client, base, fixture, small);
+    } else if (scenario == "content_hash") {
+      ContentHash(checks, *client, base, fixture, small);
     } else if (scenario == "resume") {
       if (!harness::FindRom(*client, base, fixture, kLargeRom, &large)) {
         std::cerr << "the library has no " << kLargeRom
