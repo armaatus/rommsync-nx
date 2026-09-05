@@ -34,10 +34,14 @@
 #include "rommsync/json.hpp"
 #include "rommsync/sync.hpp"
 
+namespace {
+
+// Inside the anonymous namespace, not beside it: POSIX declares `void sync(void)`
+// in <unistd.h>, so a file-scope `namespace sync = ...` is a redefinition on any
+// host whose standard headers happen to pull that in -- which is a green local
+// run and a red CI. `sync.plan` learned this the loud way.
 namespace json = rommsync::json;
 namespace sync = rommsync::sync;
-
-namespace {
 
 /// One field of `ClientSaveState`, as the snapshot declares it and as the
 /// encoder must emit it.

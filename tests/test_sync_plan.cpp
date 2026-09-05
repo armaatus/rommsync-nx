@@ -31,10 +31,15 @@
 #include "rommsync/auth.hpp"
 #include "rommsync/sync.hpp"
 
+namespace {
+
+// Inside the anonymous namespace, not beside it: POSIX declares `void sync(void)`
+// in <unistd.h>, which libstdc++ pulls in behind <fstream>, so a file-scope
+// `namespace sync = ...` is a redefinition on a glibc host and compiles fine on
+// a libc++ one. That is a green local run and a red CI, which is the worst way
+// to find out.
 namespace auth = rommsync::auth;
 namespace sync = rommsync::sync;
-
-namespace {
 
 std::string ReadCapture(checks::Checks& c, const std::string& name) {
   const std::string path = std::string(ROMMSYNC_CAPTURES_DIR) + "/" + name;
