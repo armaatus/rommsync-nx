@@ -306,7 +306,7 @@ progress rides on the `queue` list kind (M5-4).
 | `core/src/ipc_service.cpp` | `ipc::ServiceCore` -- one method per command, and every decision |
 | `sysmodule/source/ipc/service.*` | the `cmif` binding: buffers in, buffers out, `ipc::Error` to a `Result`. No logic. |
 | `sysmodule/source/ipc/server.*` | hosting it: `smRegisterServiceCmif`, `svcAcceptSession`, the session table, `svcReplyAndReceive` |
-| `sysmodule/source/engine.*` | the `ipc::Engine` `ServiceCore` reads the console out of, as far as it is built |
+| `sysmodule/source/engine.*` | the `ipc::Engine` `ServiceCore` reads the console out of, as far as it is built. Names no libnx type, so the host build compiles it too and `engine.*` drives it against a directory (`tests/test_engine.cpp`) |
 | `overlay/source/ipc_client.*` | `smGetService("rommsync")` and the *same* codecs |
 | `core/include/rommsync/overlay_status_view.hpp` | what the status screen *says*, decided off the framebuffer (`overlay.status`) |
 

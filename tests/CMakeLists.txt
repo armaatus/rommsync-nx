@@ -819,3 +819,89 @@ add_test(NAME policy.tests_are_host_local
 set_tests_properties(policy.loopback_only policy.writes_refuse_remote
                      policy.tests_are_host_local
                      PROPERTIES TIMEOUT 120)
+
+# --- M3-2: the download queue and the worker that drains it ------------------
+# The first six need no server and must stay checked with docker stopped: what
+# they pin is what a yanked SD card leaves behind -- a queue.json that is
+# truncated, oversized, half-written, or written by another release -- and a
+# healthy RomM cannot produce one of those. The last five are transfers, so they
+# need the real RomM and the fault proxy in front of it.
+add_executable(test_download test_download.cpp)
+target_link_libraries(test_download PRIVATE rommsync::host)
+target_include_directories(test_download PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_download PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env"
+  # `drain` and `resume` compare what reached the card against the bytes RomM is
+  # serving from, which is the only comparison that proves a download rather than
+  # a plausible-looking file of the right length.
+  ROMMSYNC_LIBRARY_DIR="${CMAKE_SOURCE_DIR}/server/testing/library")
+
+set(DOWNLOAD_UNIT_SCENARIOS
+  roundtrip  # every field survives queue.json, states and a null hash included
+  queue      # Enqueue/Remove/Clear/Snapshot, and the fixed IPC error set
+  corrupt    # truncated, garbage, another release's format: an empty queue and a reason
+  store      # the write is atomic, leaves no .tmp/.old, and a failed one costs nothing
+  bounds     # a full queue of worst-case entries still fits the byte bound
+  endpoint   # the content URL's encoding, and the rom detail shape
+)
+foreach(scenario IN LISTS DOWNLOAD_UNIT_SCENARIOS)
+  add_test(NAME download.${scenario} COMMAND test_download ${scenario})
+  set_tests_properties(download.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
+set(DOWNLOAD_RIG_SCENARIOS
+  drain      # the seeded 240pee.nes, byte-for-byte at the mapped destination
+  retries    # a 500 leaves the entry queued with attempts up and backoff spent
+  disabled   # `[downloads] enabled = false` drains nothing and loses nothing
+  multifile  # a disc set is refused with a reason and no archive reaches the card
+  missing    # a rom the server's library no longer holds fails with a sentence
+)
+foreach(scenario IN LISTS DOWNLOAD_RIG_SCENARIOS)
+  add_test(NAME download.${scenario} COMMAND test_download ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(download.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  # RUN_SERIAL for the reason every rig test has it: the fault proxy holds one
+  # armed scenario for every client, so two of these at once damage each other.
+  set_tests_properties(download.${scenario} PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+endforeach()
+
+# `resume` moves the 120 MiB fixture twice -- 4 MiB, a dropped connection, then
+# the rest over Range -- through the Python fault proxy, so it gets its own
+# budget rather than the 180 seconds the others need.
+add_test(NAME download.resume COMMAND test_download resume)
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(download.resume PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+set_tests_properties(download.resume PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
+
+# --- the sysmodule's ipc::Engine, on the host --------------------------------
+# `sysmodule/source/engine.cpp` names no libnx type, so the only thing that tied
+# it to a console was the `sdmc:` prefix on its config directory -- and
+# `SdEngine::Load` takes that as a parameter. M3-2 is the first issue to put real
+# behaviour behind one of its commands (Enqueue/Dequeue change a file on the
+# card), which is what makes "it compiles" stop being a description of what the
+# engine does. Needs no server: what it pins is the card.
+add_executable(test_engine test_engine.cpp
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/engine.cpp")
+target_link_libraries(test_engine PRIVATE rommsync::host)
+target_include_directories(test_engine PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/sysmodule/source")
+target_compile_definitions(test_engine PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+
+set(ENGINE_SCENARIOS
+  queue     # enqueue, dequeue, and the depth the status screen reads
+  persists  # every change reaches queue.json, and a fresh engine reads it back
+  rollback  # a write that cannot happen changes neither the file nor memory
+  corrupt   # a queue.json a yanked card left behind never blocks the boot
+  commands  # what is still `kUnavailable`, so the list shrinks deliberately
+)
+foreach(scenario IN LISTS ENGINE_SCENARIOS)
+  add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
+  set_tests_properties(engine.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()

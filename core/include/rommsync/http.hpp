@@ -196,6 +196,16 @@ struct DownloadTarget {
   std::uint64_t expected_size = 0;
 };
 
+/// Where a `Download` stages the bytes before it commits them: `<path>.part`.
+///
+/// Public because the staging file is not only the backend's business. A caller
+/// that reports how far a download has got has to look at the same file the
+/// backend is writing -- `download::QueueEntry::bytes_done` counts it, so a
+/// resumed transfer's progress bar carries on instead of restarting at zero --
+/// and a second spelling of the suffix inside `core/` would be a platform
+/// detail smuggled past this interface (core/AGENTS.md). One name, named here.
+std::string PartialPathFor(std::string_view path);
+
 /// Backend-independent knobs. A backend ignores what it cannot honour.
 struct ClientOptions {
   /// Sent on every request. Empty means the backend uses `rommsync::kUserAgent`.

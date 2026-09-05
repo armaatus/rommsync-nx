@@ -59,4 +59,6 @@ const std::string* FindHeader(const Headers& headers, std::string_view name) {
   return nullptr;
 }
 
+std::string PartialPathFor(std::string_view path) { return std::string(path) + ".part"; }
+
 }  // namespace rommsync::http
