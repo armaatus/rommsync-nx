@@ -65,8 +65,12 @@ bool Usable(const QueueEntry& entry, std::string* why) {
     *why = "bytes_done is negative";
     return false;
   }
-  if (entry.attempts < 0) {
-    *why = "attempts is negative";
+  // Both ends of the bound, because `ParseEntry` refuses the ceiling too: an
+  // entry that crossed it in memory would serialise and commit fine and then
+  // cost the *next* boot the whole file. `Drainer` saturates rather than
+  // climbing past it, so reaching this is a bug rather than a long uptime.
+  if (entry.attempts < 0 || entry.attempts > kMaxAttemptsRecorded) {
+    *why = "attempts is outside the range an entry can claim";
     return false;
   }
   if (entry.queued_at < 0) {
@@ -150,41 +154,33 @@ bool ReadString(const json::Value& object, std::string_view key, std::string* ou
   return true;
 }
 
-bool ReadInteger(const json::Value& object, std::string_view key, std::int64_t* out,
-                 std::string* why) {
-  const json::Value* member = object.Find(key);
-  if (member == nullptr) {
-    *why = "field " + std::string(key) + ": missing";
-    return false;
-  }
-  if (!member->is_integer()) {
-    *why = "field " + std::string(key) + ": expected a whole number";
-    return false;
-  }
-  *out = member->integer();
-  return true;
-}
-
 bool ParseEntry(const json::Value& object, QueueEntry* out, std::string* why) {
-  if (!object.is_object()) {
-    *why = "a queue entry is not an object";
-    return false;
-  }
-
   QueueEntry entry;
   std::int64_t attempts = 0;
+
+  // The numbers go through `json::Reader`, the same strict reader every server
+  // response uses -- it already refuses a fraction, an exponent and anything
+  // outside an `int64_t`, and it says which field. Only the strings are
+  // hand-read, for the reason `ReadString` gives. `Reader`'s constructor is also
+  // what catches an entry that is not an object at all.
+  json::Reader numbers(object, "queue entry");
+  numbers.Required("rom_id", &entry.rom_id);
+  numbers.Required("size_bytes", &entry.size_bytes);
+  numbers.Required("bytes_done", &entry.bytes_done);
+  numbers.Required("attempts", &attempts);
+  numbers.Required("queued_at", &entry.queued_at);
+  if (!numbers.ok()) {
+    *why = numbers.error().Describe();
+    return false;
+  }
+
   std::string state;
-  const bool read = ReadInteger(object, "rom_id", &entry.rom_id, why) &&
-                    ReadString(object, "platform_fs_slug", &entry.platform_fs_slug, why) &&
+  const bool read = ReadString(object, "platform_fs_slug", &entry.platform_fs_slug, why) &&
                     ReadString(object, "fs_name", &entry.fs_name, why) &&
-                    ReadInteger(object, "size_bytes", &entry.size_bytes, why) &&
                     ReadString(object, "sha1_hash", &entry.sha1_hash, why) &&
                     ReadString(object, "destination", &entry.destination, why) &&
                     ReadString(object, "state", &state, why) &&
-                    ReadInteger(object, "bytes_done", &entry.bytes_done, why) &&
-                    ReadInteger(object, "attempts", &attempts, why) &&
-                    ReadString(object, "message", &entry.message, why) &&
-                    ReadInteger(object, "queued_at", &entry.queued_at, why);
+                    ReadString(object, "message", &entry.message, why);
   if (!read) {
     return false;
   }
@@ -217,7 +213,14 @@ io::BoundedRead ReadBounded(const std::string& path, std::string* out) {
 ///
 /// `<cstdio>` rather than `<filesystem>`, which `core/` may not include
 /// (core/AGENTS.md). It is used for one thing: how many bytes of a rom are
-/// already on the card, `.part` included, which is what `bytes_done` means.
+/// already on the card, which is what `bytes_done` means.
+///
+/// `std::ftell` answers a `long`, so this can only measure a file up to
+/// `LONG_MAX`. Both targets are LP64 -- devkitA64 and the host rig alike -- so
+/// that is 8 EiB and not a bound anything reaches; there is no standard 64-bit
+/// seek `core/` is allowed to reach for, `fseeko` being POSIX. A platform where
+/// `long` is 32 bits would report `0` for a rom over 2 GiB, which shows as a
+/// progress bar that never moves rather than as a corrupt download.
 std::int64_t FileSizeBytes(const std::string& path) {
   std::FILE* file = std::fopen(path.c_str(), "rb");
   if (file == nullptr) {
@@ -232,12 +235,19 @@ std::int64_t FileSizeBytes(const std::string& path) {
   return size;
 }
 
-/// Bytes on the card for `destination`: the finished file if it is there, the
-/// `.part` otherwise. `http::DownloadTarget` renames one onto the other, so at
-/// most one of the two is the answer at any moment.
-std::int64_t BytesOnCard(const std::string& destination) {
-  const std::int64_t whole = FileSizeBytes(destination);
-  return whole > 0 ? whole : FileSizeBytes(destination + ".part");
+/// Bytes of an *unfinished* transfer on the card: the staging file's size, or
+/// zero when there is none.
+///
+/// Deliberately not "the destination if it is there": a rom queued again over
+/// one already on the card would otherwise start at 100% and stay there for the
+/// whole download (#22). The finished file is what the transfer is about to
+/// replace, not progress towards it.
+///
+/// The staging name comes from `http::PartialPathFor` rather than from a second
+/// spelling of `.part` here -- it is the backend's file, and a `core/` copy of
+/// the suffix would be a platform detail past the interface (core/AGENTS.md).
+std::int64_t PartialBytes(const std::string& destination) {
+  return FileSizeBytes(http::PartialPathFor(destination));
 }
 
 /// Whole Unix seconds now. Not injected: `queued_at` is stamped once, is never
@@ -384,19 +394,24 @@ std::size_t Queue::size() const {
 }
 
 ipc::DownloadSnapshot Queue::CurrentDownload() const {
-  std::lock_guard<std::mutex> held(mutex_);
-  for (const QueueEntry& entry : entries_) {
-    if (entry.state != QueueState::kActive && entry.state != QueueState::kVerifying) {
-      continue;
-    }
+  const auto draw = [](const QueueEntry& entry, ipc::DownloadState state) {
     ipc::DownloadSnapshot snapshot;
-    snapshot.state = entry.state == QueueState::kVerifying ? ipc::DownloadState::kVerifying
-                                                           : ipc::DownloadState::kDownloading;
+    snapshot.state = state;
     snapshot.rom_id = entry.rom_id;
     snapshot.fs_name = entry.fs_name;
     snapshot.bytes_done = entry.bytes_done;
     snapshot.bytes_total = entry.size_bytes;
     return snapshot;
+  };
+
+  std::lock_guard<std::mutex> held(mutex_);
+  for (const QueueEntry& entry : entries_) {
+    if (entry.state == QueueState::kActive) {
+      return draw(entry, ipc::DownloadState::kDownloading);
+    }
+    if (entry.state == QueueState::kVerifying) {
+      return draw(entry, ipc::DownloadState::kVerifying);
+    }
   }
   // A queue with something waiting and nothing moving is `kQueued`, not
   // `kIdle`: the status screen has to tell "nothing to do" from "about to
@@ -408,22 +423,19 @@ ipc::DownloadSnapshot Queue::CurrentDownload() const {
   // has the whole snapshot to decide from.
   for (const QueueEntry& entry : entries_) {
     if (entry.state == QueueState::kQueued) {
-      ipc::DownloadSnapshot snapshot;
-      snapshot.state = ipc::DownloadState::kQueued;
-      snapshot.rom_id = entry.rom_id;
-      snapshot.fs_name = entry.fs_name;
-      snapshot.bytes_done = entry.bytes_done;
-      snapshot.bytes_total = entry.size_bytes;
-      return snapshot;
+      return draw(entry, ipc::DownloadState::kQueued);
     }
   }
   return {};
 }
 
-QueueEntry Queue::NextPending() const {
+QueueEntry Queue::NextPending(const std::vector<std::int64_t>& skip) const {
   std::lock_guard<std::mutex> held(mutex_);
   for (const QueueEntry& entry : entries_) {
-    if (!Terminal(entry.state)) {
+    if (Terminal(entry.state)) {
+      continue;
+    }
+    if (std::find(skip.begin(), skip.end(), entry.rom_id) == skip.end()) {
       return entry;
     }
   }
@@ -471,6 +483,8 @@ const char* ToString(StoreError error) {
       return "too_many_entries";
     case StoreError::kTooLarge:
       return "too_large";
+    case StoreError::kUnusableEntry:
+      return "unusable_entry";
     case StoreError::kOpenFailed:
       return "open_failed";
     case StoreError::kWriteFailed:
@@ -598,12 +612,16 @@ LoadedQueue LoadQueue(const std::string& path) {
       // floor. "A commit was interrupted *and* what it left behind is unusable"
       // is the one state worth seeing in a log, and it is the state that would
       // otherwise have been silent.
+      // The test is whether `.old` *parsed*, not whether it held anything: a
+      // drained queue is legitimately written as `entries: []`, and calling
+      // that "no usable queue" would log the one state the module calls a
+      // perfectly good queue as corruption.
       std::vector<std::string> diagnostics{Describe(
-          path, recovered.entries.empty()
-                    ? "is missing and " + previous_path +
-                          " holds no usable queue either -- a write of it was interrupted"
-                    : "is missing; the queue was recovered from " + previous_path +
-                          " after an interrupted write")};
+          path, recovered.diagnostics.empty()
+                    ? "is missing; the queue was recovered from " + previous_path +
+                          " after an interrupted write"
+                    : "is missing and " + previous_path +
+                          " holds no usable queue either -- a write of it was interrupted")};
       for (std::string& diagnostic : recovered.diagnostics) {
         Add(&diagnostics, std::move(diagnostic));
       }
@@ -649,7 +667,7 @@ StoreResult SaveQueue(const std::string& path, const Queue& queue) {
       // A refusal rather than a skip -- see the header. It names the rom id and
       // not the rom, because the name is the field most likely to be the problem
       // and the one that must not reach a log (config.hpp).
-      result.error = StoreError::kTooLarge;
+      result.error = StoreError::kUnusableEntry;
       result.message = Describe(path, "the entry for rom " + std::to_string(entry.rom_id) +
                                           " cannot be written: " + why);
       return result;
@@ -779,7 +797,6 @@ const char* ToString(DrainOutcome outcome) {
 }
 
 namespace {
-
 /// What one exchange with RomM means for the entry that made it.
 enum class Verdict {
   kOk,
@@ -789,25 +806,43 @@ enum class Verdict {
   kCanceled,
 };
 
-/// Classify a completed exchange. `why` gets a sentence for
-/// `QueueEntry::message`, and never quotes the rom.
-Verdict Judge(const http::Result& result, std::string* why) {
+/// What one exchange leaves on the entry, and what it leaves for the log.
+///
+/// Two strings rather than one because they go to different places and are held
+/// to different bars. `entry` is copied into `QueueEntry::message`, which the
+/// queue file carries and the overlay renders, and which **never quotes
+/// `fs_name`** -- and `http::Result::message` does: a `kWriteFailed` from the
+/// libcurl backend is `"could not open <destination>.part: ..."`, destination
+/// and rom name included. `log` is the fuller line, for `DrainResult::message`.
+struct Reason {
+  std::string entry;
+  std::string log;
+};
+
+/// Classify a completed exchange.
+Verdict Judge(const http::Result& result, Reason* why) {
+  const auto say = [&result, why](std::string sentence) {
+    why->entry = std::move(sentence);
+    why->log = why->entry;
+    if (!result.message.empty()) {
+      why->log += " (" + result.message + ")";
+    }
+  };
+
   if (!result.ok()) {
     switch (result.error) {
       case http::Error::kCanceled:
-        *why = "the download was stopped";
+        say("the download was stopped");
         return Verdict::kCanceled;
       case http::Error::kInvalidRequest:
       case http::Error::kWriteFailed:
         // Neither gets better by trying again: one is this client building a
         // request wrong, the other is the card refusing the write -- a mapped
         // folder that does not exist is the ordinary way to reach it.
-        *why = std::string("the transfer could not be made: ") + http::ToString(result.error) +
-               " (" + result.message + ")";
+        say(std::string("the transfer could not be made: ") + http::ToString(result.error));
         return Verdict::kFatal;
       default:
-        *why = std::string("the transfer did not complete: ") + http::ToString(result.error) +
-               " (" + result.message + ")";
+        say(std::string("the transfer did not complete: ") + http::ToString(result.error));
         return Verdict::kRetry;
     }
   }
@@ -819,22 +854,39 @@ Verdict Judge(const http::Result& result, std::string* why) {
   if (status == 401 || status == 403) {
     // Not this entry's problem, and a retried 401 is a 401 retried forever
     // (sync.hpp). The drain stops rather than spending the whole queue on it.
-    *why = status == 401 ? "the server no longer accepts this console's token"
-                         : "this console's token was not granted what a download needs";
+    say(status == 401 ? "the server no longer accepts this console's token"
+                      : "this console's token was not granted what a download needs");
     return Verdict::kUnauthorized;
   }
   if (status == 404) {
-    *why = "the server has no such rom any more";
+    say("the server has no such rom any more");
     return Verdict::kFatal;
   }
   if (status == 408 || status == 429 || status >= 500) {
     // A proxy and a rate limiter answer with the first two; a 5xx is the server
     // having a bad minute. All three are worth another request.
-    *why = "the server answered " + std::to_string(status);
+    say("the server answered " + std::to_string(status));
     return Verdict::kRetry;
   }
-  *why = "the server refused the request with " + std::to_string(status);
+  say("the server refused the request with " + std::to_string(status));
   return Verdict::kFatal;
+}
+
+/// The drain outcome a verdict ends the entry's turn with. One mapping rather
+/// than one per request loop, so the two cannot drift apart.
+DrainOutcome OutcomeFor(Verdict verdict) {
+  switch (verdict) {
+    case Verdict::kRetry:
+      return DrainOutcome::kRetryable;
+    case Verdict::kUnauthorized:
+      return DrainOutcome::kUnauthorized;
+    case Verdict::kCanceled:
+      return DrainOutcome::kCanceled;
+    case Verdict::kOk:
+    case Verdict::kFatal:
+      break;
+  }
+  return DrainOutcome::kCompleted;
 }
 
 http::Request Authed(const WorkerOptions& options, std::string url) {
@@ -854,13 +906,13 @@ enum class Written {
 };
 
 /// The state one entry's turn left the drain in.
+///
+/// `kCompleted` means "this entry is finished with, carry on"; every other value
+/// is something the caller of `Drain` has to hear about.
 struct Step {
   DrainOutcome outcome = DrainOutcome::kCompleted;
   StoreResult store;
   std::string message;
-
-  /// Keep going round the loop. False for everything that ends the drain.
-  bool advance() const { return outcome == DrainOutcome::kCompleted; }
 };
 
 /// One drain, and the bookkeeping its two request loops share.
@@ -873,7 +925,7 @@ class Drainer {
         config_(config),
         queue_(queue),
         options_(options),
-        attempts_(options.max_attempts > 0 ? options.max_attempts : 1),
+        budget_(options.max_attempts > 0 ? options.max_attempts : 1),
         backoff_(options.backoff) {}
 
   DrainResult Run() {
@@ -887,25 +939,42 @@ class Drainer {
     }
 
     bool worked = false;
+    DrainOutcome stopped = DrainOutcome::kCompleted;
     for (;;) {
       if (Canceled()) {
-        result.outcome = DrainOutcome::kCanceled;
+        stopped = DrainOutcome::kCanceled;
         result.message = "the drain was stopped";
         break;
       }
-      const QueueEntry entry = queue_.NextPending();
+      const QueueEntry entry = queue_.NextPending(deferred_);
       if (entry.rom_id == 0) {
-        result.outcome = worked ? DrainOutcome::kCompleted : DrainOutcome::kIdle;
         break;
       }
       worked = true;
       const Step step = One(entry);
-      if (!step.advance()) {
-        result.outcome = step.outcome;
+      if (step.outcome == DrainOutcome::kRetryable) {
+        // Set aside, not dropped. One rom whose endpoint answers 500 every time
+        // must not starve the rest of the queue, and it is still the user's
+        // download -- so it stays `kQueued` and the next entry gets a turn.
+        deferred_.push_back(entry.rom_id);
+        deferred_message_ = step.message;
+        continue;
+      }
+      if (step.outcome != DrainOutcome::kCompleted) {
+        stopped = step.outcome;
         result.store = step.store;
         result.message = step.message;
         break;
       }
+    }
+
+    if (stopped != DrainOutcome::kCompleted) {
+      result.outcome = stopped;
+    } else if (!deferred_.empty()) {
+      result.outcome = DrainOutcome::kRetryable;
+      result.message = deferred_message_;
+    } else {
+      result.outcome = worked ? DrainOutcome::kCompleted : DrainOutcome::kIdle;
     }
 
     result.downloaded = downloaded_;
@@ -918,6 +987,16 @@ class Drainer {
 
  private:
   bool Canceled() const { return options_.cancel != nullptr && options_.cancel->canceled(); }
+
+  /// One more failed request against the entry in hand, saturating rather than
+  /// climbing past what the file may claim: an `attempts` over
+  /// `kMaxAttemptsRecorded` writes fine and costs the *next* boot the whole
+  /// queue, which is the silent loss the two bounds exist to prevent.
+  static void CountAttempt(QueueEntry* entry) {
+    if (entry->attempts < static_cast<int>(kMaxAttemptsRecorded)) {
+      ++entry->attempts;
+    }
+  }
 
   /// Wait out one backoff, doubling it for the next.
   ///
@@ -937,6 +1016,13 @@ class Drainer {
     backoff_ = backoff_ * 2 > options_.max_backoff ? options_.max_backoff : backoff_ * 2;
   }
 
+  /// Spend one of the entry's requests, and say whether it had one to spend.
+  ///
+  /// The budget is the *entry's*, shared by the detail call and the transfer:
+  /// a budget each would let one entry issue twice `max_attempts` requests and
+  /// wait twice the backoff in a single drain.
+  bool Spend() { return ++spent_ < budget_; }
+
   /// Write the queue down. **Every state transition goes through this**, so the
   /// file and memory never disagree by more than one `rename` -- which is what
   /// makes a power cut resumable rather than a restart.
@@ -954,11 +1040,18 @@ class Drainer {
     return Written::kFailed;
   }
 
-  /// Finish `entry` in a terminal state, counting it.
+  /// Finish `entry` in a terminal state.
+  ///
+  /// The count follows the write, not the intention: an entry the user removed
+  /// mid-transfer has no row left to explain a `failed: 1` with, so it is not
+  /// counted.
   Step Settle(QueueEntry entry, QueueState state, std::string why) {
     Step step;
     entry.state = state;
     entry.message = Clip(std::move(why));
+    if (Persist(entry, &step) != Written::kOk) {
+      return step;
+    }
     switch (state) {
       case QueueState::kDone:
         ++downloaded_;
@@ -970,25 +1063,24 @@ class Drainer {
         ++failed_;
         break;
     }
-    Persist(entry, &step);
     return step;
   }
 
   /// Leave `entry` queued after a failure that says nothing about the rom, and
-  /// end the drain with `outcome`.
-  Step Requeue(QueueEntry entry, std::string why, DrainOutcome outcome) {
+  /// end the entry's turn with `outcome`.
+  Step Requeue(QueueEntry entry, const Reason& why, DrainOutcome outcome) {
     Step step;
     entry.state = QueueState::kQueued;
-    entry.message = Clip(std::move(why));
+    entry.message = Clip(why.entry);
     if (!destination_.empty()) {
-      // What a resume will start from. Counting the `.part` rather than this
-      // request's bytes is the difference between a bar that carries on and one
-      // that restarts at zero (#22).
-      entry.bytes_done = BytesOnCard(destination_);
+      // What a resume will start from. Counting the staging file rather than
+      // this request's bytes is the difference between a bar that carries on
+      // and one that restarts at zero (#22).
+      entry.bytes_done = PartialBytes(destination_);
     }
     if (Persist(entry, &step) != Written::kFailed) {
       step.outcome = outcome;
-      step.message = entry.message;
+      step.message = why.log;
     }
     return step;
   }
@@ -997,24 +1089,31 @@ class Drainer {
     QueueEntry entry = queued;
     // Nothing carries over from the last entry: `Requeue` asks the card how many
     // bytes a *resolved* destination holds, and a stale one would answer about
-    // another rom's file.
+    // another rom's file. The budget is per entry for the same reason.
     destination_.clear();
+    spent_ = 0;
+    backoff_ = options_.backoff;
 
     // 1. Who is this rom? `Enqueue` recorded an id and nothing else, because no
     // IPC command may block on the network (ipc.hpp).
     RomDetail detail;
-    std::string why;
-    switch (FetchDetail(&entry, &detail, &why)) {
-      case Verdict::kOk:
-        break;
-      case Verdict::kRetry:
-        return Requeue(std::move(entry), std::move(why), DrainOutcome::kRetryable);
-      case Verdict::kCanceled:
-        return Requeue(std::move(entry), std::move(why), DrainOutcome::kCanceled);
-      case Verdict::kUnauthorized:
-        return Requeue(std::move(entry), std::move(why), DrainOutcome::kUnauthorized);
-      case Verdict::kFatal:
-        return Settle(std::move(entry), QueueState::kFailed, std::move(why));
+    Reason why;
+    const Verdict resolved = FetchDetail(&entry, &detail, &why);
+    if (resolved == Verdict::kFatal) {
+      return Settle(std::move(entry), QueueState::kFailed, why.entry);
+    }
+    if (resolved != Verdict::kOk) {
+      return Requeue(std::move(entry), why, OutcomeFor(resolved));
+    }
+
+    if (detail.id != entry.rom_id) {
+      // The id is read back and checked rather than ignored. RomM has one
+      // download path where the id in the URL and the bytes served can disagree
+      // (docs/API_CONTRACT.md#multi-file-roms), so a body describing a different
+      // rom is worth refusing here rather than writing its bytes under this
+      // entry's name.
+      return Settle(std::move(entry), QueueState::kFailed,
+                    "the server answered with a different rom than the one that was asked for");
     }
 
     entry.platform_fs_slug = detail.platform_fs_slug;
@@ -1058,15 +1157,16 @@ class Drainer {
     return Transfer(std::move(entry));
   }
 
-  Verdict FetchDetail(QueueEntry* entry, RomDetail* out, std::string* why) {
+  Verdict FetchDetail(QueueEntry* entry, RomDetail* out, Reason* why) {
     http::Request request =
         Authed(options_, options_.base_url + "/api/roms/" + std::to_string(entry->rom_id));
     request.headers.push_back({"Accept", "application/json"});
     request.timeout = options_.detail_timeout;
 
-    for (int attempt = 1;; ++attempt) {
+    for (;;) {
       const http::Result result = client_.Send(request);
       ++requests_;
+      const bool more = Spend();
       Verdict verdict = Judge(result, why);
       if (verdict == Verdict::kOk) {
         const json::Error shape = ParseRomDetail(result.response.body, out);
@@ -1077,13 +1177,22 @@ class Drainer {
         // shape, and this is the failure that must never be papered over --
         // "this server is not the RomM this build was written against"
         // (rom_index.hpp).
-        *why = "the rom could not be read: " + shape.Describe();
+        why->entry = "the rom could not be read: " + shape.Describe();
+        why->log = why->entry;
         verdict = Verdict::kFatal;
       }
       if (verdict != Verdict::kCanceled) {
-        ++entry->attempts;
+        CountAttempt(entry);
       }
-      if (verdict != Verdict::kRetry || attempt >= attempts_ || Canceled()) {
+      if (Canceled()) {
+        // Checked before the budget, so a stop that lands while a request was
+        // failing for some other reason is still reported as a stop rather than
+        // as a network failure the caller might retry.
+        why->entry = "the download was stopped";
+        why->log = why->entry;
+        return Verdict::kCanceled;
+      }
+      if (verdict != Verdict::kRetry || !more) {
         return verdict;
       }
       Wait();
@@ -1106,9 +1215,9 @@ class Drainer {
     // thing that catches a body ending early (fault_proxy.py).
     target.expected_size = static_cast<std::uint64_t>(entry.size_bytes);
 
-    for (int attempt = 1;; ++attempt) {
+    for (;;) {
       entry.state = QueueState::kActive;
-      entry.bytes_done = BytesOnCard(destination_);
+      entry.bytes_done = PartialBytes(destination_);
       entry.message.clear();
       Step step;
       if (Persist(entry, &step) != Written::kOk) {
@@ -1119,28 +1228,27 @@ class Drainer {
 
       const http::Result result = client_.Download(request, target);
       ++requests_;
-      std::string why;
+      const bool more = Spend();
+      Reason why;
       const Verdict verdict = Judge(result, &why);
       if (verdict == Verdict::kOk) {
-        entry.bytes_done = BytesOnCard(destination_);
+        entry.bytes_done = FileSizeBytes(destination_);
         // M3-3 (#20) puts `kVerifying` and the SHA-1 between here and `kDone`.
         return Settle(std::move(entry), QueueState::kDone, "downloaded");
       }
       if (verdict != Verdict::kCanceled) {
-        ++entry.attempts;
+        CountAttempt(&entry);
       }
-      switch (verdict) {
-        case Verdict::kFatal:
-          return Settle(std::move(entry), QueueState::kFailed, std::move(why));
-        case Verdict::kUnauthorized:
-          return Requeue(std::move(entry), std::move(why), DrainOutcome::kUnauthorized);
-        case Verdict::kCanceled:
-          return Requeue(std::move(entry), std::move(why), DrainOutcome::kCanceled);
-        default:
-          break;
+      if (verdict == Verdict::kFatal) {
+        return Settle(std::move(entry), QueueState::kFailed, why.entry);
       }
-      if (attempt >= attempts_ || Canceled()) {
-        return Requeue(std::move(entry), std::move(why), DrainOutcome::kRetryable);
+      if (Canceled()) {
+        // Before the budget, for the reason `FetchDetail` gives.
+        return Requeue(std::move(entry), {"the download was stopped", "the download was stopped"},
+                       DrainOutcome::kCanceled);
+      }
+      if (verdict != Verdict::kRetry || !more) {
+        return Requeue(std::move(entry), why, OutcomeFor(verdict));
       }
       Wait();
     }
@@ -1151,12 +1259,20 @@ class Drainer {
   const config::Config& config_;
   Queue& queue_;
   const WorkerOptions& options_;
-  const int attempts_;
+
+  /// Requests one entry may spend, and how many the entry in hand has spent.
+  const int budget_;
+  int spent_ = 0;
 
   /// The real path the entry in hand is written to, set by `One` and cleared by
   /// it. Empty until a destination has resolved, which is what `Requeue` checks
   /// before asking the card how many bytes of it are already there.
   std::string destination_;
+
+  /// The entries this drain set aside, and the last reason it did. They are
+  /// still in the queue and still the user's downloads -- see `Run`.
+  std::vector<std::int64_t> deferred_;
+  std::string deferred_message_;
 
   std::chrono::milliseconds backoff_;
   std::chrono::milliseconds waited_{0};
@@ -1165,7 +1281,6 @@ class Drainer {
   int skipped_ = 0;
   int failed_ = 0;
 };
-
 }  // namespace
 
 DrainResult Drain(http::HttpClient& client, fs::FileSystem& filesystem,

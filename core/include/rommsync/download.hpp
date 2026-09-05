@@ -245,10 +245,16 @@ class Queue {
   /// `kIdle` when nothing is `kActive` or `kVerifying`.
   ipc::DownloadSnapshot CurrentDownload() const;
 
-  /// The first entry the worker still has to do, or a default-constructed one
-  /// with `rom_id == 0` when there is none. A copy, so the worker holds no
-  /// reference into a vector the IPC thread may reallocate under it.
-  QueueEntry NextPending() const;
+  /// The first entry the worker still has to do whose `rom_id` is not in
+  /// `skip`, or a default-constructed one with `rom_id == 0` when there is
+  /// none. A copy, so the worker holds no reference into a vector the IPC
+  /// thread may reallocate under it.
+  ///
+  /// `skip` is how one drain sets an entry aside without taking it out of the
+  /// queue: a rom whose own endpoint keeps answering 500 must not hold up the
+  /// sixty-three behind it, and it is still the user's download rather than
+  /// something to drop. See `Drain`.
+  QueueEntry NextPending(const std::vector<std::int64_t>& skip = {}) const;
 
   /// Write `entry` back over the row with the same `rom_id`.
   ///
@@ -342,9 +348,17 @@ enum class StoreError {
   kNone,
   kTooManyEntries,  ///< more than `kMaxQueueEntries`; the reader would discard the file
   kTooLarge,        ///< the serialised file exceeds `kMaxQueueBytes`, same reason
-  kOpenFailed,      ///< the temp file could not be created -- usually a missing directory
-  kWriteFailed,     ///< the bytes did not all reach the disk; the destination is untouched
-  kCommitFailed,    ///< the rename onto `path` failed; see atomic_file.hpp
+
+  /// One entry is not one `ParseQueue` would read back -- a `rom_id` that is
+  /// not positive, a negative count, an over-long field. Its own member rather
+  /// than folded into `kTooLarge`: whoever reads the log after a field failure
+  /// would otherwise start from the wrong hypothesis, and only one of the two
+  /// is fixed by making the queue smaller.
+  kUnusableEntry,
+
+  kOpenFailed,    ///< the temp file could not be created -- usually a missing directory
+  kWriteFailed,   ///< the bytes did not all reach the disk; the destination is untouched
+  kCommitFailed,  ///< the rename onto `path` failed; see atomic_file.hpp
 };
 
 /// Stable, log-friendly name. Never null.
@@ -420,8 +434,13 @@ struct WorkerOptions {
   std::chrono::milliseconds detail_timeout = http::kDefaultTimeout;
   std::chrono::milliseconds stall_timeout = http::kDefaultStallTimeout;
 
-  /// Requests one entry may spend inside one drain, including the first. Only a
-  /// retryable failure spends another; the entry stays queued either way.
+  /// Requests one entry may spend inside one drain, including the first.
+  ///
+  /// **The budget is the entry's, not each request's.** An entry costs a
+  /// `GET /api/roms/{id}` and then a transfer, and a budget spent separately by
+  /// each would let one entry issue twice this many requests and wait twice the
+  /// backoff. Only a retryable failure spends another; the entry stays queued
+  /// either way.
   int max_attempts = 3;
 
   /// The first delay before a retry, doubled per consecutive retryable failure
@@ -445,7 +464,10 @@ enum class DrainOutcome {
   kIdle,       ///< nothing left to do -- the queue holds no pending entry
   kDisabled,   ///< `[downloads] enabled = false`. Nothing was touched.
   kCompleted,  ///< every pending entry reached a terminal state
-  kRetryable,  ///< a network failure; the entry is still queued and will be tried again
+  /// At least one entry failed in a way that says nothing about the rom. Every
+  /// one of them is still queued and will be tried again; the rest of the queue
+  /// was drained around them.
+  kRetryable,
   kCanceled,   ///< the caller's `CancelToken` fired
   kUnauthorized,  ///< 401 -- the token is gone. Retrying will not fix it; pairing will.
   kStoreFailed,   ///< the queue could not be written; see `store` for which bound
@@ -491,6 +513,16 @@ struct DrainResult {
 /// **`[downloads] enabled = false` idles; it does not drop the queue.** The
 /// answer is `kDisabled` and the file is not even opened, so switching downloads
 /// back on resumes exactly what was there (docs/CONFIG.md).
+///
+/// **A retryable failure sets that entry aside and the drain carries on.** The
+/// entry stays `kQueued` with its `attempts` up, and the next entry is tried:
+/// one rom whose endpoint answers 500 every time -- a permission or a path
+/// problem on the server's side -- must not starve the sixty-three behind it,
+/// and it is still the user's download rather than something to drop. The drain
+/// ends `kRetryable` when anything was set aside. The three outcomes that are
+/// *not* about one entry -- `kUnauthorized`, `kCanceled`, `kStoreFailed` -- end
+/// it immediately instead, because every remaining entry would fail the same
+/// way.
 ///
 /// `filesystem` supplies `Resolve` alone: the engine names SD paths and only a
 /// backend knows the prefix (file_system.hpp). A destination the backend refuses

@@ -317,7 +317,9 @@ class CurlHttpClient final : public http::HttpClient {
       return result;
     }
 
-    const std::string partial_path = target.path + ".part";
+    // The one spelling of the staging name, so `core/` can look at the same
+    // file this writes without knowing the suffix (http.hpp).
+    const std::string partial_path = http::PartialPathFor(target.path);
 
     // A caller-set range means "fetch this slice" and starts the file fresh; a
     // resume means "finish this file" and is the only case that keeps the bytes

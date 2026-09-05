@@ -388,6 +388,22 @@ void Store(checks::Checks& c) {
   c.Expect(!recovered.diagnostics.empty(), "and the recovery is not silent");
   c.Expect(download::SaveQueue(path, queue).ok(), "and the file is put back for what follows");
 
+  // A queue that was drained is legitimately written as no entries at all, so
+  // recovering an *empty* `.old` is a recovery and not a corruption. Reporting
+  // it as one would log the state the module calls a perfectly good queue as
+  // the state it calls a lost one.
+  const std::string spare = sandbox.Host("/config/rommsync/drained.json");
+  download::Queue nothing_queued;
+  c.Expect(download::SaveQueue(spare, nothing_queued).ok(), "an empty queue is written");
+  c.Expect(io::WriteAtomically(io::PreviousPathFor(spare), io::ReadFile(spare).contents).ok(),
+           "and staged as a .old");
+  c.Expect(std::remove(spare.c_str()) == 0, "with the file taken away mid-commit");
+  const download::LoadedQueue drained = download::LoadQueue(spare);
+  c.Expect(drained.entries.empty(), "the recovered queue is empty, as it was");
+  c.Expect(drained.DescribeDiagnostics().find("recovered") != std::string::npos,
+           "and the diagnostic says it was recovered, not that it was unusable: " +
+               drained.DescribeDiagnostics());
+
   // A write that cannot happen costs the new queue and never the working one.
   download::Queue elsewhere;
   elsewhere.Enqueue(9, &position);
@@ -405,6 +421,9 @@ void Store(checks::Checks& c) {
   oversized.Reset({huge});
   const download::StoreResult too_big = download::SaveQueue(path, oversized);
   c.Expect(!too_big.ok(), "an entry the reader would refuse is not written");
+  c.Expect(too_big.error == download::StoreError::kUnusableEntry,
+           "and it is named as a bad entry rather than as a file that is too big -- the two "
+           "send whoever reads the log to different places");
   c.Expect(!too_big.message.empty(), "and the refusal says which bound it hit");
   c.Expect(too_big.message.find(huge.fs_name) == std::string::npos,
            "without quoting the rom's name back into the log");
@@ -533,7 +552,8 @@ class Rig {
     // Creating a mapped folder is the platform layer's job, not the engine's
     // (atomic_file.hpp). A test that skipped this would be checking the failure
     // path for a folder that is not there, not a download.
-    for (const char* folder : {"/tico/roms/nes", "/tico/roms/gba", "/tico/roms/psx"}) {
+    for (const char* folder :
+         {"/tico/roms/nes", "/tico/roms/gb", "/tico/roms/gba", "/tico/roms/psx"}) {
       sandbox.MakeDirs(folder);
     }
     settings = Settings();
@@ -645,14 +665,43 @@ void Drain(checks::Checks& c, http::HttpClient& client, const std::string& base,
   const download::DrainResult again = rig.Drain(client);
   c.Expect(again.outcome == download::DrainOutcome::kIdle, "a drained queue is idle");
   c.ExpectEq(again.attempts, 0, "and costs no requests");
+
+  // Queued again over the rom already on the card: `bytes_done` is progress
+  // towards *this* transfer, so it starts at nothing. Counting the finished
+  // file -- which the transfer is about to replace, not build on -- would show
+  // the overlay's bar at 100% for the whole download (#22).
+  {
+    std::int32_t position = 0;
+    c.Expect(rig.queue.Enqueue(rom_id, &position) == ipc::Error::kOk,
+             "a finished rom can be asked for again");
+    rig.options.max_attempts = 1;
+    harness::Fault fault(c, client, base,
+                         "{\"mode\":\"status\",\"status\":500,\"count\":9,\"path\":\"/api/roms/" +
+                             std::to_string(rom_id) + "/content\"}");
+    const download::DrainResult requeued = rig.Drain(client);
+    c.Expect(requeued.outcome == download::DrainOutcome::kRetryable,
+             std::string("...and the transfer that fails leaves it queued -- got ") +
+                 download::ToString(requeued.outcome));
+    c.ExpectEq(rig.Persisted(rom_id).bytes_done, std::int64_t{0},
+               "with no progress claimed for a transfer that has not moved a byte");
+    c.Expect(rig.sandbox.Read("/tico/roms/nes/240pee.nes") == expected,
+             "and the rom already on the card is untouched");
+  }
 }
 
 void Retries(checks::Checks& c, http::HttpClient& client, const std::string& base,
              const harness::Fixture& fixture) {
   Rig rig(c, "download-retries", base, fixture);
   harness::Rom rom;
+  harness::Rom behind;
   const std::int64_t rom_id = Queued(c, client, base, fixture, &rig.queue, "240pee.nes", &rom);
-  if (rom_id == 0) {
+  // A second, healthy rom behind the failing one. Without it this scenario says
+  // nothing about the *queue*: a worker that stopped the whole drain at the
+  // first retryable entry would starve the sixty-three behind it, and a
+  // one-entry queue cannot tell that apart from correct behaviour.
+  const std::int64_t behind_id =
+      Queued(c, client, base, fixture, &rig.queue, "gb240p.gb", &behind);
+  if (rom_id == 0 || behind_id == 0) {
     return;
   }
 
@@ -670,23 +719,28 @@ void Retries(checks::Checks& c, http::HttpClient& client, const std::string& bas
     c.Expect(result.outcome == download::DrainOutcome::kRetryable,
              std::string("a 500 is retryable, not fatal -- got ") +
                  download::ToString(result.outcome));
-    c.ExpectEq(result.attempts, rig.options.max_attempts,
-               "the whole retry budget was spent on it");
     c.Expect(rig.slept.count() > 0, "and the backoff was actually asked for");
     c.Expect(rig.slept >= rig.options.backoff, "at least the first delay");
-    c.ExpectEq(result.downloaded, 0, "nothing came down");
-    c.ExpectEq(result.failed, 0, "and nothing was written off as failed");
+    c.ExpectEq(result.failed, 0, "nothing was written off as failed");
+
+    // The drain goes round the entry that cannot be served rather than stopping
+    // at it. The failing rom is the *head* of the queue, so this is exactly the
+    // arrangement a head-of-line stall would show up in.
+    c.ExpectEq(result.downloaded, 1, "the healthy rom behind it still came down");
+    c.Expect(rig.sandbox.Read("/tico/roms/gb/gb240p.gb") == FixtureRom("roms/gb/gb240p.gb"),
+             "byte for byte");
+    c.Expect(rig.Persisted(behind_id).state == QueueState::kDone, "and its entry is done");
   }
 
   const QueueEntry entry = rig.Persisted(rom_id);
-  c.ExpectEq(entry.rom_id, rom_id, "the entry is still in the file on the card");
+  c.ExpectEq(entry.rom_id, rom_id, "the failing entry is still in the file on the card");
   c.Expect(entry.state == QueueState::kQueued, "still queued, never dropped");
   c.ExpectEq(entry.attempts, rig.options.max_attempts, "with its attempts counted");
   c.Expect(!entry.message.empty(), "and a reason a user can read");
   c.Expect(entry.message.find("500") != std::string::npos, "naming the status the server sent");
   c.ExpectEq(rig.queue.pending(), std::size_t{1}, "and it is still the worker's to do");
   c.Expect(!rig.sandbox.Exists("/tico/roms/nes/240pee.nes"),
-           "nothing reached the destination on a drain that never got a rom");
+           "nothing reached the destination for the rom that could not be resolved");
 
   // The fault is disarmed, so the same queue drains. That is what "never
   // dropped" is worth: the retry is the *next* drain, not a lost download.
@@ -700,6 +754,37 @@ void Retries(checks::Checks& c, http::HttpClient& client, const std::string& bas
   c.Expect(rig.Persisted(rom_id).state == QueueState::kDone, "and the entry is done");
   c.ExpectEq(rig.Persisted(rom_id).attempts, rig.options.max_attempts,
              "with what it cost still recorded");
+
+  // The retry budget belongs to the *entry*, not to each half of its turn.
+  //
+  // This is the case the 500 above cannot see: there the detail call fails, so
+  // only the first of the worker's two request loops ever runs. Here the detail
+  // call succeeds and the transfer is what keeps failing, so a budget spent
+  // separately by each half would issue one request more than `max_attempts`
+  // and wait one more backoff for this single entry.
+  {
+    harness::Rom nova;
+    const std::int64_t nova_id = Queued(c, client, base, fixture, &rig.queue, "nova.nes", &nova);
+    if (nova_id == 0) {
+      return;
+    }
+    harness::Fault fault(
+        c, client, base,
+        "{\"mode\":\"drop\",\"bytes\":1024,\"count\":9,\"path\":\"/api/roms/" +
+            std::to_string(nova_id) + "/content\"}");
+    const download::DrainResult result = rig.Drain(client);
+    c.Expect(result.outcome == download::DrainOutcome::kRetryable,
+             std::string("a transfer that keeps dropping is retryable -- got ") +
+                 download::ToString(result.outcome));
+    c.ExpectEq(result.attempts, rig.options.max_attempts,
+               "one entry's turn costs one entry's budget: the detail call and the transfers "
+               "share it rather than each getting their own");
+    c.ExpectEq(rig.Persisted(nova_id).attempts, rig.options.max_attempts - 1,
+               "...so the transfer failed for every request left after the detail call");
+    c.Expect(rig.Persisted(nova_id).state == QueueState::kQueued, "and the entry is still queued");
+    c.Expect(!rig.sandbox.Exists("/tico/roms/nes/nova.nes"),
+             "with no short file where a complete rom is expected");
+  }
 }
 
 void Resume(checks::Checks& c, http::HttpClient& client, const std::string& base,
@@ -758,6 +843,42 @@ void Resume(checks::Checks& c, http::HttpClient& client, const std::string& base
                FixtureRom("roms/gba/synthetic-large.gba"),
            "with the whole rom byte-identical to the fixture");
   c.Expect(rig.Persisted(rom_id).state == QueueState::kDone, "the entry on the card is done");
+
+  // The assertions above are all satisfied by a second drain that *restarted*
+  // from zero, so on their own they do not pin the property the issue names --
+  // "an entry left `kActive` by a power cut is **resumed** from its `.part`, not
+  // restarted". This does, by making the two outcomes different bytes: seed a
+  // staging file whose contents are not the rom's, and see them survive.
+  //
+  // What it therefore also pins is why M3-3 (#20) is not optional. The rom that
+  // lands here is the right *length* and the wrong *bytes*, and nothing in this
+  // issue can tell the difference -- only the SHA-1 can.
+  {
+    harness::Rom nova;
+    const std::int64_t nova_id = Queued(c, client, base, fixture, &rig.queue, "nova.nes", &nova);
+    if (nova_id == 0) {
+      return;
+    }
+    const std::string seeded(1024, 'X');
+    c.Expect(rig.sandbox.Write("/tico/roms/nes/nova.nes.part", seeded),
+             "a staging file from an interrupted transfer is on the card");
+
+    const download::DrainResult result = rig.Drain(client);
+    c.Expect(result.outcome == download::DrainOutcome::kCompleted,
+             std::string("the drain finishes -- got ") + download::ToString(result.outcome) + " (" +
+                 result.message + ")");
+
+    const std::string landed = rig.sandbox.Read("/tico/roms/nes/nova.nes");
+    const std::string whole = FixtureRom("roms/nes/nova.nes");
+    c.ExpectEq(landed.size(), whole.size(), "the file is the length the server declared");
+    c.Expect(landed != whole,
+             "and it is NOT the fixture -- which is only possible if the transfer continued from "
+             "the staging file rather than starting the download over");
+    c.ExpectEq(landed.substr(0, seeded.size()), seeded,
+               "the bytes that were already there are the ones that are still there");
+    c.ExpectEq(rig.Persisted(nova_id).bytes_done, static_cast<std::int64_t>(whole.size()),
+               "and bytes_done counts the whole file, not just this request's share");
+  }
 }
 
 void Disabled(checks::Checks& c, http::HttpClient& client, const std::string& base,
