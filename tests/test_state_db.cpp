@@ -221,49 +221,125 @@ void RecoversFromTheCommitWindow(checks::Checks& c) {
            "the recovery is reported, not silent -- " + loaded.DescribeDiagnostics());
 }
 
-/// A row that could not be read back is refused before anything is written.
+/// A row that could not be read back is **skipped**, and the rest are written.
 ///
-/// `token_store`'s reasoning: a file that exists and cannot be parsed is worse
-/// than no file, because the next boot finds one, discards the lot, and
-/// re-hashes the library for the life of the bug.
-void RefusesARowItCouldNotReadBack(checks::Checks& c) {
+/// The module is an optimisation and never a gate, and that has to hold for the
+/// writer too. A console whose RTC was never set stamps a save with the epoch,
+/// which is outside the range a save may claim; refusing the whole file over it
+/// would freeze the baseline at its last good version and re-hash the entire
+/// library on every tick from then on. Leaving that one save out costs that one
+/// save a re-hash.
+void SkipsARowItCouldNotReadBack(checks::Checks& c) {
   const std::filesystem::path path = FreshPath("unusable.db");
+
+  state::Baseline baseline;
+  baseline.Set(Full());
+
+  // A SHA1, which is the mistake this whole issue is written against, and an
+  // uppercase digest, which is the same failure from a subtler cause.
+  state::SaveRecord sha1 = Full();
+  sha1.rom_id = 13;
+  sha1.content_hash = std::string(40, 'a');
+  baseline.Set(sha1);
+  state::SaveRecord shouty = Full();
+  shouty.rom_id = 14;
+  shouty.content_hash = "D41D8CD98F00B204E9800998ECF8427E";
+  baseline.Set(shouty);
+
+  // An empty slot is neither "autosave" nor archival, and the server pairs
+  // those two differently.
+  state::SaveRecord blank = Full();
+  blank.rom_id = 15;
+  blank.slot = "";
+  baseline.Set(blank);
+
+  // The epoch: a console that has never seen a clock. The realistic one.
+  state::SaveRecord unset_clock = Full();
+  unset_clock.rom_id = 16;
+  unset_clock.mtime = At(0);
+  baseline.Set(unset_clock);
+
+  const state::StoreResult stored = state::SaveBaseline(path.string(), baseline);
+  c.Expect(stored.ok(), "four bad rows are not a failed write -- " + stored.message);
+  c.ExpectEq(stored.rows_written, std::size_t{1}, "the good row was written");
+  c.ExpectEq(stored.skipped.size(), std::size_t{4}, "and the four bad ones are named");
+
+  const state::LoadedBaseline loaded = state::LoadBaseline(path.string());
+  c.Expect(loaded.diagnostics.empty(),
+           "what was written reads back clean -- " + loaded.DescribeDiagnostics());
+  c.ExpectEq(loaded.value.size(), std::size_t{1}, "with the one good row");
+  c.Expect(loaded.value.Find(12, std::optional<std::string>("autosave")) != nullptr,
+           "and it is the right one");
+  for (std::int64_t dropped : {13, 14, 15, 16}) {
+    c.Expect(loaded.value.Find(dropped, std::optional<std::string>("autosave")) == nullptr,
+             "rom " + std::to_string(dropped) + " was left out");
+  }
+
+  // The skip must be visible to the caller, not just absent from the file --
+  // a save silently missing from the baseline is a re-hash nobody can explain.
+  bool names_the_rom = false;
+  for (const std::string& why : stored.skipped) {
+    names_the_rom = names_the_rom || why.find("16") != std::string::npos;
+  }
+  c.Expect(names_the_rom, "the unset-clock row is named in `skipped`");
+}
+
+/// The file-level bounds *are* refusals, because there is nothing partial to
+/// fall back to: a file over either is one `ParseBaseline` discards whole, so
+/// writing it trades one loud failure for a silent re-hash on every boot.
+void RefusesAFileTheReaderWouldDiscard(checks::Checks& c) {
+  const std::filesystem::path path = FreshPath("oversize.db");
 
   state::Baseline baseline;
   baseline.Set(Full());
   c.Expect(state::SaveBaseline(path.string(), baseline).ok(), "a good baseline is written");
   const std::string kept = ReadWhole(path.string());
 
-  // A SHA1, which is the mistake this whole issue is written against.
-  state::SaveRecord sha1 = Full();
-  sha1.rom_id = 13;
-  sha1.content_hash = std::string(40, 'a');
-  baseline.Set(sha1);
-  const state::StoreResult refused = state::SaveBaseline(path.string(), baseline);
-  c.ExpectEq(state::ToString(refused.error), std::string("unusable_record"),
-             "a 40-digit digest is refused");
-  c.Expect(refused.message.find("13") != std::string::npos,
-           "and the refusal names the rom -- " + refused.message);
+  state::Baseline too_many;
+  for (std::size_t at = 0; at <= state::kMaxRecords; ++at) {
+    state::SaveRecord record = Full();
+    record.rom_id = static_cast<std::int64_t>(at) + 1;
+    too_many.Set(record);
+  }
+  const state::StoreResult over_rows = state::SaveBaseline(path.string(), too_many);
+  c.ExpectEq(state::ToString(over_rows.error), std::string("too_many_records"),
+             "one row past kMaxRecords is refused");
+  c.ExpectEq(over_rows.rows_written, std::size_t{0}, "and nothing was written");
   c.ExpectEq(ReadWhole(path.string()), kept, "the working baseline is untouched");
 
-  // ...and an uppercase one, which is the same failure from a subtler cause.
-  state::Baseline shouty;
-  state::SaveRecord upper = Full();
-  upper.content_hash = "D41D8CD98F00B204E9800998ECF8427E";
-  shouty.Set(upper);
-  c.ExpectEq(state::ToString(state::SaveBaseline(path.string(), shouty).error),
-             std::string("unusable_record"), "an uppercase digest is refused too");
+  // Under the row bound and over the byte bound: `Usable` puts no limit on a
+  // slot's length, so the row count alone cannot keep the file readable.
+  state::Baseline fat;
+  for (std::size_t at = 0; at < 64; ++at) {
+    state::SaveRecord record = Full();
+    record.rom_id = static_cast<std::int64_t>(at) + 1;
+    record.slot = std::string(state::kMaxStateBytes / 32, 'x');
+    fat.Set(record);
+  }
+  const state::StoreResult over_bytes = state::SaveBaseline(path.string(), fat);
+  c.ExpectEq(state::ToString(over_bytes.error), std::string("too_large"),
+             "a baseline over kMaxStateBytes is refused on size, not on row count");
+  c.ExpectEq(ReadWhole(path.string()), kept, "and that one is untouched too");
+}
 
-  // An empty slot is neither "autosave" nor archival, and the server pairs
-  // those two differently.
-  state::Baseline blank_slot;
-  state::SaveRecord empty = Full();
-  empty.slot = "";
-  blank_slot.Set(empty);
-  c.ExpectEq(state::ToString(state::SaveBaseline(path.string(), blank_slot).error),
-             std::string("unusable_record"), "an empty slot is refused");
-
-  c.ExpectEq(ReadWhole(path.string()), kept, "and none of them reached the file");
+/// The two bounds have to agree, or the writer produces files the reader throws
+/// away. A full baseline must serialize to less than the byte bound.
+void TheTwoBoundsAgree(checks::Checks& c) {
+  state::Baseline full;
+  for (std::size_t at = 0; at < state::kMaxRecords; ++at) {
+    state::SaveRecord record = Full();
+    record.rom_id = static_cast<std::int64_t>(at) + 1;
+    // A slot longer than any real one, so the headroom is real and not an
+    // artefact of the eight characters `Full()` happens to use.
+    record.slot = "autosave-" + std::string(23, 'x');
+    full.Set(record);
+  }
+  const std::string text = state::SerializeBaseline(full);
+  c.Expect(text.size() <= state::kMaxStateBytes,
+           "kMaxRecords rows fit in kMaxStateBytes -- " + std::to_string(text.size()) + " vs " +
+               std::to_string(state::kMaxStateBytes));
+  c.Expect(state::ParseBaseline(text).diagnostics.empty(),
+           "and a full baseline reads back clean");
 }
 
 void NamesAMissingDirectory(checks::Checks& c) {
@@ -359,6 +435,77 @@ void APartialFileIsNotAPartialBaseline(checks::Checks& c) {
   c.Expect(loaded.value.empty(),
            "three intact rows and one fragment is not a baseline of three");
   c.Expect(!loaded.diagnostics.empty(), "and it is diagnosed");
+}
+
+/// A timestamp too large for the local clock type is a diagnostic, not UB.
+///
+/// `system_clock::duration` is *nanoseconds* on libstdc++ -- CI's runners and
+/// devkitA64 -- so `Timestamp{} + seconds{253402300799}` is 2.5e20 nanoseconds
+/// against an int64 that stops at 9.2e18: signed overflow, and the wrapped
+/// value then sails through any range check made afterwards. `state.db` is an
+/// untrusted file, so the check has to be on the integer before anything builds
+/// a `Timestamp` out of it.
+///
+/// The boundary is derived from the clock rather than written down, because it
+/// *is* the clock's: microsecond libc++ tops out past the year 9999 and
+/// nanosecond libstdc++ tops out in 2262, and a hardcoded number would be
+/// testing one platform's answer on both. What must hold everywhere is that the
+/// last representable second parses and the first unrepresentable one is
+/// diagnosed -- never overflowed.
+void AHugeTimestampIsDiagnosedNotOverflowed(checks::Checks& c) {
+  constexpr std::int64_t kRepresentable =
+      std::chrono::duration_cast<std::chrono::seconds>(sync::Timestamp::duration::max()).count();
+  const std::int64_t ceiling =
+      sync::kMaxTimestampSeconds < kRepresentable ? sync::kMaxTimestampSeconds : kRepresentable;
+
+  const std::string digest = crypto::Md5Hex("x");
+  auto row = [&digest](const std::string& mtime, const std::string& server_updated_at) {
+    return "rommsync-state 1\n{\"rom_id\":12,\"slot\":null,\"content_hash\":\"" + digest +
+           "\",\"mtime\":" + mtime + ",\"file_size_bytes\":1,\"server_updated_at\":" +
+           server_updated_at + ",\"server_content_hash\":null}\n";
+  };
+
+  // The last second this build can hold parses, so the check is a boundary and
+  // not a blanket refusal of anything far away.
+  const state::LoadedBaseline edge = state::ParseBaseline(row(std::to_string(ceiling), "null"));
+  c.Expect(edge.diagnostics.empty(),
+           "the last representable second parses -- " + edge.DescribeDiagnostics());
+  c.ExpectEq(edge.value.size(), std::size_t{1}, "and yields its row");
+
+  struct Case {
+    const char* what;
+    std::string text;
+  };
+  const Case kCases[] = {
+      {"one second past what the clock can hold", row(std::to_string(ceiling + 1), "null")},
+      {"an mtime past every clock", row("9223372036854775807", "null")},
+      {"a negative mtime", row("-9223372036854775807", "null")},
+      {"the epoch, which no save may claim", row("0", "null")},
+      {"an unrepresentable server_updated_at",
+       row("1757000000", std::to_string(ceiling + 1))},
+      {"a server_updated_at past every clock", row("1757000000", "9223372036854775807")},
+  };
+  for (const Case& scenario : kCases) {
+    const state::LoadedBaseline loaded = state::ParseBaseline(scenario.text);
+    c.Expect(loaded.value.empty(), std::string(scenario.what) + " yields an empty baseline");
+    c.Expect(!loaded.diagnostics.empty(), std::string(scenario.what) + " is diagnosed");
+  }
+}
+
+/// `state.db` missing *and* `.old` unusable is its own state, and it used to
+/// read as "does not exist yet" -- the message a brand-new card produces.
+void AnUnusableOldIsNotABrandNewCard(checks::Checks& c) {
+  const std::filesystem::path path = FreshPath("bad-old.db");
+  WriteWhole(io::PreviousPathFor(path.string()), "\x01 not a state.db at all\n");
+
+  const state::LoadedBaseline loaded = state::LoadBaseline(path.string());
+  c.Expect(loaded.value.empty(), "an unusable .old is an empty baseline");
+  c.Expect(!loaded.diagnostics.empty(), "and it is diagnosed");
+  c.Expect(loaded.DescribeDiagnostics().find(io::PreviousPathFor(path.string())) !=
+               std::string::npos,
+           "naming the .old that could not be used -- " + loaded.DescribeDiagnostics());
+  c.Expect(loaded.DescribeDiagnostics().find("does not exist yet") == std::string::npos,
+           "and NOT as a card nobody has synced -- " + loaded.DescribeDiagnostics());
 }
 
 /// A file too large to be one this client wrote is refused by size, not read.
@@ -519,10 +666,14 @@ int main() {
   TheOrderIsStable(c);
   AWriteLeavesNothingBeside(c);
   RecoversFromTheCommitWindow(c);
-  RefusesARowItCouldNotReadBack(c);
+  SkipsARowItCouldNotReadBack(c);
+  RefusesAFileTheReaderWouldDiscard(c);
+  TheTwoBoundsAgree(c);
   NamesAMissingDirectory(c);
   CorruptFilesAreAnEmptyBaselineAndADiagnostic(c);
   APartialFileIsNotAPartialBaseline(c);
+  AHugeTimestampIsDiagnosedNotOverflowed(c);
+  AnUnusableOldIsNotABrandNewCard(c);
   OversizedFilesAreRefusedBySize(c);
   TooManyRowsIsRefused(c);
   AMissingFileIsReportedAndNotAFailure(c);

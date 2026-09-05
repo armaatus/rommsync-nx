@@ -72,14 +72,32 @@ inline constexpr int kFormatVersion = 1;
 
 /// The largest `state.db` that will be read, and the most rows it may hold.
 ///
-/// The same reasoning as `config::kMaxConfigBytes`: this runs on a sysmodule
-/// heap measured in megabytes, from a FAT32 card that gets yanked mid-write, so
-/// a corrupt directory entry pointing at four gigabytes of garbage has to be a
-/// named refusal rather than a `bad_alloc`. A row is a couple of hundred bytes
-/// and a large library has a few thousand saves, so neither bound is reachable
-/// by a file this client wrote.
-inline constexpr std::size_t kMaxStateBytes = 1024 * 1024;
-inline constexpr std::size_t kMaxRecords = 4096;
+/// The same reasoning as `config::kMaxConfigBytes`: a FAT32 card that gets
+/// yanked mid-write leaves a directory entry that can claim any size at all, so
+/// a corrupt one has to be a named refusal rather than a `bad_alloc`.
+///
+/// **These are sized against the sysmodule's heap, not against a round number.**
+/// A bound larger than the heap is not a bound -- it is a `bad_alloc` with a
+/// constant next to it. The arithmetic, from
+/// [docs/DEVELOPMENT.md](../../../docs/DEVELOPMENT.md#tls-in-a-sysmodule):
+/// `kInnerHeapSize` is `0x80000` (512 KiB) and the trimmed socket transfer
+/// memory takes 116 KiB of it, leaving **~390 KiB** for everything else --
+/// which is the download buffer *and* this. Loading a baseline costs the file's
+/// text and then the parsed `Baseline`, whose per-row `std::string`s each
+/// exceed the 15-character small-string buffer and land on the heap, so the map
+/// costs more than the text it came from. At ~214 bytes a row, `kMaxRecords`
+/// rows is ~110 KiB of text and ~130 KiB parsed: about 240 KiB at the peak,
+/// with room left for a transfer.
+///
+/// `core.state_db` asserts the two agree -- a full baseline must serialize to
+/// less than the byte bound, or the writer would produce a file the reader
+/// discards. And it is the *writer* that enforces both, so exceeding them is a
+/// named refusal once rather than a silent re-hash on every boot.
+///
+/// A card with more saves than this needs the sysmodule heap raised first.
+/// These two constants and `kInnerHeapSize` move together.
+inline constexpr std::size_t kMaxRecords = 512;
+inline constexpr std::size_t kMaxStateBytes = 128 * 1024;
 
 /// How many diagnostics are kept before the rest are dropped. `config`'s
 /// reasoning: a corrupt file must not answer with fifty thousand strings.
@@ -186,9 +204,13 @@ LoadedBaseline ParseBaseline(std::string_view text);
 LoadedBaseline LoadBaseline(const std::string& path);
 
 /// Why writing the baseline did not work. Mirrors `auth::StoreError`.
+///
+/// There is deliberately no "a row was bad" member. A single unusable row is
+/// **skipped**, not fatal -- see `SaveBaseline`.
 enum class StoreError {
   kNone,
-  kUnusableRecord,  ///< a row would not have been readable back; nothing was written
+  kTooManyRecords,  ///< more rows than `kMaxRecords`; the reader would discard the file
+  kTooLarge,        ///< the serialized file exceeds `kMaxStateBytes`, same reason
   kOpenFailed,      ///< the temp file could not be created -- usually a missing directory
   kWriteFailed,     ///< the bytes did not all reach the disk; the destination is untouched
   kCommitFailed,    ///< the rename onto `path` failed; see atomic_file.hpp
@@ -203,16 +225,35 @@ struct StoreResult {
   /// For logs. Names the path and what went wrong.
   std::string message;
 
+  /// How many rows reached the file. Less than `baseline.size()` when rows were
+  /// skipped; `0` on any error, because nothing was written.
+  std::size_t rows_written = 0;
+
+  /// One line per row that was left out, bounded by `kMaxDiagnostics`. Empty on
+  /// the ordinary path. **Not an error** -- see `SaveBaseline`.
+  std::vector<std::string> skipped;
+
   bool ok() const { return error == StoreError::kNone; }
 };
 
 /// Write `baseline` to `path`, atomically.
 ///
-/// A row that could not be read back -- a non-positive `rom_id`, an empty slot,
-/// a digest that is not 32 lowercase hex -- is refused before anything is
-/// written, on `token_store`'s reasoning: a file that exists and cannot be
-/// parsed is worse than no file, because the next boot finds one, discards all
-/// of it, and re-hashes the library for the life of the bug.
+/// **A row that could not be read back is skipped, and the rest are written.**
+/// The bar is `kMaxRecords`-style validity: a positive `rom_id`, a slot that is
+/// either absent or non-empty, digests that are 32 lowercase hex, timestamps a
+/// save can actually claim. The reason it is a skip and not a refusal is the
+/// module's own framing -- an optimisation, never a gate. A console whose RTC
+/// was never set stamps a save with the epoch, which is outside the range;
+/// refusing the whole file over it would freeze the baseline at its last good
+/// version and re-hash the entire library on every tick from then on, forever,
+/// with one log line to explain it. Leaving that one save out costs that one
+/// save a re-hash. The skipped rows are named in `skipped`.
+///
+/// The file-level bounds are refusals, because there is nothing partial to fall
+/// back to: more than `kMaxRecords` rows, or more than `kMaxStateBytes` of text,
+/// is a file `ParseBaseline` would discard whole. Writing one anyway is the
+/// silent version of the same failure -- every later boot finds a `state.db`,
+/// throws all of it away, and re-hashes. Better to fail once, loudly, here.
 ///
 /// Writing the baseline at the end of a tick is M2-6's; this owns the format.
 StoreResult SaveBaseline(const std::string& path, const Baseline& baseline);

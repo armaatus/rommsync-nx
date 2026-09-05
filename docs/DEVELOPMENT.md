@@ -204,8 +204,12 @@ No auto-boot sysmodule was installed on any console for this spike, and no
 console was involved in it at all.
 
 Budget note: sysmodules declare their heap in `config.json`/`npdm`; size it for
-one in-flight download buffer + the bsd transfer memory above, and stream to file
-rather than buffering whole roms in RAM.
+one in-flight download buffer + the bsd transfer memory above + the `state.db`
+baseline, and stream to file rather than buffering whole roms in RAM. The
+baseline is the one item that grows with the library rather than being a fixed
+buffer — its text and then its parsed rows, bounded by `state::kMaxStateBytes`
+and `state::kMaxRecords`, which are sized against the 390 KiB this section
+leaves free and have to move with it (`core/include/rommsync/state_db.hpp`).
 
 ## IPC
 

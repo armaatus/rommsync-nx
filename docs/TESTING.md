@@ -296,10 +296,25 @@ ctest --test-dir build --output-on-failure
   **empty baseline plus a diagnostic** rather than a refusal. A truncation is
   the one worth reading: three intact rows and one fragment is not a baseline of
   three, because a prefix is individually well-formed and collectively a lie.
-  It also covers the commit-window recovery from `.old` and the optimisation
-  itself — an unchanged file is not re-opened (proved by pointing the call at a
-  path that does not exist) and still reports its stored digest, while a file
-  whose size moved or whose mtime moved is re-hashed. It never skips.
+  It also covers the commit-window recovery from `.old` — including the case
+  that used to be silent, where `state.db` is missing *and* the `.old` beside it
+  is unusable, which must not report as the brand-new card it looks like. On the
+  writer side it separates the two kinds of bad: an individual unusable row is
+  **skipped** and the rest are written (a console with an unset RTC stamps a
+  save with the epoch, and refusing the whole file over it would freeze the
+  baseline and re-hash the library on every tick from then on), while a file
+  over `kMaxRecords` or `kMaxStateBytes` is **refused**, because that is a file
+  the reader would discard whole and writing it trades one loud failure for a
+  silent re-hash forever. One check asserts the two bounds agree — a full
+  baseline must serialize to less than the byte bound. Timestamps are checked as
+  integers before any `Timestamp` is built from them, since
+  `system_clock::duration` is nanoseconds on libstdc++ and `kMaxTimestampSeconds`
+  is twenty-seven times what that can hold; the boundary in the test is derived
+  from the clock, not written down, so it is right on both a microsecond libc++
+  and a nanosecond libstdc++. Finally the optimisation itself — an unchanged
+  file is not re-opened (proved by pointing the call at a path that does not
+  exist) and still reports its stored digest, while a file whose size moved or
+  whose mtime moved is re-hashed. It never skips.
 - `harness.content_hash` is the half of M2-3 no vector suite can check: the
   digest `state::HashFile` computes for a save on the card is compared against
   the one **RomM itself** computed for the same bytes (`harness::ServerMd5`

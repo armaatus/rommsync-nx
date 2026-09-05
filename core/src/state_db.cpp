@@ -23,6 +23,29 @@ std::string Describe(const std::string& path, std::string_view what) {
   return path + ": " + std::string(what);
 }
 
+/// Whether `seconds` is a moment a save can claim, checked **before** anything
+/// builds a `Timestamp` out of it.
+///
+/// The order matters and is not obvious. `system_clock::duration` is
+/// *nanoseconds* on libstdc++ -- CI's runners and devkitA64 both -- so
+/// `Timestamp{} + seconds{253402300799}` is 2.5e20 nanoseconds against an
+/// `int64` that stops at 9.2e18: signed overflow, which is UB, and the wrapped
+/// value then sails through any range check made afterwards. `kMaxTimestampSeconds`
+/// is twenty-seven times the largest representable value, so even a figure this
+/// module considers *legal* is unrepresentable. It is invisible on macOS, whose
+/// libc++ counts microseconds and has room -- which is exactly why the check has
+/// to be on the integer and not on the `Timestamp`.
+bool SecondsInRange(std::int64_t seconds) {
+  // The narrower of "what a save may claim" and "what the local clock type can
+  // hold", so this is right whatever the platform's duration period is.
+  constexpr std::int64_t kRepresentable =
+      std::chrono::duration_cast<std::chrono::seconds>(sync::Timestamp::duration::max()).count();
+  const std::int64_t ceiling =
+      sync::kMaxTimestampSeconds < kRepresentable ? sync::kMaxTimestampSeconds : kRepresentable;
+  return seconds >= sync::kMinTimestampSeconds && seconds <= ceiling;
+}
+
+/// Only ever called on a value `SecondsInRange` has accepted.
 sync::Timestamp FromUnixSeconds(std::int64_t seconds) {
   return sync::Timestamp{} + std::chrono::seconds{seconds};
 }
@@ -73,8 +96,7 @@ bool Usable(const SaveRecord& record, std::string* why) {
            " lowercase hex digits (MD5), or null";
     return false;
   }
-  const std::int64_t mtime = sync::UnixSeconds(record.mtime);
-  if (mtime < sync::kMinTimestampSeconds || mtime > sync::kMaxTimestampSeconds) {
+  if (!SecondsInRange(sync::UnixSeconds(record.mtime))) {
     // The epoch is what a console with an unset clock reports, and a baseline
     // row holding one would match no real file's mtime anyway. Refusing it here
     // keeps the row from becoming a `ClientSaveState` that `sync::Validate`
@@ -82,12 +104,10 @@ bool Usable(const SaveRecord& record, std::string* why) {
     *why = "mtime is outside the range a save can claim";
     return false;
   }
-  if (record.server_updated_at.has_value()) {
-    const std::int64_t updated = sync::UnixSeconds(*record.server_updated_at);
-    if (updated < sync::kMinTimestampSeconds || updated > sync::kMaxTimestampSeconds) {
-      *why = "server_updated_at is outside the range a save can claim";
-      return false;
-    }
+  if (record.server_updated_at.has_value() &&
+      !SecondsInRange(sync::UnixSeconds(*record.server_updated_at))) {
+    *why = "server_updated_at is outside the range a save can claim";
+    return false;
   }
   if (record.file_size_bytes < 0) {
     *why = "file_size_bytes is negative";
@@ -138,6 +158,10 @@ bool ReadNullableSeconds(const json::Value& object, std::string_view key,
     *why = "field " + std::string(key) + ": expected whole seconds or null";
     return false;
   }
+  if (!SecondsInRange(member->integer())) {
+    *why = "field " + std::string(key) + ": outside the range a save can claim";
+    return false;
+  }
   *out = FromUnixSeconds(member->integer());
   return true;
 }
@@ -160,6 +184,14 @@ bool ParseRecord(std::string_view line, SaveRecord* out, std::string* why) {
   reader.RequiredNullable("server_content_hash", &record.server_content_hash);
   if (!reader.ok()) {
     *why = reader.error().Describe();
+    return false;
+  }
+  if (!SecondsInRange(mtime)) {
+    // Before the conversion, not after: see `SecondsInRange`. A corrupt card
+    // region reading `"mtime":253402300799` is the case this whole module
+    // promises to answer with a diagnostic, and it must not be UB on the way to
+    // producing one.
+    *why = "field mtime: outside the range a save can claim";
     return false;
   }
   record.mtime = FromUnixSeconds(mtime);
@@ -228,8 +260,10 @@ const char* ToString(StoreError error) {
   switch (error) {
     case StoreError::kNone:
       return "none";
-    case StoreError::kUnusableRecord:
-      return "unusable_record";
+    case StoreError::kTooManyRecords:
+      return "too_many_records";
+    case StoreError::kTooLarge:
+      return "too_large";
     case StoreError::kOpenFailed:
       return "open_failed";
     case StoreError::kWriteFailed:
@@ -348,19 +382,29 @@ LoadedBaseline LoadBaseline(const std::string& path) {
     // `io::WriteAtomically` opens between its two renames, and the previous
     // baseline is sitting under `.old`. `token_store`, `device_identity` and
     // `config` recover from it the same way, and only from a *missing* file.
+    const std::string previous_path = io::PreviousPathFor(path);
     std::string previous;
-    if (ReadBounded(io::PreviousPathFor(path), &previous) == io::BoundedRead::kOk) {
+    if (ReadBounded(previous_path, &previous) == io::BoundedRead::kOk) {
       LoadedBaseline recovered = ParseBaseline(previous);
-      if (!recovered.value.empty()) {
-        std::vector<std::string> diagnostics{
-            Describe(path, "is missing and was read from " + io::PreviousPathFor(path) +
-                               " instead -- a write of it was interrupted")};
-        for (std::string& diagnostic : recovered.diagnostics) {
-          Add(&diagnostics, std::move(diagnostic));
-        }
-        recovered.diagnostics = std::move(diagnostics);
-        return recovered;
+      // Whatever came back, this branch answers -- including an empty baseline.
+      // Falling through to the `kMissing` case would report "does not exist
+      // yet", the message a brand-new card produces, and drop `recovered`'s
+      // diagnostics on the floor. "A commit was interrupted *and* the copy it
+      // left behind is unusable" is the one state worth seeing in a log, and it
+      // is exactly the state that would have been silent. `config.cpp` takes
+      // the parsed result unconditionally for the same reason.
+      std::vector<std::string> diagnostics{
+          Describe(path, recovered.value.empty()
+                             ? "is missing and " + previous_path +
+                                   " holds no usable baseline either -- a write of it was "
+                                   "interrupted; every save is hashed this tick"
+                             : "is missing and was read from " + previous_path +
+                                   " instead -- a write of it was interrupted")};
+      for (std::string& diagnostic : recovered.diagnostics) {
+        Add(&diagnostics, std::move(diagnostic));
       }
+      recovered.diagnostics = std::move(diagnostics);
+      return recovered;
     }
   }
 
@@ -390,31 +434,65 @@ LoadedBaseline LoadBaseline(const std::string& path) {
 }
 
 StoreResult SaveBaseline(const std::string& path, const Baseline& baseline) {
-  // Refused before anything is written, on `token_store`'s reasoning: a file
-  // that exists and cannot be parsed is worse than no file, because every later
-  // boot finds one, discards all of it, and re-hashes the library.
+  StoreResult result;
+
+  // A bad row is left out; the rest still get a baseline. See the header for
+  // why this is a skip and not a refusal -- an unset RTC stamping one save with
+  // the epoch must not cost the whole library its baseline forever.
+  Baseline writable;
   for (const auto& [key, record] : baseline.rows()) {
     (void)key;
     std::string why;
     if (!Usable(record, &why)) {
-      return {StoreError::kUnusableRecord,
-              Describe(path, "refusing to write a row for rom " + std::to_string(record.rom_id) +
-                                 ": " + why)};
+      Add(&result.skipped, "rom " + std::to_string(record.rom_id) + ": " + why +
+                               "; this save is hashed again next tick");
+      continue;
     }
+    writable.Set(record);
   }
 
-  const io::WriteResult written = io::WriteAtomically(path, SerializeBaseline(baseline));
-  switch (written.error) {
-    case io::WriteError::kNone:
-      return {};
-    case io::WriteError::kOpenFailed:
-      return {StoreError::kOpenFailed, written.message};
-    case io::WriteError::kWriteFailed:
-      return {StoreError::kWriteFailed, written.message};
-    case io::WriteError::kCommitFailed:
-      return {StoreError::kCommitFailed, written.message};
+  // The file-level bounds *are* refusals: a file over either of them is one
+  // `ParseBaseline` discards whole, so writing it would trade one loud failure
+  // here for a silent re-hash of the library on every boot from now on.
+  if (writable.size() > kMaxRecords) {
+    result.error = StoreError::kTooManyRecords;
+    result.message =
+        Describe(path, "would hold " + std::to_string(writable.size()) + " rows, more than the " +
+                           std::to_string(kMaxRecords) +
+                           " a baseline can be read back with; nothing was written");
+    return result;
   }
-  return {StoreError::kCommitFailed, written.message};
+
+  const std::string text = SerializeBaseline(writable);
+  if (text.size() > kMaxStateBytes) {
+    result.error = StoreError::kTooLarge;
+    result.message =
+        Describe(path, "would be " + std::to_string(text.size()) + " bytes, more than the " +
+                           std::to_string(kMaxStateBytes) +
+                           " a baseline can be read back with; nothing was written");
+    return result;
+  }
+
+  const io::WriteResult written = io::WriteAtomically(path, text);
+  if (written.error != io::WriteError::kNone) {
+    result.message = written.message;
+    switch (written.error) {
+      case io::WriteError::kOpenFailed:
+        result.error = StoreError::kOpenFailed;
+        break;
+      case io::WriteError::kWriteFailed:
+        result.error = StoreError::kWriteFailed;
+        break;
+      case io::WriteError::kNone:
+      case io::WriteError::kCommitFailed:
+        result.error = StoreError::kCommitFailed;
+        break;
+    }
+    return result;
+  }
+
+  result.rows_written = writable.size();
+  return result;
 }
 
 HashOutcome HashFile(const std::string& path) {
