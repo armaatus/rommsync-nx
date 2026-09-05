@@ -626,6 +626,88 @@ inline http::Result Negotiate(::checks::Checks& checks, http::HttpClient& client
 }
 
 /// `POST /api/sync/sessions/{id}/complete`, the accounting step.
+/// Close a session this scenario opened, whatever came of it.
+///
+/// RomM keeps ONE active sync session per device, and a `negotiate` for a device
+/// that already has one has to cancel that one first. Every scenario here shares
+/// the fixture's device, so a scenario that negotiates and walks away leaves a
+/// session for the next one to cancel -- and that cancel-the-previous work
+/// races, under load, with the session the new negotiate just created. The
+/// symptom is the new session coming back CANCELLED with none of its operations
+/// recorded, which is how `harness.partial` failed intermittently in CI while
+/// passing every time locally (issue #76). It was the only scenario that
+/// completed its session, so it was the only one that could notice.
+///
+/// Best effort by design: this is cleanup, and a scenario must not fail because
+/// tidying up did not work. Takes the negotiate response so a caller cannot
+/// close a session it did not open.
+inline void CloseSession(http::HttpClient& client, const std::string& base,
+                         const Fixture& fixture, const std::string& negotiate_body) {
+  const json::ParseResult parsed = json::Parse(negotiate_body);
+  if (!parsed.ok()) {
+    return;
+  }
+  const std::int64_t session_id = Number(parsed.value, "session_id");
+  if (session_id == 0) {
+    return;
+  }
+  PostJson(client, base + "/api/sync/sessions/" + std::to_string(session_id) + "/complete",
+           fixture, R"({"operations_completed":0,"operations_failed":0,"play_sessions":[]})");
+}
+
+/// Complete every sync session this device has left open.
+///
+/// The sibling of `rig::DisarmFault`, and for the same reason: what an earlier
+/// run left behind damages this one. RomM keeps ONE active session per device,
+/// so a `negotiate` for a device that already has one has to cancel that one
+/// first -- and under load that cancel lands on the session the negotiate just
+/// created instead. The symptom is a brand-new session coming back CANCELLED
+/// with none of its operations recorded, which is how `harness.partial` failed
+/// intermittently in CI while passing every time locally (issue #76).
+///
+/// Every scenario across these binaries shares the fixture's device, and each
+/// runs as its own process, so the leftovers accumulate across processes. This
+/// clears them at the start of each one, which is the only place that cannot be
+/// forgotten by a scenario that negotiates and walks away.
+///
+/// Best effort by design: this is cleanup, and a scenario must not fail because
+/// tidying up did not work.
+inline void CloseOpenSessions(http::HttpClient& client, const std::string& base,
+                              const Fixture& fixture) {
+  const http::Result listed =
+      client.Send(Authed(http::Method::kGet, base + "/api/sync/sessions", fixture));
+  if (!listed.successful()) {
+    return;
+  }
+  const json::ParseResult parsed = json::Parse(listed.response.body);
+  if (!parsed.ok()) {
+    return;
+  }
+  // RomM has served this both as a bare array and wrapped in `items`; take
+  // whichever is there rather than pinning a shape cleanup does not depend on.
+  const json::Value* sessions = &parsed.value;
+  if (parsed.value.is_object()) {
+    sessions = parsed.value.Find("items");
+  }
+  if (sessions == nullptr || !sessions->is_array()) {
+    return;
+  }
+  for (const json::Value& session : sessions->elements()) {
+    if (Field(session, "status") != "IN_PROGRESS") {
+      continue;
+    }
+    if (Field(session, "device_id") != fixture.device_id) {
+      continue;
+    }
+    const std::int64_t id = Number(session, "id");
+    if (id == 0) {
+      continue;
+    }
+    PostJson(client, base + "/api/sync/sessions/" + std::to_string(id) + "/complete", fixture,
+             R"({"operations_completed":0,"operations_failed":0,"play_sessions":[]})");
+  }
+}
+
 inline http::Result Complete(http::HttpClient& client, const std::string& base,
                              const Fixture& fixture, std::int64_t session_id,
                              int completed, int failed) {

@@ -719,6 +719,12 @@ int main(int argc, char** argv) {
   if (!harness::LoadFixture(&fixture)) {
     return rig::kSkip;
   }
+  // The sibling of DisarmFault above. Every scenario in these binaries shares
+  // the fixture's device, RomM keeps one active session per device, and a
+  // negotiate that has to cancel a leftover races with the session it just
+  // created. See harness::CloseOpenSessions and issue #76.
+  harness::CloseOpenSessions(*client, base, fixture);
+
   const std::int64_t rom_id = FirstRomId(*client, base, fixture);
   if (rom_id == 0) {
     std::cerr << "the fixture library holds no roms; nothing to hang a save off\n"

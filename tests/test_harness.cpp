@@ -288,9 +288,19 @@ void Expired(rig::Checks& checks, http::HttpClient& client, const std::string& b
         R"({"mode":"status","status":401,"path":"/api/sync/negotiate","after":1,"count":1})");
 
     const http::Result first = harness::Negotiate(checks, client, base, fixture, payload);
+    // One active session per device, and every scenario here shares the
+    // fixture's. Left open, this one is cancelled by the NEXT negotiate --
+    // and that cancel races with the session that negotiate creates. See
+    // harness::CloseSession and issue #76.
+    harness::CloseSession(client, base, fixture, first.response.body);
     checks.ExpectEq(first.response.status, 200, "the tick starts normally");
 
     const http::Result denied = harness::Negotiate(checks, client, base, fixture, payload);
+    // One active session per device, and every scenario here shares the
+    // fixture's. Left open, this one is cancelled by the NEXT negotiate --
+    // and that cancel races with the session that negotiate creates. See
+    // harness::CloseSession and issue #76.
+    harness::CloseSession(client, base, fixture, denied.response.body);
     checks.Expect(denied.ok(),
                   "a 401 is a response, not a transport error -- Result::ok() stays true");
     checks.Expect(!denied.successful(), "...and successful() does not");
@@ -302,6 +312,11 @@ void Expired(rig::Checks& checks, http::HttpClient& client, const std::string& b
     // `token.dat` on the first one sends the user to a pairing screen for a
     // proxy hiccup.
     const http::Result recovered = harness::Negotiate(checks, client, base, fixture, payload);
+    // One active session per device, and every scenario here shares the
+    // fixture's. Left open, this one is cancelled by the NEXT negotiate --
+    // and that cancel races with the session that negotiate creates. See
+    // harness::CloseSession and issue #76.
+    harness::CloseSession(client, base, fixture, recovered.response.body);
     checks.ExpectEq(recovered.response.status, 200,
                     "the same token still works -- one 401 is not a verdict on the pairing");
   }
@@ -366,6 +381,11 @@ void Conflict(rig::Checks& checks, http::HttpClient& client, const std::string& 
       std::chrono::system_clock::now() + std::chrono::seconds{300}, 10));
 
   const http::Result result = harness::Negotiate(checks, client, base, fixture, payload);
+  // One active session per device, and every scenario here shares the
+  // fixture's. Left open, this one is cancelled by the NEXT negotiate --
+  // and that cancel races with the session that negotiate creates. See
+  // harness::CloseSession and issue #76.
+  harness::CloseSession(client, base, fixture, result.response.body);
   checks.ExpectEq(result.response.status, 200, "the negotiation is answered");
   const json::ParseResult plan = json::Parse(result.response.body);
   const json::Value* operation = plan.ok() ? harness::OperationFor(plan.value, slot) : nullptr;
@@ -454,6 +474,11 @@ void SameTimestamp(rig::Checks& checks, http::HttpClient& client, const std::str
   payload.saves.push_back(harness::LocalSave(rom.id, name, slot, "harness", device_hash, when, 12));
 
   const http::Result result = harness::Negotiate(checks, client, base, fixture, payload);
+  // One active session per device, and every scenario here shares the
+  // fixture's. Left open, this one is cancelled by the NEXT negotiate --
+  // and that cancel races with the session that negotiate creates. See
+  // harness::CloseSession and issue #76.
+  harness::CloseSession(client, base, fixture, result.response.body);
   const json::ParseResult plan = json::Parse(result.response.body);
   const json::Value* operation = plan.ok() ? harness::OperationFor(plan.value, slot) : nullptr;
   if (operation == nullptr) {
@@ -804,6 +829,11 @@ void Stall(rig::Checks& checks, http::HttpClient& client, const std::string& bas
 
   // A stall must cost one tick, not the pairing: the next one goes through.
   const http::Result next = harness::Negotiate(checks, client, base, fixture, payload);
+  // One active session per device, and every scenario here shares the
+  // fixture's. Left open, this one is cancelled by the NEXT negotiate --
+  // and that cancel races with the session that negotiate creates. See
+  // harness::CloseSession and issue #76.
+  harness::CloseSession(client, base, fixture, next.response.body);
   checks.ExpectEq(next.response.status, 200, "and the next tick negotiates normally");
 }
 
@@ -1091,6 +1121,11 @@ int main(int argc, char** argv) {
   if (!harness::LoadFixture(&fixture)) {
     return rig::kSkip;
   }
+
+  // The sibling of DisarmFault above: a session an earlier scenario left open is
+  // one this scenario's negotiate has to cancel, and that cancel races with the
+  // session it just created. See harness::CloseOpenSessions and issue #76.
+  harness::CloseOpenSessions(*client, base, fixture);
 
   if (scenario == "disarms") {
     Disarms(checks, *client, base);
