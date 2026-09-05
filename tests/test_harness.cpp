@@ -574,12 +574,27 @@ void Partial(rig::Checks& checks, http::HttpClient& client, const std::string& b
   checks.Expect(listed.response.body.find(planned[1].slot) == std::string::npos,
                 "the failed upload left no save behind");
 
+  // What the server thinks of the session, read BEFORE completing it.
+  //
+  // This is here because of a CI-only failure that said only
+  // `expected 200, got 400` and `{"detail":"Session is already CANCELLED"}` --
+  // true, and useless. It does not say who cancelled it, when, or what the
+  // server had recorded by then, and none of that is reproducible locally
+  // (fresh fixture or warm, macOS or the same suite in the same order). A
+  // failing assertion that cannot say what it saw costs a round trip through CI
+  // for every guess, so the state goes in the failure message.
+  const http::Result before = client.Send(harness::Authed(
+      http::Method::kGet, base + "/api/sync/sessions/" + std::to_string(session_id), fixture));
+  const std::string state = "session " + std::to_string(session_id) + " before complete: HTTP " +
+                            std::to_string(before.response.status) + " " + before.response.body;
+
   const http::Result done = harness::Complete(client, base, fixture, session_id, completed, failed);
-  checks.ExpectEq(done.response.status, 200, "the session completes");
+  checks.ExpectEq(done.response.status, 200, "the session completes -- " + state);
   const json::ParseResult session = json::Parse(done.response.body);
   const json::Value* record = session.ok() ? session.value.Find("session") : nullptr;
   if (record == nullptr) {
-    checks.Expect(false, "the completed session comes back: " + done.response.body);
+    checks.Expect(false, "the completed session comes back: " + done.response.body +
+                             " -- " + state);
   } else {
     checks.ExpectEq(harness::Number(*record, "operations_failed"), 1,
                     "the server records the accurate failure count");
