@@ -138,13 +138,18 @@ void PairingScreen::Poll() {
     return;
   }
 
-  if (blocked_ && status.state == auth::PairingState::kIdle) {
-    // The refusal stands. Nothing was started, so `GetPairState` truthfully
-    // reports `kIdle` -- and drawing "Not paired" over the reason one frame
-    // after the button press is how a user concludes the button does nothing.
+  if (blocked_) {
+    // The refusal stands until the user presses the button again. `StartPair`
+    // refuses *before* `PairingSession::Begin()` runs (`ipc::ServiceCore`), so
+    // the session still reports whatever the last attempt left behind --
+    // `kIdle` on a first Pair, `kExpired` or `kDenied` on a Start over -- and
+    // every one of those would redraw over the reason one frame after the
+    // press. Nothing is polling behind a refusal to keep saying it, and a
+    // button that visibly does nothing is what this whole screen exists to
+    // avoid. `GetPairState` is still called every frame above, so a sysmodule
+    // that goes away while the refusal is up is still reported.
     return;
   }
-  blocked_ = false;
   view_ = RenderPairing(status);
 }
 
@@ -234,7 +239,8 @@ void PairingScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
 
   // Last, and only when there is something the button does. A prompt for an
   // action the screen would decline is worse than no prompt at all.
-  const char* action = view_.start ? "\uE0E0  Pair" : (view_.start_over ? "\uE0E0  Start over" : "");
+  const char* action =
+      view_.start ? "\uE0E0  Pair" : (view_.start_over ? "\uE0E0  Start over" : "");
   if (action[0] != '\0' && fits(kRowHeight * 2)) {
     row += kRowHeight / 2;
     renderer->drawString(action, false, x, row, kBodyFont,

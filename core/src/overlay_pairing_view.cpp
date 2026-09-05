@@ -20,16 +20,33 @@ std::string Detail(std::string message, const char* fallback) {
   return message.empty() ? std::string(fallback) : message;
 }
 
-/// A code is only worth drawing while there is time left to type it in.
-///
-/// A `kPending` whose countdown has run out is not terminal -- the sysmodule's
-/// next `Poll()` moves it to `kExpired` -- but the code it holds is already
-/// spent, and the seconds between the two are exactly when a user would start
-/// retyping it. So the screen expires it here rather than waiting for the state
-/// machine to agree.
-bool HasLiveCode(const auth::PairingStatus& status) {
-  return status.state == auth::PairingState::kPending && status.expires_in > 0s &&
-         !status.user_code.empty();
+/// A `kPending` that cannot be drawn as a live code, and why.
+enum class Unusable {
+  kNo,  ///< there is a code, an address, and time left to type them
+
+  /// The countdown reached zero. Not terminal -- the sysmodule's next `Poll()`
+  /// moves it to `kExpired` -- but the code is already spent, and the seconds
+  /// between the two are exactly when a user would start retyping it.
+  kSpent,
+
+  /// A code with no address to type it into, or an address with no code.
+  ///
+  /// Reachable, and not by a bug: `ipc::ServiceCore::Bounded` withholds a
+  /// `verification_url` longer than `ipc::kMaxVerificationUrlBytes` and leaves
+  /// the rest of the status alone, because `GetPairState` is documented never
+  /// to fail. What comes across is a live code and a blank address -- which
+  /// drawn as a live code is the one screen state a user cannot act on.
+  kUnactionable,
+};
+
+Unusable WhyUnusable(const auth::PairingStatus& status) {
+  if (status.expires_in <= 0s) {
+    return Unusable::kSpent;
+  }
+  if (status.user_code.empty() || status.verification_url.empty()) {
+    return Unusable::kUnactionable;
+  }
+  return Unusable::kNo;
 }
 
 }  // namespace
@@ -73,9 +90,22 @@ PairingView RenderPairing(auth::PairingStatus status) {
       view.tone = Tone::kNeutral;
       return view;
 
-    case auth::PairingState::kPending:
-      if (!HasLiveCode(status)) {
+    case auth::PairingState::kPending: {
+      const Unusable why = WhyUnusable(status);
+      if (why == Unusable::kSpent) {
         break;  // drawn as expired, below
+      }
+      if (why == Unusable::kUnactionable) {
+        // Its own sentence rather than "expired": the code has time left on it
+        // and starting over is still worth a try, but there is nothing on this
+        // screen a user can act on, and saying so names what the server did.
+        view.headline = "Cannot show the pairing address";
+        view.hint = "Press Start over to try again";
+        view.detail = Detail(std::move(status.message),
+                             "The server answered an address this console cannot show");
+        view.tone = Tone::kBad;
+        view.start_over = true;
+        return view;
       }
       view.headline = "Pair this console";
       view.hint = "Go to this address on a phone or computer and enter the code";
@@ -90,6 +120,7 @@ PairingView RenderPairing(auth::PairingStatus status) {
       // looks stuck when they are not.
       view.detail = std::move(status.message);
       return view;
+    }
 
     case auth::PairingState::kApproved:
       view.headline = "Paired";

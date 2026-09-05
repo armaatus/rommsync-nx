@@ -13,9 +13,10 @@
 # prevent. What else it takes from core/ is the screens' view models
 # (`rommsync/overlay_status_view.hpp`, `rommsync/overlay_pairing_view.hpp`),
 # which are the half of a screen that is a decision rather than a draw call and
-# are therefore the half a host test can check. `--gc-sections` drops the engine the screens never reference; the rule
-# that matters is unchanged, and it is about ownership rather than about the
-# link map: no sync, download or auth logic lives in this directory.
+# are therefore the half a host test can check. `--gc-sections` drops the engine
+# the screens never reference; the rule that matters is unchanged, and it is
+# about ownership rather than about the link map: no sync, download or auth
+# logic lives in this directory.
 #
 # libultrahand is the library the screens are drawn with, pinned as a submodule
 # at lib/libultrahand and compiled from source -- upstream ships no library. Its

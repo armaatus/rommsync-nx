@@ -26,6 +26,7 @@
 // that a compile-time fact rather than a comment.
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 
@@ -55,9 +56,10 @@ const char* ToString(PairBlock block);
 
 /// Everything the pairing screen draws, and nothing about how.
 ///
-/// Every string is either non-empty or deliberately absent: `code`, `url`,
-/// `qr_payload` and `countdown` are empty together, and only when there is no
-/// live code to show. `headline` is never empty in any state.
+/// Every string is either non-empty or deliberately absent: `code`, `url` and
+/// `countdown` are empty together, and only when there is no live code to show.
+/// `qr_payload` is never set without them and may be empty beside them, because
+/// the QR is optional. `headline` is never empty in any state.
 struct PairingView {
   /// The state **as drawn**, which is not always the state that was reported: a
   /// `kPending` whose countdown has reached zero draws as `kExpired`, because a
@@ -88,7 +90,10 @@ struct PairingView {
   std::string url;
 
   /// The same URL with `?user_code=` on it, for a QR code. Optional and
-  /// rendering-side; the screen is complete without one.
+  /// rendering-side, and nothing draws one yet: `pairing_screen.cpp` shows the
+  /// address and the code, which is the version a person can act on with no
+  /// second device. Carried here so a QR is a drawing change in M8-2 (#44)
+  /// rather than a change to what crosses IPC.
   std::string qr_payload;
 
   /// "Expires in 9:12", or empty when there is no live code.
@@ -99,11 +104,15 @@ struct PairingView {
   /// reason, never a body and never a credential (pairing.hpp).
   std::string detail;
 
-  /// Whether to offer "Start over". True in every terminal state, and also for
-  /// a `kPending` whose code has run out: that one is not terminal -- the
-  /// sysmodule's next `Poll()` will make it so -- but the user has nothing left
-  /// to do with the code, and a screen offering no way out of it is a screen
-  /// they have to exit and come back to.
+  /// Whether to offer "Start over".
+  ///
+  /// `IsTerminal` is the shorthand and not the rule. Three of the four terminal
+  /// states offer it; `kApproved` does not, because a console that just paired
+  /// has nothing to start over and re-pairing is the settings screen's action
+  /// (#26). A `kPending` whose code has run out *does* offer it despite not
+  /// being terminal -- the sysmodule's next `Poll()` will make it so, and until
+  /// then the user has nothing left to do with the code and no way out of the
+  /// screen but to leave it.
   bool start_over = false;
 
   /// Whether to offer "Pair". Only `kIdle`, where nothing has been started.

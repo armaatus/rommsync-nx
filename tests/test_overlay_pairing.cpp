@@ -94,13 +94,15 @@ bool Contains(const std::string& haystack, const std::string& needle) {
 
 /// Nothing a view draws may be blank where a sentence belongs, and a code, its
 /// URL and its countdown are all-or-nothing: a code with no address to type it
-/// into is a screen a user cannot act on.
+/// into is a screen a user cannot act on. The QR payload is the one that may be
+/// absent beside them -- it is optional -- but never present without them.
 void ExpectWellFormed(Checks& checks, const overlay::PairingView& view, const std::string& what) {
   checks.Expect(!view.headline.empty(), what + ": the headline is never empty");
   const bool shows_code = !view.code.empty();
   checks.ExpectEq(view.url.empty(), !shows_code, what + ": a code comes with an address");
   checks.ExpectEq(view.countdown.empty(), !shows_code, what + ": ...and with a countdown");
-  checks.ExpectEq(view.qr_payload.empty(), !shows_code, what + ": ...and with a QR payload");
+  checks.Expect(view.qr_payload.empty() || shows_code,
+                what + ": ...and a QR payload never appears without one");
 }
 
 // --- the seven states --------------------------------------------------------
@@ -267,6 +269,41 @@ void CheckExpiredCode(Checks& checks) {
                   "and it draws as expired");
 }
 
+/// A live code with no address to type it into.
+///
+/// Not a bug shape: `ipc::ServiceCore::Bounded` withholds a `verification_url`
+/// longer than `ipc::kMaxVerificationUrlBytes` and leaves the state, the code
+/// and the countdown alone, because `GetPairState` is documented never to fail.
+/// What crosses is a `kPending` with eight characters and a blank address --
+/// and drawn as a live code that is the one screen a user cannot act on.
+void CheckCodeWithNoAddress(Checks& checks) {
+  auth::PairingStatus status = Pending();
+  status.verification_url.clear();
+  status.verification_url_complete.clear();
+  status.message = "the server answered a verification URL too long to show";
+  const overlay::PairingView view = RenderOverWire(checks, status);
+  ExpectWellFormed(checks, view, "a withheld address");
+  checks.Expect(view.code.empty(), "no code is drawn without an address to type it into");
+  checks.Expect(view.countdown.empty(), "...and no countdown beside it");
+  checks.ExpectEq(view.detail, status.message, "the server's answer is named");
+  checks.Expect(view.start_over, "and starting over is offered, since the code still has time");
+
+  const overlay::PairingView expired = [&] {
+    auth::PairingStatus spent = Pending();
+    spent.expires_in = 0s;
+    return RenderOverWire(checks, spent);
+  }();
+  checks.Expect(view.headline != expired.headline,
+                "an address this console cannot show does not read as an expired code");
+
+  // The same shape with no message on it still explains itself.
+  auth::PairingStatus silent = status;
+  silent.message.clear();
+  const overlay::PairingView bare = RenderOverWire(checks, silent);
+  checks.Expect(!bare.detail.empty(), "...and it explains itself even with no message to quote");
+  checks.ExpectEq(bare.headline, view.headline, "with the same headline either way");
+}
+
 // --- the code itself ---------------------------------------------------------
 
 /// Drawn verbatim. No dash, no space, no case fold, no character swapped for one
@@ -359,14 +396,17 @@ void CheckUnreachableAndBlocked(Checks& checks) {
   checks.Expect(Contains(incompatible.hint, "3"),
                 "a version mismatch names the version the sysmodule speaks");
 
-  const overlay::PairingView no_server = overlay::RenderPairingBlocked(overlay::PairBlock::kNoServer);
-  ExpectWellFormed(checks, no_server, "blocked: no server");
+  const overlay::PairingView no_server =
+      overlay::RenderPairingBlocked(overlay::PairBlock::kNoServer);
+  ExpectWellFormed(checks, no_server,
+                   std::string("blocked ") + overlay::ToString(overlay::PairBlock::kNoServer));
   checks.Expect(!no_server.start, "there is no Pair button when there is nothing to pair with");
   checks.Expect(Contains(no_server.hint, "server.url"),
                 "and the hint names the setting that is missing");
 
   const overlay::PairingView refused = overlay::RenderPairingBlocked(overlay::PairBlock::kRefused);
-  ExpectWellFormed(checks, refused, "blocked: refused");
+  ExpectWellFormed(checks, refused,
+                   std::string("blocked ") + overlay::ToString(overlay::PairBlock::kRefused));
   checks.Expect(refused.headline != no_server.headline,
                 "a refusal does not read as a missing server");
   checks.Expect(refused.start, "and a refusal can be tried again");
@@ -406,6 +446,7 @@ int main() {
   CheckPending(checks);
   CheckCountdown(checks);
   CheckExpiredCode(checks);
+  CheckCodeWithNoAddress(checks);
   CheckCodeIsVerbatim(checks);
   CheckNoSecretsReachTheScreen(checks);
   CheckUnreachableAndBlocked(checks);

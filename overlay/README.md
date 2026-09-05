@@ -106,8 +106,16 @@ block for exactly that.
 ## Where the work is
 
 **M4-2..M4-4** — the library/queue, sync and settings screens, built on the
-frame M4-1 landed. The pairing screen (M4-5) is built and is reached from
-*Re-pair* on the settings screen (M4-4). See milestone M4 in
-[`../ISSUES.md`](../ISSUES.md).
+frame M4-1 landed. The pairing screen (M4-5) is built and **nothing pushes it
+yet**: *Re-pair* on the settings screen (M4-4, #26) is the one place it is
+reached from, so until that lands it compiles and `--gc-sections` drops it from
+the image. See milestone M4 in [`../ISSUES.md`](../ISSUES.md).
+
+The palette (`ColorFor`), the `GetInterfaceVersion` handshake and the
+drop-and-reopen that decides *not running* from *unreachable* are now written
+out in both `status_screen.cpp` and `pairing_screen.cpp`. The third screen is
+the one that should lift them into a shared `overlay/source/screen_frame.*`
+rather than typing them a third time; doing it now, while three M4 screens are
+in flight in parallel worktrees, would be a merge conflict bought for nothing.
 
 [libultrahand]: https://github.com/ppkantorski/libultrahand

@@ -90,12 +90,15 @@ class PairingScreen : public tsl::Gui {
   /// have been replaced since the last one.
   bool version_checked_ = false;
 
-  /// Set by `Start()`, cleared by the first poll that reports an attempt.
+  /// Set by a `StartPair` the sysmodule refused, and cleared only by the next
+  /// press or by a transport failure.
   ///
-  /// Without it the frame after the button press draws whatever `StartPair`
-  /// answered and then the *next* frame's `GetPairState` overwrites it -- so a
-  /// refusal would flash for one frame and vanish. A refusal is the one answer
-  /// on this screen that has nothing polling behind it to keep saying so.
+  /// Without it the frame after the button press draws what `StartPair`
+  /// answered and the *next* frame's `GetPairState` overwrites it, so a refusal
+  /// flashes for one frame and vanishes. It cannot key off `kIdle`: `StartPair`
+  /// refuses before `PairingSession::Begin()` runs, so the session reports
+  /// whatever the last attempt left -- `kExpired` after a Start over -- and
+  /// only a first Pair from a genuinely idle session would be held.
   bool blocked_ = false;
 };
 
