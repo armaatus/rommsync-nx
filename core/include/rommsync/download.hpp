@@ -20,12 +20,31 @@
 //     `config.ini` and `state.db`: an empty queue plus a named diagnostic, and
 //     `io::PreviousPathFor` consulted when the file is merely missing.
 //
+// ## The bytes never reach the destination unchecked
+//
+// M3-3 (#20) put a hash between `kActive` and `kDone`, and that decided where
+// the transfer lands. The worker does **not** point `http::DownloadTarget` at
+// the rom's destination: it points it at `io::TempPathFor(destination)`, so the
+// backend's own rename commits a finished body to `<destination>.tmp` while the
+// destination itself is still empty. Only a digest that matches what RomM
+// recorded moves it the last step, with `io::CommitStaged`.
+//
+// Two failures fall out of that one decision, and neither has another fix:
+//
+//   - **A mismatch must not leave plausible bytes at the destination.** Hashing
+//     a file the backend has already renamed on would mean deleting a rom the
+//     card briefly held, and a power cut in that window leaves it there for
+//     good. Staging means the destination is only ever written with bytes
+//     something checked.
+//   - **`rename` onto an existing destination fails on Horizon.**
+//     `fsFsRenameFile`, which libnx's `fsdev` maps `std::rename` to, refuses a
+//     destination that already exists, so re-downloading a rom the card holds
+//     would fail on a console and pass on every host test. `io::CommitStaged`
+//     is the two-rename dance that exists for exactly this (atomic_file.hpp),
+//     and moving the commit here is what lets it be used.
+//
 // ## What is not here
 //
-// Verifying a download against the rom's `sha1_hash` is M3-3 (#20) -- so is the
-// finer half of resume, and `DownloadsConfig::verify_hash`. `kVerifying` exists
-// and round-trips because the state belongs to the format rather than to the
-// step that will use it; this issue's worker goes `kActive` -> `kDone`.
 // Byte-level progress over IPC is M3-5 (#22), which reads `bytes_done` from
 // here. What to do with a disc set beyond refusing it is M3-4 (#21).
 #pragma once
@@ -144,7 +163,13 @@ struct QueueEntry {
   std::int64_t size_bytes = 0;
 
   /// The rom's `sha1_hash`, lowercase hex, or empty when the library has none
-  /// -- an unscanned RomM leaves it null. M3-3 (#20) is what checks it.
+  /// -- an unscanned RomM leaves it null. What the downloaded bytes are checked
+  /// against, when there is one.
+  ///
+  /// `md5_hash` is deliberately **not** a field here. The fallback is decided
+  /// inside one entry's turn, from the `RomDetail` in hand, and a second digest
+  /// on every row would cost `kMaxQueueEntries` * 32 bytes of `queue.json` to
+  /// record something nothing reads back.
   std::string sha1_hash;
 
   /// The absolute SD path this rom is written to, from
@@ -433,7 +458,15 @@ struct RomDetail {
   std::string fs_name;
   std::string platform_fs_slug;
   std::int64_t size_bytes = 0;
+
+  /// The two digests RomM records for a rom, lowercase hex. Both are
+  /// `string | null` -- an unscanned library leaves them null -- and they are
+  /// the only fields here allowed to be absent. `sha1_hash` is what a download
+  /// is checked against; `md5_hash` is the fallback for a library that has one
+  /// and not the other (docs/API_CONTRACT.md#resume--integrity).
   std::string sha1_hash;
+  std::string md5_hash;
+
   bool has_multiple_files = false;
 
   /// RomM knows the rom and its file is gone from the server's own filesystem.
@@ -443,6 +476,12 @@ struct RomDetail {
 };
 
 /// Read one `DetailedRomSchema` body, or say which field was wrong.
+///
+/// Six of about eighty fields. A *missing* `sha1_hash` or `md5_hash` key is a
+/// shape error even though a null value is not: a body without them is not the
+/// schema this was written against, and reading it as "this rom has no hash"
+/// would turn a client talking to the wrong server into a library of unverified
+/// roms.
 json::Error ParseRomDetail(std::string_view body, RomDetail* out);
 
 /// How hard the worker tries, and how it reaches the world.
@@ -535,10 +574,40 @@ struct DrainResult {
 /// radio buy nothing.
 ///
 /// Per entry: `GET /api/roms/{id}` -> refuse a disc set or a rom missing from
-/// the server -> `config::Config::DestinationFor` -> stream the content to
-/// `<destination>.part` and rename it on -> `kDone`. The queue is written after
-/// every one of those transitions, which is what makes a power cut resumable
-/// rather than a restart.
+/// the server -> `config::Config::DestinationFor` -> is it already on the card?
+/// -> stream the content to `<destination>.tmp.part`, which the backend renames
+/// onto `<destination>.tmp` -> `kVerifying` -> hash it -> `io::CommitStaged`
+/// onto the destination -> `kDone`. The queue is written after every one of
+/// those transitions, which is what makes a power cut resumable rather than a
+/// restart.
+///
+/// **"Already on the card" is answered with the hash, or not at all.** Every
+/// path `config::Config::ExistingRomPaths` names is checked, not just the write
+/// target, and one whose size and digest both match ends the entry `kDone`
+/// without a single content request. Without a digest there is no way to tell
+/// "already there and correct" from "already there and truncated", so with
+/// `verify_hash` off, or against a library that recorded no hash, the rom is
+/// fetched again rather than assumed good.
+///
+/// **A digest that does not match never reaches the destination**, and what
+/// happens next depends on where the bytes came from. Bytes fetched whole that
+/// fail their digest mean the server's own hash does not describe its own file,
+/// which asking again cannot change: `kFailed`, terminal. Bytes that included
+/// any the card already held -- a resumed prefix, or a whole body a power cut
+/// left staged -- say nothing about the server, so they are discarded and the
+/// rom is fetched clean, once, out of the same attempt budget. Either way both
+/// the staged file and the `.part` go: bytes that are not this rom's are not a
+/// prefix of it either.
+///
+/// **A staged body the digest recognises is committed without a transfer.** It
+/// is the file a power cut left between the backend's rename and the hash, its
+/// name is derived from this rom's own destination, and re-fetching 120 MiB to
+/// learn what a local hash already knows is the expensive way to be sure.
+///
+/// **A download nothing could check still finishes, and says so.** Neither
+/// `verify_hash = false` nor a library with no `sha1_hash` and no `md5_hash` is
+/// a failure -- the rom is on the card and the user asked for it -- but the
+/// entry's `message` records that it was not verified, and never claims it was.
 ///
 /// **`[downloads] enabled = false` idles; it does not drop the queue.** The
 /// answer is `kDisabled` and the file is not even opened, so switching downloads

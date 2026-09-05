@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "rommsync/atomic_file.hpp"
+#include "rommsync/hash_file.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/md5.hpp"
 #include "rommsync/sync.hpp"
@@ -497,32 +498,19 @@ StoreResult SaveBaseline(const std::string& path, const Baseline& baseline) {
 
 HashOutcome HashFile(const std::string& path) {
   HashOutcome outcome;
-  std::FILE* file = std::fopen(path.c_str(), "rb");
-  if (file == nullptr) {
-    outcome.error = HashError::kUnreadable;
-    outcome.message = Describe(path, "could not be opened to hash");
-    return outcome;
-  }
 
-  // 4 KiB at a time, on the stack, which is the same chunk `io::ReadBounded`
-  // uses next door. The size is not a throughput knob: `sys-rommsync.json` sets
-  // `main_thread_stack_size` to 0x4000, so this frame gets **16 KiB in total**
-  // and a buffer sized by how fast it felt on a desktop is a stack overflow on
-  // the console. The read count is not the cost anyway -- stdio buffers
-  // underneath, and a save state is bounded by the MD5 and the card, not by how
-  // many times `fread` was called. The chunk size cannot change the digest,
-  // which `core.md5` asserts directly.
+  // 4 KiB at a time and never the whole file (`crypto::StreamFile`): the chunk
+  // is a stack budget rather than a throughput knob, and the reasoning is in
+  // hash_file.hpp. `opened` is why this calls the shared loop rather than
+  // `crypto::Md5FileHex` -- a save the scanner cannot open at all is a different
+  // diagnostic from one whose read failed half way, and only that flag keeps
+  // them apart.
   crypto::Md5Hasher hasher;
-  char buffer[4096];
-  std::size_t got = 0;
-  while ((got = std::fread(buffer, 1, sizeof(buffer), file)) > 0) {
-    hasher.Update(std::string_view(buffer, got));
-  }
-  const bool failed = std::ferror(file) != 0;
-  std::fclose(file);
-  if (failed) {
+  bool opened = false;
+  if (!crypto::StreamFile(path, hasher, &opened)) {
     outcome.error = HashError::kUnreadable;
-    outcome.message = Describe(path, "could not be read to hash");
+    outcome.message =
+        Describe(path, opened ? "could not be read to hash" : "could not be opened to hash");
     return outcome;
   }
 

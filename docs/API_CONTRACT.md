@@ -561,8 +561,17 @@ RetroArch SD folder; default map + override scheme in [CONFIG.md](CONFIG.md).
 ## Resume & integrity
 
 - Range requests are supported on `content` endpoints (SwitchRomM already relies
-  on `Range` resume) — use them for large-rom downloads on flaky links.
+  on `Range` resume) — use them for large-rom downloads on flaky links. Proven
+  against a live 5.2.0 by `harness.resume`, and consumed by the download worker:
+  `download.resume` asserts the resumed request comes back **206** carrying only
+  the bytes that were missing.
 - Verify **rom** downloads against `sha1_hash`/`md5_hash` from the rom schema,
-  and **save** downloads against the `content_hash` MD5.
+  and **save** downloads against the `content_hash` MD5. Both rom digests are
+  `string | null` and both are on the detail *and* the list schema; an unscanned
+  library leaves them null, and M3-3 records such a download as unverified rather
+  than passing it off as checked (`download.fallback`).
+- `truncate` — a body that ends early with no `Content-Length` at all — is caught
+  only by the client's own expected size, so a rom download always sets
+  `DownloadTarget::expected_size` from `fs_size_bytes` (`download.truncate`).
 - Saves are matched to roms by `fs_name_no_ext` (exact) with `fs_name_no_tags`
   fallback, scoped by platform when known — see [SYNC_PROTOCOL.md](SYNC_PROTOCOL.md).

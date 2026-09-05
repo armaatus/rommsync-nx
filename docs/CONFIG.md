@@ -17,7 +17,7 @@ conflict_show = true               ; surface conflicts in the overlay
 
 [downloads]
 enabled       = true
-verify_hash   = true               ; check sha1 after download
+verify_hash   = true               ; check sha1 (or md5) after download
 resume        = true
 
 ; Platform folder map: RomM platform_fs_slug -> SD folders.
@@ -172,6 +172,13 @@ Each report carries a severity, the line number, and the section and key:
 
 - Booleans are `true`/`false`, `yes`/`no`, `on`/`off`, `1`/`0`, in any case.
   Anything else → `warning`, and the previous value stands.
+- `verify_hash` decides two things, not one: whether a finished download is
+  checked against the rom's `sha1_hash` (falling back to `md5_hash`), **and**
+  whether "this rom is already on the card" can be answered at all. With it off
+  there is no way to tell a rom that is already there and correct from one that
+  is already there and truncated, so a rom queued again is downloaded again
+  rather than assumed good. A download nothing could check still finishes; the
+  queue entry says it was not verified and never claims it was.
 - `interval_min` is a whole number of minutes. Negative or unparseable →
   `warning`, default kept. Above the 10080-minute (one week) maximum → clamped
   to it with a `warning`, because falling back to the 30-minute default would
