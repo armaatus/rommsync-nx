@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -181,7 +182,7 @@ std::map<std::string, std::string, std::less<>> PlatformHints(const config::Conf
   return hints;
 }
 
-sync::ClientSaveState SaveFile::ToClientSaveState() const {
+sync::ClientSaveState SaveFile::ToClientSaveState(std::optional<std::string> content_hash) const {
   sync::ClientSaveState state;
   state.rom_id = rom_id;
   state.file_name = file_name;
@@ -191,8 +192,12 @@ sync::ClientSaveState SaveFile::ToClientSaveState() const {
   if (!emulator.empty()) {
     state.emulator = emulator;
   }
-  // `content_hash` stays null: M2-3 hashes. Null is a documented value -- the
-  // server reads it as "cannot compare content" and arbitrates on timestamps.
+  // Never an empty string: "" and `null` are different values to the server and
+  // only one of them is a value, which is why `sync::Validate` refuses the
+  // former outright.
+  if (content_hash.has_value() && !content_hash->empty()) {
+    state.content_hash = std::move(content_hash);
+  }
   state.updated_at =
       sync::Timestamp{} + std::chrono::seconds(modified_unix);
   state.file_size_bytes = size_bytes;

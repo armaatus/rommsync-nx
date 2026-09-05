@@ -287,6 +287,20 @@ void Unusable(::checks::Checks& checks) {
   }
   const sync::Encoded encoded = sync::EncodeNegotiateRequest(payload);
   checks.Expect(encoded.ok(), "what the scan did emit encodes: " + encoded.error.Describe());
+  checks.Expect(!payload.saves.front().content_hash.has_value(),
+                "a record built with no digest sends null, which the server reads as "
+                "'cannot compare content'");
+
+  // M2-3's digest goes in through the same call, because a save reported without
+  // one is planned as an upload the server already has, on every tick.
+  const std::string digest(sync::kContentHashDigits, 'a');
+  const sync::ClientSaveState hashed = result.saves.front().ToClientSaveState(digest);
+  checks.Expect(hashed.content_hash.has_value() && *hashed.content_hash == digest,
+                "a digest handed to ToClientSaveState reaches the payload");
+  checks.Expect(sync::Validate(hashed).ok(), "and the record is still one the encoder accepts");
+  // Not "" -- an empty string and a null are different values to the server.
+  checks.Expect(!result.saves.front().ToClientSaveState(std::string()).content_hash.has_value(),
+                "an empty digest is null, not a blank value the server would store");
 
   // Two files for one rom in one folder land on the same `(rom_id, slot)`, which
   // the server pairs on -- so they would overwrite each other through RomM on

@@ -17,15 +17,19 @@
 //     -- or worse, into a save the server accepts and arbitrates as something
 //     the client did not mean.
 //
-// Hashing is not here: `content_hash` is left `null` and M2-3 fills it. A null
-// hash is a documented value -- "cannot compare content", fall back to
-// timestamps -- so the records below negotiate correctly, just less precisely,
-// until it lands.
+// Hashing is not here: M2-3 owns it, and `ToClientSaveState` takes the digest
+// rather than computing one. A null hash is a documented value -- "cannot
+// compare content", fall back to timestamps -- so the records below negotiate
+// correctly until M2-3 lands, and less precisely than they should: a save
+// reported without a digest is planned as an upload the server already has, on
+// every tick. Passing the digest is therefore the caller's job and not
+// optional in practice.
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -71,8 +75,17 @@ struct SaveFile {
   /// mtime, whole seconds since the Unix epoch, UTC.
   std::int64_t modified_unix = 0;
 
-  /// The negotiate entry for this file, with `content_hash` left null (M2-3).
-  sync::ClientSaveState ToClientSaveState() const;
+  /// The negotiate entry for this file.
+  ///
+  /// `content_hash` is a parameter rather than a field because this module does
+  /// not hash (M2-3 does) and because leaving it null is not free: the server
+  /// reads a null digest as "cannot compare content", falls back to timestamps,
+  /// and plans an `upload` for a save it already has -- on this tick and every
+  /// tick after it. So the tick assembling the payload passes
+  /// `state::ContentHashFor`'s answer here, and the default exists for the
+  /// callers that genuinely have nothing to compare with yet.
+  sync::ClientSaveState ToClientSaveState(
+      std::optional<std::string> content_hash = std::nullopt) const;
 };
 
 /// Why a file in a save directory did not become a `SaveFile`.
