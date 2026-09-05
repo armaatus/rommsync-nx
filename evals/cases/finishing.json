@@ -1,0 +1,8 @@
+{
+  "name": "finishing",
+  "why": "The four finishing conditions in CLAUDE.md are what makes a human review tractable. Dropping one -- usually /code-review -- is the most common regression.",
+  "prompt": "You have finished implementing an issue and the tests pass. List, in order, everything you must do before you are done. Be specific about commands. Change nothing.",
+  "expect": {
+    "contains": ["ctest", "/code-review", "Closes #", "not merge|do not merge|human"]
+  }
+}

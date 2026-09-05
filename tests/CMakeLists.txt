@@ -406,16 +406,30 @@ set_tests_properties(orca.romm_tab_pidfile orca.romm_tab_pidfile_streaming
 # `romm-browser.sh` opens RomM in a browser tab and signs it in; the log tab
 # proves the server is alive, this is where you can see what it scanned.
 # `agent-autostart.sh` sends the issue prompt Orca leaves drafted but unsent in a
-# new worktree's agent. Both stub the orca CLI and need neither Docker nor a
-# workspace, so they never skip.
+# new worktree's agent -- completing it first when Orca drafted only the issue
+# URL, which is what an untrusted orca.yaml `issueCommand` falls back to, and
+# reaching the agent at all through a wrapper that cannot find Orca.app. Both
+# stub the orca CLI and need neither Docker nor a workspace, so they never skip.
 set(ORCA_BROWSER_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_orca_browser.sh")
 
 foreach(phase opens reuses foreign no_romm submits no_draft unstable
-              watch_needs_issue watch_late_draft watch_grace watch_submits watch_single)
+              watch_needs_issue watch_late_draft watch_grace watch_submits watch_single
+              watch_bare_url watch_full_draft_untouched cli_broken)
   add_test(NAME orca.browser_${phase}
            COMMAND "${BASH_PROGRAM}" "${ORCA_BROWSER_TEST}" ${phase})
   set_tests_properties(orca.browser_${phase} PROPERTIES TIMEOUT 60)
 endforeach()
+
+# --- the agent configuration itself ------------------------------------------
+# CLAUDE.md, REVIEW.md, the skills, the subagents and the hooks steer three
+# parallel worktrees, and every way they break is silent: a skill whose
+# frontmatter does not parse never loads, a hook whose path is wrong never runs,
+# a guard whose pattern stopped matching stops blocking. Deterministic, no model
+# and no network, so it never skips. Mirrored by the `static` job in
+# .github/workflows/agent-config.yml -- this is the same check, one push earlier.
+add_test(NAME agent.config
+         COMMAND "${BASH_PROGRAM}" "${CMAKE_SOURCE_DIR}/evals/lint.sh")
+set_tests_properties(agent.config PROPERTIES TIMEOUT 60)
 
 # --- worktree environment: scripts/orca/env.sh -------------------------------
 # setup.sh's first step, and not its only caller -- compose.sh generates a

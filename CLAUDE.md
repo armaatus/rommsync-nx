@@ -3,7 +3,8 @@
 On-device RomM sync for a modded Nintendo Switch: a background **sysmodule**
 (`sys-rommsync`) plus an Ultrahand/Tesla **overlay** (`ovl-rommsync`). Read
 [README.md](README.md) for the product, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-for the shape.
+for the shape, and [docs/WORKFLOW.md](docs/WORKFLOW.md) for how work moves from an
+idea to a merged PR — this file is the short form of it.
 
 ## Hard rules
 
@@ -98,6 +99,18 @@ it starts, even if the labels say several things are ready. Three agents each
 inventing their own version of a shared header is the one merge conflict worth
 serialising to avoid.
 
+## Plan before you edit
+
+Start in plan mode and stay there until the plan is right. Commit it as
+`plans/<issue-number>-<slug>.md` with four headings — **Files that change**,
+**Order of work**, **Risks**, **Proof**. The bar is that an engineer who has never
+seen the conversation could implement the change from it alone. See
+[plans/README.md](plans/README.md).
+
+When the implementation departs from the plan, **update the plan in the same
+commit**. Departing is normal; departing silently is not, and the review checks
+the diff against it.
+
 ## Code
 
 - C++20. `-Wall -Wextra -Wpedantic -Werror` — warnings are errors, including in
@@ -129,14 +142,38 @@ and say so in the PR body. Never edit them as a side effect of rewording a body.
 ## Finishing a task
 
 1. `ctest --test-dir build --output-on-failure` is green, and your change has a
-   test that would have failed before it.
+   test that would have failed before it. Run it and read the output before
+   reporting anything complete — "it should pass" is not this. For a bug fix,
+   write the failing test first and commit it before the fix.
 2. **Run `/code-review` on your own branch** and put the findings in the PR body.
    This is required, not optional — it is what makes a human review tractable.
+   [REVIEW.md](REVIEW.md) is the policy it follows: three passes, what counts as
+   Important rather than a Nit, and what not to report at all.
 3. Any issue your findings invalidated is edited, and the PR body says which and
    why.
 4. Open a PR with `Closes #N` for your issue. A workflow uses that line to
    unblock dependent issues, so the wording matters.
 5. A human merges. Do not merge your own PR.
+
+## What is watching you
+
+- **Skills** ([`.claude/skills/`](.claude/skills)) load when they become
+  relevant: `save-safety` on anything that writes a save, `core-portability` on
+  anything reaching for a platform facility inside `core/`, `tracker-is-spec` on
+  anything that finds an issue to be wrong. They are advisory.
+- **Hooks** ([`.claude/hooks/`](.claude/hooks)) are not. They block, with an
+  explanation: merging a PR, force-pushing `main`, editing secrets, hand-editing
+  `server/contract/captures/`, editing `unblock.yml`. A block is a rule you were
+  about to break, not a bug.
+- **Subagents**: [`verifier`](.claude/agents/verifier.md) gives an independent
+  build-and-test verdict from a fresh context before you open a PR;
+  [`researcher`](.claude/agents/researcher.md) answers questions about the
+  codebase without spending your context on the files it read.
+- `./evals/lint.sh` (also `ctest -R agent.config`) checks that all of the above
+  is still well-formed and still enforcing what it claims.
+
+When you get the same correction twice, it belongs in this file or in a skill —
+put it there as part of the work, not in a note to yourself.
 
 ## Layout
 
@@ -150,3 +187,7 @@ and say so in the PR body. Never edit them as a side effect of rewording a body.
 | `server/` | Pinned RomM API snapshot, contract probe, and the Docker test fixture. |
 | `tests/` | CTest suites. |
 | `scripts/orca/` | Per-worktree provisioning hooks. |
+| `plans/` | One committed plan per issue, written before the code. |
+| `evals/` | Regression tests for the agent configuration itself. |
+| `.claude/` | Skills, subagents and hooks — what steers and what blocks. |
+| `AGENTS.md` | Symlink to this file, for agent tools that look for that name. |

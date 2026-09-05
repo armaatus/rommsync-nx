@@ -80,7 +80,7 @@ if [ "${ROMMSYNC_AGENT_AUTOSTART:-1}" = "0" ]; then
   echo "==> agent autostart disabled (ROMMSYNC_AGENT_AUTOSTART=0)"
   exit 0
 fi
-command -v orca >/dev/null 2>&1 || { echo "==> no orca CLI; nothing to start"; exit 0; }
+orca_cli_resolve || { echo "==> no orca CLI answers here; nothing to start"; exit 0; }
 command -v python3 >/dev/null 2>&1 || { echo "==> no python3; cannot read the agent's draft"; exit 0; }
 
 # This worktree's agent terminal. `orca terminal list` reports every terminal on
@@ -101,8 +101,13 @@ for t in terminals:
 sys.exit(1)
 '
 
-# The composer text the agent has NOT sent, as a single comparable line. Prints
-# nothing when there is no draft, which is a normal answer rather than a failure.
+# The composer text the agent has NOT sent, as a single comparable line: its
+# length, a space, then the text with newlines flattened. Prints nothing when
+# there is no draft, which is a normal answer rather than a failure.
+#
+# Whole, not truncated -- the text is read back below to decide whether Orca
+# drafted a real prompt or only the issue URL, and a 60-character prefix cannot
+# tell a bare URL apart from one with instructions after it.
 DRAFT_PY='
 import json, sys
 try:
@@ -110,7 +115,7 @@ try:
 except Exception:
     sys.exit(1)
 if draft and str(draft).strip():
-    print(len(str(draft)), str(draft).strip().replace("\n", " ")[:60])
+    print(len(str(draft)), str(draft).strip().replace("\n", " "))
 '
 
 # The issue this worktree was created from, if any. Orca records it on the
@@ -129,12 +134,12 @@ sys.exit(1)
 '
 
 linked_issue() {
-  orca_run_with_deadline "$CLI_SECONDS" "$CLI_OUT" orca worktree current --json || return 1
+  orca_run_with_deadline "$CLI_SECONDS" "$CLI_OUT" "$ORCA_CLI" worktree current --json || return 1
   python3 -c "$LINKED_ISSUE_PY" <"$CLI_OUT"
 }
 
 agent_terminal() {
-  orca_run_with_deadline "$CLI_SECONDS" "$CLI_OUT" orca terminal list --json || return 1
+  orca_run_with_deadline "$CLI_SECONDS" "$CLI_OUT" "$ORCA_CLI" terminal list --json || return 1
   python3 -c "$AGENT_TERMINAL_PY" "$REPO_ROOT" <"$CLI_OUT"
 }
 
@@ -142,8 +147,29 @@ agent_terminal() {
 # which the caller has to be able to tell apart from "could not look".
 draft_of() {
   orca_run_with_deadline "$CLI_SECONDS" "$CLI_OUT" \
-    orca terminal read --terminal "$1" --screen --limit 1 --json || return 1
+    "$ORCA_CLI" terminal read --terminal "$1" --screen --limit 1 --json || return 1
   python3 -c "$DRAFT_PY" <"$CLI_OUT"
+}
+
+# What to add to a draft that is only a link.
+#
+# orca.yaml's `issueCommand` is SHARED config, and Orca will not run shared
+# config it has not been trusted with: trusting it is a click in the app's
+# repository-hooks settings, and until someone makes it, the prompt Orca drafts
+# falls back to the bare issue URL. That is the worst of both worlds -- an agent
+# starts, reads a title, and invents the scope the issue already specifies. All
+# three worktrees open on 2026-09-05 were drafted this way.
+#
+# So a draft that is nothing but a link is completed here, pointing at the same
+# script orca.yaml points at, which is where the brief actually lives. Appended
+# rather than replacing the composer: clearing it means sending an interrupt to
+# a live agent, and a link followed by an instruction reads fine.
+ISSUE_LINK_RE='^https?://[^[:space:]]+/(issues|pull)/([0-9]+)/?$'
+completion_for() {
+  local text="$1" num
+  [[ "$text" =~ $ISSUE_LINK_RE ]] || return 1
+  num="${BASH_REMATCH[2]}"
+  printf '  Run `GH_PAGER=cat ./scripts/orca/issue-command.sh %s` first and follow everything it prints.' "$num"
 }
 
 # 0 means stop -- either the prompt was sent or there is nothing here to send.
@@ -184,9 +210,22 @@ attempt() {
     return 1
   fi
 
-  echo "==> submitting the agent's drafted prompt ($draft)"
+  # Everything after the length prefix DRAFT_PY writes.
+  local text="${draft#* }" completion
+  if completion="$(completion_for "$text")"; then
+    echo "==> the drafted prompt is only a link ($text); pointing it at the spec"
+    orca_run_with_deadline "$CLI_SECONDS" "$CLI_OUT" \
+      "$ORCA_CLI" terminal send --terminal "$handle" --text "$completion" --json || {
+        echo "    the orca CLI would not extend it; the agent would start from a bare URL"
+        echo "    press Return in the agent tab yourself, or trust orca.yaml in Orca's"
+        echo "    repository-hooks settings so the issueCommand template is used"
+        return 0
+      }
+  fi
+
+  echo "==> submitting the agent's drafted prompt (${text:0:60})"
   orca_run_with_deadline "$CLI_SECONDS" "$CLI_OUT" \
-    orca terminal send --terminal "$handle" --enter --json || {
+    "$ORCA_CLI" terminal send --terminal "$handle" --enter --json || {
       echo "    the orca CLI would not send it; press Return in the agent tab"
       return 0
     }

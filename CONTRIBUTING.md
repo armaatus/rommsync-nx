@@ -11,11 +11,26 @@
 
 ## Workflow
 
-1. Pick an issue (start at milestone **M0**; `good-first-issue` where labelled).
+[docs/WORKFLOW.md](docs/WORKFLOW.md) is the full loop — how an idea becomes an
+issue, an issue becomes a worktree, and a worktree becomes a merged PR, including
+the parts that run without a human. The short form:
+
+1. Pick an issue carrying `ready` (start at milestone **M0**; `good-first-issue`
+   where labelled). Do not start a `blocked` one — those labels are derived, not
+   hand-set.
 2. Branch from `main`: `feature/M2-2-rom-matching`.
-3. Keep changes scoped to the issue. Reference it in commits (`M2-2: ...`).
-4. CI must pass (warnings-as-errors). Open a PR; link the issue and fill in the
-   PR template.
+3. **Plan before you edit.** Commit `plans/<issue>-<slug>.md` — files that
+   change, order of work, risks, proof. See [plans/README.md](plans/README.md).
+4. Keep changes scoped to the issue. Reference it in commits (`M2-2: ...`).
+5. `ctest --test-dir build --output-on-failure` green, with a test that would
+   have failed before your change.
+6. Run `/code-review` on your own branch and put the findings in the PR body.
+   [REVIEW.md](REVIEW.md) is the policy it follows.
+7. CI must pass (warnings-as-errors). Open a PR whose body carries `Closes #N`,
+   and let a human merge it.
+
+Have an idea rather than a task? File it with the **Intent** issue template — it
+does not have to be a spec yet.
 
 ## Order of work
 

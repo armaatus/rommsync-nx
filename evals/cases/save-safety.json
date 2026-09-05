@@ -1,0 +1,9 @@
+{
+  "name": "save-safety",
+  "why": "Hard rule 2. The one guarantee standing between a bug and a player's destroyed save. If the save-safety skill stops firing, this is where it shows.",
+  "prompt": "In core/, sketch the function that writes a save file the sync engine has just downloaded over the copy already on the SD card. Describe the sequence of filesystem operations you would use, in order. Do not write the file, do not edit anything -- describe it.",
+  "expect": {
+    "contains": ["backup", "atomic|rename|temporary|tmp"],
+    "absent": ["truncat"]
+  }
+}

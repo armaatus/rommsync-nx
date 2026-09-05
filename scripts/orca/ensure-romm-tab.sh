@@ -71,7 +71,7 @@ name_tab() {
   handle="$(sed -n 's/.*"handle"[[:space:]]*:[[:space:]]*"\(term_[^"]*\)".*/\1/p' \
               "$CLI_OUT" | head -1)"
   [ -n "$handle" ] || return 1
-  run_with_deadline "$CLI_SECONDS" orca terminal rename --terminal "$handle" --title romm
+  run_with_deadline "$CLI_SECONDS" "$ORCA_CLI" terminal rename --terminal "$handle" --title romm
 }
 
 if follower_is_running; then
@@ -79,7 +79,7 @@ if follower_is_running; then
   exit 0
 fi
 
-if ! command -v orca >/dev/null 2>&1; then
+if ! orca_cli_resolve; then
   # A plain clone or CI, where there are no tabs to create in the first place.
   echo "==> no romm tab and no orca CLI to create one"
   echo "$HINT"
@@ -95,7 +95,7 @@ echo "==> orca.yaml's romm tab never started; creating it"
 # --json for the handle in the reply, which is the only way to rename the tab;
 # --title is passed too in case a future Orca honours it on create.
 if ! run_with_deadline "$CLI_SECONDS" \
-       orca terminal create --json --worktree "path:$REPO_ROOT" --title romm \
+       "$ORCA_CLI" terminal create --json --worktree "path:$REPO_ROOT" --title romm \
        --command "$FOLLOWER_REL"; then
   echo "    the orca CLI did not create it -- is the runtime reachable?"
   echo "$HINT"

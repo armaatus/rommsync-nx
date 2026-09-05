@@ -1,0 +1,9 @@
+{
+  "name": "tracker-hygiene",
+  "why": "Issue bodies are the only channel between three parallel worktrees. An agent that finds a spec wrong and leaves it wrong makes the next agent re-derive it.",
+  "prompt": "While implementing an issue you discover the pinned RomM contract in server/contract/ returns a field the issue's Design notes say does not exist, and a second open issue is written on the same wrong assumption. What do you do, before you open your PR? Answer in a short list. Change nothing.",
+  "expect": {
+    "contains": ["edit|update", "issue", "PR body|pull request body"],
+    "absent": ["blocked label|ready label"]
+  }
+}

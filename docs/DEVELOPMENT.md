@@ -4,6 +4,10 @@
 dev machine with the devkitPro toolchain (or in CI). The server box only hosts
 RomM and the contract snapshot/probe under `server/`.
 
+For how work actually moves through this repo — issue to worktree to plan to PR,
+and which parts run without a human — see [WORKFLOW.md](WORKFLOW.md). This file
+is the toolchain; that one is the process.
+
 ## Toolchain
 
 Two build systems, on purpose:

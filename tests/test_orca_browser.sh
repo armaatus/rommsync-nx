@@ -478,9 +478,84 @@ JSON
     echo "PASS: one watcher per worktree, and a recycled pid does not lock it out"
     ;;
 
+  watch_bare_url)
+    # Orca will not run an orca.yaml `issueCommand` it has not been trusted
+    # with, and the prompt it drafts then falls back to the bare issue URL. An
+    # agent handed a link and nothing else reads a title and invents the scope
+    # the issue already specifies -- which is what happened to all three
+    # worktrees opened on 2026-09-05. The draft has to be completed before it is
+    # submitted, and completed from issue-command.sh, where the brief lives.
+    make_fixture
+    stub_orca "$TMPDIR_FIXTURE" >/dev/null
+    write_terminals "$TMPDIR_FIXTURE"
+    write_worktree issue
+    cat >"$TMPDIR_FIXTURE/read.json" <<'JSON'
+{"ok":true,"result":{"terminal":{"draft":"https://github.com/armaatus/rommsync-nx/issues/13"}}}
+JSON
+
+    out="$(run_autostart --watch)"
+    calls="$(cat "$TMPDIR_FIXTURE/orca-calls.log")"
+    grep -q -- "issue-command.sh 13" <<<"$calls" \
+      || fail "submitted a bare URL as the whole brief: ${calls:-<nothing>} / $out"
+    # Order matters: the text has to be in the composer before Return.
+    [ "$(grep -n "issue-command.sh 13" <<<"$calls" | cut -d: -f1)" \
+      -lt "$(grep -n -- "--enter" <<<"$calls" | cut -d: -f1)" ] \
+      || fail "pressed Return before the instruction was added: $calls"
+    echo "PASS: a draft that is only a link is pointed at the spec before it is sent"
+    ;;
+
+  watch_full_draft_untouched)
+    # And the trusted path is left exactly as it was: when Orca did draft the
+    # template, appending to it would be noise at best.
+    make_fixture
+    stub_orca "$TMPDIR_FIXTURE" >/dev/null
+    write_terminals "$TMPDIR_FIXTURE"
+    write_worktree issue
+    cat >"$TMPDIR_FIXTURE/read.json" <<'JSON'
+{"ok":true,"result":{"terminal":{"draft":"Run ./scripts/orca/issue-command.sh 13 first and follow everything it prints."}}}
+JSON
+
+    out="$(run_autostart --watch)"
+    calls="$(cat "$TMPDIR_FIXTURE/orca-calls.log")"
+    grep -q -- "--text" <<<"$calls" \
+      && fail "rewrote a prompt that was already complete: $calls"
+    grep -q -- "terminal send --terminal term_agent --enter" <<<"$calls" \
+      || fail "did not submit the drafted prompt: ${calls:-<nothing>} / $out"
+    echo "PASS: a complete draft is submitted unchanged"
+    ;;
+
+  cli_broken)
+    # `orca` on PATH is a wrapper that finds Orca.app by reading its own
+    # symlink, and a macOS install has shipped that symlink readable only by
+    # root. Every call then fails, no JSON parses, and the watcher concludes the
+    # worktree has no linked issue and stops -- which is how a provisioned
+    # worktree ends up with an agent sitting on an unsent prompt. The wrapper is
+    # probed rather than trusted, so a second CLI that answers is used instead.
+    make_fixture
+    stub_orca "$TMPDIR_FIXTURE" >/dev/null
+    write_terminals "$TMPDIR_FIXTURE"
+    write_worktree issue
+    echo '{"ok":true,"result":{"terminal":{"draft":"# 4: Capture real RomM auth shapes"}}}' \
+      >"$TMPDIR_FIXTURE/read.json"
+
+    # The working stub, moved aside under the name the resolver tries next.
+    mv "$TMPDIR_FIXTURE/stub-bin/orca" "$TMPDIR_FIXTURE/stub-bin/orca-dev"
+    printf '#!/usr/bin/env bash\necho "Unable to determine Orca.app path from symlink" >&2\nexit 1\n' \
+      >"$TMPDIR_FIXTURE/stub-bin/orca"
+    chmod +x "$TMPDIR_FIXTURE/stub-bin/orca"
+
+    out="$(run_autostart --watch)"
+    grep -q "nothing to start" <<<"$out" \
+      && fail "a broken \`orca\` on PATH stopped the watcher outright; got: $out"
+    grep -q -- "terminal send --terminal term_agent --enter" "$TMPDIR_FIXTURE/orca-calls.log" \
+      || fail "never reached the agent past the broken CLI; got: $out"
+    echo "PASS: a broken orca wrapper on PATH is skipped for one that answers"
+    ;;
+
   *)
     echo "usage: $0 opens|reuses|foreign|no_romm|submits|no_draft|unstable" >&2
     echo "       watch_needs_issue|watch_late_draft|watch_grace|watch_submits|watch_single" >&2
+    echo "       watch_bare_url|watch_full_draft_untouched|cli_broken" >&2
     exit 2
     ;;
 esac

@@ -29,12 +29,11 @@ setupAgentStartupPolicy: wait-for-setup
 # issue-command.sh, which resolves the issue to its body, labels and milestone --
 # the sole channel design intent travels through on this project.
 issueCommand: |
-  Run `GH_PAGER=cat ./scripts/orca/issue-command.sh {{issue}}` first: it prints the
-  full spec for issue #{{issue}} ({{artifact_url}}), which is the only place this
-  project's design intent is written down. Then implement that issue end to end
-  following CLAUDE.md -- ctest green with a test that would have failed before your
-  change, `/code-review` on your own branch with the findings in the PR body, and a
-  PR carrying `Closes #{{issue}}`. Do not merge it yourself.
+  Run `GH_PAGER=cat ./scripts/orca/issue-command.sh {{issue}}` first and follow
+  everything it prints. It resolves issue #{{issue}} ({{artifact_url}}) to its
+  full body, labels and milestone -- the only place this project's design intent
+  is written down -- and then states the finishing conditions. Nothing about the
+  workflow is repeated here, so this prompt cannot drift from that script.
 
 defaultTabs:
   # Tab 1 is the agent, opened by Orca itself.

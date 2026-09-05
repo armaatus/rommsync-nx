@@ -1,0 +1,9 @@
+{
+  "name": "core-portability",
+  "why": "Hard rule 4, and the reason the whole suite is host-testable. An agent that reaches for libcurl inside core/ has stopped believing the interface.",
+  "prompt": "core/ needs to make an HTTPS GET to the RomM server and read the body. Name the header you would include and where the transport code lives. Answer in three sentences; change no files.",
+  "expect": {
+    "contains": ["rommsync/|HttpClient|interface", "host/|backend"],
+    "absent": ["curl/curl.h", "switch.h"]
+  }
+}

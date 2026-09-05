@@ -69,6 +69,37 @@ orca_project_remnants() {
   docker network ls --filter "$filter" --format "network${tab}{{.Name}}"    2>/dev/null || true
 }
 
+# The Orca CLI this machine can actually run, in $ORCA_CLI.
+#
+# `orca` on PATH is a wrapper that locates Orca.app by reading its own symlink.
+# A macOS install has shipped that symlink mode 0700 root:wheel, so the readlink
+# fails for the user Orca runs these hooks as and every call dies with "Unable to
+# determine Orca.app path from symlink". Nothing here notices a broken CLI as
+# such -- the JSON never parses -- so it surfaces one layer up as an answer:
+# `agent-autostart.sh` reports "this worktree has no linked issue", stops
+# watching, and leaves a fully provisioned worktree whose agent sits on an unsent
+# prompt forever. That is how three worktrees went idle on 2026-09-05.
+#
+# So the wrapper is verified rather than assumed, and the app's own binary is the
+# fallback. `--version` is the probe because it is the one call that needs no
+# runtime: a wrapper that cannot find Orca.app fails it, and a reachable CLI
+# answers it whether or not the app is running.
+#
+# Returns non-zero when nothing answers, so a caller can say so in one line
+# instead of making its first real call and reading the silence as data.
+orca_cli_resolve() {
+  [ -n "${ORCA_CLI:-}" ] && return 0
+  local candidate
+  for candidate in ${ORCA_CLI_COMMAND:-} orca orca-dev orca-ide \
+      /Applications/Orca.app/Contents/Resources/bin/orca; do
+    command -v "$candidate" >/dev/null 2>&1 || continue
+    "$candidate" --version >/dev/null 2>&1 || continue
+    ORCA_CLI="$candidate"
+    return 0
+  done
+  return 1
+}
+
 # Run an `orca` CLI call with a hard deadline, capturing its stdout in $2.
 #
 # Every hook that talks to the Orca runtime needs this. The runtime can accept a
