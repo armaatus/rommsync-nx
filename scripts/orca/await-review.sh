@@ -18,6 +18,7 @@
 #   4  nothing arrived before the deadline -- look at Actions
 #   5  the third round is over; stop and say what is unresolved
 #   6  the review job failed on this commit; the reason is printed
+#   7  the PR's build is red; a review cannot fix that
 #
 # The round cap is counted HERE rather than left to the agent to remember. Three
 # rounds is more than almost any PR needs, and a fourth is not what a
@@ -88,6 +89,35 @@ while [ "$waited" -lt "$DEADLINE_SECONDS" ]; do
     echo
     echo "STOPPED: $ORCA_FLEET_STOP exists. Put the work down and report where you got to."
     exit 3
+  fi
+
+  # A PR whose build is red does not need a review, it needs a fix. Waiting
+  # here for one is how #88 sat parked while `host-tests` was failing on its own
+  # new test -- the agent watching for a review that could never help. Ignores
+  # merge-gate (red until a review exists, by design) and the review job itself
+  # (handled just below).
+  broken="$(GH_PAGER=cat gh pr view "$pr" --json statusCheckRollup 2>/dev/null \
+            | python3 -c "
+import json, sys
+try:
+    checks = json.load(sys.stdin).get('statusCheckRollup') or []
+except Exception:
+    raise SystemExit
+skip = ('merge-gate', 'review against REVIEW.md')
+bad = [c.get('name') for c in checks
+       if (c.get('conclusion') or '') in ('FAILURE', 'TIMED_OUT', 'ACTION_REQUIRED')
+       and c.get('name') not in skip]
+print(', '.join(n for n in bad if n))
+" 2>/dev/null)"
+  if [ -n "$broken" ]; then
+    echo
+    echo "CI is failing on this PR: $broken"
+    echo
+    echo "No review will fix a red build. Reproduce it locally:"
+    echo "  ctest --test-dir build --output-on-failure"
+    echo "then fix it, re-run the local reviews, ./scripts/orca/record-review.sh for the"
+    echo "new commit, push, and come back here."
+    exit 7
   fi
 
   # A review job that FAILED is not a review that is late. Waiting out the full

@@ -592,6 +592,37 @@ GHSTUB
     echo "PASS: a failed review job is reported at once, not waited out"
     ;;
 
+  await_reports_a_red_build)
+    # #88 sat in await-review.sh while host-tests failed on its own new test.
+    # A review cannot fix a red build, and waiting for one costs 45 minutes and
+    # then reports the wrong thing.
+    make_fixture
+    cp "$REPO_ROOT"/scripts/orca/{await-review.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    stub="$TMPDIR_FIXTURE/stub-bin"; mkdir -p "$stub"
+    cat >"$stub/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"pr list"*)              printf '[{"number":88}]\n' ;;
+  *statusCheckRollup*)      printf '{"statusCheckRollup":[{"name":"host-tests","conclusion":"FAILURE"},{"name":"merge-gate","conclusion":"FAILURE"}]}\n' ;;
+  *"pr view"*)              printf '{"reviews":[]}\n' ;;
+  *"run list"*)             printf '\n' ;;
+  *)                        printf '\n' ;;
+esac
+GHSTUB
+    chmod +x "$stub/gh"
+    ( cd "$TMPDIR_FIXTURE" && git init -q . && git commit -q --allow-empty -m fixture ) 2>/dev/null
+    out="$(cd "$TMPDIR_FIXTURE" &&
+           PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$TMPDIR_FIXTURE/fleet" \
+           AWAIT_REVIEW_DEADLINE=5 AWAIT_REVIEW_POLL=1 \
+           bash "$TMPDIR_FIXTURE/scripts/orca/await-review.sh" 88 2>&1)"
+    rc=$?
+    grep -q "host-tests" <<<"$out" || fail "did not name the failing check: $out"
+    grep -q "merge-gate" <<<"$out" \
+      && fail "reported merge-gate, which is red by design until a review exists: $out"
+    [ "$rc" = 7 ] || fail "expected exit 7 for a red build, got $rc: $out"
+    echo "PASS: a red build is reported at once, and merge-gate is not mistaken for one"
+    ;;
+
   fleet_notices_a_stalled_agent)
     # The other half of this PR, which shipped untested and should not have.
     # An agent in `waiting` is at a prompt, not working -- the board still reads
@@ -641,7 +672,8 @@ STUB
     echo "usage: $0 opens|reuses|foreign|no_romm|submits|no_draft|unstable" >&2
     echo "       watch_needs_issue|watch_late_draft|watch_grace|watch_submits|watch_single" >&2
     echo "       watch_bare_url|watch_full_draft_untouched|cli_broken" >&2
-    echo "       await_reports_failed_review|fleet_notices_a_stalled_agent" >&2
+    echo "       await_reports_failed_review|await_reports_a_red_build" >&2
+    echo "       fleet_notices_a_stalled_agent" >&2
     exit 2
     ;;
 esac

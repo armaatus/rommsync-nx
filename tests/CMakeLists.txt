@@ -875,7 +875,8 @@ set(ORCA_BROWSER_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_orca_browser.sh")
 foreach(phase opens reuses foreign no_romm submits no_draft unstable
               watch_needs_issue watch_late_draft watch_grace watch_submits watch_single
               watch_bare_url watch_full_draft_untouched cli_broken
-              await_reports_failed_review fleet_notices_a_stalled_agent)
+              await_reports_failed_review await_reports_a_red_build
+              fleet_notices_a_stalled_agent)
   add_test(NAME orca.browser_${phase}
            COMMAND "${BASH_PROGRAM}" "${ORCA_BROWSER_TEST}" ${phase})
   set_tests_properties(orca.browser_${phase} PROPERTIES TIMEOUT 60)
