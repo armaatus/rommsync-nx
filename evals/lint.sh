@@ -243,7 +243,9 @@ fi
 # skips -- and the JOB GOES GREEN while nothing was reviewed. That is the worst
 # shape a failure can take here: merge-gate then blocks every PR on a review
 # that was never submitted, and the check that should have said so is passing.
-if grep -rn "track_progress" .github/workflows/*.yml >/dev/null 2>&1; then
+# The KEY, not the word: the comment above the removal in claude-review.yml
+# explains what track_progress does, and a bare grep flags its own explanation.
+if grep -rnE "^[[:space:]]*track_progress:" .github/workflows/*.yml >/dev/null 2>&1; then
   fail "a workflow sets track_progress, which forces tag mode; an automatic review then skips silently while its job reports success"
 else
   ok "no workflow forces tag mode on an automatic review"
