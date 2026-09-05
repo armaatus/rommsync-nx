@@ -200,9 +200,13 @@ struct Config {
   /// when the platform is unmapped or maps no rom folder.
   std::string RomTarget(std::string_view slug) const;
 
-  /// The absolute path one rom downloads to: `RomTarget(rom.platform_fs_slug)`
-  /// joined with the rom's `fs_name`, or an empty path and the reason there is
-  /// none.
+  /// The absolute path one rom downloads to: the platform's first `roms` entry
+  /// -- the same folder `RomTarget()` names -- joined with the rom's `fs_name`,
+  /// or an empty path and the reason there is none.
+  ///
+  /// It does not call `RomTarget()`, which answers with a folder and nothing
+  /// else: this needs the folder *and* the reason it is missing from one
+  /// lookup, and `ExistingRomPaths()` needs the whole list from the same one.
   ///
   /// This is the only supported way to turn a rom into a destination. The
   /// joining is not the interesting part -- the refusals are: an unmapped
