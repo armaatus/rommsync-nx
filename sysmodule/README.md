@@ -64,10 +64,16 @@ guess at now — they are recorded here so they are not discovered on a console.
   most reach in a project whose second hard rule is about not destroying a
   player's save.
 - **Heap and capabilities.** `main_thread_stack_size` and the inner heap in
-  `source/main.cpp` are the template's numbers, sized for a skeleton. The real
-  budget is one in-flight download buffer plus a TLS context
-  ([../docs/DEVELOPMENT.md](../docs/DEVELOPMENT.md#tls-in-a-sysmodule)); roms
-  stream to file and never sit in RAM whole. `service_access` lists what the
+  `source/main.cpp` are the template's numbers, sized for a skeleton. M0-1
+  measured what the real budget is made of
+  ([../docs/DEVELOPMENT.md](../docs/DEVELOPMENT.md#m0-1-the-measurement-and-the-decision)):
+  the TLS context itself costs this process nothing -- it lives in the `ssl`
+  sysmodule -- and the dominant term is the bsd transfer memory, which
+  `socketInitialize` takes out of the inner heap. A trimmed socket config needs
+  **116 KiB** of the current `0x80000`; libnx's default config needs **2.25 MiB**
+  and cannot fit at all, so `socketInitializeDefault()` is the one call this
+  process must never make. Add one in-flight download buffer to that; roms stream
+  to file and never sit in RAM whole. `service_access` lists what the
   design commits to (`fsp-srv`, `set:sys`, `ssl`, `bsd:u`, `sfdnsres`, `nifm:u`,
   `time:s`) rather than `*`, so adding a service is a deliberate edit — and a
   missing one fails at runtime, on hardware, which is the reason to keep the
@@ -79,8 +85,10 @@ The core engine is built and proven natively (host build + a real RomM in
 docker, never a mock) before any of it runs on a Switch — see
 [`../docs/TESTING.md`](../docs/TESTING.md).
 
-- **M0-1** — the sysmodule `ssl`-service TLS question, a *de-risking spike*
-  (Ryujinx-first, off the boot path).
+- **M0-1** — the sysmodule `ssl`-service TLS question. Answered as far as it can
+  be answered off-console: the spike is [`../tlsprobe/`](../tlsprobe/README.md),
+  the decision is `ssl`, and the part that still needs a console is recorded with
+  it.
 - **M1 onward** — auth, sync, downloads and the IPC service, in `core/` first.
 
 See milestone M0 in [`../ISSUES.md`](../ISSUES.md).

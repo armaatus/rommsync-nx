@@ -18,6 +18,14 @@
 #                                   the way out, and a pid it merely left behind
 #                                   -- one the system has since handed to
 #                                   something else -- is not. Needs no docker.
+#   test_orca_teardown.sh profiles  every profile in the compose file is named on
+#                                   the `down` that removes the stack. `down`
+#                                   only touches services whose profile is
+#                                   active, so a profiled service is invisible to
+#                                   a teardown that does not ask for it -- it
+#                                   survives, `restart: unless-stopped` brings it
+#                                   back, and it holds its port and blocks the
+#                                   network removal behind it. Needs no docker.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -231,8 +239,35 @@ FAKE
     echo "PASS: reap.sh sweeps $ORPHAN, spares $live, and refuses to guess"
     ;;
 
+  profiles)
+    # Every profile the compose file defines, as bare names.
+    profiles="$(grep -oE '^[[:space:]]*profiles:[[:space:]]*\[[^]]*\]' \
+                  "$REPO_ROOT/server/testing/docker-compose.yml" \
+                | grep -oE '"[^"]+"' | tr -d '"' | sort -u)"
+    if [ -z "$profiles" ]; then
+      echo "PASS: the compose file defines no profiles; nothing to cover"
+      exit 0
+    fi
+
+    for script in archive.sh reap.sh; do
+      # The `down` invocation, which spans two lines in both scripts.
+      down="$(grep -A2 -E 'docker compose -p "\$project"' \
+                "$REPO_ROOT/scripts/orca/$script" | tr '\n' ' ')"
+      [ -n "$down" ] || fail "$script no longer runs docker compose down on a project"
+      for profile in $profiles; do
+        case "$down" in
+          *"--profile $profile"*|*"--profile '*'"*|*'COMPOSE_PROFILES'*) ;;
+          *) fail "$script's \`down\` does not activate the '$profile' profile, so"\
+                  "$profile services survive teardown and restart themselves" ;;
+        esac
+      done
+    done
+
+    echo "PASS: teardown activates every compose profile ($(echo $profiles | tr '\n' ' '))"
+    ;;
+
   *)
-    echo "usage: $0 derives|reap|watcher" >&2
+    echo "usage: $0 derives|reap|watcher|profiles" >&2
     exit 2
     ;;
 esac

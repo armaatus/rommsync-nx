@@ -1,0 +1,36 @@
+# TLS in front of the fixture RomM, for the M0-1 probe and nothing else.
+#
+# The docker fixture speaks plain HTTP (docker-compose.yml) because every host
+# test reaches it over loopback, where TLS would only add a certificate to
+# manage. The probe cannot use it: the question M0-1 asks is specifically about
+# the TLS path, so it needs something on the other end that actually does a
+# handshake -- see tlsprobe/README.md.
+#
+# nginx:alpine renders this with envsubst at start-up; ${UPSTREAM} comes from
+# the service's environment in docker-compose.yml, which is also where
+# tests/test_policy.py can see it.
+server {
+    listen 8443 ssl;
+    server_name _;
+
+    ssl_certificate     /etc/nginx/certs/server.crt;
+    ssl_certificate_key /etc/nginx/certs/server.key;
+
+    # TLSv1.2 is not optional here. libnx's SslVersion_Auto is "TLS 1.0 through
+    # 1.2"; 1.3 needs [11.0.0+] and an explicit bit. A 1.3-only terminator would
+    # fail the handshake for a reason that has nothing to do with the question
+    # being asked.
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:probe:1m;
+
+    # No ALPN advertisement beyond the default: the ssl service only sends one
+    # with SslOptionType_EnableAlpn [9.0.0+], and HTTP/1.1 is what the probe
+    # writes by hand.
+    location / {
+        proxy_pass ${UPSTREAM};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 300s;
+    }
+}

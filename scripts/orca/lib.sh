@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Shared helpers for the Orca hooks. Sourced, never executed.
 
-# A worktree's identity -- its compose project name and its two ports -- is a
+# A worktree's identity -- its compose project name and its ports -- is a
 # pure function of its absolute path. env.sh writes the result to .env when the
 # worktree is created; teardown recomputes it instead of reading .env back.
 #
@@ -39,6 +39,11 @@ print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:4])
   orca_offset=$(( 0x$hex % 2000 ))
   orca_romm_port=$((21000 + orca_offset))
   orca_proxy_port=$((23000 + orca_offset))
+  # The TLS terminator in front of RomM (server/testing/docker-compose.yml's
+  # `tls` profile). Derived like the other two rather than picked at run time,
+  # for the same reason: teardown recomputes ports instead of reading .env back,
+  # and a port nothing can re-derive is a port nothing can release.
+  orca_tls_port=$((25000 + orca_offset))
   # The offset is part of the name, not just the ports: two worktrees whose leaf
   # directory names collide (a checkout and a worktree both called
   # "rommsync-nx") would otherwise share a compose project, and the second

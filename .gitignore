@@ -8,6 +8,10 @@ device.dat*
 .env
 .env.tmp*
 
+# the fixture TLS certificate and its private key: minted per worktree by
+# scripts/orca/tls-fixture.sh, throwaway, and still a private key
+server/testing/tls/generated/
+
 # generated per-worktree environment / fixtures — never shared, never committed
 .cache/
 server/testing/library/

@@ -34,10 +34,10 @@ cmake -S . -B build && cmake --build build      # build
 ctest --test-dir build --output-on-failure       # test
 ctest --test-dir build -R sync --output-on-failure   # one group
 
-# the two Switch targets, built by devkitPro rather than CMake. Nothing built
+# the three Switch targets, built by devkitPro rather than CMake. Nothing built
 # here runs anywhere before the M8-1 gate; see switch.mk.
 docker run --rm -v "$PWD:/work" -w /work devkitpro/devkita64:latest \
-  bash -lc 'make -C sysmodule && make -C overlay'
+  bash -lc 'make -C sysmodule && make -C overlay && make -C tlsprobe'
 
 ./scripts/orca/env.sh                            # regenerate .env
 ./scripts/orca/romm-browser.sh                   # open RomM signed in, if the tab is gone
@@ -45,6 +45,7 @@ docker run --rm -v "$PWD:/work" -w /work devkitpro/devkita64:latest \
 ./server/testing/seed.sh                         # re-seed ROM fixtures
 ./.venv/bin/python server/testing/provision.py   # scan the library, mint a fixture token
 ./scripts/orca/compose.sh up -d                  # start RomM
+./scripts/orca/tls-fixture.sh up                 # ...and TLS in front of it, for tlsprobe
 ./scripts/orca/compose.sh logs -f                # follow it; tab 2 shows this
 ./scripts/orca/reap.sh                           # list RomM stacks whose worktree is gone (--yes removes)
 ```
@@ -124,6 +125,7 @@ serialising to avoid.
 | `host/` | Desktop backends for `core/`'s interfaces (libcurl `HttpClient`). Never built for Switch. |
 | `sysmodule/` | `sys-rommsync`, the background engine. devkitPro Makefile. |
 | `overlay/` | `ovl-rommsync`, the libultrahand overlay. devkitPro Makefile. |
+| `tlsprobe/` | The M0-1 TLS spike: a manually-launched `.nro`, never installed. |
 | `server/` | Pinned RomM API snapshot, contract probe, and the Docker test fixture. |
 | `tests/` | CTest suites. |
 | `scripts/orca/` | Per-worktree provisioning hooks. |

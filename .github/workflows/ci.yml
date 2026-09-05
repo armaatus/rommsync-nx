@@ -147,6 +147,13 @@ jobs:
       - name: Build overlay
         run: make -C overlay -j"$(nproc)"
 
+      # The M0-1 spike (tlsprobe/README.md). Built here for the same reason the
+      # other two are: it is manually launched, never installed, and a broken
+      # cross-compile of it should be visible on the push that broke it rather
+      # than on the day someone goes to run the experiment.
+      - name: Build the TLS probe
+        run: make -C tlsprobe -j"$(nproc)"
+
       # `make` exiting 0 is not the same as having produced something loadable,
       # and upload-artifact would happily publish an empty set. An .ovl without
       # its ULTR signature is the sharp case: it builds, it uploads, and
@@ -164,6 +171,12 @@ jobs:
             echo "::error::sys-rommsync.nsp is not a PFS0 archive"; exit 1; }
           [ "$(tail -c 4 overlay/ovl-rommsync.ovl)" = "ULTR" ] || {
             echo "::error::ovl-rommsync.ovl is missing its ULTR signature"; exit 1; }
+          test -s tlsprobe/rommsync-tlsprobe.nro || {
+            echo "::error::tlsprobe built no .nro"; exit 1; }
+          # NRO0 at offset 0x10; the first 16 bytes are the entry branch.
+          [ "$(dd if=tlsprobe/rommsync-tlsprobe.nro bs=1 skip=16 count=4 \
+                 2>/dev/null)" = "NRO0" ] || {
+            echo "::error::rommsync-tlsprobe.nro is not an NRO"; exit 1; }
 
       - name: Collect artifacts
         uses: actions/upload-artifact@v7
@@ -172,4 +185,5 @@ jobs:
           path: |
             sysmodule/sys-rommsync.nsp
             overlay/ovl-rommsync.ovl
+            tlsprobe/rommsync-tlsprobe.nro
           if-no-files-found: error

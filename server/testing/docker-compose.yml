@@ -81,3 +81,29 @@ services:
       - "127.0.0.1:${PROXY_PORT:-23515}:8080"
     depends_on:
       - romm
+
+  # TLS in front of RomM, for the M0-1 probe only -- `profiles` keeps it out of
+  # every ordinary `compose.sh up -d`, so the host suite still talks plain HTTP
+  # to the fault proxy and nothing about the rig changed for it.
+  #
+  #   ./scripts/orca/tls-fixture.sh up
+  #
+  # mints the certificate and starts this; tlsprobe/README.md is what points a
+  # console at it. The certificate is self-signed and lives in ./tls/generated,
+  # which is gitignored -- a private key in the tree would break CLAUDE.md's
+  # fifth hard rule even for a throwaway one.
+  romm-tls:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    profiles: ["tls"]
+    environment:
+      # Named UPSTREAM, like the fault proxy's, so tests/test_policy.py's
+      # loopback phase checks this far end too rather than only that one.
+      UPSTREAM: http://romm:8080
+    volumes:
+      - ./tls/romm-tls.conf.template:/etc/nginx/templates/romm-tls.conf.template:ro
+      - ./tls/generated:/etc/nginx/certs:ro
+    ports:
+      - "127.0.0.1:${TLS_PORT:-25515}:8443"
+    depends_on:
+      - romm

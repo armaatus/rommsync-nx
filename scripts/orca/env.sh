@@ -41,6 +41,8 @@ ROMM_PORT=$orca_romm_port
 PROXY_PORT=$orca_proxy_port
 ROMM_BASE_URL=http://127.0.0.1:$orca_romm_port
 PROXY_BASE_URL=http://127.0.0.1:$orca_proxy_port
+TLS_PORT=$orca_tls_port
+TLS_BASE_URL=https://127.0.0.1:$orca_tls_port
 ROM_CACHE=$ROM_CACHE
 CCACHE_DIR=$CCACHE_DIR
 EOF
@@ -53,4 +55,4 @@ EOF
 # lands last publishes byte-identical content.
 mv -f "$ORCA_ENV_TMP" "$REPO_ROOT/.env"
 
-echo "worktree env: project=$orca_project romm=$orca_romm_port proxy=$orca_proxy_port"
+echo "worktree env: project=$orca_project romm=$orca_romm_port proxy=$orca_proxy_port tls=$orca_tls_port"
