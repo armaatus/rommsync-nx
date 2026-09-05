@@ -17,6 +17,7 @@
 #   3  the fleet was stopped while waiting
 #   4  nothing arrived before the deadline -- look at Actions
 #   5  the third round is over; stop and say what is unresolved
+#   6  the review job failed on this commit; the reason is printed
 #
 # The round cap is counted HERE rather than left to the agent to remember. Three
 # rounds is more than almost any PR needs, and a fourth is not what a
@@ -36,8 +37,10 @@ MAX_ROUNDS="${AWAIT_REVIEW_MAX_ROUNDS:-3}"
 ROUNDS_FILE="$REPO_ROOT/.orca/review-rounds"
 
 pr="${1:-}"
+branch="$(git rev-parse --abbrev-ref HEAD)"
+head="$(git rev-parse HEAD)"
 [ -n "$pr" ] || pr="$(orca_pr_for_branch)" || {
-  echo "no open PR for branch $(git rev-parse --abbrev-ref HEAD)" >&2; exit 2; }
+  echo "no open PR for branch $branch" >&2; exit 2; }
 
 mkdir -p "$REPO_ROOT/.orca"
 round=0
@@ -85,6 +88,26 @@ while [ "$waited" -lt "$DEADLINE_SECONDS" ]; do
     echo
     echo "STOPPED: $ORCA_FLEET_STOP exists. Put the work down and report where you got to."
     exit 3
+  fi
+
+  # A review job that FAILED is not a review that is late. Waiting out the full
+  # deadline for one costs 45 minutes and then says only "nothing arrived" --
+  # which is what happened on PR #80, where the reviewer had already died on
+  # `Reached maximum number of turns (30)` four minutes in. Ask the run, and say
+  # the real reason immediately.
+  failed_run="$(GH_PAGER=cat gh run list --branch "$branch" --workflow "claude review" \
+                  --limit 1 --json conclusion,databaseId,headSha \
+                  --jq "[.[] | select(.headSha==\"$head\" and .conclusion==\"failure\")][0].databaseId" \
+                2>/dev/null)"
+  if [ -n "$failed_run" ] && [ "$failed_run" != "null" ]; then
+    echo
+    echo "The review job FAILED on this commit -- it is not coming. Run $failed_run:"
+    GH_PAGER=cat gh run view "$failed_run" --log 2>/dev/null \
+      | grep -iE "\[error\]|maximum number of turns|validation|not installed|OIDC" \
+      | sed 's/^/    /' | cut -c1-200 | head -5
+    echo
+    echo "Fix the cause, push, and run this again. Do not wait for it."
+    exit 6
   fi
 
   # Written to a file and read back, never spliced into a Python source string:

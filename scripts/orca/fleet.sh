@@ -340,6 +340,39 @@ reap_merged() {
   done
 }
 
+# ---------------------------------------------------------- stalled agents ---
+# An agent sitting at a confirmation prompt is not working, and nothing said so.
+# #23 stopped inside two minutes on a `git submodule add` the auto-mode
+# classifier wanted confirmed, while the board still read `in-progress` and the
+# time-box had three hours to run. In auto mode nothing should be asking -- so
+# when one does, say so once, on the card and in a notification, and let a
+# person decide. The alternative is a worktree that looks busy for three hours.
+notice_stalled() {
+  local f num path state
+  for f in "$OWNED_DIR"/*; do
+    [ -e "$f" ] || continue
+    num="$(basename "$f")"; path="$(cat "$f")"
+    [ -d "$path" ] || continue
+    state="$(orca_json worktree ps | python3 -c "
+import json, sys
+try:
+    for w in json.load(sys.stdin)['result']['worktrees']:
+        if w.get('path') == sys.argv[1]:
+            print(((w.get('agents') or [{}])[0]).get('state') or '')
+            break
+except Exception:
+    pass
+" "$path" 2>/dev/null)"
+    [ "$state" = "waiting" ] || { rm -f "$STATE_DIR/stalled-$num"; continue; }
+    # Once per stall, not once per poll.
+    [ -e "$STATE_DIR/stalled-$num" ] && continue
+    : >"$STATE_DIR/stalled-$num"
+    say "#$num is waiting for input -- in auto mode nothing should be asking"
+    card "$path" --comment "#$num: waiting for input -- needs you"
+    notify "#$num needs you" "It is sitting at a prompt, not working."
+  done
+}
+
 # ------------------------------------------------------------- the time-box ---
 # An agent that cannot get green will grind. On expiry it is interrupted, the
 # issue gets a comment saying so, and the worktree is LEFT STANDING: a stuck task
@@ -513,6 +546,7 @@ cmd_run() {
 
     reap_merged
     enforce_timebox
+    notice_stalled
 
     local live
     if ! live="$(live_count)"; then

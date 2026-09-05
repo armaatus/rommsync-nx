@@ -552,10 +552,41 @@ JSON
     echo "PASS: a broken orca wrapper on PATH is skipped for one that answers"
     ;;
 
+  await_reports_failed_review)
+    # A review job that FAILED is not a review that is late. Waiting out the
+    # 45-minute deadline for one and then saying "nothing arrived" is what
+    # happened on PR #80, where the reviewer had already died on "Reached
+    # maximum number of turns" four minutes in.
+    make_fixture
+    stub="$TMPDIR_FIXTURE/stub-bin"
+    mkdir -p "$stub"
+    cat >"$stub/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"pr list"*)  printf '[{"number":80}]\n' ;;
+  *"run list"*) printf '4242\n' ;;
+  *"run view"*) printf '##[error] Execution failed: Reached maximum number of turns (30)\n' ;;
+  *"pr view"*)  printf '{"reviews":[]}\n' ;;
+  *)            printf '\n' ;;
+esac
+GHSTUB
+    chmod +x "$stub/gh"
+    out="$(cd "$TMPDIR_FIXTURE" && git init -q . 2>/dev/null;
+           PATH="$stub:$PATH" AWAIT_REVIEW_DEADLINE=5 AWAIT_REVIEW_POLL=1 \
+           bash "$REPO_ROOT/scripts/orca/await-review.sh" 80 2>&1)"
+    rc=$?
+    grep -q "maximum number of turns" <<<"$out" \
+      || fail "did not report why the review job failed; got: $out"
+    [ "$rc" = 6 ] \
+      || fail "expected exit 6 for a failed review job, got $rc: $out"
+    echo "PASS: a failed review job is reported at once, not waited out"
+    ;;
+
   *)
     echo "usage: $0 opens|reuses|foreign|no_romm|submits|no_draft|unstable" >&2
     echo "       watch_needs_issue|watch_late_draft|watch_grace|watch_submits|watch_single" >&2
     echo "       watch_bare_url|watch_full_draft_untouched|cli_broken" >&2
+    echo "       await_reports_failed_review" >&2
     exit 2
     ;;
 esac
