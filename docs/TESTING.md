@@ -278,6 +278,52 @@ ctest --test-dir build --output-on-failure
   block-boundary lengths the padding gets wrong, and then the property that
   actually matters — the identifier is the *same* identifier across a restart, a
   re-pair, a different seed, an interrupted commit and a corrupt record.
+- `core.md5` covers the digest RomM compares saves on (M2-3): RFC 1321's own
+  vectors including the empty string, the padding boundaries (55/56/63/64/119/
+  120/128 bytes) where the length field does and does not fit in the last block,
+  and the property no single-call test can see — the digest does not depend on
+  where `Update` was split, which is what `state::HashFile`'s chunked read rests
+  on. A wrong MD5 is still 32 plausible hex characters and its only symptom on a
+  console is every unchanged save negotiating as changed, forever, so the vectors
+  are the whole check. It never skips.
+- `core.state_db` covers the baseline file (M2-3): every field round-trips,
+  including a slot carrying a tab, a quote or a newline — which is why the rows
+  are JSON and not a separator-delimited record. The rest is failures, because
+  the guarantee is that a lost baseline costs a tick of hashing and never a wrong
+  comparison: an empty file, a missing or future version line, a row that is not
+  JSON, a field of the wrong type, a SHA1 where the MD5 goes, a duplicate
+  `(rom_id, slot)`, a region of zeroes and an oversized file each yield an
+  **empty baseline plus a diagnostic** rather than a refusal. A truncation is
+  the one worth reading: three intact rows and one fragment is not a baseline of
+  three, because a prefix is individually well-formed and collectively a lie.
+  It also covers the commit-window recovery from `.old` — including the case
+  that used to be silent, where `state.db` is missing *and* the `.old` beside it
+  is unusable, which must not report as the brand-new card it looks like. On the
+  writer side it separates the two kinds of bad: an individual unusable row is
+  **skipped** and the rest are written (a console with an unset RTC stamps a
+  save with the epoch, and refusing the whole file over it would freeze the
+  baseline and re-hash the library on every tick from then on), while a file
+  over `kMaxRecords` or `kMaxStateBytes` is **refused**, because that is a file
+  the reader would discard whole and writing it trades one loud failure for a
+  silent re-hash forever. One check asserts the two bounds agree — a full
+  baseline must serialize to less than the byte bound. Timestamps are checked as
+  integers before any `Timestamp` is built from them, since
+  `system_clock::duration` is nanoseconds on libstdc++ and `kMaxTimestampSeconds`
+  is twenty-seven times what that can hold; the boundary in the test is derived
+  from the clock, not written down, so it is right on both a microsecond libc++
+  and a nanosecond libstdc++. Finally the optimisation itself — an unchanged
+  file is not re-opened (proved by pointing the call at a path that does not
+  exist) and still reports its stored digest, while a file whose size moved or
+  whose mtime moved is re-hashed. It never skips.
+- `harness.content_hash` is the half of M2-3 no vector suite can check: the
+  digest `state::HashFile` computes for a save on the card is compared against
+  the one **RomM itself** computed for the same bytes (`harness::ServerMd5`
+  uploads them under a throwaway slot and deletes it again). A SHA1 or an
+  uppercase hexdigest is accepted by the server without complaint and matches
+  nothing, so the only symptom is a library that re-uploads every tick. The
+  scenario also runs the digest through `sync::Validate` and a `state.db` round
+  trip, so what the second tick would report is checked against what the server
+  holds.
 - `sync.payload` pins the negotiate shapes to the committed OpenAPI snapshot
   rather than to a second copy of the field names: tables in the test are
   checked against `server/contract/romm-openapi-5.2.0.json` — `ClientSaveState`
@@ -335,7 +381,8 @@ ctest --test-dir build --output-on-failure
   rom, then a `Range` resume, compared **byte for byte** against the file RomM
   is serving), `truncate` (a clean short body over a save — caught only by the
   caller's own expected size, which the scenario proves by showing the same body
-  accepted without one), `stall`, `multifile`, and `backup`.
+  accepted without one), `stall`, `multifile`, `backup`, and `content_hash` (M2-3's digest, checked
+  against the one the server computed).
 - Two of them are about the harness rather than the engine, and they are the
   ones that keep the rest honest. `harness.sandbox` needs no server and never
   skips: it covers the per-test SD card (`tests/harness.hpp`), which maps the
@@ -364,8 +411,8 @@ ctest --test-dir build --output-on-failure
   way round, fails here — including adding a scope marked "only if…" to the set
   the client actually requests.
 - None of `auth.scopes`, `core.token_store`, `core.device_identity`,
-  `device.shapes` or `sync.payload` touches the network, so none of them ever
-  skips.
+  `device.shapes`, `core.md5`, `core.state_db` or `sync.payload` touches the
+  network, so none of them ever skips.
 - The `policy.*` tests re-ask row 8 of [the M0 exit gate](#the-m0-exit-gate) on
   every run: the suite is configured for loopback only, the scripts that write
   refuse anything else, and no registered test reaches off this machine. They
