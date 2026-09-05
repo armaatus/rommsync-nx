@@ -124,7 +124,9 @@ for t in json.load(sys.stdin)["result"]["terminals"]:
 # --------------------------------------------------------------- the state ---
 own()          { printf '%s\n' "$2" >"$OWNED_DIR/$1"; date +%s >"$STARTED_DIR/$1"; }
 owned_path()   { cat "$OWNED_DIR/$1" 2>/dev/null; }
-disown_issue() { rm -f "$OWNED_DIR/$1" "$STARTED_DIR/$1"; }
+# ...including the stall marker, which notice_stalled writes once per stall and
+# nothing else removed -- one small file leaked per issue that ever stalled.
+disown_issue() { rm -f "$OWNED_DIR/$1" "$STARTED_DIR/$1" "$STATE_DIR/stalled-$1"; }
 
 # Non-zero when the answer could not be read, which is NOT the same as "nothing
 # is running". Reading a failed CLI call as zero live worktrees is how one

@@ -84,6 +84,8 @@ echo "  (polling every ${POLL_SECONDS}s; stop everything with ./scripts/orca/sto
 
 payload="$(mktemp)"; trap 'rm -f "$payload"' EXIT
 waited=0
+checks_due=0
+broken_before=""
 while [ "$waited" -lt "$DEADLINE_SECONDS" ]; do
   if orca_fleet_stopped; then
     echo
@@ -96,8 +98,22 @@ while [ "$waited" -lt "$DEADLINE_SECONDS" ]; do
   # new test -- the agent watching for a review that could never help. Ignores
   # merge-gate (red until a review exists, by design) and the review job itself
   # (handled just below).
-  broken="$(GH_PAGER=cat gh pr view "$pr" --json statusCheckRollup 2>/dev/null \
-            | python3 -c "
+  # Every fourth poll, and acted on only when TWO consecutive checks agree.
+  #
+  # Every fourth because these are extra `gh` calls on a 30-second loop that can
+  # run 45 minutes, and this repo is careful about gh's secondary rate limit
+  # (see count_startable in fleet.sh).
+  #
+  # Twice because `harness.partial` is a known intermittent race (#76, reopened)
+  # that runs inside host-tests. A single sighting is not evidence the PR is
+  # broken, and sending an agent to fix something that is not theirs costs it a
+  # whole cycle. The comparison is between CHECKS, not polls -- an earlier
+  # version reset its memory on the polls in between and could never see the
+  # same failure twice.
+  checks_due=$((checks_due + 1))
+  if [ "$((checks_due % 4))" = "1" ]; then
+    broken="$(GH_PAGER=cat gh pr view "$pr" --json statusCheckRollup 2>/dev/null \
+              | python3 -c "
 import json, sys
 try:
     checks = json.load(sys.stdin).get('statusCheckRollup') or []
@@ -109,15 +125,23 @@ bad = [c.get('name') for c in checks
        and c.get('name') not in skip]
 print(', '.join(n for n in bad if n))
 " 2>/dev/null)"
-  if [ -n "$broken" ]; then
-    echo
-    echo "CI is failing on this PR: $broken"
-    echo
-    echo "No review will fix a red build. Reproduce it locally:"
-    echo "  ctest --test-dir build --output-on-failure"
-    echo "then fix it, re-run the local reviews, ./scripts/orca/record-review.sh for the"
-    echo "new commit, push, and come back here."
-    exit 7
+    if [ -n "$broken" ] && [ "$broken" = "$broken_before" ]; then
+      cat <<RED
+
+CI is failing on this PR, on two consecutive checks: $broken
+
+No review will fix a red build. Reproduce it locally:
+  ctest --test-dir build --output-on-failure
+then fix it, re-run the local reviews, ./scripts/orca/record-review.sh for the
+new commit, push, and come back here.
+
+One thing to rule out first: if the only failure is harness.partial, that is a
+known intermittent race (#76) and NOT yours. Re-run the job rather than
+changing code:  gh run rerun <run-id>
+RED
+      exit 7
+    fi
+    broken_before="$broken"
   fi
 
   # A review job that FAILED is not a review that is late. Waiting out the full

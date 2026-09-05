@@ -613,10 +613,14 @@ GHSTUB
     ( cd "$TMPDIR_FIXTURE" && git init -q . && git commit -q --allow-empty -m fixture ) 2>/dev/null
     out="$(cd "$TMPDIR_FIXTURE" &&
            PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$TMPDIR_FIXTURE/fleet" \
-           AWAIT_REVIEW_DEADLINE=5 AWAIT_REVIEW_POLL=1 \
+           AWAIT_REVIEW_DEADLINE=12 AWAIT_REVIEW_POLL=1 \
            bash "$TMPDIR_FIXTURE/scripts/orca/await-review.sh" 88 2>&1)"
     rc=$?
     grep -q "host-tests" <<<"$out" || fail "did not name the failing check: $out"
+    grep -q "two consecutive checks" <<<"$out" \
+      || fail "acted on a single sighting; a known flake would send an agent chasing it: $out"
+    grep -q "#76" <<<"$out" \
+      || fail "did not point at the known flake as the first thing to rule out: $out"
     grep -q "merge-gate" <<<"$out" \
       && fail "reported merge-gate, which is red by design until a review exists: $out"
     [ "$rc" = 7 ] || fail "expected exit 7 for a red build, got $rc: $out"
