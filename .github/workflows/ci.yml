@@ -51,50 +51,17 @@ jobs:
   #
   # ROMMSYNC_REQUIRE_RIG=ON means an unreachable fixture FAILS here rather than
   # skipping. A green run must mean the tests actually ran.
-  #
-  # This is the long job -- a RomM image, a full build, 105 tests -- and it is
-  # what would eat the Actions budget. So for a PR from this repo, opened by its
-  # owner, it runs on the Mac that already has the images pulled, the ccache warm
-  # and Docker up: the same machine the worktrees run on, where minutes are free.
-  #
-  # Everything else -- a fork, a bot, anyone else's PR, a push to main -- goes to
-  # a GitHub-hosted runner. That gate is not a preference: this is a PUBLIC repo,
-  # and a self-hosted runner executing a fork's code is arbitrary code execution
-  # on a personal machine. Do not widen it.
-  #
-  # Register the runner with ./scripts/orca/runner-setup.sh; if it is offline the
-  # job queues rather than failing, and `gh run cancel` plus a re-run on the
-  # hosted path is the way out.
   host-tests:
-    runs-on: >-
-      ${{ (github.event_name == 'pull_request'
-           && github.event.pull_request.head.repo.full_name == github.repository
-           && github.event.pull_request.user.login == github.repository_owner)
-          && fromJSON('["self-hosted","rommsync"]')
-          || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
 
-      # Only on the hosted runner. The self-hosted Mac already has all of this --
-      # it is the machine the worktrees build on -- and `apt-get` does not exist
-      # there.
       - name: Install build dependencies
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake ninja-build libcurl4-openssl-dev ccache
-
-      - name: Tools are present
-        if: runner.os != 'Linux'
-        run: |
-          for tool in cmake ninja docker python3; do
-            command -v "$tool" >/dev/null || {
-              echo "::error::$tool is missing on this self-hosted runner"; exit 1; }
-          done
-          docker info >/dev/null 2>&1 || {
-            echo "::error::Docker is not running on this self-hosted runner"; exit 1; }
 
       - name: Derive environment and seed ROM fixtures
         run: |

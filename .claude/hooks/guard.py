@@ -366,6 +366,14 @@ def check_bash(command):
         if _verb(words) == "gh":
             rest = words[1:]
             if rest[:2] == ["pr", "merge"]:
+                # `--auto` does not merge. It asks GitHub to merge later, once
+                # the required checks pass -- and `merge-gate` is one of those,
+                # so the conditions in it are what actually decide. That keeps
+                # separation of duties intact: the agent never approves and
+                # never merges; it queues a request that a rule you set either
+                # satisfies or does not.
+                if "--auto" in rest and "--admin" not in rest:
+                    continue
                 deny(
                     "Blocked: agents do not merge PRs on this repo (CLAUDE.md, "
                     '"Finishing a task").\n'
@@ -530,6 +538,10 @@ SELFTEST = [
 
     # --- merging ------------------------------------------------------------
     ("Bash", {"command": "gh pr merge 42 --squash"}, 2, "an agent cannot merge its own PR"),
+    ("Bash", {"command": "gh pr merge 42 --auto --squash"}, 0,
+     "...but it may ASK GitHub to merge once the required checks pass"),
+    ("Bash", {"command": "gh pr merge 42 --squash --admin"}, 2,
+     "...and --admin, which bypasses those checks, is still merging"),
     ("Bash", {"command": "gh  pr  merge 12"}, 2, "...however it is spaced"),
     ("Bash", {"command": "/opt/homebrew/bin/gh pr merge 12"}, 2, "...through an absolute gh"),
     ("Bash", {"command": "gh api -X PUT repos/o/r/pulls/12/merge"}, 2, "...or spelled as the REST call"),

@@ -40,6 +40,8 @@ ctest --test-dir build -R sync --output-on-failure   # one group
 docker run --rm -v "$PWD:/work" -w /work devkitpro/devkita64:latest \
   bash -lc 'make -C sysmodule && make -C overlay && make -C tlsprobe'
 
+./scripts/orca/fleet.sh status                   # what the fleet is running, and what is next
+./scripts/orca/stop.sh                           # stop everything (--now interrupts the agents)
 ./evals/lint.sh                                  # the agent config still holds
 ./scripts/orca/env.sh                            # regenerate .env
 ./scripts/orca/compose.sh up -d                  # start RomM  (logs -f to follow)
@@ -149,7 +151,10 @@ and say so in the PR body. Never edit them as a side effect of rewording a body.
    why.
 4. Open a PR with `Closes #N` for your issue. A workflow uses that line to
    unblock dependent issues, so the wording matters.
-5. A human merges. Do not merge your own PR.
+5. `gh pr merge --auto --squash` — that asks GitHub to merge once the required
+   checks pass, and `merge-gate` is one of them, so the rules decide. Never merge
+   directly. A PR touching `.claude/` or `.github/workflows/` never auto-merges;
+   a person merges those.
 
 ## What is watching you
 
@@ -159,11 +164,13 @@ and say so in the PR body. Never edit them as a side effect of rewording a body.
   anything that finds an issue to be wrong. They are advisory.
 - **Hooks** ([`.claude/hooks/guard.py`](.claude/hooks/guard.py)) are not. They
   block, with an explanation: merging a PR, force-pushing `main`, writing to
-  `server/contract/captures/`, editing secrets, editing `unblock.yml`, and
-  editing the hooks and settings themselves — from a shell command as well as
-  from an edit. A block is a rule you were about to break, not a bug. It is not
-  a sandbox: `guard.py --selftest` is the record of what has been checked, not a
-  proof that nothing gets through.
+  `server/contract/captures/`, editing secrets, editing `unblock.yml` — from a
+  shell command as well as from an edit. Three more apply **only in a worktree
+  the fleet opened**: editing the hooks or settings, pushing before the local
+  review is recorded, and anything outward while the fleet is stopped. A block is
+  a rule you were about to break, not a bug. It is not a sandbox:
+  `guard.py --selftest` is the record of what has been checked, not a proof that
+  nothing gets through.
 - **Subagents**: [`verifier`](.claude/agents/verifier.md) gives an independent
   build-and-test verdict from a fresh context before you open a PR;
   [`researcher`](.claude/agents/researcher.md) answers questions about the

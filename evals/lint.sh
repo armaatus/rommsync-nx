@@ -198,6 +198,19 @@ for named in record-review.sh await-review.sh review-status.sh; do
 done
 ok "the brief still names the review loop"
 
+echo "== the merge gate"
+# The one required check `gh pr merge --auto` waits on. Its decision lives in a
+# script rather than in the YAML precisely so it can be tested without a pull
+# request -- and so a change to what "may merge" means fails here first.
+if [ -x .github/scripts/merge_gate.py ]; then
+  python3 .github/scripts/merge_gate.py --selftest 2>&1 | sed 's/^/  /'
+  [ "${PIPESTATUS[0]}" = 0 ] || fail "the merge-gate selftest does not hold"
+else
+  fail ".github/scripts/merge_gate.py is missing or not executable"
+fi
+grep -q 'merge_gate.py' .github/workflows/merge-gate.yml \
+  || fail "merge-gate.yml no longer calls merge_gate.py, so the check decides nothing"
+
 echo "== orca.yaml"
 if [ ! -f orca.yaml ]; then
   fail "orca.yaml is missing; new worktrees would provision nothing"

@@ -1,8 +1,9 @@
 # How work happens here
 
 This project is built by agents working in parallel, one per Orca worktree, with
-one human deciding what gets merged. This file is how that works end to end: what
-each stage produces, what starts the next one, and where a person is required.
+one human deciding what the rules are. This file is that loop end to end: what
+each stage produces, what starts the next, where a person is required, and how to
+stop the whole thing.
 
 New here? Read [CLAUDE.md](../CLAUDE.md) first — it is the working agreement and
 it is short. This file is the longer explanation behind it.
@@ -11,312 +12,422 @@ The shape is adapted from Anthropic's
 [AI-native SDLC playbook](https://claude.com/blog/the-ai-native-sdlc-playbook).
 The idea it turns on: **each stage ends by committing an artifact, and the next
 stage begins by reading it.** The chain of commits is the audit trail — who asked
-for what, what the agent produced, and who approved it. Nothing here is a
-handoff meeting; everything is a file.
+for what, what the agent produced, what approved it. No handoff meetings; only
+files.
 
-## The loop at a glance
+Three things shape every decision below.
 
-| Stage | Artifact it commits | What starts the next stage | Who decides |
-|---|---|---|---|
-| 1. Intent | an `intent`-labelled issue | the issue being given Goal/Scope/Acceptance | anyone can file |
-| 2. Spec | the issue body, `ready` | Orca worktree created from it | the maintainer |
-| 3. Plan | `plans/<n>-<slug>.md` | the plan being accepted | the agent, out loud in the PR |
-| 4. Build & test | the diff and its tests | `ctest` green | enforced by CI |
-| 5. Review | `/code-review` findings in the PR body | a PR with `Closes #N` | **a human merges** |
-| 6. Maintain | a new issue | back to stage 1 | the maintainer |
+**The machine is free.** This Mac has effectively unlimited time and the fixtures
+already on disk, so the heavy work — building, the full suite against a real
+RomM, both review passes — happens locally. GitHub Actions is the independent
+second opinion and the gate, and at roughly 5.5 minutes per PR it is not the
+scarce resource.
 
-Two rules run through all of it:
+**A PR arrives reviewed, or it does not arrive.** By the time a pull request
+exists it has been through `/code-review` and `/mattpocock-skills:code-review`
+locally and the findings are in its body. This is [enforced](#guardrails), not
+asked for.
 
-- **The tracker is the spec.** Design intent lives in issue bodies, nowhere else.
-  Three worktrees cannot see each other; those bodies are the only channel.
-- **A human merges.** No agent merges its own work. This is enforced, not asked
-  for — see [Guardrails](#guardrails).
+**Nothing merges on trust.** The agent never merges and never approves. It asks
+GitHub to merge, and one required check — [`merge-gate`](#the-merge-gate) —
+decides whether that is allowed.
 
 ---
 
-## Stage 1 — Intent
+## Start it
 
-An idea, a bug, a rough observation. It does not have to be a spec yet.
+Run the dispatcher in an Orca terminal, so it is as visible as the work it
+starts:
 
-File it with the **Intent** issue template
+```bash
+orca terminal create --worktree active --title fleet \
+  --command "./scripts/orca/fleet.sh run --auto"
+```
+
+Or directly:
+
+```bash
+./scripts/orca/fleet.sh run 11 12 13              # work exactly these issues
+./scripts/orca/fleet.sh run --auto                # keep taking `ready` issues
+./scripts/orca/fleet.sh run --auto --until 08:00  # ...and stop then
+./scripts/orca/fleet.sh run --auto --for 6h --max-prs 5
+./scripts/orca/fleet.sh status                    # what is running, what is next
+./scripts/orca/stop.sh                            # stop. See below — this always works.
+```
+
+`fleet.sh` is deterministic shell. No model runs in it. Its whole job is to decide
+*which* issue gets a worktree and *when*.
+
+**What it picks:** anything `ready` and not already in flight, ordered by how many
+open issues name it in a `Blocked by #N` line. The work that frees the most other
+work goes first, which is the fastest way to turn a mostly-blocked backlog into a
+wide one. Milestones do not order it — `ready` already means every blocker is
+closed, and a milestone number is not a claim about what can be built *now*.
+`--auto` never pauses; it stops when the queue empties, at `--until`/`--for`, or
+after `--max-prs`, and says which.
+
+`ready` on its own is not enough, incidentally: the label stays until the PR
+merges, so `fleet.sh` also excludes any issue that already has an open PR
+carrying `Closes #N`.
+
+**What it will not do:** it does not merge, and it never touches a worktree it did
+not create.
+
+## Stop it
+
+```bash
+./scripts/orca/stop.sh          # drain: no new worktrees, running agents finish
+./scripts/orca/stop.sh --now    # ...and interrupt every agent as well
+./scripts/orca/fleet.sh resume  # carry on
+```
+
+The stop is a **file** — `~/.rommsync-fleet/STOP` — not a signal, and it lives
+outside every worktree. That is deliberate: a signal only reaches a process that
+is still healthy, and the moment you most need a stop is the one where something
+is not.
+
+Three things read it, so it holds even when nothing cooperates:
+
+- `fleet.sh` checks it before every decision and opens nothing new.
+- `await-review.sh` checks it between polls and returns exit 3.
+- **`guard.py` refuses `git push`, `gh pr create` and every `gh … comment/edit`
+  while it exists.** So a stopped fleet produces no outward effects even from an
+  agent that is mid-thought and has not read the news. Reading, building and
+  testing stay open — the point is to stop work reaching anyone, not to freeze
+  the machine.
+
+Nothing removes that file except `fleet.sh resume`.
+
+---
+
+## The loop
+
+| Stage | Artifact | Starts the next stage | Who decides |
+|---|---|---|---|
+| 1. Intent | an `intent`-labelled issue | giving it Goal/Scope/Acceptance | anyone files |
+| 2. Spec | the issue body, `ready` | `fleet.sh` opening a worktree | the maintainer |
+| 3. Build | the diff and its tests | `ctest` green | enforced by the hook |
+| 4. Local review | `.orca/reviewed-<sha>` + the PR body | the push gate lifting | enforced by the hook |
+| 5. Independent review | a GitHub review | `merge-gate` going green | the rules you set |
+| 6. Maintain | a new issue, or an eval case | back to stage 1 | the maintainer |
+
+### Stage 1 — Intent
+
+An idea, a bug, a rough observation. File it with the **Intent** template
 ([`.github/ISSUE_TEMPLATE/intent.yml`](../.github/ISSUE_TEMPLATE/intent.yml)):
-problem, proposed outcome, affected systems, constraints, open questions. In
-your own words. The point is that an idea does not have to wait until someone
-has time to write a proper issue.
+problem, proposed outcome, affected systems, constraints, open questions, in your
+own words. An idea should not have to wait until someone has time to write a
+proper issue.
 
-If you already know the scope and what "done" means, skip this and open the
-issue in the stage 2 shape directly.
+### Stage 2 — Spec
 
-**Committed artifact:** the issue.
-
-## Stage 2 — Spec
-
-An intent becomes workable when its issue carries the four sections every issue
-on this repo carries — #5 and #40 are the standard:
-
-- **Goal** — what is true afterwards.
-- **Scope** — what is in, and explicitly what is not.
-- **Design notes** — the decisions already made, and why. This is where a
-  constraint the code imposes, or an endpoint that differs from the pinned
-  contract, gets written down.
-- **Acceptance** — what a reviewer checks. Each item is something a test or a
-  command can demonstrate.
+An issue is workable when it carries the four sections every issue here carries —
+#5 and #40 are the standard: **Goal**, **Scope** (including what is *not* in),
+**Design notes** (the decisions already made, and why), **Acceptance** (each item
+something a test or a command can demonstrate).
 
 Below a `<!-- blockers -->` marker, `Blocked by #N` lines name its dependencies.
-[`.github/workflows/unblock.yml`](../.github/workflows/unblock.yml) derives the
-`blocked` and `ready` labels from those lines on every merge. **Never hand-edit
-those labels.** The lines themselves are editable, but changing one changes what
-other agents may start — do it deliberately, alone, and say so in the PR body.
+[`unblock.yml`](../.github/workflows/unblock.yml) derives `blocked`/`ready` from
+those lines on every merge, and `fleet.sh` reads the same lines to order its
+queue. **Never hand-edit those labels.** The lines are editable, but changing one
+changes what other agents may start — do it deliberately, alone, and say so in
+the PR body.
 
-An issue is startable when it is `ready`. One exception the labels cannot
-express: **a foundation issue lands alone.** When an issue defines an interface
-later issues include (M0-2's `HttpClient` is the standing example) it merges
-before anything depending on it starts, even if several things read as ready.
+One rule the labels cannot express: **a foundation issue lands alone.** An issue
+that defines an interface later issues include (M0-2's `HttpClient` is the
+standing example) merges before anything depending on it starts. Label it
+`foundation` and `fleet.sh` holds the fan-out for it.
 
-**Committed artifact:** the issue body. **Gate:** the maintainer decides what
-gets a worktree.
+### Stage 3 — Build, in the worktree
 
-## Stage 3 — Plan
+`fleet.sh` creates the worktree with the issue linked and the brief already sent;
+`orca.yaml`'s setup hook provisions it — isolated ports, seeded ROM fixtures, a
+full build, its own RomM, a scanned library, a browser tab signed in as the
+fixture admin. `setupAgentStartupPolicy: wait-for-setup` holds the agent's tab
+until that finishes, so its first `ctest` means something.
 
-Create the worktree in Orca from the linked issue. Everything below then happens
-without you:
+The agent plans before it edits — **Files that change / Order of work / Risks /
+Proof**, in the PR body under `## Plan`, at the bar that someone who never saw the
+conversation could implement it from the plan alone. Departing from a plan is
+normal; departing silently is not.
 
-1. `orca.yaml`'s `setup` hook runs
-   [`scripts/orca/setup.sh`](../scripts/orca/setup.sh): derives isolated ports,
-   seeds ROM fixtures, builds, installs the server tooling, starts this
-   worktree's own RomM, provisions the fixture, and opens a browser tab signed
-   in as the fixture admin.
-2. `setupAgentStartupPolicy: wait-for-setup` holds the agent's tab until that
-   finishes, so the agent's first `ctest` means something.
-3. `orca.yaml`'s `issueCommand` puts a prompt in the agent's composer pointing at
-   [`scripts/orca/issue-command.sh`](../scripts/orca/issue-command.sh), which
-   resolves the issue to its full body, labels and milestone, and then states the
-   finishing conditions.
-4. [`scripts/orca/agent-autostart.sh`](../scripts/orca/agent-autostart.sh)
-   submits that prompt. Orca drafts it rather than sending it, so without this
-   the worktree comes up perfectly provisioned with an agent that has read
-   nothing.
+Then it builds, with three things that are not negotiable:
 
-The agent then plans before it edits. Claude Code starts in plan mode: it can
-read the whole tree and change none of it. The plan is committed as
-`plans/<issue-number>-<slug>.md` with four headings — **Files that change**,
-**Order of work**, **Risks**, **Proof**. See [`plans/README.md`](../plans/README.md).
+- **There is no mock RomM.** Tests run against a real RomM 5.2.0 in Docker, per
+  worktree, on its own port. Failure modes a healthy server will not produce on
+  demand — 401 mid-sync, a truncated body, a dropped connection, a stall — are
+  forced with the fault proxy. See [TESTING.md](TESTING.md).
+- **Every change carries a test that would have failed before it.** Not "the
+  suite still passes". For a bug fix, write the failing test first, watch it fail
+  for the reason you expect, commit it, and only then fix the code —
+  `/mattpocock-skills:tdd` is that loop.
+- **Verification is part of "done".** Run `ctest` and read the output. If
+  `rig.smoke` reports **Skipped**, RomM is not running and most of the suite is
+  meaningless.
 
-The bar: *an engineer who has never seen the conversation could implement the
-change from the plan alone.*
+The [`verifier`](../.claude/agents/verifier.md) subagent is the packaged final
+check: a fresh context that builds, runs the suite, hunts for the test that would
+have failed, and answers `READY` or `NOT READY`. It fixes nothing, which is why
+its verdict is worth having.
 
-**Committed artifact:** `plans/<n>-<slug>.md`. **Gate:** the plan is accepted
-before any file is edited, and if the implementation departs from it, the plan is
-updated in the same commit.
+An issue gets **three hours**. On expiry the fleet interrupts the agent, comments
+on the issue saying so, and **leaves the worktree standing** — a stuck task is
+exactly the one worth looking at, and its fixture and build state are the
+evidence. You get a notification.
 
-## Stage 4 — Build and test
+### Stage 4 — Local review, before anything leaves
 
-Ordinary work, with three things that are not negotiable.
+Two passes, because they look for different things and this machine has the time:
 
-**There is no mock RomM.** Tests run against a real RomM 5.2.0 in Docker, per
-worktree, on its own port. A passing test means the behaviour is genuinely real.
-Failure modes a healthy RomM will not produce on demand — 401 mid-sync, a
-truncated body, a dropped connection, a stall — are forced with the fault proxy
-in front of it. See [TESTING.md](TESTING.md).
+```bash
+/code-review high                  # defects: correctness, efficiency, reuse
+/mattpocock-skills:code-review     # conformance: standards, and spec-vs-diff
+```
 
-**Every change carries a test that would have failed before it.** Not "the suite
-still passes". For a bug fix, write the failing test first, watch it fail for the
-reason you expect, commit it, and only then fix the code. A test that existed
-before the fix is proof the bug is gone.
+[REVIEW.md](../REVIEW.md) is the policy both follow. Fix what is real, re-run the
+tests, then record it:
 
-**Verification is part of "done".** Run `ctest --test-dir build --output-on-failure`
-and read the output before reporting anything complete. If `rig.smoke` reports
-**Skipped**, RomM is not running and most of the suite is meaningless — start it
-rather than working around it.
+```bash
+./scripts/orca/record-review.sh findings.md
+```
 
-The [`verifier`](../.claude/agents/verifier.md) subagent is the packaged form of
-the final check: a fresh context that builds, runs the suite, looks for the test
-that would have failed, and reports `READY` or `NOT READY`. It fixes nothing,
-which is why its verdict is worth having.
+That writes `.orca/reviewed-<sha>`, and **`guard.py` refuses `git push` and
+`gh pr create` from a fleet-owned worktree without it.** The marker is
+per-commit, so amending or adding a commit needs the review re-run — which is the
+point. A worktree you opened by hand is never gated: pushing a half-finished
+branch is normal, and a guard that argues about it is a guard people route
+around.
 
-**Committed artifact:** the diff and its tests.
+The PR body carries `## Plan`, both sets of findings and what was done about
+them, any issue that was edited and why, and `Closes #N`. That body is not
+decoration — `merge-gate` reads it.
 
-## Stage 5 — Review and merge
+### Stage 5 — Independent review, and the merge
 
-Three passes, on the way to one human decision.
+On GitHub:
 
-1. **`/code-review` on your own branch.** Required by CLAUDE.md, not optional.
-   The findings go in the PR body. This is what makes a human review tractable.
-2. **CI.** [`ci.yml`](../.github/workflows/ci.yml) builds the host harness and
-   runs the whole suite against a real RomM, builds all three Switch targets and
-   checks the artifacts are what they claim to be, and enforces the mechanical
-   half of the portability rule. [`agent-config.yml`](../.github/workflows/agent-config.yml)
-   regression-tests the agent configuration itself whenever it changes.
-3. **The independent PR review.**
-   [`claude-review.yml`](../.github/workflows/claude-review.yml) reviews the PR
-   against [REVIEW.md](../REVIEW.md) from a context that has not seen the
-   conversation which produced the diff. An author reviewing their own work
-   shares its blind spots; this is the pass that does not.
+- [`ci.yml`](../.github/workflows/ci.yml) — host tests against a real RomM, three
+  Switch targets, `core/` include hygiene. ~5.5 minutes.
+- [`agent-config.yml`](../.github/workflows/agent-config.yml) — regression-tests
+  the agent configuration whenever it changes.
+- [`claude-review.yml`](../.github/workflows/claude-review.yml) — the independent
+  review, from a context that has not seen the conversation which produced the
+  diff. It submits a **real GitHub review**: `REQUEST_CHANGES` when it has an
+  Important finding, `COMMENT` when it does not, never `APPROVE`.
+- [`merge-gate.yml`](../.github/workflows/merge-gate.yml) — the required check
+  that decides whether the PR may merge itself.
 
-[REVIEW.md](../REVIEW.md) is the review policy: three passes (correctness;
-portability and platform rules; compliance with the spec), what counts as
-**Important** rather than a **Nit**, a cap on nits, and an explicit list of what
-not to report at all — starting with anything CI already enforces.
+Back in the worktree the agent waits with one blocking call:
 
-The PR body carries `Closes #N`. A workflow reads that line to unblock dependent
-issues, so the wording matters.
+```bash
+./scripts/orca/await-review.sh
+```
 
-**Gate: a human merges.** Findings inform; they do not approve and they do not
-block. No agent merges its own work — this is enforced by a hook, not asked for.
+This is the cheap half of the loop. An agent that waits by *thinking about
+whether the review has arrived* burns tokens the whole time. An agent that waits
+inside one tool call burns nothing — the session is suspended until the script
+returns. No webhook, no ingress, no daemon; `gh` on a 30-second poll.
 
-### Talking to Claude on a PR
+Then it fixes what is real, replies with a reason where it disagrees, resolves
+every thread, pushes, re-requests review, and checks:
 
-Comment `@claude …` on a PR or a review comment and
-[`claude-review.yml`](../.github/workflows/claude-review.yml) picks it up: it
-reads the thread, makes the change, and pushes to the PR branch. It cannot reach
-`main` and it cannot merge.
+```bash
+./scripts/orca/review-status.sh    # exit 0 = every thread resolved, every check green
+```
 
-Both Claude workflows need a `CLAUDE_CODE_OAUTH_TOKEN` secret — mint one with
-`claude setup-token` and add it under **Settings → Secrets and variables →
-Actions**. Without it they no-op with a notice instead of failing, so a fork or a
-plain clone still works.
+Resolution comes from GitHub's own state through GraphQL, not from whether a
+reply exists — the REST endpoint for PR comments cannot report it, and
+`isOutdated` is not `isResolved`.
 
-## Stage 6 — Maintain
+**At most three rounds.** If a third still leaves something unresolved the agent
+stops, comments saying exactly what is unresolved and why it disagrees, and flags
+the card. Another lap is not what a disagreement needs; your attention is.
 
-What comes back from a merged change re-enters at stage 1.
+When it is green the agent runs `gh pr merge --auto --squash`. That does **not**
+merge — it asks GitHub to merge once the required checks pass. Then it stops.
 
-- A review finding that shows up **twice** stops being a review finding: the
-  correction goes into [CLAUDE.md](../CLAUDE.md), or into a skill, as part of
-  that review. That is how the next session already knows it.
+### The merge gate
+
+[`merge_gate.py`](../.github/scripts/merge_gate.py) is the required check
+`--auto` waits on. It passes only when all five hold:
+
+1. the PR body shows a local `/code-review` pass;
+2. …and a local `/mattpocock-skills:code-review` pass;
+3. an independent review exists on the **current head SHA** — pushing a fix
+   invalidates it, so a re-review is required;
+4. the **latest** review from each author is not `CHANGES_REQUESTED`;
+5. no review thread is unresolved.
+
+Point 4 is the whole trick. GitHub's `reviewDecision` is sticky: once a reviewer
+requests changes it stays `CHANGES_REQUESTED` until dismissed or until that
+reviewer *approves* — and this reviewer never approves, by design. Reading it
+would leave a PR whose findings were all addressed blocked forever. Taking the
+latest review per author instead lets a clean re-review supersede the old verdict
+on its own, with no dismissal step and nothing waiting on a person.
+
+A PR touching **`.claude/**`** or **`.github/workflows/**`** fails the gate on
+purpose. Those are the only paths that can disable the checks gating their own
+PR, so they never merge themselves. `enforce_admins` is off, so you merge them by
+hand with the check red — which is exactly the intended shape.
+
+The decision lives in a script rather than in the YAML so it can be run and
+tested without a pull request: `python3 .github/scripts/merge_gate.py --selftest`,
+and `evals/lint.sh` runs it.
+
+Say `@claude …` on a PR or a review comment and the mention job picks it up,
+makes the change and pushes — gated to `OWNER`, `MEMBER` and `COLLABORATOR`,
+because that is the job that can write.
+
+### Stage 6 — Maintain
+
+Once the PR merges, `fleet.sh` marks the card `completed`, comments which PR
+landed, and removes the worktree with `--run-hooks` — which is not optional:
+without it `orca.yaml`'s archive hook never runs and that worktree's RomM stack
+survives under `restart: unless-stopped`, holding two ports forever with nothing
+left on disk to identify it by. Then the next `ready` issue takes the slot.
+
+And what comes back from the change re-enters at stage 1:
+
+- A review finding that appears **twice** stops being a review finding: the
+  correction goes into [CLAUDE.md](../CLAUDE.md) or a skill as part of that
+  review. `/mattpocock-skills:writing-for-agents` is the skill for editing those.
 - Anything that reached `main` and had to be reverted earns an eval case in
-  [`evals/cases/`](../evals/cases), written by whoever handled it, so it stays
-  fixed.
-- Anything the work invalidated in the tracker gets edited as it is found —
-  including issues that are not yours. The PR body says which and why.
+  [`evals/cases/`](../evals/cases), written by whoever handled it.
+- Anything the work invalidated in the tracker is edited as it is found —
+  including issues that are not yours.
 
 ---
+
+## Where to look
+
+Everything runs through Orca, so the board is the status surface. `fleet.sh`
+drives it: **`in-progress`** while a worktree builds, **`in-review`** once the
+agent has opened its PR, **`completed`** on merge, and a one-line comment on each
+card saying what it is waiting for.
+
+You get a macOS notification for the two cases you would otherwise miss: the
+fleet stopping, and an issue giving up on its time-box. Everything else is
+visible without being interrupted.
 
 ## Guardrails
 
 Three layers, in increasing order of how hard they are to ignore.
 
-**CLAUDE.md** — read at the start of every session. Conventions, commands, the
-five hard rules. Kept short on purpose: it is a cost paid on every task in every
-worktree, and `evals/lint.sh` fails if it grows past what a session can hold.
+**`CLAUDE.md`** — read in full at the start of every session, so its size is paid
+on every task in every worktree. `evals/lint.sh` fails if it grows past 200 lines.
 
-**Skills** ([`.claude/skills/`](../.claude/skills)) — institutional knowledge
-that must be applied consistently, loaded when it becomes relevant rather than
-read every time. [`save-safety`](../.claude/skills/save-safety/SKILL.md) fires on
-anything that writes a save; [`core-portability`](../.claude/skills/core-portability/SKILL.md)
-on anything that reaches for a platform facility inside `core/`;
-[`tracker-is-spec`](../.claude/skills/tracker-is-spec/SKILL.md) on anything that
-finds an issue to be wrong. A skill is a real control but an *advisory* one —
-nothing forces a session to comply.
+**Skills** — loaded when they become relevant rather than read every time.
+Repo-owned ones live in [`.claude/skills/`](../.claude/skills): `save-safety` on
+anything that writes a save, `core-portability` on anything reaching for a
+platform facility inside `core/`, `tracker-is-spec` on anything that finds an
+issue to be wrong. The `mattpocock-skills` plugin is enabled in the **committed**
+`.claude/settings.json`, so every worktree has it — `code-review` (standards and
+spec-vs-diff), `tdd`, `diagnosing-bugs`, `writing-for-agents`, `research`,
+`grilling` for stress-testing a plan before you commit to it. `evals/lint.sh`
+fails if that entry disappears, because the agent brief names those skills.
 
-**Hooks** ([`.claude/hooks/`](../.claude/hooks)) — the deterministic layer behind
-the skills, registered in [`.claude/settings.json`](../.claude/settings.json).
-They run on every matching action and they block, with an explanation:
+**Hooks** ([`.claude/hooks/guard.py`](../.claude/hooks/guard.py)) — deterministic.
 
-| Hook | Blocks |
+| It blocks | Why |
 |---|---|
-| `guard.py` | merging a PR; force-pushing `main`; writing to `server/contract/captures/`; editing secrets or `.env`; editing `unblock.yml`; editing the hooks and settings themselves |
-| `shellcheck-edited.sh` | *(reports, never blocks)* a shell script that no longer parses |
+| `gh pr merge`, and the `gh api …/merge` spelling | separation of duties: the agent that wrote it does not merge it |
+| `gh pr merge --auto` is **allowed** | that asks GitHub to merge once `merge-gate` passes — a rule decides, not the agent |
+| force-pushing `main` | the commit chain is the audit trail |
+| writing to `server/contract/captures/` | rewriting a capture silences the only test that notices RomM changing |
+| editing secrets, `.env`, `token.dat`, `device.dat` | hard rule 5 |
+| editing `unblock.yml` | it decides what other worktrees may start |
+| editing `.claude/hooks/` and `settings.json` **in a fleet worktree** | an agent rewriting its own guards while nobody is watching has none |
+| pushing or opening a PR from a fleet worktree with no `.orca/reviewed-<sha>` | a PR arrives reviewed or it does not arrive |
+| anything outward while `~/.rommsync-fleet/STOP` exists | a stop that depends on cooperation is not a stop |
 
-The skill makes a violation rare; the hook makes the routine forms of it fail.
+The last three apply **only in a worktree the fleet opened**. In your own
+worktree you are the control, and a guard that argues with a person doing manual
+work is a guard people route around. It is also why the guards can still be
+improved: the first version protected itself everywhere, and made its own bug
+unfixable.
 
 **What the hook is not: a sandbox.** It reads a command and decides; it does not
 confine one. A session that means to get past it can — an interpreter one-liner
-that opens a file, a path assembled from a variable, an `exec` through something
-the parser does not model. What it holds is the *routine* line: the heredoc, the
-redirect, the `sed -i`, the `gh pr merge`, the shapes an agent reaches for while
-solving the problem in front of it rather than working around a rule. Past that,
-the backstops are the diff and the human who merges. Do not write documentation —
-or a commit message — that claims more than this.
+that opens a file, a path assembled from a variable. What it holds is the
+*routine* line: the heredoc, the redirect, the `sed -i`, the `gh pr merge`, the
+shapes an agent reaches for while solving the problem in front of it rather than
+working around a rule. Past that, the backstops are the diff and `merge-gate`.
+Do not write documentation — or a commit message — that claims more.
 
-Four properties are deliberate and worth keeping if you touch it:
+Four properties are deliberate:
 
-- **It does not fail open.** An unreadable payload, a missing key, an
-  unparseable command — all of those block. A guard that quietly stops guarding
-  when something upstream changes shape is worse than no guard, because nothing
-  on screen says the enforcement went away.
-- **It tokenises with `shlex`** rather than matching raw strings, splits compound
-  commands on `;`, `&&`, `||` and `|`, and recurses into `bash -c`. So
-  `git -C /some/path push --force origin main` and `true && rm .env` are caught
-  while `git commit -m "note about --force pushes to main"` is not.
-- **A write is a write whichever verb performs it.** Every path a shell command
-  creates, replaces, moves or deletes — redirects, `tee`, `cp`/`mv`
-  destinations, `sed -i`, `rm`, `dd of=` — goes through the same rules an `Edit`
-  would. The first version checked paths only for the editing tools, so
-  `cat > .claude/hooks/guard.py` rewrote the guard and the guard said nothing.
-- **It guards itself.** `.claude/hooks/`, `.claude/settings.json` and the
-  gitignored `settings.local.json` are not agent-writable, from either direction:
-  an agent that can rewrite its own guards has none. Skills and subagents are
-  *not* protected — they are advisory by design, and an agent improving one is
-  the loop working.
+- **It does not fail open.** An unreadable payload or an unparseable command
+  blocks. A guard that quietly stops guarding when something upstream changes
+  shape is worse than no guard, because nothing says the enforcement went away.
+- **It tokenises with `shlex`**, splits compound commands on `;`, `&&`, `||` and
+  `|`, recurses into `bash -c`, and skips heredoc *bodies* — so
+  `true && rm .env` is caught while a document quoting that line is not.
+- **A write is a write whichever verb performs it.** Redirects, `tee`, `cp`/`mv`
+  destinations, `sed -i`, `rm`, `dd of=` all go through the same rules an `Edit`
+  does. The first version checked paths only for the editing tools, so
+  `cat >` into a guarded file rewrote it and the guard said nothing.
+- **Skills and subagents are never protected.** They are advisory by design, and
+  an agent improving one is the loop working.
 
-`guard.py --selftest` is 49 assertions kept next to the code they constrain, so
-a guard and its assertion cannot drift into separate files. It is the record of
-what has been checked — every row is either a rule this repo depends on or an
-escape somebody actually found — and it is **not** a proof that nothing else
-gets through. When a review finds a new way past, the fix and its row land
-together. `evals/lint.sh` runs it, and so does `ctest -R agent.config`.
+`guard.py --selftest` is 72 assertions kept next to the code they constrain. Every
+row is either a rule this repo depends on or an escape somebody actually found.
+It is the record of what has been checked — **not** a proof that nothing else
+gets through.
 
-Agents run in **auto** permission mode (`permissions.defaultMode` in
-`.claude/settings.json`) so a worktree does not sit waiting for someone to approve
-a `cmake` invocation. That is only safe because the guardrails above are what
-actually decide what an agent may do — not a prompt for each command.
+Agents run in **auto** permission mode (`permissions.defaultMode`), which is only
+safe because the above decides what they may do rather than a prompt for each
+command.
 
-### Guardrails on the GitHub side
+## Repository settings this depends on
 
-The two Claude workflows are wired defensively, and the reasons are worth knowing
-before you change them.
+`main` is protected. Required checks: `static`, `host-tests`, `switch-build`,
+`configuration is well-formed`, `merge-gate`. Conversation resolution required.
+**No required approving review** — that would make you the bottleneck on exactly
+the PRs that already did the work. `enforce_admins: false`, so you can always
+merge the enforcement-layer PRs that `merge-gate` deliberately fails.
 
-- **The `@claude` job is gated on author association** (`OWNER`, `MEMBER`,
-  `COLLABORATOR`). It is the job that can write, and anyone can leave a comment.
-  Only people who already have write access get to drive an agent that has it too.
-- **Everything a PR contains is untrusted data.** Titles, descriptions, commit
-  messages and diffs are the *subject* of the work, never a source of
-  instructions. Both jobs carry that framing — the review job in its prompt, the
-  mention job through `--append-system-prompt`, so it layers on top of the
-  triggering comment rather than being replaced by it.
-- **`pull_request`, never `pull_request_target`.** The latter would run a fork's
-  code with write credentials.
-- **The token-bearing eval job does not run on pull requests.** What it evaluates
-  is the instructions an agent loads — `CLAUDE.md`, the skills, the hooks — and it
-  evaluates them by handing them to an agent that has the token in its
-  environment. On a PR trigger those files are whatever the branch says they are,
-  and a hook is plain command execution. So evals run on `push` to `main`, after
-  review; a PR gets the token-less `lint` job.
-- **Actions are pinned to a commit SHA**, with the tag in a trailing comment. A
-  mutable tag is a supply-chain hole: whoever can move `v1` can change what runs.
-- **Both Claude jobs are `continue-on-error`.** They inform; they never block a
-  merge. The consequence is that *silence* is the failure mode — a review that
-  stops happening shows up as missing comments inside a green run, not as a red
-  check. Watch for the absence.
-- **The eval suite warns rather than fails.** A gate that cries wolf gets ignored,
-  and the useful output is the responses in the job summary.
+Auto-merge is enabled at the repository level; without it `gh pr merge --auto`
+errors out.
+
+## The configuration is tested
+
+Every way `.claude/` breaks is silent. A skill whose frontmatter does not parse
+never loads. A hook whose path is wrong never runs. A guard whose pattern stopped
+matching stops blocking. None of it shows in a diff review or turns a build red.
+
+- **`./evals/lint.sh`** — deterministic, free, no model. Also `ctest -R
+  agent.config`, so a worktree sees a break before CI does.
+- **`./evals/run.sh`** — one headless session per case in `evals/cases/`, scoring
+  what the agent actually answers. Needs `CLAUDE_CODE_OAUTH_TOKEN`.
+
+The eval job runs on **push to `main`**, never on a pull request. What it
+evaluates is the instructions an agent loads, and it evaluates them by handing
+them to an agent holding the token — on a PR trigger those files are whatever the
+branch says they are, and a settings hook is plain command execution. A PR gets
+the token-less lint.
 
 ## Working in parallel
 
-At most **three worktrees** at once. The ceiling is not machine capacity; it is
-how many streams one person can review properly. Add a fourth only when review is
-comfortably keeping up with three.
+At most **three worktrees**. The ceiling is not machine capacity; it is how many
+streams one person can review properly. Each is fully isolated — its own ports,
+compose project, RomM database and `build/`. Only the immutable, expensive things
+are shared (`.cache/roms`, `.cache/ccache`), so no agent can corrupt another's
+fixtures.
 
-Each worktree is fully isolated: its own ports, its own compose project, its own
-RomM database, its own `build/`. Only the immutable, expensive things are shared
-(`.cache/roms`, `.cache/ccache`). No agent can corrupt another's fixtures.
+Removing a worktree from the **Orca UI** runs the teardown hook. `orca worktree
+rm` does **not** unless you pass `--run-hooks` — which is why `fleet.sh` always
+does. Sweep anything left behind with `./scripts/orca/reap.sh --yes`.
 
-Tasks that touch the same files run in one worktree, one after another. A
-committed plan is the earliest point at which a collision between two branches is
-visible, which is one of the reasons the plan is a file.
-
-Removing a worktree from the **Orca UI** runs the teardown hook. Removing it with
-`orca worktree rm` does **not** unless you pass `--run-hooks`, and the stack it
-leaves behind restarts `unless-stopped` and holds two ports forever. Either pass
-the flag or sweep afterwards with `./scripts/orca/reap.sh --yes`.
-
-## What to check when the loop stalls
+## When the loop stalls
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Worktree provisioned, agent idle, nothing in the composer | Orca drafts the issue prompt instead of sending it | `./scripts/orca/agent-autostart.sh` — the `--watch` form is started by `setup.sh` |
-| The agent started from a bare issue URL and invented the scope | Orca will not run an `orca.yaml` `issueCommand` it has not been trusted with | Trust `orca.yaml` in Orca's repository-hooks settings. `agent-autostart.sh` completes the draft anyway |
-| Every hook says "this worktree has no linked issue" | the `orca` CLI on `PATH` cannot find `Orca.app` | nothing — the hooks probe the wrapper and fall back to the app's own binary. If it persists, `orca skills get orca-cli` and check the install |
+| `fleet.sh run` opens nothing | the stop file is set | `./scripts/orca/fleet.sh resume` |
+| `fleet.sh status` shows no next issue | everything `ready` is already in flight | merge something, or file work |
+| Worktree provisioned, agent idle, nothing in the composer | Orca drafts the issue prompt instead of sending it | `./scripts/orca/agent-autostart.sh` — `setup.sh` starts the `--watch` form |
+| Every hook says "this worktree has no linked issue" | the `orca` CLI on `PATH` cannot find `Orca.app` | nothing — the hooks probe it and fall back. If it persists: `sudo chmod -h 755 /usr/local/bin/orca` |
+| `git push` refused, "nothing leaves one of those unreviewed" | the local review is not recorded for this commit | run both passes, then `./scripts/orca/record-review.sh` |
+| `await-review.sh` times out | the review job never ran | `gh run list`; check `CLAUDE_CODE_OAUTH_TOKEN` is a repo secret |
+| `merge-gate` red on a PR that looks fine | usually the body is missing a review section, or the review predates the last push | read the check's output; it says which of the five |
+| A PR sits queued and never merges | a required check never reported | `gh pr checks <n>` |
 | `ctest` reports `rig.smoke` **Skipped** | RomM is not running for this worktree | `./scripts/orca/compose.sh up -d` |
-| The whole suite fails on connection errors | the fixture never provisioned | re-run `./scripts/orca/setup.sh`; read `.orca/agent-autostart.log` and the `romm` tab |
-| An agent is waiting for permission on something safe | auto mode is not on for that session | check `permissions.defaultMode` in `.claude/settings.json`, or start it with `claude --permission-mode auto` |

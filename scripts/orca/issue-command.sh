@@ -60,9 +60,9 @@ of work, Risks, Proof. The bar is that someone who never saw this conversation
 could implement it from the plan alone. It goes in the PR body under `## Plan`,
 not in a file.
 
-**2. Build it, test-first where the issue is a bug.** For a bug fix, reproduce it
-as a failing test, watch it fail for the reason you expect, commit that test, and
-only then fix the code -- `/mattpocock-skills:tdd` is the loop for this.
+**2. Build it, test-first where the issue is a bug.** Reproduce the bug as a
+failing test, watch it fail for the reason you expect, commit that test, and only
+then fix the code -- `/mattpocock-skills:tdd` is that loop.
 `ctest --test-dir build --output-on-failure` green, with a test that would have
 failed before your change. Run it and read the output.
 
@@ -72,18 +72,22 @@ because they look for different things and this machine has the time:
     /code-review high                  # defects: correctness, efficiency, reuse
     /mattpocock-skills:code-review     # conformance: standards, and spec-vs-diff
 
-REVIEW.md is the policy: three passes, Important before Nit, at most five nits,
-and a list of what not to report. Fix what is real. Re-run the tests. Then:
+REVIEW.md is the policy. Fix what is real, re-run the tests, then:
 
     ./scripts/orca/record-review.sh findings.md
 
 Until that marker exists for the exact commit you are pushing, the guard hook
-refuses `git push` and `gh pr create` from this worktree. That is deliberate: a
-PR from the fleet arrives already reviewed or it does not arrive.
+refuses `git push` and `gh pr create` here. A PR from the fleet arrives already
+reviewed or it does not arrive.
 
-**4. Push and open the PR.** Body carries `## Plan`, both sets of findings and
-what you did about them, any issue you edited and why, and `Closes #__ISSUE__` --
-a workflow reads that line to unblock dependent issues, so the wording matters.
+**4. Push and open the PR.** The body must carry `## Plan`, BOTH sets of findings
+and what you did about them, any issue you edited and why, and `Closes #__ISSUE__`.
+The `merge-gate` check reads that body: it looks for the words `/code-review` and
+`mattpocock-skills:code-review`, and without them the PR cannot merge. Then tell
+the Orca board where the work is:
+
+    orca worktree set --worktree active --workspace-status in-review \
+      --comment "#__ISSUE__: PR #<n>, waiting on review"
 
 **5. Wait for the independent review.** One blocking call, which costs nothing
 while it waits:
@@ -97,10 +101,25 @@ every thread, push, and re-request review. Then:
     ./scripts/orca/review-status.sh
 
 Exit 0 means every thread is resolved and every check is green. Anything else,
-go back to `await-review.sh`. Loop until it says ready.
+go back to `await-review.sh`.
 
-**6. Stop.** Say the PR is waiting on a human and stop. Do not merge it; the hook
-will not let you, and that is the one review control this project has.
+**At most THREE rounds of this.** If a third round still leaves something
+unresolved, stop: comment on the PR saying exactly what is unresolved and why you
+disagree, set the board comment to "#__ISSUE__: needs you -- 3 review rounds", and
+stop. Another lap is not what a disagreement needs.
+
+**6. Ask GitHub to merge it, and stop.**
+
+    gh pr merge <n> --auto --squash
+
+That does NOT merge. It asks GitHub to merge once the required checks pass, and
+`merge-gate` is one of them -- so the rules decide, not you. You may not merge
+directly; the hook will not let you, and that is the one review control this
+project has. Say the PR is queued and stop.
+
+A PR that touches `.claude/` or `.github/workflows/` never auto-merges: those are
+the paths that can disable the checks gating their own PR, and a person merges
+them. `merge-gate` will say so.
 
 At any point, if `~/.rommsync-fleet/STOP` exists, put the work down: say where you
 got to and do nothing further. Nothing can go out while it exists.

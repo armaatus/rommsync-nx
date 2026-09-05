@@ -1,0 +1,64 @@
+name: merge gate
+
+# The one required check that decides whether a PR may merge itself.
+#
+# `gh pr merge --auto` waits on it, so an agent can ask GitHub to merge and only
+# a rule you set decides whether that happens. The decision itself is in
+# .github/scripts/merge_gate.py -- a plain script with its own selftest, kept out
+# of the YAML so it can be run and tested without a pull request.
+#
+# Deliberately cheap: two API calls, no checkout, seconds. It runs on every event
+# that can change the answer, so the check re-evaluates when a review lands, a
+# thread is resolved, a fix is pushed, or the body is edited.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, edited]
+  pull_request_review:
+    types: [submitted, dismissed]
+  pull_request_review_comment:
+    types: [created, deleted]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: merge-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: merge-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Gather
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          NWO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          owner="${NWO%%/*}"; name="${NWO##*/}"
+          gh api --paginate "repos/$NWO/pulls/$PR/files" --jq '.[].filename' >files.txt
+          gh api graphql -F owner="$owner" -F name="$name" -F pr="$PR" -f query='
+            query($owner:String!,$name:String!,$pr:Int!){
+              repository(owner:$owner,name:$name){
+                pullRequest(number:$pr){
+                  body
+                  reviews(last:50){ nodes{ state submittedAt commit{oid} author{login} } }
+                  reviewThreads(first:100){ nodes{ isResolved path line } }
+                }
+              }
+            }' >pr.json
+
+      - name: Decide
+        run: |
+          python3 .github/scripts/merge_gate.py \
+            "${{ github.event.pull_request.head.sha }}" pr.json files.txt
