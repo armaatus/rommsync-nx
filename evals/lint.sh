@@ -238,6 +238,17 @@ PY
   fi
 fi
 
+# `track_progress: true` forces the action into TAG mode, which waits for an
+# @claude trigger phrase. On an automatic review there is none, so the action
+# skips -- and the JOB GOES GREEN while nothing was reviewed. That is the worst
+# shape a failure can take here: merge-gate then blocks every PR on a review
+# that was never submitted, and the check that should have said so is passing.
+if grep -rn "track_progress" .github/workflows/*.yml >/dev/null 2>&1; then
+  fail "a workflow sets track_progress, which forces tag mode; an automatic review then skips silently while its job reports success"
+else
+  ok "no workflow forces tag mode on an automatic review"
+fi
+
 echo "== the merge gate"
 # The one required check `gh pr merge --auto` waits on. Its decision lives in a
 # script rather than in the YAML precisely so it can be tested without a pull

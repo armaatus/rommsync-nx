@@ -100,8 +100,14 @@ jobs:
         if: steps.token.outputs.have_token == 'true'
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          track_progress: true
-          use_sticky_comment: true
+          # No `track_progress`. It forces TAG mode, which waits for an @claude
+          # trigger phrase in the pull request -- there is none on an automatic
+          # review, so the action logged
+          #   Auto-detected mode: tag for event: pull_request
+          #   Action skipped due to workflow validation error
+          # and did nothing, silently, while the job went green. With a `prompt`
+          # and no track_progress it runs the prompt instead, which is what this
+          # job is for.
           # Read-only over the tree. It reviews; it does not fix. `gh pr review`
           # is here because the verdict has to land in the PR's own review state,
           # which is what the worktree on the other side polls.
