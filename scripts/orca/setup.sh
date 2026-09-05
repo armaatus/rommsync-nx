@@ -31,6 +31,15 @@ set -a; . ./.env; set +a
 # created here so nothing later has to check whether it exists.
 mkdir -p "$REPO_ROOT/.orca"
 
+# A git worktree does not inherit initialised submodules from the checkout it
+# was made from, and CI checks out with `submodules: recursive` -- so a worktree
+# whose issue touches overlay/ would otherwise start by finding the dependency
+# absent and reaching for a clone. Harmless and instant when there are none.
+if [ -f .gitmodules ]; then
+  echo "==> initialising submodules"
+  git submodule update --init --recursive
+fi
+
 echo "==> seeding ROM fixtures (shared cache: $ROM_CACHE)"
 ./server/testing/seed.sh
 
