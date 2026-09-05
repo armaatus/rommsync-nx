@@ -558,6 +558,14 @@ JSON
     # happened on PR #80, where the reviewer had already died on "Reached
     # maximum number of turns" four minutes in.
     make_fixture
+    # The script under test goes INTO the fixture, like every other phase here.
+    # await-review.sh derives its own repo root from its location, so running
+    # the checkout's copy makes it cd to the real working tree -- and then
+    # `orca_fleet_stopped` reads the developer's own ~/.rommsync-fleet/STOP. If
+    # that file happens to exist the script exits 3 before it ever reaches the
+    # branch under test, and the failure blames the feature rather than the
+    # fixture. Found in review of this PR.
+    cp "$REPO_ROOT"/scripts/orca/{await-review.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
     stub="$TMPDIR_FIXTURE/stub-bin"
     mkdir -p "$stub"
     cat >"$stub/gh" <<'GHSTUB'
@@ -571,9 +579,11 @@ case "$*" in
 esac
 GHSTUB
     chmod +x "$stub/gh"
-    out="$(cd "$TMPDIR_FIXTURE" && git init -q . 2>/dev/null;
-           PATH="$stub:$PATH" AWAIT_REVIEW_DEADLINE=5 AWAIT_REVIEW_POLL=1 \
-           bash "$REPO_ROOT/scripts/orca/await-review.sh" 80 2>&1)"
+    ( cd "$TMPDIR_FIXTURE" && git init -q . && git commit -q --allow-empty -m fixture ) 2>/dev/null
+    out="$(cd "$TMPDIR_FIXTURE" &&
+           PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$TMPDIR_FIXTURE/fleet" \
+           AWAIT_REVIEW_DEADLINE=5 AWAIT_REVIEW_POLL=1 \
+           bash "$TMPDIR_FIXTURE/scripts/orca/await-review.sh" 80 2>&1)"
     rc=$?
     grep -q "maximum number of turns" <<<"$out" \
       || fail "did not report why the review job failed; got: $out"
@@ -582,11 +592,56 @@ GHSTUB
     echo "PASS: a failed review job is reported at once, not waited out"
     ;;
 
+  fleet_notices_a_stalled_agent)
+    # The other half of this PR, which shipped untested and should not have.
+    # An agent in `waiting` is at a prompt, not working -- the board still reads
+    # `in-progress` and the time-box has hours to run. The fleet has to say so,
+    # once, rather than once per poll.
+    make_fixture
+    cp "$REPO_ROOT"/scripts/orca/{fleet.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    stub="$TMPDIR_FIXTURE/stub-bin"; mkdir -p "$stub"
+    state="$TMPDIR_FIXTURE/fleet"; mkdir -p "$state/worktrees"
+    printf '%s\n' "$TMPDIR_FIXTURE" >"$state/worktrees/29"
+    cat >"$stub/orca" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$TMPDIR_FIXTURE/orca-calls.log"
+case "\$1" in
+  --version) exit 0 ;;
+  worktree)
+    printf '{"ok":true,"result":{"worktrees":[{"path":"$TMPDIR_FIXTURE","linkedIssue":29,"agents":[{"state":"waiting"}]}]}}\n' ;;
+  *) printf '{"ok":true,"result":{}}\n' ;;
+esac
+STUB
+    chmod +x "$stub/orca"
+    : >"$TMPDIR_FIXTURE/orca-calls.log"
+    out="$(PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$state" \
+           bash -c '. '"$TMPDIR_FIXTURE"'/scripts/orca/lib.sh
+                    orca_cli_resolve
+                    STATE_DIR="'"$state"'"; OWNED_DIR="$STATE_DIR/worktrees"
+                    say() { echo "$*"; }
+                    notify() { echo "NOTIFY: $*"; }
+                    orca_json() { local o; o="$(mktemp)"; orca_run_with_deadline 10 "$o" "$ORCA_CLI" "$@" --json; cat "$o"; rm -f "$o"; }
+                    card() { echo "CARD: $*"; }
+                    '"$(sed -n '/^notice_stalled()/,/^}/p' "$TMPDIR_FIXTURE/scripts/orca/fleet.sh")"'
+                    notice_stalled
+                    echo "--- second pass ---"
+                    notice_stalled' 2>&1)"
+    grep -q "waiting for input" <<<"$out" \
+      || fail "the fleet did not notice an agent sitting at a prompt: $out"
+    grep -q "NOTIFY:" <<<"$out" || fail "no notification for a stalled agent: $out"
+    grep -q "CARD:" <<<"$out" || fail "the card was not updated for a stalled agent: $out"
+    # Count the LOG line, not the phrase: the card comment repeats it, so
+    # matching "waiting for input" counts two for a single notice.
+    [ "$(grep -c "in auto mode nothing should be asking" <<<"$out")" -eq 1 ] \
+      || fail "said it more than once; it must be once per stall, not per poll: $out"
+    echo "PASS: a stalled agent is reported once, on the card and in a notification"
+    ;;
+
   *)
     echo "usage: $0 opens|reuses|foreign|no_romm|submits|no_draft|unstable" >&2
     echo "       watch_needs_issue|watch_late_draft|watch_grace|watch_submits|watch_single" >&2
     echo "       watch_bare_url|watch_full_draft_untouched|cli_broken" >&2
-    echo "       await_reports_failed_review" >&2
+    echo "       await_reports_failed_review|fleet_notices_a_stalled_agent" >&2
     exit 2
     ;;
 esac

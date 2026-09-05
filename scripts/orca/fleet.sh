@@ -348,12 +348,16 @@ reap_merged() {
 # when one does, say so once, on the card and in a notification, and let a
 # person decide. The alternative is a worktree that looks busy for three hours.
 notice_stalled() {
-  local f num path state
+  local f num path state listing
+  # ONE listing per poll, matched against every owned worktree -- not one CLI
+  # round-trip per worktree, which is three 30-second-deadline calls a minute
+  # for an answer that arrives in a single response.
+  listing="$(orca_json worktree ps 2>/dev/null)" || return 0
   for f in "$OWNED_DIR"/*; do
     [ -e "$f" ] || continue
     num="$(basename "$f")"; path="$(cat "$f")"
     [ -d "$path" ] || continue
-    state="$(orca_json worktree ps | python3 -c "
+    state="$(printf '%s' "$listing" | python3 -c "
 import json, sys
 try:
     for w in json.load(sys.stdin)['result']['worktrees']:
