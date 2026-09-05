@@ -9,6 +9,11 @@
 // snapshot without the encoder pins a document, and the encoder without the
 // snapshot pins our own opinion.
 //
+// The completion shapes (`SyncCompletePayload`, `SyncSessionSchema`,
+// `SyncCompleteResponse`) are pinned by the same tables, because step 3 is the
+// same kind of body read the same way -- see complete.parse for what the values
+// in them mean.
+//
 // The response shapes (`SyncNegotiateResponse`, `SyncOperationSchema`) are
 // pinned here too, against the same tables, because they are the same kind of
 // drift: a field the snapshot grows is a decision the server started making that
@@ -94,6 +99,50 @@ constexpr FieldSpec kPlanFields[] = {
     {"total_download", "integer", true, false},
     {"total_conflict", "integer", true, false},
     {"total_no_op", "integer", true, false},
+};
+
+/// `SyncCompletePayload`, the body step 3 sends (M2-6).
+///
+/// Not one field is in the schema's `required` set -- pydantic defaults both
+/// counts to `0` and leaves `play_sessions` optional -- which is precisely why
+/// the encoder sends all three explicitly. A completion that omitted the counts
+/// would be accepted and recorded as a tick that did nothing.
+constexpr FieldSpec kCompletePayloadFields[] = {
+    {"operations_completed", "integer", false, false},
+    {"operations_failed", "integer", false, false},
+    {"play_sessions", "array", false, true},
+};
+
+/// `SyncSessionSchema`, the session the completion answers with.
+///
+/// All twelve are read by `ParseCompleteResponse`, not the six a caller looks
+/// at, and all twelve strictly -- including the two this table marks *not*
+/// required. 5.2.0 emits every one of them on every response
+/// (`captures/sync-complete.json`), so a server that stopped sending one is a
+/// change worth a named error rather than a field that silently defaulted. This
+/// table pins what the snapshot *declares*; the strictness is the reader's
+/// decision and is argued in sync.hpp.
+constexpr FieldSpec kSessionFields[] = {
+    {"id", "integer", true, false},
+    {"device_id", "string", true, false},
+    {"user_id", "integer", true, false},
+    {"status", "string", true, false},
+    {"initiated_at", "string", true, false},
+    {"completed_at", "string", false, true},
+    {"operations_planned", "integer", true, false},
+    {"operations_completed", "integer", true, false},
+    {"operations_failed", "integer", true, false},
+    {"error_message", "string", false, true},
+    {"created_at", "string", true, false},
+    {"updated_at", "string", true, false},
+};
+
+/// `SyncCompleteResponse`. Both fields are `$ref`s rather than scalars, so their
+/// declared type is empty here and the references themselves are pinned below --
+/// the same two-step `saves[]` and `operations[]` get.
+constexpr FieldSpec kCompleteResponseFields[] = {
+    {"session", "", true, false},
+    {"play_session_ingest", "", false, true},
 };
 
 /// The four actions, in the schema's own order. `no_op` carries the underscore;
@@ -220,6 +269,11 @@ void SnapshotPin(checks::Checks& c) {
   PinSchema(c, document.value, "SyncOperationSchema", kOperationFields,
             std::size(kOperationFields));
   PinSchema(c, document.value, "SyncNegotiateResponse", kPlanFields, std::size(kPlanFields));
+  PinSchema(c, document.value, "SyncCompletePayload", kCompletePayloadFields,
+            std::size(kCompletePayloadFields));
+  PinSchema(c, document.value, "SyncSessionSchema", kSessionFields, std::size(kSessionFields));
+  PinSchema(c, document.value, "SyncCompleteResponse", kCompleteResponseFields,
+            std::size(kCompleteResponseFields));
 
   // `saves[]` is what this issue is about: entries are ClientSaveState, not some
   // other schema that happens to look like it.
@@ -251,6 +305,41 @@ void SnapshotPin(checks::Checks& c) {
   c.ExpectEq(entry_ref != nullptr ? entry_ref->string() : std::string(),
              std::string("#/components/schemas/SyncOperationSchema"),
              "operations[] element schema");
+
+  // `session` is a SyncSessionSchema and not something that merely looks like
+  // one, which is the clause `saves[]` and `operations[]` each get above. The
+  // counts this client reads are on that schema and nowhere else.
+  const json::Value* completion = Schema(document.value, "SyncCompleteResponse");
+  const json::Value* completion_properties =
+      completion != nullptr ? completion->Find("properties") : nullptr;
+  const json::Value* session =
+      completion_properties != nullptr ? completion_properties->Find("session") : nullptr;
+  const json::Value* session_ref = session != nullptr ? session->Find("$ref") : nullptr;
+  c.ExpectEq(session_ref != nullptr ? session_ref->string() : std::string(),
+             std::string("#/components/schemas/SyncSessionSchema"), "session schema");
+
+  // And `play_sessions` on the request is what M6 will fill; this client sends
+  // `[]`, so the only thing pinned here is that the array is of the schema M6
+  // will have to build rather than of something else.
+  const json::Value* complete_payload = Schema(document.value, "SyncCompletePayload");
+  const json::Value* payload_properties =
+      complete_payload != nullptr ? complete_payload->Find("properties") : nullptr;
+  const json::Value* play_sessions =
+      payload_properties != nullptr ? payload_properties->Find("play_sessions") : nullptr;
+  const json::Value* play_any_of =
+      play_sessions != nullptr ? play_sessions->Find("anyOf") : nullptr;
+  std::string play_ref;
+  if (play_any_of != nullptr) {
+    for (const json::Value& branch : play_any_of->elements()) {
+      const json::Value* items = branch.Find("items");
+      const json::Value* ref = items != nullptr ? items->Find("$ref") : nullptr;
+      if (ref != nullptr) {
+        play_ref = ref->string();
+      }
+    }
+  }
+  c.ExpectEq(play_ref, std::string("#/components/schemas/SyncPlaySessionEntry"),
+             "play_sessions[] element schema");
 
   // The `action` enum, which is the one field in the response whose *values* the
   // snapshot pins. An action this client does not know is downgraded to `no_op`

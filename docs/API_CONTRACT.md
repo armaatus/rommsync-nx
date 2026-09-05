@@ -393,6 +393,52 @@ empty `operations` array.
 *work*, so a plan of nothing but `no_op` is planned `0` — do not treat
 `operations_completed > operations_planned` as an error.
 
+**Verified — completing a session twice is a `400`, not a no-op.** The second
+`POST .../complete` for the same id answers
+`400 {"detail":"Session is already COMPLETED"}`. That is on the ordinary path
+rather than an exotic one: every network call retries with backoff, so a first
+attempt that reached RomM before the connection died makes the *second* attempt
+land here — and it means the accounting succeeded, which is the opposite of what
+a bare "the server refused the body" would say. `sync::CompleteError` therefore
+carries `kAlreadyCompleted` for it, separately from `kRejected`.
+
+**Verified — completing a session another negotiation cancelled is also a
+`400`, with a different detail: `{"detail":"Session is already CANCELLED"}`.**
+This is the *reachable* half of the pair. Each negotiate cancels the device's
+previous `IN_PROGRESS` session (above), so a tick that gave up on one
+negotiation and made another is completing a session RomM has already ended. It
+says the opposite of the `COMPLETED` detail about the accounting — those counts
+were never recorded and never will be — so `sync::CompleteError` carries
+`kSuperseded` for it, apart from both `kAlreadyCompleted` and `kRejected`.
+Nothing about the body is wrong; the answer is the next tick's own negotiation.
+
+**Verified — an unknown session id is a `404`
+`{"detail":"Sync session with ID N not found"}`.** A session RomM *cancelled*
+still exists and answers the `400` above, so reaching this means an id that was
+never a session — or a server that is not RomM. The client gates on the detail
+rather than on the status for that second reason, the same one the device `404`
+is gated on: a `server_url` pointing at something which is not this RomM answers
+`404` too, and FastAPI's own is `{"detail":"Not Found"}`.
+
+**`SyncSessionSchema` has twelve fields, not the six a completion is about.**
+`user_id`, `initiated_at`, `completed_at`, `created_at` and `updated_at` are on
+it as well. Ten of the twelve are declared required; `completed_at` and
+`error_message` are not, and the client reads them strictly anyway — the same
+stance it takes on the five optional fields of a negotiate operation, because
+5.2.0 emits all twelve on every response and a server that stopped would be a
+change worth a named error. `completed_at` is the one that says the session
+actually closed.
+
+**Verified — a save the client reports and is already in sync with is answered
+with an explicit `no_op`, not with an absence.** Reporting a save whose digest
+matches the server's comes back as an operation with
+`reason: "Content is identical"`, which is what `captures/sync-negotiate-no-op.json`
+holds. What negotiate leaves out of a plan is a save the client did not mention
+in `saves[]` — so "it does not report saves the device is already in sync with"
+above is about an *empty* request, not about a save that was reported. A client
+committing a baseline can therefore rely on every reported save carrying an
+operation.
+
 ## Save & state I/O (used while executing a plan)
 
 | Method | Path | Notes |
@@ -487,22 +533,32 @@ cleanly and early cannot be told from a complete one, because RomM's own
 `Content-Length` is what the shortening removed. That is the shape
 `server/testing/fault_proxy.py`'s `truncate` mode produces on purpose.
 
-**An upload needs `overwrite=true`, and the flag does two things.** With a
-`device_id` and a `slot`, `POST /api/saves` answers `409 {"detail": "Slot has a
+**An upload needs `overwrite=true`, and the flag does exactly one thing.** With
+a `device_id` and a `slot`, `POST /api/saves` answers `409 {"detail": "Slot has a
 newer save since your last sync"}` when this device has no sync row for the
 slot's current save — which is exactly the state negotiate calls `Client save is
-newer (no sync history)` and tells the client to upload. `execute.occupied`
-arranges that state and asserts the 409 on the flagless request, then asserts
-the same upload succeeds with the flag.
+newer (no sync history)` and tells the client to upload. The flag clears that
+check and nothing else; it is read well before the row is looked up.
+`execute.occupied` arranges the state and asserts the 409 on the flagless
+request, then asserts the same upload succeeds with the flag. A previous
+revision said the flag did a *second* thing — see below; it does not.
 
-**Verified — with the flag, an upload into an occupied slot replaces the row in
-place.** Same `id`, same stored `file_name` (the datetime tag from the *first*
-ingest is kept), new bytes, `file_size_bytes` and `updated_at`. Without the flag
-the same post creates a **second** row with a fresh tag, when the device's sync
-row is current enough not to be refused. Earlier revisions of this page and of
-[SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#step-2--execute-the-plan) said a second POST
-was always a second row, "`overwrite=true` included"; it is not, and the
-difference decides whether a slot accretes a row per tick.
+**Verified — whether an upload replaces a row or adds one is decided by the
+clock, not by the flag.** RomM stamps a slot upload with a second-granularity
+datetime tag and looks the existing row up by that tagged name
+(`_apply_datetime_tag`, `get_save_by_filename`; `endpoints/saves.py` in 5.2.0),
+so a POST lands on the existing row only when it shares the base file name **and
+the wall-clock second** of the ingest that created it. One second later it
+creates a **second** row, `overwrite=true` included. Measured directly: two
+uploads of the same file in one second answered the same `id`; the next, two
+seconds later, answered a new one.
+
+A previous revision of this section claimed the flag "replaces the row in place,
+tag and id included" and that this is what keeps a slot from accreting a row per
+tick. That was a same-second run read as a rule, and it is what made
+`execute.occupied` pass locally and fail in CI (issue #85). **A slot does accrete
+a row per upload**, which is what `autocleanup` / `autocleanup_limit` on this
+endpoint exist for, and which is a reason not to re-post an upload inside a tick.
 `PUT /api/saves/{id}` also moves a row forward, and unlike either POST it takes
 no `slot`, so it is what a test uses to change the server's copy without
 touching a device's history.

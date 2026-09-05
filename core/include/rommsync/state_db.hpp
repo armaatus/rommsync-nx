@@ -40,9 +40,11 @@
 // a field of the wrong type is a named diagnostic rather than a default value
 // that silently means "unchanged".
 //
-// Timestamps are whole Unix seconds, not RFC 3339: the engine can *format* that
-// (`sync::FormatTimestamp`) and has no parser for it, and the comparison the
-// server makes is at second granularity anyway.
+// Timestamps are whole Unix seconds, not RFC 3339. The comparison the server
+// makes is at second granularity anyway, and a number cannot be spelled two
+// ways -- which the string can: this client writes `Z` and RomM writes `+00:00`
+// (`sync::FormatTimestamp` and `sync::ParseTimestamp` read and write both, and
+// the row stores the result rather than the spelling).
 //
 // The write is `io::WriteAtomically` and the read recovers from
 // `io::PreviousPathFor`, the same commit and the same recovery `token.dat`,
@@ -131,6 +133,17 @@ struct SaveRecord {
   /// What the server last said about its own copy. Absent until a sync has
   /// completed for this save, which is the "no sync history" branch M2-8
   /// arbitrates differently (docs/SYNC_PROTOCOL.md).
+  ///
+  /// **After an upload, `server_updated_at` is absent and
+  /// `server_content_hash` is not.** The digest is known -- the server stored
+  /// the bytes this client just sent it -- but the row's new timestamp is the
+  /// server's own clock, and no response the client reads carries it back
+  /// (`sync::OperationResult` keeps the save id and nothing else). It is left
+  /// absent rather than guessed from the local mtime: an absent one costs the
+  /// next arbitration a fallback, a wrong one costs it the answer. Closing that
+  /// means carrying the upload response's `updated_at` up out of
+  /// `sync::ExecutePlan`, which is worth doing when something actually reads
+  /// this field.
   std::optional<sync::Timestamp> server_updated_at;
   std::optional<std::string> server_content_hash;
 };
@@ -255,7 +268,9 @@ struct StoreResult {
 /// silent version of the same failure -- every later boot finds a `state.db`,
 /// throws all of it away, and re-hashes. Better to fail once, loudly, here.
 ///
-/// Writing the baseline at the end of a tick is M2-6's; this owns the format.
+/// Writing the baseline at the end of a tick is `sync::FinishTick`'s
+/// (sync_finish.hpp), which also decides *which* rows a tick may move; this owns
+/// the format.
 StoreResult SaveBaseline(const std::string& path, const Baseline& baseline);
 
 /// Why a file could not be hashed.

@@ -1,5 +1,10 @@
-// Step 1 of the sync loop, both halves: what the client *tells* RomM it has,
-// and the plan RomM sends back.
+// Steps 1 and 3 of the sync loop: what the client *tells* RomM it has, the plan
+// RomM sends back, and the accounting call that closes the session at the end.
+//
+// Steps 1 and 3 share a header because they share the session: `Negotiate` opens
+// one and `CompleteSession` closes it, and nothing between them is here. Step 2
+// -- acting on the plan -- is sync_execute.hpp, and the order the baseline and
+// the completion happen in is sync_finish.hpp.
 //
 // The request side is `SyncNegotiatePayload` and the `ClientSaveState` entries
 // under it (M2-1). The answer side is `Negotiate`, which makes the one call the
@@ -7,6 +12,10 @@
 // read strictly enough to act on -- an `action`, a classified `reason` and the
 // server's own hash and timestamp, per save. Nothing here executes a plan; M2-5
 // owns that.
+//
+// Step 3 is `CompleteSession` and the `SyncSession` it answers with. It is
+// accounting and not a commit: the transfers already happened on the server, so
+// a failed `complete` is a tick reported wrong rather than a tick undone.
 //
 // Every field name below is pinned to
 // server/contract/romm-openapi-5.2.0.json (`ClientSaveState`) and was sent to a
@@ -92,6 +101,27 @@ std::string FormatTimestamp(Timestamp when);
 /// `system_clock::time_point` cannot be relied on to *hold* the upper one: its
 /// tick is implementation-defined, and a nanosecond tick runs out in 2262.
 std::int64_t UnixSeconds(Timestamp when);
+
+/// `2026-09-04T11:36:27+00:00` -> a `Timestamp`, whole seconds. Empty for
+/// anything that is not that shape.
+///
+/// The inverse of `FormatTimestamp`, and it has to read a spelling that
+/// function never writes: this client sends `Z` and RomM sends `+00:00`, so a
+/// reader that only accepted its own spelling would refuse every timestamp the
+/// server ever sends. Both are accepted, the offset is applied, and a missing
+/// one is read as UTC -- which is what RomM stores and what every capture under
+/// server/contract/captures/ carries.
+///
+/// Sub-second digits are dropped *downwards*, the same direction and for the
+/// same reason `FormatTimestamp` drops them: rounding up would claim a copy is
+/// newer than it is.
+///
+/// **`server_updated_at` on a plan is deliberately still carried as text**
+/// (`SyncOperation`) -- nothing in the plan compares it. This exists for the
+/// one place a `Timestamp` is actually required: the `server_updated_at` a
+/// baseline row stores (state_db.hpp), which is a number of seconds and cannot
+/// hold the string.
+std::optional<Timestamp> ParseTimestamp(std::string_view text);
 
 /// The earliest instant a save may claim, one second past the epoch.
 ///
@@ -423,6 +453,13 @@ enum class NegotiateError {
   kNoSuchDevice,     ///< 404 -- the device was deleted in RomM's web UI
   kSyncDisabled,     ///< 400 "Sync is disabled for this device" -- the user's own switch
   kRejected,         ///< another 4xx; a 422 names the field the body got wrong
+
+  /// `CallPolicy::cancel` fired. Neither a failure of the server nor of the
+  /// payload: the call was stopped rather than answered, and nothing after it
+  /// was attempted -- the same thing `OperationOutcome::kCanceled` says one step
+  /// later.
+  kCanceled,
+
   kUnreachable,      ///< the exchange never completed -- offline, stalled, dropped
   kServerError,      ///< 5xx, or the 429/408 a rate limiter or a proxy answers with
   kMalformed,        ///< a 2xx that is not a plan -- truncated, or a shape that moved
@@ -455,8 +492,12 @@ bool ShouldRetry(NegotiateError error);
 /// rejected polls.
 bool NeedsPairing(NegotiateError error);
 
-/// How hard one negotiation tries.
-struct NegotiateOptions {
+/// How hard one call tries.
+///
+/// Shared by the two calls in this header rather than written twice: negotiate
+/// and complete want exactly these five knobs, for exactly the same reasons,
+/// and two copies of them would be two places for a default to drift.
+struct CallPolicy {
   /// Ceiling on a single request. A tick that hangs is a tick that never ends,
   /// and nothing may block boot (CLAUDE.md).
   std::chrono::milliseconds timeout = http::kDefaultTimeout;
@@ -484,7 +525,21 @@ struct NegotiateOptions {
   /// with backoff (CLAUDE.md). The wait happens on the calling thread, which is
   /// a sync tick's worker and never boot.
   std::function<void(std::chrono::milliseconds)> wait;
+
+  /// Optional, not owned; must outlive the call. Passed to every request and
+  /// checked before each retry, so a shutdown ends the call rather than waiting
+  /// out a timeout that has already stopped mattering.
+  ///
+  /// Without one, a tick cancelled at an operation boundary still owes this
+  /// call: three attempts at `timeout` plus the backoff between them, on a link
+  /// that is usually the reason the shutdown happened. `ExecuteOptions::cancel`
+  /// is the same token and the same reasoning one step earlier.
+  const http::CancelToken* cancel = nullptr;
 };
+
+/// The spelling `Negotiate` takes. An alias rather than a struct of its own:
+/// see `CallPolicy`.
+using NegotiateOptions = CallPolicy;
 
 /// A plan, or the reason there isn't one. `plan` is left default-constructed on
 /// failure and must not be used -- check `ok()`.
@@ -522,5 +577,226 @@ struct Negotiation {
 Negotiation Negotiate(http::HttpClient& client, const auth::StoredToken& token,
                       const std::vector<ClientSaveState>& saves,
                       const NegotiateOptions& options = {});
+
+// --- step 3: complete ---------------------------------------------------------
+//
+// The accounting call, and the one place the loop tells RomM what this device
+// actually did. It is deliberately *not* the commit point: the uploads and
+// downloads already happened on the server, so a `complete` that fails is a tick
+// reported wrong, not a tick undone -- see sync_finish.hpp, which owns the order
+// the baseline and this call happen in.
+
+/// What one finished tick reports about itself -- a `SyncCompletePayload`.
+///
+/// `play_sessions` is not here: it belongs to M6 and this client sends the empty
+/// array (`EncodeCompleteRequest`).
+struct CompletionCounts {
+  /// Operations that did what the plan asked, planned `no_op`s included.
+  ///
+  /// **`operations_completed > operations_planned` is normal.** RomM's own
+  /// `operations_planned` counts only the operations that need *work*, so a plan
+  /// of nothing but no-ops is planned `0` and completed however many there were
+  /// (docs/API_CONTRACT.md). Nothing here or on the server treats that as an
+  /// error.
+  int operations_completed = 0;
+
+  /// Operations that did not, which is one more thing than it sounds like:
+  /// a failure, *and* an `action` this build did not understand. See
+  /// `CountsFor` (sync_finish.hpp) for why the second is counted here.
+  int operations_failed = 0;
+};
+
+/// The request body for `POST /api/sync/sessions/{id}/complete`, or a named
+/// error.
+///
+/// Refuses a negative count rather than sending it. Neither field is a number
+/// the server sanity-checks -- it stores what it is told and shows it in a sync
+/// history a user reads -- so a count that went negative upstream would become a
+/// permanent, unexplainable row rather than a bug anyone traces back.
+///
+/// `play_sessions` is sent as `[]` rather than omitted. The schema declares it
+/// `array | null` with no default, and an explicit empty array is the client
+/// saying it tracked none, which is true; M6 is what makes it non-empty.
+Encoded EncodeCompleteRequest(const CompletionCounts& counts);
+
+/// The session row RomM keeps for one negotiate -> execute -> complete pass, as
+/// `SyncSessionSchema` sends it.
+///
+/// All twelve fields are read, not the six a caller is likely to look at, and
+/// all twelve are read strictly -- including `completed_at` and `error_message`,
+/// which are the two the snapshot does *not* list as required.
+///
+/// That is the same stance `ParseNegotiateResponse` takes on the five optional
+/// fields of an operation, for the same reason: 5.2.0 emits every one of them on
+/// every response, as `server/contract/captures/sync-complete.json` shows, so a
+/// server that genuinely stopped sending one is a change worth a named error
+/// rather than a field that silently defaulted. The cost of being wrong is a
+/// tick reported failed whose baseline is on the card anyway (sync_finish.hpp),
+/// which is the cheap direction.
+struct SyncSession {
+  std::int64_t id = 0;
+  std::string device_id;
+  std::int64_t user_id = 0;
+
+  /// **Upper-case** -- `COMPLETED`, `IN_PROGRESS`, `CANCELLED`. Compared as the
+  /// server spells it; a lower-cased comparison matches nothing.
+  std::string status;
+
+  std::string initiated_at;
+
+  /// Null until the session ends, which is exactly the field that says it did.
+  std::optional<std::string> completed_at;
+
+  /// The operations the server decided needed *work*. See
+  /// `CompletionCounts::operations_completed`.
+  std::int64_t operations_planned = 0;
+  std::int64_t operations_completed = 0;
+  std::int64_t operations_failed = 0;
+
+  /// Null on an ordinary completion. RomM writes it when it ends a session for
+  /// a reason of its own.
+  std::optional<std::string> error_message;
+
+  std::string created_at;
+  std::string updated_at;
+};
+
+/// A whole `SyncCompleteResponse`.
+struct SyncCompletion {
+  SyncSession session;
+
+  /// True when the server answered a `play_session_ingest` object rather than
+  /// `null`. This client sends no play sessions, so it should always be false;
+  /// M6 owns the case where it is not, and a `true` here is reported in
+  /// `warnings` rather than parsed into a shape nothing yet uses.
+  bool play_session_ingest = false;
+
+  /// One line per thing the client did not expect: a `status` that is not
+  /// `COMPLETED`, an `error_message` the server attached, a
+  /// `play_session_ingest` for play sessions that were never sent.
+  ///
+  /// None of them is an error. The accounting call succeeded; these are things
+  /// worth a log line, and `core/` has no logger (docs/ARCHITECTURE.md), so they
+  /// are handed up the way `SyncPlan::warnings` are.
+  std::vector<std::string> warnings;
+};
+
+/// Parse a 200 body from `POST /api/sync/sessions/{id}/complete`.
+///
+/// Whole or not at all, the same rule the plan is read by. A truncated body is a
+/// named error rather than a half-read session: a session whose counts are the
+/// ones that happened to arrive is worse than no session at all, because it
+/// reads exactly like one that was reported correctly.
+auth::Parsed<SyncCompletion> ParseCompleteResponse(std::string_view body);
+
+/// Why a session was not completed.
+///
+/// The same shape as `NegotiateError` and split on the same question -- what a
+/// caller would *do* about it -- rather than on the status code.
+enum class CompleteError {
+  kNone,
+  kNotRegistered,   ///< the token names no server or no device
+  kNoSession,       ///< there is no session id to complete; nothing was sent
+  kUnauthorized,    ///< 401 -- revoked. `expires_at` is null, so nothing to refresh
+  kForbidden,       ///< 403 -- a scope this pairing was not granted
+
+  /// 404 `Sync session with ID {id} not found` -- RomM has no such session.
+  ///
+  /// Gated on the detail for the reason the negotiate 404 is: a `server_url`
+  /// that points at something which is not this RomM answers 404 too, and
+  /// FastAPI's own is `{"detail":"Not Found"}`.
+  ///
+  /// **This is not what a stale session id looks like** -- a session RomM
+  /// cancelled still exists, and answers `kSuperseded` below. Reaching here
+  /// means an id that was never a session, or a server that is not RomM.
+  kNoSuchSession,
+
+  /// 400 `Session is already COMPLETED` -- this session has been accounted for.
+  ///
+  /// **This is what a successful retry looks like.** `CompleteSession` retries a
+  /// 5xx or a dropped exchange, and a request that reached RomM before the
+  /// connection died has already written the history row; the second attempt is
+  /// then refused by the server precisely because the first one worked. Kept
+  /// apart from `kRejected` so a caller can say "the accounting is done" rather
+  /// than "the server refused the body", which is the opposite of what happened.
+  ///
+  /// It is still not `ok()`: there is no session in the answer, and inventing
+  /// one would be reporting counts nothing confirmed.
+  kAlreadyCompleted,
+
+  /// 400 `Session is already CANCELLED` -- another negotiation took this device.
+  ///
+  /// The other half of the same 400, and the reachable one: each
+  /// `POST /api/sync/negotiate` cancels the device's previous `IN_PROGRESS`
+  /// session (docs/API_CONTRACT.md), so a tick that gave up on one negotiation
+  /// and made another is completing a session RomM has already ended. Verified
+  /// against the live 5.2.0.
+  ///
+  /// Apart from `kAlreadyCompleted` because the two say opposite things about
+  /// the accounting: that one means the counts were recorded, this one means
+  /// they never will be. Apart from `kRejected` because nothing is wrong with
+  /// the body -- retrying it, editing it or re-pairing all miss the point, and
+  /// the answer is the next tick's own negotiation.
+  kSuperseded,
+
+  kRejected,        ///< another 4xx; a 422 names the field the body got wrong
+  kUnusablePayload, ///< the counts could not be sent faithfully; nothing was sent
+
+  /// `CallPolicy::cancel` fired. Neither a failure of the server nor of the
+  /// body: the call was stopped rather than answered, which is what a shutdown
+  /// looks like, and the session it would have closed is one the next negotiate
+  /// cancels anyway.
+  kCanceled,
+
+  kUnreachable,     ///< the exchange never completed -- offline, stalled, dropped
+  kServerError,     ///< 5xx, or the 429/408 a rate limiter or a proxy answers with
+  kMalformed,       ///< a 2xx that is not a completion -- truncated, or a shape that moved
+};
+
+/// Stable, log-friendly name. Never null.
+const char* ToString(CompleteError error);
+
+/// Whether the same call could succeed later. The same two members
+/// `ShouldRetry(NegotiateError)` picks, for the same reason.
+///
+/// **Retrying this is cheap and losing it is not.** A `complete` that never
+/// lands leaves the session `IN_PROGRESS`, which the next negotiate cancels --
+/// so the cost is a session RomM shows as cancelled in a history a user reads,
+/// not a corrupted anything.
+bool ShouldRetry(CompleteError error);
+
+/// The spelling `CompleteSession` takes. An alias rather than a struct of its
+/// own: see `CallPolicy`.
+using CompleteOptions = CallPolicy;
+
+/// A completed session, or the reason there isn't one. `value` is left
+/// default-constructed on failure and must not be used -- check `ok()`.
+struct Completion {
+  SyncCompletion value{};
+  CompleteError error = CompleteError::kNone;
+
+  /// For logs and for the overlay. Names the status and the reason, never the
+  /// token.
+  std::string message;
+
+  int attempts = 0;
+  std::chrono::milliseconds waited{0};
+
+  bool ok() const { return error == CompleteError::kNone; }
+};
+
+/// `POST /api/sync/sessions/{session_id}/complete`, and the session it answers
+/// with.
+///
+/// The counts are the ones the *execution* produced, not the plan's totals:
+/// `sync::CountsFor` (sync_finish.hpp) derives them from an `ExecutionReport`.
+///
+/// **Only the last session id is worth completing.** Each negotiate cancels the
+/// device's previous `IN_PROGRESS` session, verified against a live 5.2.0
+/// (docs/API_CONTRACT.md), so a tick that gave up on one negotiation and made
+/// another must complete the second id.
+Completion CompleteSession(http::HttpClient& client, const auth::StoredToken& token,
+                           std::int64_t session_id, const CompletionCounts& counts,
+                           const CompleteOptions& options = {});
 
 }  // namespace rommsync::sync

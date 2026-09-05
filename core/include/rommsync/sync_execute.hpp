@@ -35,11 +35,15 @@
 //     writes this device's sync row; skip it and every later negotiation for
 //     that save stays in the no-history branch.
 //
-// There is no retry inside a tick, deliberately, and not for the reason the
-// pinned docs used to give. A re-posted upload does *not* duplicate the save:
-// `overwrite=true` replaces the slot's row in place, tag and id included
-// (`execute.occupied` verifies it against a live 5.2.0). The reason is that the
-// plan describes a state the server may have moved on from, and the arbiter of
+// There is no retry inside a tick, deliberately, and for two reasons that have
+// both been written down wrong at some point. **A re-posted upload does
+// duplicate the save**, `overwrite=true` included: RomM matches an existing
+// slot row by a second-granularity datetime tag it computes at ingest, so a
+// retry a second later gets a name that matches nothing and becomes a second
+// row (docs/API_CONTRACT.md, verified against a live 5.2.0; the revision of this
+// comment that said otherwise was reading a same-second run, which is why
+// `execute.occupied` passed on a laptop and failed in CI -- issue #85). And the
+// plan describes a state the server may have moved on from, so the arbiter of
 // that is a fresh negotiation rather than this client -- which is what
 // docs/SYNC_PROTOCOL.md's failure rules already say: count the operation
 // failed, leave that save alone, let the next tick negotiate again. M2-7 owns

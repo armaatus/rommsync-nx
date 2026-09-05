@@ -3,11 +3,60 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
+#include <optional>
 #include <string>
 #include <string_view>
 
 namespace rommsync::sync {
 namespace {
+
+/// `count` decimal digits starting at `at`, or empty if they are not all
+/// digits. **Consumes them**: `at` is advanced past them on success and left
+/// where it was otherwise, so a caller reads the fields in order.
+///
+/// Written out rather than left to `sscanf`, which accepts leading spaces and a
+/// sign and would read `2026-9-4T1:2:3` as a date -- a shape RomM never sends,
+/// and one whose acceptance would let a body that is not a timestamp become an
+/// instant a save is arbitrated on.
+std::optional<int> TakeDigits(std::string_view text, std::size_t& at, std::size_t count) {
+  if (at + count > text.size()) {
+    return std::nullopt;
+  }
+  int value = 0;
+  for (std::size_t index = 0; index < count; ++index) {
+    const char character = text[at + index];
+    if (character < '0' || character > '9') {
+      return std::nullopt;
+    }
+    value = value * 10 + (character - '0');
+  }
+  at += count;
+  return value;
+}
+
+/// Howard Hinnant's days_from_civil, the exact inverse of the civil_from_days
+/// spelled out in `FormatTimestamp`. Both are here rather than in the C library
+/// for the same reason: its UTC conversion is not available in the same shape on
+/// Horizon and on the host, and its thread-safe spelling differs again.
+std::int64_t DaysFromCivil(std::int64_t year, std::int64_t month, std::int64_t day) {
+  const std::int64_t shifted = year - (month <= 2 ? 1 : 0);
+  const std::int64_t era = (shifted >= 0 ? shifted : shifted - 399) / 400;
+  const std::int64_t year_of_era = shifted - era * 400;                             // [0, 399]
+  const std::int64_t day_of_year = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+  const std::int64_t day_of_era =
+      year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+  return era * 146097 + day_of_era - 719468;
+}
+
+/// The days in `month` of `year`, so 2026-02-30 is refused rather than rolled
+/// forward into March. A date that rolls is a save dated a day it was not.
+int DaysInMonth(int year, int month) {
+  constexpr int kLengths[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (month == 2 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0)) {
+    return 29;
+  }
+  return kLengths[month - 1];
+}
 
 json::Error Fail(std::string_view field, std::string message) {
   json::Error error;
@@ -93,6 +142,92 @@ bool IsSingleFileName(std::string_view value) {
 
 std::int64_t UnixSeconds(Timestamp when) {
   return std::chrono::floor<std::chrono::seconds>(when.time_since_epoch()).count();
+}
+
+std::optional<Timestamp> ParseTimestamp(std::string_view text) {
+  std::size_t at = 0;
+  const std::optional<int> year = TakeDigits(text, at, 4);
+  if (!year.has_value() || at >= text.size() || text[at++] != '-') {
+    return std::nullopt;
+  }
+  const std::optional<int> month = TakeDigits(text, at, 2);
+  if (!month.has_value() || at >= text.size() || text[at++] != '-') {
+    return std::nullopt;
+  }
+  const std::optional<int> day = TakeDigits(text, at, 2);
+  if (!day.has_value() || at >= text.size() || (text[at] != 'T' && text[at] != ' ')) {
+    return std::nullopt;
+  }
+  ++at;
+  const std::optional<int> hour = TakeDigits(text, at, 2);
+  if (!hour.has_value() || at >= text.size() || text[at++] != ':') {
+    return std::nullopt;
+  }
+  const std::optional<int> minute = TakeDigits(text, at, 2);
+  if (!minute.has_value() || at >= text.size() || text[at++] != ':') {
+    return std::nullopt;
+  }
+  const std::optional<int> second = TakeDigits(text, at, 2);
+  if (!second.has_value()) {
+    return std::nullopt;
+  }
+
+  // The fraction is dropped rather than rounded, which is `FormatTimestamp`'s
+  // rule read the other way: a copy stamped :27.9 is not newer than one stamped
+  // :27, and rounding it up would hand it an arbitration it should have lost.
+  if (at < text.size() && text[at] == '.') {
+    ++at;
+    const std::size_t digits = at;
+    while (at < text.size() && text[at] >= '0' && text[at] <= '9') {
+      ++at;
+    }
+    if (at == digits) {
+      return std::nullopt;  // a dot with no fraction after it
+    }
+  }
+
+  // `Z`, `+00:00`, or nothing at all. RomM sends the second, this client writes
+  // the first, and a naive datetime -- which pydantic can emit -- is UTC,
+  // because that is what RomM stores.
+  std::int64_t offset_seconds = 0;
+  if (at < text.size() && (text[at] == 'Z' || text[at] == 'z')) {
+    ++at;
+  } else if (at < text.size() && (text[at] == '+' || text[at] == '-')) {
+    const int sign = text[at] == '-' ? -1 : 1;
+    ++at;
+    const std::optional<int> offset_hours = TakeDigits(text, at, 2);
+    if (!offset_hours.has_value() || at >= text.size() || text[at++] != ':') {
+      return std::nullopt;
+    }
+    const std::optional<int> offset_minutes = TakeDigits(text, at, 2);
+    if (!offset_minutes.has_value() || *offset_hours > 23 || *offset_minutes > 59) {
+      return std::nullopt;
+    }
+    offset_seconds = sign * (*offset_hours * 3600 + *offset_minutes * 60);
+  }
+  if (at != text.size()) {
+    return std::nullopt;  // trailing anything is a shape this is not reading
+  }
+
+  // A leap second is refused rather than rolled into the next minute, on the same
+  // rule `DaysInMonth` applies to 2026-02-30: a value that rolls is an instant
+  // the string did not name. RomM stores datetimes and never writes one.
+  if (*month < 1 || *month > 12 || *day < 1 || *day > DaysInMonth(*year, *month) || *hour > 23 ||
+      *minute > 59 || *second > 59) {
+    return std::nullopt;
+  }
+
+  const std::int64_t seconds =
+      DaysFromCivil(*year, *month, *day) * 86400 + *hour * 3600 + *minute * 60 + *second -
+      offset_seconds;
+  // The same window `Validate` holds a save's own mtime to. An instant outside
+  // it is one no baseline row may store and no save may claim, so returning it
+  // would only move the refusal somewhere with less to say about which save it
+  // was.
+  if (seconds < kMinTimestampSeconds || seconds > kMaxTimestampSeconds) {
+    return std::nullopt;
+  }
+  return Timestamp{} + std::chrono::seconds{seconds};
 }
 
 std::string FormatTimestamp(Timestamp when) {
