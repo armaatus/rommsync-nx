@@ -270,6 +270,34 @@ void ReaderReportsTheField(checks::Checks& c) {
              "a nullable field refuses an embedded NUL too");
   }
   {
+    // `integer | null`, which exists for a negotiate operation's `save_id`:
+    // `null` is a save the server does not have yet, and a `0` standing in for
+    // it would be a save id that names no save.
+    json::Reader reader(doc.value, "fixture");
+    std::optional<std::int64_t> present;
+    std::optional<std::int64_t> absent;
+    c.Expect(reader.RequiredNullable("count", &present), "a nullable integer reads");
+    c.Expect(present.has_value() && *present == 3, "...and carries the value");
+    c.Expect(reader.RequiredNullable("note", &absent), "a null nullable integer is empty");
+    c.Expect(!absent.has_value(), "...rather than a zero");
+    c.Expect(reader.ok(), "neither is an error: " + reader.error().Describe());
+  }
+  {
+    const Case kNullableInteger[] = {
+        {"absent", "absent", "a missing nullable integer"},
+        {"name", "name", "a string where a nullable integer belongs"},
+        {"fraction", "fraction", "a fraction where a whole number belongs"},
+        {"tags", "tags", "an array where a nullable integer belongs"},
+    };
+    for (const Case& bad : kNullableInteger) {
+      json::Reader reader(doc.value, "fixture");
+      std::optional<std::int64_t> out = 7;
+      c.Expect(!reader.RequiredNullable(bad.key, &out), std::string("refuses ") + bad.what);
+      c.ExpectEq(reader.error().field, std::string(bad.field),
+                 std::string("names the field, for ") + bad.what);
+    }
+  }
+  {
     // The first failure is the one reported: a reader that kept overwriting
     // would name whichever field happened to be read last.
     json::Reader reader(doc.value, "fixture");

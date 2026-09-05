@@ -671,4 +671,23 @@ bool Reader::RequiredNullable(std::string_view key, std::optional<std::string>* 
   return true;
 }
 
+bool Reader::RequiredNullable(std::string_view key, std::optional<std::int64_t>* out) {
+  const Value* member = Lookup(key);
+  if (member == nullptr) {
+    return false;
+  }
+  if (member->is_null()) {
+    out->reset();
+    return true;
+  }
+  if (!member->is_number()) {
+    return Fail(key, std::string("expected a number or null, got ") + ToString(member->type()));
+  }
+  if (!member->is_integer()) {
+    return Fail(key, "expected a whole number that fits 64 bits, or null");
+  }
+  *out = member->integer();
+  return true;
+}
+
 }  // namespace rommsync::json

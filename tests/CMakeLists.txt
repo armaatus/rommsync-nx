@@ -54,6 +54,18 @@ target_compile_definitions(test_sync_payload PRIVATE
   ROMMSYNC_OPENAPI="${CMAKE_SOURCE_DIR}/server/contract/romm-openapi-5.2.0.json")
 add_test(NAME sync.payload COMMAND test_sync_payload)
 
+# The other direction: the plan RomM sends back, against the captured responses
+# in server/contract/captures/ rather than against a second copy of the field
+# names. The reason table is the part no capture can pin -- only five of the
+# thirteen strings 5.2.0 emits appear in one -- so it is checked against the
+# table in docs/API_CONTRACT.md instead. No network, so it never skips.
+add_executable(test_sync_plan test_sync_plan.cpp)
+target_link_libraries(test_sync_plan PRIVATE rommsync::core)
+target_include_directories(test_sync_plan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_sync_plan PRIVATE
+  ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures")
+add_test(NAME sync.plan COMMAND test_sync_plan)
+
 # token.dat. Pure filesystem and parsing, so this never skips either -- and the
 # guarantee it exists for (a failed write costs the new token, never the working
 # one) is checkable with no server at all.
@@ -302,6 +314,7 @@ endforeach()
 # entry per scenario, so a red run names the behaviour.
 add_executable(test_sync_negotiate test_sync_negotiate.cpp)
 target_link_libraries(test_sync_negotiate PRIVATE rommsync::host)
+target_include_directories(test_sync_negotiate PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(test_sync_negotiate PRIVATE
   ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
   ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
@@ -311,6 +324,12 @@ set(SYNC_SCENARIOS
   accepted    # a live 5.2.0 takes the encoded body and echoes the entry back
   required    # a renamed REQUIRED field is a 422 that names it
   understood  # a renamed OPTIONAL one is a silent 200 with a different plan
+  negotiates  # sync::Negotiate end to end: a session and an operation, typed
+  discovers   # an empty `saves` is how a client learns what it is missing
+  revoked     # 401 is a revoked token, not a parse failure, and nothing changes
+  truncated   # a clean short body is a named json error and no plan
+  stalled     # a stall times out and is retried, with the backoff doubling
+  refused     # 404 device-gone, 400 sync-disabled, and the 404 that is neither
 )
 
 foreach(scenario IN LISTS SYNC_SCENARIOS)

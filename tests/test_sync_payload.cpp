@@ -1,13 +1,20 @@
-// `ClientSaveState` against the PINNED SNAPSHOT, in both directions.
+// The negotiate SHAPES against the pinned snapshot, in both directions.
 //
-// One table below (`kSaveFields`) says what the seven fields are called, which
-// are required, and which may be null. It is checked against
+// One table below (`kSaveFields`) says what `ClientSaveState`'s seven fields are
+// called, which are required, and which may be null. It is checked against
 // server/contract/romm-openapi-5.2.0.json -- so a RomM that renames, re-types or
 // re-requires a field goes red the moment the snapshot is refreshed -- and then
 // against a body `EncodeNegotiateRequest` actually produced, so the struct
 // cannot drift from the table either. Neither half is worth much alone: the
 // snapshot without the encoder pins a document, and the encoder without the
 // snapshot pins our own opinion.
+//
+// The response shapes (`SyncNegotiateResponse`, `SyncOperationSchema`) are
+// pinned here too, against the same tables, because they are the same kind of
+// drift: a field the snapshot grows is a decision the server started making that
+// this client cannot see. What the *values* in those fields mean -- the four
+// actions and the thirteen reasons -- is `sync.plan`'s, which reads the
+// committed captures rather than the schema.
 //
 // What no offline test can pin is whether a *misnamed* optional field would be
 // noticed. It would not: RomM answers 200 and ignores it. `sync.understood`
@@ -27,10 +34,14 @@
 #include "rommsync/json.hpp"
 #include "rommsync/sync.hpp"
 
+namespace {
+
+// Inside the anonymous namespace, not beside it: POSIX declares `void sync(void)`
+// in <unistd.h>, so a file-scope `namespace sync = ...` is a redefinition on any
+// host whose standard headers happen to pull that in -- which is a green local
+// run and a red CI. `sync.plan` learned this the loud way.
 namespace json = rommsync::json;
 namespace sync = rommsync::sync;
-
-namespace {
 
 /// One field of `ClientSaveState`, as the snapshot declares it and as the
 /// encoder must emit it.
@@ -55,6 +66,40 @@ constexpr FieldSpec kPayloadFields[] = {
     {"device_id", "string", false, true},
     {"saves", "array", true, false},
 };
+
+/// `SyncOperationSchema`, the entry `SyncOperation` is read from.
+///
+/// Five of the nine are declared `T | null` and only four are in the schema's
+/// `required` set -- which is a pydantic default, not a promise that the other
+/// five may be absent: 5.2.0 emits all nine on every operation, as every capture
+/// under server/contract/captures/ shows. `ParseNegotiateResponse` therefore
+/// reads all nine with `RequiredNullable`, so a server that genuinely stopped
+/// sending one is a named error rather than a field that silently defaulted.
+constexpr FieldSpec kOperationFields[] = {
+    {"action", "string", true, false},
+    {"rom_id", "integer", true, false},
+    {"save_id", "integer", false, true},
+    {"file_name", "string", true, false},
+    {"slot", "string", false, true},
+    {"emulator", "string", false, true},
+    {"reason", "string", true, false},
+    {"server_updated_at", "string", false, true},
+    {"server_content_hash", "string", false, true},
+};
+
+constexpr FieldSpec kPlanFields[] = {
+    {"session_id", "integer", true, false},
+    {"operations", "array", true, false},
+    {"total_upload", "integer", true, false},
+    {"total_download", "integer", true, false},
+    {"total_conflict", "integer", true, false},
+    {"total_no_op", "integer", true, false},
+};
+
+/// The four actions, in the schema's own order. `no_op` carries the underscore;
+/// a client that guessed `noop` would take every no-op through the unknown
+/// branch (`sync.plan` checks the classifier itself).
+constexpr const char* kActions[] = {"upload", "download", "conflict", "no_op"};
 
 std::string ReadFile(const std::string& path) {
   std::ifstream in(path, std::ios::binary);
@@ -172,6 +217,9 @@ void SnapshotPin(checks::Checks& c) {
 
   PinSchema(c, document.value, "ClientSaveState", kSaveFields, std::size(kSaveFields));
   PinSchema(c, document.value, "SyncNegotiatePayload", kPayloadFields, std::size(kPayloadFields));
+  PinSchema(c, document.value, "SyncOperationSchema", kOperationFields,
+            std::size(kOperationFields));
+  PinSchema(c, document.value, "SyncNegotiateResponse", kPlanFields, std::size(kPlanFields));
 
   // `saves[]` is what this issue is about: entries are ClientSaveState, not some
   // other schema that happens to look like it.
@@ -192,6 +240,44 @@ void SnapshotPin(checks::Checks& c) {
   const json::Value* format = updated_at != nullptr ? updated_at->Find("format") : nullptr;
   c.ExpectEq(format != nullptr ? format->string() : std::string(), std::string("date-time"),
              "updated_at format");
+
+  // `operations[]` entries are SyncOperationSchema and not something that merely
+  // looks like it -- the same clause `saves[]` gets above, on the response side.
+  const json::Value* plan = Schema(document.value, "SyncNegotiateResponse");
+  const json::Value* operations = plan != nullptr ? plan->Find("properties") : nullptr;
+  operations = operations != nullptr ? operations->Find("operations") : nullptr;
+  const json::Value* entry = operations != nullptr ? operations->Find("items") : nullptr;
+  const json::Value* entry_ref = entry != nullptr ? entry->Find("$ref") : nullptr;
+  c.ExpectEq(entry_ref != nullptr ? entry_ref->string() : std::string(),
+             std::string("#/components/schemas/SyncOperationSchema"),
+             "operations[] element schema");
+
+  // The `action` enum, which is the one field in the response whose *values* the
+  // snapshot pins. An action this client does not know is downgraded to `no_op`
+  // rather than guessed at, so a fifth one appearing here is the signal that the
+  // downgrade has started firing on a real plan.
+  const json::Value* operation = Schema(document.value, "SyncOperationSchema");
+  const json::Value* operation_properties =
+      operation != nullptr ? operation->Find("properties") : nullptr;
+  const json::Value* action =
+      operation_properties != nullptr ? operation_properties->Find("action") : nullptr;
+  const json::Value* enumerated = action != nullptr ? action->Find("enum") : nullptr;
+  if (enumerated == nullptr) {
+    c.Expect(false, "SyncOperationSchema.action enumerates its values");
+  } else {
+    c.ExpectEq(enumerated->size(), std::size(kActions), "the snapshot declares four actions");
+    for (const char* expected : kActions) {
+      c.Expect(Lists(enumerated, expected),
+               std::string("the snapshot still declares the action ") + expected);
+    }
+    for (const json::Value& listed : enumerated->elements()) {
+      const bool known = std::any_of(std::begin(kActions), std::end(kActions),
+                                     [&listed](const char* name) {
+                                       return listed.string() == name;
+                                     });
+      c.Expect(known, "the snapshot grew an action this client does not know: " + listed.string());
+    }
+  }
 }
 
 sync::ClientSaveState SampleSave() {

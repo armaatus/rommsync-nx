@@ -25,10 +25,13 @@
 #include "rommsync/md5.hpp"
 #include "rommsync/sync.hpp"
 
+namespace {
+
+// Inside the anonymous namespace, not beside it: POSIX declares `void sync(void)`
+// in <unistd.h>, so a file-scope `namespace sync = ...` is a redefinition on any
+// host whose standard headers pull that in. See test_state_db.cpp.
 namespace crypto = rommsync::crypto;
 namespace sync = rommsync::sync;
-
-namespace {
 
 struct Vector {
   const char* input;

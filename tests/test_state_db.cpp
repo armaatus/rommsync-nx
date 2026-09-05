@@ -25,12 +25,17 @@
 #include "rommsync/state_db.hpp"
 #include "rommsync/sync.hpp"
 
+namespace {
+
+// Inside the anonymous namespace, not beside it: POSIX declares `void sync(void)`
+// in <unistd.h>, so a file-scope `namespace sync = ...` is a redefinition on any
+// host whose standard headers pull that in. Which ones do is not stable -- it
+// moved when `sync.hpp` grew an include in M2-4 -- so a green local run and a red
+// CI is the failure mode, and the anonymous namespace is what removes it.
 namespace crypto = rommsync::crypto;
 namespace io = rommsync::io;
 namespace state = rommsync::state;
 namespace sync = rommsync::sync;
-
-namespace {
 
 std::filesystem::path ScratchDir() {
   const std::filesystem::path dir = std::filesystem::path(ROMMSYNC_TEST_SCRATCH) / "state_db";
