@@ -134,6 +134,20 @@ echo "== guards actually guard"
 if [ -x .claude/hooks/guard.py ]; then
   python3 .claude/hooks/guard.py --selftest 2>&1 | sed 's/^/  /'
   [ "${PIPESTATUS[0]}" = 0 ] || fail "the guard selftest does not hold"
+
+  # ...and it has to hold from INSIDE a fleet worktree too. The stateless cases
+  # assert what the guard does for an ordinary developer ("an ordinary push is
+  # fine"), which is untrue by design where the fleet's own rules apply. Run
+  # against the real fleet directory the selftest passed on a laptop and failed
+  # in every agent's worktree -- `ctest -R agent.config` red exactly where the
+  # work happens, green only on CI runners that are nobody's fleet.
+  guard_tmp="$(mktemp -d)"
+  mkdir -p "$guard_tmp/worktrees"
+  printf '%s\n' "$REPO_ROOT" >"$guard_tmp/worktrees/999"
+  ROMMSYNC_FLEET_DIR="$guard_tmp" python3 .claude/hooks/guard.py --selftest >/dev/null 2>&1 \
+    || fail "the guard selftest depends on where it is run: it fails inside a fleet worktree"
+  rm -rf "$guard_tmp"
+  ok "the guard selftest holds from inside a fleet worktree too"
 else
   fail ".claude/hooks/guard.py is missing or not executable"
 fi
