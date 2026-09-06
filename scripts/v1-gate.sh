@@ -546,17 +546,26 @@ matching() { echo "$REGISTERED" | grep -E "$1" || true; }
 RAN_FAILED=""
 RAN_SKIPPED=""
 RAN_SEEN=""
+# What the run exited with, or the word `transcript` when there was no run to
+# exit -- quoting "ctest exited 0" for a recorded fixture would put a number in
+# front of somebody that no ctest ever produced.
 RAN_STATUS=0
 
 # $ROMMSYNC_GATE_TRANSCRIPT is a seam: a file holding what a
 # `ctest` run printed, used instead of running it. It exists so tests/test_v1_gate.sh
 # can drive the classification below -- and in particular the rule that a SKIP is
 # not a pass -- without a rig, a docker RomM and four minutes. Nothing else sets it.
+# Results go into the file named by $2 rather than onto stdout, because the
+# caller needs `RAN_STATUS` as well as the results, and a command substitution
+# runs this in a subshell where an assignment to it goes nowhere. That is not a
+# hypothetical: read through `$(run_groups ...)`, this function set RAN_STATUS
+# faithfully and the caller saw the value it was initialised with, so a run that
+# died reported "ctest exited 0" -- a number no ctest had produced.
 run_groups() {
-  local regex="$1" out
+  local regex="$1" into="$2" out
   if [ -n "${ROMMSYNC_GATE_TRANSCRIPT:-}" ]; then
     out="$(cat "$ROMMSYNC_GATE_TRANSCRIPT")"
-    RAN_STATUS=0
+    RAN_STATUS="transcript"
   else
     out="$(ctest --test-dir "$BUILD_DIR" -R "$regex" --output-on-failure 2>&1)"
     RAN_STATUS=$?
@@ -569,7 +578,7 @@ run_groups() {
       else if ($0 ~ /Passed/)  print "PASS " name
       else                     print "FAIL " name
       name = ""
-    }'
+    }' > "$into"
 }
 
 # --- evaluation ---------------------------------------------------------------
@@ -628,8 +637,11 @@ EOF
       status="FAIL"
       detail="$detail
     named by this row and never reported a result:$silent
-    the run did not finish (ctest exited $RAN_STATUS) -- rerun it; a test that
-    said nothing is not a test that passed"
+    $(if [ "$RAN_STATUS" = "transcript" ]; then
+        echo "the recorded run in \$ROMMSYNC_GATE_TRANSCRIPT stops before them"
+      else
+        echo "the run did not finish (ctest exited $RAN_STATUS) -- rerun it"
+      fi); a test that said nothing is not a test that passed"
     fi
     if [ "$MODE" = "dry" ] && [ "$status" != "FAIL" ]; then
       status="HELD"
@@ -760,7 +772,10 @@ EOF
     echo "Running the gate's evidence: ctest -R '$union'"
   fi
   echo
-  results="$(run_groups "$union")"
+  results_file="$(mktemp "${TMPDIR:-/tmp}/v1gate-run.XXXXXX")"
+  run_groups "$union" "$results_file"
+  results="$(cat "$results_file")"
+  rm -f "$results_file"
   RAN_FAILED="|$(echo "$results" | sed -n 's/^FAIL //p' | tr '\n' '|')"
   RAN_SKIPPED="|$(echo "$results" | sed -n 's/^SKIP //p' | tr '\n' '|')"
   RAN_SEEN="|$(echo "$results" | sed -n 's/^[A-Z]* //p' | tr '\n' '|')"

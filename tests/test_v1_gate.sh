@@ -373,6 +373,17 @@ $out"
     *) fail "the gate did not say which tests said nothing:
 $out" ;;
   esac
+  # ...and it says WHY in terms of what actually happened. `run_groups` used to
+  # be read through a command substitution, so its assignment to RAN_STATUS went
+  # into a subshell and the caller always saw the initial 0 -- every incomplete
+  # run, real or recorded, reported "ctest exited 0", a number no ctest produced.
+  case "$out" in
+    *"ctest exited 0"*) fail "the gate blamed a ctest exit code on a recorded run:
+$out" ;;
+    *"recorded run in \$ROMMSYNC_GATE_TRANSCRIPT stops before them"*) ;;
+    *) fail "the gate did not say why the results are missing:
+$out" ;;
+  esac
   [ "$status" -eq 1 ] || fail "expected exit 1 for a run that never finished, got $status"
   echo "ok: a test that reported nothing is not a test that passed"
 
