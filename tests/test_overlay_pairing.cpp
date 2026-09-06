@@ -400,16 +400,23 @@ void CheckUnreachableAndBlocked(Checks& checks) {
       overlay::RenderPairingBlocked(overlay::PairBlock::kNoServer);
   ExpectWellFormed(checks, no_server,
                    std::string("blocked ") + overlay::ToString(overlay::PairBlock::kNoServer));
-  checks.Expect(!no_server.start, "there is no Pair button when there is nothing to pair with");
   checks.Expect(Contains(no_server.hint, "server.url"),
-                "and the hint names the setting that is missing");
+                "the hint names the setting that is missing");
 
+  // Every blocked view offers *something*. A refusal is latched by the screen --
+  // nothing polls behind one to keep saying it -- so one with no action left is
+  // a screen that stays wrong after the user has fixed the thing it complained
+  // about, until they close the overlay and open it again.
   const overlay::PairingView refused = overlay::RenderPairingBlocked(overlay::PairBlock::kRefused);
+  for (const overlay::PairingView& view : {no_server, refused}) {
+    checks.Expect(view.start || view.start_over, "a refusal is never a dead end");
+  }
+
   ExpectWellFormed(checks, refused,
                    std::string("blocked ") + overlay::ToString(overlay::PairBlock::kRefused));
   checks.Expect(refused.headline != no_server.headline,
                 "a refusal does not read as a missing server");
-  checks.Expect(refused.start, "and a refusal can be tried again");
+  checks.Expect(refused.hint != no_server.hint, "...and does not send the user to config.ini");
 }
 
 /// The other half of the same rule, which the compiler cannot check: the view
