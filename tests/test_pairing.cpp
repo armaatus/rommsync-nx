@@ -624,10 +624,14 @@ int RejectionStreak(http::HttpClient& client, const std::string& base) {
 /// The approval deliberately lands after the *recovery* poll, not just after the
 /// failed one. A lost response is harmless while the answer it lost was
 /// `authorization_pending`; once a code is approved, the poll that reaches RomM
-/// redeems it whether or not the answer gets home -- and a stalled request is
-/// still in flight upstream long after the client has given up on it, so
-/// approving any earlier races that. That failure has its own ending; see
-/// `LostGrant`.
+/// redeems it whether or not the answer gets home. `drop` is the mode that does
+/// that here -- the request lands and the answer does not -- so approving before
+/// the recovery poll races it. That failure has its own ending; see `LostGrant`.
+///
+/// A stalled request no longer contributes to that race: since #109 the proxy
+/// holds it and closes it unanswered rather than replaying it upstream once the
+/// client has given up, so `pair.stall` cannot redeem a code behind the
+/// scenario's back. `pair.drop` still can, which is why the ordering stays.
 int SurvivesTransport(http::HttpClient& client, const std::string& base, const std::string& fault,
                       const std::string& what) {
   rig::Checks checks;

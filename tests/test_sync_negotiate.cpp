@@ -587,15 +587,17 @@ int Stalled(http::HttpClient& client, const std::string& base, const Fixture& fi
                   "a later attempt reaches the real server: " + negotiated.message);
     checks.Expect(negotiated.plan.session_id > 0, "the plan that came back is a real one");
 
-    // Asserted as properties rather than as exact counts, and deliberately so:
-    // the proxy's abandoned stall thread sleeps out the rest of its delay and
-    // then answers, so how many of the two stalls a client actually meets is a
-    // race with its own timeout -- `pair.retry` has the same one, and it is the
-    // proxy's, not the engine's. What the engine owes is that a stall is
-    // retried and that the wait doubles, and that is what is checked.
-    checks.Expect(negotiated.attempts >= 2,
-                  "a stall is retried rather than abandoned -- attempts: " +
-                      std::to_string(negotiated.attempts));
+    // An exact count, because the proxy no longer replays an abandoned stall
+    // (fault_proxy.py, mode `stall`). Two stalls armed and a budget of three:
+    // `claim` spends one per matching request whether or not the client waits
+    // for the answer, so attempts one and two are stalled and the third meets a
+    // healthy server. Nothing about that is a race any more.
+    //
+    // This was `>= 2` while the proxy woke up and forwarded the request the
+    // client had already given up on, which made "how many stalls did the
+    // client actually meet" depend on thread scheduling. Issue #109.
+    checks.ExpectEq(negotiated.attempts, 3,
+                    "two stalls are retried past, and the third attempt lands");
     checks.ExpectEq(waits.size(), static_cast<std::size_t>(negotiated.attempts - 1),
                     "every retry waited first");
     std::chrono::milliseconds expected{50};
