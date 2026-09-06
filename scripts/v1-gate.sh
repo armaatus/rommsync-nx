@@ -238,11 +238,45 @@ SAVE_SITE_ROOTS='core/src sysmodule/source overlay/source'
 # path written that way would be invisible to the one check that says which files
 # can land on a save at all.
 #
-# `://` is left alone so that a `"http://"` in a string does not eat the rest of
-# its own line. Multi-line /* */ blocks are not handled and there are none in
-# `core/`; the inline `/*first=*/true` form is, since it never spans a line.
+# Both comment forms are handled, `/* */` blocks included and across lines: see
+# strip_comments for why that is not tidiness.
 strip_comments() {
-  sed -e 's,^[[:space:]]*//.*,,' -e 's,\([^:/]\)//.*,\1,' "$1"
+  # One line out per line in -- the ordering check below compares line NUMBERS,
+  # so a filter that dropped lines would quietly compare the wrong ones.
+  #
+  # Both comment forms, because either can carry the literal text of a call.
+  # `//` alone was not enough: a `/* ... BackUpFirst(...) removed here ... */`
+  # block does not start with a letter, so the definition filter did not exclude
+  # it either, and a save path whose real backup call had been deleted would have
+  # matched the comment instead and read as protected. That is the hard rule this
+  # whole row exists for, so it gets the state machine rather than a regex.
+  #
+  # `://` is left alone so a `"http://"` in a string does not eat its own line.
+  # A `/*` inside a string literal would still fool this; there is none in the
+  # sources it reads, and saying so is better than implying it cannot happen.
+  awk '
+    {
+      line = $0; out = ""
+      while (length(line) > 0) {
+        if (inblk) {
+          i = index(line, "*/")
+          if (i == 0) { line = ""; break }
+          line = substr(line, i + 2); inblk = 0; continue
+        }
+        a = index(line, "//"); b = index(line, "/*")
+        while (a > 1 && substr(line, a - 1, 1) == ":") {
+          j = index(substr(line, a + 2), "//")
+          if (j == 0) { a = 0; break }
+          a = a + 2 + j - 1
+        }
+        if (a == 0 && b == 0) { out = out line; line = ""; break }
+        if (b != 0 && (a == 0 || b < a)) {
+          out = out substr(line, 1, b - 1); line = substr(line, b + 2); inblk = 1; continue
+        }
+        out = out substr(line, 1, a - 1); line = ""; break
+      }
+      print out
+    }' "$1"
 }
 
 count_calls() {

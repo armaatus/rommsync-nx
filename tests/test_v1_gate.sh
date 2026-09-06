@@ -225,12 +225,41 @@ $out" ;;
   esac
   echo "ok: a commit site on a line with a slash in it fails"
 
+  # The same, in a BLOCK comment, and with the real call gone. `//` prose was
+  # already excluded; a `/* ... */` block was not, and its lines do not start
+  # with a letter, so the definition filter did not catch them either. A save
+  # path whose backup call had been deleted would then match the comment and
+  # read as protected -- in the check that carries hard rule 2.
+  root="$(scratch)/blockcomment"; rm -rf "$root"; fake_repo "$root"
+  sed 's/      sync::BackUpFirst(/      sync::NoBackupAtAll(/' \
+    "$root/core/src/conflict_record.cpp" > "$root/core/src/conflict_record.edited"
+  mv "$root/core/src/conflict_record.edited" "$root/core/src/conflict_record.cpp"
+  grep -q "NoBackupAtAll(" "$root/core/src/conflict_record.cpp" \
+    || fail "the block-comment fixture removed no call"
+  # ...and a block comment near the top that still names it, the way a refactor
+  # leaves one behind.
+  printf '/*\n * BackUpFirst(...) used to run here; see the restore notes.\n */\n%s' \
+    "$(cat "$root/core/src/conflict_record.cpp")" > "$root/core/src/conflict_record.new"
+  mv "$root/core/src/conflict_record.new" "$root/core/src/conflict_record.cpp"
+  out="$("$root/scripts/v1-gate.sh" --audit --build-dir "$build" 2>&1)"
+  [ $? -ne 0 ] || fail "a block comment naming BackUpFirst stood in for the deleted call:
+$out"
+  case "$out" in
+    *"no CALL to BackUpFirst ahead of it"*) ;;
+    *) fail "expected the census to name the missing backup, got:
+$out" ;;
+  esac
+  echo "ok: a block comment naming BackUpFirst does not stand in for the call"
+
   # ...while a MENTION in prose is still not a call. The prose is why the census
   # cannot simply grep for the name.
   root="$(scratch)/site-prose"; rm -rf "$root"; fake_repo "$root"
   cat > "$root/core/src/probe_prose.cpp" <<'EOF'
 // This file discusses io::CommitStaged( and io::WriteAtomically( at length,
 /// including in a doc comment, and calls neither.
+/* It also names io::CommitStaged( inside a block comment
+ * that runs across lines, io::CopyAtomically( included,
+ */
 namespace { void ProbeSite() {} }  // io::CopyAtomically( is not called here
 EOF
   out="$("$root/scripts/v1-gate.sh" --audit --build-dir "$build" 2>&1)"
