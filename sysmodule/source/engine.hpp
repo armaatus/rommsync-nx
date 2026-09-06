@@ -15,7 +15,7 @@
 // than a plausible refusal that sends a user looking for a full queue or a
 // failing SD card. Each of the issues above replaces its own part of this, and
 // `kUnavailable` disappearing entirely is what says the engine is finished --
-// `StartPairing` is the last one left.
+// `StartPairing` and `SyncNow` are what is left of it.
 //
 // **The console has a transport now, and this class is still not given one.**
 // M1-7 (#126) built the Horizon `http::HttpClient` (`sysmodule/source/http/`)
@@ -29,8 +29,8 @@
 // M7-2 (#37). The host suite passes a libcurl client and drives the paging
 // through the same seam (`lists.*`).
 //
-// **`StartPairing` is the last `kUnavailable`, and M1-6 (#123) left only half of
-// it.** The engine drives a real device-code attempt now -- see `StartPairing`
+// **`StartPairing` is a `kUnavailable` M1-6 (#123) left only half of.** The
+// engine drives a real device-code attempt now -- see `StartPairing`
 // -- and it needs the same missing thing the lists above do: an
 // `http::HttpClient` for Horizon, which is #126. So on a console `StartPair`
 // answers `kUnavailable` while a list answers `kOffline`, and the difference is
@@ -470,17 +470,22 @@ class SdEngine : public ipc::Engine {
   mutable std::mutex card_mutex_;
 
   /// Guards the in-memory state the two threads share: the attempt, `auth_`,
-  /// and `gate_`. Held for assignments and never across I/O. Mutable because
-  /// `Snapshot()` and `pairing_status()` are const and both read state the
-  /// pairing thread writes.
+  /// and `gate_`. Held for assignments and never across I/O, with one exception
+  /// that is safe because it predates the contention: `Load` holds it over the
+  /// four files it reads at boot, before `UsePairingBackend` has made a second
+  /// thread to stall. Mutable because `Snapshot()` and `pairing_status()` are
+  /// const and both read state the pairing thread writes.
   mutable std::mutex mutex_;
 
   /// How the pairing thread is told there is something to do, and how it is
   /// woken early from a poll interval by a new attempt or by shutdown.
   std::condition_variable wake_;
 
-  /// Started on the first `StartPairing` and never before: a console with no
-  /// transport, which is every console today, creates no thread at all.
+  /// Created by `UsePairingBackend`, and only when it is handed a transport, so
+  /// a console with no `HttpClient` -- which is every console today -- creates no
+  /// thread at all. Not on the first `StartPairing`: see `UsePairingBackend` for
+  /// why the one throwing call in this class happens at start rather than under
+  /// a user's finger.
   ///
   /// **Its stack is not sized here, and on Horizon that is a number somebody
   /// has to derive.** devkitA64's default comes out of the 512 KiB inner heap

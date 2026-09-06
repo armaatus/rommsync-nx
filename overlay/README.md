@@ -200,8 +200,9 @@ which writes nothing when it refuses — and only discards the token once a
 pairing is genuinely starting. M1-6 (#123) built `SdEngine::StartPairing`, so
 that is no longer the *only* thing standing between a user and a destroyed
 pairing; it is still the right order, because an attempt can be refused for want
-of a `server.url` or for want of an HTTP transport (the console has no `ssl`
-backend yet, #43's gate item), and each of those answers *"This sysmodule cannot
+of a `server.url` or for want of an HTTP transport (the console has no
+`HttpClient` yet, #126, which #43's gate wants), and each of those answers *"This
+sysmodule cannot
 start a pairing yet; this console is still paired"* with nothing lost.
 
 [libultrahand]: https://github.com/ppkantorski/libultrahand
