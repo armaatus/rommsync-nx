@@ -19,13 +19,14 @@ you have installed homebrew on a Switch before and have never seen RomM.
 
 ## Before you start
 
-- **A modded console running Atmosphère**, new enough to load sysmodules out of
-  `atmosphere/contents/` — the folder this release installs into, and the one
-  Atmosphère has used since **0.14.0**, when that folder was renamed from
-  `titles`.
-  Any current 1.x is far past that. That floor is the layout's, not a tested
-  number: nothing in this repo pins a minimum, and establishing the real one is
-  part of M8-2 ([#44](https://github.com/armaatus/rommsync-nx/issues/44)).
+- **A modded console running Atmosphère 1.7.0 or newer (Horizon 18.0.0 and
+  up).** That is the version this project builds and states its releases for:
+  M6-3 ([#34](https://github.com/armaatus/rommsync-nx/issues/34)) keeps it as a
+  single `ATMOSPHERE_TARGET` string that every release body prints, and this
+  line is the second place it is written — when #34 merges, the two should be
+  checked against each other rather than left to drift. Nothing in the build
+  enforces it, and confirming it on real hardware is part of M8-2
+  ([#44](https://github.com/armaatus/rommsync-nx/issues/44)).
 - **Ultrahand or Tesla already installed and working.** The control UI is an
   overlay; if your overlay menu does not open today, fix that first — none of
   what follows is visible without it.
