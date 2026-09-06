@@ -62,6 +62,7 @@
 #include "rommsync/host/curl_http_client.hpp"
 #include "rommsync/host/native_file_system.hpp"
 #include "rommsync/ipc.hpp"
+#include "rommsync/log.hpp"
 #include "rommsync/pairing.hpp"
 #include "rommsync/token_store.hpp"
 
@@ -72,6 +73,7 @@ namespace download = rommsync::download;
 namespace fs = rommsync::fs;
 namespace http = rommsync::http;
 namespace ipc = rommsync::ipc;
+namespace log = rommsync::log;
 namespace sysmodule = rommsync::sysmodule;
 
 namespace {
@@ -163,6 +165,15 @@ class Console {
     ipc::Dispatch(*core, static_cast<std::uint32_t>(ipc::Command::kGetStatus),
                   ipc::EncodeEmpty(), &response);
     return ipc::DecodeStatus(response).value;
+  }
+
+  /// The log, read the way the overlay reads it: command 16, off the wire
+  /// (M7-3, #38). Never `log::Tail` directly -- the point is that a console can
+  /// be asked what went wrong through the service, with no SD reader.
+  ipc::LogTail Log() {
+    std::string response;
+    Call(ipc::Command::kGetLog, ipc::EncodeLogRequest(ipc::kMaxLogLines), &response);
+    return ipc::DecodeLogTail(response).value;
   }
 
   /// The queue as the *card* holds it, which is the only copy that survives a
@@ -1409,6 +1420,252 @@ void RestoreDuringSync(checks::Checks& c) {
            "and the restore is available again the moment the tick is done");
 }
 
+// --- M7-3: the log docs/TROUBLESHOOTING.md is written against ------------------
+
+/// True when some line of `tail` carries `tag` as its event.
+///
+/// Asked of the tag rather than of the whole sentence, which is the split
+/// log.hpp draws: the tag is the pinned contract and the detail after it is
+/// whatever the failing subsystem already said. A test that matched on the
+/// sentence would be a second copy of a dozen other headers' output.
+bool Logged(const ipc::LogTail& tail, const char* tag) {
+  const std::string needle = std::string(" ") + tag;
+  for (const std::string& line : tail.lines) {
+    if (line.find(needle) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::string Rendered(const ipc::LogTail& tail) {
+  std::string out;
+  for (const std::string& line : tail.lines) {
+    out += "\n    " + line;
+  }
+  return out.empty() ? std::string(" (the log is empty)") : out;
+}
+
+/// Every misconfiguration docs/TROUBLESHOOTING.md answers that needs no server.
+///
+/// Three consoles, because each is a different section of the guide and a
+/// console can only be in one of these states at a time. What is asserted is the
+/// *event tag*, because that is what the guide's sections are keyed on and what
+/// `docs.troubleshooting_events` holds the guide to.
+void LogsMisconfiguration(checks::Checks& c) {
+  // A console with no `config.ini` at all -- a first boot, and the state a user
+  // who unpacked the zip and stopped is in.
+  {
+    rommsync::log::Reset();
+    Console console(c, "engine-log-bare");
+    console.Boot();
+    const ipc::LogTail tail = console.Log();
+    c.Expect(Logged(tail, "config.no_server"),
+             "a console with no config.ini says so, and says which key:" + Rendered(tail));
+    c.Expect(Logged(tail, "config.diagnostic"),
+             "with the file's own complaint beside it:" + Rendered(tail));
+    c.Expect(!Logged(tail, "auth.token"),
+             "and nothing about credentials it does not have:" + Rendered(tail));
+    c.Expect(tail.total >= static_cast<std::int64_t>(tail.lines.size()),
+             "the total is what was written, not what was kept");
+  }
+
+  // A `config.ini` a human got wrong. The line number is the whole value of the
+  // diagnostic -- "invalid boolean" sends a user hunting through a file they
+  // cannot see (config.hpp) -- so it is what this asserts on.
+  {
+    rommsync::log::Reset();
+    Console console(c, "engine-log-badconfig");
+    c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                   "[server]\n"
+                                   "url = https://romm.example.com\n"
+                                   "\n"
+                                   "[sync]\n"
+                                   "states = yes please\n"),
+             "a card whose config.ini has a bad boolean on line 5");
+    console.Boot();
+    const ipc::LogTail tail = console.Log();
+    c.Expect(Logged(tail, "config.diagnostic"), "the complaint is logged:" + Rendered(tail));
+    bool numbered = false;
+    for (const std::string& line : tail.lines) {
+      numbered = numbered || (line.find("config.diagnostic") != std::string::npos &&
+                              line.find("line 5") != std::string::npos);
+    }
+    c.Expect(numbered,
+             "and it names the line the user has to edit, which is the point:" + Rendered(tail));
+    c.Expect(!Logged(tail, "config.no_server"),
+             "a file with one bad line still has a usable server:" + Rendered(tail));
+  }
+
+  // The folder-map failure the guide calls the common one: a `[platform.*]`
+  // section *replaces* that platform's defaults, so one that lists no `saves`
+  // switches saves off for it (docs/CONFIG.md). Emptied for every platform the
+  // client ships a default for, read out of `DefaultPlatforms()` rather than
+  // listed here -- a platform added to that map must not quietly stop this
+  // scenario from reaching zero.
+  {
+    rommsync::log::Reset();
+    Console console(c, "engine-log-nosaves");
+    std::string ini =
+        "[server]\n"
+        "url = https://romm.example.com\n";
+    for (const auto& [slug, folders] : config::DefaultPlatforms()) {
+      static_cast<void>(folders);
+      ini += "\n[platform." + slug + "]\nroms = /roms/" + slug + "\n";
+    }
+    c.Expect(console.sandbox.Write("/config/rommsync/config.ini", ini),
+             "a card where every platform maps roms and no saves");
+    console.Boot();
+    c.Expect(console.Configured().config.SaveScanDirs().empty(),
+             "which really is a console with nowhere to look for a save");
+    const ipc::LogTail tail = console.Log();
+    c.Expect(Logged(tail, "config.no_save_dirs"),
+             "and the log says so rather than leaving a silent console:" + Rendered(tail));
+  }
+
+  // A console that cannot tick at all: paired, configured, and with no transport
+  // installed. `SyncNow` is accepted and the worker settles as a failure
+  // (`engine.syncnow`); what this adds is that the *reason* is on the record.
+  {
+    rommsync::log::Reset();
+    Console console(c, "engine-log-notransport");
+    c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                   "[server]\n"
+                                   "url = https://romm.example.com\n"
+                                   "\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                   "on_boot = false\n"),
+             "a configured card");
+    auth::StoredToken token;
+    token.server_url = "https://romm.example.com";
+    token.access_token = "not-a-real-token";
+    token.device_id = "console-log";
+    token.scopes = {"roms.read"};
+    c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+             "and a paired one");
+    console.Boot();
+
+    const ipc::LogTail booted = console.Log();
+    c.Expect(Logged(booted, "auth.token"),
+             "a paired console records which server, device and scopes it holds:" +
+                 Rendered(booted));
+    for (const std::string& line : booted.lines) {
+      c.Expect(line.find("not-a-real-token") == std::string::npos,
+               "and never the token itself: " + line);
+    }
+
+    console.engine.StartWorker();
+    c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, "a tick is asked for");
+    ipc::Status status = console.Status();
+    for (int waited = 0; waited < 200 && status.last_sync_result == ipc::SyncResult::kNever;
+         ++waited) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{25});
+      status = console.Status();
+    }
+    c.Expect(status.last_sync_result == ipc::SyncResult::kFailed, "and it fails");
+    const ipc::LogTail tail = console.Log();
+    c.Expect(Logged(tail, "net.offline"),
+             "with a line saying the tick was skipped and why:" + Rendered(tail));
+  }
+}
+
+/// The four transport failures, forced against the real RomM by the fault proxy.
+///
+/// This is the criterion #38 states in those words: the guide's offline, 401,
+/// TLS and truncation sections have to match what the proxy really produces,
+/// rather than what a hand-written mock would. Each case is its own console --
+/// `auth::Gate` remembers a rejection, and a second scenario over the same card
+/// would be reading the first one's verdict.
+///
+/// The one that is not the proxy's is TLS, because a proxy cannot make a healthy
+/// server offer a bad certificate. `https://` against the proxy's *plaintext*
+/// port is the same failure from libcurl's point of view -- a handshake that
+/// does not complete, `http::Error::kTls` -- and it is a real user's commonest
+/// way in: a `[server] url` whose scheme does not match what the server speaks.
+int LogsTransportFailures(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+
+  struct Case {
+    const char* name;
+    const char* fault;  ///< the proxy body, or "" for none
+    const char* url;    ///< "" for the proxy's own base
+    const char* tag;    ///< the event docs/TROUBLESHOOTING.md documents for it
+  };
+  // `path` is `/api/roms` on each: the library fetch is the first request a tick
+  // makes, so it is where a forced fault lands and where the guide's sections
+  // say to look.
+  const Case cases[] = {
+      {"drop", R"({"mode":"drop","bytes":8,"path":"/api/roms","count":8})", "", "net.offline"},
+      {"unauthorized",
+       R"({"mode":"status","status":401,"path":"/api/roms","count":8})", "", "auth.rejected"},
+      {"stall", R"({"mode":"stall","seconds":1,"path":"/api/roms","count":8})", "",
+       "net.offline"},
+      {"truncate", R"({"mode":"truncate","bytes":8,"path":"/api/roms","count":8})", "",
+       "sync.refused"},
+      {"tls", "", "TLS", "net.tls"},
+  };
+
+  for (const Case& scenario : cases) {
+    rig::DisarmFault(client, base);
+    std::string url = base;
+    if (std::string(scenario.url) == "TLS") {
+      // The same host and port, asked for over TLS it does not speak.
+      url = "https" + base.substr(base.find(':'));
+    } else if (scenario.fault[0] != '\0') {
+      c.Expect(rig::ArmFault(client, base, scenario.fault).successful(),
+               std::string("the proxy arms ") + scenario.name);
+    }
+
+    rommsync::log::Reset();
+    Console console(c, std::string("engine-log-") + scenario.name);
+    c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                   "[server]\nurl = " + url +
+                                       "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                       "on_boot = false\n"),
+             std::string(scenario.name) + ": the console points at the rig");
+    auth::StoredToken token;
+    token.server_url = url;
+    token.access_token = fixture.token;
+    token.device_id = fixture.device_id;
+    token.scopes = {"roms.read"};
+    c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+             std::string(scenario.name) + ": with the fixture pairing on the card");
+
+    const std::unique_ptr<fs::FileSystem> card =
+        rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+    console.Boot();
+    console.engine.UseServer(&client, token.access_token);
+    console.engine.UseCard(card.get());
+    console.engine.StartWorker();
+    c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted,
+             std::string(scenario.name) + ": a tick is asked for");
+
+    ipc::Status status = console.Status();
+    for (int waited = 0; waited < 400 && status.last_sync_result == ipc::SyncResult::kNever;
+         ++waited) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{25});
+      status = console.Status();
+    }
+    c.Expect(status.last_sync_result != ipc::SyncResult::kNever,
+             std::string(scenario.name) + ": the tick settled");
+
+    const ipc::LogTail tail = console.Log();
+    c.Expect(Logged(tail, scenario.tag),
+             std::string(scenario.name) + ": the guide's section for it is `" + scenario.tag +
+                 "`, and that is what the code writes:" + Rendered(tail));
+    for (const std::string& line : tail.lines) {
+      c.Expect(line.find(fixture.token) == std::string::npos,
+               std::string(scenario.name) + ": and no line carries the token: " + line);
+    }
+  }
+  rig::DisarmFault(client, base);
+  return c.failures();
+}
+
 void Commands(checks::Checks& c) {
   Console console(c, "engine-commands");
   console.Boot();
@@ -1489,6 +1746,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"pairs", Pairs},
       {"nonblocking", NonBlocking},
       {"repairs", Repairs},
+      {"log_faults", LogsTransportFailures},
   };
   for (const RigScenario& scenario : kRigScenarios) {
     if (name == scenario.name) {
@@ -1534,6 +1792,8 @@ int main(int argc, char** argv) {
     SyncNowStarts(checks);
   } else if (scenario == "unreachable") {
     Unreachable(checks);
+  } else if (scenario == "log") {
+    LogsMisconfiguration(checks);
   } else if (const RigScenario* rig_scenario = FindRigScenario(scenario)) {
     // The scenarios that need the fixture RomM. `server` pins that a *live*
     // credential stops being on the card, and the M1-6 three drive a real

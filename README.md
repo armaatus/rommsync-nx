@@ -52,6 +52,11 @@ sysmodule with ovl-sysmodules, pointing it at your RomM, and pairing without
 typing anything secret on the console. Nothing in it has been run on hardware
 yet — that is M8-2.
 
+When a sync does not happen,
+[`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) is the page: every failure
+this client knows how to have, the line it writes in
+`sdmc:/config/rommsync/rommsync.log` when it has one, and what to do about it.
+
 ## Architecture at a glance
 
 ```

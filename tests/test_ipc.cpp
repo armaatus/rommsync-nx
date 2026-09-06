@@ -45,6 +45,7 @@ namespace config = rommsync::config;
 namespace http = rommsync::http;
 namespace conflicts = rommsync::conflicts;
 namespace ipc = rommsync::ipc;
+namespace log = rommsync::log;
 namespace json = rommsync::json;
 namespace sync = rommsync::sync;
 
@@ -621,6 +622,67 @@ int RoundTrip() {
     checks.Expect(empty.ok() && empty.value.items.empty(), "an empty page is a page");
   }
 
+  // The log tail (M7-3, #38). A tail is rendered lines and a total, and the
+  // total is deliberately not `lines.size()`: it is what the process has
+  // written, which is what tells a screen it is looking at a tail.
+  {
+    ipc::LogTail sent;
+    sent.lines = {"1 info boot rommsync-nx/0.1.0",
+                  "2 warn net.offline negotiate: connection failed",
+                  "3 error config.no_server no [server] url"};
+    sent.total = 412;
+    const ipc::Decoded<ipc::LogTail> back = ipc::DecodeLogTail(ipc::EncodeLogTail(sent));
+    checks.Expect(back.ok(), "a log tail round trips: " + back.error.Describe());
+    checks.ExpectEq(back.value.lines.size(), sent.lines.size(), "every line survives");
+    checks.ExpectEq(back.value.lines.front(), sent.lines.front(), "oldest first, byte for byte");
+    checks.ExpectEq(back.value.total, sent.total, "and the total is not the count kept");
+
+    const ipc::Decoded<ipc::LogTail> empty = ipc::DecodeLogTail(ipc::EncodeLogTail({}));
+    checks.Expect(empty.ok() && empty.value.lines.empty() && empty.value.total == 0,
+                  "an empty tail is a tail -- a sysmodule that has logged nothing is running");
+
+    const ipc::Decoded<std::int32_t> asked = ipc::DecodeLogRequest(ipc::EncodeLogRequest(8));
+    checks.Expect(asked.ok() && asked.value == 8, "the request round trips");
+    checks.Expect(!ipc::DecodeLogRequest("{\"lines\":0}").ok(),
+                  "and a request for no lines is refused -- a caller that wants none does not ask");
+
+    // The bound the decoder enforces is the log's own: a line longer than
+    // `log::kMaxLineBytes` did not come from this client's log.
+    ipc::LogTail overlong;
+    overlong.lines = {std::string(log::kMaxLineBytes + 1, 'x')};
+    checks.Expect(!ipc::DecodeLogTail(ipc::EncodeLogTail(overlong)).ok(),
+                  "a line longer than the log ever writes is refused");
+
+    // The two bounds `AppendIfItFits` holds, and which one bites when.
+    //
+    // `kMaxLogLines` lines of `kMaxLineBytes` plain bytes is ~6 KiB, inside
+    // `kMaxPayloadBytes` -- so a whole tail of ordinary lines always arrives,
+    // which is the point of sizing the ring against the payload rather than
+    // against a round number. **A line is not ordinary bytes**: it carries a
+    // file path and a save's name, and a quote or a backslash in one costs two
+    // bytes on the wire. A tail of those is past the cap, and the payload check
+    // is what stops it -- so a `GetLog` on a console whose saves are named
+    // hostilely is a shorter tail rather than a `kTooLarge`.
+    ipc::LogTail plain;
+    std::size_t ordinary = 0;
+    while (ipc::AppendIfItFits(&plain, std::string(log::kMaxLineBytes, 'y'))) {
+      ++ordinary;
+    }
+    checks.ExpectEq(ordinary, static_cast<std::size_t>(ipc::kMaxLogLines),
+                    "a whole tail of ordinary lines fits one payload");
+    checks.Expect(ipc::Fits(ipc::EncodeLogTail(plain)), "and it fits");
+
+    ipc::LogTail hostile;
+    std::size_t escaped = 0;
+    while (ipc::AppendIfItFits(&hostile, std::string(log::kMaxLineBytes, '"'))) {
+      ++escaped;
+    }
+    checks.Expect(escaped > 0, "at least one line of escapes fits");
+    checks.Expect(escaped < ordinary,
+                  "and a tail of them is stopped by the payload cap rather than overrunning it");
+    checks.Expect(ipc::Fits(ipc::EncodeLogTail(hostile)), "what it stopped at fits");
+  }
+
   // Every string field is user data and may hold anything a filesystem allows.
   // `json::Quote` is what carries it rather than interpreting it, and this is
   // the check that nothing here builds a payload by concatenation instead.
@@ -900,7 +962,26 @@ int Secrets() {
       {ipc::Command::kListEnd, ipc::EncodeCursor(7)},
       {ipc::Command::kListConflicts, ipc::EncodeConflictQuery({0, ipc::kMaxConflictPage})},
       {ipc::Command::kRestoreBackup, ipc::EncodeEntryId(3)},
+      {ipc::Command::kGetLog, ipc::EncodeLogRequest(ipc::kMaxLogLines)},
   };
+
+  // The log is the newest way a credential could reach this wire: a call site
+  // that logged one would put it in front of `GetLog` without touching a
+  // payload. `log::Write` redacts before any sink or tail sees a byte, and this
+  // is that guarantee asserted at the boundary rather than only in `log.redacts`
+  // -- so the loop below is checking a tail that really was handed both secrets.
+  log::Reset();
+  log::Error(log::Event::kAuthRejected, "Authorization: Bearer " + token);
+  log::Info(log::Event::kBoot, "device_code=" + device_code);
+  // And the one thing the log *is* allowed to carry, put there deliberately so
+  // the sweep below has to make the exception rather than pass by accident. It
+  // is `auth::DescribeStoredToken`'s own shape: #38's scope asks for exactly
+  // this line in a bug report -- which server, which device, which scopes, never
+  // the token -- and a configured origin carries no credential because
+  // `NormalizeServerUrl` refuses `user:password@` outright.
+  log::Info(log::Event::kStoredToken, "server=" + url + " device=abc scopes=[roms.read]");
+  checks.ExpectEq(core.GetLog(ipc::kMaxLogLines).lines.size(), std::size_t{3},
+                  "the tail the secrets sweep is about to read holds all three lines");
   checks.ExpectEq(calls.size(), std::size(ipc::kAllCommands),
                   "every command is exercised, including any that was just added");
 
@@ -930,6 +1011,14 @@ int Secrets() {
     const bool has_url = response.find(url) != std::string::npos;
     if (command == ipc::Command::kGetConfig) {
       checks.Expect(has_url, "GetConfig does carry the server URL -- it is the field #26 edits");
+    } else if (command == ipc::Command::kGetLog) {
+      // The deliberate third exception, and the narrowest. A log line is what a
+      // user is asked to attach to a bug report, and "which server is this
+      // console paired to" is the first question of every one of them (#38) --
+      // so `auth.token` carries the origin, and `log::Redact` is what keeps a
+      // credential out of it whatever a call site does. The *token* rule above
+      // still applies to this command unchanged.
+      checks.Expect(has_url, "GetLog carries the origin a bug report has to name");
     } else if (command == ipc::Command::kStartPair || command == ipc::Command::kGetPairState) {
       // The pairing screen has to put an absolute URL in front of the user, so
       // the two verification URLs are the deliberate exception -- and they are

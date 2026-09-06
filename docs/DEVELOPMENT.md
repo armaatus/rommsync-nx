@@ -547,6 +547,16 @@ A removed command leaves a hole.
 | 13 | `ListEnd` | cursor -> - | `kBadCursor` |
 | 14 | `ListConflicts` | `ConflictQuery` (offset + limit) -> `ConflictPage` | never fails; an empty history is a page |
 | 15 | `RestoreBackup` | `entry_id` -> `RestoreReport` (outcome + the new backup's path) | never fails; the outcome is `restored \| no_such_entry \| nothing_to_restore \| backup_missing \| backup_failed \| write_failed` |
+| 16 | `GetLog` | `lines` -> the last N log lines + how many were ever written | never fails; an empty tail is an answer |
+
+`GetLog` is the one command answered from neither the engine nor the card.
+`core/include/rommsync/log.hpp` keeps the last `log::kTailLines` lines in memory
+for the life of the process, and `ServiceCore` reads them straight out of it —
+so the overlay can show why a sync did not happen without an SD reader, and a
+console whose card refused the log file still answers. The file on the card is
+the same lines through `log::FileSink`, bounded at `log::kMaxFileBytes` with one
+`.old`; docs/TROUBLESHOOTING.md is the guide that reads it, and the event tag in
+each line is what that guide's sections are keyed on.
 
 `ListBegin` never fails, and that is a decision rather than an omission.
 It does not run out of cursors -- the cap is enforced by reclaiming the least

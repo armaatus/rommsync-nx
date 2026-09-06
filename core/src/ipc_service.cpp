@@ -10,6 +10,7 @@
 // `SyncNow` outcomes applies, what the *effective* enabled state is after a
 // write, whether a folder map fits a payload, and what a page size is clamped
 // to. `sysmodule/source/ipc/` is buffers and a `Result` on top of this.
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -321,6 +322,7 @@ bool TakesRequest(Command command) {
     case Command::kListEnd:
     case Command::kListConflicts:
     case Command::kRestoreBackup:
+    case Command::kGetLog:
       return true;
     case Command::kGetInterfaceVersion:
     case Command::kGetStatus:
@@ -373,6 +375,31 @@ conflicts::RestoreReport ServiceCore::RestoreBackup(std::int64_t entry_id) {
   // The two paths in the message are as long as the card lets them be.
   Shorten(&report.message, kMaxRestoreMessageBytes);
   return report;
+}
+
+LogTail ServiceCore::GetLog(std::int32_t lines) const {
+  // Clamped here rather than at the decoder, so an over-large ask is a smaller
+  // answer instead of a command documented never to fail failing.
+  const std::size_t want = lines < 1 ? 1
+                           : lines > kMaxLogLines
+                               ? static_cast<std::size_t>(kMaxLogLines)
+                               : static_cast<std::size_t>(lines);
+
+  std::vector<log::Line> kept;
+  LogTail tail;
+  tail.total = static_cast<std::int64_t>(log::Tail(want, &kept));
+
+  // Filled from the newest backwards and turned round at the end, so what falls
+  // off when the payload is full is the *oldest* line. The end of the log is the
+  // part that says why the last tick failed, and it is the part that must always
+  // arrive (`LogTail::lines`).
+  for (std::size_t at = kept.size(); at > 0; --at) {
+    if (!AppendIfItFits(&tail, kept[at - 1].text)) {
+      break;
+    }
+  }
+  std::reverse(tail.lines.begin(), tail.lines.end());
+  return tail;
 }
 
 Error Dispatch(ServiceCore& core, std::uint32_t command_id, std::string_view request,
@@ -533,6 +560,15 @@ Error Dispatch(ServiceCore& core, std::uint32_t command_id, std::string_view req
       // that says the call failed takes the answer with it, and "the backup is
       // gone" is an answer the screen has a sentence for.
       payload = EncodeRestoreReport(core.RestoreBackup(entry_id.value));
+      break;
+    }
+
+    case Command::kGetLog: {
+      const Decoded<std::int32_t> lines = DecodeLogRequest(request);
+      if (!lines.ok()) {
+        return Error::kMalformedRequest;
+      }
+      payload = EncodeLogTail(core.GetLog(lines.value));
       break;
     }
   }

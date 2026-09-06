@@ -275,7 +275,8 @@ struct StateSyncReport {
 
   /// One line per operation that failed or was kept-both, plus the sentence
   /// every download owes: a state is checked against its length and nothing
-  /// more. `core/` has no logger, so these are handed up.
+  /// more. Handed up rather than logged here, for `ExecutionReport::warnings`'
+  /// reason; the caller writes them.
   std::vector<std::string> warnings;
 };
 
