@@ -113,9 +113,23 @@ Decision Scheduler::Poll() {
     // settings screen pressing "Sync now" is the one event that is allowed to
     // ignore a wait this object imposed, and on a TLS fault it is the only thing
     // that ever tries again.
+    //
+    // It also consumes the boot tick, which is not a special case: a tick is
+    // about to run, and running a second one a moment later because nobody had
+    // ticked *yet* would be two ticks for one event.
     on_demand_ = false;
     booted_ = true;
     decision.trigger = Trigger::kOnDemand;
+    return decision;
+  }
+
+  if (rerun_) {
+    // The last tick asked to be run again -- a sweep restored a save the scan
+    // could not have seen -- so this is the same scheduled tick continuing, not
+    // a new trigger. `kInterval` and not `kOnDemand`: nobody pressed anything,
+    // and `requested()` must not read true when no user asked.
+    rerun_ = false;
+    decision.trigger = Trigger::kInterval;
     return decision;
   }
 
@@ -195,7 +209,7 @@ void Scheduler::Finished(TickOutcome outcome, http::Error transport) {
       // again immediately" is the one answer here that could spin.
       if (rescans_ < config_.max_rescans) {
         ++rescans_;
-        on_demand_ = true;
+        rerun_ = true;
         return;
       }
       rescans_ = 0;

@@ -210,8 +210,9 @@ class SdEngine : public ipc::Engine {
   /// **It is one thread, not two.** `sync::RunTick` and `lists::Service::Pump`
   /// both want a thread that is not the IPC one and neither wants a thread of
   /// its own: a list page is one request and a tick is a handful, and two
-  /// threads would cost two stacks out of a 512 KiB heap to serialise on the
-  /// same `http::HttpClient` anyway (`main.cpp`'s budget). The loop pumps the
+  /// threads would cost two stacks out of the 768 KiB inner heap to serialise on
+  /// the same `http::HttpClient` anyway -- and that heap's table already budgets
+  /// for exactly two worker stacks (`kInnerHeapSize`, `main.cpp`). The loop pumps the
   /// lists first, because a human is waiting at a screen for one of those and
   /// nobody is waiting for a tick.
   ///
@@ -506,7 +507,7 @@ class SdEngine : public ipc::Engine {
   /// and `conflicts::RecordSaves`/`RecordStates` on the way out -- which live
   /// here because `conflict_record.hpp` includes `state_sync.hpp`, so recording
   /// from inside the tick would be a cycle.
-  void RunOneTick(sync::Trigger trigger);
+  void RunOneTick();
 
   /// Record what one exchange said about the credentials, and persist the
   /// verdict the moment it becomes one.
@@ -575,6 +576,18 @@ class SdEngine : public ipc::Engine {
   std::shared_ptr<const config::Config> config_ =
       std::make_shared<const config::Config>(config::Defaults());
 
+  /// Guards `config_`, and **only** `config_`.
+  ///
+  /// A lock of its own rather than `mutex_`, because of the one cycle three
+  /// threads make possible: `UseServer`, `Load`, `CommitGrant` and `Unpair` hold
+  /// `mutex_` and call into `lists::Service`, taking its lock second -- while the
+  /// worker inside `lists::Service::Pump` holds *that* lock and asks this class
+  /// for a configuration snapshot. If the snapshot took `mutex_` the two orders
+  /// would close a cycle and the process would wedge with the overlay open. So
+  /// the order is `mutex_` -> `lists_`'s -> this, and this one is a leaf: nothing
+  /// is called while it is held.
+  mutable std::mutex config_mutex_;
+
   /// What was wrong with `config.ini`, and -- see `AdoptConfig` -- with
   /// `auth.json`. Rebuilt every time the configuration is re-read.
   ///
@@ -641,8 +654,16 @@ class SdEngine : public ipc::Engine {
 
   /// Fired by the destructor, and passed to every stage of a tick, so a shutdown
   /// ends the tick at an operation boundary rather than mid-write
-  /// (`sync::TickOptions::cancel`). One token per process, because there is one
-  /// tick at a time.
+  /// (`sync::TickOptions::cancel`).
+  ///
+  /// **One per process rather than one per tick**, and the difference does not
+  /// arise: cancellation is one-way and the only thing that fires it is the
+  /// process going away, which happens once. A second owner would need a second
+  /// token -- an overlay "stop this sync" is the obvious one -- and there is no
+  /// such command on the wire (`ipc::Command`), so there is nothing to give one
+  /// to. `sync::RunTick` still gets exactly one token across its three stages,
+  /// which is the rule that matters: a tick stops at a boundary rather than
+  /// half way through the accounting call.
   http::CancelToken tick_cancel_;
 
   /// What `Status::sync_in_progress` draws, and the same fact `RequestSync`

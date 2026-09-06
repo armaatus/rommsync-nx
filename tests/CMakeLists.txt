@@ -1035,6 +1035,7 @@ set(SCHEDULER_SCENARIOS
   failures  # backoff after a failed tick, floor again after a success
   tls       # a handshake failure is capped rather than retried forever
   idle      # a day switched off costs no wakeups; a day offline costs tens of ticks
+  pairing   # PairingSession polls on the shared curve, not on one of its own
 )
 foreach(scenario IN LISTS SCHEDULER_SCENARIOS)
   add_test(NAME sched.${scenario} COMMAND test_scheduler ${scenario})

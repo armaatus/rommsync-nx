@@ -1,5 +1,6 @@
 #include "engine.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -9,13 +10,6 @@
 
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/auth.hpp"
-#include "rommsync/rom_index.hpp"
-#include "rommsync/save_scan.hpp"
-#include "rommsync/scheduler.hpp"
-#include "rommsync/state_db.hpp"
-#include "rommsync/state_sync.hpp"
-#include "rommsync/sync_finish.hpp"
-#include "rommsync/sync_tick.hpp"
 #include "rommsync/auth_gate.hpp"
 #include "rommsync/config.hpp"
 #include "rommsync/conflict_log.hpp"
@@ -25,6 +19,13 @@
 #include "rommsync/ipc.hpp"
 #include "rommsync/list_service.hpp"
 #include "rommsync/pairing.hpp"
+#include "rommsync/rom_index.hpp"
+#include "rommsync/save_scan.hpp"
+#include "rommsync/scheduler.hpp"
+#include "rommsync/state_db.hpp"
+#include "rommsync/state_sync.hpp"
+#include "rommsync/sync_finish.hpp"
+#include "rommsync/sync_tick.hpp"
 #include "rommsync/token_store.hpp"
 
 namespace rommsync::sysmodule {
@@ -220,10 +221,14 @@ void SdEngine::UsePairingBackend(PairingBackend backend) {
 }
 
 void SdEngine::AdoptConfigLocked(config::LoadResult loaded) {
-  config_ = std::make_shared<const config::Config>(std::move(loaded.value));
+  {
+    // The innermost lock, held for the swap alone. See `config_mutex_`.
+    std::lock_guard<std::mutex> configuration(config_mutex_);
+    config_ = std::make_shared<const config::Config>(std::move(loaded.value));
+  }
   // In the same breath, so a changed interval takes effect with no reboot and a
   // changed `server.url` lifts a TLS park (`sync::Scheduler::Reconfigure`).
-  scheduler_.Reconfigure(ScheduleFrom(*config_));
+  scheduler_.Reconfigure(ScheduleFrom(*ConfigSnapshot()));
   diagnostics_ = auth_diagnostics_;
   diagnostics_.reserve(diagnostics_.size() + loaded.diagnostics.size());
   for (config::Diagnostic& diagnostic : loaded.diagnostics) {
@@ -235,10 +240,21 @@ bool SdEngine::WriteQueue() {
   return download::SaveQueue(PathTo(download::kQueueFileName), queue_).ok();
 }
 
-const config::Config& SdEngine::config() const { return *config_; }
+const config::Config& SdEngine::config() const {
+  // Unlocked, and safe for exactly one reason: the IPC thread is the only
+  // *writer* of this pointer and also the only caller of this method, and the
+  // `Config` behind it is never modified in place -- `AdoptConfigLocked` swaps a
+  // whole new one. Anything on another thread wants `ConfigSnapshot`, which
+  // keeps the object it was handed alive for as long as it holds it.
+  return *config_;
+}
 
 std::shared_ptr<const config::Config> SdEngine::ConfigSnapshot() const {
-  std::lock_guard<std::mutex> lock(mutex_);
+  // `config_mutex_` and not `mutex_`: this is called from inside
+  // `lists::Service::Pump`, which holds that object's lock, and `UseServer`
+  // holds `mutex_` while taking it. See `config_mutex_` for the cycle that
+  // closes.
+  std::lock_guard<std::mutex> lock(config_mutex_);
   return config_;
 }
 
@@ -383,7 +399,7 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
   // Compared against the **card**, not against `config_`. Those two part company
   // exactly when `config.ini` was there and unreadable at boot: `LoadConfig`
   // answers with the built-in defaults then (it may never refuse), so
-  // `config_->server.url` is empty while the file names a perfectly good server.
+  // `ConfigSnapshot()->server.url` is empty while the file names a perfectly good server.
   // Comparing against that would make the next edit of any kind -- a plain
   // `SetEnabled` toggle included -- look like a server change and shred a
   // working pairing over an SD card that had one bad moment.
@@ -507,10 +523,8 @@ sync::SchedulerConfig SdEngine::ScheduleFrom(const config::Config& config) {
   // `ApplyConfigEdit` rejects what is out of range -- but this is the one place
   // the number becomes a timer, and a timer is where a bad value costs a
   // battery (config.hpp's `kMinIntervalMinutes`/`kMaxIntervalMinutes`).
-  int minutes = config.sync.interval_min;
-  minutes = minutes < config::kMinIntervalMinutes ? config::kMinIntervalMinutes : minutes;
-  minutes = minutes > config::kMaxIntervalMinutes ? config::kMaxIntervalMinutes : minutes;
-  schedule.interval = std::chrono::minutes{minutes};
+  schedule.interval = std::chrono::minutes{std::clamp(
+      config.sync.interval_min, config::kMinIntervalMinutes, config::kMaxIntervalMinutes)};
   return schedule;
 }
 
@@ -519,7 +533,7 @@ void SdEngine::StartWorker() {
   if (worker_thread_.joinable()) {
     return;
   }
-  scheduler_.Reconfigure(ScheduleFrom(*config_));
+  scheduler_.Reconfigure(ScheduleFrom(*ConfigSnapshot()));
   worker_thread_ = std::thread(&SdEngine::RunWorker, this);
 }
 
@@ -586,7 +600,7 @@ void SdEngine::RunWorker() {
     if (decision.run()) {
       sync_in_progress_ = true;
       lock.unlock();
-      RunOneTick(decision.trigger);
+      RunOneTick();
       lock.lock();
       sync_in_progress_ = false;
       continue;
@@ -644,9 +658,7 @@ std::string PlaceUnder(const std::vector<std::string>& folders, std::string_view
 
 }  // namespace
 
-void SdEngine::RunOneTick(sync::Trigger trigger) {
-  (void)trigger;
-
+void SdEngine::RunOneTick() {
   const std::shared_ptr<const config::Config> config = ConfigSnapshot();
   http::HttpClient* client = nullptr;
   fs::FileSystem* files = nullptr;
@@ -685,6 +697,16 @@ void SdEngine::RunOneTick(sync::Trigger trigger) {
 
   // Step 0, the half `sync::RunTick` deliberately does not own: the library the
   // scan matches against, and the scan itself.
+  //
+  // **The index is fetched every tick and deliberately not cached.** It costs
+  // `library size / kDefaultPageSize` requests, which at the default half-hour
+  // interval is the largest thing this loop does -- and a cached one is worse in
+  // the way that actually hurts: a rom added to RomM since the last fetch has no
+  // id here, so the save beside it is *unmatched*, and an unmatched save is one
+  // this client silently does not sync. Trading a handful of requests for a save
+  // that quietly stops syncing is the wrong side of the bargain. The place to
+  // fix the cost is the request, not the frequency: RomM has no "changed since"
+  // filter on `/api/roms` in 5.2.0 (server/contract/romm-openapi-5.2.0.json).
   roms::FetchOptions fetch;
   fetch.base_url = config->server.url;
   fetch.bearer_token = token.access_token;
@@ -735,13 +757,24 @@ void SdEngine::RunOneTick(sync::Trigger trigger) {
   options.recover_dirs = config->SaveScanDirs();
   options.recover_dirs.push_back(std::string(sync::kBackupDir));
   const roms::RomIndex* index = &library.index;
-  options.execute.place = [index, config](const sync::SyncOperation& operation) -> std::string {
-    const roms::Rom* rom = index->ById(operation.rom_id);
-    if (rom == nullptr) {
-      return {};
-    }
-    const config::PlatformFolders* folders = config->Platform(rom->platform_fs_slug);
-    return folders == nullptr ? std::string() : PlaceUnder(folders->saves, operation.file_name);
+  // One placement rule, applied to the two folder lists. Saves and states are
+  // placed the same way -- find the rom, find the platform the user mapped, put
+  // it in the first folder -- and the only thing that differs is which list.
+  // Written once so the two cannot drift into placing a state where a save goes.
+  const auto placer = [index, config](std::vector<std::string> config::PlatformFolders::*which) {
+    return [index, config, which](std::int64_t rom_id,
+                                  const std::string& file_name) -> std::string {
+      const roms::Rom* rom = index->ById(rom_id);
+      if (rom == nullptr) {
+        return {};
+      }
+      const config::PlatformFolders* folders = config->Platform(rom->platform_fs_slug);
+      return folders == nullptr ? std::string() : PlaceUnder(folders->*which, file_name);
+    };
+  };
+  options.execute.place = [place = placer(&config::PlatformFolders::saves)](
+                              const sync::SyncOperation& operation) {
+    return place(operation.rom_id, operation.file_name);
   };
 
   const sync::TickResult tick =
@@ -776,13 +809,9 @@ void SdEngine::RunOneTick(sync::Trigger trigger) {
     sync::StateSyncOptions state_options;
     state_options.backup_dir = sync::kBackupDir;
     state_options.cancel = &tick_cancel_;
-    state_options.place = [index, config](const sync::ServerState& server) -> std::string {
-      const roms::Rom* rom = index->ById(server.rom_id);
-      if (rom == nullptr) {
-        return {};
-      }
-      const config::PlatformFolders* folders = config->Platform(rom->platform_fs_slug);
-      return folders == nullptr ? std::string() : PlaceUnder(folders->states, server.file_name);
+    state_options.place = [place = placer(&config::PlatformFolders::states)](
+                              const sync::ServerState& server) {
+      return place(server.rom_id, server.file_name);
     };
     states = sync::SyncStates(*client, *files, token, *config, library.index, &baseline,
                               state_options);
@@ -852,7 +881,7 @@ ipc::Error SdEngine::StartPairing() {
   // refuses an unconfigured console before the engine is reached: `Engine` is an
   // interface anything may drive, and starting an attempt against an empty
   // origin would spend the console's device identifier on a request to nowhere.
-  if (!config_->configured()) {
+  if (!ConfigSnapshot()->configured()) {
     return ipc::Error::kNotConfigured;
   }
   if (pairing_backend_.http == nullptr) {
@@ -891,7 +920,7 @@ ipc::Error SdEngine::StartPairing() {
   }
 
   auth::PairingConfig pairing;
-  pairing.server_url = config_->server.url;
+  pairing.server_url = ConfigSnapshot()->server.url;
   pairing.client_device_identifier = identity.value.client_device_identifier;
   // `device_name` and `requested_scopes` are `pairing.hpp`'s defaults on
   // purpose: the scopes are the least-privilege set `auth.scopes` pins to the
@@ -914,7 +943,7 @@ ipc::Error SdEngine::StartPairing() {
     // that follows one hung init; fixing it needs a `CancelToken` on
     // `PairingConfig`, which is `core/`'s to add.
     attempt_ = std::make_shared<PairingAttempt>(*pairing_backend_.http, std::move(pairing),
-                                                config_->server.url);
+                                                ConfigSnapshot()->server.url);
     attempt_commit_failure_.clear();
   }
   wake_.notify_all();
@@ -1110,7 +1139,16 @@ ipc::Error SdEngine::ListBegin(const ipc::ListRequest& request, ipc::Cursor* cur
 }
 
 ipc::Error SdEngine::ListNext(ipc::Cursor cursor, ipc::ListPage* page) {
-  return lists_.ListNext(cursor, page);
+  const ipc::Error answered = lists_.ListNext(cursor, page);
+  if (answered == ipc::Error::kOk && page->pending) {
+    // The page needs a request and `lists::Service` has marked the cursor for
+    // it, so something has to drive `Pump()`. Without this the worker would
+    // sleep on whatever the *scheduler* said -- which for a boot-only or
+    // switched-off console is no deadline at all, and the page would stay
+    // pending until a sync woke the thread. The overlay is asking now.
+    wake_.notify_all();
+  }
+  return answered;
 }
 
 ipc::Error SdEngine::ListEnd(ipc::Cursor cursor) { return lists_.ListEnd(cursor); }

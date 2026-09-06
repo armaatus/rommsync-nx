@@ -24,17 +24,23 @@
 //   tls       -- a handshake failure is capped rather than retried forever
 //   idle      -- many simulated hours of an offline or switched-off console cost
 //                a bounded, small number of ticks
+//   pairing   -- `auth::PairingSession` really does poll on that same curve, so
+//                "one backoff implementation" is a claim with a test behind it
+#include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <iostream>
 #include <string>
 #include <vector>
 
 #include "checks.hpp"
 #include "rommsync/backoff.hpp"
+#include "rommsync/pairing.hpp"
 #include "rommsync/scheduler.hpp"
 
 namespace {
 
+namespace auth = rommsync::auth;
 namespace http = rommsync::http;
 namespace retry = rommsync::retry;
 namespace sync = rommsync::sync;
@@ -389,9 +395,13 @@ void Failures(checks::Checks& c) {
   int rescans = 0;
   for (int i = 0; i < 10; ++i) {
     rescanning.Finished(TickOutcome::kRescanNeeded);
-    if (!rescanning.Poll().run()) {
+    c.Expect(!rescanning.requested(), "a rescan is never mistaken for a user pressing Sync now");
+    const Decision again = rescanning.Poll();
+    if (!again.run()) {
       break;
     }
+    c.Expect(again.trigger == Trigger::kInterval,
+             "a rescan is the same scheduled tick continuing, not a new trigger");
     ++rescans;
   }
   c.ExpectEq(rescans, 2, "a rescan runs again immediately, and no more than twice in a row");
@@ -486,6 +496,103 @@ void Idle(checks::Checks& c) {
   }
 }
 
+/// A server that answers `init` and then never answers a poll.
+///
+/// Enough of RomM to get a `PairingSession` into `kPending` with a known
+/// `interval`, and nothing more: every poll after that is a transport failure,
+/// which is the one thing that drives `BackOff()`. No socket, so this needs no
+/// RomM and never skips.
+class SilentServer final : public http::HttpClient {
+ public:
+  http::Result Send(const http::Request& request) override {
+    http::Result result;
+    if (request.url.find("/device/init") != std::string::npos) {
+      result.response.status = 200;
+      // The field names are the pinned capture's
+      // (server/contract/captures/auth-device-init.json), not a second spelling
+      // of them: a body this client would refuse is a body that proves nothing.
+      result.response.body =
+          R"({"device_code":")" + std::string(64, 'a') +
+          R"(","user_code":"ABCDEFGH","verification_path":"/pair/device",)"
+          R"("verification_path_complete":"/pair/device?user_code=ABCDEFGH",)"
+          R"("expires_in":600,"interval":5})";
+      return result;
+    }
+    // The poll. "The exchange never completed", which is exactly what a console
+    // whose Wi-Fi dropped mid-pairing sees, and the only answer that backs off
+    // rather than ending the attempt.
+    result.error = http::Error::kConnectFailed;
+    result.message = "no server in this test";
+    return result;
+  }
+
+  http::Result Download(const http::Request&, const http::DownloadTarget&) override {
+    return Send({});
+  }
+};
+
+/// The pairing loop polls on the shared curve, not on one of its own.
+///
+/// This is the half of "one backoff implementation, used by both" that
+/// `sched.backoff` cannot see: that scenario drives `retry::Backoff` directly,
+/// and would stay green if `PairingSession` quietly grew a second policy. What
+/// is asserted here is the *observable* consequence -- the gap
+/// `next_poll_at()` publishes doubles from the server's own `interval`, is
+/// capped, and is never shorter than that interval however the jitter falls.
+void Pairing(checks::Checks& c) {
+  SilentServer server;
+  std::chrono::steady_clock::time_point now{};
+  auth::PairingConfig config;
+  config.server_url = "http://127.0.0.1:1";
+  config.client_device_identifier = "sched-pairing";
+  config.max_poll_backoff = seconds{40};
+  auth::PairingSession session(server, config, [&now] { return now; });
+
+  c.Expect(session.Begin() == auth::PairingState::kPending, "the code is issued");
+
+  // The server asked for five seconds, so that is the floor -- undercutting it
+  // earns `slow_down` on every later poll (docs/AUTH.md).
+  const seconds interval{5};
+  std::vector<milliseconds> gaps;
+  for (int poll = 0; poll < 5; ++poll) {
+    now = session.next_poll_at();
+    c.Expect(session.Poll() == auth::PairingState::kPending,
+             "a poll that reaches nothing keeps the attempt alive");
+    gaps.push_back(std::chrono::duration_cast<milliseconds>(session.next_poll_at() - now));
+  }
+
+  for (std::size_t at = 0; at < gaps.size(); ++at) {
+    const milliseconds floor = interval;
+    const milliseconds base =
+        std::min(milliseconds{interval} * (1 << at), milliseconds{config.max_poll_backoff});
+    c.Expect(gaps[at] >= floor,
+             "poll " + std::to_string(at) + " never undercuts the server's interval");
+    c.Expect(gaps[at] >= base, "poll " + std::to_string(at) + " is at least the doubled curve");
+    // The jitter is upward and bounded by the fraction the shared policy uses,
+    // so this is the ceiling `retry::Backoff` documents -- and a pairing loop
+    // that had kept its own undoubled interval would fail the check above.
+    c.Expect(gaps[at] <= base + base / 2,
+             "poll " + std::to_string(at) + " is the curve plus jitter and nothing more");
+  }
+  c.Expect(gaps.back() <= milliseconds{config.max_poll_backoff} +
+                              milliseconds{config.max_poll_backoff} / 2,
+           "and the whole run stays under the cap the user configured");
+
+  // The assertion that would actually catch a `PairingSession` that had grown a
+  // policy of its own again: the old one doubled exactly, so every gap was its
+  // curve to the millisecond. **Jitter is the difference**, and it is the reason
+  // three consoles that lost the same router do not poll one code in lockstep
+  // and earn `slow_down` for all three. Five polls with up to a quarter of five
+  // seconds of spread each; all five landing on zero is not a run this will see.
+  bool jittered = false;
+  for (std::size_t at = 0; at < gaps.size(); ++at) {
+    jittered = jittered ||
+               gaps[at] > std::min(milliseconds{interval} * (1 << at),
+                                   milliseconds{config.max_poll_backoff});
+  }
+  c.Expect(jittered, "and the gaps are jittered, which is what the shared policy adds");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -510,6 +617,8 @@ int main(int argc, char** argv) {
     Tls(checks);
   } else if (scenario == "idle") {
     Idle(checks);
+  } else if (scenario == "pairing") {
+    Pairing(checks);
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;

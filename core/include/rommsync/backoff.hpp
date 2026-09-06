@@ -138,7 +138,8 @@ class Backoff {
   /// The built-in generator: xorshift64*, seeded from `steady_clock`.
   ///
   /// Not `<random>`: `std::mt19937` is 2.5 KiB of state per object on a heap
-  /// that is 512 KiB in total (sysmodule/AGENTS.md), and `std::random_device` on
+  /// that is 768 KiB in total (`kInnerHeapSize`, sysmodule/source/main.cpp,
+  /// where every term of it is written down), and `std::random_device` on
   /// devkitA64 is not a source anybody has checked. What this has to be is
   /// *different between two consoles*, and a steady clock read at the moment
   /// they each first failed is already that -- consoles do not boot on the same

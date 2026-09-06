@@ -87,8 +87,9 @@ enum class Trigger {
   /// schedule catching up, not a fourth kind of tick.
   kInterval,
 
-  /// The overlay's "Sync now" (`ipc::Engine::RequestSync`), or the caller
-  /// telling the scheduler that the last tick has to be run again.
+  /// The overlay's "Sync now" (`ipc::Engine::RequestSync`). **Only that**: a
+  /// tick this object decided to run again -- a rescan -- is `kInterval`,
+  /// because `requested()` must not read true when nobody pressed anything.
   kOnDemand,
 };
 
@@ -224,6 +225,14 @@ class Scheduler {
   /// marks the boot tick as taken when it answers `kBoot` -- so a caller that
   /// asks twice without running anything gets the second decision, not the first
   /// one again.
+  ///
+  /// A `kOnDemand` decision **also** consumes the boot tick, which is not a
+  /// special case: a tick is about to run, and running a second one a moment
+  /// later because nobody had ticked *yet* would be two ticks for one event.
+  ///
+  /// The contract is poll, run, `Finished` -- in that order, once each. A caller
+  /// that polls twice without running anything gets the interval decision twice,
+  /// because nothing told this object a tick happened.
   Decision Poll();
 
   /// Record how the tick `Poll()` handed out ended.
@@ -312,6 +321,11 @@ class Scheduler {
   bool booted_ = false;
 
   bool on_demand_ = false;
+
+  /// The last tick answered `kRescanNeeded` and is to be run again at once. Kept
+  /// apart from `on_demand_` so a rescan cannot look like a user pressing a
+  /// button -- see `Trigger::kOnDemand`.
+  bool rerun_ = false;
 
   /// When the backoff is up. Meaningful only while `backoff_.failures() > 0`.
   Steady retry_at_{};
