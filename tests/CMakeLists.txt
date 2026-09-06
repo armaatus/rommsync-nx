@@ -329,6 +329,31 @@ target_compile_definitions(test_overlay_library PRIVATE
   ROMMSYNC_LIBRARY_MODEL_SRC="${CMAKE_SOURCE_DIR}/core/src/overlay_library_model.cpp")
 add_test(NAME overlay.library COMMAND test_overlay_library)
 
+# --- the overlay's settings screen -------------------------------------------
+# M4-4. The whole effective configuration on a console with no keyboard, and
+# every complaint the parser had about it -- which is the point of the screen:
+# `config.ini` is edited blind, and "line 9 [sync] states: expected true or
+# false" is the difference between a fix and an evening.
+#
+# The configurations go through `config::ParseConfig` and then through the real
+# `EncodeConfigView`/`DecodeConfigView`, for the reason `overlay.library`
+# round-trips its pages: the screen renders what the wire carried, and a suite
+# that skipped the codec would agree with itself while a console drew blanks.
+#
+# The overlay's source directory and the view model's two paths are compiled in
+# because three criteria are about the code rather than about its behaviour: the
+# screen may not write `config.ini`, it may not call an engine -- it is the one
+# screen that renders `config::` types, so `LoadConfig` is one include away --
+# and the view model may not name a libnx or libultrahand type.
+add_executable(test_overlay_settings test_overlay_settings.cpp)
+target_link_libraries(test_overlay_settings PRIVATE rommsync::core)
+target_include_directories(test_overlay_settings PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_overlay_settings PRIVATE
+  ROMMSYNC_OVERLAY_SOURCE_DIR="${CMAKE_SOURCE_DIR}/overlay/source"
+  ROMMSYNC_SETTINGS_VIEW_HDR="${CMAKE_SOURCE_DIR}/core/include/rommsync/overlay_settings_view.hpp"
+  ROMMSYNC_SETTINGS_VIEW_SRC="${CMAKE_SOURCE_DIR}/core/src/overlay_settings_view.cpp")
+add_test(NAME overlay.settings COMMAND test_overlay_settings)
+
 # --- rig smoke test: proves docker RomM + fault proxy + ctest all work -------
 # Uses libcurl directly on purpose. It tests the RIG, not our code, and must
 # keep working while M0-2 replaces it as the way production code speaks HTTP.

@@ -1,6 +1,7 @@
 #include "screen_frame.hpp"
 
 #include <cstdint>
+#include <string>
 
 #include "ipc_client.hpp"
 #include "rommsync/ipc.hpp"
@@ -23,6 +24,10 @@ tsl::Color ColorFor(Tone tone) {
 }
 
 tsl::Color MutedColor() { return tsl::gfx::Renderer::a(tsl::infoTextColor); }
+
+std::string Prompt(const char* glyph, const std::string& label) {
+  return std::string(glyph) + "  " + label;
+}
 
 Link ScreenFrame::Ready() {
   if (!client_.open()) {

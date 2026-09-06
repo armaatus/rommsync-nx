@@ -100,11 +100,14 @@ class SdEngine : public ipc::Engine {
   ///
   /// **`StartPairing` is still `kUnavailable`, so the other half is not here**,
   /// and the asymmetry is worth knowing before something presses this: a console
-  /// that unpairs cannot yet pair again from the sysmodule. Nothing under
-  /// `overlay/` calls it today -- the settings screen's "Re-pair" button, which
-  /// sends `Unpair` then `StartPair`, is M4-4 (#26) -- so the order to build
-  /// them in is `StartPairing` first, or that button discards a pairing with
-  /// nothing to restart.
+  /// that unpairs cannot yet pair again from the sysmodule. The settings
+  /// screen's "Re-pair" button (M4-4, #26) is the one caller, and it sends
+  /// `StartPair` **first** for exactly this reason -- a refused `StartPair`
+  /// writes nothing and touches no token, so the console is left as it was,
+  /// while docs/AUTH.md's order would have discarded the token before finding
+  /// out. That is a gate rather than a fix: until `StartPairing` is real the
+  /// button always answers "this sysmodule cannot start a pairing yet", and no
+  /// issue owns building it.
   ///
   /// The verdict goes **after** the token, deliberately: the other order leaves
   /// a moment where the card says the pairing is fine and the credentials are

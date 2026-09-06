@@ -8,6 +8,7 @@
 #include "rommsync/ipc.hpp"
 #include "rommsync/overlay_status_view.hpp"
 #include "screen_frame.hpp"
+#include "settings_screen.hpp"
 
 namespace rommsync::overlay {
 namespace {
@@ -45,6 +46,19 @@ tsl::elm::Element* StatusScreen::createUI() {
 
 void StatusScreen::update() { Poll(); }
 
+bool StatusScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidAnalogStickState,
+                               HidAnalogStickState) {
+  if ((keys_down & HidNpadButton_Y) == 0) {
+    return false;
+  }
+  // Offered whatever the link is doing. The settings screen draws the same
+  // "sys-rommsync is not running" this one is drawing, and a way in that
+  // disappeared with the sysmodule would be a menu a user cannot reach on the
+  // console that most needs reading.
+  tsl::changeTo<SettingsScreen>(client_);
+  return true;
+}
+
 void StatusScreen::Poll() {
   // The port and the version handshake, both of which every screen needs and
   // none of which is this screen's own (`screen_frame.hpp`).
@@ -77,7 +91,6 @@ void StatusScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
   // to be adjusted in M8-2 (#44) -- but a row painted over the frame's chrome is
   // the kind of thing that reads as a corrupted overlay rather than as a
   // too-long list.
-  const s32 bottom = y + height;
   const tsl::Color muted = MutedColor();
   // Nothing runs off the right edge either. `drawString`'s `maxWidth` defaults
   // to "no limit", and a value is not ours to bound: `fs_name` comes off a RomM
@@ -85,6 +98,16 @@ void StatusScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
   // `Some Game (USA) (Rev 1) [!].gba` draws past a ~448px panel.
   const s32 value_width = width > kValueColumn + kBarInset ? width - kValueColumn - kBarInset : 0;
   const s32 full_width = width > kBarInset ? width - kBarInset : 0;
+
+  // The one control this screen has, drawn at the foot of the panel and
+  // reserved before anything else: the rows below the headline grow with what
+  // is downloading, so a prompt drawn after them is the first thing to fall off
+  // a full screen -- and a control nobody can see is a menu this overlay does
+  // not have (#26).
+  const s32 prompt = y + height - kRowHeight;
+  renderer->drawString(Prompt(kGlyphY, "Settings"), false, x, prompt, kBodyFont, muted,
+                       full_width);
+  const s32 bottom = prompt - kRowHeight / 2;
 
   s32 row = y;
   renderer->drawString(view_.headline, false, x, row, kHeadlineFont, ColorFor(view_.tone),
