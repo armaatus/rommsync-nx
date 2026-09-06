@@ -88,6 +88,7 @@ packaging/           # what the release zip ships beside the two artifacts
   README.txt.in      # substituted with VERSION and the title id by package.sh
   config.ini.example
 scripts/package.sh   # the two build outputs -> dist/rommsync-nx-<VERSION>.zip
+scripts/release-notes.sh  # the body a `v*` tag's GitHub Release carries
 ```
 
 ## Packaging
@@ -128,7 +129,84 @@ console rather than loudly here:
 
 `ctest -R package` is what holds all of it: four scenarios against stubbed
 artifacts that need no toolchain, plus `package.builds`, which packages a real
-devkitPro build inside the same container.
+devkitPro build inside the same container. `switch-build` runs the script on
+every push as well, so a failure specific to packaging *inside* the container is
+not something a tag discovers first.
+
+## Releases
+
+One version string, in `VERSION` at the repo root. Everything that reports a
+version derives it from that file and nothing restates it:
+
+| Reader | What it produces |
+|---|---|
+| `CMakeLists.txt` (`file(READ)`) | `rommsync/version.hpp` for the host build |
+| `switch.mk` (`cat`) | the same header for the three devkitPro targets |
+| `switch.mk` (`APP_VERSION`) | the overlay's NACP, which is what a user sees |
+| `scripts/package.sh` | `dist/rommsync-nx-<VERSION>.zip` and the shipped `README.txt` |
+| `scripts/release-notes.sh` | the release body |
+
+A release is a `v*` tag on a commit whose `VERSION` says the same thing. The
+bump goes through a pull request like every other change — nothing pushes to
+`main` here, and `guard.py` will not let it — and only the tag is pushed
+directly:
+
+```bash
+git switch -c release-0.2.0
+echo 0.2.0 > VERSION            # or 0.2.0-rc1 for a prerelease
+git commit -am "Release 0.2.0"
+gh pr create --fill             # ...and a person merges it
+
+git switch main && git pull     # now the bump is on main
+git tag v0.2.0
+git push origin v0.2.0          # this is what publishes
+```
+
+Push the tag and the `release` job in
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) does the rest. It waits
+for `static`, `host-tests` and `switch-build`, checks the tag and `VERSION` agree
+and that the tagged commit is an ancestor of `main` — the three jobs say the
+commit is *good*, nothing else says it was *reviewed*, and a tag can be pushed at
+any branch head — then builds the three Switch targets in `devkitpro/devkita64`,
+runs `scripts/package.sh`, and writes a `SHA256SUMS` beside the archive.
+
+It publishes in that order too: the release is created as a **draft**, the two
+assets are uploaded, both are pulled back *out* of the release through the API
+and checked with `sha256sum -c`, and only then is the draft flipped to public. A
+release is live the instant it is created, so anything less would leave a public
+page advertising a truncated download whenever an upload failed. The body is
+`scripts/release-notes.sh`: the install lines, what the build targets, the
+commits since the previous tag, and those checksums.
+
+Six things are worth knowing before you do it:
+
+- **The tag and `VERSION` must agree**, or the build is red rather than a release
+  labelled with a version nothing inside it reports. `ctest -R version.tag` is
+  that check; it is a no-op off a tag, and `host-tests` runs it on one because
+  GitHub sets `GITHUB_REF` for every step. Run it yourself first:
+  `GITHUB_REF=refs/tags/v0.2.0 ctest --test-dir build -R version.tag`.
+- **A semver suffix publishes as a prerelease.** `0.2.0-rc1` is marked one;
+  `0.2.0` is not. That is read off `VERSION`, so the tag cannot disagree with it.
+- **The checksums are computed beside the build.** The archive is
+  byte-deterministic for one `zip` build, which is what makes a published
+  checksum a statement about these bytes — one recomputed on another host is a
+  checksum of something else.
+- **A stable release's notes start at the last stable release**, not at the last
+  release candidate. `v0.2.0` cut after a `v0.2.0-rc1` lists everything since
+  `v0.1.0`; `v0.2.0-rc2` lists everything since `rc1`. `ctest -R release.history`
+  holds both halves against a throwaway repo, since this one has no tags.
+- **Re-cutting a tag means deleting its release first.** Creating a release for a
+  tag that already has one is a hard failure, on purpose: the alternative is
+  attaching these bytes to a release built from other ones.
+- **The compatibility line in the notes is a target, not a result.**
+  `ATMOSPHERE_TARGET` in `scripts/release-notes.sh` is the only place any
+  Atmosphère version is written down in this repo, and nothing here has run on a
+  console — the notes say so in the release itself. Confirming or correcting it
+  is part of the M8-1 gate (#43); the fix is that one constant.
+
+The zip is the only thing to download. `switch-build`'s per-push artifact is the
+three loose files, for debugging; a `.nsp` under its build name installs cleanly
+and does nothing at all.
 
 ## TLS in a sysmodule
 
