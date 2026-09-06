@@ -90,7 +90,8 @@ jobs:
                 pullRequest(number:$pr){
                   body
                   author{login}
-                  reviews(last:50){ nodes{ state submittedAt commit{oid} author{login} } }
+                  reviews(last:50){ nodes{ state submittedAt commit{oid} author{login}
+                                          body comments(first:1){ totalCount } } }
                   reviewThreads(first:100){ nodes{ isResolved path line } }
                 }
               }
