@@ -3,7 +3,7 @@
 	"title_id": "0x4200000000524D53",
 	"title_id_range_min": "0x4200000000524D53",
 	"title_id_range_max": "0x4200000000524D53",
-	"main_thread_stack_size": "0x00004000",
+	"main_thread_stack_size": "0x00008000",
 	"main_thread_priority": 44,
 	"default_cpu_id": 3,
 	"process_category": 0,
@@ -14,7 +14,7 @@
 	"filesystem_access": {
 		"permissions": "0xffffffffffffffff"
 	},
-	"service_access": ["fsp-srv", "set:sys", "ssl", "bsd:u", "sfdnsres", "nifm:u", "time:s"],
+	"service_access": ["fsp-srv", "set:sys", "ssl", "bsd:u", "sfdnsres", "nifm:u"],
 	"service_host": ["rommsync"],
 	"kernel_capabilities": [{
 			"type": "kernel_flags",

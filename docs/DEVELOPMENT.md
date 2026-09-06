@@ -46,7 +46,7 @@ with `cat`, and both substitute the same `version.hpp.in`.
   because libultrahand's own objects reference them (its updater and its package
   handling), and `--gc-sections` cannot drop a symbol a linked object still
   names. The overlay is a launched process with the applet's memory, not a
-  resident sysmodule in a `0x80000` heap, so the footprint M0-1 was measuring
+  resident sysmodule in a `0xC0000` heap, so the footprint M0-1 was measuring
   does not apply to it -- and `ovl-rommsync` itself opens no socket: everything
   it does over the network happens in `sys-rommsync` (overlay/AGENTS.md). The
   rule for the **sysmodule** is unchanged.
@@ -76,7 +76,8 @@ tests/               # CTest suites
 sysmodule/
   Makefile
   sys-rommsync.json  # NPDM: title id, heap, service and syscall capabilities
-  source/            # engine: auth, http(tls), sync, downloads, ipc, scheduler
+  source/            # engine: auth, sync, downloads, ipc, scheduler
+    http/            # the Horizon HttpClient: HTTP/1.1, and `ssl` under it
 overlay/
   Makefile
   source/            # gui screens, ipc client
@@ -227,11 +228,27 @@ mbedTLS/OpenSSL stack is heavy.
   [`core/include/rommsync/http.hpp`](../core/include/rommsync/http.hpp) (M0-2):
   GET/POST, multipart with file parts streamed from disk, streamed
   download-to-file with `Range` resume, connect/total/stall timeouts and
-  cancellation. The native backend is `host/src/curl_http_client.cpp`, the only
-  file in the tree that names a transport library. Two CI checks keep it that
-  way: `static` rejects any include in `core/` that is not a standard or
-  `rommsync/` header, and `switch-build` compiles every `core/` translation unit
-  with devkitA64 and links them into the sysmodule.
+  cancellation. Two CI checks keep `core/` clear of any transport: `static`
+  rejects any include in `core/` that is not a standard or `rommsync/` header,
+  and `switch-build` compiles every `core/` translation unit with devkitA64 and
+  links them into the sysmodule.
+
+  There are two backends, and the split inside the second one is the thing to
+  know before reading it:
+
+  | file | what it is |
+  |---|---|
+  | `host/src/curl_http_client.cpp` | libcurl, for the laptop and CI (`http.*`) |
+  | `sysmodule/source/http/http_wire.cpp` | HTTP/1.1 over an abstract `Connection`. Names no libnx type, so the host build compiles it and `wire.*` drives it against the docker RomM |
+  | `sysmodule/source/http/ssl_http_client.cpp` | bsd sockets and the `ssl` service under it. The only part no test can reach before M8-1 |
+
+  That split is M1-7 (#126)'s answer to "this cannot be proven on the host":
+  almost nothing a backend has to get right is *transport* — it is framing,
+  `Range` resume, the `.part` file, the timeouts and the progress contract — and
+  all of that is checked for real. `wire.*` and `http.*` are the same eighteen
+  scenarios in `tests/test_http_native.cpp`, compiled twice against the two
+  clients rather than copied, so neither can drift from what `http.hpp`
+  promises.
 
 ### M0-1: the measurement, and the decision
 
@@ -270,13 +287,35 @@ a sysmodule pays for a TLS request is therefore:
    | config | transfer memory |
    |---|---|
    | libnx default (`socketInitializeDefault()`) | **0x234000 — 2.25 MiB** |
-   | the probe's trimmed config | **0x1D000 — 116 KiB** |
+   | the probe's config (`tlsprobe/source/probe.hpp`) | **0x25000 — 148 KiB** |
+   | `sys-rommsync`'s (`sysmodule/source/http/ssl_http_client.hpp`) | **0x1D000 — 116 KiB** |
 
-   `sys-rommsync`'s inner heap is `0x80000` (512 KiB). The default socket config
-   does not fit in it and never will; the trimmed one leaves ~390 KiB. **Never
-   call `socketInitializeDefault()` from the sysmodule** — that single line is
-   the difference between a working engine and one that dies at
-   `socketInitialize`.
+   The middle row is a correction M1-7 (#126) found while writing the backend
+   this section is about: the 116 KiB this page attributed to the probe is not
+   what the probe's own defaults compute to. They keep libnx's
+   `udp_rx_buf_size` of `0xA500`, and the formula above turns that into 0x25000.
+   The sysmodule's config is the one that produces 0x1D000, by cutting the UDP
+   receive buffer to `0x2400`: name resolution on Horizon goes through the
+   `sfdnsres` **service**, not through a UDP socket of ours, so 39 KiB of the
+   heap was being reserved for traffic this process never sends. The probe is
+   left as it was — it measured what it measured, and a spike edited after the
+   fact measures nothing.
+
+   `sys-rommsync`'s inner heap is `0xC0000` (768 KiB), derived term by term in
+   `sysmodule/source/main.cpp` and checked there by a `static_assert` rather than
+   by this table. The default socket config does not fit in it and never will;
+   the sysmodule's leaves ~650 KiB. **Never call `socketInitializeDefault()` from
+   the sysmodule** — that single line is the difference between a working engine
+   and one that dies at `socketInitialize`.
+
+   The heap was `0x80000` until M1-7, and the two terms it was short by are the
+   two easiest to miss. **A list response is buffered whole** — `Send` returns a
+   `std::string` and nothing caps it — and the two that can be large were
+   measured against the fixture rather than guessed: `/api/platforms` is an
+   unpaged bare array in 5.2.0 at ~800 bytes a row, so `kMaxPlatforms` of them is
+   ~200 KiB, and `/api/roms?limit=64` is ~136 KiB. And there are **two** worker
+   threads to come, not one — M1-6's pairing thread and M7-2's scheduler — each
+   paying its stack out of this heap.
 2. **One in-flight buffer** — the download-streaming buffer, ours to size. Roms
    stream to file and never sit in RAM whole (hard rule 2's sibling: nothing is
    buffered that does not have to be).
@@ -297,10 +336,16 @@ knowing before the M8 backend is written:
   returns is ours to `close()`, *before* `sslConnectionClose`.
 - **`SslIoMode_Blocking`'s timeout is five minutes** (libnx `ssl.h`). That is not
   a timeout a sync tick can wait out, and "never block boot" is a hard rule. The
-  real backend needs `SslIoMode_NonBlocking` with `sslConnectionPoll`, or
-  `sslConnectionSetIoTimeout` on [16.0.0+]. The probe sets `SO_RCVTIMEO` on the
-  socket before handing it over and uses blocking mode; whether the service
-  honours that socket option is one of the things a run would tell us.
+  probe sets `SO_RCVTIMEO` on the socket before handing it over and uses
+  blocking mode; whether the service honours that socket option is one of the
+  things a run would tell us. **The M1-7 backend does not rely on finding out**:
+  every read and write goes through `sslConnectionPoll` with the caller's own
+  remaining budget first (`SslStream::Wait`), so the wait is bounded by
+  `http::Request`'s timeouts whatever the service does with the socket option —
+  which is also what lets the overlay's "stop" land within a fifth of a second
+  rather than at the end of a stall timeout. `sslConnectionSetIoTimeout` is set
+  as well on [16.0.0+], and `SO_RCVTIMEO`/`SO_SNDTIMEO` are still set: three
+  bounds, of which only the first is known to work.
 - `SslVersion_Auto` is **TLS 1.0–1.2**; 1.3 needs [11.0.0+] and its own bit. A
   server that only offers 1.3 cannot be reached by a firmware-agnostic client, so
   the fixture terminator offers 1.2 as well (`ctest -R tls.serves` asserts it).
@@ -346,8 +391,11 @@ one in-flight download buffer + the bsd transfer memory above + the `state.db`
 baseline, and stream to file rather than buffering whole roms in RAM. The
 baseline is the one item that grows with the library rather than being a fixed
 buffer — its text and then its parsed rows, bounded by `state::kMaxStateBytes`
-and `state::kMaxRecords`, which are sized against the 390 KiB this section
+and `state::kMaxRecords`, which are sized against the ~650 KiB this section
 leaves free and have to move with it (`core/include/rommsync/state_db.hpp`).
+Since M1-7 (#126) that budget is written out term by term above
+`kInnerHeapSize` in `sysmodule/source/main.cpp`, and a `static_assert` there
+fails the build rather than the console when a term outgrows it.
 
 ## IPC
 
@@ -497,7 +545,7 @@ say "update the sysmodule" instead of decoding garbage.
 ### The bounds
 
 `ipc::kMaxPayloadBytes` (8 KiB) caps every single request and response, in both
-directions. The inner heap is `0x80000` with ~390 KiB left after the trimmed bsd
+directions. The inner heap is `0xC0000` with ~650 KiB left after the trimmed bsd
 transfer memory ([M0-1](#m0-1-the-measurement-and-the-decision)), and that budget
 already owes a download buffer and the `state.db` baseline.
 

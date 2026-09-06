@@ -100,14 +100,22 @@ inline constexpr int kFormatVersion = 2;
 /// A bound larger than the heap is not a bound -- it is a `bad_alloc` with a
 /// constant next to it. The arithmetic, from
 /// [docs/DEVELOPMENT.md](../../../docs/DEVELOPMENT.md#tls-in-a-sysmodule):
-/// `kInnerHeapSize` is `0x80000` (512 KiB) and the trimmed socket transfer
-/// memory takes 116 KiB of it, leaving **~390 KiB** for everything else --
-/// which is the download buffer *and* this. Loading a baseline costs the file's
+/// `kInnerHeapSize` is `0xC0000` (768 KiB) since M1-7 (#126) -- the issue that
+/// gave the console a transport also made that constant a number somebody
+/// derived rather than devkitPro's template default -- and the trimmed socket
+/// transfer memory takes 116 KiB of it, leaving **~650 KiB** for everything else
+/// -- which is the download buffer *and* this. Loading a baseline costs the file's
 /// text and then the parsed `Baseline`, whose per-row `std::string`s each
 /// exceed the 15-character small-string buffer and land on the heap, so the map
 /// costs more than the text it came from. At ~214 bytes a row, `kMaxRecords`
 /// rows is ~110 KiB of text and ~130 KiB parsed: about 240 KiB at the peak,
 /// with room left for a transfer.
+///
+/// **The heap grew and these did not**, which is the safe direction and is
+/// deliberate: this pair bounds the *file*, and how many saves a console may
+/// hold is a decision about a library rather than about a heap. What the extra
+/// headroom bought was the terms M1-7 added beside this one -- a buffered
+/// `/api/platforms` and two worker thread stacks -- not a bigger baseline.
 ///
 /// `core.state_db` asserts the two agree -- a full baseline must serialize to
 /// less than the byte bound, or the writer would produce a file the reader

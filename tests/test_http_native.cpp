@@ -1,4 +1,4 @@
-// The native HttpClient backend, exercised against the real docker RomM.
+// An HttpClient backend, exercised against the real docker RomM.
 //
 // One scenario per CTest entry (`http.get`, `http.drop`, ...), selected by
 // argv[1], so a failure names the behaviour that broke rather than "the http
@@ -10,6 +10,16 @@
 // happy path and quietly leaves a half-written rom behind when the connection
 // dies is worse than one that does not work at all, so `drop`, `truncate`,
 // `cancel` and `stall` all assert on what is NOT on disk afterwards.
+//
+// **This file is compiled twice**, and that is the point (M1-7, #126). The
+// scenarios below are the whole of what `core/include/rommsync/http.hpp`
+// promises a caller, and there are now two backends that have to keep that
+// promise: libcurl's, which is the host's (`http.*`), and the console's
+// (`wire.*`), whose HTTP half is `sysmodule/source/http/http_wire.cpp` and is
+// driven here over plain TCP. Only the twenty `ssl` calls underneath it are
+// unreachable off a console -- everything a downloader can get wrong is
+// checked, against the same RomM, by the same eighteen scenarios. A second copy
+// of them would have drifted from this one by the second issue.
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -22,7 +32,18 @@
 
 #include "rig.hpp"
 
+#ifdef ROMMSYNC_TEST_WIRE_BACKEND
+#include "tcp_connector.hpp"
+#endif
+
 namespace {
+
+/// Which backend this build drives, and the prefix a passing run reports under.
+#ifdef ROMMSYNC_TEST_WIRE_BACKEND
+constexpr const char* kSuite = "wire";
+#else
+constexpr const char* kSuite = "http";
+#endif
 
 namespace http = rommsync::http;
 
@@ -670,7 +691,7 @@ int Cancel(http::HttpClient& client, const std::string& base, const std::string&
 
 int main(int argc, char** argv) {
   if (argc != 2) {
-    std::cerr << "usage: test_http_native <scenario>\n";
+    std::cerr << "usage: " << (argc > 0 ? argv[0] : "test_http") << " <scenario>\n";
     return 2;
   }
   const std::string scenario = argv[1];
@@ -683,7 +704,14 @@ int main(int argc, char** argv) {
     return 2;
   }
 
+#ifdef ROMMSYNC_TEST_WIRE_BACKEND
+  // The connector outlives the client: `MakeWireHttpClient` borrows it.
+  rig::TcpConnector connector;
+  const std::unique_ptr<http::HttpClient> client =
+      rommsync::sysmodule::MakeWireHttpClient(connector);
+#else
   const std::unique_ptr<http::HttpClient> client = rommsync::host::MakeCurlHttpClient();
+#endif
   if (!rig::Reachable(*client, base)) {
     std::cerr << "rig unreachable at " << base
               << "\n  start it with: ./scripts/orca/compose.sh up -d\n";
@@ -748,7 +776,7 @@ int main(int argc, char** argv) {
   }
 
   if (failures == 0) {
-    std::cout << "http." << scenario << " ok against " << base << "\n";
+    std::cout << kSuite << "." << scenario << " ok against " << base << "\n";
   }
   return failures == 0 ? 0 : 1;
 }

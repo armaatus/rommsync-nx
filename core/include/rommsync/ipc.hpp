@@ -35,7 +35,7 @@
 // ## The bounds
 //
 // `kMaxPayloadBytes` caps **every** single request and response. The sysmodule's
-// inner heap is `0x80000` with ~390 KiB left after the trimmed bsd transfer
+// inner heap is `0xC0000` with ~650 KiB left after the trimmed bsd transfer
 // memory (docs/DEVELOPMENT.md#m0-1-the-measurement-and-the-decision), and that
 // budget already owes a download buffer and the `state.db` baseline. Nothing
 // here may grow with the size of the library: lists page (`ListBegin` /

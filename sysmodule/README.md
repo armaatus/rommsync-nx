@@ -45,23 +45,38 @@ sys-rommsync.json     # NPDM: title id, heap, service and syscall capabilities
 source/
   main.cpp            # init, service registration, and the loop
   engine.hpp/.cpp     # the ipc::Engine ServiceCore reads the console out of
+  http/
+    http_wire.hpp/.cpp       # HTTP/1.1 over an abstract Connection. No libnx.
+    ssl_http_client.hpp/.cpp # bsd + the `ssl` service under it. libnx only.
   ipc/
     server.hpp/.cpp   # the port, the session table, svcReplyAndReceive
     service.hpp/.cpp  # one cmif request in, one reply out. No logic.
 ```
 
+`http/` is split in two on purpose (M1-7, #126). `http_wire.cpp` names no libnx
+type, so the host CMake build compiles it and `ctest -R wire` drives it against
+the real docker RomM through the fault proxy — the same eighteen scenarios
+`http.*` holds libcurl's backend to, out of the same source file compiled twice
+(`tests/test_http_native.cpp`). What is left in `ssl_http_client.cpp` is opening
+a socket, handing it to `ssl`, and reading and writing through the connection
+that comes back: the only part of the transport nothing can execute before the
+M8-1 gate, and deliberately as small as it could be made.
+
 Object files are named by basename, so nothing under `source/` may share one
 with `core/src/` — `switch.mk` makes that an error rather than a silently
 dropped translation unit.
 
-Planned as the engine lands: `http/` (the `ssl`-service HttpClient backend) and
-whatever Horizon glue the sync and download workers need. The portable half of
-all of that belongs in `core/`, where it is testable without a console.
+Planned as the engine lands: whatever Horizon glue the sync and download workers
+need. The portable half of all of that belongs in `core/`, where it is testable
+without a console.
 
-## Three things in `sys-rommsync.json` to settle before hardware
+## `sys-rommsync.json`, and what is settled in it
 
-None of them matters before the **M8-1** gate, and all of them are wrong to
-guess at now — they are recorded here so they are not discovered on a console.
+The **M8-1** gate is still what confirms any of this on a console. Two of the
+three items that used to be listed here as "wrong to guess at now" stopped being
+guesses with M1-7 (#126), which gave this process a transport and so made its
+heap and its capabilities things somebody had to add up. The third is still a
+guess, and is still wrong to make now.
 
 - **Title id `0x4200000000524D53`.** The `0x42…` range is where homebrew
   sysmodules live by convention (ldn_mitm, sys-ftpd, sys-con); the low bytes
@@ -73,21 +88,29 @@ guess at now — they are recorded here so they are not discovered on a console.
   narrowed to what the engine actually opens. It is also the capability with the
   most reach in a project whose second hard rule is about not destroying a
   player's save.
-- **Heap and capabilities.** `main_thread_stack_size` and the inner heap in
-  `source/main.cpp` are the template's numbers, sized for a skeleton. M0-1
-  measured what the real budget is made of
-  ([../docs/DEVELOPMENT.md](../docs/DEVELOPMENT.md#m0-1-the-measurement-and-the-decision)):
-  the TLS context itself costs this process nothing -- it lives in the `ssl`
-  sysmodule -- and the dominant term is the bsd transfer memory, which
-  `socketInitialize` takes out of the inner heap. A trimmed socket config needs
-  **116 KiB** of the current `0x80000`; libnx's default config needs **2.25 MiB**
-  and cannot fit at all, so `socketInitializeDefault()` is the one call this
-  process must never make. Add one in-flight download buffer to that; roms stream
-  to file and never sit in RAM whole. `service_access` lists what the
-  design commits to (`fsp-srv`, `set:sys`, `ssl`, `bsd:u`, `sfdnsres`, `nifm:u`,
-  `time:s`) rather than `*`, so adding a service is a deliberate edit — and a
-  missing one fails at runtime, on hardware, which is the reason to keep the
-  list honest as each is first used.
+- **Heap and capabilities, settled.** `kInnerHeapSize` is `0xC0000` (768 KiB)
+  and is derived term by term in the table above the constant in
+  `source/main.cpp`, where a `static_assert` fails the build rather than the
+  console if a term outgrows it. The dominant term is the bsd transfer memory,
+  which `socketInitialize` takes out of that heap: the config in
+  `source/http/ssl_http_client.hpp` needs **116 KiB**, and libnx's default needs
+  **2.25 MiB** and cannot fit at all — so `socketInitializeDefault()` is the one
+  call this process must never make. Add one in-flight transfer buffer to that;
+  roms stream to file and never sit in RAM whole.
+
+  `main_thread_stack_size` went from the template's `0x4000` to `0x8000` for a
+  reason that is not the transport: the main thread is where `SdEngine::Load`
+  parses `config.ini`, `queue.json` and `auth.json`, and `json::kMaxDepth` is 64
+  — so a document a card left behind can recurse further than 16 KiB of stack
+  allows, and the failure that causes has no console to report it on.
+
+  `service_access` is now what is used and nothing more — `fsp-srv`, `set:sys`,
+  `ssl`, `bsd:u`, `sfdnsres`, `nifm:u`. `time:s` was dropped: nothing in this
+  build calls `timeInitialize`, and the `ssl` service does its own certificate
+  date checks in its own process. **The scheduler (M7-2, #37) has to put it
+  back**, together with the `timeInitialize` that makes
+  `std::chrono::system_clock` mean anything on Horizon — `core/`'s sync and
+  download paths already call it.
 
 ## Where the work is
 

@@ -484,6 +484,40 @@ foreach(scenario IN LISTS HTTP_SCENARIOS)
   set_tests_properties(http.${scenario} PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 endforeach()
 
+# --- the console's HttpClient against the same rig ---------------------------
+# M1-7 (#126). The Horizon backend is split so that the half that can be got
+# wrong is reachable from here: `sysmodule/source/http/http_wire.cpp` speaks
+# HTTP/1.1 over an abstract `Connection` and names no libnx type, so
+# `sysmodule/AGENTS.md`'s rule applies to it the way it does to `engine.cpp`.
+# `posix_connection.cpp` is compiled in beside it for the same reason and is not
+# a test double: it is the plain-TCP connector the console itself uses for an
+# `http://` origin, so what runs here is the shipping code minus the one layer
+# nothing off a console can execute -- `ssl_http_client.cpp`, which the M8-1
+# gate (#43) owns and CMake does not build at all.
+#
+# The scenarios are `test_http_native.cpp`'s, compiled a second time with a
+# different backend rather than copied, so the two clients cannot drift on what
+# `http.hpp` promises. `wire.*` and `http.*` are therefore the same eighteen
+# assertions against the same RomM.
+add_executable(test_http_wire test_http_native.cpp
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/http/http_wire.cpp"
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/http/posix_connection.cpp")
+target_link_libraries(test_http_wire PRIVATE rommsync::host Threads::Threads)
+target_include_directories(test_http_wire PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/sysmodule/source")
+target_compile_definitions(test_http_wire PRIVATE
+  ROMMSYNC_TEST_WIRE_BACKEND
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch-wire")
+
+foreach(scenario IN LISTS HTTP_SCENARIOS)
+  add_test(NAME wire.${scenario} COMMAND test_http_wire ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(wire.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  set_tests_properties(wire.${scenario} PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
+endforeach()
+
 # --- the device-code pairing flow against the real rig -----------------------
 # Same shape as the http.* tests: one CTest entry per scenario, so a red run
 # names the behaviour. Every code is one RomM issued, and the approvals go

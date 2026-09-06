@@ -17,12 +17,17 @@
 // `kUnavailable` disappearing entirely is what says the engine is finished --
 // `StartPairing` is the last one left.
 //
-// **What this build still has no backend for is the network.** Nothing
-// implements `http::HttpClient` for Horizon (M0-1 measured what TLS would cost;
-// `main.cpp` says the rest), so the `queue` list -- served off `queue.json` --
-// works in full here while `platforms` and `roms` answer `kOffline`, which is
-// what a console with no way to reach its server amounts to. `UseServer` is the
-// seam, and the host suite is what drives the paging through it (`lists.*`).
+// **The console has a transport now, and this class is still not given one.**
+// M1-7 (#126) built the Horizon `http::HttpClient` (`sysmodule/source/http/`)
+// and `main.cpp` holds one, but `UseServer` is deliberately not called with it:
+// `lists::Service` answers a page that needs a request with `ListPage::pending`
+// and makes the request in `Pump()`, so a client handed over without a thread
+// driving `PumpLists()` would turn `kOffline` -- which #25's browser draws --
+// into "pending" forever, which it cannot. So `platforms` and `roms` still
+// answer `kOffline` here while `queue`, served off `queue.json`, works in full.
+// **Whoever starts that worker installs the client in the same commit**: that is
+// M7-2 (#37). The host suite passes a libcurl client and drives the paging
+// through the same seam (`lists.*`).
 //
 // Nothing here has ever run: it is Horizon-side and is exercised in Ryujinx
 // before the M8-1 gate, never on hardware (sysmodule/AGENTS.md).
@@ -86,13 +91,15 @@ class SdEngine : public ipc::Engine {
 
   /// The network the library is read over, and the token to read it with.
   ///
-  /// **Null and empty on the console today.** This build has no HTTP backend
-  /// for Horizon -- M0-1 measured what TLS would cost and nothing implements
-  /// `http::HttpClient` there yet (`main.cpp` says so) -- so `platforms` and
-  /// `roms` answer `ipc::Error::kOffline` while `queue`, which never touches
-  /// the network, is served in full. The host suite passes a libcurl client and
-  /// the fixture token, which is what proves the paging (`lists.*`). This is
-  /// also the seam M7-2 (#37) fills when the scheduler brings a client with it.
+  /// **Null and empty on the console today, and no longer for want of a
+  /// backend.** M1-7 (#126) built the Horizon one and `main.cpp` holds a client;
+  /// what is missing is the thread. Handing one over without a `PumpLists()`
+  /// worker leaves every page that needs a request `pending` forever -- see the
+  /// note at the top of this file -- so `platforms` and `roms` answer
+  /// `ipc::Error::kOffline` while `queue`, which never touches the network, is
+  /// served in full. The host suite passes a libcurl client and the fixture
+  /// token, which is what proves the paging (`lists.*`). **M7-2 (#37) fills this
+  /// seam and starts that worker in the same commit**; neither alone is correct.
   void UseServer(http::HttpClient* client, std::string bearer_token);
 
   /// Where a rom already on the card is looked for, for a rom row's `on_disk`.
