@@ -380,7 +380,13 @@ conflicts::RestoreReport ServiceCore::RestoreBackup(std::int64_t entry_id) {
 LogTail ServiceCore::GetLog(std::int32_t lines) const {
   // Clamped here rather than at the decoder, so an over-large ask is a smaller
   // answer instead of a command documented never to fail failing.
-  const std::size_t want = lines < 1 ? 1
+  //
+  // **Zero clamps down to an empty tail, not up to one line.** `total` is still
+  // answered, so `GetLog(0)` is the cheap "has this console logged anything at
+  // all" a screen asks before it decides to draw a pane -- and a caller that
+  // asked for nothing must not be handed something. The *wire* refuses zero
+  // (`DecodeLogRequest`), so this is the in-process caller's answer.
+  const std::size_t want = lines < 0 ? 0
                            : lines > kMaxLogLines
                                ? static_cast<std::size_t>(kMaxLogLines)
                                : static_cast<std::size_t>(lines);

@@ -131,6 +131,33 @@ void RedactUserInfo(std::string* text) {
   }
 }
 
+/// Replace the value starting at `from` with `kRedacted`, and answer where to
+/// carry on scanning from.
+///
+/// The tail both redactors below share: skip the spaces, notice a quote and step
+/// over it, find where the value ends, and put the placeholder in. An empty
+/// value is left alone -- there is no secret in one, and replacing it would
+/// claim a field had held something.
+std::size_t RedactValueAt(std::string* text, std::size_t from) {
+  while (from < text->size() && ((*text)[from] == ' ' || (*text)[from] == '\t')) {
+    ++from;
+  }
+  const char quote =
+      from < text->size() && ((*text)[from] == '"' || (*text)[from] == '\'') ? (*text)[from]
+                                                                            : '\0';
+  if (quote != '\0') {
+    ++from;
+  }
+  const std::size_t end = ValueEnd(*text, from, quote);
+  if (end <= from) {
+    // Advancing by one rather than by the replacement's length, which would skip
+    // bytes nothing replaced.
+    return from + 1;
+  }
+  text->replace(from, end - from, kRedacted);
+  return from + std::strlen(kRedacted);
+}
+
 /// True when a `Bearer` starting at `at` is a *header value* rather than the
 /// English word.
 ///
@@ -162,25 +189,7 @@ void RedactBearer(std::string* text) {
       ++at;
       continue;
     }
-    std::size_t from = at + kBearer.size();
-    while (from < text->size() && (*text)[from] == ' ') {
-      ++from;
-    }
-    const char quote = from < text->size() && ((*text)[from] == '"' || (*text)[from] == '\'')
-                           ? (*text)[from]
-                           : '\0';
-    if (quote != '\0') {
-      ++from;
-    }
-    const std::size_t end = ValueEnd(*text, from, quote);
-    if (end <= from) {
-      // `Bearer` with nothing after it. Advancing by one rather than by the
-      // replacement's length, which would skip bytes nothing replaced.
-      at = from + 1;
-      continue;
-    }
-    text->replace(from, end - from, kRedacted);
-    at = from + std::strlen(kRedacted);
+    at = RedactValueAt(text, at + kBearer.size());
   }
 }
 
@@ -218,26 +227,34 @@ void RedactKeyedValues(std::string* text) {
       continue;
     }
 
-    std::size_t from = at + 1;
-    while (from < text->size() && ((*text)[from] == ' ' || (*text)[from] == '\t')) {
-      ++from;
-    }
-    const char quote = from < text->size() && ((*text)[from] == '"' || (*text)[from] == '\'')
-                           ? (*text)[from]
-                           : '\0';
-    if (quote != '\0') {
-      ++from;
-    }
-    const std::size_t end = ValueEnd(*text, from, quote);
-    if (end <= from) {
-      // Nothing between the separator and the terminator: an empty value is
-      // already no secret, and replacing it would claim one had been there.
-      at = from;
-      continue;
-    }
-    text->replace(from, end - from, kRedacted);
-    at = from + std::strlen(kRedacted);
+    at = RedactValueAt(text, at + 1);
   }
+}
+
+/// The largest `at <= limit` that does not fall inside a UTF-8 sequence.
+///
+/// A line carries a save's file name, which is the user's data and is very often
+/// not ASCII. Cutting at a fixed byte count lands mid-sequence about half the
+/// time for a name that reaches the bound, and the result is a stray byte that
+/// renders as a replacement character in a text editor and in the overlay's
+/// font. Backing off costs at most three bytes.
+///
+/// Continuation bytes are `10xxxxxx`; anything else starts a character. A run of
+/// continuations longer than a sequence can be is malformed input, and the loop
+/// stopping at `limit - 3` leaves it alone rather than eating the line.
+std::size_t Utf8BoundaryAt(std::string_view text, std::size_t limit) {
+  // `at == text.size()` is the clamp's own answer and there is nothing to back
+  // off from there -- the whole text is being kept. It is also the one index
+  // `std::string_view::operator[]` will not take: unlike `std::string`'s, it is
+  // undefined at `size()`, so the bound is in the loop rather than assumed away
+  // by the only call site.
+  std::size_t at = limit < text.size() ? limit : text.size();
+  const std::size_t floor = at > 3 ? at - 3 : 0;
+  while (at > floor && at < text.size() &&
+         (static_cast<unsigned char>(text[at]) & 0xC0) == 0x80) {
+    --at;
+  }
+  return at;
 }
 
 /// `text` with every newline, carriage return and tab turned into a space.
@@ -356,7 +373,7 @@ void Write(Level level, Event event, std::string_view detail) {
       // The marker is part of the bound rather than added past it: the point of
       // the bound is what one line costs, and a line that announced its own
       // truncation by exceeding the limit would defeat it.
-      line.resize(kMaxLineBytes > marker ? kMaxLineBytes - marker : 0);
+      line.resize(Utf8BoundaryAt(line, kMaxLineBytes > marker ? kMaxLineBytes - marker : 0));
       line += kTruncationMarker;
     }
 
@@ -374,6 +391,14 @@ void Write(Level level, Event event, std::string_view detail) {
   // handles.
   if (sink != nullptr) {
     sink->Write(level, line);
+  }
+}
+
+void WriteEach(Level level, Event event, const std::vector<std::string>& lines) {
+  for (const std::string& line : lines) {
+    if (!line.empty()) {
+      Write(level, event, line);
+    }
   }
 }
 

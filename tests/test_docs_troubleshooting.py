@@ -237,13 +237,27 @@ def phase_emitted(args) -> int:
                         sources.append(path)
     if not sources:
         return fail(f"no sources found under {CALL_SITE_DIRS}")
+    # Comments stripped first. These files explain themselves at length and name
+    # `log::Event::kNoServer` and friends in prose constantly, so a sweep over
+    # the raw text would stay green after somebody deleted a call and left the
+    # paragraph above it -- exactly the rot this phase exists to catch. `///`
+    # doc comments are covered by the line rule.
     body = "\n".join(read(path) for path in sources)
+    body = re.sub(r"/\*.*?\*/", " ", body, flags=re.DOTALL)
+    body = re.sub(r"//[^\n]*", "", body)
 
-    orphans = sorted(tag for tag, name in known.items() if f"Event::{name}" not in body)
+    # A *call*, not a mention: one of the five entry points, an open paren, and
+    # the event within the same statement. The level argument in between may be a
+    # literal or a call (`LevelFor(note.severity)`), so it is matched loosely and
+    # bounded by the statement's own semicolon.
+    orphans = sorted(
+        tag for tag, name in known.items()
+        if not re.search(rf"\b(?:Error|Warn|Info|Write|WriteEach)\s*\([^;]{{0,80}}?"
+                         rf"Event::{name}\b", body))
     if orphans:
         return fail(f"docs/TROUBLESHOOTING.md documents {orphans}, and nothing outside the "
-                    "log module ever writes them. A section about a line the code cannot "
-                    "produce is worse than no section.")
+                    "log module ever *writes* them -- a mention in a comment does not count. "
+                    "A section about a line the code cannot produce is worse than no section.")
 
     print(f"every one of {len(known)} events has a call site across {len(sources)} sources")
     return 0
@@ -339,6 +353,18 @@ def phase_structure(args) -> int:
         return fail("docs/TROUBLESHOOTING.md's sections are not #38's, in order.\n"
                     "  expected: " + " / ".join(SECTIONS) + "\n"
                     "  found:    " + " / ".join(found))
+
+    # The guide quotes whole log lines, and only the first three fields of one
+    # are a contract -- `phase_events` pins those and deliberately pins nothing
+    # after the tag (core/include/rommsync/log.hpp says why). A page that quoted
+    # a detail without saying so would be promising more than any test here
+    # keeps, so it has to say so.
+    reading = text[text.index("## " + SECTIONS[0]): text.index("## " + SECTIONS[1])]
+    if "first three fields" not in reading:
+        return fail("the 'Reading the log' section does not say that only the ordinal, the "
+                    "level and the event tag are promised. The detail after the tag is not "
+                    "pinned by any test, and a guide that quotes one without saying so is "
+                    "promising a wording that will move.")
 
     head = text[: text.index("## " + SECTIONS[0])]
     if not re.search(r"not yet validated on hardware", head, re.IGNORECASE):

@@ -641,6 +641,22 @@ int RoundTrip() {
     checks.Expect(empty.ok() && empty.value.lines.empty() && empty.value.total == 0,
                   "an empty tail is a tail -- a sysmodule that has logged nothing is running");
 
+    // `GetLog(0)` clamps *down*: it is the cheap "has this console logged
+    // anything at all", and a caller that asked for nothing must not be handed
+    // something. The total is answered either way, which is what makes it a
+    // useful question.
+    {
+      FakeEngine quiet;
+      ipc::ServiceCore core(quiet);
+      log::Reset();
+      log::Info(log::Event::kBoot, "something happened");
+      const ipc::LogTail none = core.GetLog(0);
+      checks.Expect(none.lines.empty(), "a request for no lines answers no lines");
+      checks.ExpectEq(none.total, std::int64_t{1}, "and still says how many there are");
+      checks.ExpectEq(core.GetLog(4 * ipc::kMaxLogLines).lines.size(), std::size_t{1},
+                      "while an over-large ask is clamped rather than refused");
+    }
+
     const ipc::Decoded<std::int32_t> asked = ipc::DecodeLogRequest(ipc::EncodeLogRequest(8));
     checks.Expect(asked.ok() && asked.value == 8, "the request round trips");
     checks.Expect(!ipc::DecodeLogRequest("{\"lines\":0}").ok(),

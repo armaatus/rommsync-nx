@@ -1168,9 +1168,14 @@ class ServiceCore {
   conflicts::RestoreReport RestoreBackup(std::int64_t entry_id);
 
   /// Command 16. The last `lines` lines of this process's log, clamped to
-  /// `kMaxLogLines`. Never fails: a console that has logged nothing has an empty
-  /// tail, and that is itself an answer -- it says the sysmodule is running and
-  /// has not got as far as a tick.
+  /// `[0, kMaxLogLines]`. Never fails: a console that has logged nothing has an
+  /// empty tail, and that is itself an answer -- it says the sysmodule is
+  /// running and has not got as far as a tick.
+  ///
+  /// `0` is an empty tail with the total still filled in, which is the cheap
+  /// question "has this console logged anything" -- not one line. The wire
+  /// refuses `0` outright (`DecodeLogRequest`), so that answer is only ever an
+  /// in-process caller's.
   ///
   /// **Answered from `log::Tail` rather than through `Engine`.** The log is
   /// process state, like `io::FileSync`, and not something the engine holds --

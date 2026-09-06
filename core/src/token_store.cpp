@@ -145,7 +145,14 @@ std::string DescribeStoredToken(const StoredToken& token) {
     }
     out += token.scopes[at];
   }
-  out += "] token=";
+  // **Spelled `credential=` and deliberately not `token=`.** A field literally
+  // named `token` is what any redactor treats as a secret -- `log::Redact` does,
+  // and so does a human running `grep -i token` over a log somebody pasted --
+  // and this line's whole job is to be the one summary that survives being
+  // logged. Redacted, it would read `token=<redacted>` for a console with no
+  // credentials and `token=<redacted>(68 chars)` for one that has them, which
+  // loses the single bit a support thread most needs (M7-3, #38).
+  out += "] credential=";
   out += token.access_token.empty()
              ? std::string("absent")
              : "present(" + std::to_string(token.access_token.size()) + " chars)";

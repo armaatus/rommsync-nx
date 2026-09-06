@@ -41,10 +41,13 @@ Every line is the same four fields:
 
 ```
 1 info boot rommsync-nx/0.1.0
-2 info auth.token server=https://romm.example.com device=console-1 scopes=[roms.read] token=<redacted>(68 chars) expires=never
-3 warn net.offline GET /api/roms: connection failed; the rom index could not be fetched
+2 info auth.token server=https://romm.example.com device=console-1 scopes=[roms.read] credential=present(68 chars) expires=never
+3 warn net.offline GET /api/roms: connection failed; the rom index could not be fetched: connection failed (Connection refused)
 4 info sync.tick outcome=offline completed=0 failed=0 states_completed=0 states_failed=0 baseline=not stored
 ```
+
+That is a whole failed sync: the build, the pairing it is using, what went
+wrong, and how the tick ended.
 
 - **ordinal** counts up from 1 for as long as the sysmodule has been running. It
   is what orders the file, and a jump back to `1` is a reboot.
@@ -53,6 +56,17 @@ Every line is the same four fields:
 - **event** is the tag this page is organised by. Find it in the table below and
   read that section.
 - **detail** is whatever the part that failed had to say.
+
+**Only the first three fields are promised.** The ordinal, the level and the
+event tag are a contract — a build is tested against the tag list in this page,
+both ways. The detail after the tag is the sentence the failing part already had
+for itself, and its exact wording moves when that part's does. So match what you
+see against the **tag**, and read the detail; do not expect it word for word.
+
+**Every tick ends with a `sync.tick` line**, whatever ended it — including the
+ones that give up before they send anything. So the quickest way to read a log
+is backwards: find the last `sync.tick`, read its `outcome=`, and then read
+upwards to the lines that explain it.
 
 **There is no timestamp, deliberately.** A Switch answers "what time is it" with
 nothing usable until the clock service has come up, and a console whose clock
@@ -87,7 +101,7 @@ and a log is not worth it. A save is never in that position; see
 | `scan.skipped` | a save file was not matched to a rom | [Saves are skipped: nothing matches](#saves-are-skipped-nothing-matches) |
 | `sync.refused` | the server answered, and the answer will not change | [The server refused the sync](#the-server-refused-the-sync) |
 | `save.failed` | a save could not be written — usually a full card | [The SD card is full](#the-sd-card-is-full) |
-| `sync.tick` | how one sync ended | [What to attach to a bug report](#what-to-attach-to-a-bug-report) |
+| `sync.tick` | how one sync ended — every tick writes one | [What to attach to a bug report](#what-to-attach-to-a-bug-report) |
 
 The overlay does not show the log yet. `sys-rommsync` serves it over IPC —
 `GetLog`, command 16 in [DEVELOPMENT.md](DEVELOPMENT.md#the-command-set) — so a
@@ -104,10 +118,14 @@ in RomM and never come back from it. Nothing changes on the card.
 **Log line.**
 
 ```
-3 warn net.offline GET /api/roms: connection failed; the rom index could not be fetched
-3 warn net.offline negotiate: host could not be resolved
+3 warn net.offline GET /api/roms: body ended early; the rom index could not be fetched: body ended early (transfer closed with 14822 bytes remaining to read)
+3 warn net.offline negotiate: connection failed; the negotiation never completed
 2 warn net.offline tick skipped: this build has no transport
 ```
+
+The part before the `;` is where it failed and how — `GET /api/roms` is the
+library fetch a tick starts with, `negotiate` is the call that decides what
+syncs. The part after it is the same failure as that step already described it.
 
 **What is happening.** The request never completed — the name did not resolve,
 the connection was refused, the link went away mid-body, or the server stopped
@@ -155,7 +173,13 @@ refresh, so nothing here comes back on its own
 ([AUTH.md](AUTH.md#re-pairing--revocation)).
 
 After a few rejections in a row the console stops asking altogether, and only a
-new pairing lifts that.
+new pairing lifts that. A console in that state writes two lines per sync
+interval and makes no request at all:
+
+```
+41 error auth.rejected this console is blocked until it is paired again; no request will be made
+42 info sync.tick outcome=unauthorized completed=0 failed=0 states_completed=0 states_failed=0 baseline=not stored
+```
 
 **The fix.** Pair the console again — **Re-pair** on the overlay's settings
 screen, or step 4 of [INSTALL.md](INSTALL.md#4-pair-the-console). Re-pairing
@@ -214,8 +238,12 @@ every request failing instantly rather than slowly.
 **Log line.**
 
 ```
-3 error net.tls GET /api/roms: TLS failure; the rom index could not be fetched: TLS failure
+2 error net.tls GET /api/roms: TLS failure; the rom index could not be fetched: TLS failure (error:1404B42E:SSL routines:ST_CONNECT:tlsv1 alert protocol version)
 ```
+
+The text in brackets is the TLS library's own, and it is the most useful part:
+`alert protocol version` is cause 3 below, and a message naming a certificate or
+a hostname is cause 1 or 2.
 
 **What is happening.** The handshake did not complete, or the certificate was
 not one the console trusts. It is kept apart from `net.offline` because it does
@@ -413,6 +441,10 @@ time no matter how long you wait.
 7 warn sync.refused sync disabled: sync is disabled for this device
 ```
 
+The first of those is a truncated or non-RomM body, and it is the one that reads
+like a bug in this client and is not: the offset is where the parse gave up on
+whatever answered.
+
 **What is happening.** The server answered, and the answer will not be different
 next time — which is why this is not `net.offline`. Three real causes:
 
@@ -444,8 +476,13 @@ Four things, and the log has three of them:
    the token, which is reduced to its length before it is ever written:
 
    ```
-   2 info auth.token server=https://romm.example.com device=console-1 scopes=[roms.read] token=<redacted>(68 chars) expires=never
+   2 info auth.token server=https://romm.example.com device=console-1 scopes=[roms.read] credential=present(68 chars) expires=never
    ```
+
+   The field is `credential=`, not `token=`, and only ever says *absent* or how
+   many characters long the token is. It is named that way on purpose: a field
+   called `token` is one the redactor blanks, and blanking it would lose the one
+   thing this line is for — whether this console has credentials at all.
 
 3. **The last tick.** What the sync did, or did not:
 

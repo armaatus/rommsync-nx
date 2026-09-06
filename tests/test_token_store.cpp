@@ -25,6 +25,7 @@
 
 #include "checks.hpp"
 #include "rommsync/atomic_file.hpp"
+#include "rommsync/log.hpp"
 #include "rommsync/pairing.hpp"
 #include "rommsync/token_store.hpp"
 
@@ -540,6 +541,24 @@ void NoSecretReachesALogLine(checks::Checks& c) {
   c.Expect(described.find("me.read") != std::string::npos, "and the scopes");
   c.Expect(described.find(std::to_string(kToken.size())) != std::string::npos,
            "and that there is a token, by length only");
+
+  // The field is `credential=`, not `token=`, and that is not cosmetic: this
+  // line exists to be written to `sdmc:/config/rommsync/rommsync.log`, and
+  // `log::Redact` blanks the value of any field whose *name* says secret. Named
+  // `token` it would come out as `token=<redacted>` whether or not there is one
+  // -- losing the bit a support thread starts from (M7-3, #38).
+  c.Expect(described.find("token=") == std::string::npos,
+           "no field here is named `token`, so a redactor leaves the summary alone: " +
+               described);
+  c.Expect(rommsync::log::Redact(described) == described,
+           "and the summary really does survive redaction unchanged: " +
+               rommsync::log::Redact(described));
+  auth::StoredToken unpaired = token;
+  unpaired.access_token.clear();
+  const std::string none = auth::DescribeStoredToken(unpaired);
+  c.Expect(none.find("absent") != std::string::npos,
+           "a console with no credentials says so, in a word redaction does not take: " + none);
+  c.Expect(rommsync::log::Redact(none) == none, "which also survives redaction");
 }
 
 }  // namespace

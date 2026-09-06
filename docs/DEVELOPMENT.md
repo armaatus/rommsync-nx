@@ -133,7 +133,9 @@ console rather than loudly here:
 - **No `flags/boot2.flag`, and no `config.ini`.** The sysmodule ships disabled
   (#33), and an upgrade is this same zip unpacked over the top — replacing a
   user's settings is not something a release may do. `token.dat`, `device.dat`,
-  `state.db` and `queue.json` are not in the archive either, so they survive.
+  `state.db`, `queue.json` and `rommsync.log` are not in the archive either, so
+  they survive — the log in particular, because the failure a user is about to
+  report is usually the one they upgraded to fix.
 - **The archive is byte-deterministic** — fixed entry order, timestamps and
   permissions — so the checksums a release publishes describe the build and not
   one upload.

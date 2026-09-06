@@ -170,6 +170,10 @@ bool IsEvent(std::string_view tag, Event* out = nullptr);
 /// marker rather than dropped: the tag and the start of the detail are the part
 /// that identifies the failure, and losing the line entirely would lose those
 /// too.
+///
+/// **The cut is taken at a UTF-8 boundary**, up to three bytes short of this,
+/// because a save's name is very often not ASCII and half a character renders as
+/// a replacement box in a text editor and in the overlay's font alike.
 inline constexpr std::size_t kMaxLineBytes = 256;
 
 /// What the marker says. Public because the doc test greps for it, and because
@@ -249,6 +253,15 @@ inline void Info(Event event, std::string_view detail) { Write(Level::kInfo, eve
 /// Empty lines are dropped; an empty `text` writes nothing at all, which is what
 /// makes "log the diagnostics" safe to call on a file with none.
 void WriteEach(Level level, Event event, std::string_view text);
+
+/// One line each, for a caller that already has them apart.
+///
+/// The three reports a tick hands up -- `ExecutionReport::warnings`,
+/// `TickCompletion::warnings`, `RecoveryReport::warnings` -- are already a
+/// `vector<string>`, where the describers above render one block. Both spellings
+/// exist so neither caller has to convert into the other's shape and back.
+/// Empty entries are dropped, as they are above.
+void WriteEach(Level level, Event event, const std::vector<std::string>& lines);
 
 /// One line as the tail remembers it.
 struct Line {

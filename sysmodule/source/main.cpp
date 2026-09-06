@@ -43,6 +43,7 @@
 #include "rommsync/list_service.hpp"
 #include "rommsync/log.hpp"
 #include "rommsync/state_db.hpp"
+#include "rommsync/version.hpp"
 
 namespace {
 
@@ -79,7 +80,10 @@ namespace {
 //     costs its stack out of this heap.
 //   * **The log keeps its last lines in RAM**, so `GetLog` can answer without
 //     going near the card (log.hpp). It is `kTailLines * kMaxLineBytes` at
-//     worst, and it is a term here rather than a cost nobody added up.
+//     worst, and it is a term here rather than a cost nobody added up. That is
+//     the **content**: the per-`std::string` header and the deque's blocks are
+//     allocator overhead and belong to the newlib term below, which is what that
+//     term is for.
 //
 // 0xC0000 leaves 0x17800 -- 94 KiB -- over that peak, which is the margin a
 // process nobody can attach a debugger to needs: a `bad_alloc` here is
@@ -371,6 +375,13 @@ void __appExit(void) {
 }  // extern "C"
 
 int main(int, char**) {
+  // Before anything writes, and once: `io::SetFileSync` is process-wide and is
+  // not meant to be swapped while a write is in flight (atomic_file.hpp). First
+  // in `main` since M7-3 (#38) rather than after the boot lines, because the
+  // card is now built above them and an ordering where a hook is installed after
+  // the first thing that touches the card is one somebody eventually relies on.
+  rommsync::io::SetFileSync(&HorizonFileSync);
+
   // The card, and the log on it, before anything else says anything (M7-3, #38).
   //
   // `MakeSdCard` is built here rather than where M7-2 (#37) built it -- it holds
@@ -383,6 +394,13 @@ int main(int, char**) {
   // left to report it to, and the log's in-memory tail still answers `GetLog` --
   // a client that stopped syncing over a log file it could not write would have
   // the tail wagging the dog. `fsdevMountSdmc` has already run, in `__appInit`.
+  //
+  // **What this costs at boot**, stated rather than left to be measured: one
+  // `mkdir` and one append of a few dozen bytes. It is SD I/O on the boot path
+  // and it is bounded -- `engine.Load()` a few lines below already reads five
+  // files off the same card, and the rule that matters is that nothing here
+  // touches the *network* (CLAUDE.md, "Never block boot"), which is still true.
+  // Nothing in this block waits on anything.
   g_card = rommsync::sysmodule::MakeSdCard();
   static_cast<void>(g_card->CreateDirectory(rommsync::sysmodule::kConfigSdDir));
   g_log = std::make_unique<rommsync::log::FileSink>(
@@ -390,14 +408,15 @@ int main(int, char**) {
   rommsync::log::SetSink(g_log.get());
 
   // A crash dump or a debug log that cannot say which build produced it costs
-  // an afternoon, and version() is the cheapest possible answer. It goes to the
+  // an afternoon, and this is the cheapest possible answer. It goes to the
   // debugger and to the card, which is `Log`'s whole job -- and it is the first
   // line of the file docs/TROUBLESHOOTING.md asks a user to attach.
-  Log(rommsync::version());
-
-  // Before anything writes, and once: `io::SetFileSync` is process-wide and is
-  // not meant to be swapped while a write is in flight (atomic_file.hpp).
-  rommsync::io::SetFileSync(&HorizonFileSync);
+  //
+  // `kUserAgent` rather than `version()`: they differ by the `rommsync-nx/`
+  // prefix, and the prefixed one is what RomM records against every request
+  // this console makes (`version.hpp`). A support thread that has the server's
+  // logs and the console's should be reading the same string in both.
+  Log(rommsync::kUserAgent);
 
   // Which way this console's `client_device_identifier` will be derived, and
   // whether this build has a transport at all. Two lines at boot because they

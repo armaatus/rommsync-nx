@@ -1565,6 +1565,19 @@ void LogsMisconfiguration(checks::Checks& c) {
     const ipc::LogTail tail = console.Log();
     c.Expect(Logged(tail, "net.offline"),
              "with a line saying the tick was skipped and why:" + Rendered(tail));
+
+    // **Every path out of a tick writes a `sync.tick`, including the ones that
+    // return before a plan exists.** The guide teaches a user that a tick ends
+    // with this line and that `outcome=` is where to start reading; the four
+    // early returns are the commonest failures there are, so a summary that
+    // skipped them would be teaching it for the cases it is least true.
+    bool summarised = false;
+    for (const std::string& line : tail.lines) {
+      summarised = summarised || (line.find("sync.tick") != std::string::npos &&
+                                  line.find("outcome=offline") != std::string::npos);
+    }
+    c.Expect(summarised,
+             "and a tick that never reached a plan still says how it ended:" + Rendered(tail));
   }
 }
 
@@ -1657,10 +1670,20 @@ int LogsTransportFailures(http::HttpClient& client, const std::string& base) {
     c.Expect(Logged(tail, scenario.tag),
              std::string(scenario.name) + ": the guide's section for it is `" + scenario.tag +
                  "`, and that is what the code writes:" + Rendered(tail));
+    bool summarised = false;
     for (const std::string& line : tail.lines) {
       c.Expect(line.find(fixture.token) == std::string::npos,
                std::string(scenario.name) + ": and no line carries the token: " + line);
+      // `http::ToString(http::Error::kNone)` is "ok", and a failure line that
+      // gave it as the reason once read `net.offline negotiate: ok` -- the
+      // client blaming a request that succeeded. Nothing that reports a failure
+      // may name it.
+      c.Expect(!(line.find(" net.offline ") != std::string::npos && line.find(": ok;") != std::string::npos),
+               std::string(scenario.name) + ": no failure is reported as `ok`: " + line);
+      summarised = summarised || line.find("sync.tick") != std::string::npos;
     }
+    c.Expect(summarised,
+             std::string(scenario.name) + ": the tick still says how it ended:" + Rendered(tail));
   }
   rig::DisarmFault(client, base);
   return c.failures();

@@ -63,6 +63,30 @@ std::size_t SizeOf(const std::string& path) {
   return error ? 0 : static_cast<std::size_t>(size);
 }
 
+/// True when `text` ends on a complete UTF-8 character.
+///
+/// Not "the last byte is not a continuation byte", which is the tempting check
+/// and the wrong one: a complete three-byte character *ends* on a continuation
+/// byte. What has to hold is that the last **lead** byte's sequence is entirely
+/// inside `text` -- so this walks back to it and compares the length it declares
+/// against what is actually there.
+bool EndsOnACharacter(const std::string& text) {
+  if (text.empty()) {
+    return true;
+  }
+  std::size_t lead = text.size() - 1;
+  while (lead > 0 && (static_cast<unsigned char>(text[lead]) & 0xC0) == 0x80) {
+    --lead;
+  }
+  const unsigned char byte = static_cast<unsigned char>(text[lead]);
+  const std::size_t declared = byte < 0x80         ? 1
+                               : (byte & 0xE0) == 0xC0 ? 2
+                               : (byte & 0xF0) == 0xE0 ? 3
+                               : (byte & 0xF8) == 0xF0 ? 4
+                                                       : 1;
+  return lead + declared == text.size();
+}
+
 std::size_t CountLines(const std::string& text) {
   std::size_t lines = 0;
   for (const char letter : text) {
@@ -139,6 +163,16 @@ void Renders(checks::Checks& c) {
                recorder.lines[5].find("line 12 ") != std::string::npos,
            "in the order the describer rendered them");
 
+  // The other spelling, for the reports that hand up a vector rather than a
+  // block. Same rule about empties, so neither caller has to convert into the
+  // other's shape.
+  log::WriteEach(log::Level::kError, log::Event::kSaveFailed,
+                 std::vector<std::string>{"upload Game.srm: refused", "", "the baseline"});
+  c.ExpectEq(recorder.lines.size(), std::size_t{8}, "a vector writes one line each too");
+  c.Expect(recorder.lines[6].find("upload Game.srm") != std::string::npos &&
+               recorder.lines[7].find("the baseline") != std::string::npos,
+           "in order, with the empty entry dropped");
+
   // The bound is on the whole line, marker included: a line that announced its
   // own truncation by exceeding the limit would defeat the limit.
   const std::string enormous(4 * log::kMaxLineBytes, 'x');
@@ -151,6 +185,29 @@ void Renders(checks::Checks& c) {
            "and says so, rather than ending mid-word: " + cut.substr(cut.size() - 24));
   c.Expect(cut.find("scan.skipped") != std::string::npos,
            "with the tag still in it -- the part that identifies the failure survives");
+
+  // A save's name is the user's data and is very often not ASCII, so the cut is
+  // taken at a character boundary rather than at a byte count. Built so that a
+  // three-byte character straddles the limit whatever the prefix costs: every
+  // length in a four-byte window is tried, and none of them may leave a
+  // continuation byte at the end of the text.
+  for (std::size_t pad = 0; pad < 4; ++pad) {
+    std::string wide(pad, 'a');
+    while (wide.size() < 2 * log::kMaxLineBytes) {
+      wide += "\xe6\x97\xa5";  // U+65E5, three bytes
+    }
+    log::Info(log::Event::kScanSkipped, wide);
+    const std::string& line = recorder.lines.back();
+    const std::string body = line.substr(0, line.size() - std::strlen(log::kTruncationMarker));
+    c.Expect(EndsOnACharacter(body),
+             "a truncated line never ends inside a UTF-8 character (pad " +
+                 std::to_string(pad) + ")");
+    c.Expect(line.size() <= log::kMaxLineBytes,
+             "and backing off to the boundary never pushes it over the bound");
+    c.Expect(line.size() + 3 > log::kMaxLineBytes,
+             "nor costs more than the one character it had to drop: " +
+                 std::to_string(line.size()));
+  }
 }
 
 // --- the secrets --------------------------------------------------------------
