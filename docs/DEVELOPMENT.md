@@ -212,11 +212,12 @@ and its `.backup/` copy is beside it — but the file the console looks for is
 absent in the meantime. Sweeping anyway would be a disabled sysmodule renaming
 files on the card, which is what the switch promises it will not do.
 
-Nothing in the shipped build calls `RunTick` yet — the scheduler is M7-2 (#37) —
-so today that gate is proven at the seam rather than end to end. #37 sets it
-from `config.sync.enabled` and parks the timer as well; a scheduler that woke up
-every interval only to be refused would still be spending the wakeups this
-project's idle-cost requirement is about.
+The shipped build calls `RunTick` from `SdEngine`'s worker since M7-2 (#37),
+which sets that gate from `config.sync.enabled` and parks the timer as well: a
+scheduler that woke up every interval only to be refused would still be spending
+the wakeups this project's idle-cost requirement is about. `ctest -R sched`
+covers the parking with an injected clock and `ctest -R toggle` the gate under
+it.
 
 ### The four states the overlay draws
 
@@ -593,7 +594,8 @@ refusal that would send a user looking for a full queue or a failing SD card.
 Each of M3-2, M5-3, M5-4 and M7-2 removes its own use of it, and the last one to
 go is what says the engine is finished (`sysmodule/source/engine.hpp`). M3-2
 took the queue commands off that list, M5-3 took `SetConfig` and `SetEnabled`,
-and M5-4 took the three list commands; what is left is `StartPairing`.
+M5-4 took the three list commands, and M7-2 took the last of `SyncNow`'s;
+`StartPairing` on a build with no transport is what is left.
 
 The list commands came off it in a way worth knowing about, because `kOffline`
 does some of the work `kUnavailable` used to. The paging engine is `core/`'s
@@ -603,17 +605,19 @@ implements the interface there yet. So on a console the `queue` kind, which is
 served off `queue.json` and never touches the network, works in full, while
 `platforms` and `roms` answer `kOffline`: the same sentence a console with its
 Wi-Fi off gets, which is what a build with no network amounts to.
-`SdEngine::UseServer` is the seam M7-2 fills, and the host suite passes it a
-libcurl client and the fixture token, which is what proves the paging
-(`lists.*`).
+`SdEngine::UseServer` is the seam M7-2 filled: `main.cpp` now installs M1-7's
+Horizon client through it and starts the worker that drives `PumpLists()` in the
+same breath, which is the pair that had to land together -- a client with no
+worker turns "offline" into "pending" forever. The host suite passes it a libcurl
+client and the fixture token, which is what proves the paging (`lists.*`).
 
-`SyncNow` is the one command that cannot say it, and the reason is the seam
-rather than a choice: `ipc::Engine::RequestSync()` is a `bool`, so an engine
-that has not been built answers `false` and `ServiceCore` reports
-`already_running` -- exactly the plausible refusal the rule above exists to
-avoid. Widening `RequestSync` to an `Error` would be a contract change for one
-caller that M7-2 is about to make true anyway, so it is recorded here and in
-`engine.cpp` instead of papered over.
+`SyncNow` used to be the one command that could not say it: `ipc::Engine::RequestSync()`
+is a `bool`, so an engine that had not been built answered `false` and
+`ServiceCore` reported `already_running` -- exactly the plausible refusal the
+rule above exists to avoid. M7-2 (#37) removed the cause rather than widening the
+signature: `RequestSync` now starts a tick and answers `false` for one reason
+only, which is a tick already running -- the same fact `Status::sync_in_progress`
+carries, so the overlay's greyed button and the sysmodule cannot disagree.
 
 `Status` carries the interface version and the build, the enable switch, the auth
 state (paired / unauthenticated / never paired), configured, online, the last

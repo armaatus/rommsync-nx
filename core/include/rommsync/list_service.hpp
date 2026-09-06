@@ -59,14 +59,14 @@
 // A page that fails is a failed page. The cursor keeps its offset and stays
 // usable, because the alternative is a list that wedges on one timeout.
 //
-// `Pump()` is the only thing here that runs on another thread, so the two
-// backends it uses are copied out under the lock before the request is made.
-// The **configuration** is not, and cannot be: `ipc::Engine::config()` hands out
-// a reference, so a `SetConfig` on the IPC thread frees a `Config` a page build
-// may be reading (`sysmodule/source/engine.hpp` states that seam and what has to
-// change to close it -- a snapshot rather than a reference). Nothing on the
-// console drives `Pump()` yet, which is why it is a note rather than a bug; the
-// issue that starts the worker is M7-2 (#37), and it is written there.
+// `Pump()` is the only thing here that runs on another thread, so everything it
+// uses is copied out under the lock before the request is made: the two
+// backends, and -- since M7-2 (#37) started the worker that drives it -- the
+// **configuration**. That one used to be held as a reference, which was a data
+// race the moment anything but the IPC thread read it: `SetConfig` replaces the
+// whole `Config`. `Service::ConfigSource` is what closed it, and it is the
+// snapshot `sysmodule/source/engine.hpp` said would have to replace the
+// reference.
 #pragma once
 
 #include <chrono>

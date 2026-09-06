@@ -1206,6 +1206,59 @@ void Unreachable(checks::Checks& c) {
 
 // --- what is still not built --------------------------------------------------
 
+/// M7-2 (#37): "Sync now" starts a tick, and says so.
+///
+/// Before this issue `SdEngine::RequestSync` returned `false` unconditionally
+/// and `ServiceCore::SyncNow` reported that as `kAlreadyRunning`, so a
+/// configured, paired, idle console was told *a sync is already running* when
+/// nothing was (#24 said so at length). This is that answer, and the worker
+/// behind it.
+void SyncNowStarts(checks::Checks& c) {
+  Console console(c, "engine-syncnow");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\n"
+                                 "url = https://romm.example.com\n"
+                                 "\n"
+                                 "[sync]\n"
+                                 "enabled = true\n"
+                                 // Boot and on demand only, so the one tick this
+                                 // scenario counts is the one it asked for.
+                                 "interval_min = 0\n"),
+           "a configured card");
+  auth::StoredToken token;
+  token.server_url = "https://romm.example.com";
+  token.access_token = "not-a-real-token";
+  token.device_id = "console-syncnow";
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+           "and a paired one, so nothing in front of the engine refuses the command");
+  console.Boot();
+
+  c.Expect(!console.Status().sync_in_progress, "an idle console is not drawn as syncing");
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted,
+           "Sync now is accepted rather than answered with 'one is already running'");
+
+  // The worker, which this build has for the first time. It has no
+  // `http::HttpClient` -- nothing installed one -- so the tick it runs cannot
+  // negotiate and settles as a failure, which is the honest answer and the one
+  // the status screen draws.
+  console.engine.StartWorker();
+  ipc::Status status = console.Status();
+  for (int waited = 0; waited < 200 && status.last_sync_result == ipc::SyncResult::kNever;
+       ++waited) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    status = console.Status();
+  }
+  c.Expect(status.last_sync_result == ipc::SyncResult::kFailed,
+           "a console with no transport fails the tick rather than reporting a sync");
+  c.Expect(!status.sync_in_progress, "and is not left marked as syncing afterwards");
+
+  // The one thing `RequestSync` is allowed to answer false for is a tick already
+  // running, which is the same fact `sync_in_progress` carries -- so on an idle
+  // console it is accepted again (`ipc.hpp`).
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted,
+           "and the next press is accepted too, because nothing is running");
+}
+
 void Commands(checks::Checks& c) {
   Console console(c, "engine-commands");
   console.Boot();
@@ -1325,6 +1378,8 @@ int main(int argc, char** argv) {
     Relaunch(checks);
   } else if (scenario == "reenable") {
     Reenable(checks);
+  } else if (scenario == "syncnow") {
+    SyncNowStarts(checks);
   } else if (scenario == "unreachable") {
     Unreachable(checks);
   } else if (const RigScenario* rig_scenario = FindRigScenario(scenario)) {

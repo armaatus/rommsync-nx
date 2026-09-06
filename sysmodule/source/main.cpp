@@ -6,10 +6,10 @@
 // `http::HttpClient` of its own -- the Horizon `ssl` one under `http/` -- so the
 // engine that was proven against a real RomM on a laptop can reach a server from
 // here too. M1-6 (#123) installs it in the pairing seam below, so `StartPair` is
-// answered here rather than refused. There is still no scheduler (M7-2, #37), so
-// the commands behind that answer `ipc::Error::kUnavailable`; what is real today
-// is the console's configuration -- read *and* written, since M5-3 (#30) --
-// whether it has ever paired, the pairing itself, and the build
+// answered here rather than refused. Since M7-2 (#37) it also starts the
+// **worker**: one thread that runs sync ticks on a schedule and drives the list
+// paging, which is what makes `SyncNow` start something, the library browsable
+// on a console, and `auth.json` a file this build writes rather than only reads
 // (see `engine.hpp`).
 //
 // The service is registered inside `__appInit`, while `sm` is still up, because

@@ -3,8 +3,8 @@
 // `ipc::Engine` is the seam the whole command set is driven through, and it was
 // written before most of what sits behind it existed (`ipc.hpp`): the download
 // queue is M3-2 (#19), live `config.ini` writes are M5-3 (#30), list paging is
-// M5-4 (#31), the scheduler is M7-2. This is the implementation that lets the
-// overlay have a service to talk to in the meantime.
+// M5-4 (#31), the scheduler is M7-2 (#37). This is the implementation they each
+// filled a part of.
 //
 // **It answers only what this build actually knows.** The console's
 // configuration -- which it now writes as well as reads (M5-3) -- whether it has
@@ -15,20 +15,24 @@
 // than a plausible refusal that sends a user looking for a full queue or a
 // failing SD card. Each of the issues above replaces its own part of this, and
 // `kUnavailable` disappearing entirely is what says the engine is finished --
-// `StartPairing` and `SyncNow` are what is left of it.
+// `StartPairing` on a build with no transport is what is left of it.
 //
-// **The console has a transport now, and this class is given it for pairing and
-// withheld from it for the lists.** M1-7 (#126) built the Horizon
-// `http::HttpClient` (`sysmodule/source/http/`), `main.cpp` holds one and hands
-// it to `UsePairingBackend`; `UseServer` is deliberately not called with it:
-// `lists::Service` answers a page that needs a request with `ListPage::pending`
-// and makes the request in `Pump()`, so a client handed over without a thread
-// driving `PumpLists()` would turn `kOffline` -- which #25's browser draws --
-// into "pending" forever, which it cannot. So `platforms` and `roms` still
-// answer `kOffline` here while `queue`, served off `queue.json`, works in full.
-// **Whoever starts that worker installs the client in the same commit**: that is
-// M7-2 (#37). The host suite passes a libcurl client and drives the paging
-// through the same seam (`lists.*`).
+// **The console has a transport and a worker.** M1-7 (#126) built the Horizon
+// `http::HttpClient` (`sysmodule/source/http/`) and `main.cpp` holds one; M7-2
+// (#37) hands it to `UseServer` and starts the thread that drives `PumpLists()`
+// in the same breath, because either alone is wrong -- a client with no worker
+// turns `kOffline`, which #25's browser draws, into "pending" forever, which it
+// cannot. That thread is also the one that runs `sync::RunTick` on a schedule,
+// which is what makes `SyncNow` start something and `auth.json` a file this
+// build writes rather than only reads. The host suite passes a libcurl client
+// and drives the paging through the same seam (`lists.*`).
+//
+// **Three threads now, and what each one owns.** The IPC thread answers every
+// command and is the only one that writes `config_` and `queue_`; the pairing
+// thread (M1-6, #123) drives one device-code attempt; the worker (M7-2, #37)
+// runs ticks and pumps list pages. None of them blocks on the network while
+// holding `mutex_`, and the configuration crosses between them as a snapshot
+// rather than as a reference -- see `ConfigSnapshot`.
 //
 // **`StartPairing` is answered here, and that is what M1-6 (#123) was for.** The
 // engine drives a real device-code attempt on a thread of its own -- see
@@ -188,11 +192,12 @@ class SdEngine : public ipc::Engine {
   /// (#31) and M1-6 (#123) landed in parallel and each needed one -- M1-7 (#126)
   /// gave the console a real transport and the two did not collapse into one
   /// call, because they are not the same promise. This one is safe the moment a
-  /// client exists: the pairing thread is this class's own. `UseServer` is not,
-  /// and `main.cpp` says why at length -- `lists::Service` needs a `PumpLists()`
-  /// worker in the same breath or every page that needs a request is `pending`
-  /// forever, and that worker is M7-2 (#37). One setter would make it impossible
-  /// to install the half that is ready.
+  /// client exists, because the pairing thread is this class's own, where
+  /// `UseServer` was not until M7-2 (#37) started the worker that drives
+  /// `PumpLists()`. They stay two setters even now that both are installed on
+  /// the same line of `main.cpp`: they are two promises, and one call would make
+  /// it impossible to install the half that is ready -- which is the state this
+  /// build spent two milestones in.
   void UsePairingBackend(PairingBackend backend);
 
   /// Start the worker: the one thread that runs sync ticks and drives the list
@@ -251,21 +256,26 @@ class SdEngine : public ipc::Engine {
   /// what proves the paging against a server this class never paired with.
   void UseServer(http::HttpClient* client, std::string bearer_token);
 
-  /// Where a rom already on the card is looked for, for a rom row's `on_disk`.
-  /// Null on the console for the same reason: nothing implements
-  /// `fs::FileSystem` for Horizon yet, and `on_disk` is then `false` rather
-  /// than guessed (`list_service.hpp`).
+  /// The SD card, behind `fs::FileSystem`. `sysmodule/source/card.hpp` is the
+  /// Horizon implementation (M7-2, #37) and `main.cpp` installs it; the host
+  /// suite passes its sandbox's. A null one leaves a rom row's `on_disk` false,
+  /// which is the honest answer for a build that cannot look
+  /// (`list_service.hpp`), and refuses a restore with `kBackupFailed`.
+  ///
+  /// It is also what a **tick** reads and writes every save through, so a
+  /// console with none never gets past the scan.
   void UseCard(fs::FileSystem* filesystem);
 
   /// Drive one list page fetch, from a thread that is **not** the IPC one.
   ///
-  /// There is no such thread in this build, which costs nothing while there is
-  /// no client to fetch with: `ListNext` answers `kOffline` before it ever asks
-  /// for a page. It is the same seam the scheduler needs (M7-2, #37) -- one
-  /// worker loop calling this and `sync_tick` -- and the host suite calls it
-  /// directly between two `ListNext`s, which is what makes every paging case
-  /// deterministic rather than timed. The pairing thread is **not** it: that one
-  /// drives one attempt and touches nothing a list reads.
+  /// That thread is the worker `StartWorker` starts (M7-2, #37), which calls
+  /// this between ticks -- one loop for both, not two threads. The host suite
+  /// calls it directly between two `ListNext`s, which is what makes every paging
+  /// case deterministic rather than timed. The pairing thread is **not** it:
+  /// that one drives one attempt and touches nothing a list reads.
+  ///
+  /// It returns immediately and `false` when there is nothing to do, so an idle
+  /// worker loop pays one function call.
   bool PumpLists();
 
   const config::Config& config() const override;
@@ -370,11 +380,11 @@ class SdEngine : public ipc::Engine {
   /// The conflict history, for the tick that writes it.
   ///
   /// **Nothing in this build drives a tick**, so nothing appends to it here yet
-  /// -- the scheduler is M7-2 (#37), and it is written there that
-  /// `conflicts::RecordSaves` and `conflicts::RecordStates` are what it owes
-  /// this file after each half of a tick. What this build does is load it at
-  /// boot and serve it, which is what makes an entry written by an earlier
-  /// release readable by this one.
+  /// -- since M7-2 (#37) the worker appends to it: `conflicts::RecordSaves` after
+  /// the saves half of a tick and `conflicts::RecordStates` after the states
+  /// half, both from `RunOneTick` rather than from inside `sync::RunTick`,
+  /// because `conflict_record.hpp` includes `state_sync.hpp` and recording from
+  /// in there would be a cycle. It is guarded by `history_mutex_`.
   conflicts::History& history() { return history_; }
 
   /// Whether the backup `entry` names is still on the card, for
@@ -607,16 +617,13 @@ class SdEngine : public ipc::Engine {
   /// The card, for a restore. The same pointer `UseCard` hands `lists_`, kept
   /// here too because a restore opens two files through it.
   ///
-  /// **Null on the console today**: nothing implements `fs::FileSystem` for
-  /// Horizon yet (`UseCard`). A restore then refuses with
-  /// `RestoreOutcome::kBackupFailed`, whose promise -- nothing was written -- is
-  /// exactly what a build that cannot open the card manages to keep. Listing is
-  /// not affected: `BackupPresent` falls back to `kSdRoot`, because *reading*
-  /// whether a file is there needs one `io::Exists` and no interface at all.
-  ///
-  /// Installing a Horizon `fs::FileSystem` is what makes the restore work on a
-  /// console, and it is not this issue's: it is the same seam the download
-  /// worker and the scheduler need (M7-2, #37).
+  /// **Installed on the console since M7-2 (#37)** -- `sysmodule/source/card.hpp`
+  /// is the Horizon backend and `main.cpp` hands it over. A build that never
+  /// called `UseCard` refuses a restore with `RestoreOutcome::kBackupFailed`,
+  /// whose promise -- nothing was written -- is exactly what a build that cannot
+  /// open the card manages to keep. Listing is not affected: `BackupPresent`
+  /// falls back to `kSdRoot`, because *reading* whether a file is there needs one
+  /// `io::Exists` and no interface at all.
   fs::FileSystem* card_ = nullptr;
 
   /// The credentials as `token.dat` holds them, re-read whenever it changes.
@@ -662,12 +669,12 @@ class SdEngine : public ipc::Engine {
 
   /// The verdict `auth.json` holds, and what a worker consults before calling.
   ///
-  /// Restored at boot rather than counted from zero. Nothing in this build
-  /// observes an answer into it yet -- there is no scheduler to make the calls
-  /// (M7-2, #37) -- so what it does today is carry the stored verdict and let
-  /// `Unpair` lift it. That is the seam #37 fills in: `Observe` each call's
-  /// `auth::AnswerOf(...)`, and persist the block the moment `blocked()` turns
-  /// true.
+  /// Restored at boot rather than counted from zero, and driven from then on by
+  /// `ObserveAnswer` -- which every call the worker and the list pages make
+  /// reports into (M7-2, #37). It is the one place a `401` is counted, and the
+  /// one place the verdict is written: `auth::SaveBlock` the moment `blocked()`
+  /// first turns true, with `auth_` set in the same breath. `Unpair` is the only
+  /// thing that lifts it.
   auth::Gate gate_;
 
   /// The transport and the identity seed a pairing attempt runs on. Empty on the

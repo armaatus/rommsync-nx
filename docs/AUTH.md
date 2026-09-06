@@ -567,13 +567,13 @@ at all, and the worst it costs is those requests. That is the opposite call from
 by asking. `Unpair` clears it along with the token, and a `server.url` change
 clears it too, since the token it judged is gone.
 
-**Nothing writes it yet, and that is a seam rather than an omission.** Writing it
-needs something that makes the calls the counting is over, and the sysmodule has
-no scheduler until M7-2 (#37): `SdEngine` holds no `HttpClient` and does not
-start the download worker. So M1-4 shipped `auth::SaveBlock`, the read-back in
-`SdEngine::Load` and the `ipc::AuthState::kUnauthenticated` that comes off it,
-and #37 adds the two lines on the other side — `SaveBlock` when
-`SdEngine::gate_` first reports `blocked()`, and `SdEngine::auth_` set at the
-same moment so the overlay sees it without waiting for a reboot. Until then a
-console reaches the unauthenticated state within one boot's rejection budget and
-does not remember it across a reboot.
+**It is written since M7-2 (#37), and by one function.** M1-4 shipped
+`auth::SaveBlock`, the read-back in `SdEngine::Load` and the
+`ipc::AuthState::kUnauthenticated` that comes off it; what it could not ship was
+the caller, because writing the verdict needs something that makes the calls the
+counting is over. `SdEngine::ObserveAnswer` is that caller: every exchange the
+worker and the list pages make reports its `auth::Answer` into the one
+`auth::Gate`, and the moment `blocked()` first turns true the file is written and
+`SdEngine::auth_` is set in the same breath — so the overlay draws "pair this
+console again" on its next poll rather than after a reboot. It is deliberately
+one function rather than two call sites, so no caller can do half of it.

@@ -1632,6 +1632,7 @@ set(ENGINE_SCENARIOS
   unauthenticated  # M1-4: the verdict the card carries, and the re-pair that lifts it
   commands  # what is still `kUnavailable`, so the list shrinks deliberately
   unreachable  # M1-6: a server that answers nothing refuses the attempt, and writes nothing
+  syncnow   # M7-2: Sync now starts a tick and says so, instead of "one is already running"
 )
 foreach(scenario IN LISTS ENGINE_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
