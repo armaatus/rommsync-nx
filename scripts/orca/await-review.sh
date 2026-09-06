@@ -182,10 +182,22 @@ RED
   # above exists to respect -- and a rate-limited answer is indistinguishable
   # from "nothing yet", which is precisely how #80 defeated the old check.
   # Nothing is spent until there is a failure to explain.
+  # `--limit 25`, not 1, and that is the whole check working at all. The review
+  # workflow fires on `pull_request_review` and `pull_request_review_comment` as
+  # well as on the push, and those runs no-op with `skipped` -- so a run that
+  # genuinely FAILED is buried under every skipped run posted since. On this PR
+  # that was not an edge case but the shape of every head: each one's newest
+  # `claude review` run was a skipped review-event run, with the real one four
+  # or five entries down. `--limit 1` would have found nothing, fallen through
+  # to "no failed run found", and waited out the full 45 minutes to report that
+  # nothing arrived -- #80 exactly, the failure this check was written to end,
+  # reintroduced through the list window instead of through a rate limit.
+  # The `--jq` already selects on this head AND conclusion == failure, so the
+  # only job of the limit is to make sure the matching run is inside the window.
   failed_run=""
   if [ -n "$review_dead" ]; then
     failed_run="$(GH_PAGER=cat gh run list --branch "$branch" --workflow "claude review" \
-                    --limit 1 --json conclusion,databaseId,headSha \
+                    --limit 25 --json conclusion,databaseId,headSha \
                     --jq "[.[] | select(.headSha==\"$head\" and .conclusion==\"failure\")][0].databaseId" \
                   2>/dev/null)"
   fi

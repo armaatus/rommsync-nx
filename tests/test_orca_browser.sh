@@ -597,6 +597,63 @@ GHSTUB
     echo "PASS: a failed review job is reported at once, not waited out"
     ;;
 
+  await_finds_the_failed_run_under_newer_skipped_ones)
+    # The phase above proves the report happens; this one proves it is still
+    # reachable on a real PR. `claude review` fires on pull_request_review and
+    # pull_request_review_comment as well as on the push, and those runs no-op
+    # with `skipped`. So the FAILED run sinks: on this PR every single head had
+    # a skipped review-event run as its newest `claude review` run, with the
+    # real one four or five entries below. Asking for `--limit 1` therefore
+    # returns a skipped run forever, the failure is never seen, and the wait
+    # runs its full 45 minutes to report that nothing arrived -- which is #80,
+    # the exact failure this check exists to end.
+    #
+    # The stub models GitHub's ordering rather than answering a constant: it
+    # builds five skipped runs ahead of the failure, truncates to whatever
+    # --limit the script asked for, and then applies the same select the real
+    # --jq applies. A window too small to reach the failure yields nothing,
+    # exactly as gh would.
+    make_fixture
+    cp "$REPO_ROOT"/scripts/orca/{await-review.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    stub="$TMPDIR_FIXTURE/stub-bin"
+    mkdir -p "$stub"
+    cat >"$stub/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"pr list"*)  printf '[{"number":80}]\n' ;;
+  *"run list"*)
+    limit=1
+    for a in "$@"; do
+      [ "$prev" = "--limit" ] && limit="$a"
+      prev="$a"
+    done
+    echo "$limit" >>"$LIMIT_LOG"
+    # Five skipped runs sit ahead of the failure, as they do on a real PR.
+    if [ "$limit" -gt 5 ]; then printf '4242\n'; else printf '\n'; fi ;;
+  *"run view"*) printf '##[error] Execution failed: Reached maximum number of turns (30)\n' ;;
+  *statusCheckRollup*)
+    printf '{"statusCheckRollup":[{"name":"review against REVIEW.md","conclusion":"FAILURE"},{"name":"host-tests","conclusion":"SUCCESS"}]}\n' ;;
+  *"pr view"*)  printf '{"reviews":[]}\n' ;;
+  *)            printf '\n' ;;
+esac
+GHSTUB
+    chmod +x "$stub/gh"
+    ( cd "$TMPDIR_FIXTURE" && git init -q . && git commit -q --allow-empty -m fixture ) 2>/dev/null
+    limitlog="$TMPDIR_FIXTURE/limits.log"; : >"$limitlog"
+    out="$(cd "$TMPDIR_FIXTURE" &&
+           PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$TMPDIR_FIXTURE/fleet" \
+           LIMIT_LOG="$limitlog" \
+           AWAIT_REVIEW_DEADLINE=5 AWAIT_REVIEW_POLL=1 \
+           bash "$TMPDIR_FIXTURE/scripts/orca/await-review.sh" 80 2>&1)"
+    rc=$?
+    [ -s "$limitlog" ] || fail "never asked for the run list at all; the fixture proves nothing"
+    [ "$rc" = 6 ] \
+      || fail "a failed review run buried under newer skipped runs was never found (exit $rc, asked for --limit $(head -1 "$limitlog")); the wait would run its full deadline and blame no one: $out"
+    grep -q "maximum number of turns" <<<"$out" \
+      || fail "found the run but did not say why it failed; got: $out"
+    echo "PASS: the failed run is found even under newer skipped runs"
+    ;;
+
   await_reports_a_red_build)
     # #88 sat in await-review.sh while host-tests failed on its own new test.
     # A review cannot fix a red build, and waiting for one costs 45 minutes and
@@ -991,6 +1048,7 @@ PYCHECK
     echo "       watch_needs_issue|watch_late_draft|watch_grace|watch_submits|watch_single" >&2
     echo "       watch_bare_url|watch_full_draft_untouched|cli_broken" >&2
     echo "       await_reports_failed_review|await_reports_a_red_build" >&2
+    echo "       await_finds_the_failed_run_under_newer_skipped_ones" >&2
     echo "       fleet_notices_a_stalled_agent" >&2
     echo "       review_status_shows_the_open_thread|brief_never_lists_threads_over_rest" >&2
     echo "       brief_queues_the_merge_at_step_four" >&2
