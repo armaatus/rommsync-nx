@@ -914,10 +914,36 @@ const char* ToString(DrainOutcome outcome) {
       return "canceled";
     case DrainOutcome::kUnauthorized:
       return "unauthorized";
+    case DrainOutcome::kForbidden:
+      return "forbidden";
     case DrainOutcome::kStoreFailed:
       return "store_failed";
   }
   return "idle";
+}
+
+auth::Answer AnswerOf(DrainOutcome outcome) {
+  switch (outcome) {
+    case DrainOutcome::kUnauthorized:
+      return auth::Answer::kRejected;
+    case DrainOutcome::kForbidden:
+      return auth::Answer::kForbidden;
+    // Every pending entry reached a terminal state, which took a rom body out of
+    // RomM with this token.
+    case DrainOutcome::kCompleted:
+      return auth::Answer::kAccepted;
+    // The rest are not evidence either way, and the direction matters: a 500 or
+    // a shutdown that cleared a rejection count would let a proxy alternating
+    // 401 with 500 keep a console asking forever. A cancel can even come before
+    // the first request.
+    case DrainOutcome::kRetryable:
+    case DrainOutcome::kCanceled:
+    case DrainOutcome::kIdle:
+    case DrainOutcome::kDisabled:
+    case DrainOutcome::kStoreFailed:
+      break;
+  }
+  return auth::Answer::kSilent;
 }
 
 namespace {
@@ -927,6 +953,7 @@ enum class Verdict {
   kRetry,         ///< nothing about this says the request was wrong; try it again
   kFatal,         ///< this rom will not download as asked, however often it is tried
   kUnauthorized,  ///< the token, not the rom. Every other entry would fail the same way.
+  kForbidden,     ///< the same, and not a revocation: a scope the pairing lacks.
   kCanceled,
 };
 
@@ -975,12 +1002,19 @@ Verdict Judge(const http::Result& result, Reason* why) {
   if (status >= 200 && status < 300) {
     return Verdict::kOk;
   }
-  if (status == 401 || status == 403) {
+  if (status == 401) {
     // Not this entry's problem, and a retried 401 is a 401 retried forever
     // (sync.hpp). The drain stops rather than spending the whole queue on it.
-    say(status == 401 ? "the server no longer accepts this console's token"
-                      : "this console's token was not granted what a download needs");
+    say("the server no longer accepts this console's token");
     return Verdict::kUnauthorized;
+  }
+  if (status == 403) {
+    // The same stop, a different sentence and a different outcome: RomM approves
+    // what the user ticked, so this is a scope missing from a pairing that
+    // otherwise works and not a token that was revoked
+    // (docs/AUTH.md#scopes-to-request).
+    say("this console's token was not granted what a download needs");
+    return Verdict::kForbidden;
   }
   if (status == 404) {
     say("the server has no such rom any more");
@@ -1004,6 +1038,8 @@ DrainOutcome OutcomeFor(Verdict verdict) {
       return DrainOutcome::kRetryable;
     case Verdict::kUnauthorized:
       return DrainOutcome::kUnauthorized;
+    case Verdict::kForbidden:
+      return DrainOutcome::kForbidden;
     case Verdict::kCanceled:
       return DrainOutcome::kCanceled;
     case Verdict::kOk:

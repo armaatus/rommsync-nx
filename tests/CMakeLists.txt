@@ -82,6 +82,28 @@ if(UNIX)
 endif()
 add_test(NAME core.token_store COMMAND test_token_store)
 
+# M1-4: what a rejected call means once you count them. No server -- RomM issues
+# no refresh token, so there is nothing to refresh and what is left is arithmetic
+# over answers -- and it must stay checked with docker stopped, because the
+# decision it holds is the one standing between a proxy hiccup and a console sent
+# to the pairing screen. The live-server half of that claim is `harness.expired`.
+add_executable(test_auth_gate test_auth_gate.cpp)
+target_link_libraries(test_auth_gate PRIVATE rommsync::core)
+target_include_directories(test_auth_gate PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_auth_gate PRIVATE
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+
+set(AUTH_GATE_SCENARIOS
+  answers   # a status becomes an Answer, and every error enum agrees with it
+  counts    # three consecutive rejections is a verdict; one is not
+  backoff   # the wait doubles, caps, and is zero while nothing is wrong
+  persists  # the verdict round-trips through auth.json, and is cleared
+)
+foreach(scenario IN LISTS AUTH_GATE_SCENARIOS)
+  add_test(NAME auth.gate_${scenario} COMMAND test_auth_gate ${scenario})
+  set_tests_properties(auth.gate_${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
 # The stable client_device_identifier, and the SHA-256 under it. Known-answer
 # vectors, a parser and the filesystem, so this never skips either -- and the
 # thing it guards (one console, one identifier, across a re-pair) is checkable

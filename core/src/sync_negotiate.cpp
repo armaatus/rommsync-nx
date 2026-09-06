@@ -318,6 +318,32 @@ bool NeedsPairing(NegotiateError error) {
          error == NegotiateError::kForbidden || error == NegotiateError::kNoSuchDevice;
 }
 
+auth::Answer AnswerOf(NegotiateError error) {
+  switch (error) {
+    case NegotiateError::kUnauthorized:
+      return auth::Answer::kRejected;
+    case NegotiateError::kForbidden:
+      return auth::Answer::kForbidden;
+    // Accepted only where the answer is proof RomM read the token: a plan, and
+    // the two refusals gated on RomM's own `detail` text.
+    case NegotiateError::kNone:
+    case NegotiateError::kNoSuchDevice:
+    case NegotiateError::kSyncDisabled:
+      return auth::Answer::kAccepted;
+    // The rest say nothing. `kRejected` is a bare 4xx, which anything in front
+    // of RomM can answer, so it does not clear a count either.
+    case NegotiateError::kRejected:
+    case NegotiateError::kUnusablePayload:
+    case NegotiateError::kNotRegistered:
+    case NegotiateError::kCanceled:
+    case NegotiateError::kUnreachable:
+    case NegotiateError::kServerError:
+    case NegotiateError::kMalformed:
+      break;
+  }
+  return auth::Answer::kSilent;
+}
+
 auth::Parsed<SyncPlan> ParseNegotiateResponse(std::string_view body) {
   auth::Parsed<SyncPlan> parsed;
   const json::ParseResult document = json::Parse(body);

@@ -68,6 +68,7 @@
 #include <vector>
 
 #include "rommsync/auth.hpp"
+#include "rommsync/auth_gate.hpp"
 #include "rommsync/http.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/token_store.hpp"
@@ -492,6 +493,15 @@ bool ShouldRetry(NegotiateError error);
 /// rejected polls.
 bool NeedsPairing(NegotiateError error);
 
+/// What this error says about the credentials, for `auth::Gate`.
+///
+/// Neither of the two above: this is "did the server take the token", which is
+/// the question M1-4 (#8) counts consecutive answers to before a pairing is
+/// given up on. A `kNoSuchDevice` or a `kSyncDisabled` says the token *was*
+/// taken -- the server had to read it to answer either -- so both clear a count
+/// rather than adding to one.
+auth::Answer AnswerOf(NegotiateError error);
+
 /// How hard one call tries.
 ///
 /// Shared by the two calls in this header rather than written twice: negotiate
@@ -764,6 +774,10 @@ const char* ToString(CompleteError error);
 /// so the cost is a session RomM shows as cancelled in a history a user reads,
 /// not a corrupted anything.
 bool ShouldRetry(CompleteError error);
+
+/// What this error says about the credentials, for `auth::Gate`. The same
+/// question `AnswerOf(NegotiateError)` answers, over the other call's enum.
+auth::Answer AnswerOf(CompleteError error);
 
 /// The spelling `CompleteSession` takes. An alias rather than a struct of its
 /// own: see `CallPolicy`.

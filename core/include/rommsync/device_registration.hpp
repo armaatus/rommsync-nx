@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "rommsync/auth.hpp"
+#include "rommsync/auth_gate.hpp"
 #include "rommsync/http.hpp"
 #include "rommsync/token_store.hpp"
 
@@ -106,7 +107,18 @@ RegistrationState StateOf(const StoredToken& token);
 enum class RegistrationError {
   kNone,
   kNotRegistered,  ///< the record carries no device id; there is nothing to confirm
-  kUnauthorized,   ///< 401/403 -- the token was revoked. Re-pair.
+  kUnauthorized,   ///< 401 -- the token was revoked. Re-pair.
+
+  /// 403 -- the token is real and was not granted what this call needs.
+  ///
+  /// Kept apart from a revocation, which is the same split `sync::NegotiateError`
+  /// makes and for the same reason: RomM approves what the *user* ticked, which
+  /// need not be what was requested, so a 403 is a scope missing from an
+  /// otherwise working pairing (docs/AUTH.md#scopes-to-request). Telling that
+  /// user their token was revoked sends them looking for something that did not
+  /// happen, and a client that discarded `token.dat` over it would re-pair
+  /// straight back into the same partial grant.
+  kForbidden,
   kNoSuchDevice,   ///< 404, or no row carries the identifier -- deleted in RomM's UI
   kAmbiguous,      ///< more than one device names this identifier; picking one would guess
   kSyncDisabled,   ///< the device is there and the user has turned sync off for it
@@ -132,14 +144,27 @@ bool ShouldRetry(RegistrationError error);
 
 /// Whether the remedy is to pair again.
 ///
-/// The three failures that mean the credentials no longer name a device on that
-/// server. Distinct from `ShouldRetry` on purpose: the overlay's two sentences
+/// The four failures that mean the credentials do not, as they stand, name a
+/// device on that server.
+///
+/// `kForbidden` is in it and earns a different sentence: re-pairing is where the
+/// user approves the scope that is missing, so the remedy really is to pair
+/// again -- but "pair again and approve the scopes this needs" is not "your
+/// pairing is gone", and only the second is true of a 401
+/// (`auth::Describe(Block)` carries both). Distinct from `ShouldRetry` on purpose: the overlay's two sentences
 /// are "your server is unreachable, this will retry" and "pair this console
 /// again", and sending a user to the second over a dropped connection is how a
 /// working pairing gets thrown away. An error that is in neither -- sync turned
 /// off, a body that would not parse -- is one that neither waiting nor
 /// re-pairing fixes, and saying so is the whole point of not collapsing them.
 bool NeedsPairing(RegistrationError error);
+
+/// What this error says about the credentials, for `auth::Gate`.
+///
+/// Not the same question as either of the two above: `kNoSuchDevice` and
+/// `kSyncDisabled` are answers the server could only give *because* it took the
+/// token, so they clear a rejection count rather than adding to one.
+Answer AnswerOf(RegistrationError error);
 
 /// A resolved registration, or the reason there isn't one. `device` is left
 /// default-constructed on failure and must not be used -- check `ok()`.

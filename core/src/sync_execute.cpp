@@ -116,10 +116,26 @@ std::optional<std::pair<OperationError, std::string>> Refused(const http::Result
                           std::string(what) + " did not complete: " + http::ToString(result.error) +
                               (result.message.empty() ? "" : " (" + result.message + ")"));
   }
+  const int status = result.response.status;
+  if (status == 401) {
+    // Not this operation's problem, and not the next one's either: the token is
+    // gone, so `ExecutePlan` stops here rather than refusing the rest of the
+    // plan one request at a time (`sync_execute.hpp`, `download::Drain`).
+    return std::make_pair(OperationError::kUnauthorized,
+                          std::string(what) +
+                              " was rejected: HTTP 401; the token has been revoked");
+  }
+  if (status == 403) {
+    // The same stop, a different sentence: a scope this pairing was not granted
+    // rather than a pairing that is gone (docs/AUTH.md#scopes-to-request).
+    return std::make_pair(OperationError::kForbidden,
+                          std::string(what) +
+                              " was rejected: HTTP 403; this pairing was not granted the scopes "
+                              "sync needs");
+  }
   if (!result.successful()) {
-    return std::make_pair(
-        OperationError::kRefused,
-        std::string(what) + " was refused: HTTP " + std::to_string(result.response.status));
+    return std::make_pair(OperationError::kRefused,
+                          std::string(what) + " was refused: HTTP " + std::to_string(status));
   }
   return std::nullopt;
 }
@@ -228,6 +244,10 @@ const char* ToString(OperationError error) {
       return "backup_failed";
     case OperationError::kTransferFailed:
       return "transfer_failed";
+    case OperationError::kUnauthorized:
+      return "unauthorized";
+    case OperationError::kForbidden:
+      return "forbidden";
     case OperationError::kRefused:
       return "refused";
     case OperationError::kUnverified:
@@ -240,6 +260,34 @@ const char* ToString(OperationError error) {
       return "canceled";
   }
   return "none";
+}
+
+auth::Answer AnswerOf(OperationError error) {
+  switch (error) {
+    case OperationError::kUnauthorized:
+      return auth::Answer::kRejected;
+    case OperationError::kForbidden:
+      return auth::Answer::kForbidden;
+    // An operation that did what the plan asked did it with this token.
+    case OperationError::kNone:
+      return auth::Answer::kAccepted;
+    // The rest say nothing about the credentials. `kRefused` is among them for
+    // the reason `NegotiateError::kRefused` is: a bare 4xx is an answer anything
+    // in front of RomM gives, and clearing a rejection count on one would let a
+    // proxy alternating statuses keep a console asking forever.
+    case OperationError::kNoLocalSave:
+    case OperationError::kNoSaveId:
+    case OperationError::kUnreadableCard:
+    case OperationError::kBackupFailed:
+    case OperationError::kTransferFailed:
+    case OperationError::kRefused:
+    case OperationError::kUnverified:
+    case OperationError::kCommitFailed:
+    case OperationError::kUnconfirmed:
+    case OperationError::kCanceled:
+      break;
+  }
+  return auth::Answer::kSilent;
 }
 
 std::string BackupFileName(std::int64_t rom_id, const std::optional<std::string>& slot,
@@ -711,7 +759,13 @@ ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
         ++report.completed;
         break;
     }
-    const bool stop = result.outcome == OperationOutcome::kCanceled;
+    // The two failures that are not about one operation. A cancellation was
+    // never attempted; a 401 or a 403 was, and failed -- so it is counted above,
+    // and only the operations *after* it go unattempted.
+    const bool refused_the_token = result.error == OperationError::kUnauthorized ||
+                                   result.error == OperationError::kForbidden;
+    report.unauthorized = report.unauthorized || refused_the_token;
+    const bool stop = result.outcome == OperationOutcome::kCanceled || refused_the_token;
     report.operations.push_back(std::move(result));
     if (stop) {
       break;

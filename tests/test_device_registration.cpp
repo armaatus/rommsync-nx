@@ -447,9 +447,8 @@ int Forbidden(http::HttpClient& client, const std::string& base) {
   const auth::Registration refused = auth::ConfirmRegistration(client, token);
   rig::DisarmFault(client, base);
 
-  checks.Expect(refused.error != auth::RegistrationError::kUnauthorized,
-                std::string("a 403 is a scope this pairing lacks, not a revoked token -- got ") +
-                    auth::ToString(refused.error));
+  ExpectError(checks, refused, auth::RegistrationError::kForbidden,
+              "a 403 is a scope this pairing lacks, not a revoked token");
   checks.Expect(refused.message.find("revoke") == std::string::npos,
                 "and it does not tell the user their token was revoked: " + refused.message);
   checks.Expect(refused.message.find("scope") != std::string::npos,
@@ -472,9 +471,8 @@ int Forbidden(http::HttpClient& client, const std::string& base) {
       "arming a second lookup the pairing was not granted");
   const auth::Registration resolved = auth::ResolveRegistration(client, token, identifier);
   rig::DisarmFault(client, base);
-  checks.Expect(resolved.error != auth::RegistrationError::kUnauthorized,
-                std::string("and the diagnosis survives the resolve -- got ") +
-                    auth::ToString(resolved.error));
+  ExpectError(checks, resolved, auth::RegistrationError::kForbidden,
+              "and the diagnosis survives the resolve");
 
   checks.ExpectEq(rig::ReadFile(path), before, "token.dat is byte-for-byte untouched");
   return checks.failures();

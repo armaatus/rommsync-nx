@@ -68,13 +68,23 @@ std::optional<Registration> Refused(const http::Result& result, std::string_view
                 std::string(what) + " did not complete: " + http::ToString(result.error));
   }
   const int status = result.response.status;
-  if (status == 401 || status == 403) {
+  if (status == 401) {
     // `expires_at` is null on 5.2.0, so a token does not go stale on its own:
     // a 401 is a token that was revoked, and retrying it is retrying forever
     // (docs/AUTH.md#re-pairing--revocation).
     return Fail(RegistrationError::kUnauthorized,
-                std::string(what) + " was rejected: HTTP " + std::to_string(status) +
-                    "; the token has been revoked");
+                std::string(what) + " was rejected: HTTP 401; the token has been revoked");
+  }
+  if (status == 403) {
+    // Deliberately not folded into the 401, the same split `sync::Refuse` makes.
+    // RomM approves what the *user* ticked, which need not be what was
+    // requested, so a 403 is a scope missing from a pairing that is otherwise
+    // working, and the client is meant to have read `scopes` back off the token
+    // rather than meet it here (docs/AUTH.md#scopes-to-request). Reporting it as
+    // a revocation sends the user looking for something that did not happen.
+    return Fail(RegistrationError::kForbidden,
+                std::string(what) + " was rejected: HTTP 403; this pairing was not granted the "
+                                    "scopes it needs");
   }
   // 429 and 408 sit here with the 5xx rather than falling through, because they
   // are the same kind of answer: the server would not deal with this request
@@ -261,6 +271,8 @@ const char* ToString(RegistrationError error) {
       return "not_registered";
     case RegistrationError::kUnauthorized:
       return "unauthorized";
+    case RegistrationError::kForbidden:
+      return "forbidden";
     case RegistrationError::kNoSuchDevice:
       return "no_such_device";
     case RegistrationError::kAmbiguous:
@@ -283,7 +295,34 @@ bool ShouldRetry(RegistrationError error) {
 
 bool NeedsPairing(RegistrationError error) {
   return error == RegistrationError::kNotRegistered ||
-         error == RegistrationError::kUnauthorized || error == RegistrationError::kNoSuchDevice;
+         error == RegistrationError::kUnauthorized || error == RegistrationError::kForbidden ||
+         error == RegistrationError::kNoSuchDevice;
+}
+
+Answer AnswerOf(RegistrationError error) {
+  switch (error) {
+    case RegistrationError::kUnauthorized:
+      return Answer::kRejected;
+    case RegistrationError::kForbidden:
+      return Answer::kForbidden;
+    // Accepted only where the answer is proof RomM read the token: each of these
+    // comes off a device record or a device list this client parsed.
+    case RegistrationError::kNone:
+    case RegistrationError::kSyncDisabled:
+    case RegistrationError::kAmbiguous:
+      return Answer::kAccepted;
+    // The rest are not evidence either way. `kNoSuchDevice` is among them
+    // because it is also a bare 404, which a `server.url` pointing at something
+    // that is not RomM answers -- and reading that as an acceptance would clear
+    // a count the next 401 should have finished.
+    case RegistrationError::kNoSuchDevice:
+    case RegistrationError::kNotRegistered:
+    case RegistrationError::kUnreachable:
+    case RegistrationError::kServerError:
+    case RegistrationError::kMalformed:
+      break;
+  }
+  return Answer::kSilent;
 }
 
 namespace {

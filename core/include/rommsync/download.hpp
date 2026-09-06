@@ -58,6 +58,7 @@
 #include <string_view>
 #include <vector>
 
+#include "rommsync/auth_gate.hpp"
 #include "rommsync/config.hpp"
 #include "rommsync/file_system.hpp"
 #include "rommsync/http.hpp"
@@ -539,11 +540,28 @@ enum class DrainOutcome {
   kRetryable,
   kCanceled,   ///< the caller's `CancelToken` fired
   kUnauthorized,  ///< 401 -- the token is gone. Retrying will not fix it; pairing will.
+
+  /// 403 -- the pairing is real and was not granted what a download needs.
+  ///
+  /// The same split `sync::NegotiateError` and `auth::RegistrationError` make,
+  /// and the drain already wrote two different sentences for the two statuses
+  /// before it had two outcomes to put them behind. Both end the drain and both
+  /// are fixed by pairing again; only one of them means the pairing is gone
+  /// (docs/AUTH.md#scopes-to-request).
+  kForbidden,
+
   kStoreFailed,   ///< the queue could not be written; see `store` for which bound
 };
 
 /// Stable, log-friendly name. Never null.
 const char* ToString(DrainOutcome outcome);
+
+/// What this outcome says about the credentials, for `auth::Gate`.
+///
+/// A drain that reached a terminal state for every entry used the token to do
+/// it, so it clears a rejection count. One that made no request -- disabled, an
+/// empty queue, a queue it could not write -- says nothing.
+auth::Answer AnswerOf(DrainOutcome outcome);
 
 /// What one drain did.
 struct DrainResult {
@@ -620,8 +638,8 @@ struct DrainResult {
 /// and it is still the user's download rather than something to drop. The drain
 /// ends `kRetryable` when anything was set aside. The three outcomes that are
 /// *not* about one entry -- `kUnauthorized`, `kCanceled`, `kStoreFailed` -- end
-/// it immediately instead, because every remaining entry would fail the same
-/// way.
+/// it immediately instead -- `kForbidden` with them -- because every remaining
+/// entry would fail the same way.
 ///
 /// `filesystem` supplies `Resolve` alone: the engine names SD paths and only a
 /// backend knows the prefix (file_system.hpp). A destination the backend refuses
