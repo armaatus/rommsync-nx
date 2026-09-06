@@ -11,6 +11,8 @@
 #include "rommsync/auth.hpp"
 #include "rommsync/auth_gate.hpp"
 #include "rommsync/config.hpp"
+#include "rommsync/conflict_log.hpp"
+#include "rommsync/conflict_record.hpp"
 #include "rommsync/device_identity.hpp"
 #include "rommsync/download.hpp"
 #include "rommsync/ipc.hpp"
@@ -44,7 +46,10 @@ void SdEngine::UseServer(http::HttpClient* client, std::string bearer_token) {
   lists_.UseServer(client, std::move(bearer_token));
 }
 
-void SdEngine::UseCard(fs::FileSystem* filesystem) { lists_.UseCard(filesystem); }
+void SdEngine::UseCard(fs::FileSystem* filesystem) {
+  card_ = filesystem;
+  lists_.UseCard(filesystem);
+}
 
 bool SdEngine::PumpLists() { return lists_.Pump(); }
 
@@ -142,6 +147,15 @@ void SdEngine::Load(const std::string& config_dir) {
     queue_message.pop_back();
   }
   queue_.set_queue_message(std::move(queue_message));
+
+  // Beside `state.db`, and read the same way: a file that is not there is a
+  // console that has overwritten nothing, which is a history and not a failure.
+  // The complaints go nowhere yet -- `core/` has no logger and this is not a
+  // `config.ini` problem, so putting them on `config_diagnostics()` would be the
+  // placeholder M5-4 took off the settings screen. They are returned by `Load`
+  // for the scheduler (M7-2, #37) to log when there is somewhere to log to.
+  history_ = conflicts::History(PathTo(conflicts::kHistoryFileName));
+  static_cast<void>(history_.Load());
 
   AdoptConfig(config::LoadConfig(PathTo(config::kConfigFileName)));
 }
@@ -647,5 +661,59 @@ ipc::Error SdEngine::ListNext(ipc::Cursor cursor, ipc::ListPage* page) {
 }
 
 ipc::Error SdEngine::ListEnd(ipc::Cursor cursor) { return lists_.ListEnd(cursor); }
+
+/// Whether the backup an entry names is still on the card.
+///
+/// **A build with no `fs::FileSystem` cannot look**, and answers "as far as I
+/// can tell" rather than "it is gone" -- see `ipc::ConflictRow::backup_present`.
+/// The restore itself then refuses with `kBackupFailed`, which is the honest
+/// sentence for a console that cannot open the card at all.
+bool SdEngine::BackupPresent(const conflicts::Entry& entry) const {
+  if (!entry.restorable()) {
+    return false;
+  }
+  if (card_ == nullptr) {
+    return true;
+  }
+  const std::string resolved = card_->Resolve(entry.backup_sd_path);
+  return !resolved.empty() && io::Exists(resolved);
+}
+
+ipc::Error SdEngine::ListConflicts(const ipc::ConflictQuery& query, ipc::ConflictPage* page) {
+  const std::vector<conflicts::Entry>& entries = history_.entries();
+  page->offset = query.offset;
+  page->total = static_cast<std::int32_t>(entries.size());
+
+  // Past the end is an empty page rather than a refusal: a history that shrank
+  // under an open screen is normal, and the screen's next request corrects it.
+  std::size_t at = static_cast<std::size_t>(query.offset);
+  const std::size_t wanted = static_cast<std::size_t>(query.limit);
+  for (; at < entries.size() && page->entries.size() < wanted; ++at) {
+    ipc::ConflictRow row;
+    row.entry = entries[at];
+    row.backup_present = BackupPresent(entries[at]);
+    if (!ipc::AppendIfItFits(page, std::move(row))) {
+      // The byte bound, not the count: the page stops here and says so, and the
+      // caller's next offset is this one. See `ipc::ConflictQuery`.
+      break;
+    }
+  }
+  page->has_more = at < entries.size();
+  return ipc::Error::kOk;
+}
+
+ipc::Error SdEngine::RestoreBackup(std::int64_t entry_id, conflicts::RestoreReport* report) {
+  if (card_ == nullptr) {
+    // Nothing implements `fs::FileSystem` for Horizon yet (`engine.hpp`).
+    // `kBackupFailed` rather than a transport failure: its promise is that
+    // nothing was written, which is the one thing a build that cannot open the
+    // card is certain of.
+    report->outcome = conflicts::RestoreOutcome::kBackupFailed;
+    report->message = "this build cannot open the SD card, so nothing was written";
+    return ipc::Error::kOk;
+  }
+  *report = conflicts::Restore(*card_, history_, entry_id);
+  return ipc::Error::kOk;
+}
 
 }  // namespace rommsync::sysmodule

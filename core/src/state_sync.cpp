@@ -597,6 +597,10 @@ StateOperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   }
 
   result.outcome = StateOutcome::kDownloaded;
+  // The row that was fetched, so a caller can say what the bytes it replaced
+  // were replaced *with* -- a length and an `updated_at`, which is the whole of
+  // what RomM knows about a state (M7-1, #36).
+  result.server = server;
   result.message = Describe(server.rom_id, server.file_name) + ": wrote the server's copy to " +
                    sd_path +
                    (result.backup_sd_path.empty()
@@ -605,14 +609,23 @@ StateOperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   return result;
 }
 
+/// `server` is the row both copies were kept *of*, or null when the reason
+/// there are two copies is that this console has no history for a row it cannot
+/// tell apart. Carried so M7-1's screen can show what the other copy is; a null
+/// one leaves `result.server.id` at zero, which is that answer.
 StateOperationResult KeepBoth(std::int64_t rom_id, const std::string& file_name,
-                              const std::string& sd_path, std::string why) {
+                              const std::string& sd_path, std::string why,
+                              const ServerState* server = nullptr) {
   StateOperationResult result;
   result.action = StateAction::kKeepBoth;
   result.rom_id = rom_id;
   result.file_name = file_name;
   result.sd_path = sd_path;
   result.outcome = StateOutcome::kKeptBoth;
+  if (server != nullptr) {
+    result.state_id = server->id;
+    result.server = *server;
+  }
   result.message = Describe(rom_id, file_name) + ": " + std::move(why);
   return result;
 }
@@ -872,7 +885,8 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
         break;
       }
       case StateAction::kKeepBoth:
-        if (!record(KeepBoth(file.rom_id, file.file_name, file.sd_path, std::move(why)))) {
+        if (!record(KeepBoth(file.rom_id, file.file_name, file.sd_path, std::move(why),
+                             server))) {
           stopped = true;
         }
         break;
@@ -940,7 +954,8 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
       if (!record(KeepBoth(server.rom_id, server.file_name, sd_path,
                            "the server holds a state this console has no history for, and " +
                                sd_path +
-                               " is already taken; both copies are kept and neither was touched"))) {
+                               " is already taken; both copies are kept and neither was touched",
+                           &server))) {
         break;
       }
       continue;

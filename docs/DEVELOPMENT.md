@@ -544,6 +544,8 @@ A removed command leaves a hole.
 | 11 | `ListBegin` | `ListRequest` -> cursor | never fails |
 | 12 | `ListNext` | cursor -> `ListPage` | `kBadCursor`, `kNotConfigured`, `kOffline`, `kInternal` |
 | 13 | `ListEnd` | cursor -> - | `kBadCursor` |
+| 14 | `ListConflicts` | `ConflictQuery` (offset + limit) -> `ConflictPage` | never fails; an empty history is a page |
+| 15 | `RestoreBackup` | `entry_id` -> `RestoreReport` (outcome + the new backup's path) | never fails; the outcome is `restored \| no_such_entry \| nothing_to_restore \| backup_missing \| backup_failed \| write_failed` |
 
 `ListBegin` never fails, and that is a decision rather than an omission.
 It does not run out of cursors -- the cap is enforced by reclaiming the least

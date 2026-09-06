@@ -106,9 +106,23 @@ overlay.
 - `sdmc:/config/rommsync/.backup/` — pre-overwrite copies of saves, on a
   conflict *and* on any download that replaced a file.
   `<rom_id>-<slot>-<unix seconds>.<ext>`, written before the overwrite by
-  `sync::ExecutePlan` (docs/SYNC_PROTOCOL.md#backups). The directory has to
-  exist: `core/` cannot create one, and a missing `.backup/` stops the
-  overwrite rather than proceeding without a copy.
+  `sync::ExecutePlan` (docs/SYNC_PROTOCOL.md#backups). A save state's is
+  `<rom_id>-state-<name>-<unix seconds>.<ext>`, written by `sync::SyncStates`
+  into the same directory. The directory has to exist: `core/` cannot create
+  one, and a missing `.backup/` stops the overwrite rather than proceeding
+  without a copy. **Nothing ever deletes a file from here** — not the history
+  bound below, not a restore, not the recovery sweep, which removes only an
+  interrupted `.tmp`.
+- `sdmc:/config/rommsync/conflicts.db` — the index that makes `.backup/`
+  legible (M7-1). A header line and one JSON object per overwrite, newest
+  first, written with `io::WriteAtomically` after **every** entry:
+  `{rom_id, rom name, file name, slot, emulator, when, the server's reason,
+  local size/MD5/mtime, server_content_hash, server_updated_at, backup path}`.
+  Bounded at `conflicts::kMaxEntries`; the oldest entry falls off the end and
+  its backup stays on the card. The overlay reads it over `ListConflicts` and
+  asks the sysmodule to put bytes back over `RestoreBackup`
+  (`core/include/rommsync/conflict_log.hpp`). `[sync] conflict_show` hides the
+  *screen* and never the recording.
 
 The overlay and sysmodule both read config; the **sysmodule owns writes** to
 token/state to avoid races — the overlay asks it to change things via IPC.
@@ -129,6 +143,8 @@ scheduler fires
                  → back up the local file → commit → POST .../downloaded
         conflict → the same, keep-both: RomM sends NO resolution, so the
                    server's copy lands and the local bytes stay in .backup/
+  → record every overwrite in conflicts.db, so a human can find the backup
+    (conflicts::RecordSaves / RecordStates, M7-1)
         noop     → skip
   → update state.db  (sync::FinishTick, and in this order: complete is
                       accounting, so a failed one must not cost the baseline)

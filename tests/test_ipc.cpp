@@ -43,6 +43,7 @@ namespace {
 namespace auth = rommsync::auth;
 namespace config = rommsync::config;
 namespace http = rommsync::http;
+namespace conflicts = rommsync::conflicts;
 namespace ipc = rommsync::ipc;
 namespace json = rommsync::json;
 namespace sync = rommsync::sync;
@@ -152,6 +153,35 @@ class FakeEngine : public ipc::Engine {
     last_cursor = cursor;
     return list_end_error;
   }
+
+  ipc::Error ListConflicts(const ipc::ConflictQuery& query, ipc::ConflictPage* page) override {
+    last_conflict_query = query;
+    page->offset = query.offset;
+    page->total = static_cast<std::int32_t>(conflicts_.size());
+    std::size_t at = static_cast<std::size_t>(query.offset);
+    for (; at < conflicts_.size() &&
+           page->entries.size() < static_cast<std::size_t>(query.limit);
+         ++at) {
+      if (!ipc::AppendIfItFits(page, conflicts_[at])) {
+        break;
+      }
+    }
+
+    page->has_more = at < conflicts_.size();
+    return ipc::Error::kOk;
+  }
+
+  ipc::Error RestoreBackup(std::int64_t entry_id, conflicts::RestoreReport* report) override {
+    last_restore_id = entry_id;
+    *report = restore_report;
+    return restore_error;
+  }
+
+  std::vector<ipc::ConflictRow> conflicts_;
+  ipc::ConflictQuery last_conflict_query;
+  std::int64_t last_restore_id = 0;
+  conflicts::RestoreReport restore_report;
+  ipc::Error restore_error = ipc::Error::kOk;
 };
 
 // --- shared fixtures ----------------------------------------------------------
@@ -868,6 +898,8 @@ int Secrets() {
       {ipc::Command::kListBegin, ipc::EncodeListRequest({ipc::ListKind::kRoms, 1, "z", 8})},
       {ipc::Command::kListNext, ipc::EncodeCursor(7)},
       {ipc::Command::kListEnd, ipc::EncodeCursor(7)},
+      {ipc::Command::kListConflicts, ipc::EncodeConflictQuery({0, ipc::kMaxConflictPage})},
+      {ipc::Command::kRestoreBackup, ipc::EncodeEntryId(3)},
   };
   checks.ExpectEq(calls.size(), std::size(ipc::kAllCommands),
                   "every command is exercised, including any that was just added");
@@ -1253,7 +1285,7 @@ int DispatchTable() {
     FakeEngine engine;
     ipc::ServiceCore core(engine);
     std::string response = "left over from the last call";
-    checks.Expect(ipc::Dispatch(core, 14, ipc::EncodeEmpty(), &response) ==
+    checks.Expect(ipc::Dispatch(core, 99, ipc::EncodeEmpty(), &response) ==
                       ipc::Error::kUnknownCommand,
                   "an id past the table is a named refusal, not a crash");
     checks.Expect(response.empty(), "and the response buffer is cleared, not left stale");
@@ -1689,6 +1721,12 @@ class HarnessEngine : public ipc::Engine {
   }
   ipc::Error ListNext(ipc::Cursor, ipc::ListPage*) override { return ipc::Error::kInternal; }
   ipc::Error ListEnd(ipc::Cursor) override { return ipc::Error::kInternal; }
+  ipc::Error ListConflicts(const ipc::ConflictQuery&, ipc::ConflictPage*) override {
+    return ipc::Error::kOk;
+  }
+  ipc::Error RestoreBackup(std::int64_t, conflicts::RestoreReport*) override {
+    return ipc::Error::kOk;
+  }
 
   auth::StoredToken token() const {
     std::lock_guard<std::mutex> held(mutex_);

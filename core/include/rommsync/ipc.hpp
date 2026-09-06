@@ -75,6 +75,7 @@
 
 #include "rommsync/auth.hpp"
 #include "rommsync/config.hpp"
+#include "rommsync/conflict_log.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/pairing.hpp"
 
@@ -159,6 +160,8 @@ enum class Command : std::uint32_t {
   kListBegin = 11,
   kListNext = 12,
   kListEnd = 13,
+  kListConflicts = 14,
+  kRestoreBackup = 15,
 };
 
 /// Every command, in id order. The dispatch table and the documentation are both
@@ -169,7 +172,8 @@ inline constexpr std::array kAllCommands = {
     Command::kSetConfig,           Command::kSetEnabled,   Command::kSyncNow,
     Command::kStartPair,           Command::kGetPairState, Command::kUnpair,
     Command::kEnqueue,             Command::kDequeue,      Command::kListBegin,
-    Command::kListNext,            Command::kListEnd,
+    Command::kListNext,            Command::kListEnd,      Command::kListConflicts,
+    Command::kRestoreBackup,
 };
 
 /// Stable, log-friendly name -- `GetStatus`. Never null; "Unknown" for an id
@@ -743,6 +747,98 @@ bool AppendIfItFits(ListPage* page, ListItem item);
 /// default-constructed request cannot accidentally address a live cursor.
 using Cursor = std::uint32_t;
 
+// --- the conflict history (M7-1, #36) -----------------------------------------
+//
+// Two commands rather than a fourth `ListKind`, and the reason is the payload
+// rather than taste. A `ListItem` is a flat object of at most `kMaxItemFields`
+// scalars; a conflict entry carries eighteen -- both sides of a comparison, two
+// paths and the sentence RomM sent -- so it does not fit the envelope the three
+// browsable lists share. It also needs no cursor: the history is a bounded
+// local vector that never touches the network, so an offset is the whole of the
+// state a page needs, and a screen that opened one would spend a cursor out of
+// `lists::kMaxCursors` for no fetch.
+//
+// The entry itself is `conflicts::Entry` rather than a second copy of the
+// fields. It is the type the sysmodule stores and the type the overlay draws,
+// and one struct is what keeps the two halves from disagreeing about which
+// timestamp is whose -- the same reason `ipc::list_keys` exists.
+
+/// How many entries one page may hold, whatever the client asks for.
+///
+/// A count cap, and -- like `kMaxPageSize` -- not the binding one: an entry
+/// carries two paths and a rom's name, so the *byte* bound is what usually
+/// decides a page's length. `AppendIfItFits` honours both.
+inline constexpr std::int32_t kMaxConflictPage = 8;
+
+/// Which slice of the history to send.
+///
+/// **An offset, not a page number.** A page can come back shorter than `limit`
+/// because the next entry would not fit the payload, and a client that then
+/// asked for "page 2" would skip whatever the short page left out. The answer
+/// carries the offset it started at and how many it holds, so the next request
+/// is `offset + entries.size()` and nothing can fall through the gap.
+struct ConflictQuery {
+  /// How many entries to skip, newest first. Past the end is an empty page, not
+  /// an error: a history that shrank under an open screen is normal.
+  std::int32_t offset = 0;
+
+  /// What the client would like. **Clamped** to `[1, kMaxConflictPage]` by the
+  /// sysmodule; the page says how many it actually holds.
+  std::int32_t limit = kMaxConflictPage;
+};
+
+/// One entry, plus the one thing about it that is not in the file.
+struct ConflictRow {
+  conflicts::Entry entry;
+
+  /// The backup this entry names is still on the card.
+  ///
+  /// **Not a stored fact.** Whether a file is there is a fact about the card
+  /// *now* -- a user can delete a backup, or move the card -- so it is answered
+  /// by the sysmodule as the page is built rather than written into
+  /// `conflicts.db`, where it would be a claim that went stale the moment it was
+  /// made. It is what lets a screen draw an entry as unrestorable **before** a
+  /// press instead of finding out at write time (#36).
+  ///
+  /// False means the sysmodule looked and it was not there. A build that cannot
+  /// look at all reports `true` for any entry that names a backup and refuses
+  /// the restore itself with `RestoreOutcome::kBackupFailed`, which is the
+  /// honest split: "it is gone" and "I cannot see" are different sentences.
+  bool backup_present = false;
+};
+
+struct ConflictPage {
+  /// Newest first, the order the history keeps.
+  std::vector<ConflictRow> entries;
+
+  /// Where this page started. Echoed rather than assumed, so a screen that sent
+  /// two requests can tell which answer it is holding.
+  std::int32_t offset = 0;
+
+  /// There are more entries after this page.
+  bool has_more = false;
+
+  /// How many entries the history holds altogether. What lets a screen say
+  /// "3 of 12" without walking to the end.
+  std::int32_t total = 0;
+};
+
+/// Add `entry` to `page` unless doing so would break a bound.
+///
+/// `AppendIfItFits(ListPage*, ListItem)`'s job and its reasoning: a rom's name
+/// and a save's file name are the user's data, so "eight entries" is not a size.
+/// Returns false without touching `page`. A false on an *empty* page means one
+/// entry does not fit a payload on its own, which is why `conflicts::Shorten`
+/// bounds every string before an entry is ever stored.
+bool AppendIfItFits(ConflictPage* page, ConflictRow row);
+
+/// How long a `conflicts::RestoreReport::message` may be on this wire.
+///
+/// The message is written by `core/` and is a sentence for a human, so it is
+/// bounded rather than trusted: it names two paths, and a path is as long as a
+/// card lets it be.
+inline constexpr std::size_t kMaxRestoreMessageBytes = 512;
+
 // --- codecs -------------------------------------------------------------------
 //
 // Every one of these round-trips losslessly and every decoder refuses a payload
@@ -802,6 +898,23 @@ Decoded<Cursor> DecodeCursor(std::string_view text);
 
 std::string EncodeListPage(const ListPage& page);
 Decoded<ListPage> DecodeListPage(std::string_view text);
+
+std::string EncodeConflictQuery(const ConflictQuery& query);
+Decoded<ConflictQuery> DecodeConflictQuery(std::string_view text);
+
+std::string EncodeConflictPage(const ConflictPage& page);
+Decoded<ConflictPage> DecodeConflictPage(std::string_view text);
+
+/// `{"entry_id":<int>}` -- `RestoreBackup`'s request.
+///
+/// Spelled apart from `EncodeRomId` even though both are one integer: they name
+/// different things, and a screen that sent a `rom_id` where an entry id was
+/// wanted would restore whatever entry happened to carry that number.
+std::string EncodeEntryId(std::int64_t entry_id);
+Decoded<std::int64_t> DecodeEntryId(std::string_view text);
+
+std::string EncodeRestoreReport(const conflicts::RestoreReport& report);
+Decoded<conflicts::RestoreReport> DecodeRestoreReport(std::string_view text);
 
 /// The payload of a command that carries none: `{}`. A shape rather than an
 /// empty buffer, so every decoder on both sides can assume a JSON object.
@@ -903,6 +1016,24 @@ class Engine {
   virtual Error ListBegin(const ListRequest& request, Cursor* cursor) = 0;
   virtual Error ListNext(Cursor cursor, ListPage* page) = 0;
   virtual Error ListEnd(Cursor cursor) = 0;
+
+  /// One page of the conflict history (M7-1, #36). Never fails: a console that
+  /// has never overwritten anything has an empty history, and that is the page
+  /// the screen most needs to draw.
+  ///
+  /// **`[sync] conflict_show` is not consulted here.** It hides the screen, and
+  /// the screen is the overlay's; an engine that filtered the answer would have
+  /// the sysmodule lie about what it recorded. See conflict_log.hpp.
+  virtual Error ListConflicts(const ConflictQuery& query, ConflictPage* page) = 0;
+
+  /// Put the bytes an entry names back on the card.
+  ///
+  /// Never fails at the transport either, for `SetConfig`'s reason: what
+  /// happened is a `conflicts::RestoreOutcome` inside a successful reply,
+  /// because a `Result` that says the call failed takes the answer with it --
+  /// and "the backup is gone" and "the sysmodule is not running" must not arrive
+  /// at a screen as the same thing.
+  virtual Error RestoreBackup(std::int64_t entry_id, conflicts::RestoreReport* report) = 0;
 };
 
 /// The service, as a plain C++ class with one method per command.
@@ -968,6 +1099,13 @@ class ServiceCore {
   Error ListBegin(const ListRequest& request, Cursor* cursor);
   Error ListNext(Cursor cursor, ListPage* page);
   Error ListEnd(Cursor cursor);
+
+  /// Command 14. The limit is clamped here rather than in the engine, so every
+  /// implementation is held to the same cap.
+  ConflictPage ListConflicts(const ConflictQuery& query);
+
+  /// Command 15. Never fails; the outcome is in the answer.
+  conflicts::RestoreReport RestoreBackup(std::int64_t entry_id);
 
  private:
   /// A pairing status cut to what a payload carries. See the definition: the

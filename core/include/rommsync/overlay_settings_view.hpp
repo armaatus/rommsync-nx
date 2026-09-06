@@ -58,6 +58,17 @@ enum class Destination {
   kSync,
   kLibrary,
   kPairing,
+
+  /// What a sync overwrote, and putting it back (M7-1, #36).
+  ///
+  /// **The one row on this menu that is conditional.** `[sync] conflict_show`
+  /// is documented as hiding the conflicts screen, and this is where it does
+  /// it: with the setting off the row is not drawn, so the screen has no way in.
+  /// The *recording* is untouched -- the sysmodule writes an entry and a backup
+  /// either way, and turning the setting back on shows every one of them
+  /// (conflict_log.hpp). The `[sync]` section below still reports the value, so
+  /// a user who cannot find the screen can see why in the same place.
+  kConflicts,
 };
 const char* ToString(Destination destination);
 

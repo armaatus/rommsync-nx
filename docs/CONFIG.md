@@ -77,6 +77,18 @@ states =
 A platform that maps no folders is skipped entirely, the same as one nobody
 ever mapped.
 
+### `conflict_show` hides the screen, never the recording
+
+`[sync] conflict_show = false` takes the **Conflicts** row off the overlay's
+menu, and that is all it does. The sysmodule still records every overwrite in
+`conflicts.db` and still writes every backup under `.backup/` — a backup that
+nothing recorded is a file whose name says neither the game nor the day, which
+is the state the screen exists to fix (docs/SYNC_PROTOCOL.md#conflicts).
+
+Turning it back on shows every conflict that happened while it was off. The
+`[sync]` section of the settings screen reports the value, so a user who cannot
+find the screen can see why in the same place.
+
 ### Where a rom lands
 
 A download's destination is that platform's **first** `roms` folder with the

@@ -33,6 +33,7 @@
 namespace {
 
 namespace config = rommsync::config;
+namespace conflicts = rommsync::conflicts;
 namespace ipc = rommsync::ipc;
 namespace overlay = rommsync::overlay;
 
@@ -75,6 +76,12 @@ class KnobEngine : public ipc::Engine {
   }
   ipc::Error ListNext(ipc::Cursor, ipc::ListPage*) override { return ipc::Error::kOk; }
   ipc::Error ListEnd(ipc::Cursor) override { return ipc::Error::kOk; }
+  ipc::Error ListConflicts(const ipc::ConflictQuery&, ipc::ConflictPage*) override {
+    return ipc::Error::kOk;
+  }
+  ipc::Error RestoreBackup(std::int64_t, conflicts::RestoreReport*) override {
+    return ipc::Error::kOk;
+  }
 
  private:
   std::vector<config::Diagnostic> notes_;

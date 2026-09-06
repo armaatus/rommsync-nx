@@ -328,6 +328,8 @@ bool TakesRequest(Command command) {
     case Command::kListBegin:
     case Command::kListNext:
     case Command::kListEnd:
+    case Command::kListConflicts:
+    case Command::kRestoreBackup:
       return true;
     case Command::kGetInterfaceVersion:
     case Command::kGetStatus:
@@ -339,6 +341,41 @@ bool TakesRequest(Command command) {
       return false;
   }
   return false;
+}
+
+ConflictPage ServiceCore::ListConflicts(const ConflictQuery& query) {
+  // Clamped here rather than in the engine, so every implementation is held to
+  // the same cap -- `ListBegin`'s page size, for its reason.
+  ConflictQuery clamped = query;
+  if (clamped.limit < 1) {
+    clamped.limit = 1;
+  }
+  if (clamped.limit > kMaxConflictPage) {
+    clamped.limit = kMaxConflictPage;
+  }
+  if (clamped.offset < 0) {
+    clamped.offset = 0;
+  }
+  ConflictPage page;
+  page.offset = clamped.offset;
+  // Never fails: a console that has never overwritten anything has an empty
+  // history, and that is the page the screen most needs to draw.
+  static_cast<void>(engine_.ListConflicts(clamped, &page));
+  return page;
+}
+
+conflicts::RestoreReport ServiceCore::RestoreBackup(std::int64_t entry_id) {
+  conflicts::RestoreReport report;
+  const Error refused = engine_.RestoreBackup(entry_id, &report);
+  if (refused != Error::kOk && report.outcome == conflicts::RestoreOutcome::kRestored) {
+    // An engine that refused and reported success is a bug on that side; the
+    // wire says what the file did, so the safe reading is the refusal.
+    report.outcome = conflicts::RestoreOutcome::kWriteFailed;
+    report.message = "the sysmodule could not carry out the restore";
+  }
+  // The two paths in the message are as long as the card lets them be.
+  Shorten(&report.message, kMaxRestoreMessageBytes);
+  return report;
 }
 
 Error Dispatch(ServiceCore& core, std::uint32_t command_id, std::string_view request,
@@ -478,6 +515,27 @@ Error Dispatch(ServiceCore& core, std::uint32_t command_id, std::string_view req
       if (error == Error::kOk) {
         payload = EncodeEmpty();
       }
+      break;
+    }
+
+    case Command::kListConflicts: {
+      const Decoded<ConflictQuery> query = DecodeConflictQuery(request);
+      if (!query.ok()) {
+        return Error::kMalformedRequest;
+      }
+      payload = EncodeConflictPage(core.ListConflicts(query.value));
+      break;
+    }
+
+    case Command::kRestoreBackup: {
+      const Decoded<std::int64_t> entry_id = DecodeEntryId(request);
+      if (!entry_id.ok()) {
+        return Error::kMalformedRequest;
+      }
+      // Succeeds whatever the restore did, for `SetConfig`'s reason: a `Result`
+      // that says the call failed takes the answer with it, and "the backup is
+      // gone" is an answer the screen has a sentence for.
+      payload = EncodeRestoreReport(core.RestoreBackup(entry_id.value));
       break;
     }
   }

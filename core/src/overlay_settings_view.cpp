@@ -62,12 +62,20 @@ SettingsRow Navigate(std::string label, std::string value, Destination destinati
 /// It is first rather than last, and that is deliberate: the folder map is one
 /// section per platform and the built-in map alone is eleven of them, so a menu
 /// under it is a menu nobody scrolls to.
-SettingsSection Menu() {
+SettingsSection Menu(const config::SyncConfig& sync) {
   SettingsSection section;
   section.title = "Screens";
   section.rows.push_back(Navigate("Sync", "the switch and Sync now", Destination::kSync));
   section.rows.push_back(
       Navigate("Library", "browse roms and the queue", Destination::kLibrary));
+  // The one conditional row on this menu -- see `Destination::kConflicts`. The
+  // setting hides the screen; it never stops the sysmodule recording, so a
+  // console that had it off for a month lists every conflict when it goes on.
+  if (sync.conflict_show) {
+    section.rows.push_back(
+        Navigate("Conflicts", "what a sync overwrote, and undoing it",
+                 Destination::kConflicts));
+  }
   // Reaching the pairing screen without discarding anything. "Re-pair" is the
   // destructive way in and is a button rather than a row; this is how a user
   // reads a code that is already on its way (#27).
@@ -102,7 +110,14 @@ SettingsSection SyncSection(const config::SyncConfig& sync) {
   section.rows.push_back(Value("on_boot", BoolText(sync.on_boot)));
   section.rows.push_back(Value("saves", BoolText(sync.saves)));
   section.rows.push_back(Value("states", BoolText(sync.states)));
-  section.rows.push_back(Value("conflict_show", BoolText(sync.conflict_show)));
+  {
+    // Said next to the value, because the value is the only explanation a user
+    // gets for a menu row that is not there.
+    SettingsRow row = Value("conflict_show", BoolText(sync.conflict_show));
+    row.note = sync.conflict_show ? "the Conflicts screen is on the menu above"
+                                  : "the Conflicts screen is hidden; conflicts are still recorded";
+    section.rows.push_back(std::move(row));
+  }
   return section;
 }
 
@@ -363,6 +378,8 @@ const char* ToString(Destination destination) {
       return "library";
     case Destination::kPairing:
       return "pairing";
+    case Destination::kConflicts:
+      return "conflicts";
   }
   return "none";
 }
@@ -431,7 +448,7 @@ SettingsView RenderSettings(const ipc::ConfigView& config, const RepairState& re
   SetHeadline(&view, config);
   AddComplaints(&view, config.diagnostics);
 
-  view.sections.push_back(Menu());
+  view.sections.push_back(Menu(config.config.sync));
   view.sections.push_back(ServerSection(config.config));
   view.sections.push_back(SyncSection(config.config.sync));
   view.sections.push_back(DownloadsSection(config.config.downloads));

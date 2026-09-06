@@ -298,6 +298,32 @@ carrying `device_id` and by `POST /api/saves/{id}/downloaded` — a download the
 client never confirms leaves the device looking like it has never seen the save,
 which puts every later comparison in the no-sync-history branch above.
 
+#### Finding the backup again, and putting it back
+
+A backup is only a safety net if a human can find one without an SD reader, so
+every overwrite is recorded in `conflicts.db` beside `state.db` as it happens —
+a conflict, a download that replaced a file, and the same two on the states side
+(`core/include/rommsync/conflict_log.hpp`, M7-1). The entry stores **the exact
+path the backup was written to**, never a name derived a second time: a
+`BackUpFirst` that had to step past an occupied name would make the two
+spellings differ, and a restore from the wrong path is the failure backups exist
+to prevent.
+
+`conflicts::Restore` puts those bytes back, and it is **a save overwrite in its
+own right**: it copies the file it is about to replace under `.backup/` first,
+through the same `sync::BackUpFirst`, and then commits with
+`io::CopyAtomically`. A restore that ate the server's copy would be this rule
+broken one level up.
+
+It writes the local file and nothing else. **The server stays the source of
+truth**: the next negotiation arbitrates, and will most likely plan an `upload`.
+The user is choosing which bytes to offer, not overruling RomM, and the overlay
+says so before the press.
+
+`[sync] conflict_show` hides the overlay's conflicts screen. It never stops the
+recording — a console that had it off for a month lists every conflict, and
+keeps every backup, when it goes back on.
+
 ## Step 3 — complete
 
 `POST /api/sync/sessions/{session_id}/complete`:

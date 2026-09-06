@@ -58,6 +58,7 @@
 #include "rommsync/device_identity.hpp"
 #include "rommsync/download.hpp"
 #include "rommsync/file_system.hpp"
+#include "rommsync/conflict_log.hpp"
 #include "rommsync/http.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/list_service.hpp"
@@ -273,6 +274,26 @@ class SdEngine : public ipc::Engine {
   ipc::Error ListNext(ipc::Cursor cursor, ipc::ListPage* page) override;
   ipc::Error ListEnd(ipc::Cursor cursor) override;
 
+  /// M7-1 (#36). Both are served from `conflicts.db` beside `state.db` and
+  /// neither touches the network -- the history is what a *previous* tick wrote,
+  /// and a restore is one copy between two files on the card.
+  ipc::Error ListConflicts(const ipc::ConflictQuery& query, ipc::ConflictPage* page) override;
+  ipc::Error RestoreBackup(std::int64_t entry_id, conflicts::RestoreReport* report) override;
+
+  /// The conflict history, for the tick that writes it.
+  ///
+  /// **Nothing in this build drives a tick**, so nothing appends to it here yet
+  /// -- the scheduler is M7-2 (#37), and it is written there that
+  /// `conflicts::RecordSaves` and `conflicts::RecordStates` are what it owes
+  /// this file after each half of a tick. What this build does is load it at
+  /// boot and serve it, which is what makes an entry written by an earlier
+  /// release readable by this one.
+  conflicts::History& history() { return history_; }
+
+  /// Whether the backup `entry` names is still on the card, for
+  /// `ipc::ConflictRow::backup_present`.
+  bool BackupPresent(const conflicts::Entry& entry) const;
+
  private:
   /// Apply `change` to the queue and write the file, or leave both exactly as
   /// they were. Shared by `Enqueue` and `Dequeue` so the rollback cannot be got
@@ -442,6 +463,19 @@ class SdEngine : public ipc::Engine {
   /// The three lists the overlay browses (M5-4, #31). Declared after `config_`
   /// and `queue_` because it holds a reference to each.
   lists::Service lists_;
+
+  /// What has been overwritten on this card, newest first (M7-1, #36). Reloaded
+  /// by `Load`, which is also what points it at the right directory.
+  conflicts::History history_{std::string(conflicts::kHistorySdPath)};
+
+  /// The card, for a restore. The same pointer `UseCard` hands `lists_`, kept
+  /// here too because a restore opens two files through it.
+  ///
+  /// **Null on the console today**: nothing implements `fs::FileSystem` for
+  /// Horizon yet (`UseCard`). A restore then refuses with
+  /// `RestoreOutcome::kBackupFailed`, whose promise -- nothing was written -- is
+  /// exactly what a build that cannot open the card manages to keep.
+  fs::FileSystem* card_ = nullptr;
 
   /// The verdict `auth.json` holds, and what a worker consults before calling.
   ///
