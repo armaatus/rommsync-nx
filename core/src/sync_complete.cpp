@@ -434,34 +434,43 @@ auth::Parsed<SyncCompletion> ParseCompleteResponse(std::string_view body) {
   // Present-and-null is the ordinary answer and the schema does not require the
   // key at all, so only a non-null object is read.
   //
-  // **A malformed ingest is a malformed completion.** It could have been a
-  // warning -- the session came back and the counts are on the server either
-  // way -- but the ingest is the only thing that says which buffered play
-  // sessions may be dropped, and a caller handed an empty answer would keep
-  // every one of them and re-send them forever. A named error keeps them too,
-  // and says why.
+  // **An ingest this build cannot read is a warning, never an error**, and that
+  // is the whole feature's rule applied to the answer half: a play session may
+  // not cost a sync tick. Failing here would make `CompleteError::kMalformed`
+  // out of a completion the server performed, which `sync_tick.hpp` turns into a
+  // failed `TickOutcome` and a scheduler backoff -- over play time, on a tick
+  // whose saves are already synced.
+  //
+  // Leaving `play_session_ingest` absent is exactly the right fallback because
+  // absent already means "the server said nothing about them": `play::Reconcile`
+  // is never reached, nothing is released, and the sessions go out again on the
+  // next tick to be answered `duplicate`. The cost of a RomM that changed this
+  // shape is therefore one duplicate per tick, not a console that stops syncing.
   if (const json::Value* ingest = document.value.Find("play_session_ingest");
       ingest != nullptr && !ingest->is_null()) {
     auth::Parsed<PlaySessionIngest> parsed_ingest =
         ParseIngestResponse(*ingest, "play session ingest");
-    if (!parsed_ingest.ok()) {
-      parsed.error = parsed_ingest.error;
-      parsed.error.field =
-          parsed.error.field.empty() ? "play_session_ingest"
-                                     : "play_session_ingest." + parsed.error.field;
-      return parsed;
-    }
-    for (const PlaySessionIngestResult& result : parsed_ingest.value.results) {
-      if (result.status == IngestStatus::kError) {
-        // RomM's own sentence, carried rather than classified: nothing here can
-        // act on it, and a caller that logs one list must still be able to see
-        // that a session was refused rather than recorded.
-        completion.warnings.push_back(
-            "the server refused play session " + std::to_string(result.index) + ": " +
-            (result.detail.has_value() ? *result.detail : std::string("no reason given")));
+    if (parsed_ingest.ok()) {
+      for (const PlaySessionIngestResult& result : parsed_ingest.value.results) {
+        if (result.status == IngestStatus::kError) {
+          // RomM's own sentence, carried rather than classified: nothing here
+          // can act on it, and a caller that logs one list must still be able to
+          // see that a session was refused rather than recorded.
+          completion.warnings.push_back(
+              "the server refused play session " + std::to_string(result.index) + ": " +
+              (result.detail.has_value() ? *result.detail : std::string("no reason given")));
+        }
       }
+      completion.play_session_ingest = std::move(parsed_ingest.value);
+    } else {
+      // `play_session_ingest` is deliberately left absent, and the completion
+      // carries on -- the two checks below still run, because a session that
+      // came back CANCELLED is news whatever became of the play time.
+      completion.warnings.push_back(
+          "the server's play_session_ingest could not be read, so the play sessions this tick "
+          "sent stay buffered and are sent again: " +
+          parsed_ingest.error.Describe());
     }
-    completion.play_session_ingest = std::move(parsed_ingest.value);
   }
 
   if (completion.session.status != kCompletedStatus) {
@@ -479,12 +488,6 @@ auth::Parsed<SyncCompletion> ParseCompleteResponse(std::string_view body) {
 
   parsed.value = std::move(completion);
   return parsed;
-}
-
-Completion CompleteSession(http::HttpClient& client, const auth::StoredToken& token,
-                           std::int64_t session_id, const CompletionCounts& counts,
-                           const CompleteOptions& options) {
-  return CompleteSession(client, token, session_id, counts, {}, options);
 }
 
 Completion CompleteSession(http::HttpClient& client, const auth::StoredToken& token,

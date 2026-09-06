@@ -147,14 +147,43 @@ Derivation DeriveSessions(const std::vector<SaveObservation>& previous,
   }
 
   const std::map<ObservationKey, sync::Timestamp> before = IndexObservations(previous);
+  // One line for the count bound however many saves hit it: it is one event
+  // rather than N, and sixteen copies would crowd out every other diagnostic.
+  // A flag rather than `skipped == 0`, because the other three skips bump that
+  // too -- one save with a future mtime would otherwise silence this entirely.
+  bool said_too_many = false;
 
   for (const SaveObservation& observation : current) {
     if (observation.rom_id <= 0) {
       continue;
     }
     const auto found = before.find(ObservationKey{observation.rom_id, observation.slot});
-    const bool seen_before = found != before.end();
-    if (seen_before && observation.mtime <= found->second) {
+    if (found == before.end()) {
+      // **A save this client has no previous observation of produces nothing**,
+      // and that is not the conservative choice, it is the only correct one.
+      //
+      // "New since the last tick" is indistinguishable from "the row went
+      // away", and the rows go away for reasons that are the *client's own
+      // writes*: `AdvanceBaseline` erases a row whose bytes it could not read
+      // back after a download, and a `state.db` a yanked card left unreadable is
+      // discarded whole -- which would otherwise report the entire library as
+      // played, in one window, on the next tick.
+      //
+      // **It does not cover an M7-1 restore**, which is worth saying because it
+      // looks as though it should: `conflicts::Restore` writes the save and
+      // never touches `state.db`, so the row survives with its old mtime and the
+      // restored file takes the ordinary "this moved" path below. That one is a
+      // known false positive, bounded by `kMaxWindowSeconds` and no worse than
+      // one session; fixing it means the restore telling the baseline what it
+      // did, which is M7-1's call to make and not this module's.
+      //
+      // It costs the first write to a save that genuinely is new: one session,
+      // once per save, and the second write is reported normally. That is the
+      // cheap direction. Play time nobody played is not correctable by anyone
+      // once RomM has it.
+      continue;
+    }
+    if (observation.mtime <= found->second) {
       // Nothing was written to this save since the last tick, so nobody played
       // it. The common case, and deliberately not counted: an unchanged card
       // must produce no diagnostics at all.
@@ -185,8 +214,7 @@ Derivation DeriveSessions(const std::vector<SaveObservation>& previous,
     // tick looked" and "when this save was last written". The second only wins
     // when a save was written after the last tick had already read it, which is
     // exactly the case where it is the better bound.
-    const sync::Timestamp start =
-        seen_before && found->second > last_seen ? found->second : last_seen;
+    const sync::Timestamp start = found->second > last_seen ? found->second : last_seen;
     if (observation.mtime <= start) {
       // The write landed at or before the window opened. A restored file, or a
       // clock corrected between the two reads; either way there is no window to
@@ -195,16 +223,30 @@ Derivation DeriveSessions(const std::vector<SaveObservation>& previous,
       continue;
     }
 
+    if (sync::UnixSeconds(observation.mtime) - sync::UnixSeconds(start) >
+        options.max_window_seconds) {
+      // A window longer than a session can plausibly be. The arithmetic is not
+      // wrong -- the play did happen inside it -- but a console that was off for
+      // a week would otherwise report a week of play time. See
+      // `kMaxWindowSeconds`.
+      derived.skipped++;
+      AddWarning(&derived.warnings,
+                 "rom " + std::to_string(observation.rom_id) +
+                     " has a save that changed inside a window longer than " +
+                     std::to_string(options.max_window_seconds / 3600) +
+                     " hours; the console was not looking for most of it, so nothing was "
+                     "recorded");
+      continue;
+    }
+
     if (derived.sessions.size() >= options.max_sessions) {
-      // Counted for every remaining save, so `skipped` is honest -- but the line
-      // is written once. This is one event, not one per save, and sixteen copies
-      // of it would crowd out every other diagnostic the tick produced.
-      if (derived.skipped == 0) {
+      derived.skipped++;
+      if (!said_too_many) {
+        said_too_many = true;
         AddWarning(&derived.warnings,
                    "more than " + std::to_string(options.max_sessions) +
                        " saves changed in one tick; the rest were not recorded as play sessions");
       }
-      derived.skipped++;
       continue;
     }
 

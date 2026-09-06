@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -90,6 +91,31 @@ sync::PlaySession SessionOf(std::int64_t rom_id, const std::string& slot, std::i
   session.duration_ms = (end - start) * 1000;
   return session;
 }
+
+/// An `HttpClient` that fails the test if anything is sent through it.
+///
+/// `test_sync_complete.cpp`'s `NeverCalled`, for its reason: the refusals
+/// `CompleteSession` makes before it builds a request must not reach the network
+/// at all.
+class NeverSent : public http::HttpClient {
+ public:
+  explicit NeverSent(rig::Checks& checks) : checks_(&checks) {}
+
+  http::Result Send(const http::Request& request) override { return Refuse(request); }
+  http::Result Download(const http::Request& request, const http::DownloadTarget&) override {
+    return Refuse(request);
+  }
+
+ private:
+  http::Result Refuse(const http::Request& request) {
+    checks_->Expect(false, "nothing should have been sent, and a request went to " + request.url);
+    http::Result result;
+    result.error = http::Error::kTransport;
+    return result;
+  }
+
+  rig::Checks* checks_;
+};
 
 /// A window unique to this run and safely in the past.
 ///
@@ -272,16 +298,38 @@ void Derive(rig::Checks& checks) {
                     "bounded by the save's previous mtime, not by the older tick");
   }
 
-  // A save this client has never seen before. There is no previous mtime, so the
-  // window is the tick's, and that is the honest answer rather than a skip.
+  // A save this client has no previous observation of. **Nothing**, and this is
+  // the rule that keeps the client's own writes out of a user's play time: "new
+  // since the last tick" cannot be told from "its baseline row went away", and
+  // the rows go away for reasons that are writes this client made -- a download
+  // whose bytes could not be read back (`AdvanceBaseline` erases the row), an
+  // M7-1 restore, a `state.db` a yanked card left unreadable.
   const play::Derivation fresh = play::DeriveSessions({}, {Seen(9, "tico-srm", kNoon - 30)},
                                                       At(kNoon - 600), At(kNoon));
-  checks.ExpectEq(static_cast<int>(fresh.sessions.size()), 1,
-                  "a save that appeared since the last tick is a session too");
-  if (fresh.sessions.size() == 1) {
-    checks.ExpectEq(sync::UnixSeconds(fresh.sessions[0].start_time), kNoon - 600,
-                    "...bounded by the tick, which is all there is to bound it with");
+  checks.Expect(fresh.sessions.empty(),
+                "a save with no previous observation is not a session");
+  checks.Expect(fresh.warnings.empty(),
+                "...and is not a complaint either: it is the second write that gets recorded");
+
+  // The case that makes it worth the first write it costs: a baseline that
+  // would not parse is an *empty* one, and the whole library would otherwise
+  // come back as played in a single window.
+  std::vector<play::SaveObservation> library;
+  for (std::int64_t rom = 1; rom <= 30; ++rom) {
+    library.push_back(Seen(rom, "retroarch-srm", kNoon - 30));
   }
+  const play::Derivation discarded =
+      play::DeriveSessions({}, library, At(kNoon - 600), At(kNoon));
+  checks.Expect(discarded.sessions.empty(),
+                "a discarded state.db does not report the whole library as played");
+
+  // And the second write to that same save is reported normally, which is what
+  // makes the cost one session rather than the save.
+  const play::Derivation second = play::DeriveSessions(
+      {Seen(9, "tico-srm", kNoon - 30)}, {Seen(9, "tico-srm", kNoon - 10)}, At(kNoon - 600),
+      At(kNoon));
+  checks.ExpectEq(static_cast<int>(second.sessions.size()), 1,
+                  "the next write to a save the client has now seen is a session");
 
   // The first tick after a boot with no buffer. Silent, and it must be: with no
   // window every save on the card would come back as one enormous session.
@@ -316,21 +364,77 @@ void Derive(rig::Checks& checks) {
   checks.Expect(ancient.sessions.empty(), "a save with an implausible mtime is not a session");
   checks.ExpectEq(ancient.skipped, static_cast<std::size_t>(1), "...and is counted");
 
-  // A card whose every save moved at once -- a restore, a card swap, a touch.
-  // The bound is the buffer's, so a tick cannot push out sessions it already has
-  // in favour of ones it cannot explain either.
+  // A window longer than a session can plausibly be. The arithmetic is right --
+  // the play did happen in there -- but a console that was off for a week must
+  // not report a week of play time, and the half of the window this client
+  // controls is "when did I last look".
+  const std::int64_t week = 7 * 24 * 3600;
+  const play::Derivation stale = play::DeriveSessions(
+      {Seen(4, "retroarch-srm", kNoon - week)}, {Seen(4, "retroarch-srm", kNoon - 60)},
+      At(kNoon - week), At(kNoon));
+  checks.Expect(stale.sessions.empty(),
+                "a save that moved inside a week-long window is not a week of play time");
+  checks.ExpectEq(stale.skipped, static_cast<std::size_t>(1), "it is a counted skip");
+  checks.Expect(!stale.warnings.empty(), "...and a named one");
+
+  // The legitimate long window this is deliberately generous about: a console
+  // suspended overnight fires one tick on wake, and the session it derives spans
+  // the sleep. Refusing that would cost play that actually happened.
+  const play::Derivation overnight = play::DeriveSessions(
+      {Seen(4, "retroarch-srm", kNoon - 9 * 3600)}, {Seen(4, "retroarch-srm", kNoon - 60)},
+      At(kNoon - 9 * 3600), At(kNoon));
+  checks.ExpectEq(static_cast<int>(overnight.sessions.size()), 1,
+                  "a nine-hour window is still recorded -- a suspend is not a fabrication");
+
+  // Exactly at the bound is inside it; one second past is not.
+  const std::int64_t cap = play::kMaxWindowSeconds;
+  checks.ExpectEq(
+      static_cast<int>(play::DeriveSessions({Seen(4, "s", kNoon - cap)}, {Seen(4, "s", kNoon)},
+                                            At(kNoon - cap), At(kNoon))
+                           .sessions.size()),
+      1, "a window exactly at the bound is kept");
+  checks.Expect(play::DeriveSessions({Seen(4, "s", kNoon - cap - 1)}, {Seen(4, "s", kNoon)},
+                                     At(kNoon - cap - 1), At(kNoon))
+                    .sessions.empty(),
+                "and one second past it is not");
+
+  // A card whose every known save moved at once -- a `touch` over the folder, or
+  // a card the player edited elsewhere. The bound is the buffer's, so a tick
+  // cannot push out sessions it already has in favour of ones it cannot explain
+  // either.
+  std::vector<play::SaveObservation> known;
   std::vector<play::SaveObservation> stampede;
   for (std::int64_t rom = 1; rom <= 60; ++rom) {
+    known.push_back(Seen(rom, "retroarch-srm", kNoon - 3600));
     stampede.push_back(Seen(rom, "retroarch-srm", kNoon - 60));
   }
   play::DeriveOptions bounded;
   bounded.max_sessions = 4;
   const play::Derivation capped =
-      play::DeriveSessions({}, stampede, At(kNoon - 1800), At(kNoon), bounded);
+      play::DeriveSessions(known, stampede, At(kNoon - 1800), At(kNoon), bounded);
   checks.ExpectEq(static_cast<int>(capped.sessions.size()), 4, "one tick's output is bounded");
   checks.ExpectEq(capped.skipped, static_cast<std::size_t>(56), "and the rest are counted exactly");
   checks.Expect(capped.warnings.size() <= play::kMaxDiagnostics,
                 "the count is exact and only the spelling out is bounded");
+
+  // ...and the line saying so survives an earlier skip of a different kind. It
+  // is guarded by a flag of its own rather than by `skipped == 0`, which the
+  // future-mtime and implausible-mtime branches also bump -- one odd save would
+  // otherwise silence the only explanation for fifty-six dropped sessions.
+  std::vector<play::SaveObservation> with_a_future_one = stampede;
+  with_a_future_one.insert(with_a_future_one.begin(), Seen(99, "retroarch-srm", kNoon + 3600));
+  std::vector<play::SaveObservation> known_plus = known;
+  known_plus.push_back(Seen(99, "retroarch-srm", kNoon - 3600));
+  const play::Derivation noisy =
+      play::DeriveSessions(known_plus, with_a_future_one, At(kNoon - 1800), At(kNoon), bounded);
+  bool said_too_many = false;
+  for (const std::string& warning : noisy.warnings) {
+    if (warning.find("saves changed in one tick") != std::string::npos) {
+      said_too_many = true;
+    }
+  }
+  checks.Expect(said_too_many,
+                "the overflow line is still written when another skip came first");
 
   // The archival save: no slot on either side. A derivation that spelled the two
   // differently would report every archival save as played on every tick.
@@ -338,6 +442,95 @@ void Derive(rig::Checks& checks) {
       {Seen(4, "", kNoon - 3600)}, {Seen(4, "", kNoon - 3600)}, At(kNoon - 1800), At(kNoon));
   checks.Expect(archival.sessions.empty(),
                 "an unchanged archival save is matched on the empty slot, not treated as new");
+}
+
+// --- carded -------------------------------------------------------------------
+//
+// The same derivation over mtimes that came off a real card rather than out of a
+// literal: files in the harness sandbox, listed through `fs::FileSystem` exactly
+// as `scan::ScanSaves` lists them, and the `modified_unix` -> `sync::Timestamp`
+// conversion the engine performs on the way in.
+//
+// It is the other half of the acceptance criterion `derive` covers -- an
+// injected clock *and* the harness sandbox -- and it is where a save the card
+// dates in whole seconds meets arithmetic written in `Timestamp`s.
+
+void Carded(rig::Checks& checks) {
+  Sandbox sandbox(checks, "play-carded");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+
+  // Two saves and an archival one. The archival save is the hazard: `state.db`
+  // holds a *null* slot for it and the scan holds the empty string, and a
+  // derivation that spelled the two differently would report it as a save it
+  // had never seen -- which now means it never records play time at all.
+  sandbox.SeedSave(SavePath("played.srm"), "the player got somewhere\n");
+  sandbox.SeedSave(SavePath("untouched.srm"), "nobody opened this\n");
+  sandbox.SeedSave(SavePath("archival.srm"), "no slot at all\n");
+
+  const fs::Listing listing = files->List(harness::kSavesDir);
+  checks.Expect(listing.ok(), "the sandbox's saves list: " + listing.message);
+  std::map<std::string, std::int64_t> mtimes;
+  for (const fs::Entry& entry : listing.entries) {
+    if (!entry.is_directory) {
+      mtimes[entry.name] = entry.modified_unix;
+      checks.Expect(entry.modified_unix > play::kEarliestPlausibleSeconds,
+                    "the card gives up an mtime this client will stamp a session with: " +
+                        entry.name);
+    }
+  }
+  if (mtimes.size() != 3) {
+    checks.Expect(false, "all three seeded saves were listed");
+    return;
+  }
+
+  // What the engine builds: the baseline's rows on one side, the scan's files on
+  // the other. Written the way `ObservationsOf` writes them -- a null slot
+  // becomes the empty string -- because that agreement is what is under test.
+  const std::int64_t now = mtimes["played.srm"] + 1;
+  const std::vector<play::SaveObservation> before = {
+      Seen(4, "retroarch-srm", mtimes["played.srm"] - 1800),
+      Seen(5, "retroarch-srm", mtimes["untouched.srm"]),
+      Seen(6, "", mtimes["archival.srm"] - 1800)};
+  const std::vector<play::SaveObservation> after = {
+      Seen(4, "retroarch-srm", mtimes["played.srm"]),
+      Seen(5, "retroarch-srm", mtimes["untouched.srm"]),
+      Seen(6, "", mtimes["archival.srm"])};
+
+  const play::Derivation derived =
+      play::DeriveSessions(before, after, At(mtimes["played.srm"] - 900), At(now));
+  checks.ExpectEq(static_cast<int>(derived.sessions.size()), 2,
+                  "the two saves the card says moved are sessions, and the third is not");
+  checks.ExpectEq(derived.skipped, static_cast<std::size_t>(0), "with nothing skipped");
+  bool archival_recorded = false;
+  for (const sync::PlaySession& session : derived.sessions) {
+    checks.Expect(sync::Validate(session).ok(),
+                  "a session derived from a real mtime is one the encoder will take: " +
+                      sync::Validate(session).Describe());
+    checks.Expect(sync::UnixSeconds(session.end_time) <= now,
+                  "and it never ends after the tick that derived it -- RomM refuses a future "
+                  "end_time (docs/API_CONTRACT.md#play-sessions)");
+    if (session.rom_id.has_value() && *session.rom_id == 6) {
+      archival_recorded = true;
+      checks.Expect(!session.save_slot.has_value(),
+                    "an archival save carries a null slot on the wire, never an empty string");
+    }
+  }
+  checks.Expect(archival_recorded,
+                "the archival save is matched on the empty slot the two sides agree on");
+
+  // And the whole round trip: derive off the card, buffer, and read back what a
+  // reboot would.
+  const std::string path = sandbox.Host(play::kBufferSdPath);
+  play::Buffer buffer(path);
+  static_cast<void>(buffer.Load());
+  checks.Expect(buffer.Record(derived.sessions, At(now)).ok(), "they reach the card");
+  play::Buffer rebooted(path);
+  static_cast<void>(rebooted.Load());
+  checks.ExpectEq(static_cast<int>(rebooted.size()), 2, "and survive a reboot");
+  const sync::Encoded body = sync::EncodePlaySessions(
+      {rebooted.sessions()[0].session, rebooted.sessions()[1].session});
+  checks.Expect(body.ok(), "and encode after the round trip: " + body.error.Describe());
 }
 
 // --- store --------------------------------------------------------------------
@@ -415,13 +608,35 @@ void Store(rig::Checks& checks) {
     }
 
     // The bound on the *file* is what the reader enforces, so a full buffer has
-    // to fit inside it -- otherwise the reader discards a file the writer was
-    // happy with.
+    // to fit inside it -- otherwise `Persist` refuses, nothing is written, and
+    // `last_seen` never reaches the card either: the buffer wedges silently on a
+    // console nobody can attach a debugger to.
     const std::string text =
         play::SerializeBuffer(buffer.sessions(), 10'000, At(kNoon + 100'000));
     checks.Expect(text.size() <= play::kMaxBufferBytes,
                   "a full buffer fits inside the bound its own reader enforces: " +
                       std::to_string(text.size()) + " bytes");
+
+    // And the **worst** buffer, not the realistic one: every field at full
+    // width and a slot at `kMaxSlotBytes`, which `Buffer::Record` accepts. A
+    // fit that only held for `retroarch-srm` is a bound that holds until
+    // somebody adds an emulator with a long name.
+    std::vector<play::BufferedSession> widest;
+    for (std::size_t at = 0; at < play::kMaxSessions; ++at) {
+      sync::PlaySession session;
+      session.rom_id = 9'223'372'036'854'775'807LL;
+      session.save_slot = std::string(play::kMaxSlotBytes, 'x');
+      session.start_time = At(sync::kMaxTimestampSeconds - play::kMaxWindowSeconds);
+      session.end_time = At(sync::kMaxTimestampSeconds);
+      session.duration_ms = play::kMaxWindowSeconds * 1000;
+      widest.push_back({9'223'372'036'854'775'807LL - static_cast<std::int64_t>(at), session});
+    }
+    const std::string worst = play::SerializeBuffer(widest, 9'223'372'036'854'775'807LL,
+                                                    At(sync::kMaxTimestampSeconds));
+    checks.Expect(worst.size() <= play::kMaxBufferBytes,
+                  "and so does the widest one this code will ever store: " +
+                      std::to_string(worst.size()) + " bytes against a bound of " +
+                      std::to_string(play::kMaxBufferBytes));
   }
 
   // Releasing by id, which is what an ingest answer produces.
@@ -570,6 +785,34 @@ void Tick(rig::Checks& checks) {
   const sync::SyncCompletion empty;
   checks.Expect(!empty.play_session_ingest.has_value(),
                 "a completion with no ingest says nothing about what was sent");
+
+  // `play_sessions_sent` counts what the body *carried*, not what was handed
+  // over, and the difference is a whole class of caller bug: `CompleteSession`
+  // refuses an unpaired token before it builds a request, and a caller reading
+  // the field as "these went out" would release sessions no server ever saw.
+  Sandbox sandbox(checks, "play-tick");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  NeverSent client(checks);
+
+  sync::SyncPlan plan;
+  plan.session_id = 7;
+  sync::FinishOptions finish;
+  finish.complete.wait = [](std::chrono::milliseconds) {};
+  finish.play_sessions = {fine};
+
+  const sync::TickCompletion unpaired =
+      sync::FinishTick(client, *files, auth::StoredToken{}, plan, sync::ExecutionReport{}, {},
+                       /*previous=*/{}, finish);
+  checks.Expect(unpaired.reported.error == sync::CompleteError::kNotRegistered,
+                std::string("an unpaired token refuses before it builds a request: ") +
+                    sync::ToString(unpaired.reported.error));
+  checks.ExpectEq(unpaired.reported.attempts, 0, "...having attempted nothing");
+  checks.ExpectEq(unpaired.play_sessions_sent, static_cast<std::size_t>(0),
+                  "so the tick reports that it carried none, and the buffer keeps them");
+  checks.Expect(unpaired.stored.ok(),
+                "and the baseline still reached the card, which is the half that matters: " +
+                    unpaired.stored.message);
 }
 
 // --- ingest (rig) -------------------------------------------------------------
@@ -886,12 +1129,14 @@ int main(int argc, char** argv) {
   // into an object that outlives it -- see `harness::Sandbox`.
   rig::Checks checks;
 
-  if (scenario == "encode" || scenario == "derive" || scenario == "store" ||
-      scenario == "reconcile" || scenario == "tick") {
+  if (scenario == "encode" || scenario == "derive" || scenario == "carded" ||
+      scenario == "store" || scenario == "reconcile" || scenario == "tick") {
     if (scenario == "encode") {
       Encode(checks);
     } else if (scenario == "derive") {
       Derive(checks);
+    } else if (scenario == "carded") {
+      Carded(checks);
     } else if (scenario == "store") {
       Store(checks);
     } else if (scenario == "reconcile") {

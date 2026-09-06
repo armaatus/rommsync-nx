@@ -386,9 +386,14 @@ TickCompletion FinishTick(http::HttpClient& client, fs::FileSystem& files,
       play_sessions.clear();
     }
   }
-  tick.play_sessions_sent = play_sessions.size();
   tick.reported = CompleteSession(client, token, plan.session_id, tick.counts, play_sessions,
                                   options.complete);
+  // Set from what actually went out rather than from what was handed over.
+  // `CompleteSession` refuses before it builds a request for an unpaired token,
+  // a session id there is none of, and a caller that cancelled first -- and each
+  // of those leaves `attempts` at zero. A caller reading this field as "the body
+  // carried them" would otherwise release sessions no server ever saw.
+  tick.play_sessions_sent = tick.reported.attempts > 0 ? play_sessions.size() : 0;
   return tick;
 }
 

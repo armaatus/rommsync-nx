@@ -411,9 +411,23 @@ client says so rather than pretending otherwise:
 - its *start* is the later of the previous tick and the save's previous mtime,
   the tightest lower bound the client actually has;
 - a save whose mtime did not move produces nothing at all;
+- neither does one the client has no previous observation of — "new since the
+  last tick" cannot be told from "its `state.db` row went away", and the rows go
+  away for reasons that are the client's *own* writes (a download whose bytes
+  could not be read back, an M7-1 restore, a baseline a yanked card left
+  unreadable). It costs the first write to a genuinely new save; the alternative
+  is the whole library reported as played the day `state.db` will not parse;
 - the first tick after a boot with no buffer produces nothing, and must: with no
-  previous observation every save on the card would come back as one enormous
-  session.
+  window there is no lower bound at all;
+- and a window longer than `play::kMaxWindowSeconds` (twelve hours) produces
+  nothing either. The arithmetic is still right — the play did happen in there —
+  but the half of the window the client controls is "when did I last look", and a
+  console that was off for a week did not look for a week. Twelve rather than
+  something tight because a console suspended overnight fires one tick on wake
+  and the session it derives spans the sleep; refusing *that* would cost play
+  that really happened. Every path that gives up on a tick still moves the window
+  forward (`SdEngine::StampPlayWindow`), so the bound is a backstop rather than
+  the usual case.
 
 Wall clock only. A console whose clock was never set, or that has been corrected
 backwards, records nothing for that tick rather than sending a timestamp RomM
@@ -430,6 +444,12 @@ does not lose it.
 They ride out on the completion the tick is making anyway, so a console on
 battery spends no extra request. `POST /api/play-sessions` is the other route,
 for flushing without a sync (`play::Flush`).
+
+An answer this build cannot read is a **warning**, not an error: it leaves
+`play_session_ingest` absent, which already means "keep them buffered", and the
+tick completes normally. A malformed play-session answer failing a completion the
+server actually performed would be play time costing a sync tick, which is the
+one thing this feature may not do.
 
 A session is dropped from the buffer only against an answer that names it, and
 `duplicate` counts as an answer — which is what makes a retried flush safe. An

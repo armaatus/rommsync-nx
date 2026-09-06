@@ -680,6 +680,50 @@ void SdEngine::RunWorker() {
 
 namespace {
 
+/// The saves as the *last* tick left them, for M7-4's derivation.
+///
+/// Two projections rather than one, because the two sides of the comparison come
+/// from different types -- `state.db`'s rows and this tick's scan -- and the one
+/// thing they have to agree about is the slot. **A null slot is an archival
+/// save, which `scan::SaveFile` spells as the empty string.** Spell them
+/// differently and every archival save reads as one the client has never seen,
+/// which `play::DeriveSessions` answers by producing nothing at all -- so the
+/// symptom would be an archival save that never records play time, silently and
+/// forever.
+///
+/// Here rather than in `play_sessions.hpp` because that header takes three plain
+/// fields on purpose: it is drivable from a literal, and one that took a
+/// `state::Baseline` would drag the baseline and the scanner in behind it
+/// (play_sessions.hpp, `SaveObservation`).
+std::vector<play::SaveObservation> ObservationsOf(const state::Baseline& baseline) {
+  std::vector<play::SaveObservation> observations;
+  observations.reserve(baseline.rows().size());
+  for (const std::pair<const state::Baseline::Key, state::SaveRecord>& stored : baseline.rows()) {
+    play::SaveObservation observation;
+    observation.rom_id = stored.second.rom_id;
+    observation.slot = stored.second.slot.value_or(std::string());
+    observation.mtime = stored.second.mtime;
+    observations.push_back(std::move(observation));
+  }
+  return observations;
+}
+
+/// ...and as this tick found them. `scan::SaveFile::slot` is already the empty
+/// string for an archival save, which is the spelling above matches.
+std::vector<play::SaveObservation> ObservationsOf(const std::vector<scan::SaveFile>& saves) {
+  std::vector<play::SaveObservation> observations;
+  observations.reserve(saves.size());
+  for (const scan::SaveFile& save : saves) {
+    play::SaveObservation observation;
+    observation.rom_id = save.rom_id;
+    observation.slot = save.slot;
+    observation.mtime =
+        std::chrono::system_clock::from_time_t(static_cast<std::time_t>(save.modified_unix));
+    observations.push_back(std::move(observation));
+  }
+  return observations;
+}
+
 /// Where a save or a state the console has no local copy of should be written.
 ///
 /// Empty when there is nowhere to put it, which is what `ExecuteOptions::place`
@@ -713,6 +757,24 @@ void SdEngine::RecordFailedTickLocked() {
   failed_ = 0;
 }
 
+void SdEngine::StampPlayWindow() {
+  // Move the play-session window forward without recording anything (M7-4, #39).
+  //
+  // **A tick that gave up still looked**, and that is the whole point. The
+  // window is `[the last time this console looked, the save's mtime]`, and every
+  // tick that returns early without moving the first half stretches the next
+  // session by one interval. A paired console with no wifi fails the rom-index
+  // fetch on every tick for a week and would then report the first save that
+  // moved as a week of play -- which `play::kMaxWindowSeconds` would refuse
+  // outright, so the cost of not doing this is the play time as well as the
+  // exaggeration.
+  //
+  // Moving it can only ever *lose* a session -- a save written before this
+  // stamp and noticed after it is skipped -- and that is the safe direction:
+  // play time nobody played is the failure nobody can correct.
+  static_cast<void>(play_.Record({}, std::chrono::system_clock::now()));
+}
+
 void SdEngine::RunOneTick() {
   const std::shared_ptr<const config::Config> config = ConfigSnapshot();
   http::HttpClient* client = nullptr;
@@ -744,6 +806,7 @@ void SdEngine::RunOneTick() {
     // "Sync now", and there the gate's real guarantee is the one that holds:
     // three rejections and it is blocked, so a user leaning on the button costs
     // three requests and then this branch.
+    StampPlayWindow();
     std::lock_guard<std::mutex> lock(mutex_);
     scheduler_.Finished(sync::TickOutcome::kUnauthorized);
     RecordFailedTickLocked();
@@ -757,6 +820,7 @@ void SdEngine::RunOneTick() {
     // the answer -- back off and try again later -- is the same one a console on
     // a train gets. The status screen says which of the four it is; the schedule
     // does not need to know.
+    StampPlayWindow();
     std::lock_guard<std::mutex> lock(mutex_);
     scheduler_.Finished(sync::TickOutcome::kOffline);
     RecordFailedTickLocked();
@@ -781,6 +845,8 @@ void SdEngine::RunOneTick() {
   const roms::FetchResult library = roms::FetchRomIndex(*client, fetch);
   ObserveAnswer(roms::AnswerOf(library));
   if (!library.ok()) {
+    // The common one: a console with no wifi fails this every tick.
+    StampPlayWindow();
     std::lock_guard<std::mutex> lock(mutex_);
     scheduler_.Finished(library.status == 401 || library.status == 403
                             ? sync::TickOutcome::kUnauthorized
@@ -821,31 +887,9 @@ void SdEngine::RunOneTick() {
   const sync::Timestamp play_now = std::chrono::system_clock::now();
   std::vector<play::BufferedSession> play_sent;
   if (config->sync.enabled) {
-    std::vector<play::SaveObservation> played_before;
-    played_before.reserve(loaded.value.rows().size());
-    for (const std::pair<const state::Baseline::Key, state::SaveRecord>& stored :
-         loaded.value.rows()) {
-      play::SaveObservation observation;
-      observation.rom_id = stored.second.rom_id;
-      // A null slot is an archival save, which `scan::SaveFile` spells as the
-      // empty string -- the two have to agree or every archival save reads as a
-      // rom that was never seen before and is reported played on every tick.
-      observation.slot = stored.second.slot.value_or(std::string());
-      observation.mtime = stored.second.mtime;
-      played_before.push_back(std::move(observation));
-    }
-    std::vector<play::SaveObservation> played_now;
-    played_now.reserve(scanned.saves.size());
-    for (const scan::SaveFile& save : scanned.saves) {
-      play::SaveObservation observation;
-      observation.rom_id = save.rom_id;
-      observation.slot = save.slot;
-      observation.mtime = std::chrono::system_clock::from_time_t(
-          static_cast<std::time_t>(save.modified_unix));
-      played_now.push_back(std::move(observation));
-    }
     const play::Derivation played =
-        play::DeriveSessions(played_before, played_now, play_.last_seen(), play_now);
+        play::DeriveSessions(ObservationsOf(loaded.value), ObservationsOf(scanned.saves),
+                             play_.last_seen(), play_now);
     static_cast<void>(play_.Record(played.sessions, play_now));
     // What the completion will carry, captured rather than re-read afterwards:
     // `play::Reconcile` matches the answer to this list by index, so the two
@@ -854,13 +898,9 @@ void SdEngine::RunOneTick() {
   } else {
     // `[sync] enabled = false`: nothing is recorded and nothing is sent, because
     // a user who switched save sync off did not ask this console to keep
-    // telling a server what they played.
-    //
-    // **The window still moves.** A `last_seen` frozen for the month the switch
-    // was off would make the first tick after it goes back on report every save
-    // that changed in that month as one month-long session -- play time that
-    // never happened, in a total nobody can correct.
-    static_cast<void>(play_.Record({}, play_now));
+    // telling a server what they played. The window still moves -- see
+    // `StampPlayWindow`.
+    StampPlayWindow();
   }
 
   sync::TickOptions options;

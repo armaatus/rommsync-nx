@@ -196,10 +196,12 @@ struct TickCompletion {
 
   /// How many of `FinishOptions::play_sessions` the body actually carried.
   ///
-  /// Less than what was handed over means the encoder refused one and the
-  /// completion went out without any of them -- the array is refused whole,
-  /// because `play::Reconcile` matches an answer to what was sent by index. The
-  /// line in `warnings` names the field.
+  /// Less than what was handed over means one of two things, and both are zero
+  /// rather than a smaller number: the encoder refused a session, so the array
+  /// went whole (`play::Reconcile` matches an answer by index, so a filtered one
+  /// would reconcile against a list the server never saw); or `CompleteSession`
+  /// refused before it built a request at all -- an unpaired token, no session
+  /// id, a caller that had already cancelled. A `warnings` line names the first.
   ///
   /// **Zero is not "the server rejected them"**: it is "nothing was sent", and
   /// the sessions are still in the buffer. What RomM did with the ones that

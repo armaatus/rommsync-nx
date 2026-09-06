@@ -1033,6 +1033,7 @@ target_compile_definitions(test_play_sessions PRIVATE
 set(PLAY_UNIT_SCENARIOS
   encode     # the entry both endpoints carry, and every refusal that keeps a wrong number out
   derive     # the mtime arithmetic, on an injected clock: an upper bound, and the cases it declines
+  carded     # the same, over mtimes off a real card in the harness sandbox -- the archival slot included
   store      # play.db: bounded, oldest-dropped, survives a reboot, one bad row costs one row
   reconcile  # what an answer releases -- duplicate is success, and a refusal is dropped, not retried
   tick       # a session the encoder refuses costs the play time and never the completion

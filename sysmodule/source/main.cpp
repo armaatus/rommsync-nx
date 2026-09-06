@@ -58,9 +58,9 @@ namespace {
 //   | one in-flight transfer buffer            | 0x4000  |  16 KiB |
 //   | the largest buffered list response        | 0x32000 | 200 KiB |
 //   | two worker thread stacks (M1-6, M7-2)    | 0x10000 |  64 KiB |
-//   | the play-session buffer (M7-4)           | 0x4000  |  16 KiB |
+//   | the play-session buffer (M7-4)           | 0x8000  |  32 KiB |
 //   | newlib arena overhead and fragmentation  | 0x8000  |  32 KiB |
-//   | **peak**                                 | 0xAB000 | 684 KiB |
+//   | **peak**                                 | 0xAF000 | 700 KiB |
 //
 // The old 0x80000 does not cover that, and the two terms it is short by are the
 // two that are easiest to miss:

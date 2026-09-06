@@ -830,6 +830,13 @@ struct SyncCompletion {
   /// treated it as such would drop the sessions it just had accepted. It is
   /// "the server said nothing", which is why `play::Reconcile` releases a
   /// buffered session only against a result that names it.
+  ///
+  /// It is also what an ingest this build *could not read* leaves behind. That
+  /// is a warning rather than a parse error, because a play session may not cost
+  /// a sync tick: an error here would become `CompleteError::kMalformed` for a
+  /// completion the server actually performed. Absent already means "keep them
+  /// buffered", so the cost of a RomM that moved this shape is one duplicate per
+  /// tick.
   std::optional<PlaySessionIngest> play_session_ingest;
 
   /// One line per thing the client did not expect: a `status` that is not
@@ -970,14 +977,15 @@ struct Completion {
 /// connection died has already ingested them -- so the second attempt is
 /// answered `duplicate`, which `Ingested` reads as success. That is what makes
 /// the retry safe rather than a source of double-counted play time.
+///
+/// **One signature, not an overload pair.** A second four-argument spelling with
+/// `options` defaulted would make `CompleteSession(c, t, id, counts, {})`
+/// ambiguous -- `{}` is as good a `CompleteOptions` as it is a vector -- and the
+/// next caller would find that out as a compile error rather than reading it
+/// here. A tick with no play time passes `{}` and says so.
 Completion CompleteSession(http::HttpClient& client, const auth::StoredToken& token,
                            std::int64_t session_id, const CompletionCounts& counts,
-                           const std::vector<PlaySession>& play_sessions,
-                           const CompleteOptions& options = {});
-
-/// The same call for a tick that recorded no play sessions.
-Completion CompleteSession(http::HttpClient& client, const auth::StoredToken& token,
-                           std::int64_t session_id, const CompletionCounts& counts,
+                           const std::vector<PlaySession>& play_sessions = {},
                            const CompleteOptions& options = {});
 
 }  // namespace rommsync::sync

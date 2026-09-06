@@ -24,7 +24,18 @@
 //     the moment the emulator wrote -- rather than the tick that noticed it;
 //   - its start is the later of the previous tick and the save's previous
 //     mtime, which is the tightest lower bound this client actually has;
-//   - a save whose mtime did not move produces nothing at all.
+//   - a save whose mtime did not move produces nothing at all;
+//   - and neither does a save this client has no previous observation of. That
+//     is the one rule that looks over-cautious and is not: "new since the last
+//     tick" cannot be told from "the baseline row went away", and the rows go
+//     away for reasons that are the client's *own* writes -- a download whose
+//     bytes could not be read back, a `state.db` a yanked card left unreadable.
+//     Recording those is play time nobody played, in a total nobody can correct
+//     afterwards.
+//
+// The window is bounded as well as anchored (`kMaxWindowSeconds`), because the
+// half of it this client controls is "when did I last look" and a console that
+// was off for a week did not look for a week.
 //
 // A session that could not be attributed is still worth sending: `rom_id` is
 // nullable in the pinned schema. This client always has one, because the
@@ -98,12 +109,20 @@ inline constexpr int kFormatVersion = 1;
 /// forever. At the default half-hour interval, forty-eight rows is a day of
 /// play nobody could sync, which is more than a play-time total ever needs.
 ///
-/// A row is a rom id, a slot, two timestamps and a duration: ~140 bytes, so
-/// `kMaxSessions` of them fit inside `kMaxBufferBytes` with room over. The
-/// *file* bound is what the reader enforces (`LoadBuffer`), so the two move
-/// together.
+/// A row is a rom id, a slot, two timestamps and a duration. The realistic one
+/// is ~120 bytes -- `retroarch-srm` is a thirteen-character slot -- but the
+/// bound has to hold for the **worst** row this code will store: `kMaxSlotBytes`
+/// of slot and an `int64_t` at full width in each of the four numbers is 215
+/// bytes, so `kMaxSessions` of them is 10,384 with the header.
+///
+/// That is the number `kMaxBufferBytes` is set against, and it is not academic:
+/// a serialization over the bound makes `Persist` refuse, which writes *nothing*
+/// -- so `last_seen` never reaches the card either and the buffer wedges,
+/// silently, on a console nobody can attach a debugger to. `play.store` builds
+/// its rows at `kMaxSlotBytes` and asserts the fit, so the two constants cannot
+/// drift apart again.
 inline constexpr std::size_t kMaxSessions = 48;
-inline constexpr std::size_t kMaxBufferBytes = 8 * 1024;
+inline constexpr std::size_t kMaxBufferBytes = 16 * 1024;
 
 /// How many diagnostics a load or a derivation keeps.
 /// `state::kMaxDiagnostics`'s reasoning: a card that produced four hundred bad
@@ -158,8 +177,9 @@ struct Derivation {
   std::vector<sync::PlaySession> sessions;
 
   /// Saves whose mtime moved and which still produced nothing: an mtime before
-  /// the window, one in the future, or the bound below. **Not an error** --
-  /// each costs one session of play time and nothing else.
+  /// the window, one in the future, a window longer than
+  /// `DeriveOptions::max_window_seconds`, or the count bound below. **Not an
+  /// error** -- each costs one session of play time and nothing else.
   std::size_t skipped = 0;
 
   /// One line per skip, bounded by `kMaxDiagnostics`, plus one for a clock this
@@ -167,8 +187,29 @@ struct Derivation {
   std::vector<std::string> warnings;
 };
 
+/// The longest window a session may claim: twelve hours.
+///
+/// **The bound that stops a missed tick becoming a fabricated day.** A window is
+/// `[the last time this console looked, the save's mtime]`, and every gap in
+/// that first half stretches it: a console switched off for a week, a tick that
+/// gave up before it could stamp the window, a card moved between consoles. The
+/// arithmetic is still correct -- the play *did* happen inside that window --
+/// but "you played for nine days" is not an upper bound anyone can use, and RomM
+/// stores it in a total nobody can correct afterwards.
+///
+/// Twelve hours rather than something tight, because the legitimate long window
+/// is real: a console suspended overnight fires one tick on wake, and the
+/// session it derives spans the sleep. Refusing that would cost the play that
+/// actually happened. Past half a day the claim stops being informative, so it
+/// is dropped and counted rather than clamped -- a clamped window would be a
+/// number nobody derived, which is the thing `Validate` refuses one level down.
+inline constexpr std::int64_t kMaxWindowSeconds = 12 * 60 * 60;
+
 /// Bounds on one derivation.
 struct DeriveOptions {
+  /// The longest window one session may claim. See `kMaxWindowSeconds`.
+  std::int64_t max_window_seconds = kMaxWindowSeconds;
+
   /// The most sessions one tick will produce.
   ///
   /// A card whose every save changed at once -- a restore, a card swap, a
@@ -192,6 +233,10 @@ struct DeriveOptions {
 /// save on the card would come back as one enormous session. That is the empty
 /// result with no warning; a clock that is unset or has gone backwards is the
 /// empty result *with* one.
+///
+/// **A save with no entry in `previous` produces nothing either**, for the
+/// second half of that reason: an empty or discarded baseline would otherwise
+/// report the whole library as played. See the header note.
 Derivation DeriveSessions(const std::vector<SaveObservation>& previous,
                           const std::vector<SaveObservation>& current,
                           sync::Timestamp last_seen, sync::Timestamp now,

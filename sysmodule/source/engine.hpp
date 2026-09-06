@@ -563,6 +563,18 @@ class SdEngine : public ipc::Engine {
   /// from inside the tick would be a cycle.
   void RunOneTick();
 
+  /// Move M7-4's play-session window forward, recording nothing (#39).
+  ///
+  /// Called from every path `RunOneTick` gives up on -- blocked credentials, no
+  /// transport, an unreachable library, `[sync] enabled = false` -- because a
+  /// tick that gave up still *looked*, and a window whose start only advanced on
+  /// successful ticks would stretch by one interval for every one that failed. A
+  /// console with no wifi fails the rom-index fetch every half hour; after a week
+  /// the next save that moved would claim a week of play, which
+  /// `play::kMaxWindowSeconds` then refuses outright -- so not stamping costs the
+  /// play time as well as the exaggeration.
+  void StampPlayWindow();
+
   /// Record what one exchange said about the credentials, and persist the
   /// verdict the moment it becomes one.
   ///
@@ -696,10 +708,18 @@ class SdEngine : public ipc::Engine {
   /// #39), and the moment the last tick looked at the saves. Reloaded by `Load`
   /// beside `history_`, and pointed at the right directory by it.
   ///
-  /// Touched only from the worker thread, inside `RunTickLocked`'s
-  /// `save_write_mutex_` -- so it needs no lock of its own, and gets none
-  /// rather than one that would suggest a second writer exists. Nothing on the
-  /// IPC surface reads it: play time is not on any screen.
+  /// **Guarded by nothing, because there is only one toucher.** `Load` reads it
+  /// before any thread exists, and after that only `RunOneTick` -- on the
+  /// worker, one tick at a time -- derives, records and releases. It is
+  /// deliberately *not* under `save_write_mutex_`: half of what it does happens
+  /// before that lock is taken, and a comment claiming otherwise would be the
+  /// kind of wrong `why` that survives into the next refactor.
+  ///
+  /// A second toucher is what changes this, and there is one obvious candidate:
+  /// an overlay "send my play time now" would reach it from the IPC thread and
+  /// would need a lock of its own, exactly as `history_mutex_` was added the
+  /// moment the scheduler became a second writer of `.backup/`. Nothing on the
+  /// IPC surface reads it today -- play time is not on any screen.
   play::Buffer play_{std::string(play::kBufferSdPath)};
 
   /// The card, for a restore. The same pointer `UseCard` hands `lists_`, kept
