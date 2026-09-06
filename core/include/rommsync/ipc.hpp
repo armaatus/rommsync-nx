@@ -242,18 +242,20 @@ enum class Error {
   /// `kWriteFailed` sends them looking at their SD card. **Nothing was
   /// attempted and nothing changed**, exactly as for `kInvalid`.
   ///
-  /// What still answers it, and what removes each one:
+  /// What still answers it, and what removes each one. M5-4 (#31) took the three
+  /// list commands off this list; these two are what is left:
   ///
-  /// - `ListBegin` / `ListNext` / `ListEnd` -- list paging, M5-4 (#31).
   /// - `SyncNow` on a console with no scheduler to hand a tick to, M7-2 (#37).
   ///   It arrives as `kAlreadyRunning` rather than as this, because
   ///   `Engine::RequestSync` is a bool with no room for it to say so.
   /// - `StartPair` on a build with **no HTTP transport**. M1-6 (#123) built the
   ///   engine half; `core/` reaches a server through `http::HttpClient`, and the
-  ///   Horizon `ssl` backend that implements it for the console is the M8-1 gate
-  ///   item (#43) nobody has written. It is a different sentence from
-  ///   `kNotConfigured`, which is a console with no `server.url` -- one is
-  ///   something the user can fix on the settings screen and the other is not.
+  ///   Horizon backend that implements it for the console is #126, which #43's
+  ///   gate wants. It is a different sentence from `kNotConfigured`, which is a
+  ///   console with no `server.url` -- one is something the user can fix on the
+  ///   settings screen and the other is not. **Note it is not `kOffline`
+  ///   either**, which is what a *list* answers on the same console: a list has
+  ///   a server it cannot reach, and a pairing attempt has no way to reach one.
   ///
   /// It is appended rather than inserted: `sysmodule::ToResult` maps the
   /// ordinal, so renumbering one would change what an already-built overlay

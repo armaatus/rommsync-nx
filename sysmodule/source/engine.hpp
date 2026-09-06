@@ -29,12 +29,14 @@
 // M7-2 (#37). The host suite passes a libcurl client and drives the paging
 // through the same seam (`lists.*`).
 //
-// M1-6 (#123) took `StartPair` off that list, and left half of it there. The
-// engine drives a real device-code attempt now -- see `StartPairing` -- but it
-// needs an `http::HttpClient` to drive it on, and the console has no
-// implementation of one: the Horizon `ssl` backend is #43's gate item and is not
-// written. So a console still answers `kUnavailable` to `StartPair`, and the
-// host harness, which has libcurl's, does not (`engine.pairs`).
+// **`StartPairing` is the last `kUnavailable`, and M1-6 (#123) left only half of
+// it.** The engine drives a real device-code attempt now -- see `StartPairing`
+// -- and it needs the same missing thing the lists above do: an
+// `http::HttpClient` for Horizon, which is #126. So on a console `StartPair`
+// answers `kUnavailable` while a list answers `kOffline`, and the difference is
+// real rather than sloppy: a list has a server it cannot reach, and a pairing
+// attempt has no way to reach one at all. The host harness has libcurl's client
+// and does neither (`engine.pairs`, `lists.*`).
 //
 // Nothing here has ever run: it is Horizon-side and is exercised in Ryujinx
 // before the M8-1 gate, never on hardware (sysmodule/AGENTS.md).
@@ -141,9 +143,26 @@ class SdEngine : public ipc::Engine {
   /// alternative is glue that is only ever proven by the fact that it compiles.
   void Load(const std::string& config_dir = kConfigDir);
 
-  /// Give the engine the platform facilities a pairing attempt needs. Call it
-  /// before the service starts answering; it is not meant to change under a
-  /// running attempt.
+  /// Give the engine the platform facilities a pairing attempt needs, and start
+  /// the thread that will drive attempts. Call it before the service starts
+  /// answering; it is not meant to change under a running attempt.
+  ///
+  /// **The thread is started here rather than on the first `StartPairing`, and
+  /// that is about `-fno-exceptions`** (`switch.mk`): `std::thread`'s
+  /// constructor throws when the thread or its stack cannot be created, and a
+  /// throw on the console calls `std::terminate`. Failing at start is what the
+  /// rest of `main.cpp` already does with `sm` and `fs` -- a sysmodule that
+  /// cannot build what it needs should not come up half-working -- whereas
+  /// failing on a button press would kill the process under the user's hands and
+  /// leave a pairing screen that never moves. A backend with no transport starts
+  /// nothing, which is every console today.
+  ///
+  /// Separate from `UseServer` below, and that is a seam to reconcile rather
+  /// than a decision: both hand this class an `http::HttpClient*`, because M5-4
+  /// (#31) and M1-6 (#123) landed in parallel and each needed one. **Whichever
+  /// issue gives the console a real transport (#126) should make it one call**
+  /// -- a console has one client, and two setters is two chances to install
+  /// only half of it.
   void UsePairingBackend(PairingBackend backend);
 
   /// The network the library is read over, and the token to read it with.
@@ -172,7 +191,8 @@ class SdEngine : public ipc::Engine {
   /// for a page. It is the same seam the scheduler needs (M7-2, #37) -- one
   /// worker loop calling this and `sync_tick` -- and the host suite calls it
   /// directly between two `ListNext`s, which is what makes every paging case
-  /// deterministic rather than timed.
+  /// deterministic rather than timed. The pairing thread is **not** it: that one
+  /// drives one attempt and touches nothing a list reads.
   bool PumpLists();
 
   const config::Config& config() const override;

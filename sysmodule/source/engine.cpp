@@ -21,16 +21,6 @@
 namespace rommsync::sysmodule {
 namespace {
 
-/// How often the pairing thread offers the session a chance to act.
-///
-/// Not the poll interval: `PairingSession::Poll` enforces the one RomM asked
-/// for and returns immediately when the next request is not due, because a
-/// client that undercuts that interval earns `slow_down` until the code expires
-/// (`pairing.hpp`). This is only how promptly the thread notices that the
-/// interval has elapsed, that a new attempt has replaced this one, or that the
-/// engine is going away.
-constexpr std::chrono::milliseconds kPairingTick{200};
-
 }  // namespace
 
 /// One of this client's files, as a path the SD card understands. `core/` owns
@@ -38,20 +28,10 @@ constexpr std::chrono::milliseconds kPairingTick{200};
 /// this side's job -- once, rather than at each call site.
 std::string SdEngine::PathTo(const char* file_name) const { return config_dir_ + file_name; }
 
-<<<<<<< HEAD
 /// The service reads the configuration in force and the queue on the card, both
 /// of which outlive it because it is a member beside them.
 SdEngine::SdEngine() : lists_(config_, queue_) {}
 
-void SdEngine::UseServer(http::HttpClient* client, std::string bearer_token) {
-  lists_.UseServer(client, std::move(bearer_token));
-}
-
-void SdEngine::UseCard(fs::FileSystem* filesystem) { lists_.UseCard(filesystem); }
-
-bool SdEngine::PumpLists() { return lists_.Pump(); }
-
-=======
 SdEngine::~SdEngine() {
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -63,7 +43,14 @@ SdEngine::~SdEngine() {
   }
 }
 
->>>>>>> 960b9da (M1-6: the console starts a pairing, on a thread of its own)
+void SdEngine::UseServer(http::HttpClient* client, std::string bearer_token) {
+  lists_.UseServer(client, std::move(bearer_token));
+}
+
+void SdEngine::UseCard(fs::FileSystem* filesystem) { lists_.UseCard(filesystem); }
+
+bool SdEngine::PumpLists() { return lists_.Pump(); }
+
 void SdEngine::Load(const std::string& config_dir) {
   // The pairing thread reads `auth_` and `gate_`, and this writes both. It
   // cannot be running yet -- it is started by the first `StartPairing`, and
@@ -155,6 +142,14 @@ void SdEngine::Load(const std::string& config_dir) {
 
 void SdEngine::UsePairingBackend(PairingBackend backend) {
   pairing_backend_ = std::move(backend);
+  if (pairing_backend_.http != nullptr && !pairing_thread_.joinable()) {
+    // See the header: this is the one throwing call in the class, and it happens
+    // at start rather than under a user's finger. It parks on `wake_` until
+    // there is an attempt, so a console that never pairs pays a blocked thread
+    // and its stack -- which is #126's to budget, along with the rest of the
+    // heap the transport needs.
+    pairing_thread_ = std::thread(&SdEngine::DrivePairing, this);
+  }
 }
 
 void SdEngine::AdoptConfig(config::LoadResult loaded) {
@@ -438,9 +433,6 @@ ipc::Error SdEngine::StartPairing() {
     attempt_ = std::make_shared<PairingAttempt>(*pairing_backend_.http, std::move(pairing),
                                                 config_.server.url);
     attempt_commit_failure_.clear();
-    if (!pairing_thread_.joinable()) {
-      pairing_thread_ = std::thread(&SdEngine::DrivePairing, this);
-    }
   }
   wake_.notify_all();
   // `pairing_status()` already answers `kStarting`, which is the contract
@@ -455,9 +447,17 @@ void SdEngine::AbandonPairingLocked() {
 }
 
 bool SdEngine::AwaitNextPoll(const std::shared_ptr<PairingAttempt>& attempt) {
+  // Until the session says the next request is due, rather than on a tick of our
+  // own. `PairingSession::Poll` enforces RomM's interval itself and answers a
+  // premature call by doing nothing, so a fixed tick would wake this thread a
+  // few thousand times over a ten-minute code to be told that each time -- on a
+  // process that is resident for the life of the console. Waiting *until* the
+  // deadline it publishes costs one wake-up per poll actually made, and the
+  // condition variable still cuts the wait short for a new attempt or for
+  // shutdown, which is what promptness there actually depends on.
+  const std::chrono::steady_clock::time_point due = attempt->session.next_poll_at();
   std::unique_lock<std::mutex> lock(mutex_);
-  wake_.wait_for(lock, kPairingTick,
-                 [this, &attempt] { return stopping_ || attempt_ != attempt; });
+  wake_.wait_until(lock, due, [this, &attempt] { return stopping_ || attempt_ != attempt; });
   return !stopping_ && attempt_ == attempt;
 }
 
