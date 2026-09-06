@@ -415,6 +415,69 @@ int Revoked(http::HttpClient& client, const std::string& base) {
   return checks.failures();
 }
 
+/// A 403, which is not a revocation however much it looks like one.
+///
+/// The finding M2-4 handed to M1-4 (#8): RomM approves what the *user* ticked,
+/// which need not be what was requested, so a 403 is a scope missing from a
+/// pairing that is otherwise working (docs/AUTH.md#scopes). A user
+/// told their token was revoked goes looking for something that did not happen,
+/// and a client that discarded `token.dat` over it would re-pair straight back
+/// into the same partial grant.
+///
+/// Forced with the proxy: RomM answers 403 only for a grant this fixture cannot
+/// arrange on demand, and what is under test is the client's reading of the
+/// status rather than RomM's reasons for sending it.
+int Forbidden(http::HttpClient& client, const std::string& base) {
+  rig::Checks checks;
+  const std::string identifier = "nx-test-forbidden";
+  const auth::StoredToken token = Pair(client, base, checks, identifier);
+  if (token.device_id.empty()) {
+    return checks.failures();
+  }
+
+  const std::string path = Scratch("forbidden");
+  checks.Expect(auth::SaveToken(path, token).ok(), "a paired record is on disk");
+  const std::string before = rig::ReadFile(path);
+
+  ExpectSucceeded(
+      checks,
+      rig::ArmFault(client, base,
+                    R"({"mode":"status","status":403,"path":"/api/devices","count":1})"),
+      "arming a lookup the pairing was not granted");
+  const auth::Registration refused = auth::ConfirmRegistration(client, token);
+  rig::DisarmFault(client, base);
+
+  ExpectError(checks, refused, auth::RegistrationError::kForbidden,
+              "a 403 is a scope this pairing lacks, not a revoked token");
+  checks.Expect(refused.message.find("revoke") == std::string::npos,
+                "and it does not tell the user their token was revoked: " + refused.message);
+  checks.Expect(refused.message.find("scope") != std::string::npos,
+                "it names what is actually missing: " + refused.message);
+
+  // Both halves of the classification, which are the same as a 401's and are
+  // reached for different reasons: pairing again is where the user approves the
+  // scope, and nothing about a partial grant changes on its own.
+  checks.Expect(auth::NeedsPairing(refused.error), "the remedy is still to pair again");
+  checks.Expect(!auth::ShouldRetry(refused.error),
+                "but not to keep asking for something that was not granted");
+
+  // The resolve does not fall through to a listing, for the reason a 401 does
+  // not: the listing needs the same scope and would fail the same way, and it
+  // is the *second* failure that would get reported.
+  ExpectSucceeded(
+      checks,
+      rig::ArmFault(client, base,
+                    R"({"mode":"status","status":403,"path":"/api/devices","count":1})"),
+      "arming a second lookup the pairing was not granted");
+  const auth::Registration resolved = auth::ResolveRegistration(client, token, identifier);
+  rig::DisarmFault(client, base);
+  ExpectError(checks, resolved, auth::RegistrationError::kForbidden,
+              "and the diagnosis survives the resolve");
+
+  checks.ExpectEq(rig::ReadFile(path), before, "token.dat is byte-for-byte untouched");
+  return checks.failures();
+}
+
 /// Sync switched off for this device in RomM's own UI.
 ///
 /// The device is there and the id is right; what is wrong is a setting, and
@@ -751,7 +814,8 @@ struct Scenario {
 
 constexpr Scenario kScenarios[] = {
     {"registered", Registered},   {"repair", Repair},   {"recovers", Recovers},
-    {"deleted", Deleted},         {"revoked", Revoked}, {"sync_disabled", SyncDisabled},
+    {"deleted", Deleted},         {"revoked", Revoked}, {"forbidden", Forbidden},
+    {"sync_disabled", SyncDisabled},
     {"offline", Offline},         {"impostor", Impostor},
     {"never_post", NeverPost},
 };

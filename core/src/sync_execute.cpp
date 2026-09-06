@@ -116,10 +116,26 @@ std::optional<std::pair<OperationError, std::string>> Refused(const http::Result
                           std::string(what) + " did not complete: " + http::ToString(result.error) +
                               (result.message.empty() ? "" : " (" + result.message + ")"));
   }
+  const int status = result.response.status;
+  if (status == 401) {
+    // Not this operation's problem, and not the next one's either: the token is
+    // gone, so `ExecutePlan` stops here rather than refusing the rest of the
+    // plan one request at a time (`sync_execute.hpp`, `download::Drain`).
+    return std::make_pair(OperationError::kUnauthorized,
+                          std::string(what) +
+                              " was rejected: HTTP 401; the token has been revoked");
+  }
+  if (status == 403) {
+    // The same stop, a different sentence: a scope this pairing was not granted
+    // rather than a pairing that is gone (docs/AUTH.md#scopes).
+    return std::make_pair(OperationError::kForbidden,
+                          std::string(what) +
+                              " was rejected: HTTP 403; this pairing was not granted the scopes "
+                              "sync needs");
+  }
   if (!result.successful()) {
-    return std::make_pair(
-        OperationError::kRefused,
-        std::string(what) + " was refused: HTTP " + std::to_string(result.response.status));
+    return std::make_pair(OperationError::kRefused,
+                          std::string(what) + " was refused: HTTP " + std::to_string(status));
   }
   return std::nullopt;
 }
@@ -228,6 +244,10 @@ const char* ToString(OperationError error) {
       return "backup_failed";
     case OperationError::kTransferFailed:
       return "transfer_failed";
+    case OperationError::kUnauthorized:
+      return "unauthorized";
+    case OperationError::kForbidden:
+      return "forbidden";
     case OperationError::kRefused:
       return "refused";
     case OperationError::kUnverified:
@@ -240,6 +260,32 @@ const char* ToString(OperationError error) {
       return "canceled";
   }
   return "none";
+}
+
+auth::Answer AnswerOf(OperationError error) {
+  switch (error) {
+    case OperationError::kUnauthorized:
+      return auth::Answer::kRejected;
+    case OperationError::kForbidden:
+      return auth::Answer::kForbidden;
+    // The one acceptance: an operation that did what the plan asked did it with
+    // this token (the rule is on `auth::AnswerOf(const http::Result&)`).
+    case OperationError::kNone:
+      return auth::Answer::kAccepted;
+    // The rest say nothing, `kRefused` -- a bare 4xx -- included.
+    case OperationError::kNoLocalSave:
+    case OperationError::kNoSaveId:
+    case OperationError::kUnreadableCard:
+    case OperationError::kBackupFailed:
+    case OperationError::kTransferFailed:
+    case OperationError::kRefused:
+    case OperationError::kUnverified:
+    case OperationError::kCommitFailed:
+    case OperationError::kUnconfirmed:
+    case OperationError::kCanceled:
+      break;
+  }
+  return auth::Answer::kSilent;
 }
 
 std::string BackupFileName(std::int64_t rom_id, const std::optional<std::string>& slot,
@@ -434,6 +480,20 @@ ServerSave DescribeServerSave(http::HttpClient& client, const auth::StoredToken&
                                                       std::to_string(save_id)),
                          token, options.timeout, options.cancel));
   if (!result.successful()) {
+    // A refusal of the *credentials* is named as one. This call cannot fail the
+    // operation -- it only supplies the expected size, and a download with no
+    // expected size is still a download -- so the 401 that follows on the
+    // content request is what actually stops the plan, one request later. What
+    // must not happen in between is a warning saying the save row "could not be
+    // read", which sends whoever reads the log looking at RomM's database
+    // instead of at the pairing.
+    const auth::Answer answer = auth::AnswerOf(result);
+    if (answer == auth::Answer::kRejected || answer == auth::Answer::kForbidden) {
+      warnings->push_back(std::string(where) + ": the server refused the save row with HTTP " +
+                          std::to_string(result.response.status) +
+                          "; this is the pairing, not the save");
+      return described;
+    }
     warnings->push_back(std::string(where) +
                         ": the server's save row could not be read, so the download has no "
                         "expected size to catch a short body with");
@@ -612,8 +672,23 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
     // arbitration is concerned this device still has not seen the save, and a
     // baseline advanced for it (M2-6) would record a sync that the server has
     // no record of.
-    OperationResult failed = Fail(operation, OperationError::kUnconfirmed,
-                                  refused->second + "; the save itself is correct on the card");
+    //
+    // **A 401 or a 403 keeps its own name rather than becoming `kUnconfirmed`.**
+    // This is the one call site that used to flatten every refusal into one
+    // error, and flattening these two would hide them from everything M1-4
+    // added: `ExecutePlan` would not stop, `ExecutionReport::unauthorized` would
+    // stay false, and `AnswerOf` would report silence. The scenario is real --
+    // a pairing granted the read scopes and not the write one this endpoint
+    // needs 403s here on *every* download, having successfully written each save
+    // first -- and it is exactly the case whose remedy is a sentence naming the
+    // missing scope. `message` still says the save is correct on the card,
+    // which is the part a user has to hear either way.
+    const OperationError error = refused->first == OperationError::kUnauthorized ||
+                                         refused->first == OperationError::kForbidden
+                                     ? refused->first
+                                     : OperationError::kUnconfirmed;
+    OperationResult failed =
+        Fail(operation, error, refused->second + "; the save itself is correct on the card");
     failed.sd_path = target->sd_path;
     failed.backup_sd_path = result.backup_sd_path;
     failed.save_id = save_id;
@@ -711,7 +786,13 @@ ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
         ++report.completed;
         break;
     }
-    const bool stop = result.outcome == OperationOutcome::kCanceled;
+    // The two failures that are not about one operation. A cancellation was
+    // never attempted; a 401 or a 403 was, and failed -- so it is counted above,
+    // and only the operations *after* it go unattempted.
+    const bool refused_the_token = result.error == OperationError::kUnauthorized ||
+                                   result.error == OperationError::kForbidden;
+    report.unauthorized = report.unauthorized || refused_the_token;
+    const bool stop = result.outcome == OperationOutcome::kCanceled || refused_the_token;
     report.operations.push_back(std::move(result));
     if (stop) {
       break;

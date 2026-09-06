@@ -68,6 +68,7 @@
 #include <vector>
 
 #include "rommsync/auth.hpp"
+#include "rommsync/auth_gate.hpp"
 #include "rommsync/http.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/token_store.hpp"
@@ -447,7 +448,7 @@ enum class NegotiateError {
   /// Not a revocation, and kept apart from one for that reason: RomM approves
   /// what the *user* ticked, which need not be what was requested, so a 403 here
   /// is a scope missing from an otherwise working pairing
-  /// (docs/AUTH.md#scopes-to-request). Telling that user their token was revoked
+  /// (docs/AUTH.md#scopes). Telling that user their token was revoked
   /// sends them looking for something that did not happen.
   kForbidden,
   kNoSuchDevice,     ///< 404 -- the device was deleted in RomM's web UI
@@ -491,6 +492,15 @@ bool ShouldRetry(NegotiateError error);
 /// discarding a pairing is the caller's, the way `PairingConfig` counts
 /// rejected polls.
 bool NeedsPairing(NegotiateError error);
+
+/// What this error says about the credentials, for `auth::Gate`.
+///
+/// Neither of the two above: this is "did the server take the token", which is
+/// the question M1-4 (#8) counts consecutive answers to before a pairing is
+/// given up on. A `kNoSuchDevice` or a `kSyncDisabled` says the token *was*
+/// taken -- the server had to read it to answer either -- so both clear a count
+/// rather than adding to one.
+auth::Answer AnswerOf(NegotiateError error);
 
 /// How hard one call tries.
 ///
@@ -764,6 +774,10 @@ const char* ToString(CompleteError error);
 /// so the cost is a session RomM shows as cancelled in a history a user reads,
 /// not a corrupted anything.
 bool ShouldRetry(CompleteError error);
+
+/// What this error says about the credentials, for `auth::Gate`. The same
+/// question `AnswerOf(NegotiateError)` answers, over the other call's enum.
+auth::Answer AnswerOf(CompleteError error);
 
 /// The spelling `CompleteSession` takes. An alias rather than a struct of its
 /// own: see `CallPolicy`.

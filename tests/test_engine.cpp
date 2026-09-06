@@ -28,6 +28,8 @@
 //   unpairs   -- M5-3: the pairing goes before the write, even when it fails
 //   stale     -- M5-3: an unreadable boot does not make the next edit un-pair
 //   server    -- M5-3: changing the server discards the token it does not own
+//   unauthenticated -- M1-4: the verdict `auth.json` carries, and the re-pair
+//                      that lifts it
 //   commands  -- what is still `kUnavailable`, so the list shrinks deliberately
 #include <cstddef>
 #include <cstdint>
@@ -43,6 +45,7 @@
 #include "harness.hpp"
 #include "rig.hpp"
 #include "rommsync/auth.hpp"
+#include "rommsync/auth_gate.hpp"
 #include "rommsync/download.hpp"
 #include "rommsync/host/curl_http_client.hpp"
 #include "rommsync/ipc.hpp"
@@ -588,6 +591,76 @@ int ServerChanged(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+// --- M1-4: the verdict the card carries, and the re-pair that lifts it ---------
+
+void Unauthenticated(checks::Checks& c) {
+  Console console(c, "engine-unauthenticated");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = https://romm.example.com\n"),
+           "a configured console");
+
+  auth::StoredToken token;
+  token.server_url = "https://romm.example.com";
+  token.access_token = "not-a-real-token";
+  token.device_id = "console-1";
+  const std::string token_path = console.directory + auth::kTokenFileName;
+  const std::string verdict_path = console.directory + auth::kAuthStateFileName;
+  c.Expect(auth::SaveToken(token_path, token).ok(), "with a pairing on the card");
+
+  console.Boot();
+  c.Expect(console.Status().auth == ipc::AuthState::kPaired,
+           "a console with a token and no verdict is paired");
+
+  // What a previous boot wrote once `auth::Gate` had counted enough consecutive
+  // rejections. Serving it from the card is the whole point: the overlay's
+  // re-pair prompt is up on the first poll, rather than after this boot has
+  // spent the same budget of requests reaching the same conclusion.
+  c.Expect(auth::SaveBlock(verdict_path, auth::Block::kRevoked).ok(),
+           "an earlier boot recorded that the server stopped accepting the token");
+  Console rebooted(c, "engine-unauthenticated-2", console.directory);
+  rebooted.Boot();
+  c.Expect(rebooted.Status().auth == ipc::AuthState::kUnauthenticated,
+           "so the console comes up unauthenticated, with no request made");
+  c.Expect(rebooted.sandbox.Exists("/config/rommsync/token.dat") ||
+               console.sandbox.Exists("/config/rommsync/token.dat"),
+           "and the token is still there -- this is a verdict, not a discard");
+
+  // The re-pair, which the acceptance criterion asks to work without a restart:
+  // the same engine object, one command, and the console is ready to pair again.
+  std::string response;
+  c.Expect(rebooted.Call(ipc::Command::kUnpair, ipc::EncodeEmpty(), &response) == ipc::Error::kOk,
+           "Unpair is answered");
+  c.Expect(rebooted.Status().auth == ipc::AuthState::kNeverPaired,
+           "and the console is ready to pair again, with no reload");
+  c.Expect(!auth::LoadToken(token_path).ok(), "the credentials are gone");
+  c.Expect(auth::LoadBlock(verdict_path).value == auth::Block::kNone,
+           "and so is the verdict about them");
+  c.Expect(!console.sandbox.Exists("/config/rommsync/auth.json"), "no file is left behind");
+  c.Expect(!console.sandbox.Exists("/config/rommsync/auth.json.old"), "nor an interrupted .old");
+
+  // A verdict left over a pairing that is already gone must not be read as one.
+  // A never-paired console sent to a screen that says "pair this console again"
+  // is one word wrong about a user who never paired at all.
+  c.Expect(auth::SaveBlock(verdict_path, auth::Block::kScopeDenied).ok(),
+           "a stale verdict is on the card");
+  Console orphaned(c, "engine-unauthenticated-3", console.directory);
+  orphaned.Boot();
+  c.Expect(orphaned.Status().auth == ipc::AuthState::kNeverPaired,
+           "a verdict with no token to be about leaves the console never-paired");
+  c.Expect(auth::ClearBlock(verdict_path), "and it is cleaned up after the check");
+
+  // An `auth.json` that will not read is not a verdict either: this file holds
+  // nothing that cannot be worked out again by asking, so it never blocks a
+  // boot (`auth_gate.hpp`).
+  c.Expect(auth::SaveToken(token_path, token).ok(), "the console is paired again");
+  c.Expect(console.sandbox.Write("/config/rommsync/auth.json", "{\"format\":\"rommsync-auth\""),
+           "and a half-written verdict is on the card");
+  Console corrupt(c, "engine-unauthenticated-4", console.directory);
+  corrupt.Boot();
+  c.Expect(corrupt.Status().auth == ipc::AuthState::kPaired,
+           "which stops nothing: the console will find out by asking");
+}
+
 // --- what is still not built --------------------------------------------------
 
 void Commands(checks::Checks& c) {
@@ -604,9 +677,10 @@ void Commands(checks::Checks& c) {
   c.Expect(console.Call(ipc::Command::kListBegin, ipc::EncodeListRequest(listing), &response) ==
                ipc::Error::kUnavailable,
            "ListBegin is still unavailable: M5-4 (#31) is what makes it real");
-  c.Expect(console.Call(ipc::Command::kUnpair, ipc::EncodeEmpty(), &response) ==
-               ipc::Error::kUnavailable,
-           "and so is Unpair");
+  // `Unpair` came off this list in M1-4 (#8): it discards `token.dat` and the
+  // verdict beside it, which is the half of "re-pairing recovers" the engine
+  // owns. Starting the device-code flow afterwards is `StartPair`'s and is not
+  // built.
   // `StartPair` never reaches the engine on this console: `ServiceCore` refuses
   // first, because there is no `server.url` to pair with -- which is the right
   // answer and a different sentence from "not built yet".
@@ -619,6 +693,9 @@ void Commands(checks::Checks& c) {
   std::int32_t position = 0;
   c.Expect(console.Enqueue(4, &position) != ipc::Error::kUnavailable, "Enqueue is built (#19)");
   c.Expect(console.Dequeue(4) != ipc::Error::kUnavailable, "and so is Dequeue (#19)");
+  c.Expect(console.Call(ipc::Command::kUnpair, ipc::EncodeEmpty(), &response) !=
+               ipc::Error::kUnavailable,
+           "Unpair is built (#8)");
   c.Expect(console.Call(ipc::Command::kSetEnabled, ipc::EncodeEnabled(true), &response) ==
                ipc::Error::kOk,
            "SetEnabled answers inside a successful reply, whatever it did");
@@ -636,6 +713,8 @@ int main(int argc, char** argv) {
 
   if (scenario == "queue") {
     Queue(checks);
+  } else if (scenario == "unauthenticated") {
+    Unauthenticated(checks);
   } else if (scenario == "persists") {
     Persists(checks);
   } else if (scenario == "rollback") {

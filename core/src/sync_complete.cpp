@@ -207,6 +207,33 @@ bool ShouldRetry(CompleteError error) {
   return error == CompleteError::kUnreachable || error == CompleteError::kServerError;
 }
 
+auth::Answer AnswerOf(CompleteError error) {
+  switch (error) {
+    case CompleteError::kUnauthorized:
+      return auth::Answer::kRejected;
+    case CompleteError::kForbidden:
+      return auth::Answer::kForbidden;
+    // Accepted only where the answer is proof RomM read the token: a session,
+    // and the three refusals gated on RomM's own `detail` text (auth_gate.hpp).
+    case CompleteError::kNone:
+    case CompleteError::kNoSuchSession:
+    case CompleteError::kAlreadyCompleted:
+    case CompleteError::kSuperseded:
+      return auth::Answer::kAccepted;
+    // The rest say nothing, `kRejected` -- a bare 4xx -- included.
+    case CompleteError::kRejected:
+    case CompleteError::kNotRegistered:
+    case CompleteError::kNoSession:
+    case CompleteError::kUnusablePayload:
+    case CompleteError::kCanceled:
+    case CompleteError::kUnreachable:
+    case CompleteError::kServerError:
+    case CompleteError::kMalformed:
+      break;
+  }
+  return auth::Answer::kSilent;
+}
+
 Encoded EncodeCompleteRequest(const CompletionCounts& counts) {
   Encoded encoded;
   if (counts.operations_completed < 0) {

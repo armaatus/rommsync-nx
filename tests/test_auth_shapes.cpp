@@ -125,6 +125,16 @@ void TokenCapture(checks::Checks& c) {
   // The one nullable field, and null on every 5.2.0 response: this token does
   // not expire on its own, which is never an error.
   c.Expect(!token.expires_at.has_value(), "expires_at is null");
+
+  // **And there is no refresh token**, which is why M1-4 (#8) has no refresh in
+  // it: a token that does not expire and cannot be refreshed means a 401 is a
+  // revocation and the only remedy is pairing again (docs/AUTH.md). Said out
+  // loud here as well as enforced by `OnlyKnownFields` above, because it is the
+  // premise a whole issue rests on -- a RomM that started sending one would turn
+  // this red, which is the point at which somebody reconsiders. `contract.captures`
+  // re-asks the live server the same question on every run.
+  c.Expect(body.find("refresh_token") == std::string::npos,
+           "the token response carries no refresh_token to refresh with");
 }
 
 /// The pending poll, from the capture rather than from a literal: this is the

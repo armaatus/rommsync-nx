@@ -192,7 +192,7 @@ std::optional<Negotiation> Refused(const http::Result& result) {
     // ticked, which need not be what was requested, so a 403 is a scope missing
     // from a pairing that is otherwise working -- and the client is meant to
     // have read `scopes` back off the token rather than meet it here
-    // (docs/AUTH.md#scopes-to-request). Reporting it as a revocation sends the
+    // (docs/AUTH.md#scopes). Reporting it as a revocation sends the
     // user looking for something that did not happen.
     return Refuse(NegotiateError::kForbidden,
                   "the negotiation was rejected: HTTP 403; this pairing was not granted the "
@@ -316,6 +316,31 @@ bool ShouldRetry(NegotiateError error) {
 bool NeedsPairing(NegotiateError error) {
   return error == NegotiateError::kNotRegistered || error == NegotiateError::kUnauthorized ||
          error == NegotiateError::kForbidden || error == NegotiateError::kNoSuchDevice;
+}
+
+auth::Answer AnswerOf(NegotiateError error) {
+  switch (error) {
+    case NegotiateError::kUnauthorized:
+      return auth::Answer::kRejected;
+    case NegotiateError::kForbidden:
+      return auth::Answer::kForbidden;
+    // Accepted only where the answer is proof RomM read the token: a plan, and
+    // the two refusals gated on RomM's own `detail` text (auth_gate.hpp).
+    case NegotiateError::kNone:
+    case NegotiateError::kNoSuchDevice:
+    case NegotiateError::kSyncDisabled:
+      return auth::Answer::kAccepted;
+    // The rest say nothing, `kRejected` -- a bare 4xx -- included.
+    case NegotiateError::kRejected:
+    case NegotiateError::kUnusablePayload:
+    case NegotiateError::kNotRegistered:
+    case NegotiateError::kCanceled:
+    case NegotiateError::kUnreachable:
+    case NegotiateError::kServerError:
+    case NegotiateError::kMalformed:
+      break;
+  }
+  return auth::Answer::kSilent;
 }
 
 auth::Parsed<SyncPlan> ParseNegotiateResponse(std::string_view body) {

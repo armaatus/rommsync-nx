@@ -66,6 +66,19 @@ overlay.
 - `sdmc:/config/rommsync/device.dat` — the `client_device_identifier`, derived
   once and kept for the life of the SD. Separate from `token.dat` because it has
   to survive a re-pair ([AUTH.md](AUTH.md#client-identifier)).
+- `sdmc:/config/rommsync/auth.json` — the server's standing verdict on the
+  token, to be written once `auth::Gate` has counted enough consecutive `401`s
+  or `403`s to give up on the pairing ([AUTH.md](AUTH.md#re-pairing--revocation)).
+  **Read but not yet written**: the writer is the scheduler that makes the calls,
+  M7-2 (#37) — see AUTH.md for exactly which two lines it adds.
+  One JSON object, `{"format":"rommsync-auth","version":1,"block":"revoked"}`,
+  and it **exists only while the console is blocked** — so the overlay's re-pair
+  prompt is up on the first poll after a boot rather than after the engine has
+  spent the same budget of requests again. Never a gate on boot: an unreadable or
+  unrecognised one is no verdict, and the console finds out by asking. Beside
+  `token.dat` rather than inside it, because a verdict re-derivable in three
+  requests has no business being written into the one file that cannot be
+  re-fetched without a human at a browser.
 - `sdmc:/config/rommsync/state.db` — last-synced hash/mtime per (rom, slot) so the
   client can tell which side changed. A **flat, line-oriented file**: a version
   line, then one JSON object per row (`core/include/rommsync/state_db.hpp`).

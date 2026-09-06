@@ -192,6 +192,24 @@ enum class OperationError {
   /// out without `overwrite=true`.
   kRefused,
 
+  /// 401 -- the server has stopped accepting this console's token.
+  ///
+  /// Not this operation's problem, and kept apart from `kRefused` because of
+  /// what it does to the ones after it: every remaining operation would be
+  /// refused the same way, so `ExecutePlan` **stops** rather than spending a
+  /// whole plan's worth of requests on a token that is gone -- the call
+  /// `download::Drain` already makes for its queue. `expires_at` is null on
+  /// 5.2.0, so there is nothing to refresh and nothing that starts working again
+  /// on its own (docs/AUTH.md#re-pairing--revocation).
+  kUnauthorized,
+
+  /// 403 -- the pairing is real and was not granted what this operation needs.
+  ///
+  /// The same stop, and deliberately not the same sentence: RomM approves what
+  /// the *user* ticked, so this is a missing scope rather than a revocation
+  /// (docs/AUTH.md#scopes).
+  kForbidden,
+
   /// The downloaded bytes are not the save the plan described. They were
   /// discarded and the local file was not touched.
   kUnverified,
@@ -211,6 +229,10 @@ enum class OperationError {
 
 /// Stable, log-friendly name. Never null.
 const char* ToString(OperationError error);
+
+/// What this error says about the credentials, for `auth::Gate`. The same
+/// question `sync::AnswerOf(NegotiateError)` answers, over one operation.
+auth::Answer AnswerOf(OperationError error);
 
 /// One operation, and what became of it.
 struct OperationResult {
@@ -265,6 +287,19 @@ struct ExecutionReport {
   /// `completed + failed + not_understood` is short of `operations.size()`
   /// exactly when this is set.
   bool canceled = false;
+
+  /// The server stopped accepting the token part way through, so the operations
+  /// after that one were not attempted.
+  ///
+  /// **Unlike `canceled`, the operation that met it is counted `failed`**: it
+  /// was attempted and it did not happen, and that is what keeps the
+  /// `operations_failed` this tick reports to `complete` honest (M2-6). The ones
+  /// after it are in no total, because they were never tried.
+  ///
+  /// A caller feeds `AnswerOf(OperationError)` for the last operation to
+  /// `auth::Gate`; the flag is here so it does not have to search the vector for
+  /// the reason the tick ended early.
+  bool unauthorized = false;
 
   /// One line per operation that failed or was not understood, plus anything a
   /// completed one is worth saying out loud -- a download that could not be
@@ -323,6 +358,11 @@ struct ExecuteOptions {
 /// One failed operation does not abandon the rest: each is isolated, counted,
 /// and left for the next tick. Nothing here deletes a save, and nothing here
 /// resolves a conflict the server did not report.
+///
+/// The two exceptions are the two failures that are not about one operation: a
+/// cancellation, and a 401 or 403 (`ExecutionReport::unauthorized`). Both stop
+/// the plan where it stands, because everything after them would end the same
+/// way -- and on a battery, twenty requests to prove that is nineteen too many.
 ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
                             const auth::StoredToken& token, const SyncPlan& plan,
                             const std::vector<SaveTarget>& targets,

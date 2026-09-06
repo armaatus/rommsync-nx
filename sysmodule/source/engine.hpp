@@ -8,7 +8,8 @@
 //
 // **It answers only what this build actually knows.** The console's
 // configuration -- which it now writes as well as reads (M5-3) -- whether it has
-// ever paired, and -- since M3-2 (#19) -- its download queue are on the SD card
+// ever paired, whether the server has stopped accepting its token (M1-4, #8),
+// and -- since M3-2 (#19) -- its download queue are on the SD card
 // and are read from it; everything else is
 // `ipc::Error::kUnavailable`, which is a sentence the overlay can draw rather
 // than a plausible refusal that sends a user looking for a full queue or a
@@ -24,6 +25,7 @@
 #include <vector>
 
 #include "rommsync/auth.hpp"
+#include "rommsync/auth_gate.hpp"
 #include "rommsync/config.hpp"
 #include "rommsync/download.hpp"
 #include "rommsync/ipc.hpp"
@@ -87,6 +89,34 @@ class SdEngine : public ipc::Engine {
                              std::vector<config::Diagnostic>* diagnostics) override;
   bool RequestSync() override;
   ipc::Error StartPairing() override;
+
+  /// M1-4 (#8). Discard `token.dat` and the verdict beside it, and report the
+  /// console as never paired.
+  ///
+  /// This is the half of "re-pairing recovers without a restart" the engine
+  /// owns: an unauthenticated console is one whose `auth.json` says so, and
+  /// nothing else lifts that -- `auth::Gate::Reset` is the only exit, by design,
+  /// because a client that is not calling cannot be told its token works.
+  ///
+  /// **`StartPairing` is still `kUnavailable`, so the other half is not here**,
+  /// and the asymmetry is worth knowing before something presses this: a console
+  /// that unpairs cannot yet pair again from the sysmodule. Nothing under
+  /// `overlay/` calls it today -- the settings screen's "Re-pair" button, which
+  /// sends `Unpair` then `StartPair`, is M4-4 (#26) -- so the order to build
+  /// them in is `StartPairing` first, or that button discards a pairing with
+  /// nothing to restart.
+  ///
+  /// The verdict goes **after** the token, deliberately: the other order leaves
+  /// a moment where the card says the pairing is fine and the credentials are
+  /// gone, and a console that stopped there would report itself paired and 401
+  /// on every tick. A token that could not be discarded is `kWriteFailed` with
+  /// nothing changed. A verdict that could not be *cleared* is `kWriteFailed`
+  /// with the console reported as never paired and the gate reset anyway, which
+  /// is what actually happened: the credentials are gone, so the verdict is
+  /// about a token that no longer exists and leaving it standing would have a
+  /// worker refuse to call on a console the user has just re-paired. What the
+  /// failure costs is the file surviving to the next boot, where `Load` already
+  /// refuses to honour a verdict with no token to be about.
   ipc::Error Unpair() override;
   /// M3-2 (#19). Both are real: the queue is on the card and neither touches
   /// the network, which is `ipc.hpp`'s rule for every command.
@@ -164,9 +194,10 @@ class SdEngine : public ipc::Engine {
 
   /// Take `loaded` as the configuration in force.
   ///
-  /// The queue's complaints go **in front** of the file's rather than being
-  /// dropped. They are not complaints about `config.ini`, and the section says
-  /// so -- but a queue that vanished with nothing anywhere saying why is the
+  /// The queue's complaints, and `auth.json`'s, go **in front** of the file's
+  /// rather than being dropped. They are not complaints about `config.ini`, and
+  /// the section says so -- but a queue that vanished with nothing anywhere
+  /// saying why is the
   /// failure a diagnostic exists to prevent, and the settings screen (#26) is
   /// the one place on this console a user can read one. In front because
   /// `ipc::TrimDiagnostics` keeps the first few and summarises the rest, so a
@@ -193,19 +224,37 @@ class SdEngine : public ipc::Engine {
   /// write does not silently drop it.
   std::vector<config::Diagnostic> queue_diagnostics_;
 
+  /// And `auth.json`'s half, kept apart for the same reason. At most one line,
+  /// and only when the file was there and would not read (M1-4, #8).
+  std::vector<config::Diagnostic> auth_diagnostics_;
+
   /// The download queue as the card holds it. Loaded once and written by every
   /// command that changes it, so the file and this never disagree by more than
   /// one `rename` (`download.hpp`).
   download::Queue queue_;
 
-  /// `kNeverPaired` or `kPaired`. `kUnauthenticated` is a *server's* answer --
-  /// a token this console still holds and RomM has stopped accepting -- so it
-  /// cannot be decided from the card, and reporting it from here would send a
-  /// working console to the re-pair screen (`ipc::AuthState`).
+  /// What `GetStatus` answers with.
   ///
-  /// `kNeverPaired` means the file is *missing*, not that it could not be read:
-  /// an SD card having a bad moment is not a console that has never paired.
+  /// `kNeverPaired` means `token.dat` is *missing*, not that it could not be
+  /// read: an SD card having a bad moment is not a console that has never
+  /// paired.
+  ///
+  /// `kUnauthenticated` is a *server's* answer, so it is never decided here --
+  /// it is read off `auth.json`, which is written only once `auth::Gate` has
+  /// counted enough consecutive rejections to give up on the pairing (M1-4, #8).
+  /// Serving it from the card is what puts the re-pair prompt up on the first
+  /// poll after a boot, instead of after the engine has spent that budget again.
   ipc::AuthState auth_ = ipc::AuthState::kNeverPaired;
+
+  /// The verdict `auth.json` holds, and what a worker consults before calling.
+  ///
+  /// Restored at boot rather than counted from zero. Nothing in this build
+  /// observes an answer into it yet -- there is no scheduler to make the calls
+  /// (M7-2, #37) -- so what it does today is carry the stored verdict and let
+  /// `Unpair` lift it. That is the seam #37 fills in: `Observe` each call's
+  /// `auth::AnswerOf(...)`, and persist the block the moment `blocked()` turns
+  /// true.
+  auth::Gate gate_;
 };
 
 }  // namespace rommsync::sysmodule

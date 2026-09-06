@@ -1137,6 +1137,110 @@ void Reported(rig::Checks& checks, http::HttpClient& client, const std::string& 
   }
 }
 
+// --- revoked ------------------------------------------------------------------
+//
+// M1-4 (#8), and the acceptance clause that costs the most to get wrong: a 401
+// arriving mid-tick has to end that tick **cleanly**. No partial writes, a
+// `state.db` the next boot can still read, and an `operations_failed` that says
+// what actually happened.
+//
+// The baseline is the thing worth protecting here, and it is protected by an
+// ordering rather than by a check: `FinishTick` persists it *before* it reports
+// the session, because the transfers already landed on the server and a lost
+// baseline is the whole library re-hashed and re-uploaded, silently. A tick that
+// was refused half way did not advance any row -- so what has to come back off
+// the card is the baseline that was already there, byte for byte, not a shorter
+// one and not an empty one.
+
+void Revoked(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+             const Fixture& fixture, const harness::Rom& rom) {
+  Sandbox sandbox(checks, "complete-revoked");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const std::string slot = harness::UniqueSlot("m1-4-tick");
+  const std::string name = "revoked-tick.srm";
+  const std::string bytes = "the device's only copy\n";
+  sandbox.SeedSave(SavePath(name), bytes);
+
+  sync::ClientSaveState local;
+  if (!LocalSaveOnCard(checks, *files, sandbox, rom.id, name, slot, &local)) {
+    return;
+  }
+  sync::SyncNegotiatePayload payload;
+  payload.device_id = fixture.device_id;
+  payload.saves.push_back(local);
+
+  // A baseline an earlier tick left behind, for a save that is not in this
+  // plan at all. It is what a real console always has, and it is what a tick
+  // that rebuilt the file from what it happened to know would silently lose.
+  state::Baseline previous;
+  state::SaveRecord earlier;
+  earlier.rom_id = rom.id + 1;
+  earlier.slot = "m1-4-earlier-tick";
+  earlier.content_hash = std::string(32, 'a');
+  earlier.file_size_bytes = 11;
+  earlier.mtime = sync::Timestamp{} + std::chrono::seconds{1'757'000'000};
+  previous.Set(earlier);
+  const state::StoreResult seeded =
+      state::SaveBaseline(files->Resolve(sync::kStateSdPath), previous);
+  checks.Expect(seeded.ok(), "an earlier tick's baseline is on the card: " + seeded.message);
+  const std::string before = sandbox.Read(sync::kStateSdPath);
+
+  sync::SyncPlan plan;
+  if (!PlanFor(checks, client, base, fixture, payload, {slot}, &plan)) {
+    return;
+  }
+
+  const std::vector<sync::SaveTarget> targets = {{rom.id, slot, SavePath(name), name}};
+  sync::ExecutionReport report;
+  {
+    harness::Fault fault(checks, client, base,
+                         R"({"mode":"status","status":401,"path":"/api/saves","count":1})");
+    report = sync::ExecutePlan(client, *files, TokenFor(base, fixture), plan, targets,
+                               ExecuteAt(1'757'000'200));
+  }
+  checks.Expect(report.unauthorized, "the tick was refused part way");
+  checks.ExpectEq(report.completed, 0, "nothing completed");
+  checks.ExpectEq(report.failed, 1, "and the operation that met the 401 is counted failed");
+
+  // The fault is spent, so `complete` reaches a healthy server: the accounting
+  // for a tick that failed still has to land, and it has to be honest.
+  const sync::TickCompletion tick =
+      sync::FinishTick(client, *files, TokenFor(base, fixture), plan, report, payload.saves,
+                       std::move(previous), FinishInstantly());
+
+  checks.ExpectEq(static_cast<int>(tick.counts.operations_completed), 0,
+                  "the session is told nothing completed");
+  checks.ExpectEq(static_cast<int>(tick.counts.operations_failed), 1,
+                  "and that exactly one operation failed -- not zero, and not the whole plan");
+  checks.ExpectEq(tick.rows_advanced, std::size_t{0},
+                  "no row moved forward, because nothing happened to a save");
+  checks.Expect(tick.stored.ok(), "the baseline was still written: " + tick.stored.message);
+
+  // Byte for byte, which is the strongest form of "nothing was corrupted": a
+  // file that parsed but had lost the earlier tick's row would pass a weaker
+  // check and cost that save a re-hash on every tick from here on.
+  checks.ExpectEq(sandbox.Read(sync::kStateSdPath), before,
+                  "and the baseline on the card is exactly the one that was there");
+  const state::LoadedBaseline loaded = StoredBaseline(*files);
+  checks.Expect(loaded.diagnostics.empty(),
+                "it still reads back clean: " + loaded.DescribeDiagnostics());
+  checks.Expect(loaded.value.Find(earlier.rom_id, earlier.slot) != nullptr,
+                "with the earlier tick's row intact");
+  checks.Expect(loaded.value.Find(rom.id, slot) == nullptr,
+                "and no row for the save this tick never managed to upload");
+
+  // The save itself, and the server's opinion of it. Neither moved.
+  checks.ExpectEq(sandbox.Read(SavePath(name)), bytes, "the save is untouched");
+  sync::SyncPlan again;
+  if (PlanFor(checks, client, base, fixture, payload, {slot}, &again)) {
+    checks.Expect(again.operations[0].action == sync::Action::kUpload,
+                  std::string("the next tick still plans the upload that did not happen: ") +
+                      sync::ToString(again.operations[0].action));
+    harness::Complete(client, base, fixture, again.session_id, 0, 0);
+  }
+}
+
 // --- refused ------------------------------------------------------------------
 //
 // The design note this issue turns on: complete is accounting, not the commit
@@ -1341,6 +1445,8 @@ int main(int argc, char** argv) {
     Unchanged(checks, *client, base, fixture, rom);
   } else if (scenario == "reported") {
     Reported(checks, *client, base, fixture, rom);
+  } else if (scenario == "revoked") {
+    Revoked(checks, *client, base, fixture, rom);
   } else if (scenario == "refused") {
     Refused(checks, *client, base, fixture, rom);
   } else if (scenario == "truncated") {
