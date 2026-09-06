@@ -9,12 +9,20 @@
 // **It answers only what this build actually knows.** The console's
 // configuration -- which it now writes as well as reads (M5-3) -- whether it has
 // ever paired, whether the server has stopped accepting its token (M1-4, #8),
-// and -- since M3-2 (#19) -- its download queue are on the SD card
-// and are read from it; everything else is
+// its download queue (M3-2, #19) and, since M5-4 (#31), the three lists the
+// overlay browses are on the SD card and are read from it; everything else is
 // `ipc::Error::kUnavailable`, which is a sentence the overlay can draw rather
 // than a plausible refusal that sends a user looking for a full queue or a
 // failing SD card. Each of the issues above replaces its own part of this, and
-// `kUnavailable` disappearing entirely is what says the engine is finished.
+// `kUnavailable` disappearing entirely is what says the engine is finished --
+// `StartPairing` is the last one left.
+//
+// **What this build still has no backend for is the network.** Nothing
+// implements `http::HttpClient` for Horizon (M0-1 measured what TLS would cost;
+// `main.cpp` says the rest), so the `queue` list -- served off `queue.json` --
+// works in full here while `platforms` and `roms` answer `kOffline`, which is
+// what a console with no way to reach its server amounts to. `UseServer` is the
+// seam, and the host suite is what drives the paging through it (`lists.*`).
 //
 // Nothing here has ever run: it is Horizon-side and is exercised in Ryujinx
 // before the M8-1 gate, never on hardware (sysmodule/AGENTS.md).
@@ -28,7 +36,10 @@
 #include "rommsync/auth_gate.hpp"
 #include "rommsync/config.hpp"
 #include "rommsync/download.hpp"
+#include "rommsync/file_system.hpp"
+#include "rommsync/http.hpp"
 #include "rommsync/ipc.hpp"
+#include "rommsync/list_service.hpp"
 #include "rommsync/pairing.hpp"
 
 namespace rommsync::sysmodule {
@@ -58,6 +69,8 @@ inline constexpr const char* kConfigDir = "sdmc:/config/rommsync/";
 /// is already the object it drains.
 class SdEngine : public ipc::Engine {
  public:
+  SdEngine();
+
   /// Read `config.ini`, look for `token.dat`, and read `queue.json`. Never
   /// fails: a console with no config is a console with the defaults, one with
   /// no token has never paired, and one with no queue has queued nothing --
@@ -70,6 +83,33 @@ class SdEngine : public ipc::Engine {
   /// engine behind `ipc::Dispatch`, against a directory, with no console. The
   /// alternative is glue that is only ever proven by the fact that it compiles.
   void Load(const std::string& config_dir = kConfigDir);
+
+  /// The network the library is read over, and the token to read it with.
+  ///
+  /// **Null and empty on the console today.** This build has no HTTP backend
+  /// for Horizon -- M0-1 measured what TLS would cost and nothing implements
+  /// `http::HttpClient` there yet (`main.cpp` says so) -- so `platforms` and
+  /// `roms` answer `ipc::Error::kOffline` while `queue`, which never touches
+  /// the network, is served in full. The host suite passes a libcurl client and
+  /// the fixture token, which is what proves the paging (`lists.*`). This is
+  /// also the seam M7-2 (#37) fills when the scheduler brings a client with it.
+  void UseServer(http::HttpClient* client, std::string bearer_token);
+
+  /// Where a rom already on the card is looked for, for a rom row's `on_disk`.
+  /// Null on the console for the same reason: nothing implements
+  /// `fs::FileSystem` for Horizon yet, and `on_disk` is then `false` rather
+  /// than guessed (`list_service.hpp`).
+  void UseCard(fs::FileSystem* filesystem);
+
+  /// Drive one list page fetch, from a thread that is **not** the IPC one.
+  ///
+  /// There is no such thread in this build, which costs nothing while there is
+  /// no client to fetch with: `ListNext` answers `kOffline` before it ever asks
+  /// for a page. It is the same seam the scheduler needs (M7-2, #37) -- one
+  /// worker loop calling this and `sync_tick` -- and the host suite calls it
+  /// directly between two `ListNext`s, which is what makes every paging case
+  /// deterministic rather than timed.
+  bool PumpLists();
 
   const config::Config& config() const override;
   const std::vector<config::Diagnostic>& config_diagnostics() const override;
@@ -133,6 +173,10 @@ class SdEngine : public ipc::Engine {
   /// position)`, which produces the whole fixed error set.
   ipc::Error Enqueue(std::int64_t rom_id, std::int32_t* position) override;
   ipc::Error Dequeue(std::int64_t rom_id) override;
+  /// M5-4 (#31). All three are `lists::Service`'s, which owns the cursors, the
+  /// cap, the TTL and the three projections -- so the one thing this class
+  /// decides about a list is what the service is allowed to reach: the card's
+  /// queue always, the network only once something hands it a client.
   ipc::Error ListBegin(const ipc::ListRequest& request, ipc::Cursor* cursor) override;
   ipc::Error ListNext(ipc::Cursor cursor, ipc::ListPage* page) override;
   ipc::Error ListEnd(ipc::Cursor cursor) override;
@@ -197,15 +241,14 @@ class SdEngine : public ipc::Engine {
 
   /// Take `loaded` as the configuration in force.
   ///
-  /// The queue's complaints, and `auth.json`'s, go **in front** of the file's
-  /// rather than being dropped. They are not complaints about `config.ini`, and
-  /// the section says so -- but a queue that vanished with nothing anywhere
-  /// saying why is the
-  /// failure a diagnostic exists to prevent, and the settings screen (#26) is
-  /// the one place on this console a user can read one. In front because
+  /// `auth.json`'s complaint goes **in front** of the file's rather than being
+  /// dropped. It is not a complaint about `config.ini` -- but a credential file
+  /// that would not read with nothing anywhere saying why is the failure a
+  /// diagnostic exists to prevent, and the settings screen (#26) is the one
+  /// place on this console a user can read one. In front because
   /// `ipc::TrimDiagnostics` keeps the first few and summarises the rest, so a
-  /// `config.ini` with a handful of complaints would otherwise push the one
-  /// saying the whole download queue was discarded into the "N more" line.
+  /// `config.ini` with a handful of complaints would otherwise push it into the
+  /// "N more" line.
   void AdoptConfig(config::LoadResult loaded);
 
   /// One of this client's files, under the directory `Load` was given.
@@ -220,15 +263,16 @@ class SdEngine : public ipc::Engine {
   config::Config config_ = config::Defaults();
 
   /// What was wrong with `config.ini`, and -- see `AdoptConfig` -- with
-  /// `queue.json`. Rebuilt every time the configuration is re-read.
+  /// `auth.json`. Rebuilt every time the configuration is re-read.
+  ///
+  /// `queue.json`'s complaints are **not** here since M5-4 (#31): they are the
+  /// queue's, they reach the user on the queue list, and a copy on a report
+  /// about `config.ini` would be the same sentence in two places.
   std::vector<config::Diagnostic> diagnostics_;
 
-  /// The queue's half of that, kept apart so re-reading `config.ini` after a
-  /// write does not silently drop it.
-  std::vector<config::Diagnostic> queue_diagnostics_;
-
-  /// And `auth.json`'s half, kept apart for the same reason. At most one line,
-  /// and only when the file was there and would not read (M1-4, #8).
+  /// `auth.json`'s half, kept apart so re-reading `config.ini` after a write
+  /// does not silently drop it. At most one line, and only when the file was
+  /// there and would not read (M1-4, #8).
   std::vector<config::Diagnostic> auth_diagnostics_;
 
   /// The download queue as the card holds it. Loaded once and written by every
@@ -248,6 +292,10 @@ class SdEngine : public ipc::Engine {
   /// Serving it from the card is what puts the re-pair prompt up on the first
   /// poll after a boot, instead of after the engine has spent that budget again.
   ipc::AuthState auth_ = ipc::AuthState::kNeverPaired;
+
+  /// The three lists the overlay browses (M5-4, #31). Declared after `config_`
+  /// and `queue_` because it holds a reference to each.
+  lists::Service lists_;
 
   /// The verdict `auth.json` holds, and what a worker consults before calling.
   ///

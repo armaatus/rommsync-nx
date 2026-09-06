@@ -735,6 +735,13 @@ std::string SerializeQueue(const std::vector<QueueEntry>& entries) {
 
 LoadedQueue ParseQueue(std::string_view text) {
   LoadedQueue loaded;
+  // Every complaint this function can produce is about contents it refused to
+  // use, so the two answers are the same one -- unlike in `LoadQueue`, where a
+  // file that was never written also has something to say.
+  struct SetDiscarded {
+    LoadedQueue* loaded;
+    ~SetDiscarded() { loaded->discarded = !loaded->diagnostics.empty(); }
+  } discarded{&loaded};
 
   const json::ParseResult document = json::Parse(text);
   if (!document.ok()) {
@@ -848,6 +855,9 @@ LoadedQueue LoadQueue(const std::string& path) {
         Add(&diagnostics, std::move(diagnostic));
       }
       recovered.diagnostics = std::move(diagnostics);
+      // A commit was interrupted. Whatever came back, the primary file is not
+      // there, and that is worth a user seeing rather than a silent recovery.
+      recovered.discarded = true;
       return recovered;
     }
   }
@@ -861,13 +871,17 @@ LoadedQueue LoadQueue(const std::string& path) {
       break;
     case io::BoundedRead::kUnreadable:
       // The one outcome that is not a discard: the queue on the card is
-      // probably intact and this boot simply cannot see it. See `trusted`.
+      // probably intact and this boot simply cannot see it. See `trusted`. It
+      // is still a queue the user has lost for this boot, so it is still
+      // something to say out loud on the queue screen.
       loaded.trusted = false;
+      loaded.discarded = true;
       Add(&loaded.diagnostics,
           Describe(path, "could not be read; the queue is empty for this boot, and must not be "
                          "written over until it can be read again"));
       break;
     case io::BoundedRead::kTooLarge:
+      loaded.discarded = true;
       Add(&loaded.diagnostics,
           Describe(path, "is larger than the " + std::to_string(kMaxQueueBytes) +
                              " bytes a queue may take; it is discarded"));

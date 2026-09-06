@@ -10,6 +10,7 @@
 #include "rommsync/config.hpp"
 #include "rommsync/download.hpp"
 #include "rommsync/ipc.hpp"
+#include "rommsync/list_service.hpp"
 #include "rommsync/pairing.hpp"
 #include "rommsync/token_store.hpp"
 
@@ -19,6 +20,18 @@ namespace rommsync::sysmodule {
 /// the file names and may not know an SD path (hard rule 4), so joining them is
 /// this side's job -- once, rather than at each call site.
 std::string SdEngine::PathTo(const char* file_name) const { return config_dir_ + file_name; }
+
+/// The service reads the configuration in force and the queue on the card, both
+/// of which outlive it because it is a member beside them.
+SdEngine::SdEngine() : lists_(config_, queue_) {}
+
+void SdEngine::UseServer(http::HttpClient* client, std::string bearer_token) {
+  lists_.UseServer(client, std::move(bearer_token));
+}
+
+void SdEngine::UseCard(fs::FileSystem* filesystem) { lists_.UseCard(filesystem); }
+
+bool SdEngine::PumpLists() { return lists_.Pump(); }
 
 void SdEngine::Load(const std::string& config_dir) {
   config_dir_ = config_dir;
@@ -77,26 +90,25 @@ void SdEngine::Load(const std::string& config_dir) {
   download::LoadedQueue queued = download::LoadQueue(PathTo(download::kQueueFileName));
   queue_.Reset(std::move(queued.entries));
   queue_trusted_ = queued.trusted;
-  // Kept rather than folded into `diagnostics_` on the spot, because
-  // `ApplyConfigEdit` rebuilds that list from the file it just wrote and would
-  // otherwise drop the one complaint no other screen can show. A field of its
-  // own on the wire is #22's to add.
-  queue_diagnostics_.clear();
-  queue_diagnostics_.reserve(queued.diagnostics.size());
-  for (const std::string& complaint : queued.diagnostics) {
-    queue_diagnostics_.push_back({config::Severity::kWarning, 0, "downloads", "", complaint});
-  }
-  // M3-5 (#22) built the home the comment above was waiting for:
-  // `download::DownloadStatus::queue_message` is a queue-level message on the
-  // queue's own model rather than a `[downloads]` section on `config.ini`'s.
-  // Both are filled from the same load, because the placeholder is still the
-  // only one of the two that reaches a user -- `ipc::Status` carries the
-  // projection and not the whole status, and the queue screen (#31) is what
-  // should render this and retire the config diagnostic.
+  // The complaint goes to the queue and nowhere else.
+  //
+  // It used to go on `config_diagnostics()` under a `[downloads]` section as
+  // well, because `ipc::Status` carries a projection rather than the whole
+  // `DownloadStatus` and the settings screen was the only place on this console
+  // a user could read a sentence (M3-5, #22). M5-4 (#31) is what that
+  // placeholder was waiting for: the `queue` list serves this as a row of its
+  // own, on the screen the user opens to ask why a rom never arrived, so a
+  // `[downloads]` section on a report about `config.ini` is now a second copy
+  // in the wrong place.
+  //
+  // `discarded` rather than "there are diagnostics": a card that has never
+  // queued anything produces one saying so, and a row on the download screen
+  // reading "queue.json is missing" on every new console is noise in the one
+  // place a user goes to find out why a rom did not arrive (`download.hpp`).
   //
   // `DescribeDiagnostics` renders one line per complaint for a log; the trailing
   // newline goes, because this one is a sentence on a screen.
-  std::string queue_message = queued.DescribeDiagnostics();
+  std::string queue_message = queued.discarded ? queued.DescribeDiagnostics() : std::string();
   while (!queue_message.empty() && queue_message.back() == '\n') {
     queue_message.pop_back();
   }
@@ -107,9 +119,8 @@ void SdEngine::Load(const std::string& config_dir) {
 
 void SdEngine::AdoptConfig(config::LoadResult loaded) {
   config_ = std::move(loaded.value);
-  diagnostics_ = queue_diagnostics_;
-  diagnostics_.reserve(diagnostics_.size() + auth_diagnostics_.size() + loaded.diagnostics.size());
-  diagnostics_.insert(diagnostics_.end(), auth_diagnostics_.begin(), auth_diagnostics_.end());
+  diagnostics_ = auth_diagnostics_;
+  diagnostics_.reserve(diagnostics_.size() + loaded.diagnostics.size());
   for (config::Diagnostic& diagnostic : loaded.diagnostics) {
     diagnostics_.push_back(std::move(diagnostic));
   }
@@ -326,12 +337,14 @@ ipc::Error SdEngine::Dequeue(std::int64_t rom_id) {
   return Commit([&] { return queue_.Remove(rom_id); });
 }
 
-ipc::Error SdEngine::ListBegin(const ipc::ListRequest&, ipc::Cursor*) {
-  return ipc::Error::kUnavailable;
+ipc::Error SdEngine::ListBegin(const ipc::ListRequest& request, ipc::Cursor* cursor) {
+  return lists_.ListBegin(request, cursor);
 }
 
-ipc::Error SdEngine::ListNext(ipc::Cursor, ipc::ListPage*) { return ipc::Error::kUnavailable; }
+ipc::Error SdEngine::ListNext(ipc::Cursor cursor, ipc::ListPage* page) {
+  return lists_.ListNext(cursor, page);
+}
 
-ipc::Error SdEngine::ListEnd(ipc::Cursor) { return ipc::Error::kUnavailable; }
+ipc::Error SdEngine::ListEnd(ipc::Cursor cursor) { return lists_.ListEnd(cursor); }
 
 }  // namespace rommsync::sysmodule

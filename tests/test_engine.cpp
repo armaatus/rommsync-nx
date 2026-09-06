@@ -130,6 +130,27 @@ class Console {
     return download::LoadQueue(directory + download::kQueueFileName);
   }
 
+  /// The queue as the overlay reads it: one page of the `queue` list (M5-4).
+  ///
+  /// One page is enough for every caller here -- these queues are a handful of
+  /// rows -- and `lists.queue` is what holds the paging itself.
+  std::vector<ipc::ListItem> QueueList() {
+    ipc::ListRequest request;
+    request.kind = ipc::ListKind::kQueue;
+    std::string response;
+    if (Call(ipc::Command::kListBegin, ipc::EncodeListRequest(request), &response) !=
+        ipc::Error::kOk) {
+      return {};
+    }
+    const ipc::Cursor cursor = ipc::DecodeCursor(response).value;
+    if (Call(ipc::Command::kListNext, ipc::EncodeCursor(cursor), &response) != ipc::Error::kOk) {
+      return {};
+    }
+    const ipc::ListPage page = ipc::DecodeListPage(response).value;
+    Call(ipc::Command::kListEnd, ipc::EncodeCursor(cursor), &response);
+    return page.items;
+  }
+
   harness::Sandbox sandbox;
   std::string directory;
   sysmodule::SdEngine engine;
@@ -270,14 +291,22 @@ void Corrupt(checks::Checks& c) {
 
   // The complaint is not dropped on the floor: a queue that vanished with
   // nothing anywhere saying why is the failure a diagnostic exists to prevent.
+  //
+  // It arrives on the **queue list** since M5-4 (#31), not on
+  // `config_diagnostics()`. #22 put it under a `[downloads]` section on a report
+  // about `config.ini` because the settings screen was the only screen that
+  // existed; the download screen is where a user goes to ask why a rom did not
+  // arrive, and that is where this now is. `lists.queue` pins the row itself;
+  // what this pins is that the sentence still reaches the overlay from *this*
+  // engine, and that it no longer arrives twice.
   std::string response;
   console.Call(ipc::Command::kGetConfig, ipc::EncodeEmpty(), &response);
   const ipc::ConfigView view = ipc::DecodeConfigView(response).value;
-  bool complained = false;
   for (const config::Diagnostic& diagnostic : view.diagnostics) {
-    complained = complained || diagnostic.section == "downloads";
+    c.Expect(diagnostic.section != "downloads",
+             "the `[downloads]` placeholder is gone from the config report");
   }
-  c.Expect(complained, "and the overlay is told the queue was discarded");
+  c.Expect(!console.QueueList().empty(), "and the overlay is told the queue was discarded");
 
   // And it still works: a console whose queue was thrown away can queue again.
   std::int32_t position = 0;
@@ -288,6 +317,12 @@ void Corrupt(checks::Checks& c) {
   // the payload. `ipc::TrimDiagnostics` keeps the first few and summarises the
   // rest, and "your whole download queue was discarded" is the one line a user
   // cannot infer from anything else on the screen -- so it goes in front.
+  //
+  // The trim is what makes the two channels worth keeping apart.
+  // `ipc::TrimDiagnostics` keeps the first few complaints and summarises the
+  // rest, so on a `config.ini` full of its own the queue's used to have to be
+  // pushed in front of them to survive at all. On a list of its own it cannot be
+  // summarised away by anything.
   Console noisy(c, "engine-corrupt-noisy");
   std::string bad("[server]\nurl = https://romm.example.com\n[sync]\n");
   for (int line = 0; line < 12; ++line) {
@@ -298,12 +333,18 @@ void Corrupt(checks::Checks& c) {
   noisy.Boot();
   noisy.Call(ipc::Command::kGetConfig, ipc::EncodeEmpty(), &response);
   const ipc::ConfigView crowded = ipc::DecodeConfigView(response).value;
-  bool survived = false;
-  for (const config::Diagnostic& diagnostic : crowded.diagnostics) {
-    survived = survived || diagnostic.section == "downloads";
-  }
   c.Expect(crowded.diagnostics.size() > 1, "the config's own complaints are there too");
-  c.Expect(survived, "and the queue's complaint survived the trim rather than being summarised");
+  c.Expect(!noisy.QueueList().empty(),
+           "and the queue's complaint is on the queue list, where nothing can trim it");
+
+  // And a card that has simply never queued anything says nothing at all: a
+  // first boot produces a diagnostic saying there is no file yet, and a row
+  // reading "queue.json is missing" on every new console is noise in the one
+  // place a user goes to find out why a rom did not arrive (`download.hpp`).
+  Console fresh(c, "engine-corrupt-fresh");
+  fresh.Boot();
+  c.ExpectEq(fresh.QueueList().size(), std::size_t{0},
+             "a console that has never queued anything has an empty queue list");
 }
 
 // --- the commands M5-3 makes real ---------------------------------------------
@@ -672,11 +713,6 @@ void Commands(checks::Checks& c) {
   // command that quietly started answering something plausible instead would
   // send a user looking for a problem that is not there (`engine.hpp`).
   std::string response;
-  ipc::ListRequest listing;
-  listing.kind = ipc::ListKind::kQueue;
-  c.Expect(console.Call(ipc::Command::kListBegin, ipc::EncodeListRequest(listing), &response) ==
-               ipc::Error::kUnavailable,
-           "ListBegin is still unavailable: M5-4 (#31) is what makes it real");
   // `Unpair` came off this list in M1-4 (#8): it discards `token.dat` and the
   // verdict beside it, which is the half of "re-pairing recovers" the engine
   // owns. Starting the device-code flow afterwards is `StartPair`'s and is not
@@ -696,6 +732,17 @@ void Commands(checks::Checks& c) {
   c.Expect(console.Call(ipc::Command::kUnpair, ipc::EncodeEmpty(), &response) !=
                ipc::Error::kUnavailable,
            "Unpair is built (#8)");
+  ipc::ListRequest listing;
+  listing.kind = ipc::ListKind::kQueue;
+  c.Expect(console.Call(ipc::Command::kListBegin, ipc::EncodeListRequest(listing), &response) ==
+               ipc::Error::kOk,
+           "ListBegin is built (#31)");
+  // The cursor payload, copied out first: `Dispatch` clears the response buffer
+  // before it writes to it, so passing one string as both would hand the decoder
+  // an empty request.
+  const std::string cursor = response;
+  c.Expect(console.Call(ipc::Command::kListNext, cursor, &response) == ipc::Error::kOk,
+           "and so is ListNext, off the card, with no server anywhere");
   c.Expect(console.Call(ipc::Command::kSetEnabled, ipc::EncodeEnabled(true), &response) ==
                ipc::Error::kOk,
            "SetEnabled answers inside a successful reply, whatever it did");

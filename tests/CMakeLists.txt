@@ -258,6 +258,55 @@ endif()
 # client, and RomM's ten-inits-a-minute limit is per IP, which is the whole suite.
 set_tests_properties(ipc.engine PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 
+# --- the three lists the overlay browses -------------------------------------
+# M5-4. The producer behind `ipc::ListBegin`/`ListNext`/`ListEnd`, driven through
+# `ipc::Dispatch` over a real `SdEngine` -- so what these scenarios assert on is
+# a response on the wire rather than a return value, which is the only place the
+# payload cap and the field names are visible.
+#
+# `sysmodule/source/engine.cpp` is compiled in for `engine.*`'s reason: the
+# engine names no libnx type, and driving the list through the object that ships
+# is worth more than driving the service the object holds.
+#
+# `caps`, `cursors` and `queue` need no server and must stay checked with Docker
+# stopped. The last of those is not incidental: the `queue` kind exists so the
+# download screen works with RomM down, and a suite that could only check it
+# against a running RomM would never have checked it at all.
+add_executable(test_lists test_lists.cpp
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/engine.cpp")
+target_link_libraries(test_lists PRIVATE rommsync::host)
+target_include_directories(test_lists PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/sysmodule/source")
+target_compile_definitions(test_lists PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+
+set(LIST_UNIT_SCENARIOS
+  caps     # nothing on this wire grows with a rom's name, at any page size
+  cursors  # the cap, the TTL, and what a reclaimed cursor answers
+  queue    # served off the card, and never over the network
+)
+foreach(scenario IN LISTS LIST_UNIT_SCENARIOS)
+  add_test(NAME lists.${scenario} COMMAND test_lists ${scenario})
+  set_tests_properties(lists.${scenario} PROPERTIES TIMEOUT 120)
+endforeach()
+
+# The two that need this worktree's RomM: paging the seeded library, and the
+# three ways a page fails. RUN_SERIAL for the reason every fault test has it --
+# one armed proxy for every client in the suite.
+set(LIST_RIG_SCENARIOS
+  library  # every rom exactly once, in a stable order, with the count RomM reports
+  faults   # stall, drop and truncate: a failed page, and a cursor that survives it
+)
+foreach(scenario IN LISTS LIST_RIG_SCENARIOS)
+  add_test(NAME lists.${scenario} COMMAND test_lists ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(lists.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  set_tests_properties(lists.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+endforeach()
+
 # --- the overlay's status screen ---------------------------------------------
 # M4-1. Everything about the screen that is a decision rather than a draw call --
 # which sentence a never-paired console gets, what a download with no declared

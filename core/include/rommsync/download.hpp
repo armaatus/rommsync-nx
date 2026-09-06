@@ -522,6 +522,18 @@ struct LoadedQueue {
   /// write instead (`sysmodule::SdEngine::Commit`).
   bool trusted = true;
 
+  /// Something in the file was lost: it was there and its contents could not be
+  /// used, it could not be read at all, or a commit of it was interrupted.
+  ///
+  /// Not the same question as "are there diagnostics": a **first boot** produces
+  /// one, saying there is no file yet, and has lost nothing. Not the same
+  /// question as `trusted` either, which is false for only one of the ways to
+  /// lose a queue. This is the one that tells "this console has never queued
+  /// anything" from "this console's queue is gone" -- and the queue list puts
+  /// the second in front of a user as a row (M5-4, #31), which is a sentence
+  /// that must not appear on every new card.
+  bool discarded = false;
+
   /// In the order they were found, bounded by `kMaxDiagnostics`. A first boot
   /// produces exactly one, saying there is no file yet.
   std::vector<std::string> diagnostics;

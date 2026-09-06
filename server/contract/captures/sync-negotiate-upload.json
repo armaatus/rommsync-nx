@@ -1,12 +1,12 @@
 {
-  "session_id": 138,
+  "session_id": 2,
   "operations": [
     {
       "action": "upload",
       "rom_id": 4,
       "save_id": null,
       "file_name": "probe.srm",
-      "slot": "probe-4bb29c6c-a",
+      "slot": "probe-873af96c-a",
       "emulator": "probe-emulator",
       "reason": "Save exists on client but not on server",
       "server_updated_at": null,

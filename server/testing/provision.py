@@ -64,6 +64,9 @@ CLIENT_SCOPES = [
     "devices.read",
     "devices.write",
     "collections.read",
+    # GET /api/platforms 403s without it, and the overlay's library browser
+    # starts there (M4-3, #25 / M5-4, #31).
+    "platforms.read",
 ]
 
 SOCKETIO_PATH = "/ws/socket.io"
