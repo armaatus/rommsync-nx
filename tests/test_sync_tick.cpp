@@ -1264,10 +1264,15 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  // Whatever the scenario did, it does not get to leave a fault armed for
-  // whichever test runs next.
+  // Asserted **before** the cleanup disarm, not after it. Every scenario arms
+  // through `harness::Fault`, which disarms on the way out including out of an
+  // early return; this is the belt to that brace, and a `DisarmFault` in front
+  // of it would make it a check that can never fail. The unconditional disarm
+  // still happens afterwards, because a scenario that left one armed must not
+  // damage the next test's first request as well as failing its own.
+  harness::ExpectDisarmed(checks, *client, base,
+                          "tick." + scenario + " left the fault proxy disarmed");
   rig::DisarmFault(*client, base);
-  harness::ExpectDisarmed(checks, *client, base, "the scenario left the proxy disarmed");
   harness::CloseOpenSessions(*client, base, fixture);
 
   if (checks.failures() == 0) {
