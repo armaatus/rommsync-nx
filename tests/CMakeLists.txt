@@ -699,6 +699,7 @@ set(HARNESS_SCENARIOS
   resume          # a TCP reset mid-rom, then Range resume, byte for byte
   truncate        # a clean short body, caught only by the caller's expected size
   stall           # a server that says nothing: one tick lost, nothing else
+  stall_dropped   # ...and the stalled request never reaches RomM at all (#109)
   multifile       # the two-disc fixture, its traps, and the nested rom beside it
   backup          # back up FIRST, proven by interrupting the overwrite
   content_hash    # the MD5 this client computes is the one RomM compares against

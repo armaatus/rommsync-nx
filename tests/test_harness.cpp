@@ -837,6 +837,200 @@ void Stall(rig::Checks& checks, http::HttpClient& client, const std::string& bas
 }
 
 
+// --- stall_dropped ------------------------------------------------------------
+//
+// A stalled request must never reach RomM. Issue #109.
+//
+// Every `stall` caller in this suite sets a client timeout well under the sleep,
+// because what each of them asserts is that the CLIENT gives up first. The proxy
+// used to wake afterwards and forward the request anyway -- seconds late, with
+// nobody waiting for the answer and usually after the test that armed it had
+// exited. What arrived was not a slow server; it was a second client nothing
+// could see, writing a save row nobody asked for or opening a sync session that
+// cancelled whatever the NEXT test had just started.
+//
+// The damage is only ever visible on the SERVER, after the sleep has elapsed, so
+// that is where both halves are asserted. Every other `stall` scenario checks
+// its own client and would pass either way -- which is exactly why this one has
+// to exist and why it is written to fail against the old proxy rather than to
+// describe the new one.
+//
+// Both halves poll rather than sleep a fixed span: a failure is reported the
+// moment the row or the session appears, so the full deadline is only ever spent
+// on the passing path.
+
+void StallDropped(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                  const Fixture& fixture, const harness::Rom& rom) {
+  Sandbox sandbox(checks, "stall-dropped");
+
+  constexpr int kStallSeconds = 4;
+  constexpr auto kClientTimeout = std::chrono::milliseconds{1'200};
+  // Past the point an abandoned request would have been replayed, with room for
+  // a loaded machine: the old proxy forwarded at exactly `kStallSeconds`.
+  constexpr auto kDeadline = std::chrono::seconds{kStallSeconds + 4};
+
+  // --- the upload that never left ---------------------------------------------
+  const std::string slot = harness::UniqueSlot("m0-5-stall-dropped");
+  const std::string name = "stall-dropped.srm";
+  sandbox.Write(SavePath(name), "bytes the server must never be given\n");
+
+  const auto rows_for_slot = [&](std::vector<std::int64_t>* ids) {
+    ids->clear();
+    const http::Result listed = client.Send(harness::Authed(
+        http::Method::kGet, base + "/api/saves?rom_id=" + std::to_string(rom.id), fixture));
+    const json::ParseResult parsed = json::Parse(listed.response.body);
+    if (!listed.successful() || !parsed.ok() || !parsed.value.is_array()) {
+      return;
+    }
+    for (const json::Value& save : parsed.value.elements()) {
+      if (harness::Field(save, "slot") == slot) {
+        ids->push_back(harness::Number(save, "id"));
+      }
+    }
+  };
+
+  std::vector<std::int64_t> planted;
+  rows_for_slot(&planted);
+  checks.Expect(planted.empty(), "the slot starts empty, so a row in it can only be this upload");
+
+  // The fault is armed with `count:1` on a path prefix, and the proxy holds one
+  // armed scenario for every client -- so this scenario, like every other rig
+  // scenario, depends on running alone (RUN_SERIAL). The reads around the fault
+  // scope are deliberately outside it: `/api/saves` is a prefix of this fault's
+  // path, and a listing inside the scope would spend the stall on itself.
+
+  const auto upload_started = std::chrono::steady_clock::now();
+  {
+    harness::Fault fault(checks, client, base,
+                         R"({"mode":"stall","seconds":4,"path":"/api/saves","count":1})");
+
+    http::Request upload = harness::Authed(
+        http::Method::kPost,
+        base + "/api/saves?rom_id=" + std::to_string(rom.id) + "&emulator=harness&slot=" + slot +
+            "&device_id=" + fixture.device_id,
+        fixture);
+    http::FormPart part;
+    part.name = "saveFile";
+    part.file_path = sandbox.Host(SavePath(name));
+    part.file_name = name;
+    part.content_type = "application/octet-stream";
+    upload.form.push_back(part);
+    upload.timeout = kClientTimeout;
+
+    const http::Result stalled = client.Send(upload);
+    checks.ExpectError(stalled, http::Error::kTimeout,
+                       "the client gives up on the stalled upload, as every stall caller does");
+  }
+
+  bool row_appeared = false;
+  std::chrono::seconds row_after{0};
+  while (std::chrono::steady_clock::now() - upload_started < kDeadline) {
+    rows_for_slot(&planted);
+    if (!planted.empty()) {
+      row_appeared = true;
+      row_after = std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::steady_clock::now() - upload_started);
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{250});
+  }
+  checks.Expect(!row_appeared,
+                "the abandoned upload never reaches RomM -- a row appeared in " +
+                    std::to_string(row_after.count()) +
+                    "s, which is the proxy replaying a request the client had already given up "
+                    "on (issue #109). tick.upload_stall counts on this.");
+  for (const std::int64_t id : planted) {
+    harness::DeleteSave(client, base, fixture, id);
+  }
+
+  // --- the negotiate that opened nothing --------------------------------------
+  //
+  // RomM cancels a device's active session on every negotiate
+  // (/backend/endpoints/sync.py in 5.2.0), and every scenario in this suite
+  // shares the fixture's one device -- so a replayed negotiate does not merely
+  // leak a session, it cancels the session whichever test is running by then
+  // just opened. That is the shape #76 reports; whether it is #76's cause is
+  // not established, and this scenario does not claim it. What it pins is the
+  // narrower fact: an abandoned negotiate must not reach RomM at all.
+  const auto highest_session = [&]() {
+    std::int64_t highest = 0;
+    const http::Result listed = client.Send(
+        harness::Authed(http::Method::kGet, base + "/api/sync/sessions", fixture));
+    const json::ParseResult parsed = json::Parse(listed.response.body);
+    if (!listed.successful() || !parsed.ok()) {
+      return highest;
+    }
+    // RomM has served this both as a bare array and wrapped in `items`.
+    const json::Value* sessions = &parsed.value;
+    if (parsed.value.is_object()) {
+      sessions = parsed.value.Find("items");
+    }
+    if (sessions == nullptr || !sessions->is_array()) {
+      return highest;
+    }
+    for (const json::Value& session : sessions->elements()) {
+      // This device's sessions only. A session opened for some other device --
+      // `pair.*` and `device.*` each register their own -- is not what this
+      // scenario is about, and this test is the whole proof that the fix works:
+      // a false positive in it costs more than the bug does.
+      if (harness::Field(session, "device_id") != fixture.device_id) {
+        continue;
+      }
+      const std::int64_t id = harness::Number(session, "id");
+      if (id > highest) {
+        highest = id;
+      }
+    }
+    return highest;
+  };
+
+  sync::SyncNegotiatePayload payload;
+  payload.device_id = fixture.device_id;
+  const sync::Encoded encoded = sync::EncodeNegotiateRequest(payload);
+  checks.Expect(encoded.ok(), "the payload encodes");
+
+  const std::int64_t before = highest_session();
+  const auto negotiate_started = std::chrono::steady_clock::now();
+  {
+    harness::Fault fault(checks, client, base,
+                         R"({"mode":"stall","seconds":4,"path":"/api/sync/negotiate","count":1})");
+
+    http::Request request =
+        harness::Authed(http::Method::kPost, base + "/api/sync/negotiate", fixture);
+    request.headers.push_back({"Content-Type", "application/json"});
+    request.body = encoded.body;
+    request.timeout = kClientTimeout;
+
+    const http::Result stalled = client.Send(request);
+    checks.ExpectError(stalled, http::Error::kTimeout, "the client gives up on the stalled tick");
+  }
+
+  std::int64_t opened = 0;
+  std::chrono::seconds session_after{0};
+  while (std::chrono::steady_clock::now() - negotiate_started < kDeadline) {
+    const std::int64_t highest = highest_session();
+    if (highest > before) {
+      opened = highest;
+      session_after = std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::steady_clock::now() - negotiate_started);
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{250});
+  }
+  checks.ExpectEq(opened, std::int64_t{0},
+                  "the abandoned negotiate opens no session -- session " +
+                      std::to_string(opened) + " appeared in " +
+                      std::to_string(session_after.count()) +
+                      "s. A negotiate the client abandoned must not reach RomM: RomM cancels "
+                      "this device's active session on every one, and every scenario here shares "
+                      "this device.");
+
+  // Whether or not the assertion above held, this scenario does not get to leave
+  // a session open for the next one to trip over.
+  harness::CloseOpenSessions(client, base, fixture);
+}
+
+
 // --- multifile ----------------------------------------------------------------
 //
 // The two-disc fixture, and the line M3-4 draws around it. This is what the
@@ -1302,6 +1496,8 @@ int main(int argc, char** argv) {
       SameTimestamp(checks, *client, base, fixture, small);
     } else if (scenario == "partial") {
       Partial(checks, *client, base, fixture, small);
+    } else if (scenario == "stall_dropped") {
+      StallDropped(checks, *client, base, fixture, small);
     } else if (scenario == "truncate") {
       Truncate(checks, *client, base, fixture, small);
     } else if (scenario == "backup") {
