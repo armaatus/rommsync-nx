@@ -68,6 +68,7 @@
 #include "rommsync/ipc.hpp"
 #include "rommsync/list_service.hpp"
 #include "rommsync/pairing.hpp"
+#include "rommsync/play_sessions.hpp"
 #include "rommsync/scheduler.hpp"
 #include "rommsync/sync_tick.hpp"
 #include "rommsync/token_store.hpp"
@@ -690,6 +691,16 @@ class SdEngine : public ipc::Engine {
   /// What has been overwritten on this card, newest first (M7-1, #36). Reloaded
   /// by `Load`, which is also what points it at the right directory.
   conflicts::History history_{std::string(conflicts::kHistorySdPath)};
+
+  /// Play time this console has recorded and not yet handed to RomM (M7-4,
+  /// #39), and the moment the last tick looked at the saves. Reloaded by `Load`
+  /// beside `history_`, and pointed at the right directory by it.
+  ///
+  /// Touched only from the worker thread, inside `RunTickLocked`'s
+  /// `save_write_mutex_` -- so it needs no lock of its own, and gets none
+  /// rather than one that would suggest a second writer exists. Nothing on the
+  /// IPC surface reads it: play time is not on any screen.
+  play::Buffer play_{std::string(play::kBufferSdPath)};
 
   /// The card, for a restore. The same pointer `UseCard` hands `lists_`, kept
   /// here too because a restore opens two files through it.

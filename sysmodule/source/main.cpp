@@ -42,6 +42,7 @@
 #include "rommsync/device_identity.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/list_service.hpp"
+#include "rommsync/play_sessions.hpp"
 #include "rommsync/state_db.hpp"
 
 namespace {
@@ -57,8 +58,9 @@ namespace {
 //   | one in-flight transfer buffer            | 0x4000  |  16 KiB |
 //   | the largest buffered list response        | 0x32000 | 200 KiB |
 //   | two worker thread stacks (M1-6, M7-2)    | 0x10000 |  64 KiB |
+//   | the play-session buffer (M7-4)           | 0x4000  |  16 KiB |
 //   | newlib arena overhead and fragmentation  | 0x8000  |  32 KiB |
-//   | **peak**                                 | 0xA7000 | 668 KiB |
+//   | **peak**                                 | 0xAB000 | 684 KiB |
 //
 // The old 0x80000 does not cover that, and the two terms it is short by are the
 // two that are easiest to miss:
@@ -94,7 +96,12 @@ namespace {
 //   * the transfer buffer is `kTransferBufferSize` in `http/http_wire.hpp` --
 //     one per in-flight request, because roms stream to file and never sit in
 //     RAM whole;
-//   * the list response is `lists::kMaxPlatforms` times the row estimate below.
+//   * the list response is `lists::kMaxPlatforms` times the row estimate below;
+//   * the play-session buffer is twice `play::kMaxBufferBytes` -- the file's
+//     text and then the rows it becomes -- and it is the one term here that is
+//     *not* held for the life of the process: it is read at `Load` and rewritten
+//     once a tick (`play_sessions.hpp`). It is counted anyway, because a peak is
+//     a peak.
 constexpr size_t kInnerHeapSize = 0xC0000;
 
 // What one platform's JSON weighs on the wire. Measured against the fixture
@@ -119,6 +126,7 @@ static_assert(rommsync::sysmodule::ExpectedBsdTransferMemory({}) +
                       2 * rommsync::state::kMaxStateBytes +
                       rommsync::sysmodule::kTransferBufferSize +
                       rommsync::lists::kMaxPlatforms * kPlatformJsonBytes +
+                      2 * rommsync::play::kMaxBufferBytes +
                       2 * 0x8000 /* worker thread stacks */ +
                       0x8000 /* newlib arena overhead */ <
                   kInnerHeapSize,

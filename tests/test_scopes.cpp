@@ -7,10 +7,17 @@
 // would go green while the document said something else, and the document is
 // what a reviewer reads.
 //
-// `me.write` is the case worth having a test for. It is in the document, marked
-// "only if recording play sessions", and this client does not record them --
-// so it must be granted to nobody. A scope that is requested and never used is
-// blast radius bought for nothing.
+// `me.write` is the case worth having a test for. It is in the document,
+// qualified with a `#` comment, and this client calls nothing it guards -- so it
+// must be granted to nobody. A scope that is requested and never used is blast
+// radius bought for nothing.
+//
+// It used to be qualified "only if recording play sessions", which was wrong on
+// both counts: `me.write` guards `PUT /api/users/{id}`, the client-token family
+// and device approve/deny, and M7-4 (#39) records play sessions through
+// `roms.user.write` and `devices.write`, both of which are unconditional above.
+// The test does not read the comment's text -- only that a qualified scope
+// exists and is not requested -- so a corrected reason keeps it green.
 //
 // Pure file reading and string comparison: no rig, so it never skips.
 #include <algorithm>

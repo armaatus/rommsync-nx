@@ -219,6 +219,7 @@ core/src/conflict_log.cpp|0|0|1||not a save: the conflict log M7-1 writes
 core/src/conflict_record.cpp|0|1|0|io::CopyAtomically|SAVE (M7-1 restore): putting a backup back IS an overwrite, so sync::BackUpFirst runs first
 core/src/device_identity.cpp|0|0|2||not a save: device.dat
 core/src/download.cpp|1|0|1||not a save: rom bytes, and the queue record
+core/src/play_sessions.cpp|0|0|1||not a save: the play-session buffer M7-4 writes
 core/src/state_db.cpp|0|0|1||not a save: the sync baseline
 core/src/state_sync.cpp|1|0|0|io::CommitStaged|SAVE STATE: sync::BackUpFirst runs first
 core/src/sync_execute.cpp|1|1|0|io::CommitStaged|SAVE: sync::BackUpFirst runs first, and IS the CopyAtomically here

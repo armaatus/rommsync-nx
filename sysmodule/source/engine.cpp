@@ -19,6 +19,7 @@
 #include "rommsync/ipc.hpp"
 #include "rommsync/list_service.hpp"
 #include "rommsync/pairing.hpp"
+#include "rommsync/play_sessions.hpp"
 #include "rommsync/rom_index.hpp"
 #include "rommsync/save_scan.hpp"
 #include "rommsync/scheduler.hpp"
@@ -212,6 +213,15 @@ void SdEngine::Load(const std::string& config_dir) {
   // for the scheduler (M7-2, #37) to log when there is somewhere to log to.
   history_ = conflicts::History(PathTo(conflicts::kHistoryFileName));
   static_cast<void>(history_.Load());
+
+  // The same treatment for the play-session buffer (M7-4, #39), and for the
+  // same reason: a console that has never recorded any play time has no file,
+  // which is a first boot rather than a failure. The `last_seen` it carries is
+  // what bounds the next tick's sessions -- with no file there is no window and
+  // the first tick after this one derives nothing, which is `DeriveSessions`'s
+  // documented first-boot answer.
+  play_ = play::Buffer(PathTo(play::kBufferFileName));
+  static_cast<void>(play_.Load());
 
   AdoptConfigLocked(config::LoadConfig(PathTo(config::kConfigFileName)));
 }
@@ -798,6 +808,61 @@ void SdEngine::RunOneTick() {
     targets.push_back(std::move(target));
   }
 
+  // M7-4 (#39): the play time this tick can infer, derived *before* the buffer's
+  // window is stamped forward and handed to the completion the tick is going to
+  // make anyway. `state.db` as the last tick left it is the previous
+  // observation, the scan is the current one, and the two ticks bound each
+  // session -- see `play::DeriveSessions` for why that is an upper bound rather
+  // than a measurement, and why this console cannot do better.
+  //
+  // Every failure here is swallowed on purpose. A play-session error must never
+  // reach `TickOutcome`: the feature writes no save, and a sync tick lost to it
+  // would be an optional extra taking hard rule 2's machinery down with it.
+  const sync::Timestamp play_now = std::chrono::system_clock::now();
+  std::vector<play::BufferedSession> play_sent;
+  if (config->sync.enabled) {
+    std::vector<play::SaveObservation> played_before;
+    played_before.reserve(loaded.value.rows().size());
+    for (const std::pair<const state::Baseline::Key, state::SaveRecord>& stored :
+         loaded.value.rows()) {
+      play::SaveObservation observation;
+      observation.rom_id = stored.second.rom_id;
+      // A null slot is an archival save, which `scan::SaveFile` spells as the
+      // empty string -- the two have to agree or every archival save reads as a
+      // rom that was never seen before and is reported played on every tick.
+      observation.slot = stored.second.slot.value_or(std::string());
+      observation.mtime = stored.second.mtime;
+      played_before.push_back(std::move(observation));
+    }
+    std::vector<play::SaveObservation> played_now;
+    played_now.reserve(scanned.saves.size());
+    for (const scan::SaveFile& save : scanned.saves) {
+      play::SaveObservation observation;
+      observation.rom_id = save.rom_id;
+      observation.slot = save.slot;
+      observation.mtime = std::chrono::system_clock::from_time_t(
+          static_cast<std::time_t>(save.modified_unix));
+      played_now.push_back(std::move(observation));
+    }
+    const play::Derivation played =
+        play::DeriveSessions(played_before, played_now, play_.last_seen(), play_now);
+    static_cast<void>(play_.Record(played.sessions, play_now));
+    // What the completion will carry, captured rather than re-read afterwards:
+    // `play::Reconcile` matches the answer to this list by index, so the two
+    // must be the same list.
+    play_sent = play_.Pending(play::kMaxSessions);
+  } else {
+    // `[sync] enabled = false`: nothing is recorded and nothing is sent, because
+    // a user who switched save sync off did not ask this console to keep
+    // telling a server what they played.
+    //
+    // **The window still moves.** A `last_seen` frozen for the month the switch
+    // was off would make the first tick after it goes back on report every save
+    // that changed in that month as one month-long session -- play time that
+    // never happened, in a total nobody can correct.
+    static_cast<void>(play_.Record({}, play_now));
+  }
+
   sync::TickOptions options;
   // The switch, passed **into** the tick rather than re-decided here: the gate
   // one level down is what makes "a disabled sysmodule makes no network call"
@@ -814,6 +879,9 @@ void SdEngine::RunOneTick() {
   // just changed (`sync::RecoverStaging`).
   options.recover_dirs = config->SaveScanDirs();
   options.recover_dirs.push_back(std::string(sync::kBackupDir));
+  for (const play::BufferedSession& buffered : play_sent) {
+    options.finish.play_sessions.push_back(buffered.session);
+  }
   const roms::RomIndex* index = &library.index;
   // One placement rule, applied to the two folder lists. Saves and states are
   // placed the same way -- find the rom, find the platform the user mapped, put
@@ -844,6 +912,18 @@ void SdEngine::RunOneTick() {
   const sync::TickResult tick =
       sync::RunTick(*client, *files, token, reported, targets, loaded.value, options);
   ObserveAnswer(tick.answer);
+
+  // The other half of M7-4: drop the sessions RomM accounted for, and keep the
+  // ones it did not. A tick that never reached the server releases nothing, and
+  // the next one re-sends the same sessions -- which RomM answers `duplicate` if
+  // this one secretly landed (`sync::Ingested`). Nothing here can fail the tick
+  // either.
+  if (tick.finished.play_sessions_sent > 0 &&
+      tick.finished.reported.value.play_session_ingest.has_value()) {
+    const play::Reconciliation reconciled =
+        play::Reconcile(play_sent, *tick.finished.reported.value.play_session_ingest);
+    static_cast<void>(play_.Release(reconciled.release));
+  }
 
   // M7-1 (#36)'s call site, which nothing in this build had. It is outside
   // `sync::RunTick` because `conflict_record.hpp` includes `state_sync.hpp`, so

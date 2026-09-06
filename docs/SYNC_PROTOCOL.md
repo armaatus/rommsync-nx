@@ -330,7 +330,10 @@ keeps every backup, when it goes back on.
 ```jsonc
 { "operations_completed": 7, "operations_failed": 0, "play_sessions": [] }
 ```
-→ `{ "session": SyncSessionSchema, "play_session_ingest": null }`. The session's
+→ `{ "session": SyncSessionSchema, "play_session_ingest": null }`. `[]` is what a
+tick that recorded no play time sends, and it is sent explicitly rather than
+omitted; when there *is* play time it goes in that array and the ingest comes
+back non-null — see [Play time](#play-time) below. The session's
 `operations_planned` counts operations that need *work*, so a plan of nothing but
 `no_op` reports `0` planned against however many you completed; that is not an
 error.
@@ -387,6 +390,53 @@ kept — a listing may hold up to `fs::kMaxDirectoryEntries` names on a heap of
 512 KiB, so a memo per directory is unbounded in the one dimension that is
 scarce, on the tick that already downloaded the most. Keeping the last one still
 collapses the case that matters, which is several saves in one folder.
+
+## Play time
+
+Optional, and last in every sense (M7-4, #39): it writes no save, touches no
+baseline, and **a play-session failure never fails a tick**. If it is in the way,
+it is the thing to cut.
+
+**The console cannot see which rom is running.** Horizon will name the
+foreground *application*, but on a modded Switch that application is RetroArch or
+Tico — never the rom — and no API says which file an emulator loaded. So the
+sessions are derived from the saves instead: a save whose mtime moved between two
+ticks means that rom was played, and the two ticks bound the window.
+
+That makes `duration_ms` an **upper bound rather than a measurement**, and the
+client says so rather than pretending otherwise:
+
+- the window's *end* is the save's own mtime — a real observation, the moment the
+  emulator wrote — not the tick that noticed it;
+- its *start* is the later of the previous tick and the save's previous mtime,
+  the tightest lower bound the client actually has;
+- a save whose mtime did not move produces nothing at all;
+- the first tick after a boot with no buffer produces nothing, and must: with no
+  previous observation every save on the card would come back as one enormous
+  session.
+
+Wall clock only. A console whose clock was never set, or that has been corrected
+backwards, records nothing for that tick rather than sending a timestamp RomM
+would file under 1970 forever — the bound is `play::kEarliestPlausibleSeconds`,
+deliberately tighter than the one a save's `updated_at` is held to.
+
+Unsent sessions wait in `sdmc:/config/rommsync/play.db`, which is `conflicts.db`'s
+format: a header line carrying the next id and the moment the last tick looked,
+then one JSON object per session, oldest first, written with
+`io::WriteAtomically`. It is bounded and the **oldest fall off the front**, so an
+offline console fills it and stops rather than growing a file forever; a reboot
+does not lose it.
+
+They ride out on the completion the tick is making anyway, so a console on
+battery spends no extra request. `POST /api/play-sessions` is the other route,
+for flushing without a sync (`play::Flush`).
+
+A session is dropped from the buffer only against an answer that names it, and
+`duplicate` counts as an answer — which is what makes a retried flush safe. An
+entry RomM answers `error` is dropped too, with a line saying so: the body was
+already validated on the way out, so a refusal is deterministic, and a session
+kept at the head of the buffer would be re-sent and refused forever while holding
+a slot RomM would have taken.
 
 ## Change detection between ticks
 
