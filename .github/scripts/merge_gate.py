@@ -112,8 +112,16 @@ def evaluate(head_sha, pull_request, changed_files):
             "re-request review. A review by this PR's own author does not count."
         )
     else:
+        # From `substantive`, NOT from `on_head`. The same reviewer filing a real
+        # CHANGES_REQUESTED and then, later on the same head, an empty COMMENTED
+        # record -- which is exactly what a review job that runs and submits
+        # nothing produces -- would otherwise make the empty one the review of
+        # record, and `blocking` would come back empty with the findings never
+        # addressed. That is PR #95's bug with the ordering reversed: an empty
+        # record standing in for a review, arriving after instead of before.
+        # Found in review of this PR.
         latest = {}
-        for r in sorted(on_head, key=lambda r: r.get("submittedAt") or ""):
+        for r in sorted(substantive, key=lambda r: r.get("submittedAt") or ""):
             if r.get("state") in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"):
                 latest[(r.get("author") or {}).get("login") or "?"] = r
         blocking = sorted(w for w, r in latest.items()
@@ -347,6 +355,27 @@ SELFTEST = [
         },
         ["core/src/sync.cpp"],
         True,
+    ),
+    (
+        "an empty review does not supersede a real CHANGES_REQUESTED",
+        "abc123",
+        {
+            "body": "## Review findings\n/code-review high\nmattpocock-skills:code-review\n",
+            "reviews": {"nodes": [
+                {"state": "CHANGES_REQUESTED", "submittedAt": "2026-09-06T10:00:00Z",
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"},
+                 "body": "A real review, long enough to clear MIN_REVIEW_BODY, "
+                         "asking for changes that were never made."},
+                # The review job re-ran and submitted nothing. Later, so it wins
+                # on submittedAt -- and it must not.
+                {"state": "COMMENTED", "submittedAt": "2026-09-06T10:30:00Z",
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"},
+                 "body": ""},
+            ]},
+            "reviewThreads": {"nodes": []},
+        },
+        ["core/src/sync.cpp"],
+        False,
     ),
 ]
 
