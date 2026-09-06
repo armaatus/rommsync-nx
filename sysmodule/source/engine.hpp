@@ -119,6 +119,16 @@ struct PairingBackend {
 /// overlay polls every frame never wait on an SD card. Order is `card_mutex_`
 /// then `mutex_`, never the reverse.
 ///
+/// **`history_` and a restore are under neither, and that is deliberate.** M7-1
+/// (#36) added two commands that touch the card from the IPC thread, and they
+/// share no file with the pairing thread: that one writes `token.dat` and
+/// `auth.json` under `card_mutex_`, a restore writes a save and a copy under
+/// `.backup/`. Taking `card_mutex_` for a restore would make a pairing grant
+/// wait behind a save-state copy of tens of megabytes, which is the thing the
+/// two-lock split exists to prevent. What would change that is a second writer
+/// of `.backup/` -- the scheduler running a tick (M7-2, #37) -- and that is the
+/// moment `history_` needs a lock of its own, not this one.
+///
 /// `config_` and `queue_` are deliberately *not* under it, and that is still a
 /// fact about today rather than a decision to keep: `ServiceServer::Run` is a
 /// single `svcReplyAndReceive` loop, so every command runs on one thread, and
