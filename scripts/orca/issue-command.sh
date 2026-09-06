@@ -122,17 +122,19 @@ every check green.
 
 So after every review, whatever its verdict:
 
-    ./scripts/orca/open-threads.sh
+    ./scripts/orca/review-status.sh
 
-It prints only the threads that are still UNRESOLVED, each with the thread ID
-`resolveReviewThread` wants. Do NOT reach for
+It prints every thread that is still UNRESOLVED -- where it is, what it says,
+and the thread ID `resolveReviewThread` wants -- along with anything else
+keeping the PR from merging. Do NOT reach for
 `gh api repos/{owner}/{repo}/pulls/<n>/comments` instead: that endpoint cannot
 say whether a thread is resolved, so on round two it hands you every comment
 ever left with the live ones buried among them.
 
 Fix what is real; where you disagree, reply on the thread with your reasoning --
 both are acceptable, silence is not. Then RESOLVE each thread (the
-`resolveReviewThread` GraphQL mutation), push if you changed anything, and:
+`resolveReviewThread` GraphQL mutation), push if you changed anything, and run
+it again:
 
     ./scripts/orca/review-status.sh
 

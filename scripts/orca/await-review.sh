@@ -115,7 +115,7 @@ while [ "$waited" -lt "$DEADLINE_SECONDS" ]; do
   # same failure twice.
   checks_due=$((checks_due + 1))
   if [ "$((checks_due % 4))" = "1" ]; then
-    broken="$(GH_PAGER=cat gh pr view "$pr" --json statusCheckRollup 2>/dev/null \
+    rollup="$(GH_PAGER=cat gh pr view "$pr" --json statusCheckRollup 2>/dev/null \
               | python3 -c "
 import json, sys
 try:
@@ -132,8 +132,10 @@ print(', '.join(n for n in bad if n))
 print('REVIEW_FAILED' if review_dead else '')
 " 2>/dev/null)"
     # Two lines out of one capture: the failing check names, then the marker
-    # saying the review check itself is among the dead.
-    { IFS= read -r broken; IFS= read -r review_dead; } <<<"$broken" || true
+    # saying the review check itself is among the dead. Read from `rollup` rather
+    # than from `broken` -- reusing one name as both the here-string source and
+    # the first read target works, but reads like a bug.
+    { IFS= read -r broken; IFS= read -r review_dead; } <<<"$rollup" || true
     if [ -n "$broken" ] && [ "$broken" = "$broken_before" ]; then
       cat <<RED
 
