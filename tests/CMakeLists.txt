@@ -984,6 +984,22 @@ set_tests_properties(release.ci PROPERTIES TIMEOUT 60)
 add_test(NAME release.notes COMMAND "${BASH_PROGRAM}" "${RELEASE_TEST}" notes)
 set_tests_properties(release.notes PROPERTIES TIMEOUT 60)
 
+# Which versions are prereleases. The release job asks release-notes.sh for the
+# flag rather than repeating the rule, which is what lets this run it against
+# eight made-up versions here instead of finding out on the day a v0.2.0-rc1
+# published as a stable release.
+add_test(NAME release.prerelease
+         COMMAND "${BASH_PROGRAM}" "${RELEASE_TEST}" prerelease)
+set_tests_properties(release.prerelease PROPERTIES TIMEOUT 60)
+
+# Which tag the change list is counted from, against a throwaway repo with real
+# tags in it. `release.notes` above can only ever exercise the first-release
+# fallback, because this repo has no tags -- and the case that actually ships,
+# a stable cut after one or more release candidates, is the one that was wrong.
+add_test(NAME release.history
+         COMMAND "${BASH_PROGRAM}" "${RELEASE_TEST}" history)
+set_tests_properties(release.history PROPERTIES TIMEOUT 120)
+
 # --- the TLS terminator the M0-1 probe aims at -------------------------------
 # The rig is plain HTTP because the host suite reaches it over loopback; the
 # probe needs a real handshake to complete, so server/testing/docker-compose.yml

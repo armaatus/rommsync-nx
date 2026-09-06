@@ -196,16 +196,6 @@ jobs:
                  2>/dev/null)" = "NRO0" ] || {
             echo "::error::rommsync-tlsprobe.nro is not an NRO"; exit 1; }
 
-      # Packaged on every push, not only on a tag. `ctest -R package.builds` is the
-      # only other thing that runs scripts/package.sh inside this container, and
-      # it skips on every runner `host-tests` uses -- so without this step a
-      # failure specific to packaging here (a missing `zip`, a tool the image
-      # dropped) would first appear on a tag, which is the one moment it must
-      # not. The zip is not uploaded: the artifact below stays the loose debug
-      # drop, and the archive is a RELEASE asset (#32, #34).
-      - name: Package
-        run: scripts/package.sh
-
       - name: Collect artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -216,6 +206,20 @@ jobs:
             tlsprobe/rommsync-tlsprobe.nro
           if-no-files-found: error
 
+      # Packaged on every push, not only on a tag. `ctest -R package.builds` is the
+      # only other thing that runs scripts/package.sh inside this container, and
+      # it skips on every runner `host-tests` uses -- so without this step a
+      # failure specific to packaging here (a missing `zip`, a tool the image
+      # dropped) would first appear on a tag, which is the one moment it must
+      # not. The zip is not uploaded: the artifact above stays the loose debug
+      # drop, and the archive is a RELEASE asset (#32, #34).
+      #
+      # AFTER the upload, not before: a failure here is exactly when the three
+      # loose files are worth having, and a step that fails before them takes
+      # them with it.
+      - name: Package
+        run: scripts/package.sh
+
   # A tag becomes something a user can download. Nothing else publishes: the
   # `if` below is what keeps this job off every other push, since the tag
   # trigger runs the whole workflow.
@@ -223,11 +227,17 @@ jobs:
   # `needs` is the point of the job as much as the upload is. host-tests is
   # where `ctest -R version.tag` runs -- GitHub sets GITHUB_REF for every step
   # on a tag push, so that entry sees the tag and fails when it disagrees with
-  # VERSION -- and switch-build is where the three targets and the packaging are
-  # proven. A release that skipped either would be bytes nobody tested.
+  # VERSION -- switch-build is where the three targets and the packaging are
+  # proven, and static is where this very workflow is checked for validity. A
+  # release that skipped any of them would be bytes nobody tested.
+  #
+  # Those three say the tagged commit is GOOD. They do not say it was reviewed:
+  # a tag can be pushed at any commit on any branch, and this job would publish
+  # it. The `git merge-base` step below is what closes that, since every commit
+  # on main went through a pull request and the merge gate.
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [host-tests, switch-build]
+    needs: [static, host-tests, switch-build]
     runs-on: ubuntu-latest
     container: devkitpro/devkita64:latest
     # The default token is read-only. Creating a release and attaching assets to
@@ -253,6 +263,47 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           ./tests/test_release.sh version
 
+      # ...and the commit it names is on main. Nothing else here would notice
+      # `git push origin v9.9.9` pointing at a branch head: the build would be
+      # green, because the build is green on that branch, and a public release
+      # would be cut from code that never went through a pull request or the
+      # merge gate. fetch-depth: 0 above is what makes origin/main present.
+      - name: The tag is on main
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor HEAD origin/main || {
+            echo "::error::${GITHUB_REF_NAME} is not an ancestor of main."
+            echo "Releases are cut from main, which is the only branch every"
+            echo "commit reached through a reviewed pull request."
+            exit 1
+          }
+
+      # Read once, here, and used by every step below: the archive's name, the
+      # release's prerelease flag and the checksum line all derive from this one
+      # string, and a second reader is a second thing that can disagree with it.
+      # The prerelease rule lives in release-notes.sh so `ctest -R
+      # release.prerelease` can exercise it without a tag or a token.
+      - name: Read VERSION
+        run: |
+          set -euo pipefail
+          # Assigned before they are written, and checked. `echo "X=$(cmd)" >>`
+          # takes echo's exit status, not the command's, so `set -e` cannot see
+          # a failing script -- PRERELEASE would land empty and the Publish step
+          # reads an empty string as "not a prerelease", publishing a v0.2.0-rc1
+          # as stable. That is the exact failure release.prerelease exists for,
+          # arriving by the one route that test cannot see.
+          version="$(sed -n '1{s/^[[:space:]]*//;s/[[:space:]]*$//;p;}' VERSION)"
+          [ -n "$version" ] || { echo "::error::VERSION is empty"; exit 1; }
+          prerelease="$(./scripts/release-notes.sh --prerelease)"
+          case "$prerelease" in
+            true|false) ;;
+            *) echo "::error::--prerelease answered '$prerelease'"; exit 1 ;;
+          esac
+          {
+            echo "VERSION=$version"
+            echo "PRERELEASE=$prerelease"
+          } >> "$GITHUB_ENV"
+
       # The same three builds switch-build runs, in the same image. tlsprobe is
       # built but never packaged -- it is a spike, never installed
       # (tlsprobe/README.md) -- and it is built here so a release cannot be cut
@@ -271,17 +322,18 @@ jobs:
       - name: Package
         run: scripts/package.sh
 
-      # Beside the build, in the same job, and verified here. The archive is
+      # Computed beside the build, in the same job. The archive is
       # byte-deterministic for one `zip` build, which is what makes this a
       # statement about these bytes -- a checksum computed anywhere else is a
-      # checksum of something else.
+      # checksum of something else. Verifying it is a later step's job, and it
+      # deliberately happens after the upload rather than here: `sha256sum -c`
+      # run on the file the digest was taken from seconds earlier proves only
+      # that the disk did not change under us.
       - name: Checksums
         run: |
           set -euo pipefail
-          version="$(sed -n '1{s/^[[:space:]]*//;s/[[:space:]]*$//;p;}' VERSION)"
           cd dist
-          sha256sum "rommsync-nx-$version.zip" > SHA256SUMS
-          sha256sum -c SHA256SUMS
+          sha256sum "rommsync-nx-$VERSION.zip" > SHA256SUMS
           cat SHA256SUMS
 
       - name: Release notes
@@ -299,27 +351,27 @@ jobs:
       # makes that a red job. Deliberate: the alternative is attaching these
       # bytes to a release built from other ones. Re-cutting a tag means
       # deleting its release first.
+      #
+      # The release is created as a DRAFT and stays one until the assets are up
+      # and verified. A non-draft release exists the moment it is POSTed, and a
+      # 502 or a truncated upload one second later leaves a live, public page
+      # advertising a download that is missing or corrupt -- which, given the
+      # 422 above, then needs a human to delete before the tag can be re-cut. A
+      # draft is visible only to people who can write to the repo.
       - name: Publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          version="$(sed -n '1{s/^[[:space:]]*//;s/[[:space:]]*$//;p;}' VERSION)"
 
-          # Semver calls a suffix a prerelease, and the tag/VERSION check above
-          # has already tied the tag to that string -- so v0.2.0-rc1 is marked
-          # prerelease and v0.2.0 is not, without either being typed twice.
-          prerelease=false
-          case "$version" in *-*) prerelease=true ;; esac
-
-          python3 - "$TAG" "$prerelease" notes.md > body.json <<'PY'
+          python3 - "$TAG" "$PRERELEASE" notes.md > body.json <<'PY'
           import json, sys
           tag, prerelease, notes = sys.argv[1], sys.argv[2] == "true", sys.argv[3]
           with open(notes, encoding="utf-8") as f:
               body = f.read()
           print(json.dumps({"tag_name": tag, "name": tag, "body": body,
-                            "draft": False, "prerelease": prerelease}))
+                            "draft": True, "prerelease": prerelease}))
           PY
 
           curl -fsS -X POST \
@@ -333,13 +385,57 @@ jobs:
           # an RFC 6570 template -- `...{?name,label}` -- so the parameters are
           # appended to the part before the brace rather than to the template.
           upload="$(python3 -c 'import json; print(json.load(open("release.json"))["upload_url"].split("{")[0])')"
+          python3 -c 'import json; print(json.load(open("release.json"))["id"])' > release-id
 
-          for asset in "dist/rommsync-nx-$version.zip" dist/SHA256SUMS; do
+          for asset in "dist/rommsync-nx-$VERSION.zip" dist/SHA256SUMS; do
             curl -fsS -X POST \
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               -H "Content-Type: application/octet-stream" \
               --data-binary @"$asset" \
-              "$upload?name=$(basename "$asset")" > /dev/null
+              "$upload?name=$(basename "$asset")" \
+              > "upload-$(basename "$asset").json"
             echo "uploaded $(basename "$asset")"
           done
+
+      # The check the published checksum is actually making. Recomputing a digest
+      # over the file that was just written proves only that the disk did not
+      # change under us -- so this pulls both assets back OUT of the release,
+      # through the API, and runs `sha256sum -c` on what a user would download.
+      # A truncated upload is the failure it catches, and it is the only failure
+      # here that produces a release page that looks completely fine.
+      - name: The published checksums match the published asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p published
+          for asset in "rommsync-nx-$VERSION.zip" SHA256SUMS; do
+            id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' \
+                  "upload-$asset.json")"
+            curl -fsSL \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/octet-stream" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/assets/$id" \
+              -o "published/$asset"
+          done
+          cd published
+          cat SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      # Only now does anyone outside the repo see it. Everything above can fail
+      # with nothing published but a draft, which is the state a human deletes
+      # without a user ever having seen a broken download.
+      - name: Undraft the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          curl -fsS -X PATCH \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            --data '{"draft": false}' \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/$(cat release-id)" \
+            > /dev/null
+          echo "published $GITHUB_REF_NAME"

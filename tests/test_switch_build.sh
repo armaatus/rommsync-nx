@@ -3,12 +3,13 @@
 # the shared switch.mk they include, plus the CI job that is supposed to fail
 # when one of them stops producing something loadable.
 #
-#   test_switch_build.sh ci        the switch-build job builds both targets
-#                                  unconditionally and refuses to publish an
-#                                  empty artifact set. This is the regression:
-#                                  the job shipped with `if [ -f Makefile ]`
-#                                  guards and `if-no-files-found: ignore` while
-#                                  the Makefiles did not exist, so it printed a
+#   test_switch_build.sh ci        the switch-build job builds all three targets
+#                                  unconditionally, packages them, and refuses
+#                                  to publish an empty artifact set. This is the
+#                                  regression: the job shipped with
+#                                  `if [ -f Makefile ]` guards and
+#                                  `if-no-files-found: ignore` while the
+#                                  Makefiles did not exist, so it printed a
 #                                  ::notice:: and stayed green over a Switch
 #                                  build that had never happened. Re-introducing
 #                                  either would make a broken cross-compile
@@ -81,7 +82,15 @@ phase_ci() {
   grep -q 'if-no-files-found: error' <<<"$job" ||
     fail "switch-build would publish an empty artifact set"
 
-  echo "ok: switch-build builds all three targets and requires their artifacts"
+  # ...and it packages, on every push. `ctest -R package.builds` is the only
+  # other caller of scripts/package.sh inside devkitpro/devkita64, and it skips
+  # on every runner `host-tests` uses -- so without this step a failure specific
+  # to packaging in the container (a missing `zip`, a tool the image dropped)
+  # would first appear on a tag, which is the one moment it must not (#34).
+  grep -q 'scripts/package.sh' <<<"$job" ||
+    fail "switch-build does not package; a packaging failure would first show on a tag"
+
+  echo "ok: switch-build builds all three targets, packages them, and requires the artifacts"
 }
 
 # --- the real cross-compile ---------------------------------------------------

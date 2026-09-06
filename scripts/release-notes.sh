@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The body of a GitHub Release, printed on stdout.
 #
-#   scripts/release-notes.sh [--checksums FILE] [--ref REF]
+#   scripts/release-notes.sh [--checksums FILE]
+#   scripts/release-notes.sh --prerelease
 #
 # Three parts, in this order:
 #
@@ -42,21 +43,23 @@ die() { echo "release-notes.sh: $*" >&2; exit 1; }
 
 usage() {
   cat <<'USAGE'
-usage: scripts/release-notes.sh [--checksums FILE] [--ref REF]
+usage: scripts/release-notes.sh [--checksums FILE]
+       scripts/release-notes.sh --prerelease
 
   --checksums FILE  a SHA256SUMS to quote verbatim (default: none)
-  --ref REF         the commit the release is cut from (default: HEAD)
+  --prerelease      print `true` or `false` for VERSION and exit, writing no
+                    notes -- the flag the GitHub Release is created with
 USAGE
 }
 
 CHECKSUMS=""
-REF="HEAD"
+PRERELEASE_ONLY=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --checksums) [ $# -ge 2 ] || die "--checksums needs a path"; CHECKSUMS="$2"; shift 2 ;;
-    --ref)       [ $# -ge 2 ] || die "--ref needs a ref";        REF="$2";       shift 2 ;;
-    -h|--help)   usage; exit 0 ;;
+    --checksums)  [ $# -ge 2 ] || die "--checksums needs a path"; CHECKSUMS="$2"; shift 2 ;;
+    --prerelease) PRERELEASE_ONLY=1; shift ;;
+    -h|--help)    usage; exit 0 ;;
     *) usage >&2; die "unknown argument: $1" ;;
   esac
 done
@@ -65,30 +68,54 @@ VERSION="$(sed -n '1{s/^[[:space:]]*//;s/[[:space:]]*$//;p;}' "$REPO_ROOT/VERSIO
            2>/dev/null || true)"
 [ -n "$VERSION" ] || die "could not read a version from $REPO_ROOT/VERSION"
 
+# Semver: anything after the first `-` is a prerelease identifier. The release
+# job asks this script rather than repeating the rule, so `0.2.0-rc1` publishes
+# as a prerelease and `0.2.0` does not without the test for it needing a tag,
+# a token or a network -- `ctest -R release.prerelease` runs exactly this.
+if [ "$PRERELEASE_ONLY" -eq 1 ]; then
+  case "$VERSION" in
+    *-*) echo "true" ;;
+    *)   echo "false" ;;
+  esac
+  exit 0
+fi
+
 TAG="v$VERSION"
 ZIP="rommsync-nx-$VERSION.zip"
 
-# Where the project lives. Taken from the environment in CI and from the remote
-# otherwise, rather than typed: packaging/README.txt.in already holds one copy
-# of this URL for the file that ships inside the archive, and two hardcoded
-# copies is one fork away from a release note pointing at somebody else's repo.
+# Where the project lives. Three sources, in this order, and none of them is a
+# URL typed into this file: CI's own environment, then whichever git remote
+# yields one, then the URL packaging/README.txt.in already ships inside every
+# archive. That last one is the fallback rather than a literal here because a
+# second hardcoded copy is one fork away from a release note and a shipped
+# README pointing at two different repositories.
+#
+# A remote whose URL is a path -- a local clone, a bare mirror -- is skipped
+# rather than printed: the notes would otherwise carry a link to somebody's home
+# directory. Nothing here dies, because a release without notes is worse than a
+# release whose link is the project's own front page.
 project_url() {
   if [ -n "${GITHUB_SERVER_URL:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
     printf '%s/%s\n' "${GITHUB_SERVER_URL%/}" "$GITHUB_REPOSITORY"
     return
   fi
-  local url
-  url="$(git -C "$REPO_ROOT" config --get remote.origin.url 2>/dev/null || true)"
-  [ -n "$url" ] || die "no remote.origin.url and no GITHUB_REPOSITORY; cannot link the project"
-  # git@host:owner/name.git -> https://host/owner/name
-  url="$(sed -e 's#^git@\([^:]*\):#https://\1/#' -e 's#\.git$##' <<<"$url")"
-  # A remote that is a path -- a local clone, a bare mirror -- normalises to
-  # itself, and the notes would carry a link to somebody's home directory. There
-  # is no right answer to guess here, so this stops instead.
-  case "$url" in
-    http://*|https://*) printf '%s\n' "$url" ;;
-    *) die "remote.origin.url ($url) is not a URL; set GITHUB_REPOSITORY" ;;
-  esac
+
+  local remote url
+  for remote in $(git -C "$REPO_ROOT" remote 2>/dev/null); do
+    url="$(git -C "$REPO_ROOT" config --get "remote.$remote.url" 2>/dev/null || true)"
+    # git@host:owner/name.git -> https://host/owner/name
+    url="$(sed -e 's#^git@\([^:]*\):#https://\1/#' -e 's#\.git$##' <<<"$url")"
+    case "$url" in
+      http://*|https://*) printf '%s\n' "$url"; return ;;
+    esac
+  done
+
+  # The one the archive's own README.txt carries, read out of the template
+  # rather than restated.
+  url="$(grep -oE 'https://[^ ]*/rommsync-nx' "$REPO_ROOT/packaging/README.txt.in" \
+         2>/dev/null | head -n 1 || true)"
+  [ -n "$url" ] || die "no git remote, no GITHUB_REPOSITORY, and no URL in packaging/README.txt.in"
+  printf '%s\n' "$url"
 }
 
 URL="$(project_url)"
@@ -98,8 +125,20 @@ URL="$(project_url)"
 # Absent -- an unshallow checkout with no earlier tag -- means this is the first
 # release, and the whole history is the change list. That is the path this repo
 # takes today, and `ctest -R release.notes` is what exercises it.
-PREVIOUS="$(git -C "$REPO_ROOT" describe --tags --abbrev=0 --exclude "$TAG" "$REF" \
-            2>/dev/null || true)"
+#
+# A STABLE release also skips every prerelease tag. Cutting v0.2.0 after a
+# v0.2.0-rc1 would otherwise produce "Changes since v0.2.0-rc1" and a list of
+# one commit, silently dropping everything since v0.1.0 -- and the rc is the
+# recommended path (docs/DEVELOPMENT.md#releases), so that is the normal case,
+# not a corner. A prerelease keeps them: rc2's interesting delta really is
+# "since rc1". `ctest -R release.history` is what holds both halves.
+RELEASE_EXCLUDES=(--exclude "$TAG")
+case "$VERSION" in
+  *-*) ;;                                        # cutting a prerelease
+  *)   RELEASE_EXCLUDES+=(--exclude '*-*') ;;    # cutting a stable one
+esac
+PREVIOUS="$(git -C "$REPO_ROOT" describe --tags --abbrev=0 \
+            "${RELEASE_EXCLUDES[@]}" HEAD 2>/dev/null || true)"
 
 # What produced these bytes. dkp-pacman is how the devkitPro container records
 # it, so the line is derived where the release is built and degrades to the
@@ -138,12 +177,12 @@ EOF
 
 if [ -n "$PREVIOUS" ]; then
   echo "## Changes since $PREVIOUS"
-  RANGE="$PREVIOUS..$REF"
+  RANGE="$PREVIOUS..HEAD"
 else
   echo "## Changes"
   echo
   echo "The first release: everything up to \`$TAG\`."
-  RANGE="$REF"
+  RANGE="HEAD"
 fi
 echo
 

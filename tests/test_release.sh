@@ -20,6 +20,16 @@
 #   test_release.sh notes     scripts/release-notes.sh produces a body that names
 #                             the version, the archive, where the guide is, what
 #                             the build targets, and the checksums it was handed.
+#   test_release.sh prerelease  ...and it answers `--prerelease` with the semver
+#                             rule the release job creates the release by, so an
+#                             inverted answer is caught here rather than by a
+#                             v0.2.0-rc1 that published as a stable release.
+#   test_release.sh history   ...and it picks the right previous tag, against a
+#                             throwaway repo with real tags in it. This repo has
+#                             none, so `notes` only ever exercises the
+#                             first-release fallback; the case that actually
+#                             ships -- v0.1.0, some rcs, then v0.2.0 -- can only
+#                             be seen here.
 #
 # All three read files in the checkout. None of them needs Docker, a network or a
 # tag, so none of them ever skips -- a release path that is only exercised by
@@ -88,25 +98,37 @@ phase_version() {
 
 # --- the job that publishes ----------------------------------------------------
 
-# One named job, from `  <name>:` up to the next key at the same indentation.
+# The release job, from `  release:` up to the next key at the same indentation.
 # Same shape, and the same reason for it, as switch_build_job() in
 # tests/test_switch_build.sh: grepping the whole file would happily match
 # another job's step, and so would stopping on a narrower pattern than a job id
 # can be.
 #
-# Scoped to the `jobs:` block first, which switch_build_job() does not need to
-# be and this does: `  release:` at two spaces is also how the `on: release:`
-# trigger is spelled, so a workflow that declared that trigger and no job would
-# otherwise hand back the trigger's own body and every assertion below would be
-# read against it.
-job_block() {
-  awk -v want="  $1:" '
-       /^jobs:/ { in_jobs = 1; next }
+# One difference, and it is why this is not that function with an argument: this
+# is scoped to the `jobs:` block first. `  release:` at two spaces is also how
+# the `on: release:` trigger is spelled, so a workflow that declared that
+# trigger and no job would otherwise hand back the trigger's own body, and every
+# assertion below would be read against it and pass or fail on the wrong text.
+release_job() {
+  awk '/^jobs:/ { in_jobs = 1; next }
        in_jobs && /^[^ #]/ { in_jobs = 0 }
        !in_jobs { next }
-       $0 == want { in_job = 1; next }
+       /^  release:/ { in_job = 1; next }
        in_job && /^  [^ #]+:/ { in_job = 0 }
        in_job { print }' "$WORKFLOW"
+}
+
+# One step of that job, by name, up to the next step. Needed because the job has
+# two `for asset in ...` loops -- one uploading, one pulling the assets back out
+# to verify them -- and an assertion about "the upload names both files" run
+# over the whole job is satisfied by the other loop no matter what the upload
+# does. Asked for by name so a renamed step is a red test rather than a silently
+# vacuous one.
+release_step() {
+  release_job | awk -v want="      - name: $1" '
+       $0 == want { in_step = 1; next }
+       in_step && /^      - / { in_step = 0 }
+       in_step { print }'
 }
 
 # The `on:` block, by the same rule.
@@ -143,7 +165,7 @@ phase_ci() {
   fi
 
   local job
-  job="$(job_block release)"
+  job="$(release_job)"
   [ -n "$job" ] || fail "no release job in $WORKFLOW"
 
   if [ "$release_trigger" -eq 1 ]; then
@@ -164,6 +186,13 @@ phase_ci() {
   [ -n "$needs" ] || fail "the release job has no needs:; it would publish untested bytes"
   grep -q 'host-tests' <<<"$needs" || fail "the release job does not depend on host-tests"
   grep -q 'switch-build' <<<"$needs" || fail "the release job does not depend on switch-build"
+  grep -q 'static' <<<"$needs" || fail "the release job does not depend on static"
+
+  # ...and on the tag being somewhere a human reviewed. Those three jobs say the
+  # commit is good; none of them says it was reviewed, and `git push origin
+  # v9.9.9` at any branch head would otherwise publish it.
+  grep -q 'merge-base --is-ancestor' <<<"$job" ||
+    fail "the release job does not check that the tag is on main"
 
   # --- it builds what it ships ---
   grep -q 'container: devkitpro/devkita64' <<<"$job" ||
@@ -187,28 +216,55 @@ phase_ci() {
   # these bytes rather than about whichever host recomputed it.
   grep -qE 'sha256sum -c' <<<"$job" ||
     fail "the release job does not verify SHA256SUMS against the asset it built"
-  grep -q 'rommsync-nx-' <<<"$job" ||
-    fail "the release job never names the versioned archive it uploads"
-  # Both assets reach the release, not just the zip.
+  # ...and against what a user actually gets. `sha256sum -c` run on the file it
+  # was computed from seconds earlier proves nothing that survived the upload,
+  # and a truncated upload is the one failure that leaves a release page looking
+  # completely fine. So the assets have to come back out of the release first.
+  grep -q 'releases/assets/' <<<"$job" ||
+    fail "the release job never re-reads the published assets to verify them"
+
+  # ...and nothing is visible until that has passed. A release is live the
+  # moment it is POSTed, so it is created as a draft and undrafted last; a
+  # truncated upload would otherwise leave a public page advertising a download
+  # that is corrupt, and the 422 on re-creating a tag's release means recovering
+  # from that needs a human.
+  grep -q '"draft": True' <<<"$job" ||
+    fail "the release is created live, before its assets exist"
+  grep -q -- '-X PATCH' <<<"$job" ||
+    fail "nothing undrafts the release once its assets are verified"
   grep -q 'releases' <<<"$job" ||
     fail "the release job never posts to the releases API"
 
-  # A tag with a semver prerelease suffix has to publish as a prerelease, and
-  # the only place that can be decided is here.
-  grep -q 'prerelease' <<<"$job" ||
-    fail "the release job never marks a prerelease"
+  # Both assets, and the upload itself. `grep releases` above is satisfied by the
+  # call that CREATES the release, and `grep rommsync-nx-` by the checksum step
+  # -- so neither says anything about an asset reaching the release page. Read
+  # off the Publish step alone, for the reason release_step() gives.
+  local publish
+  publish="$(release_step Publish)"
+  [ -n "$publish" ] || fail "the release job has no Publish step"
+  grep -q -- '--data-binary' <<<"$publish" ||
+    fail "the Publish step never streams an asset's bytes to the upload URL"
 
-  # --- the gap between tags ---
-  #
-  # ctest -R package.builds is the only thing that runs scripts/package.sh in the
-  # devkitPro container, and it skips on every runner host-tests uses. Without a
-  # package step on every push, a failure specific to packaging in that container
-  # would first appear on a tag -- the one moment it must not.
-  local switch_job
-  switch_job="$(job_block switch-build)"
-  [ -n "$switch_job" ] || fail "no switch-build job in $WORKFLOW"
-  grep -q 'scripts/package.sh' <<<"$switch_job" ||
-    fail "switch-build does not package on every push; packaging would first fail on a tag"
+  local uploads
+  uploads="$(grep -E '^ +for asset in ' <<<"$publish")"
+  [ -n "$uploads" ] || fail "the Publish step has no asset upload loop"
+  grep -q 'rommsync-nx-' <<<"$uploads" ||
+    fail "the Publish step does not upload the versioned archive"
+  grep -q 'SHA256SUMS' <<<"$uploads" ||
+    fail "the Publish step does not upload SHA256SUMS beside the archive"
+
+  # A tag with a semver prerelease suffix has to publish as a prerelease. The
+  # rule itself lives in scripts/release-notes.sh, where `release.prerelease`
+  # can exercise it against made-up versions -- so what this asserts is that the
+  # job ASKS. Anchored on the flag rather than on the bare word, which the
+  # comments in this job satisfy on their own.
+  grep -q -- '--prerelease' <<<"$job" ||
+    fail "the release job never asks release-notes.sh which releases are prereleases"
+
+  # The other half of this -- that `switch-build` packages on every push, so a
+  # container-specific packaging failure does not first appear on a tag -- is an
+  # assertion about that job, and lives with it in
+  # tests/test_switch_build.sh (`switch.ci_requires_artifacts`).
 
   echo "ok: one trigger, and a gated release job that builds, packages and uploads"
 }
@@ -272,9 +328,120 @@ phase_notes() {
   echo "ok: the notes name the archive, the guide, the target and the checksums"
 }
 
+# --- which releases are prereleases -------------------------------------------
+
+phase_prerelease() {
+  [ -x "$NOTES" ] || fail "no executable $NOTES"
+
+  # Against a copy holding a made-up VERSION, because the answer is a function
+  # of that file and this repo holds one version at a time. The script reads
+  # $REPO_ROOT/VERSION relative to its own location and `--prerelease` returns
+  # before it touches git, so a directory with those two files in it is the
+  # whole world it needs.
+  SCRATCH="$(mktemp -d)"
+  mkdir -p "$SCRATCH/scripts"
+  cp "$NOTES" "$SCRATCH/scripts/"
+
+  local version expected answer
+  # The suffix forms semver actually produces, and the two that must NOT be
+  # read as one: a build identifier after `+` is not a prerelease, and neither
+  # is a hyphen-free version however many components it has.
+  for version in \
+      "0.1.0:false" \
+      "1.0.0:false" \
+      "10.20.30:false" \
+      "0.2.0+build7:false" \
+      "0.2.0-rc1:true" \
+      "0.2.0-rc.1:true" \
+      "1.0.0-alpha:true" \
+      "1.0.0-beta.2+build7:true"; do
+    expected="${version##*:}"
+    echo "${version%%:*}" > "$SCRATCH/VERSION"
+    answer="$("$SCRATCH/scripts/release-notes.sh" --prerelease)" ||
+      fail "--prerelease failed on ${version%%:*}"
+    [ "$answer" = "$expected" ] ||
+      fail "${version%%:*} answered $answer, expected $expected"
+  done
+
+  echo "ok: a semver suffix is a prerelease and a build identifier is not"
+}
+
+# --- which tag the changes are counted from -----------------------------------
+
+# A throwaway repo: one commit per tag, so "which commits are listed" and "which
+# tag was chosen" are the same question and the answer is readable.
+build_history() {
+  local dir="$1"
+  mkdir -p "$dir/scripts"
+  cp "$NOTES" "$dir/scripts/"
+  mkdir -p "$dir/packaging"
+  cp "$REPO_ROOT/packaging/README.txt.in" "$dir/packaging/"
+  git -C "$dir" init -q
+  git -C "$dir" config user.email "test@example.invalid"
+  git -C "$dir" config user.name "release test"
+  # No remote, so the notes fall back to the URL packaging/README.txt.in ships.
+  local step
+  for step in "before-0.1.0:v0.1.0" "after-0.1.0:" "the-rc-commit:v0.2.0-rc1" "after-the-rc:"; do
+    echo "${step%%:*}" > "$dir/step"
+    git -C "$dir" add -A
+    git -C "$dir" commit -q -m "${step%%:*}"
+    [ -z "${step##*:}" ] || git -C "$dir" tag "${step##*:}"
+  done
+}
+
+phase_history() {
+  command -v git >/dev/null 2>&1 || fail "git is needed to build a history"
+  SCRATCH="$(mktemp -d)"
+  build_history "$SCRATCH"
+
+  local body="$SCRATCH/notes.md"
+
+  # Cutting a STABLE release. The last tag is v0.2.0-rc1, and counting from it
+  # would list one commit and silently drop everything since v0.1.0 -- which is
+  # every change the release is actually made of.
+  echo "0.2.0" > "$SCRATCH/VERSION"
+  "$SCRATCH/scripts/release-notes.sh" > "$body" || fail "release-notes.sh failed on 0.2.0"
+  grep -q "Changes since v0.1.0" "$body" ||
+    fail "a stable release counts from the last prerelease, not the last release"
+  grep -q 'after-0.1.0' "$body" ||
+    fail "the commits between v0.1.0 and the rc are missing from the stable notes"
+  grep -q 'the-rc-commit' "$body" || fail "the rc's own commit is missing"
+  grep -q 'after-the-rc' "$body" || fail "the commits after the rc are missing"
+
+  # Cutting the NEXT prerelease. Here the last rc is the right base: what an
+  # rc2 reader wants is what changed since rc1, not since the last stable.
+  echo "0.2.0-rc2" > "$SCRATCH/VERSION"
+  "$SCRATCH/scripts/release-notes.sh" > "$body" || fail "release-notes.sh failed on 0.2.0-rc2"
+  grep -q "Changes since v0.2.0-rc1" "$body" ||
+    fail "a prerelease does not count from the previous prerelease"
+  grep -q 'after-the-rc' "$body" || fail "the commits since the rc are missing"
+  grep -q 'after-0.1.0' "$body" &&
+    fail "the prerelease notes reach back past v0.2.0-rc1"
+
+  # And a first release, where there is no previous tag at all. That is the path
+  # `notes` takes in this repo, asserted here against a repo whose history is
+  # small enough to read.
+  local first="$SCRATCH/first"
+  mkdir -p "$first"
+  cp -R "$SCRATCH/scripts" "$SCRATCH/packaging" "$first/"
+  git -C "$first" init -q
+  git -C "$first" config user.email "test@example.invalid"
+  git -C "$first" config user.name "release test"
+  echo "0.1.0" > "$first/VERSION"
+  git -C "$first" add -A
+  git -C "$first" commit -q -m "the only commit"
+  "$first/scripts/release-notes.sh" > "$body" || fail "release-notes.sh failed on a first release"
+  grep -q 'The first release' "$body" || fail "a repo with no tags is not treated as a first release"
+  grep -q 'the only commit' "$body" || fail "the first release lists no commits"
+
+  echo "ok: a stable counts from the last stable, a prerelease from the last prerelease"
+}
+
 case "${1:-}" in
-  version) phase_version ;;
-  ci)      phase_ci ;;
-  notes)   phase_notes ;;
-  *)       echo "usage: $0 {version|ci|notes}" >&2; exit 2 ;;
+  version)    phase_version ;;
+  ci)         phase_ci ;;
+  notes)      phase_notes ;;
+  prerelease) phase_prerelease ;;
+  history)    phase_history ;;
+  *)          echo "usage: $0 {version|ci|notes|prerelease|history}" >&2; exit 2 ;;
 esac

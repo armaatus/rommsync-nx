@@ -481,9 +481,18 @@ ctest --test-dir build --output-on-failure
   artifacts — four bytes of magic is all the script inspects — so they need no
   toolchain and never skip. `package.builds` does the real cross-compile and
   packages it *inside* the container, and skips on the same missing image
-  `switch.builds` does. Unlike that one it has no CI equivalent yet: nothing in
-  `.github/workflows/ci.yml` runs `scripts/package.sh`, so on a machine without
-  the image the packaging is not exercised at all (#34).
+  `switch.builds` does — and, like that one, it now has an equivalent in CI that
+  cannot skip: `switch-build` runs `scripts/package.sh` on every push and the
+  `release` job runs it again on a tag, both in that image (#34).
+- The `release.*` group and `version.tag` cover what turns a `v*` tag into a
+  downloadable release, and none of them needs Docker, a network or a tag:
+  `version.tag` refuses a tag that disagrees with `VERSION` (it reads
+  `GITHUB_REF`, so the `host-tests` job runs it on a tag push without knowing it
+  exists); `release.ci` reads the release job out of `.github/workflows/ci.yml`;
+  `release.notes` and `release.history` run `scripts/release-notes.sh`, the
+  second against a throwaway repo with real tags in it, because this one has
+  none; and `release.prerelease` checks the semver rule the release is created
+  by. See [DEVELOPMENT.md](DEVELOPMENT.md#releases) for the procedure they hold.
 
 ### Provisioning the fixture
 
