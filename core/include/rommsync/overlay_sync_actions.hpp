@@ -107,8 +107,32 @@ struct LastCommand {
   /// switch where it was (M5-3, #30).
   ipc::WriteOutcome write = ipc::WriteOutcome::kApplied;
 
-  /// `kSyncNow` only. Every one of the five is drawn, including `kAccepted`.
+  /// `kSetEnabled` only: `Status::enabled` as it stood when that answer came
+  /// back.
+  ///
+  /// It is what makes a refusal a sentence rather than a *permanent* one. The
+  /// notice stands while it is still true, and a later `Status` that disagrees
+  /// means the switch has moved since -- by a retry, by the settings screen
+  /// (#26), by anything -- so "that did not take" is no longer about the state
+  /// the screen is showing, and a sentence a user cannot act on is worse than
+  /// none.
+  bool enabled_then = false;
+
+  /// `kSyncNow` only. Every one of the five is drawn, including `kAccepted` --
+  /// which is dropped again as soon as `sync_in_progress` makes it visible, so
+  /// "Sync started" does not stand over a tick that finished ten minutes ago.
   ipc::SyncOutcome sync = ipc::SyncOutcome::kAccepted;
+
+  /// `SyncNow` answered `outcome`.
+  static LastCommand SyncNow(ipc::SyncOutcome outcome);
+
+  /// `SetEnabled` answered `outcome`, over a console reporting `enabled_now`.
+  ///
+  /// Named rather than braced because the two arms are exclusive: a positional
+  /// `LastCommand{Kind::kSyncNow, kApplied, false, outcome}` has to fill in a
+  /// `WriteOutcome` that means nothing, and a filler value is one somebody
+  /// eventually reads.
+  static LastCommand SetEnabled(ipc::WriteOutcome outcome, bool enabled_now);
 };
 
 /// Everything the sync screen draws, and nothing about how.

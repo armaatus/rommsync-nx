@@ -325,7 +325,8 @@ StatusView Render(const ipc::Status& status, std::int64_t now_unix) {
       status.enabled ? Tone::kGood : Tone::kNeutral);
   Add(&view.lines, "Last sync", FormatRelativeTime(status.last_sync_at, now_unix));
   Add(&view.lines, "Result",
-      status.sync_in_progress ? std::string("Running now") : SyncResultText(status.last_sync_result),
+      status.sync_in_progress ? std::string("Running now")
+                              : SyncResultText(status.last_sync_result),
       status.sync_in_progress ? Tone::kNeutral : SyncResultTone(status.last_sync_result));
   AddCounts(&view.lines, status);
   Add(&view.lines, "Queue",

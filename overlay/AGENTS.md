@@ -11,7 +11,7 @@ Ultrahand overlay list.
 - It *compiles* `core/` (`ROMMSYNC_USE_CORE` in the Makefile) and links almost
   none of it. Two things it does link: the IPC codecs — `rommsync/ipc.hpp`,
   shared with the sysmodule so one copy of the field names serves both halves —
-  and the screens' view models -- `rommsync/overlay_status_view.hpp`,
+  and the screens' view models — `rommsync/overlay_status_view.hpp`,
   `rommsync/overlay_pairing_view.hpp`, `rommsync/overlay_sync_actions.hpp` and
   whatever M4-3/M4-4 add beside them. `--gc-sections` drops the engine no screen
   references. The rule above is about ownership, not about the link map.
@@ -53,12 +53,13 @@ Ultrahand overlay list.
 - The sysmodule owns writes to `config.ini`; the overlay asks it to change
   settings and never writes the file itself. `ctest -R overlay.sync_actions`
   greps this directory for the write path and for the boot flag rather than
-  leaving it reviewed.
+  leaving it reviewed. Reading `config.ini` is allowed — both components read it
+  (docs/ARCHITECTURE.md); writing it is the sysmodule's alone.
 - **The enable switch is a runtime pause, not the ovl-sysmodules boot flag.**
   That flag lives under `/atmosphere/contents/<TID>/flags/` and means the
   process does not exist; `[sync] enabled` means it is resident, idle and still
   answering IPC. Rendering both as "disabled" hides a sysmodule that failed to
-  start. Nothing here reads or writes the flag -- that is M6-2 (#33).
+  start. Nothing here reads or writes the flag — that is M6-2 (#33).
 - libultrahand is upstream's code, not ours: `switch.mk` compiles it with
   `-isystem` headers and without `-Wextra -Wpedantic -Werror`. Do not relax
   those for anything in `source/`, and do not patch the submodule in place —

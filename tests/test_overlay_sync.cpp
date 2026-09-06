@@ -297,22 +297,38 @@ void CheckEveryState(Checks& checks) {
                 "...and so is one whose sign-in expired");
 }
 
-/// Toggling twice is idempotent: the same reported state renders the same
-/// screen, whatever it took to get back there. A view that latched anything of
-/// its own would drift on the way back.
+/// Toggling twice is idempotent, driven through the command that does it.
+///
+/// Not three hand-built consoles compared to each other: what the acceptance
+/// line is about is a *round trip*, so this turns the switch off and on through
+/// `ipc::ServiceCore::SetEnabled` and renders the `GetStatus` that comes back
+/// after each. A `SetEnabled` that landed somewhere other than where the first
+/// one started -- or an `EnabledResult::enabled` that reported the state asked
+/// for rather than the state that took -- is red here and nowhere else.
 void CheckToggleIsIdempotent(Checks& checks) {
-  Console on = Working();
-  Console off = Working();
-  off.enabled = false;
+  KnobEngine engine;
+  Load(&engine, Working());
+  ipc::ServiceCore core(engine);
 
-  const overlay::LastCommand applied{overlay::LastCommand::Kind::kSetEnabled,
-                                     ipc::WriteOutcome::kApplied, ipc::SyncOutcome::kAccepted};
-  const overlay::SyncActionsView first = ViewOf(on, applied);
-  const overlay::SyncActionsView middle = ViewOf(off, applied);
-  const overlay::SyncActionsView again = ViewOf(on, applied);
+  const auto draw = [&](const ipc::EnabledResult& answer) {
+    return overlay::RenderSyncActions(
+        core.GetStatus(), overlay::LastCommand::SetEnabled(answer.outcome, answer.enabled));
+  };
 
-  checks.ExpectEq(AllText(first), AllText(again), "on -> off -> on lands on the same screen");
-  checks.Expect(AllText(first) != AllText(middle), "and the trip through off was visible");
+  const ipc::EnabledResult first = core.SetEnabled(true);
+  checks.Expect(first.enabled, "the switch starts on, and SetEnabled(true) reads back on");
+  const std::string on = AllText(draw(first));
+
+  const ipc::EnabledResult off_answer = core.SetEnabled(false);
+  checks.Expect(!off_answer.enabled, "SetEnabled(false) reads back off");
+  const std::string off = AllText(draw(off_answer));
+
+  const ipc::EnabledResult back = core.SetEnabled(true);
+  checks.Expect(back.enabled, "...and back on again");
+  const std::string again = AllText(draw(back));
+
+  checks.ExpectEq(again, on, "on -> off -> on lands on the same screen");
+  checks.Expect(on != off, "and the trip through off was visible");
 }
 
 /// The switch is drawn from what took, and a write that did not take says so.
@@ -326,19 +342,25 @@ void CheckWriteThatDidNotTake(Checks& checks) {
   off.enabled = false;
 
   for (ipc::WriteOutcome outcome : {ipc::WriteOutcome::kInvalid, ipc::WriteOutcome::kWriteFailed}) {
-    const overlay::LastCommand last{overlay::LastCommand::Kind::kSetEnabled, outcome,
-                                    ipc::SyncOutcome::kAccepted};
-    // The user asked for "on" and the sysmodule still reports "off".
+    // The user asked for "on", and the sysmodule still reports "off".
+    const overlay::LastCommand last = overlay::LastCommand::SetEnabled(outcome, false);
     const overlay::SyncActionsView view = ViewOf(off, last);
     ExpectWellFormed(checks, view, std::string("set_enabled ") + ipc::ToString(outcome));
     checks.Expect(!view.notice.empty(),
                   std::string("a ") + ipc::ToString(outcome) + " write is a sentence on screen");
     checks.Expect(!view.enabled, "...and the switch stays where the sysmodule says it is");
+
+    // ...and the sentence expires the moment the console contradicts it. A
+    // retry that took, or the settings screen (#26), moves `enabled`; a
+    // permanent "that did not take" about a state that is no longer the state
+    // is one a user cannot act on.
+    checks.Expect(ViewOf(Working(), last).notice.empty(),
+                  std::string("a ") + ipc::ToString(outcome) +
+                      " notice goes once the switch has moved since");
   }
 
-  const overlay::LastCommand applied{overlay::LastCommand::Kind::kSetEnabled,
-                                     ipc::WriteOutcome::kApplied, ipc::SyncOutcome::kAccepted};
-  checks.Expect(ViewOf(off, applied).notice.empty(),
+  checks.Expect(ViewOf(off, overlay::LastCommand::SetEnabled(ipc::WriteOutcome::kApplied, false))
+                    .notice.empty(),
                 "a write that took needs no notice: the switch having moved is the answer");
 }
 
@@ -355,9 +377,9 @@ void CheckEveryOutcomeIsDrawn(Checks& checks) {
   std::vector<std::string> sentences;
   for (ipc::SyncOutcome outcome : kOutcomes) {
     const std::string text = overlay::SyncOutcomeText(outcome);
-    checks.Expect(!text.empty(), std::string("outcome ") + ipc::ToString(outcome) + " has a sentence");
-    const overlay::LastCommand last{overlay::LastCommand::Kind::kSyncNow,
-                                    ipc::WriteOutcome::kApplied, outcome};
+    checks.Expect(!text.empty(),
+                  std::string("outcome ") + ipc::ToString(outcome) + " has a sentence");
+    const overlay::LastCommand last = overlay::LastCommand::SyncNow(outcome);
     const overlay::SyncActionsView view = ViewOf(Working(), last);
     ExpectWellFormed(checks, view, std::string("sync_now ") + ipc::ToString(outcome));
     checks.ExpectEq(view.notice, text, std::string("...and pressing it draws that sentence"));
@@ -369,6 +391,18 @@ void CheckEveryOutcomeIsDrawn(Checks& checks) {
                     "no two refusals read the same: \"" + sentences[i] + "\"");
     }
   }
+
+  // "Sync started" goes as soon as the headline says the same thing, so it
+  // cannot stand over a tick that finished ten minutes ago. Every other answer
+  // stays until the next press, because nothing else on the screen says it.
+  Console syncing = Working();
+  syncing.sync_in_progress = true;
+  checks.Expect(
+      ViewOf(syncing, overlay::LastCommand::SyncNow(ipc::SyncOutcome::kAccepted)).notice.empty(),
+      "an accepted sync stops being news once the screen says Syncing");
+  checks.Expect(!ViewOf(syncing, overlay::LastCommand::SyncNow(ipc::SyncOutcome::kAlreadyRunning))
+                     .notice.empty(),
+                "...and a refusal mid-tick is still a sentence");
 }
 
 /// A sysmodule that could not be reached is a screen of its own: both controls
@@ -393,9 +427,9 @@ void CheckUnreachable(Checks& checks) {
     checks.ExpectEq(view.headline, overlay::RenderUnreachable(link, 3).headline,
                     what + ": the same diagnosis reads the same as on the status screen");
   }
-  checks.Expect(Contains(overlay::RenderSyncActionsUnreachable(overlay::Link::kIncompatible, 3).hint,
-                         "3"),
-                "a version mismatch names the two numbers");
+  const overlay::SyncActionsView mismatch =
+      overlay::RenderSyncActionsUnreachable(overlay::Link::kIncompatible, 3);
+  checks.Expect(Contains(mismatch.hint, "3"), "a version mismatch names the two numbers");
 }
 
 // --- what the code may not do ------------------------------------------------
@@ -413,13 +447,20 @@ void CheckUnreachable(Checks& checks) {
 /// screen in a year's time. Comment lines are skipped: this file's own
 /// neighbours explain the rule in prose, and explaining it is not breaking it.
 void CheckOverlayWritesNothing(Checks& checks) {
-  // The write path, and the flag. `SetConfig` and `SetEnabled` are absent on
-  // purpose -- those are the *commands* by which the overlay asks the sysmodule
-  // to write, which is exactly the arrangement this test defends.
+  // The write path, and the flag.
+  //
+  // `config.ini` itself is *not* forbidden: both components read it
+  // (docs/ARCHITECTURE.md), and #24's acceptance says so in as many words --
+  // "Reading it is allowed". What is banned is opening anything for writing.
+  //
+  // `SetConfig` and `SetEnabled` are absent for the opposite reason: those are
+  // the *commands* by which the overlay asks the sysmodule to write, which is
+  // exactly the arrangement this test defends. `SetSyncEnabled` is the engine
+  // method behind one of them, and a screen reaching for it would be skipping
+  // the boundary entirely.
   static constexpr const char* kForbidden[] = {
-      "config.ini",   "ofstream",   "fopen",  "fwrite",   "AtomicWrite",
-      "atomic_file",  "ApplyEdit",  "boot2",  "flags/",   "atmosphere/contents",
-      "SetSyncEnabled",
+      "ofstream",    "fopen",  "fwrite", "WriteAtomically",     "atomic_file",
+      "ApplyEdit",   "boot2",  "flags/", "atmosphere/contents", "SetSyncEnabled",
   };
 
   int scanned = 0;
@@ -444,7 +485,9 @@ void CheckOverlayWritesNothing(Checks& checks) {
       for (const char* token : kForbidden) {
         checks.Expect(!Contains(line, token),
                       path.filename().string() + ":" + std::to_string(number) + " names " +
-                          token + "; the sysmodule owns every write and the boot flag is #33's");
+                          token +
+                          "; the sysmodule owns every write (reading config.ini is fine) and "
+                          "the boot flag is #33's");
       }
     }
   }

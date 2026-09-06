@@ -100,14 +100,9 @@ void SyncScreen::Poll() {
   }
 
   status_ = status;
-  // A "Sync started" that the headline has since taken over from is a notice
-  // about something that is now visibly true, and it would otherwise stand
-  // until the next press -- long after the tick it announced had finished.
-  // Every other answer stands, because nothing else on the screen says it.
-  if (last_.kind == LastCommand::Kind::kSyncNow &&
-      last_.sync == ipc::SyncOutcome::kAccepted && status_.sync_in_progress) {
-    last_ = LastCommand{};
-  }
+  // When a notice stops being true is `RenderSyncActions`'s to decide, not this
+  // screen's -- both expiry rules are in the view model, where a host test
+  // reaches them (`overlay_sync_actions.hpp`).
   Refresh();
 }
 
@@ -118,8 +113,7 @@ void SyncScreen::PressSyncNow() {
     // `overlay.sync_actions` holds the prediction against
     // `ipc::ServiceCore::SyncNow` itself, so a screen that greys the button is
     // a screen that would have been told exactly this.
-    last_ = LastCommand{LastCommand::Kind::kSyncNow, ipc::WriteOutcome::kApplied,
-                        PredictSyncNow(status_)};
+    last_ = LastCommand::SyncNow(PredictSyncNow(status_));
     Refresh();
     return;
   }
@@ -134,7 +128,7 @@ void SyncScreen::PressSyncNow() {
   // tick is queued, so the next `Status` may not have `sync_in_progress` set
   // yet, and a press with nothing on screen for two frames is a press a user
   // repeats.
-  last_ = LastCommand{LastCommand::Kind::kSyncNow, ipc::WriteOutcome::kApplied, outcome};
+  last_ = LastCommand::SyncNow(outcome);
   Refresh();
 }
 
@@ -157,8 +151,7 @@ void SyncScreen::PressToggle() {
   // frame rather than on the next poll; the next `GetStatus` overwrites it with
   // the same fact.
   status_.enabled = result.enabled;
-  last_ = LastCommand{LastCommand::Kind::kSetEnabled, result.outcome,
-                      ipc::SyncOutcome::kAccepted};
+  last_ = LastCommand::SetEnabled(result.outcome, status_.enabled);
   Refresh();
 }
 
@@ -206,13 +199,14 @@ void SyncScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
     line(view_.notice, kBodyFont, ColorFor(view_.notice_tone), kRowHeight);
   }
 
-  // The two prompts. A control that cannot be pressed is still drawn -- greyed,
+  // The two prompts. A control that would be *refused* is still drawn -- greyed,
   // with its sentence under it -- because a button that vanishes is a button a
-  // user goes looking for.
+  // user goes looking for. A `kInert` one is not drawn at all: there is nothing
+  // on the far side to press against, and the headline is already saying so.
   const auto control = [&](const char* glyph, const Button& button) {
     if (button.state == ControlState::kInert) {
-      // No prompt at all: there is nothing on the far side to press against,
-      // and the headline is already saying so.
+      // Its `label` is still set, so that every `Button` carries one in every
+      // state (`overlay_sync_actions.hpp`); it is simply never drawn.
       return;
     }
     const tsl::Color color = button.state == ControlState::kLive

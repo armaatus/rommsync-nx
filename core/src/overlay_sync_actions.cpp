@@ -89,17 +89,28 @@ void AddRows(SyncActionsView* view, const ipc::Status& status) {
            status.sync_in_progress ? Tone::kNeutral : SyncResultTone(status.last_sync_result)});
 }
 
-/// What the last press has to say for itself.
+/// What the last press has to say for itself, and when it stops having anything
+/// to say.
 ///
 /// A `SetEnabled` that took says nothing: the switch having moved is the
 /// answer, and a "that worked" beside it is a line a user learns to stop
 /// reading. Everything else is a sentence, because a press that changed nothing
 /// and said nothing is the silent no-op #24 forbids.
-void SetNotice(SyncActionsView* view, const LastCommand& last) {
+///
+/// Both of the cases that *expire* are decided here rather than in the screen,
+/// so a host test holds them: a notice is a fact about the console, and a fact
+/// the console has since contradicted is not one to keep on screen.
+void SetNotice(SyncActionsView* view, const ipc::Status& status, const LastCommand& last) {
   switch (last.kind) {
     case LastCommand::Kind::kNone:
       return;
     case LastCommand::Kind::kSetEnabled:
+      if (status.enabled != last.enabled_then) {
+        // The switch has moved since that answer -- a retry that took, or the
+        // settings screen (#26). "That did not take" about a state that is no
+        // longer the state is a sentence a user cannot act on.
+        return;
+      }
       switch (last.write) {
         case ipc::WriteOutcome::kApplied:
           return;
@@ -117,9 +128,14 @@ void SetNotice(SyncActionsView* view, const LastCommand& last) {
       view->notice_tone = Tone::kBad;
       return;
     case LastCommand::Kind::kSyncNow:
-      // Including `kAccepted`. `SyncNow` returns as soon as the tick is queued,
-      // so the very next `Status` may not have `sync_in_progress` set yet -- and
-      // a press with nothing on screen for two frames is a press a user repeats.
+      // `kAccepted` is drawn because `SyncNow` returns as soon as the tick is
+      // queued: the very next `Status` may not have `sync_in_progress` set yet,
+      // and a press with nothing on screen for two frames is a press a user
+      // repeats. It is dropped again the moment the headline takes over, so
+      // "Sync started" cannot stand over a tick that finished long ago.
+      if (last.sync == ipc::SyncOutcome::kAccepted && status.sync_in_progress) {
+        return;
+      }
       view->notice = SyncOutcomeText(last.sync);
       view->notice_tone = SyncOutcomeTone(last.sync);
       return;
@@ -127,6 +143,21 @@ void SetNotice(SyncActionsView* view, const LastCommand& last) {
 }
 
 }  // namespace
+
+LastCommand LastCommand::SyncNow(ipc::SyncOutcome outcome) {
+  LastCommand last;
+  last.kind = Kind::kSyncNow;
+  last.sync = outcome;
+  return last;
+}
+
+LastCommand LastCommand::SetEnabled(ipc::WriteOutcome outcome, bool enabled_now) {
+  LastCommand last;
+  last.kind = Kind::kSetEnabled;
+  last.write = outcome;
+  last.enabled_then = enabled_now;
+  return last;
+}
 
 const char* ToString(ControlState state) {
   switch (state) {
@@ -212,7 +243,7 @@ SyncActionsView RenderSyncActions(const ipc::Status& status, const LastCommand& 
                                                          : Blocked("Sync now", outcome);
 
   AddRows(&view, status);
-  SetNotice(&view, last);
+  SetNotice(&view, status, last);
   return view;
 }
 
