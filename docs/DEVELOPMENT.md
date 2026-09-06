@@ -99,6 +99,7 @@ loads. `scripts/package.sh` turns them into the install tree:
 
 ```
 atmosphere/contents/<TID>/exefs.nsp    the sysmodule, RENAMED
+atmosphere/contents/<TID>/toolbox.json what ovl-sysmodules lists it by
 switch/.overlays/ovl-rommsync.ovl      the overlay
 config/rommsync/config.ini.example     a starting configuration
 README.txt
@@ -111,11 +112,16 @@ make -C sysmodule && make -C overlay
 ./scripts/package.sh --list       # the entry paths, without building anything
 ```
 
-Four things about it are load-bearing, and every one of them fails silently on a
+Five things about it are load-bearing, and every one of them fails silently on a
 console rather than loudly here:
 
 - **`exefs.nsp`, not `sys-rommsync.nsp`.** Atmosphère loads the former. The
   build's own name installs cleanly, boots, and does nothing at all.
+- **`toolbox.json` beside it.** Atmosphère ignores that file; ovl-sysmodules
+  builds its whole list from it, skipping any title id folder that has none or
+  whose copy will not parse, and saying nothing about it. Without it the
+  sysmodule installs, boots when flagged, and is absent from the one screen the
+  install guide sends a user to. See [The two switches](#the-two-switches).
 - **`<TID>` comes out of `sysmodule/sys-rommsync.json`**, never typed. The id is
   still unconfirmed against the installed homebrew set (`sysmodule/README.md`),
   so it will move, and a second copy of it is how a move lands in one place only.
@@ -131,7 +137,78 @@ console rather than loudly here:
 artifacts that need no toolchain, plus `package.builds`, which packages a real
 devkitPro build inside the same container. `switch-build` runs the script on
 every push as well, so a failure specific to packaging *inside* the container is
-not something a tag discovers first.
+not something a tag discovers first. `tests/toolbox_check.py` is the part that
+reads `toolbox.json` the way ovl-sysmodules does, so a field that overlay
+requires cannot quietly go missing.
+
+## The two switches
+
+There are two of them, they mean different things, and every screen and document
+in this project has to keep them apart. Collapsing them hands a user a switch
+that does nothing.
+
+| Switch | Mechanism | What it decides |
+|---|---|---|
+| **ovl-sysmodules' boot toggle** | `atmosphere/contents/<TID>/flags/boot2.flag` present or absent, plus `pmshellLaunchProgram` / `pmshellTerminateProgram` for *right now* | whether the **process exists at all** |
+| **ovl-rommsync's enable switch** | `[sync] enabled` in `config.ini`, written by the sysmodule over `SetEnabled` (#29, #30) | whether a **resident process syncs** |
+
+`docs/INSTALL.md` step 2 is the same table written for the person holding the
+console; the two are meant to agree, and changing one means changing the other.
+
+**`ovl-rommsync` never writes `boot2.flag`.** It may read it to explain a
+silence. Creating it is ovl-sysmodules' job — that overlay `mkdir`s the `flags/`
+directory itself before writing the flag into it, which is why the archive ships
+no `flags/` entry and does not need to — and two overlays writing one flag is how
+they come to disagree about what is on.
+
+### What the sysmodule has to survive
+
+`toolbox.json` declares `"requires_reboot": false`, which puts `sys-rommsync` in
+ovl-sysmodules' **Dynamic** section: its `A` button terminates and launches the
+process while the console is running. Terminating is `pmshellTerminateProgram` —
+a hard kill at an arbitrary instant, with no shutdown hook and no chance to
+finish a write. Declaring `true` instead would avoid that and cost the thing the
+enable switch exists to give: a toggle that works without a reboot.
+
+So the process is written to be killed. Nothing may live only in RAM:
+
+- `queue.json`, `state.db`, `token.dat` and `config.ini` are written through
+  `io::WriteAtomically`, and each recovers from its own `.old` when it is read.
+- A killed download leaves a `.part` the next run resumes with `Range`
+  (`download.resume`), and a body that ended early is never promoted.
+- A killed save write leaves the backup already on the card — hard rule 2, and
+  `harness::Sandbox` audits it on teardown whether or not a test remembered to.
+- **Relaunch is terminate-then-launch with no gap.** No lock file, no pidfile,
+  and no state a fresh process would read as "another instance is running".
+
+`ctest -R toggle` is that list, checked. `sync::TickOptions::enabled` and
+`download::Drain`'s `[downloads] enabled` are the switch's other half: with
+either off, the engine sends nothing at all — asserted by counting the requests
+that reach the fixture, not by reading the code.
+
+### The four states the overlay draws
+
+Two of them are the same "not syncing" to a user and have entirely different
+remedies, so the status screen draws four:
+
+| State | Boot toggle | Enable switch | What `ovl-rommsync` shows |
+|---|---|---|---|
+| Not installed | — | — | "sys-rommsync is not installed" — no `exefs.nsp` under the title id |
+| Installed, not set to boot | off | read from the card | "sys-rommsync is not running", pointing at ovl-sysmodules |
+| Running, sync disabled | on | off | the live status, with sync off; `SyncNow` answers `kDisabled` |
+| Running, sync enabled | on | on | the live status |
+
+The first two are reached only when IPC connect fails, and only the card can
+tell them apart. `overlay::CardState` is what the overlay fills in from the card
+— `exefs.nsp`, `flags/boot2.flag`, and `config.ini` **read-only**, because the
+sysmodule owns every write to it — and `overlay::RenderUnreachable(link, card)`
+is the decision made about it, in `core/` where `ctest -R overlay.status` can
+reach it.
+
+The enable switch is drawn there as *"Sync switch in config.ini"* rather than as
+"Sync", deliberately: nothing is syncing on a console with no process, and a
+bare "Sync: On" over one is exactly the mislabelling the four states exist to
+prevent.
 
 ## Releases
 

@@ -28,6 +28,34 @@ to 0, set to 1, or deleted. The value we want is the default, so nothing is
 wrong today, and the key stays for parity with devkitPro's template — but do not
 read that one line as noise if the process category ever has to change.
 
+## The two switches
+
+Whether this process runs, and whether it syncs, are two different questions
+with two different answers.
+
+| Switch | Mechanism | What it decides |
+|---|---|---|
+| **ovl-sysmodules' boot toggle** | `atmosphere/contents/<TID>/flags/boot2.flag`, plus `pmshellLaunchProgram` / `pmshellTerminateProgram` for *right now* | whether this **process exists at all** |
+| **ovl-rommsync's enable switch** | `[sync] enabled` in `config.ini`, written over `SetEnabled` (#29, #30) | whether a **resident process syncs** |
+
+`toolbox.json` — shipped beside `exefs.nsp` by `scripts/package.sh`, and the
+only reason ovl-sysmodules lists this module at all — declares
+`"requires_reboot": false`. That is a promise about this process: it is
+terminated where it stands, at any instant, with no shutdown hook, and relaunched
+with no gap. Nothing here may hold state only in RAM, and nothing may write a
+lock or a pidfile a fresh process would trip over. `ctest -R toggle` is that
+promise checked; the long form, with the four states the overlay draws off these
+two switches, is
+[../docs/DEVELOPMENT.md](../docs/DEVELOPMENT.md#the-two-switches) and — for the
+person holding the console — [../docs/INSTALL.md](../docs/INSTALL.md) step 2.
+
+With `[sync] enabled = false` the process is resident, IPC answers, and nothing
+syncs: `sync::RunTick` returns `TickOutcome::kDisabled` before it opens a file or
+sends a request, and `ServiceCore::SyncNow` answers `SyncOutcome::kDisabled`
+rather than starting one — a user who pressed "Sync now" with the switch off is
+told which switch to flip, not shown a spinner. `SetEnabled(true)` lifts it in
+the running process; nothing here needs a reboot.
+
 ## Responsibilities
 
 - Device-code auth + token lifecycle ([../docs/AUTH.md](../docs/AUTH.md))
@@ -41,7 +69,9 @@ read that one line as noise if the process category ever has to change.
 
 ```
 Makefile              # target-specific vars; the rules are in ../switch.mk
-sys-rommsync.json     # NPDM: title id, heap, service and syscall capabilities
+sys-rommsync.json     # NPDM: title id, heap, service and syscall capabilities.
+                      #   Also where scripts/package.sh reads the title id and
+                      #   the name it writes into the shipped toolbox.json.
 source/
   main.cpp            # init, service registration, and the loop
   engine.hpp/.cpp     # the ipc::Engine ServiceCore reads the console out of
