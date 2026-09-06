@@ -1448,8 +1448,12 @@ add_test(NAME gate.rows
 set_tests_properties(gate.rows PROPERTIES TIMEOUT 120)
 
 # The save-overwrite census, which is the word "every" in hard rule 2's gate row.
-# The tests prove the two save paths back up first; this proves there are still
-# only two, against copies of core/ with a third added and with a backup removed.
+# The tests prove that each save path backs up first; this proves the set of them
+# is still the set somebody classified -- against copies of the tree with a
+# commit site added, one hidden behind a slash, one hidden in a block comment,
+# and a real BackUpFirst call deleted from each of the three paths that land on a
+# save. It deliberately names no count: the count moved the day M7-1 (#131)
+# landed a third, and a comment carrying one goes stale without failing.
 add_test(NAME gate.sites
          COMMAND "${BASH_PROGRAM}" "${GATE_TEST}" sites "${CMAKE_BINARY_DIR}")
 set_tests_properties(gate.sites PROPERTIES TIMEOUT 120)
