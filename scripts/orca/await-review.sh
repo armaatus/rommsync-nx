@@ -86,6 +86,9 @@ payload="$(mktemp)"; trap 'rm -f "$payload"' EXIT
 waited=0
 checks_due=0
 broken_before=""
+# Set from the rollup inside the throttled block below; declared here so a poll
+# that skips the block still has a value under `set -u`.
+review_dead=""
 while [ "$waited" -lt "$DEADLINE_SECONDS" ]; do
   if orca_fleet_stopped; then
     echo
@@ -120,11 +123,17 @@ try:
 except Exception:
     raise SystemExit
 skip = ('merge-gate', 'review against REVIEW.md')
+dead = ('FAILURE', 'TIMED_OUT', 'ACTION_REQUIRED')
 bad = [c.get('name') for c in checks
-       if (c.get('conclusion') or '') in ('FAILURE', 'TIMED_OUT', 'ACTION_REQUIRED')
-       and c.get('name') not in skip]
+       if (c.get('conclusion') or '') in dead and c.get('name') not in skip]
+review_dead = any(c.get('name') == 'review against REVIEW.md'
+                  and (c.get('conclusion') or '') in dead for c in checks)
 print(', '.join(n for n in bad if n))
+print('REVIEW_FAILED' if review_dead else '')
 " 2>/dev/null)"
+    # Two lines out of one capture: the failing check names, then the marker
+    # saying the review check itself is among the dead.
+    { IFS= read -r broken; IFS= read -r review_dead; } <<<"$broken" || true
     if [ -n "$broken" ] && [ "$broken" = "$broken_before" ]; then
       cat <<RED
 
@@ -147,12 +156,23 @@ RED
   # A review job that FAILED is not a review that is late. Waiting out the full
   # deadline for one costs 45 minutes and then says only "nothing arrived" --
   # which is what happened on PR #80, where the reviewer had already died on
-  # `Reached maximum number of turns (30)` four minutes in. Ask the run, and say
-  # the real reason immediately.
-  failed_run="$(GH_PAGER=cat gh run list --branch "$branch" --workflow "claude review" \
-                  --limit 1 --json conclusion,databaseId,headSha \
-                  --jq "[.[] | select(.headSha==\"$head\" and .conclusion==\"failure\")][0].databaseId" \
-                2>/dev/null)"
+  # `Reached maximum number of turns (30)` four minutes in. Say the real reason
+  # immediately.
+  #
+  # The rollup fetched just above already knows the check is dead, so this asks
+  # it rather than spending a `gh run list` on every poll. That mattered: an
+  # earlier version ran two extra calls per 30-second poll for up to 45 minutes,
+  # times three worktrees, against the same secondary rate limit the throttle
+  # above exists to respect -- and a rate-limited answer is indistinguishable
+  # from "nothing yet", which is precisely how #80 defeated the old check.
+  # Nothing is spent until there is a failure to explain.
+  failed_run=""
+  if [ -n "$review_dead" ]; then
+    failed_run="$(GH_PAGER=cat gh run list --branch "$branch" --workflow "claude review" \
+                    --limit 1 --json conclusion,databaseId,headSha \
+                    --jq "[.[] | select(.headSha==\"$head\" and .conclusion==\"failure\")][0].databaseId" \
+                  2>/dev/null)"
+  fi
   if [ -n "$failed_run" ] && [ "$failed_run" != "null" ]; then
     echo
     echo "The review job FAILED on this commit -- it is not coming. Run $failed_run:"

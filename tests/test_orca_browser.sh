@@ -574,6 +574,11 @@ case "$*" in
   *"pr list"*)  printf '[{"number":80}]\n' ;;
   *"run list"*) printf '4242\n' ;;
   *"run view"*) printf '##[error] Execution failed: Reached maximum number of turns (30)\n' ;;
+  # The rollup is what the script asks first: the review CHECK is dead, so it
+  # goes looking for the run behind it. Nothing else here is failing, so the
+  # red-build branch must not fire -- this has to exit 6, never 7.
+  *statusCheckRollup*)
+    printf '{"statusCheckRollup":[{"name":"review against REVIEW.md","conclusion":"FAILURE"},{"name":"host-tests","conclusion":"SUCCESS"}]}\n' ;;
   *"pr view"*)  printf '{"reviews":[]}\n' ;;
   *)            printf '\n' ;;
 esac
@@ -740,6 +745,66 @@ GHSTUB
     echo "PASS: the brief lists threads through open-threads.sh, not the REST comments list"
     ;;
 
+  brief_queues_the_merge_at_step_four)
+    # #90 went green with nothing queued to merge it: GitHub refuses auto-merge
+    # on an ALREADY-mergeable PR ("Pull request is in clean status"), and the
+    # guard forbids merging by hand, so the PR sat clean and untouched. The brief
+    # is the fleet's operating instruction -- a forward reference ("see step 6")
+    # is not an instruction to run anything, and an agent reading in order would
+    # queue it late and reproduce the bug. The command has to BE in step 4.
+    brief="$REPO_ROOT/scripts/orca/issue-command.sh"
+    step4="$(awk '/^\*\*4\. /{on=1} /^\*\*5\. /{on=0} on' "$brief")"
+    [ -n "$step4" ] || fail "could not find step 4 in the brief"
+    grep -q -- "--auto" <<<"$step4" \
+      || fail "step 4 does not carry the auto-merge command itself:
+$step4"
+    grep -q "gh pr merge" <<<"$step4" \
+      || fail "step 4 never names gh pr merge:
+$step4"
+    echo "PASS: the brief queues auto-merge in step 4, not by forward reference"
+    ;;
+
+  await_costs_nothing_while_the_review_is_healthy)
+    # The failed-review check used to spend a `gh run list` on EVERY poll -- up
+    # to 90 extra calls per waiting worktree over a 45-minute wait, times three
+    # worktrees, against the same secondary rate limit the red-build check is
+    # throttled to respect. Worse, a rate-limited answer is indistinguishable
+    # from "nothing failed", which is how #80 defeated the previous check. It now
+    # reads the rollup it already fetched, and asks about runs only once that
+    # rollup says the review check is dead.
+    make_fixture
+    cp "$REPO_ROOT"/scripts/orca/{await-review.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    stub="$TMPDIR_FIXTURE/stub-bin"
+    mkdir -p "$stub"
+    cat >"$stub/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+# Everything green and no review yet: the healthy wait.
+case "$*" in
+  *"pr list"*)          printf '[{"number":80}]
+' ;;
+  *"run list"*)         echo "$*" >>"$RUNLIST_LOG"; printf '
+' ;;
+  *statusCheckRollup*)  printf '{"statusCheckRollup":[{"name":"host-tests","conclusion":"SUCCESS"}]}
+' ;;
+  *"pr view"*)          printf '{"reviews":[]}
+' ;;
+  *)                    printf '
+' ;;
+esac
+GHSTUB
+    chmod +x "$stub/gh"
+    ( cd "$TMPDIR_FIXTURE" && git init -q . && git commit -q --allow-empty -m fixture ) 2>/dev/null
+    runlog="$TMPDIR_FIXTURE/runlist.log"; : >"$runlog"
+    ( cd "$TMPDIR_FIXTURE" &&
+      PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$TMPDIR_FIXTURE/fleet" RUNLIST_LOG="$runlog" \
+      AWAIT_REVIEW_DEADLINE=6 AWAIT_REVIEW_POLL=1 \
+      bash "$TMPDIR_FIXTURE/scripts/orca/await-review.sh" 80 >/dev/null 2>&1 )
+    calls="$(grep -c "claude review" "$runlog" || true)"
+    [ "${calls:-0}" = 0 ] \
+      || fail "spent $calls run-list call(s) while the review check was green; the rollup already said nothing failed"
+    echo "PASS: no run-list calls while the review check is healthy"
+    ;;
+
   *)
     echo "usage: $0 opens|reuses|foreign|no_romm|submits|no_draft|unstable" >&2
     echo "       watch_needs_issue|watch_late_draft|watch_grace|watch_submits|watch_single" >&2
@@ -747,6 +812,8 @@ GHSTUB
     echo "       await_reports_failed_review|await_reports_a_red_build" >&2
     echo "       fleet_notices_a_stalled_agent" >&2
     echo "       open_threads_hides_resolved|brief_never_lists_threads_over_rest" >&2
+    echo "       brief_queues_the_merge_at_step_four" >&2
+    echo "       await_costs_nothing_while_the_review_is_healthy" >&2
     exit 2
     ;;
 esac
