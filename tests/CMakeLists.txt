@@ -401,6 +401,7 @@ set(DEVICE_SCENARIOS
   recovers       # a token with no device id finds its device rather than making one
   deleted        # the device removed in RomM's UI, caught before a sync scopes by it
   revoked        # a 401 stays a 401 and does not become "no such device"
+  forbidden      # ...and a 403 is a missing scope, never reported as a revocation
   sync_disabled  # the user's own switch, reported as itself
   offline        # a dropped connection is not a verdict on the pairing
   impostor       # a 200 about a different device confirms nothing
