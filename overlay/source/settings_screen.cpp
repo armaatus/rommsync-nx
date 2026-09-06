@@ -48,25 +48,6 @@ constexpr s32 kRowIndent = 18;
 /// immediately after anything this screen does. Half a second at 60 Hz.
 constexpr int kPollFrames = 30;
 
-/// What a refusal the sysmodule named means for this button.
-///
-/// `kNotConfigured` and `kUnavailable` are the two a user can act on -- one is
-/// a missing `server.url`, the other is a sysmodule whose pairing half is not
-/// built yet -- and everything else is one sentence, because there is nothing
-/// different to do about any of them. All three leave the pairing alone, which
-/// is what the sentences say (`overlay_settings_view.hpp`).
-RepairOutcome OutcomeFor(ipc::Error error) {
-  switch (error) {
-    case ipc::Error::kNotConfigured:
-      return RepairOutcome::kNotConfigured;
-    case ipc::Error::kUnavailable:
-      return RepairOutcome::kUnavailable;
-    default:
-      break;
-  }
-  return RepairOutcome::kRefused;
-}
-
 }  // namespace
 
 SettingsScreen::SettingsScreen(IpcClient& client) : client_(client) { Rebuild(); }
@@ -151,12 +132,7 @@ void SettingsScreen::Poll() {
   // none of which is this screen's own (`screen_frame.hpp`).
   const Link link = frame_.Ready();
   if (link != Link::kOk) {
-    // The confirmation and the last answer go with the session they belonged
-    // to: a half-pressed button surviving a sysmodule that went away would fire
-    // on the first press after it came back.
-    repair_ = RepairState{};
-    view_ = RenderSettingsUnreachable(link, frame_.sysmodule_interface());
-    Rebuild();
+    ShowUnreachable(link);
     return;
   }
 
@@ -166,14 +142,22 @@ void SettingsScreen::Poll() {
     // `GetConfig` is documented never to fail -- an unconfigured console has a
     // configuration -- so a failure is the transport or a payload this build
     // cannot read, and which of the two is `Diagnose`'s to say.
-    repair_ = RepairState{};
-    view_ = RenderSettingsUnreachable(frame_.Diagnose(rc), frame_.sysmodule_interface());
-    Rebuild();
+    ShowUnreachable(frame_.Diagnose(rc));
     return;
   }
 
   config_ = config;
   Refresh();
+}
+
+void SettingsScreen::ShowUnreachable(Link link) {
+  // The confirmation and the last answer go with the session they belonged to:
+  // a half-pressed "Re-pair" surviving a sysmodule that went away would fire on
+  // the first press after it came back. Every caller of this owes that reset,
+  // which is most of why it is one function rather than five copies.
+  repair_ = RepairState{};
+  view_ = RenderSettingsUnreachable(link, frame_.sysmodule_interface());
+  Rebuild();
 }
 
 void SettingsScreen::Refresh() {
@@ -241,9 +225,7 @@ void SettingsScreen::PressRepair() {
   // The port and the handshake, as before any other command.
   const Link link = frame_.Ready();
   if (link != Link::kOk) {
-    repair_ = RepairState{};
-    view_ = RenderSettingsUnreachable(link, frame_.sysmodule_interface());
-    Rebuild();
+    ShowUnreachable(link);
     return;
   }
 
@@ -258,13 +240,11 @@ void SettingsScreen::PressRepair() {
       // A refusal the sysmodule named, which is not a transport failure --
       // drawing `kUnavailable` as "sys-rommsync is not running" is exactly what
       // `DecodeError` exists to prevent (#25). Nothing was discarded.
-      repair_.outcome = OutcomeFor(error);
+      repair_.outcome = RepairOutcomeFor(error);
       Refresh();
       return;
     }
-    repair_ = RepairState{};
-    view_ = RenderSettingsUnreachable(frame_.Diagnose(start), frame_.sysmodule_interface());
-    Rebuild();
+    ShowUnreachable(frame_.Diagnose(start));
     return;
   }
 
@@ -279,9 +259,7 @@ void SettingsScreen::PressRepair() {
       Refresh();
       return;
     }
-    repair_ = RepairState{};
-    view_ = RenderSettingsUnreachable(frame_.Diagnose(unpair), frame_.sysmodule_interface());
-    Rebuild();
+    ShowUnreachable(frame_.Diagnose(unpair));
     return;
   }
 

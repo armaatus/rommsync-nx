@@ -83,6 +83,15 @@ class SettingsScreen : public tsl::Gui {
   /// nothing -- into `view_`.
   void Poll();
 
+  /// Draw the sysmodule's absence, and drop everything that belonged to the
+  /// session that is gone.
+  ///
+  /// One function rather than the five call sites that reach it, because four
+  /// of them are error arms: the `repair_` reset is the easy half to forget,
+  /// and forgetting it leaves a half-pressed "Re-pair" armed across a sysmodule
+  /// restart.
+  void ShowUnreachable(Link link);
+
   /// Re-render `view_` from the last answer and rebuild the flat list.
   void Refresh();
 

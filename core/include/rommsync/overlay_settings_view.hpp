@@ -107,6 +107,15 @@ struct SettingsRow {
   /// M5-3 (#30) can write this key. Marked rather than offered: this screen is
   /// read-only, and the moment `overlay/` opens `config.ini` the invariant that
   /// the sysmodule owns writes is gone (docs/ARCHITECTURE.md).
+  ///
+  /// **The renderer deliberately draws nothing for it today**, and that is not
+  /// an omission: every row that is not a `kNavigate` is editable, so a marker
+  /// would be on every configuration row on the screen and would separate
+  /// nothing. It becomes worth drawing when #30 builds the editor and the set
+  /// stops being uniform -- a key it refuses, or a folder row that can only be
+  /// changed as a whole `roms` list rather than one path at a time. Until then
+  /// the flag is the model saying which keys `config::ApplyEdit` accepts, held
+  /// by `overlay.settings` rather than by a screenshot.
   bool editable = false;
 };
 

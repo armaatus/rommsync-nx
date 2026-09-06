@@ -313,7 +313,14 @@ void SetRepair(SettingsView* view, const ipc::ConfigView& config, const RepairSt
     // The sentence a destructive action owes a console with no dialog. It is
     // the notice rather than the button's `refusal`, which is what a press that
     // will not go through says.
-    view->notice = "This discards the pairing on this console";
+    //
+    // It names the pairing *first* because that is the order the press runs in
+    // and the order that decides what a refusal costs: nothing is discarded
+    // until a new pairing is genuinely starting, so a press that gets no
+    // further leaves the console exactly as it was. A sentence promising the
+    // discard outright would be a promise this button deliberately does not
+    // make (`overlay_settings_view.hpp`).
+    view->notice = "This starts a new pairing, then discards the one on this console";
     view->notice_tone = Tone::kWarn;
     return;
   }
@@ -337,6 +344,21 @@ const char* ToString(Destination destination) {
       return "pairing";
   }
   return "none";
+}
+
+RepairOutcome RepairOutcomeFor(ipc::Error error) {
+  switch (error) {
+    case ipc::Error::kNotConfigured:
+      return RepairOutcome::kNotConfigured;
+    case ipc::Error::kUnavailable:
+      return RepairOutcome::kUnavailable;
+    default:
+      break;
+  }
+  // Including `kOk`. This is only asked about a `StartPair` that failed, and a
+  // refusal that named no error is a refusal -- reading it as anything else
+  // would draw a pairing that is not happening.
+  return RepairOutcome::kRefused;
 }
 
 std::string RepairOutcomeText(RepairOutcome outcome) {

@@ -436,6 +436,62 @@ void CheckTheUrlIsNeverBesideAComplaint(Checks& checks) {
   }
 }
 
+/// A `server.url` too long to send, which `GetConfig` withholds.
+///
+/// The path #26 named and no case above reached: over `ipc::kMaxServerUrlBytes`
+/// the sysmodule clears the field and appends a `kError` rather than making the
+/// payload unsendable (`ServiceCore::GetConfig`). Built the way that command
+/// builds it, because a `ConfigView` is all the screen ever sees.
+///
+/// **What this pins is a known limitation, not the render #26 would have
+/// chosen.** `ipc::ConfigView` carries no flag telling a withheld URL from a
+/// console that never had one, so `Config::configured()` is false either way and
+/// the headline is the no-server one on a console that syncs fine. What has to
+/// hold regardless is that the complaint naming the real cause is on screen and
+/// first, and that no line carries the URL. The fix is a flag beside
+/// `platforms_truncated`, which is an `ipc::kVersion` bump; #26 records it.
+void CheckAWithheldUrlSaysWhy(Checks& checks) {
+  // The URL the console has and the payload does not. Over
+  // `ipc::kMaxServerUrlBytes` by construction, so this is the case that reaches
+  // the withholding arm rather than one that merely looks like it.
+  const std::string url = "https://romm.example.com/" + std::string(ipc::kMaxServerUrlBytes, 'a');
+  checks.Expect(url.size() > ipc::kMaxServerUrlBytes, "the URL really is one GetConfig withholds");
+
+  ipc::ConfigView sent;
+  sent.config = config::Defaults();
+  // Exactly what `ServiceCore::GetConfig` does with one this long: the value is
+  // cleared and named, never sent.
+  sent.config.server.url.clear();
+  std::vector<config::Diagnostic> diagnostics;
+  diagnostics.push_back(config::Diagnostic{
+      config::Severity::kError, 0, "server", "url",
+      "the configured server URL is too long to send over IPC; edit config.ini directly"});
+  sent.diagnostics = ipc::TrimDiagnostics(diagnostics);
+  checks.Expect(sent.config.server.url.empty(), "the payload carries no URL at all");
+
+  const ipc::Decoded<ipc::ConfigView> decoded = ipc::DecodeConfigView(ipc::EncodeConfigView(sent));
+  checks.Expect(decoded.ok(), "a withheld URL round-trips through the wire");
+  const overlay::SettingsView view = overlay::RenderSettings(decoded.value);
+
+  const overlay::SettingsRow* row = RowNamed(view, "[server]", "url");
+  checks.Expect(row != nullptr && !row->value.empty(),
+                "the url row still carries text rather than a blank the eye skips");
+  checks.Expect(row != nullptr && !Contains(row->value, "aaaa"),
+                "and it is not the URL, which the payload never carried");
+
+  checks.Expect(!view.complaints.empty(), "the complaint is drawn");
+  if (!view.complaints.empty()) {
+    checks.Expect(Contains(view.complaints.front().value, "too long"),
+                  "and it is first, because it is the one that names the cause");
+    checks.Expect(Contains(view.complaints.front().value, "config.ini"),
+                  "and says where to fix it");
+  }
+  for (const overlay::Line& line : view.complaints) {
+    checks.Expect(!Contains(line.value, url), "no complaint quotes the URL back");
+    checks.Expect(!Contains(line.value, "aaaa"), "nor any part of it");
+  }
+}
+
 // --- the menu and the button ---------------------------------------------------
 
 /// The root menu this overlay did not have.
@@ -457,9 +513,12 @@ void CheckMenuReachesEveryScreen(Checks& checks) {
   bool library = false;
   bool pairing = false;
   for (const overlay::SettingsRow& row : menu.rows) {
-    checks.Expect(row.selectable, "every menu row can be pressed");
-    checks.Expect(row.kind == overlay::SettingsRowKind::kNavigate, "and is a menu row");
-    checks.Expect(!row.editable, "a menu row is not a setting");
+    const std::string what = overlay::ToString(row.destination);
+    checks.Expect(row.selectable, "every menu row can be pressed: " + what);
+    checks.Expect(row.kind == overlay::SettingsRowKind::kNavigate, "and is a menu row: " + what);
+    checks.Expect(!row.editable, "a menu row is not a setting: " + what);
+    checks.Expect(row.destination != overlay::Destination::kNone,
+                  "and opens something: " + row.label);
     sync = sync || row.destination == overlay::Destination::kSync;
     library = library || row.destination == overlay::Destination::kLibrary;
     pairing = pairing || row.destination == overlay::Destination::kPairing;
@@ -806,6 +865,7 @@ int main() {
   CheckEditableRowsAreMarked(checks);
   CheckRepairConfirmsBeforeItAsks(checks);
   CheckEveryRepairOutcomeIsDrawn(checks);
+  CheckAWithheldUrlSaysWhy(checks);
   CheckEveryRefusalIsRead(checks);
   CheckNoServerLeadsAndStillOffersRepair(checks);
   CheckUnreachable(checks);

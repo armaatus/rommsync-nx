@@ -496,6 +496,14 @@ code, and the output is searched for both.
   bearer token under a name nobody looks at. Each is zeroed first, which claims
   nothing on flash — see [SECURITY.md](SECURITY.md#token-at-rest-on-the-sd). It
   does not touch `device.dat` — see [Client identifier](#client-identifier).
+- **The button asks before it discards, and that inverts the order above.**
+  `overlay/source/settings_screen.cpp` sends `StartPair` *first* and `Unpair`
+  only once a pairing is genuinely starting. `SdEngine::StartPairing` still
+  answers `kUnavailable` (nothing owns building it), and a refused `StartPair`
+  writes nothing and touches no token — so the documented order would discard a
+  working pairing on a console that then has no way to pair again. The end state
+  is the one described above; what changes is that a console never passes
+  through "unpaired with nothing to restart". M4-4 (#26) records it.
 - Revoking on the server (`DELETE /api/client-tokens/{id}`) invalidates it; the
   sysmodule detects `401`, marks itself unauthenticated, and prompts re-pair via
   the overlay status screen.
