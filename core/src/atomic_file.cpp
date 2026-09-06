@@ -1,5 +1,6 @@
 #include "rommsync/atomic_file.hpp"
 
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -9,6 +10,22 @@
 
 namespace rommsync::io {
 namespace {
+
+/// The platform hook, or null. See `SetFileSync`: set once from `main`, and
+/// atomic so that a late call cannot race the first write rather than because
+/// swapping it mid-write is supported.
+std::atomic<FileSync> g_file_sync{nullptr};
+
+/// Put the closed file at `path` on the card, if the platform said how.
+///
+/// Called after the handle is closed and before the rename that publishes the
+/// file: flushing and closing move the bytes from stdio to the OS, and this is
+/// what moves them from the OS to the card. With no hook installed the answer is
+/// "yes" and the promise stays the weaker one.
+bool Synced(const std::string& path) {
+  const FileSync hook = g_file_sync.load(std::memory_order_relaxed);
+  return hook == nullptr || hook(path);
+}
 
 constexpr const char* kTempSuffix = ".tmp";
 constexpr const char* kPreviousSuffix = ".old";
@@ -51,6 +68,10 @@ bool ShredOne(const std::string& path) {
 }
 
 }  // namespace
+
+void SetFileSync(FileSync sync) { g_file_sync.store(sync, std::memory_order_relaxed); }
+
+FileSync GetFileSync() { return g_file_sync.load(std::memory_order_relaxed); }
 
 const char* ToString(WriteError error) {
   switch (error) {
@@ -138,10 +159,15 @@ WriteResult WriteAtomically(const std::string& path, std::string_view contents) 
   const std::size_t written = std::fwrite(contents.data(), 1, contents.size(), file);
   // The flush has to happen while the handle is still open: fclose reports a
   // failed flush too, but by then there is nothing left to distinguish "the
-  // bytes never left the buffer" from "the close itself failed".
+  // bytes never left the buffer" from "the close itself failed". The sync has
+  // to happen there for a harder reason -- it needs the handle.
   const bool flushed = written == contents.size() && std::fflush(file) == 0;
   const bool closed = std::fclose(file) == 0;
-  if (!flushed || !closed) {
+  // After the close and before the commit below, which is the only ordering
+  // that means anything: the bytes have to be on the card before the rename
+  // publishes them.
+  const bool synced = flushed && closed && Synced(temp);
+  if (!flushed || !closed || !synced) {
     std::remove(temp.c_str());
     return {WriteError::kWriteFailed, Describe(temp, "could not be written completely")};
   }
@@ -219,7 +245,12 @@ CopyResult CopyAtomically(const std::string& from, const std::string& to) {
     result.message = Describe(from, "could not be read to the end");
     return result;
   }
-  if (short_write || !flushed || !closed) {
+  // Only once the bytes are known to be all there, and before the commit below
+  // -- which is the whole point of this copy: the previous bytes have to be on
+  // the card before the save they came from is overwritten. Syncing a temp file
+  // that is about to be deleted would just be a slow way to fail.
+  const bool synced = !short_write && flushed && closed && Synced(temp);
+  if (short_write || !flushed || !synced || !closed) {
     std::remove(temp.c_str());
     result.error = CopyError::kWriteFailed;
     result.message = Describe(temp, "could not be written completely");

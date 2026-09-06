@@ -224,8 +224,8 @@ gets a fresh datetime tag and therefore a new row (above), which is the reason a
 earlier revision gave, then withdrew, and which turns out to have been right. And
 the plan describes a state the server may have moved on from, so the arbiter of
 that is a fresh negotiation rather than this client. A failed operation is
-counted, left alone, and picked up by the next negotiation; M2-7 owns the
-schedule between ticks.
+counted, left alone, and picked up by the next negotiation. `sync::RunTick`
+owns the order of one tick and M7-2 owns the schedule between ticks.
 
 **A save the client has no local file for** (`download` /
 `Save exists on server but not on client`) needs a destination the plan cannot
@@ -251,14 +251,21 @@ than being written over. `sync::BackupFileName` is the one spelling of that,
 and `harness::Sandbox::BackupPathFor` calls it so the audit and the code under
 test cannot disagree.
 
-**What the backup promises is ordering, not durability.** The copy is flushed
-and renamed before the save is touched, so no reader ever sees half a backup and
-no overwrite happens without one — but the `fsync` that would put the copied
-*bytes* on the card before the rename is not something `core/` can call with
-only standard headers. A console that loses power between the copy and the
-overwrite can therefore leave a backup whose data blocks never landed. Closing
-that needs a platform hook, and belongs with the rest of the power-loss
-recovery (M2-7).
+**The backup promises ordering, and — once the platform layer has said how —
+durability too.** The copy is flushed, closed, made durable and only then renamed
+into place, before the save is touched: no reader ever sees half a backup, no
+overwrite happens without one, and a console that loses power between the copy
+and the overwrite does not leave a backup whose name landed and whose data blocks
+never did.
+
+That last part is `io::FileSync`, a hook the platform layer installs because
+neither `fsync` nor Horizon's `fsFsCommit` is reachable from `core/`.
+`host/src/file_sync.cpp` syncs one descriptor; `sysmodule/source/main.cpp` calls
+`fsdevCommitDevice("sdmc:")`, which is the only primitive devkitA64 has — its
+newlib exports no `fsync` at all, which is why the hook takes a path rather than
+an open handle. A hook that refuses fails the copy, so a backup that could not be
+put on the card stops the overwrite rather than being counted as one. With none
+installed the older, weaker promise stands.
 
 ### Conflicts
 
@@ -374,6 +381,91 @@ sync: a lost baseline costs time, not correctness.
 Same flow via `/api/states` (field `stateFile`). **Off by default** — states are
 core- and version-specific; only enable when your devices run matching cores.
 Config: `sync.states = true`.
+
+## One tick, and what interrupting it may leave
+
+`sync::RunTick` ([`core/include/rommsync/sync_tick.hpp`](../core/include/rommsync/sync_tick.hpp))
+is the whole loop in one call: recover, negotiate, execute, finish. It owns
+neither end — the scan is step 0's and the schedule between ticks is M7-2's — and
+it re-implements no retry, because `sync::CallPolicy` already times out, retries
+and backs off on both API calls.
+
+**The rule it exists to keep**: the state left behind after any interruption is
+either the state before the tick, or a strictly completed subset of it. There is
+no third legal outcome.
+
+### On entry: what a crash left behind
+
+A *handled* failure clears its own staging. This is the sweep for the case where
+no cleanup got to run — `sync::RecoverStaging`, over the save folders,
+`/config/rommsync` and its `.backup/`:
+
+| left behind | by | what happens to it |
+|---|---|---|
+| `<save>.tmp.part` | a download the process died during | removed. `DownloadTarget::resume` is false for a save, so nothing in it is worth keeping and the next tick refetches |
+| `<save>.tmp` | a download whose body ended and whose commit did not | **removed, not committed.** See below |
+| `<save>.old` | an interrupted `io::CommitStaged` | renamed back when `<save>` is missing — it is then the only copy of the save — and removed when `<save>` is there, because the commit finished and the previous bytes are already under `.backup/` |
+| `.backup/<rom_id>-<slot>-<ts>.<ext>` | any overwrite | never touched. A backup is never garbage: it is the copy M7-1 restores from, including one written for an overwrite that then failed |
+
+**A `<save>.tmp` is discarded rather than finished, and an earlier revision of
+this page and of issue #16 said the opposite.** The reasoning was that a `.tmp`
+holds complete, *verified* bytes that never landed. It holds complete bytes; it
+does not hold verified ones. `ExecutePlan` stages a download at
+`io::TempPathFor(<save>)`, and `http::DownloadTarget` renames its `.part` onto
+that path the moment the body ends — which is *before* the MD5 check and before
+the previous bytes are backed up. So a `.tmp` a crash left may be the wrong save,
+with no backup beside it, and nothing at recovery time can tell: the digest that
+would settle it lived in a plan that is gone. Committing it would overwrite a
+save with unverified bytes and no backup, which is hard rule 2 broken in the one
+place it matters. Discarding costs one refetch.
+
+**A bare `<name>.part` is left alone.** Only `<name>.tmp.part` is swept. A `.part`
+beside a rom is a M3-3 range-resume in progress, and a sweep that took it would
+throw away a gigabyte of a transfer that was going to finish.
+
+The sweep runs *before* the network, and it is right to run it on a tick that
+turns out to be offline: it only removes litter and puts back a save an
+interrupted commit parked. It writes no backup, no save and no `state.db`.
+
+### On entry: the directory `core/` cannot create
+
+`sdmc:/config/rommsync/.backup/` missing is an `OperationError::kBackupFailed`
+*before* the save is touched — no backup, no overwrite — so on a first boot every
+download failed until something made the folder.
+`fs::FileSystem::CreateDirectory` is that platform facility, behind the interface
+that already owns the card, and `RunTick` calls it on entry. A directory that is
+already there is success.
+
+### Cancellation
+
+`TickOptions::cancel` is **one** `http::CancelToken`, copied onto the negotiate
+policy, the execute options and the complete policy, and checked between the
+stages. A shutdown or an overlay "stop" therefore ends the tick at an operation
+boundary rather than mid-write, and without spending three timeouts plus two
+backoffs on the accounting call afterwards — on the link whose loss is usually
+why the shutdown happened. A token already fired costs no request at all. Who
+fires it is the scheduler's (M7-2) and the overlay's (M4-2).
+
+### A session that is not this tick's to close
+
+`CompleteError::kAlreadyCompleted`, `kSuperseded` and `kNoSuchSession` all set
+`TickResult::session_gone`, and none of them is a reason to re-run the plan. The
+first means the accounting succeeded — a retry landing after the first attempt
+got through looks exactly like it — and the other two mean the counts will never
+be recorded. In all three the transfers already happened and the baseline is on
+the card, so the answer is the next tick's own negotiation.
+
+### What the tick says it did
+
+`TickOutcome` is split on what the scheduler would *do*: `kCompleted`,
+`kPartial` (some operations did not happen; the next negotiation plans them
+again), `kUnreported` (the transfers landed and the accounting did not),
+`kOffline` (nothing was written — back off), `kRefused` (an answer that does not
+change on a second attempt), `kUnauthorized` and `kCanceled`.
+`TickResult::answer` is separate and is what `auth::Gate::Observe` takes: it is
+the **last** word on the credentials rather than the worst one, because one 401
+is not a verdict and a completion the same token was accepted for is proof it
+still works (M1-4).
 
 ## Failure & safety rules
 

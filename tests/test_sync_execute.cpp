@@ -872,8 +872,8 @@ void Truncate(rig::Checks& checks, http::HttpClient& client, const std::string& 
                   "and nothing was backed up, because nothing was going to be overwritten");
   }
   // Not "no backup was needed" -- no backup exists at all. A backup written for
-  // an overwrite that never happened is a file the next tick has to reason
-  // about (issue #16).
+  // an overwrite that never happened is a file the next tick would have to
+  // reason about, and `sync::RecoverStaging` deliberately never touches one.
   checks.Expect(!sandbox.HasBackupOf(previous), "there is no stray backup under .backup/");
 
   harness::DeleteSave(client, base, fixture, server.id);
@@ -1191,9 +1191,9 @@ void Dropped(rig::Checks& checks, http::HttpClient& client, const std::string& b
   // And leaves nothing behind. The backend keeps its `.part` for a resume that
   // this client never performs, so a handled failure clears both it and the
   // staging path -- otherwise a save whose download is interrupted and never
-  // planned again keeps a dead `Game.srm.tmp.part` on the card forever. What
-  // issue #16 still has to sweep is the same pair after a *crash*, where no
-  // cleanup got to run.
+  // planned again keeps a dead `Game.srm.tmp.part` on the card forever. The
+  // same pair after a *crash*, where no cleanup got to run, is
+  // `sync::RecoverStaging`'s -- `tick.recovery`.
   checks.Expect(!sandbox.Exists(io::TempPathFor(SavePath(name)) + ".part"),
                 "the partial is cleared: it is never resumed, so it is litter");
   checks.Expect(!sandbox.Exists(io::TempPathFor(SavePath(name))),

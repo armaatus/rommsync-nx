@@ -23,9 +23,11 @@
 #include <switch.h>
 
 #include <cstring>
+#include <string>
 
 #include "engine.hpp"
 #include "ipc/server.hpp"
+#include "rommsync/atomic_file.hpp"
 #include "rommsync/core.hpp"
 #include "rommsync/ipc.hpp"
 
@@ -47,6 +49,27 @@ alignas(16) u8 g_inner_heap[kInnerHeapSize];
 /// scope variable because `__appInit` takes no arguments and returns nothing --
 /// it is libnx's hook, not ours.
 Handle g_service_port = INVALID_HANDLE;
+
+/// The Horizon half of `io::FileSync` (#16): make what was just written
+/// durable, before the rename that publishes it.
+///
+/// `fsdevCommitDevice` rather than a per-file sync, because devkitA64's newlib
+/// exports no `fsync` and libnx offers no way to reach the `FsFile` behind a
+/// `FILE*`. `fsFsCommit` on `sdmc:` is the primitive Horizon does have, and it
+/// covers the staged file the way the contract in `atomic_file.hpp` allows: the
+/// path is ignored because everything on this card is committed together.
+///
+/// **What it buys is hard rule 2 on a console that loses power**: without it a
+/// save's backup can be renamed into place while the copied bytes are still only
+/// in a cache, which is a backup that reads as present and holds nothing
+/// (docs/SYNC_PROTOCOL.md#backups). It is also the reason to keep the writes
+/// this runs on rare -- one per record and one per backup, not one per chunk.
+///
+/// The name carries its colon: newlib's `FindDevice` reads a name without one as
+/// "the default device", which is right only by accident.
+bool HorizonFileSync(const std::string&) {
+  return R_SUCCEEDED(fsdevCommitDevice("sdmc:"));
+}
 
 }  // namespace
 
@@ -120,6 +143,10 @@ int main(int, char**) {
   // an afternoon, and version() is the cheapest possible answer.
   const char* ua = rommsync::version();
   svcOutputDebugString(ua, std::strlen(ua));
+
+  // Before anything writes, and once: `io::SetFileSync` is process-wide and is
+  // not meant to be swapped while a write is in flight (atomic_file.hpp).
+  rommsync::io::SetFileSync(&HorizonFileSync);
 
   // Read once, here rather than per request: `GetStatus` and `GetConfig` are
   // documented never to fail and are polled every frame by the status screen,
