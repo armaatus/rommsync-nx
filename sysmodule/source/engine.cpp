@@ -6,6 +6,7 @@
 
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/auth.hpp"
+#include "rommsync/auth_gate.hpp"
 #include "rommsync/config.hpp"
 #include "rommsync/download.hpp"
 #include "rommsync/ipc.hpp"
@@ -38,6 +39,38 @@ void SdEngine::Load(const std::string& config_dir) {
   auth_ = record.error == io::ReadError::kMissing ? ipc::AuthState::kNeverPaired
                                                   : ipc::AuthState::kPaired;
 
+  // M1-4 (#8): the one state that cannot be worked out from the card alone is
+  // read off the card anyway, because a *previous* boot asked the server and
+  // wrote down the answer. Without it the overlay draws "paired" until the
+  // engine has spent `auth::GateConfig::max_consecutive_rejections` requests
+  // reaching the same conclusion again, on every boot.
+  //
+  // Only over a token that is there. A verdict left behind by a pairing that
+  // has since been discarded is about credentials this console no longer holds,
+  // and reporting it would send a never-paired user to a "pair again" screen
+  // that is one word wrong.
+  const auth::LoadedBlock verdict = auth::LoadBlock(PathTo(auth::kAuthStateFileName));
+  auth_diagnostics_.clear();
+  if (!verdict.diagnostic.empty()) {
+    // A warning and never an error: this file holds nothing that cannot be
+    // worked out again by asking, so an unreadable one costs the rejection
+    // budget and nothing else. It is said out loud anyway, because `core/` has
+    // no logger and the settings screen (#26) is the one place on this console a
+    // user can read a complaint.
+    auth_diagnostics_.push_back({config::Severity::kWarning, 0, "", "", verdict.diagnostic});
+  }
+  if (auth_ == ipc::AuthState::kPaired) {
+    gate_.Restore(verdict.value);
+    if (gate_.blocked()) {
+      auth_ = ipc::AuthState::kUnauthenticated;
+    }
+  } else {
+    // A verdict about credentials this console no longer holds. Honouring it
+    // would send a user who has never paired to a screen that says "pair this
+    // console *again*", which is one word wrong about what happened to them.
+    gate_.Reset();
+  }
+
   // The queue never refuses to produce one either: a corrupt or oversized
   // `queue.json` is an empty queue plus a diagnostic, and nothing may block boot
   // (`download.hpp`, CLAUDE.md).
@@ -61,7 +94,8 @@ void SdEngine::Load(const std::string& config_dir) {
 void SdEngine::AdoptConfig(config::LoadResult loaded) {
   config_ = std::move(loaded.value);
   diagnostics_ = queue_diagnostics_;
-  diagnostics_.reserve(diagnostics_.size() + loaded.diagnostics.size());
+  diagnostics_.reserve(diagnostics_.size() + auth_diagnostics_.size() + loaded.diagnostics.size());
+  diagnostics_.insert(diagnostics_.end(), auth_diagnostics_.begin(), auth_diagnostics_.end());
   for (config::Diagnostic& diagnostic : loaded.diagnostics) {
     diagnostics_.push_back(std::move(diagnostic));
   }
@@ -188,6 +222,16 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
                             "server was not changed"});
     return ipc::Error::kWriteFailed;
   }
+  if (server_changed) {
+    // The verdict was about the token that has just gone, and about the server
+    // that issued it. Left behind, it would put a console that has never paired
+    // with the *new* server on a "pair again" screen (M1-4, #8). Not a refusal
+    // if it fails: unlike the token, a stale verdict here costs a wrong sentence
+    // rather than a bearer token pointed at a stranger, and the pairing is
+    // already gone by this point.
+    auth::ClearBlock(PathTo(auth::kAuthStateFileName));
+    gate_.Reset();
+  }
 
   const io::WriteResult wrote = io::WriteAtomically(PathTo(config::kConfigFileName), written);
   if (!wrote.ok()) {
@@ -238,7 +282,23 @@ bool SdEngine::RequestSync() {
 
 ipc::Error SdEngine::StartPairing() { return ipc::Error::kUnavailable; }
 
-ipc::Error SdEngine::Unpair() { return ipc::Error::kUnavailable; }
+ipc::Error SdEngine::Unpair() {
+  // The credentials first: see the header note on the order.
+  if (!auth::DiscardToken(PathTo(auth::kTokenFileName))) {
+    return ipc::Error::kWriteFailed;
+  }
+  // A verdict that outlived the token it was about is what would leave a
+  // freshly re-paired console on the re-pair screen, so this failing is a
+  // refusal rather than something to shrug at -- and the token really is gone,
+  // which the message the overlay draws has to be able to say.
+  if (!auth::ClearBlock(PathTo(auth::kAuthStateFileName))) {
+    auth_ = ipc::AuthState::kNeverPaired;
+    return ipc::Error::kWriteFailed;
+  }
+  gate_.Reset();
+  auth_ = ipc::AuthState::kNeverPaired;
+  return ipc::Error::kOk;
+}
 
 ipc::Error SdEngine::Enqueue(std::int64_t rom_id, std::int32_t* position) {
   return Commit([&] { return queue_.Enqueue(rom_id, position); });

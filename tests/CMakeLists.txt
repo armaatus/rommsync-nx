@@ -516,6 +516,7 @@ set(EXECUTE_RIG_SCENARIOS
   occupied        # overwrite=true, in the state it exists for: a 409 without it
   dropped         # a TCP reset mid-download costs a tick, not a save
   collision       # two saves of one rom, one second, two backups
+  revoked         # M1-4: a 401 stops the plan where it stands, and touches no save
 )
 foreach(scenario IN LISTS EXECUTE_RIG_SCENARIOS)
   add_test(NAME execute.${scenario} COMMAND test_sync_execute ${scenario})
@@ -689,6 +690,7 @@ set(COMPLETE_RIG_SCENARIOS
   session    # negotiate -> execute -> complete, and the baseline afterwards
   unchanged  # a second tick plans no work, and is planned 0 without being an error
   reported   # a partly failed plan sends the real counts; the failed row stands
+  revoked    # M1-4: a 401 mid-tick ends it cleanly, and the baseline survives
   refused    # a 500 on complete loses the tick, never the baseline
   truncated  # a clean short body is a named parse error, not a half-read session
 )
@@ -1076,6 +1078,7 @@ set(ENGINE_SCENARIOS
   commit    # M5-3: a commit interrupted between the two renames loses nothing
   unpairs   # M5-3: a server change discards the pairing before it writes
   stale     # M5-3: "did the server change" is a question about the card
+  unauthenticated  # M1-4: the verdict the card carries, and the re-pair that lifts it
   commands  # what is still `kUnavailable`, so the list shrinks deliberately
 )
 foreach(scenario IN LISTS ENGINE_SCENARIOS)

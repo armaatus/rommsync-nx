@@ -46,6 +46,7 @@
 #include <vector>
 
 #include "harness.hpp"
+#include "rommsync/auth_gate.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/sync.hpp"
 #include "rommsync/token_store.hpp"
@@ -471,6 +472,21 @@ int Revoked(http::HttpClient& client, const std::string& base, const Fixture& fi
                     "and no session was opened, so there is nothing to complete");
     checks.Expect(denied.message.find(fixture.token) == std::string::npos,
                   "and the message does not quote the token back");
+
+    // **The mistake this assertion exists for destroys saves.** An empty plan
+    // and a refused one look identical if you only read `plan.operations`: both
+    // are a vector of size zero. A caller that treated this as "the server has
+    // no saves" would upload nothing, delete nothing it should have kept, and
+    // -- worse, once M2-7 lands a reconciliation -- take the server's silence
+    // for a library that is genuinely empty. `ok()` is what separates them, and
+    // it is the only thing that does, so it is pinned here rather than left to
+    // a reviewer noticing that every caller checks it (M1-4, #8).
+    checks.Expect(!denied.ok(), "a refused negotiation is not a successful one");
+    checks.Expect(denied.error != sync::NegotiateError::kNone,
+                  "an empty plan with no error is what \"the server has no saves\" looks like, "
+                  "and a 401 must never produce one");
+    checks.Expect(sync::AnswerOf(denied.error) == auth::Answer::kRejected,
+                  "and the gate counts it as a rejection rather than a good tick");
   }
 
   // The fault disarmed itself. What the client must NOT have concluded is that
@@ -482,6 +498,14 @@ int Revoked(http::HttpClient& client, const std::string& base, const Fixture& fi
   checks.Expect(recovered.ok(),
                 "the same token still works -- one 401 is not a verdict on the pairing: " +
                     recovered.message);
+
+  // Which is what `auth::Gate` is for: the counting M1-4 (#8) added, driven by
+  // the two answers this scenario actually got from a live server.
+  auth::Gate gate;
+  gate.Observe(sync::AnswerOf(sync::NegotiateError::kUnauthorized));
+  checks.Expect(!gate.blocked(), "one 401 does not discard the pairing");
+  gate.Observe(sync::AnswerOf(recovered.error));
+  checks.ExpectEq(gate.rejections(), 0, "and the tick that worked clears the count");
   return checks.failures();
 }
 

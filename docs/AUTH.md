@@ -494,9 +494,58 @@ code, and the output is searched for both.
 - Revoking on the server (`DELETE /api/client-tokens/{id}`) invalidates it; the
   sysmodule detects `401`, marks itself unauthenticated, and prompts re-pair via
   the overlay status screen.
-- Because `expires_at` is null, a `401` means **revoked**, not expired. Do not
-  retry it as a transient failure — go straight to unauthenticated and ask for
-  a re-pair.
+- Because `expires_at` is null, a `401` means **revoked**, not expired. There is
+  nothing to refresh and nothing that starts working again on its own, so it is
+  never retried as a transient failure.
+
+**But one `401` is not a verdict**, and this is the correction M1-4 (#8) made to
+the sentence that used to stand here. RomM's own endpoints aside, a `401` can
+come from something in *front* of RomM — an authenticating reverse proxy, a
+gateway having a bad minute — and the token that got it usually still works.
+`harness.expired` shows exactly that against the live fixture: one `401`
+mid-flow, then the very same token accepted. A client that discarded `token.dat`
+on the first one would send the user to a pairing screen for a proxy hiccup.
+
+So the counting lives in [`auth_gate.hpp`](../core/include/rommsync/auth_gate.hpp):
+
+- `auth::AnswerOf(const http::Result&)` reads any exchange for what it says about
+  the credentials — `401` is a rejection, `403` is a scope, a `2xx` is an
+  acceptance, and everything else, a `5xx` and a `429` included, says nothing.
+  Each classified error enum has an overload beside it
+  (`sync::AnswerOf(NegotiateError)` and the rest), mapped conservatively:
+  `kAccepted` only where the answer is proof RomM read the token, so a bare `4xx`
+  never clears a count a proxy is running up. **Only an exchange that carried the
+  bearer token may be observed** — the device-code endpoints take none.
+- `auth::Gate` counts consecutive rejections and gives up on the pairing at
+  `GateConfig::max_consecutive_rejections`, which is the same budget and the same
+  argument as `PairingConfig::max_rejected_polls`. Between them it paces the
+  retries with a doubling, capped backoff, because this runs on a battery.
+- An acceptance clears the count but never a verdict already reached: a blocked
+  client makes no calls, so `Gate::Reset()` — what re-pairing calls — is the only
+  exit.
+- A `403` is **not** a revocation. RomM approves what the *user* ticked, so it is
+  a scope missing from a pairing that otherwise works ([Scopes](#scopes)).
+  Both send the user back to the pairing flow and neither is retryable, but the
+  sentences differ, and only "your pairing is gone" is true of a `401`.
+  `auth::Block` carries the two, and `sync::NegotiateError`,
+  `sync::CompleteError`, `sync::OperationError`, `auth::RegistrationError` and
+  `download::DrainOutcome` each split them.
+
+The verdict is persisted to `sdmc:/config/rommsync/auth.json`, one small object
+that **exists only while the server has stopped accepting the token**:
+
+```json
+{"format":"rommsync-auth","version":1,"block":"revoked"}
+```
+
+It is what puts the overlay's re-pair prompt up on the first poll after a boot,
+instead of after the engine has spent the whole rejection budget re-deriving a
+conclusion the last boot already reached. It is never a gate on boot — a file
+that will not read, or that names a state this build does not know, is no verdict
+at all, and the worst it costs is those requests. That is the opposite call from
+`token.dat`, and rightly: this file holds nothing that cannot be worked out again
+by asking. `Unpair` clears it along with the token, and a `server.url` change
+clears it too, since the token it judged is gone.
 
 ## Scopes
 

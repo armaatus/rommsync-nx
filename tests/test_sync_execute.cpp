@@ -31,6 +31,7 @@
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/host/native_file_system.hpp"
 #include "rommsync/md5.hpp"
+#include "rommsync/auth_gate.hpp"
 #include "rommsync/sync_execute.hpp"
 
 namespace {
@@ -1218,6 +1219,109 @@ void Dropped(rig::Checks& checks, http::HttpClient& client, const std::string& b
   harness::DeleteSave(client, base, fixture, server.id);
 }
 
+// --- revoked ------------------------------------------------------------------
+//
+// M1-4 (#8): a 401 arriving part way through a plan.
+//
+// It is not this operation's problem and it is not the next one's either -- the
+// token is gone, so every remaining operation would be refused the same way.
+// Twenty requests to prove that is nineteen too many on a battery, and each one
+// of them is a chance to have half-written something. `ExecutePlan` stops where
+// it stands, the call `download::Drain` already makes for its queue.
+//
+// Two uploads, and the fault spends itself on the first. That is what makes the
+// stop observable rather than assumed: if the plan carried on, the second upload
+// would meet a healthy server and succeed.
+
+void Revoked(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+             const Fixture& fixture, const harness::Rom& rom) {
+  Sandbox sandbox(checks, "execute-revoked");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+
+  const std::string first_slot = harness::UniqueSlot("m1-4-revoked-a");
+  const std::string second_slot = harness::UniqueSlot("m1-4-revoked-b");
+  const std::string first_name = "revoked-a.srm";
+  const std::string second_name = "revoked-b.srm";
+  const std::string first_bytes = "the save the 401 lands on\n";
+  const std::string second_bytes = "the save that is never attempted\n";
+  sandbox.SeedSave(SavePath(first_name), first_bytes);
+  sandbox.SeedSave(SavePath(second_name), second_bytes);
+
+  sync::SyncNegotiatePayload payload;
+  payload.device_id = fixture.device_id;
+  const auto now = std::chrono::system_clock::now();
+  payload.saves.push_back(harness::LocalSave(rom.id, first_name, first_slot, "m1-4",
+                                             crypto::Md5Hex(first_bytes), now,
+                                             static_cast<std::int64_t>(first_bytes.size())));
+  payload.saves.push_back(harness::LocalSave(rom.id, second_name, second_slot, "m1-4",
+                                             crypto::Md5Hex(second_bytes), now,
+                                             static_cast<std::int64_t>(second_bytes.size())));
+
+  sync::SyncPlan plan;
+  if (!PlanFor(checks, client, base, fixture, payload, {first_slot, second_slot}, &plan)) {
+    return;
+  }
+
+  const std::vector<sync::SaveTarget> targets = {
+      {rom.id, first_slot, SavePath(first_name), first_name},
+      {rom.id, second_slot, SavePath(second_name), second_name}};
+
+  sync::ExecutionReport report;
+  {
+    // One use, so a plan that carried on would find the server healthy again and
+    // upload the second save -- which is exactly what must not happen.
+    harness::Fault fault(checks, client, base,
+                         R"({"mode":"status","status":401,"path":"/api/saves","count":1})");
+    report = sync::ExecutePlan(client, *files, TokenFor(base, fixture), plan, targets,
+                               OptionsAt(1'757'000'100));
+  }
+
+  checks.Expect(report.unauthorized, "the report says the token was refused");
+  checks.ExpectEq(static_cast<int>(report.operations.size()), 1,
+                  "and the plan stopped at the operation that met it");
+  checks.ExpectEq(report.completed, 0, "nothing completed");
+  checks.ExpectEq(report.failed, 1,
+                  "and the one that was attempted is counted failed, not skipped");
+  checks.ExpectEq(report.not_understood, 0, "nothing was downgraded");
+  checks.Expect(!report.canceled, "and this is not a cancellation -- nobody stopped it");
+
+  if (report.operations.empty()) {
+    return;
+  }
+  const sync::OperationResult& refused = report.operations[0];
+  checks.Expect(refused.outcome == sync::OperationOutcome::kFailed,
+                std::string("the operation failed: ") + sync::ToString(refused.outcome));
+  checks.Expect(refused.error == sync::OperationError::kUnauthorized,
+                std::string("with the token as the reason, not a refused body: ") +
+                    sync::ToString(refused.error) + " -- " + refused.message);
+  checks.Expect(refused.message.find(fixture.token) == std::string::npos,
+                "and the message does not quote the token back");
+  checks.Expect(sync::AnswerOf(refused.error) == auth::Answer::kRejected,
+                "which is what the gate counts");
+
+  // Nothing was written and nothing was destroyed. The sandbox's teardown audit
+  // makes the second half of that claim independently -- a save whose bytes
+  // changed with no copy under `.backup/` fails the run whatever is asserted
+  // here.
+  checks.ExpectEq(sandbox.Read(SavePath(first_name)), first_bytes,
+                  "the save the 401 landed on is untouched");
+  checks.ExpectEq(sandbox.Read(SavePath(second_name)), second_bytes,
+                  "and so is the one that was never attempted");
+  checks.Expect(!refused.save_id.has_value(), "no server row was created");
+
+  // The server agrees: a second negotiation still plans an upload for the save
+  // that was never sent, rather than a no-op over one RomM thinks it has.
+  sync::SyncPlan again;
+  if (PlanFor(checks, client, base, fixture, payload, {first_slot, second_slot}, &again)) {
+    for (const sync::SyncOperation& operation : again.operations) {
+      checks.Expect(operation.action == sync::Action::kUpload,
+                    std::string("both saves are still the client's alone: ") +
+                        sync::ToString(operation.action));
+    }
+  }
+}
+
 // --- collision ----------------------------------------------------------------
 //
 // The acceptance criterion the old backup scheme failed: two saves of ONE rom,
@@ -1374,6 +1478,8 @@ int main(int argc, char** argv) {
     Dropped(checks, *client, base, fixture, rom);
   } else if (scenario == "collision") {
     Collision(checks, *client, base, fixture, rom);
+  } else if (scenario == "revoked") {
+    Revoked(checks, *client, base, fixture, rom);
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;

@@ -102,6 +102,12 @@ void Gate::Observe(Answer answer) {
 }
 
 std::chrono::milliseconds Gate::backoff() const {
+  if (blocked()) {
+    // There is nothing left to wait for -- `blocked()` is what decides whether a
+    // call may be made at all -- so this is a pace for whatever loop is still
+    // turning, and the slowest one is the right one.
+    return config_.max_backoff;
+  }
   if (rejections_ <= 0) {
     return std::chrono::milliseconds{0};
   }

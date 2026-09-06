@@ -145,8 +145,9 @@ class Gate {
   /// Doubling per consecutive rejection and capped, so a server behind a proxy
   /// that answers 401 for a minute costs three requests spread over that minute
   /// rather than a tight loop on a battery. A gate that is `blocked()` answers
-  /// `max_backoff`, which is a pace for whatever loop is still turning and never
-  /// a licence to call: `blocked()` is the question that decides that.
+  /// `max_backoff` whatever the doubling would have reached: there is nothing
+  /// left to wait for, so it is a pace for whatever loop is still turning and
+  /// never a licence to call -- `blocked()` is the question that decides that.
   std::chrono::milliseconds backoff() const;
 
   /// Adopt a verdict that was already reached -- what a boot does with the one

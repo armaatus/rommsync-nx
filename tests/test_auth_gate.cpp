@@ -276,6 +276,15 @@ void Backoff(checks::Checks& c) {
   c.Expect(gate.backoff() == std::chrono::milliseconds{0},
            "a token that works again is not something to wait on");
 
+  // A blocked gate paces whatever loop is still turning at the slowest rate it
+  // has. It is not a licence to call: `blocked()` is what decides that, and the
+  // doubling would still have been mid-way up the ramp when the verdict landed.
+  for (int at = 0; at < config.max_consecutive_rejections; ++at) {
+    gate.Observe(Answer::kRejected);
+  }
+  c.Expect(gate.blocked(), "the budget is spent");
+  c.Expect(gate.backoff() == config.max_backoff, "and a blocked gate waits the longest it can");
+
   // The default is measured in tens of seconds, not the second a retry inside
   // one call uses: this is how long before the console asks at all.
   const auth::Gate stock;
