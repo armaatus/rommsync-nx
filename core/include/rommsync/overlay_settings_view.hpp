@@ -152,8 +152,9 @@ enum class RepairOutcome {
   kNotConfigured,
 
   /// `StartPair` answered `kUnavailable`: this build has no HTTP transport to
-  /// reach the server with (#43's `ssl` backend), so it cannot start a pairing.
-  /// Nothing was discarded, which is the whole point of asking first.
+  /// reach the server with, so it cannot start a pairing. A console has one
+  /// since M1-7 (#126), so this is the answer a build with the wiring removed
+  /// gives. Nothing was discarded, which is the whole point of asking first.
   kUnavailable,
 
   /// `StartPair` refused for some other reason. Nothing was discarded.

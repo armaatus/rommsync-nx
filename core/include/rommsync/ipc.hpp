@@ -248,10 +248,11 @@ enum class Error {
   /// - `SyncNow` on a console with no scheduler to hand a tick to, M7-2 (#37).
   ///   It arrives as `kAlreadyRunning` rather than as this, because
   ///   `Engine::RequestSync` is a bool with no room for it to say so.
-  /// - `StartPair` on a build with **no HTTP transport**. M1-6 (#123) built the
-  ///   engine half; `core/` reaches a server through `http::HttpClient`, and the
-  ///   Horizon backend that implements it for the console is #126, which #43's
-  ///   gate wants. It is a different sentence from `kNotConfigured`, which is a
+  /// - `StartPair` on a build with **no HTTP transport**. Not the console any
+  ///   more: M1-6 (#123) built the engine half and M1-7 (#126) the Horizon
+  ///   backend, and `main.cpp` installs it at boot, so a console answers this
+  ///   only if that wiring is removed. It survives for a host binary that never
+  ///   installed one. It is a different sentence from `kNotConfigured`, which is a
   ///   console with no `server.url` -- one is something the user can fix on the
   ///   settings screen and the other is not. **Note it is not `kOffline`
   ///   either**, which is what a *list* answers on the same console: a list has

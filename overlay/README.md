@@ -197,12 +197,11 @@ a row there; it does not add a second way in from `main.cpp`.
 
 **"Re-pair" asks before it discards.** The button sends `StartPair` first —
 which writes nothing when it refuses — and only discards the token once a
-pairing is genuinely starting. M1-6 (#123) built `SdEngine::StartPairing`, so
-that is no longer the *only* thing standing between a user and a destroyed
-pairing; it is still the right order, because an attempt can be refused for want
-of a `server.url` or for want of an HTTP transport (the console has no
-`HttpClient` yet, #126, which #43's gate wants), and each of those answers *"This
-sysmodule cannot
-start a pairing yet; this console is still paired"* with nothing lost.
+pairing is genuinely starting. M1-6 (#123) built `SdEngine::StartPairing` and
+M1-7 (#126) the transport under it, so a configured console now starts a real
+attempt and the common path is a pairing screen with a code on it. The order
+still holds, because an attempt is still refusable for want of a `server.url`,
+and that answers *"This sysmodule cannot start a pairing yet; this console is
+still paired"* with nothing lost.
 
 [libultrahand]: https://github.com/ppkantorski/libultrahand

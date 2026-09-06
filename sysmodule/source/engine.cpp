@@ -53,13 +53,14 @@ void SdEngine::Load(const std::string& config_dir) {
   // takes both locks in the documented order.
   //
   // It is the one place `mutex_` is held across I/O, and the header says so.
-  // The pairing thread may well exist by now -- `UsePairingBackend` starts it
-  // and both `main()` and the tests call that first -- but it is parked in
-  // `AwaitNextPoll` with no attempt to drive, so all it ever does with `mutex_`
-  // here is take it for the length of a condition-variable predicate. Nothing
-  // that a frame-polled command reaches can block on these reads, because
-  // nothing is answering commands yet: `Boot` builds the `ServiceCore` after
-  // this returns.
+  // Whether a pairing thread exists yet depends on the caller: `main()` calls
+  // this *before* `UsePairingBackend`, so on a console there is none; the tests'
+  // `BootPairable` calls `UsePairingBackend` first, so there is. Neither can
+  // stall on these reads. A thread that does not exist is no reader, and one
+  // that does is parked in `AwaitNextPoll` with no attempt to drive, taking
+  // `mutex_` only for the length of a condition-variable predicate. What the
+  // rule is really about -- the frame-polled commands -- cannot reach it either
+  // way, because no `ServiceCore` exists to answer them until this returns.
   std::lock_guard<std::mutex> card(card_mutex_);
   std::lock_guard<std::mutex> lock(mutex_);
   config_dir_ = config_dir;
@@ -408,10 +409,13 @@ ipc::Error SdEngine::StartPairing() {
     return ipc::Error::kNotConfigured;
   }
   if (pairing_backend_.http == nullptr) {
-    // The one `kUnavailable` this command has left, and it is the honest one:
-    // `core/` reaches a server through `http::HttpClient` and no Horizon backend
-    // for it exists yet (#43's gate item). Nothing was attempted and nothing
-    // changed, exactly as `ipc.hpp` promises.
+    // Nobody called `UsePairingBackend`. On a console that no longer happens --
+    // `main.cpp` installs M1-7 (#126)'s Horizon client at boot -- so this is
+    // reached by a host binary that never wired one, and by the tests that pin
+    // the refusal. Kept rather than asserted away: an engine with no transport
+    // has to answer *something*, and `kUnavailable` says "this build cannot",
+    // which is the sentence the pairing screen draws. Nothing was attempted and
+    // nothing changed, exactly as `ipc.hpp` promises.
     return ipc::Error::kUnavailable;
   }
 

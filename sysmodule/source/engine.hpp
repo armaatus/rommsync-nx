@@ -17,9 +17,10 @@
 // `kUnavailable` disappearing entirely is what says the engine is finished --
 // `StartPairing` and `SyncNow` are what is left of it.
 //
-// **The console has a transport now, and this class is still not given one.**
-// M1-7 (#126) built the Horizon `http::HttpClient` (`sysmodule/source/http/`)
-// and `main.cpp` holds one, but `UseServer` is deliberately not called with it:
+// **The console has a transport now, and this class is given it for pairing and
+// withheld from it for the lists.** M1-7 (#126) built the Horizon
+// `http::HttpClient` (`sysmodule/source/http/`), `main.cpp` holds one and hands
+// it to `UsePairingBackend`; `UseServer` is deliberately not called with it:
 // `lists::Service` answers a page that needs a request with `ListPage::pending`
 // and makes the request in `Pump()`, so a client handed over without a thread
 // driving `PumpLists()` would turn `kOffline` -- which #25's browser draws --
@@ -29,14 +30,14 @@
 // M7-2 (#37). The host suite passes a libcurl client and drives the paging
 // through the same seam (`lists.*`).
 //
-// **`StartPairing` is a `kUnavailable` M1-6 (#123) left only half of.** The
-// engine drives a real device-code attempt now -- see `StartPairing`
-// -- and it needs the same missing thing the lists above do: an
-// `http::HttpClient` for Horizon, which is #126. So on a console `StartPair`
-// answers `kUnavailable` while a list answers `kOffline`, and the difference is
-// real rather than sloppy: a list has a server it cannot reach, and a pairing
-// attempt has no way to reach one at all. The host harness has libcurl's client
-// and does neither (`engine.pairs`, `lists.*`).
+// **`StartPairing` is answered here, and that is what M1-6 (#123) was for.** The
+// engine drives a real device-code attempt on a thread of its own -- see
+// `StartPairing` -- over the same Horizon client the lists are withheld from,
+// because this class owns the thread that drives it and `lists::Service` does
+// not own the one that would drive `Pump()`. It still answers `kUnavailable` to
+// a caller that never installed a backend, which on a console no longer happens
+// and in the host harness is exactly what `engine.commands` pins. The harness
+// has libcurl's client and pairs against a real RomM with it (`engine.pairs`).
 //
 // Nothing here has ever run: it is Horizon-side and is exercised in Ryujinx
 // before the M8-1 gate, never on hardware (sysmodule/AGENTS.md).

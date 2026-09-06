@@ -48,10 +48,10 @@ enum class PairBlock {
   /// sysmodule's result module (`sysmodule/source/ipc/service.hpp`).
   kNoServer,
 
-  /// It refused for some other reason. `kUnavailable` is the one this build
-  /// will actually meet until the console has an `HttpClient` to reach a server
-  /// with -- M1-6 (#123) built the engine half, and #126 is the Horizon
-  /// transport under it, which #43's gate wants.
+  /// It refused for some other reason. `kUnavailable` is the one to expect from
+  /// a build with no `HttpClient` to reach a server with; a console has had one
+  /// since M1-6 (#123) built the engine half and M1-7 (#126) the transport under
+  /// it, so on hardware the refusal to expect is `kNoServer`.
   kRefused,
 };
 const char* ToString(PairBlock block);

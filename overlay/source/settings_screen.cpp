@@ -238,8 +238,9 @@ void SettingsScreen::PressRepair() {
   // The half that can refuse for free, first. See the note in the header: a
   // refused `StartPair` writes nothing and touches no token, so asking before
   // discarding costs a console that cannot pair nothing at all. M1-6 (#123)
-  // built `SdEngine::StartPairing`; the order outlives it, because an attempt is
-  // still refusable -- for want of a `server.url`, or of a transport (#126).
+  // built `SdEngine::StartPairing` and M1-7 (#126) the transport under it; the
+  // order outlives both, because an attempt is still refusable for want of a
+  // `server.url`, and a refusal after a discard is the thing to avoid.
   auth::PairingStatus pairing;
   const Result start = client_.StartPair(&pairing);
   if (R_FAILED(start)) {
