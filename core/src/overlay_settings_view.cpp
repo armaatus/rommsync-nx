@@ -241,19 +241,18 @@ void AddComplaints(SettingsView* view, const std::vector<config::Diagnostic>& di
   }
 }
 
-std::size_t CountOf(const std::vector<config::Diagnostic>& diagnostics,
-                    config::Severity severity) {
-  std::size_t count = 0;
+/// Whether the payload carries a complaint of this severity.
+///
+/// A predicate rather than a count, and that is the point: the only count
+/// reachable here is the trimmed one, so a function that returned one would be
+/// an invitation to put it on the screen. See `SetHeadline`.
+bool Any(const std::vector<config::Diagnostic>& diagnostics, config::Severity severity) {
   for (const config::Diagnostic& diagnostic : diagnostics) {
     if (diagnostic.severity == severity) {
-      ++count;
+      return true;
     }
   }
-  return count;
-}
-
-std::string Plural(std::size_t count, const char* singular, const char* plural) {
-  return std::to_string(count) + " " + (count == 1 ? singular : plural);
+  return false;
 }
 
 /// The headline, in remedy order.
@@ -271,16 +270,32 @@ void SetHeadline(SettingsView* view, const ipc::ConfigView& config) {
     view->tone = Tone::kBad;
     return;
   }
-  const std::size_t errors = CountOf(config.diagnostics, config::Severity::kError);
-  if (errors > 0) {
-    view->headline = "config.ini has " + Plural(errors, "error", "errors");
+  // **No number.** `GetConfig` sends at most `ipc::kMaxDiagnosticsInPayload`
+  // complaints and a `kNotice` saying how many did not fit, so the only count
+  // available here is the trimmed one -- a file with twenty-three bad lines
+  // would read "config.ini has 7 warnings", stated as fact, on the one screen
+  // whose job is saying what the parser found. It would also disagree with the
+  // status screen, which counts the *untrimmed* list
+  // (`ServiceCore::GetStatus`). The list below the headline is the count, and
+  // it carries the notice naming what it could not show.
+  //
+  // The same trim has a second edge that is *not* this screen's to fix:
+  // `ipc::TrimDiagnostics` drops from the tail, so an error behind eight
+  // warnings never reaches the console at all and this function falls through
+  // to "Settings in force". It is unreachable today -- every `kError`
+  // `ParseConfig` produces over a configured console is one it also produces
+  // `configured() == false` for, and that arm is above this one -- and it stops
+  // being unreachable the moment a sysmodule emits an error over a configured
+  // console. Keeping errors preferentially is `TrimDiagnostics`' change to
+  // make; #26 records it.
+  if (Any(config.diagnostics, config::Severity::kError)) {
+    view->headline = "config.ini has errors";
     view->hint = "The values below are the ones in force";
     view->tone = Tone::kBad;
     return;
   }
-  const std::size_t warnings = CountOf(config.diagnostics, config::Severity::kWarning);
-  if (warnings > 0) {
-    view->headline = "config.ini has " + Plural(warnings, "warning", "warnings");
+  if (Any(config.diagnostics, config::Severity::kWarning)) {
+    view->headline = "config.ini has warnings";
     view->hint = "Those lines did not take effect as written";
     view->tone = Tone::kWarn;
     return;
@@ -309,7 +324,13 @@ void SetRepair(SettingsView* view, const ipc::ConfigView& config, const RepairSt
     view->repair = Button{ControlState::kLive, "Re-pair", std::string(), Tone::kNeutral};
   }
 
-  if (repair.confirming) {
+  if (repair.confirming && view->repair.state == ControlState::kLive) {
+    // Only under a button a press can reach. A console that lost its
+    // `server.url` between the two presses blocks the button, and a warning
+    // about discarding a pairing sitting under a control that refuses
+    // everything is a state with no exit on a screen with no dialog. The
+    // screen drops the half-press with it (`SettingsScreen::Poll`).
+    //
     // The sentence a destructive action owes a console with no dialog. It is
     // the notice rather than the button's `refusal`, which is what a press that
     // will not go through says.

@@ -126,8 +126,10 @@ production RomM or a real library.
    menu rows and expect the sync, library and pairing screens; **B** comes back
    to settings, and **B** again to status.
 
-8. **Re-pair, as far as it goes.** Press **Ⓧ**, expect *"This discards the
-   pairing on this console"* and the button to become *press again to confirm*,
+8. **Re-pair, as far as it goes.** Press **Ⓧ**, expect *"This starts a new
+   pairing, then discards the one on this console"* — that order is the whole
+   design, not a wording preference — and the button to become
+   *press again to confirm*,
    and expect **nothing to have happened yet**. Press **Ⓧ** again and — until
    `SdEngine::StartPairing` is built — expect *"This sysmodule cannot start a
    pairing yet; this console is still paired"*. Then confirm the console really

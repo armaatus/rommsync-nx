@@ -167,7 +167,7 @@ void CheckErrorOverAConfiguredConsole(Checks& checks) {
                                                 "enabled", "something a later build knows about"});
 
   const overlay::SettingsView view = overlay::RenderSettings(sent);
-  checks.ExpectEq(view.headline, std::string("config.ini has 1 error"),
+  checks.ExpectEq(view.headline, std::string("config.ini has errors"),
                   "an error over a configured console is counted in the headline");
   checks.Expect(view.tone == overlay::Tone::kBad, "an error reads as bad");
   checks.Expect(!view.hint.empty(), "the error headline says what the rows below are");
@@ -178,7 +178,7 @@ void CheckWarningsAndNotices(Checks& checks) {
   const ipc::ConfigView warned =
       ViewFor(checks, "[server]\nurl = https://romm.example.com\n[sync]\nstates = maybe\n");
   const overlay::SettingsView warning_view = overlay::RenderSettings(warned);
-  checks.ExpectEq(warning_view.headline, std::string("config.ini has 1 warning"),
+  checks.ExpectEq(warning_view.headline, std::string("config.ini has warnings"),
                   "a dropped line is counted in the headline");
   checks.Expect(warning_view.tone == overlay::Tone::kWarn, "a warning reads as a warning");
   // The value in force is the default, not the text that was refused.

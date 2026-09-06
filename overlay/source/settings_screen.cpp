@@ -147,6 +147,12 @@ void SettingsScreen::Poll() {
   }
 
   config_ = config;
+  if (!config_.config.configured()) {
+    // The console lost the server the second press was going to pair with, so
+    // the first press goes with it. Only `confirming`: an outcome from a press
+    // that already happened is still what the user needs to read.
+    repair_.confirming = false;
+  }
   Refresh();
 }
 
@@ -303,6 +309,11 @@ void SettingsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
   // folder path is the user's own text with no length this screen can assume.
   const s32 bottom = y + height;
   const s32 line_width = width > kInset ? width - kInset : 0;
+  // Everything drawn at `x + kRowIndent` is bounded from there, not from `x`.
+  // `library_screen.cpp` keeps the same two: a title or a note given
+  // `line_width` runs `kRowIndent` past the drawer's right edge, and the
+  // `[platform.*]` note is long enough to reach it.
+  const s32 indented_width = width > kRowIndent + kInset ? width - kRowIndent - kInset : 0;
   const s32 value_width =
       width > kRowIndent + kValueColumn + kInset ? width - kRowIndent - kValueColumn - kInset : 0;
   const tsl::Color muted = MutedColor();
@@ -377,7 +388,7 @@ void SettingsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
       }
       marker();
       renderer->drawString(section.title, false, x + kRowIndent, row, kBodyFont, plain,
-                           line_width);
+                           indented_width);
       row += kSectionHeight;
       // A section with no rows is a section with something to say -- a platform
       // switched off, a folder map too large to have been sent -- so the note
@@ -387,7 +398,7 @@ void SettingsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
           break;
         }
         renderer->drawString(section.note, false, x + kRowIndent, row, kNoteFont,
-                             ColorFor(section.note_tone), line_width);
+                             ColorFor(section.note_tone), indented_width);
         row += kNoteHeight;
       }
       continue;
@@ -412,7 +423,7 @@ void SettingsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
         break;
       }
       renderer->drawString(entry_row.note, false, x + kRowIndent, row, kNoteFont,
-                           ColorFor(entry_row.tone), line_width);
+                           ColorFor(entry_row.tone), indented_width);
       row += kNoteHeight;
     }
   }
