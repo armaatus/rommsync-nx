@@ -1011,6 +1011,37 @@ foreach(scenario IN LISTS COMPLETE_RIG_SCENARIOS)
   set_tests_properties(complete.${scenario} PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
 endforeach()
 
+# --- M7-2: when a tick runs ---------------------------------------------------
+# The scheduler and the one backoff curve it shares with `auth::PairingSession`.
+# Every scenario drives an injected steady clock and an injected wall clock, so
+# an interval, a suspend and a day of retries are arithmetic rather than a wait.
+#
+# **None of these may ever need a server**, and that is the point rather than a
+# convenience: what they pin is that the schedule does *not* fire -- a claim
+# about requests that were never made, which no running RomM can witness.
+# `sched.idle` is the battery one and `sched.suspend` the one a console produces
+# several times a day.
+add_executable(test_scheduler test_scheduler.cpp)
+target_link_libraries(test_scheduler PRIVATE rommsync::core)
+target_include_directories(test_scheduler PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+
+set(SCHEDULER_SCENARIOS
+  backoff   # doubles, caps, jitters, and never falls below the floor
+  interval  # exactly one tick per interval, whatever the poll rate
+  ondemand  # interval_min = 0: boot and Sync now, and no timer
+  disabled  # the switch: never fires, and refuses a request rather than queueing it
+  suspend   # a clock advanced past several intervals is ONE catch-up tick
+  skew      # a wall clock corrected in either direction: no storm, no stall
+  failures  # backoff after a failed tick, floor again after a success
+  tls       # a handshake failure is capped rather than retried forever
+  idle      # a day switched off costs no wakeups; a day offline costs tens of ticks
+  pairing   # PairingSession polls on the shared curve, not on one of its own
+)
+foreach(scenario IN LISTS SCHEDULER_SCENARIOS)
+  add_test(NAME sched.${scenario} COMMAND test_scheduler ${scenario})
+  set_tests_properties(sched.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
 # --- M2-7: an interrupted tick ------------------------------------------------
 # The stages are individually safe since M2-4/5/6; what these check is what is
 # left on the card *between* them. Every rig scenario runs `sync::RunTick` inside
@@ -1068,6 +1099,24 @@ set(TICK_RIG_SCENARIOS
   complete_stall   # the same on the timeout, and the next tick finds no work to redo
   resumes          # a reset mid-download, then a second tick: one save, one row
 )
+
+# M7-2 (#37), registered under `sched.` because what they check is the schedule
+# around a tick rather than the tick. They live in this executable because the
+# two acceptance cases they cover cannot be produced with an injected outcome: a
+# tick has to really fail on the stall timeout, and a connection has to really be
+# reset, before "reschedules with backoff rather than spinning" means anything.
+set(SCHEDULER_RIG_SCENARIOS
+  sched_stall  # a stalled negotiation: backoff, no spin, and the next tick recovers
+  sched_drop   # a reset mid-plan: transient, nothing written, one row afterwards
+)
+foreach(scenario IN LISTS SCHEDULER_RIG_SCENARIOS)
+  string(REPLACE "sched_" "" name "${scenario}")
+  add_test(NAME sched.${name} COMMAND test_sync_tick ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(sched.${name} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  set_tests_properties(sched.${name} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+endforeach()
 # M6-2 (#33), and a rig scenario for the same reason `resumes` is one: the kill
 # has to happen to a real transfer. `resumes` interrupts a tick; this interrupts
 # the *process*, throwing away the client, the filesystem and the baseline before
@@ -1584,6 +1633,8 @@ set(ENGINE_SCENARIOS
   unauthenticated  # M1-4: the verdict the card carries, and the re-pair that lifts it
   commands  # what is still `kUnavailable`, so the list shrinks deliberately
   unreachable  # M1-6: a server that answers nothing refuses the attempt, and writes nothing
+  syncnow   # M7-2: Sync now starts a tick and says so, instead of "one is already running"
+  restore_race  # M7-2: a restore pressed while a tick is writing saves is refused, not interleaved
 )
 foreach(scenario IN LISTS ENGINE_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})

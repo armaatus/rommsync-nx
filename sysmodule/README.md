@@ -139,13 +139,14 @@ guess, and is still wrong to make now.
   — so a document a card left behind can recurse further than 16 KiB of stack
   allows, and the failure that causes has no console to report it on.
 
-  `service_access` is now what is used and nothing more — `fsp-srv`, `set:sys`,
-  `ssl`, `bsd:u`, `sfdnsres`, `nifm:u`. `time:s` was dropped: nothing in this
-  build calls `timeInitialize`, and the `ssl` service does its own certificate
-  date checks in its own process. **The scheduler (M7-2, #37) has to put it
-  back**, together with the `timeInitialize` that makes
-  `std::chrono::system_clock` mean anything on Horizon — `core/`'s sync and
-  download paths already call it.
+  `service_access` is what is used and nothing more — `fsp-srv`, `set:sys`,
+  `ssl`, `bsd:u`, `sfdnsres`, `nifm:u`, `time:s`. M1-7 (#126) dropped `time:s`
+  because nothing in that build called `timeInitialize`, and the `ssl` service
+  does its own certificate date checks in its own process; M7-2 (#37) put it
+  back with the `timeInitialize` beside `fsInitialize`, because the scheduler is
+  what makes `std::chrono::system_clock` matter — `core/`'s sync and download
+  paths call it, and a save stamped from an uninitialised clock is one
+  docs/SYNC_PROTOCOL.md refuses as an epoch `updated_at`.
 
 ## Where the work is
 

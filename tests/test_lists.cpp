@@ -571,7 +571,8 @@ void Cursors(checks::Checks& c) {
   config::Config configuration = config::Defaults();
   download::Queue queue;
   std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
-  lists::Service service(configuration, queue, [&now] { return now; });
+  lists::Service service(lists::Service::FixedConfig(configuration), queue,
+                         [&now] { return now; });
 
   ipc::Cursor first = 0;
   c.ExpectEq(static_cast<int>(service.ListBegin(request, &first)),

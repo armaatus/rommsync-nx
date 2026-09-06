@@ -567,6 +567,23 @@ struct Negotiation {
   int attempts = 0;
   std::chrono::milliseconds waited{0};
 
+  /// The transport failure behind a `kUnreachable`, or `kNone`.
+  ///
+  /// `NegotiateError` deliberately collapses offline, stalled and dropped into
+  /// one member, because a caller's answer to all three is the same: back off
+  /// and try the next tick. **One of them is not like the others.**
+  /// `http::Error::kTls` is a certificate the console does not trust, a hostname
+  /// that does not match, or a proxy intercepting the connection -- a
+  /// configuration fault that does not come right on its own, and one a client
+  /// re-handshaking every thirty seconds forever would spend a battery on. The
+  /// scheduler caps its retries and parks (`sync::SchedulerConfig::max_tls_attempts`).
+  ///
+  /// It is carried rather than re-derived because deriving it would mean reading
+  /// `http::Error` a second time at a call site that has already classified it
+  /// once, which is how two classifications come to disagree. `roms::FetchResult`
+  /// carries the same field for the same reason.
+  http::Error transport = http::Error::kNone;
+
   bool ok() const { return error == NegotiateError::kNone; }
 };
 

@@ -40,6 +40,7 @@
 //   repairs   -- M1-6: `StartPair` then `Unpair`, with neither instant losing
 //                both the old pairing and the new attempt
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -59,13 +60,16 @@
 #include "rommsync/auth_gate.hpp"
 #include "rommsync/download.hpp"
 #include "rommsync/host/curl_http_client.hpp"
+#include "rommsync/host/native_file_system.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/pairing.hpp"
 #include "rommsync/token_store.hpp"
 
 namespace auth = rommsync::auth;
 namespace config = rommsync::config;
+namespace conflicts = rommsync::conflicts;
 namespace download = rommsync::download;
+namespace fs = rommsync::fs;
 namespace http = rommsync::http;
 namespace ipc = rommsync::ipc;
 namespace sysmodule = rommsync::sysmodule;
@@ -1206,6 +1210,205 @@ void Unreachable(checks::Checks& c) {
 
 // --- what is still not built --------------------------------------------------
 
+/// M7-2 (#37): "Sync now" starts a tick, and says so.
+///
+/// Before this issue `SdEngine::RequestSync` returned `false` unconditionally
+/// and `ServiceCore::SyncNow` reported that as `kAlreadyRunning`, so a
+/// configured, paired, idle console was told *a sync is already running* when
+/// nothing was (#24 said so at length). This is that answer, and the worker
+/// behind it.
+void SyncNowStarts(checks::Checks& c) {
+  Console console(c, "engine-syncnow");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\n"
+                                 "url = https://romm.example.com\n"
+                                 "\n"
+                                 "[sync]\n"
+                                 "enabled = true\n"
+                                 // No timer and no boot tick, so the scheduler
+                                 // parks with **no deadline at all** and the
+                                 // only thing that can ever run one is the
+                                 // press. That is the shape a lost wake-up
+                                 // would strand forever rather than merely
+                                 // delay.
+                                 "interval_min = 0\n"
+                                 "on_boot = false\n"),
+           "a configured card");
+  auth::StoredToken token;
+  token.server_url = "https://romm.example.com";
+  token.access_token = "not-a-real-token";
+  token.device_id = "console-syncnow";
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+           "and a paired one, so nothing in front of the engine refuses the command");
+  console.Boot();
+
+  c.Expect(!console.Status().sync_in_progress, "an idle console is not drawn as syncing");
+
+  // The worker, which this build has for the first time. With no boot tick and
+  // no interval it parks immediately, so nothing has run and nothing is due.
+  console.engine.StartWorker();
+  std::this_thread::sleep_for(std::chrono::milliseconds{200});
+  c.Expect(console.Status().last_sync_result == ipc::SyncResult::kNever,
+           "a parked worker runs nothing on its own");
+
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted,
+           "Sync now is accepted rather than answered with 'one is already running'");
+
+  // And the parked worker actually wakes for it. It has no `http::HttpClient`
+  // -- nothing installed one -- so the tick cannot negotiate and settles as a
+  // failure, which is the honest answer and the one the status screen draws.
+  ipc::Status status = console.Status();
+  for (int waited = 0; waited < 200 && status.last_sync_result == ipc::SyncResult::kNever;
+       ++waited) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    status = console.Status();
+  }
+  c.Expect(status.last_sync_result == ipc::SyncResult::kFailed,
+           "a console with no transport fails the tick rather than reporting a sync");
+  c.Expect(!status.sync_in_progress, "and is not left marked as syncing afterwards");
+
+  // The one thing `RequestSync` is allowed to answer false for is a tick already
+  // running, which is the same fact `sync_in_progress` carries -- so on an idle
+  // console it is accepted again (`ipc.hpp`).
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted,
+           "and the next press is accepted too, because nothing is running");
+}
+
+/// M7-2 (#37): a restore and a running tick both write saves, and only one of
+/// them may.
+///
+/// Until this issue nothing else in the sysmodule wrote a save, so
+/// `RestoreBackup` had the card to itself. The worker changed that: it runs
+/// `sync::Execute` and `sync::SyncStates` over the same `sd_path` a restore
+/// targets. Each write is atomic on its own, so what a collision produces is a
+/// lost update -- restored bytes replaced moments later by an in-flight
+/// download, and the tick's `.backup/` copy taken of a half-restored file --
+/// which is hard rule 2 defeated by timing rather than by a bug in either
+/// writer.
+///
+/// **The check has to be concurrent**, not a sequential call that finds a flag
+/// set: an earlier version of this fix read `sync_in_progress_` under a lock and
+/// then let it go, which is a race with a handful of instructions in it rather
+/// than no race. So this holds a tick open *inside* `sync::RunTick` -- a stub
+/// server that blocks on the negotiation -- and presses restore while it is
+/// there.
+void RestoreDuringSync(checks::Checks& c) {
+  /// A server that answers an empty library and then stops answering.
+  ///
+  /// Enough for the worker to get past step 0 and into `sync::RunTick`, and no
+  /// further: the negotiation blocks until this scenario lets it go, which is
+  /// the window the restore has to be refused in.
+  class HeldServer final : public http::HttpClient {
+   public:
+    http::Result Send(const http::Request& request) override {
+      if (request.url.find("/api/roms") != std::string::npos) {
+        http::Result result;
+        result.response.status = 200;
+        // The envelope `rom_index.cpp` reads, whole: `total`, `limit` and
+        // `offset` are all `Required`, and an empty library is what keeps this
+        // scenario about the lock rather than about a save.
+        result.response.body = R"({"total":0,"limit":64,"offset":0,"items":[]})";
+        return result;
+      }
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        in_negotiate_ = true;
+        arrived_.notify_all();
+        released_.wait(lock, [this] { return release_; });
+      }
+      http::Result result;
+      result.error = http::Error::kConnectFailed;
+      result.message = "held by the test";
+      return result;
+    }
+
+    http::Result Download(const http::Request&, const http::DownloadTarget&) override {
+      return Send({});
+    }
+
+    /// Block until the worker is inside the negotiation. False if it never got
+    /// there, which is a scenario that proved nothing rather than one that
+    /// passed.
+    bool AwaitNegotiate() {
+      std::unique_lock<std::mutex> lock(mutex_);
+      return arrived_.wait_for(lock, std::chrono::seconds{10}, [this] { return in_negotiate_; });
+    }
+
+    void Release() {
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        release_ = true;
+      }
+      released_.notify_all();
+    }
+
+   private:
+    std::mutex mutex_;
+    std::condition_variable arrived_;
+    std::condition_variable released_;
+    bool in_negotiate_ = false;
+    bool release_ = false;
+  };
+
+  Console console(c, "engine-restore-during-sync");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\n"
+                                 "url = https://romm.example.com\n"
+                                 "\n"
+                                 "[sync]\n"
+                                 "enabled = true\n"
+                                 "interval_min = 0\n"),
+           "a configured card");
+  auth::StoredToken token;
+  token.server_url = "https://romm.example.com";
+  token.access_token = "not-a-real-token";
+  token.device_id = "console-restore-race";
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+           "and a paired one, so the tick gets as far as negotiating");
+
+  HeldServer server;
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&server, "not-a-real-token");
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+
+  c.Expect(server.AwaitNegotiate(), "the worker reaches the negotiation and is held there");
+
+  // The press, while the tick is demonstrably mid-flight. The entry id is one
+  // nothing has: the refusal has to come from the write lock and not from the
+  // history, which is what tells this apart from `kNoSuchEntry`.
+  std::string response;
+  const ipc::Error answered =
+      console.Call(ipc::Command::kRestoreBackup, ipc::EncodeEntryId(1), &response);
+  c.Expect(answered == ipc::Error::kOk, "the command is answered rather than failing");
+  const conflicts::RestoreReport report = ipc::DecodeRestoreReport(response).value;
+  c.Expect(report.outcome == conflicts::RestoreOutcome::kBackupFailed,
+           "a restore during a tick is refused, with the outcome whose promise is "
+           "'nothing was written'");
+  c.Expect(report.message.find("a sync is running") != std::string::npos,
+           "and the sentence names the reason, so the screen can say press again -- got: " +
+               report.message);
+
+  server.Release();
+
+  // And once the tick has let go, the same press reaches the history again --
+  // `kNoSuchEntry` for an id nothing has, which is the answer that proves the
+  // refusal above was the lock and not a permanent state.
+  conflicts::RestoreReport after;
+  for (int waited = 0; waited < 200; ++waited) {
+    console.Call(ipc::Command::kRestoreBackup, ipc::EncodeEntryId(1), &response);
+    after = ipc::DecodeRestoreReport(response).value;
+    if (after.outcome != conflicts::RestoreOutcome::kBackupFailed) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  c.Expect(after.outcome == conflicts::RestoreOutcome::kNoSuchEntry,
+           "and the restore is available again the moment the tick is done");
+}
+
 void Commands(checks::Checks& c) {
   Console console(c, "engine-commands");
   console.Boot();
@@ -1325,6 +1528,10 @@ int main(int argc, char** argv) {
     Relaunch(checks);
   } else if (scenario == "reenable") {
     Reenable(checks);
+  } else if (scenario == "restore_race") {
+    RestoreDuringSync(checks);
+  } else if (scenario == "syncnow") {
+    SyncNowStarts(checks);
   } else if (scenario == "unreachable") {
     Unreachable(checks);
   } else if (const RigScenario* rig_scenario = FindRigScenario(scenario)) {

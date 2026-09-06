@@ -14,7 +14,7 @@
 	"filesystem_access": {
 		"permissions": "0xffffffffffffffff"
 	},
-	"service_access": ["fsp-srv", "set:sys", "ssl", "bsd:u", "sfdnsres", "nifm:u"],
+	"service_access": ["fsp-srv", "set:sys", "ssl", "bsd:u", "sfdnsres", "nifm:u", "time:s"],
 	"service_host": ["rommsync"],
 	"kernel_capabilities": [{
 			"type": "kernel_flags",

@@ -23,6 +23,16 @@ using namespace std::chrono_literals;
 /// neither an `int` nor a duration can be made to wrap.
 constexpr std::int64_t kMaxCount = 1'000'000;
 
+/// How much a backed-off poll may be stretched by, as a fraction of the delay.
+///
+/// A quarter, which on the five seconds RomM asks for is a spread of a little
+/// over a second -- enough that two consoles that failed together do not poll
+/// together, and far too small to matter against a code that lives ten minutes.
+/// Not on `PairingConfig`: nothing a user could want to set differs here, and a
+/// knob that only ever holds one value is a knob somebody eventually sets to
+/// zero to make a test deterministic and then ships (backoff.hpp).
+constexpr double kPollJitter = 0.25;
+
 constexpr const char* kInitPath = "/api/auth/device/init";
 constexpr const char* kTokenPath = "/api/auth/device/token";
 
@@ -245,18 +255,19 @@ PairingState PairingSession::Fail(std::string message) {
   return status_.state;
 }
 
-void PairingSession::ScheduleIn(std::chrono::seconds delay) {
-  const std::chrono::seconds interval = init_.poll_interval();
+void PairingSession::ScheduleIn(std::chrono::milliseconds delay) {
+  const std::chrono::milliseconds interval = init_.poll_interval();
   next_poll_ = Now() + (delay < interval ? interval : delay);
 }
 
 void PairingSession::BackOff() {
-  const std::chrono::seconds interval = init_.poll_interval();
-  std::chrono::seconds delay = interval;
-  for (int step = 1; step < transient_failures_ && delay < config_.max_poll_backoff; ++step) {
-    delay *= 2;
-  }
-  ScheduleIn(delay > config_.max_poll_backoff ? config_.max_poll_backoff : delay);
+  // The floor is the server's own `interval` and the ceiling is the user's
+  // `max_poll_backoff`, which is the curve this loop always had. What is new is
+  // `kPollJitter`: two consoles that lost the same router poll the same code at
+  // the same second otherwise, and a code that is being polled in lockstep by
+  // three consoles earns `slow_down` for all three (docs/AUTH.md).
+  backoff_.Configure({init_.poll_interval(), config_.max_poll_backoff, kPollJitter});
+  ScheduleIn(backoff_.Fail());
 }
 
 PairingState PairingSession::Begin() {
@@ -265,7 +276,7 @@ PairingState PairingSession::Begin() {
     status_ = PairingStatus{};
     token_.reset();
     init_ = DeviceInitResponse{};
-    transient_failures_ = 0;
+    backoff_.Succeed();
     rejected_polls_ = 0;
     // Both belong to the attempt being discarded. `Poll()`'s state guard means
     // a stale one is never acted on, but `next_poll_at()` is public and would
@@ -365,7 +376,6 @@ PairingState PairingSession::Poll() {
     // dropped mid-body. None of it says anything about the device_code, which
     // still has most of its ten minutes, so this backs off rather than
     // abandoning the pairing screen.
-    ++transient_failures_;
     rejected_polls_ = 0;
     BackOff();
     status_.message =
@@ -384,7 +394,7 @@ PairingState PairingSession::Poll() {
         return Fail("device token response: " + granted.error.Describe());
       }
       token_ = std::move(granted.value);
-      transient_failures_ = 0;
+      backoff_.Succeed();
       rejected_polls_ = 0;
       status_.state = PairingState::kApproved;
       status_.message.clear();
@@ -392,7 +402,7 @@ PairingState PairingSession::Poll() {
     }
 
     case TokenPoll::kAuthorizationPending:
-      transient_failures_ = 0;
+      backoff_.Succeed();
       rejected_polls_ = 0;
       status_.message.clear();
       ScheduleIn(init_.poll_interval());
@@ -404,21 +414,18 @@ PairingState PairingSession::Poll() {
       // transient failure backs off instead of arguing -- and RomM restarts
       // that window on the poll it answered, so anything shorter would earn
       // another one.
-      ++transient_failures_;
       rejected_polls_ = 0;
       BackOff();
       status_.message = "the server asked us to poll more slowly";
       return status_.state;
 
     case TokenPoll::kRateLimited:
-      ++transient_failures_;
       rejected_polls_ = 0;
       BackOff();
       status_.message = "the server is rate limiting us; backing off";
       return status_.state;
 
     case TokenPoll::kServerError:
-      ++transient_failures_;
       rejected_polls_ = 0;
       BackOff();
       status_.message = "the server is unwell (HTTP " +
@@ -454,7 +461,6 @@ PairingState PairingSession::Poll() {
   if (status_code == 401 || status_code == 403) {
     ++rejected_polls_;
     if (rejected_polls_ < config_.max_rejected_polls) {
-      ++transient_failures_;
       BackOff();
       status_.message =
           "the poll was rejected with HTTP " + std::to_string(status_code) + "; retrying";

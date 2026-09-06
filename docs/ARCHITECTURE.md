@@ -75,8 +75,8 @@ overlay.
 - `sdmc:/config/rommsync/auth.json` — the server's standing verdict on the
   token, to be written once `auth::Gate` has counted enough consecutive `401`s
   or `403`s to give up on the pairing ([AUTH.md](AUTH.md#re-pairing--revocation)).
-  **Read but not yet written**: the writer is the scheduler that makes the calls,
-  M7-2 (#37) — see AUTH.md for exactly which two lines it adds.
+  Read at boot and written by `SdEngine::ObserveAnswer`, which every call the
+  worker makes reports into (M7-2, #37) — see AUTH.md.
   One JSON object, `{"format":"rommsync-auth","version":1,"block":"revoked"}`,
   and it **exists only while the console is blocked** — so the overlay's re-pair
   prompt is up on the first poll after a boot rather than after the engine has

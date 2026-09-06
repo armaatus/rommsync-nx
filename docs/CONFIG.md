@@ -196,6 +196,27 @@ Each report carries a severity, the line number, and the section and key:
   to it with a `warning`, because falling back to the 30-minute default would
   sync far more often than you asked for.
 
+  **What the interval means across a suspend.** It is measured against the wall
+  clock, not against a timer: a console that slept for eleven hours with a
+  30-minute interval syncs **once** when it wakes and then goes back to the
+  ordinary schedule, rather than firing the twenty-two ticks it "missed". A
+  clock corrected backwards costs nothing at all — the monotonic clock is a
+  floor under the interval, so a correction can lengthen a wait and never
+  shorten one (`core/include/rommsync/scheduler.hpp`).
+
+  `0` is not a very short interval, it is **no timer at all**: the sysmodule
+  syncs at boot and when you press *Sync now*, and sleeps with no deadline in
+  between. `enabled = false` is the same, minus the boot tick. Neither costs a
+  wakeup.
+
+  After a tick that could not reach the server the next one is not at the
+  interval but on a **backoff** — 30 seconds, doubling, capped at 30 minutes,
+  with a little jitter so several consoles on one network do not retry in
+  lockstep. The first tick that works puts it back to the interval. A TLS
+  failure is treated differently from an unreachable server: a certificate the
+  console does not trust does not come right on its own, so after three the
+  schedule parks until you press *Sync now* or change a setting.
+
 **`[platform.<slug>]`**
 
 - A slug this build ships no default for is honoured, with a `notice`. It cannot

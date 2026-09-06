@@ -159,12 +159,9 @@ production RomM or a real library.
       the press must not produce is a spinner, a second copy of the sentence, or
       silence.
     - **A** with auto-sync on. **Check which sysmodule you are running first.**
-      Until M7-2 (#37) lands, `SdEngine::RequestSync()` returns `false`
-      unconditionally — it is a `bool` with nowhere to put "not built yet" — so
-      `SyncNow` answers `already_running` on an idle console and this step draws
-      *A sync is already running*. That is the sysmodule, not the screen. With
-      M7-2 in, expect *Sync started* and the headline moving to *Syncing* within
-      a poll or two; press **A** again while it runs and expect *A sync is
+      Since M7-2 (#37) `SdEngine::RequestSync()` starts a tick and answers
+      truthfully, so expect *Sync started* and the headline moving to *Syncing*
+      within a poll or two; press **A** again while it runs and expect *A sync is
       already running* with **no second `SyncNow`** reaching the sysmodule — the
       screen refuses that press itself, so the two cases are told apart by what
       the sysmodule saw, not by what the panel says.

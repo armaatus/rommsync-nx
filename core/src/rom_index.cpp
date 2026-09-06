@@ -330,4 +330,29 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
   return result;
 }
 
+auth::Answer AnswerOf(const FetchResult& fetched) {
+  if (fetched.transport != http::Error::kNone) {
+    // The exchange never completed, so it says nothing about the token.
+    return auth::Answer::kSilent;
+  }
+  if (fetched.status == 401) {
+    return auth::Answer::kRejected;
+  }
+  if (fetched.status == 403) {
+    return auth::Answer::kForbidden;
+  }
+  if (fetched.status != 0) {
+    // Another 4xx, a 5xx, a 429 -- every one of which something in front of RomM
+    // answers without ever reading the token.
+    return auth::Answer::kSilent;
+  }
+  if (!fetched.shape.ok()) {
+    // A 200 whose body is not a rom page. The token was very likely read, but
+    // "very likely" is not the standard this enum holds `kAccepted` to, and a
+    // gateway's own 200 page would otherwise clear a rejection count.
+    return auth::Answer::kSilent;
+  }
+  return auth::Answer::kAccepted;
+}
+
 }  // namespace rommsync::roms

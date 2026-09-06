@@ -223,8 +223,22 @@ json::Error ParsePlatforms(std::string_view body, std::vector<PlatformRow>* out,
 
 // --- the service --------------------------------------------------------------
 
-Service::Service(const config::Config& config, download::Queue& queue, Clock clock)
-    : config_(config), queue_(queue), clock_(std::move(clock)) {}
+Service::Service(ConfigSource config, download::Queue& queue, Clock clock)
+    : config_(std::move(config)), queue_(queue), clock_(std::move(clock)) {}
+
+Service::ConfigSource Service::FixedConfig(const config::Config& config) {
+  return [&config] {
+    // The aliasing constructor: a `shared_ptr` that points at `config` and owns
+    // nothing, so it costs no allocation and frees nothing when the page that
+    // holds it goes away.
+    return std::shared_ptr<const config::Config>(std::shared_ptr<const void>{}, &config);
+  };
+}
+
+void Service::UseAuthObserver(AuthObserver observer) {
+  const std::lock_guard<std::mutex> held(mutex_);
+  auth_observer_ = std::move(observer);
+}
 
 Service::TimePoint Service::Now() const {
   return clock_ ? clock_() : std::chrono::steady_clock::now();
@@ -374,6 +388,7 @@ ipc::Error Service::FillFromQueueLocked(Entry& entry, ipc::ListPage* page) {
 }
 
 ipc::Error Service::FillFromPlatformsLocked(Entry& entry, ipc::ListPage* page) {
+  const std::shared_ptr<const config::Config> configuration = config_();
   const std::int64_t count = static_cast<std::int64_t>(entry.platforms.size());
   const std::int64_t served =
       FillPage(page, entry.offset, count, entry.request.page_size, [&](std::int64_t index) {
@@ -386,7 +401,8 @@ ipc::Error Service::FillFromPlatformsLocked(Entry& entry, ipc::ListPage* page) {
         // Read off the configuration in force *here*, which is the point of the
         // field: the overlay never opens `config.ini` to decide whether a
         // platform has a folder (#25).
-        PutFlag(&item, keys::kPlatformMapped, config_.Platform(platform.fs_slug) != nullptr);
+        PutFlag(&item, keys::kPlatformMapped,
+                configuration->Platform(platform.fs_slug) != nullptr);
         return item;
       });
 
@@ -415,7 +431,7 @@ ipc::Error Service::PageOf(Entry& entry, ipc::ListPage* page, std::int64_t serve
   return ipc::Error::kOk;
 }
 
-bool Service::OnDisk(const RomRow& rom, fs::FileSystem* card) const {
+bool Service::OnDisk(const RomRow& rom, fs::FileSystem* card, const config::Config& config) {
   if (card == nullptr || rom.fs_name.empty() || rom.platform_fs_slug.empty()) {
     return false;
   }
@@ -423,7 +439,7 @@ bool Service::OnDisk(const RomRow& rom, fs::FileSystem* card) const {
   // written to: the later entries are exactly where someone already keeps that
   // platform's roms (config.hpp).
   for (const std::string& candidate :
-       config_.ExistingRomPaths({rom.platform_fs_slug, rom.fs_name})) {
+       config.ExistingRomPaths({rom.platform_fs_slug, rom.fs_name})) {
     const std::string real = card->Resolve(candidate);
     if (real.empty()) {
       continue;
@@ -443,7 +459,8 @@ bool Service::OnDisk(const RomRow& rom, fs::FileSystem* card) const {
 }
 
 ipc::ListPage Service::BuildRomPage(const RomPage& fetched, std::int64_t offset,
-                                    std::int32_t page_size, fs::FileSystem* card) const {
+                                    std::int32_t page_size, fs::FileSystem* card,
+                                    const config::Config& config) const {
   ipc::ListPage page;
   std::size_t appended = 0;
   for (const RomRow& rom : fetched.roms) {
@@ -458,7 +475,7 @@ ipc::ListPage Service::BuildRomPage(const RomPage& fetched, std::int64_t offset,
     PutText(&item, keys::kRomPlatformFsSlug, rom.platform_fs_slug);
     PutInteger(&item, keys::kRomSizeBytes, rom.size_bytes);
     PutFlag(&item, keys::kRomHasMultipleFiles, rom.has_multiple_files);
-    PutFlag(&item, keys::kRomOnDisk, OnDisk(rom, card));
+    PutFlag(&item, keys::kRomOnDisk, OnDisk(rom, card, config));
     // A terminal row is not "queued": a rom that failed or was skipped is one
     // the user is entitled to ask for again, and a greyed row would leave them
     // no way to (`download::Queue::Enqueue` re-queues a terminal entry on
@@ -550,14 +567,14 @@ ipc::Error Service::ListNext(ipc::Cursor cursor, ipc::ListPage* page) {
     page->has_more = false;
     return ipc::Error::kOk;
   }
-  if (config_.server.url.empty()) {
+  if (config_()->server.url.empty()) {
     return ipc::Error::kNotConfigured;
   }
   if (client_ == nullptr) {
     // No HTTP backend in this build. See `UseServer`.
     return ipc::Error::kOffline;
   }
-  if (entry->consecutive_failures > 0 && now < entry->not_before) {
+  if (entry->backoff.failures() > 0 && now < entry->not_before) {
     // Inside the backoff window: the same failure again, and no request. See
     // `kRetryBackoff`.
     return entry->failure;
@@ -582,6 +599,12 @@ bool Service::Pump() {
   // one place in this file that runs on another thread.
   http::HttpClient* client = nullptr;
   fs::FileSystem* card = nullptr;
+  AuthObserver observe;
+  // The configuration too, and for a stronger reason than the backends: the
+  // engine *replaces* a whole `Config` on the IPC thread, so a page built from a
+  // reference into the live one is a race on every string in it. `ConfigSource`
+  // hands over a snapshot that stays alive for as long as this page does.
+  std::shared_ptr<const config::Config> configuration;
   {
     const std::lock_guard<std::mutex> held(mutex_);
     // A cursor abandoned with a built page on it holds that heap until something
@@ -604,7 +627,9 @@ bool Service::Pump() {
     asked = found->request;
     offset = found->offset;
     token = bearer_token_;
-    url = config_.server.url;
+    observe = auth_observer_;
+    configuration = config_();
+    url = configuration->server.url;
   }
 
   http::Request request;
@@ -639,6 +664,14 @@ bool Service::Pump() {
 
   const http::Result sent = client->Send(request);
 
+  // What the exchange said about the credentials, into the one gate that counts
+  // them. **Not** a second 401 path and not a widening of `ipc::Error`: the page
+  // below still answers `kOffline`, which is the honest sentence for a screen
+  // with no library to draw (see `UseAuthObserver`).
+  if (observe) {
+    observe(auth::AnswerOf(sent));
+  }
+
   ipc::ListPage built;
   std::vector<PlatformRow> platforms;
   // Two names for three outcomes. A request that did not complete and a server
@@ -665,7 +698,7 @@ bool Service::Pump() {
     } else {
       // Built outside the lock: it reads the card for `on_disk` and the queue
       // for `queued`, and both take locks of their own.
-      built = BuildRomPage(fetched, offset, asked.page_size, card);
+      built = BuildRomPage(fetched, offset, asked.page_size, card, *configuration);
     }
   }
 
@@ -681,15 +714,14 @@ bool Service::Pump() {
   if (failure != ipc::Error::kOk) {
     entry->fetch = Fetch::kFailed;
     entry->failure = failure;
-    ++entry->consecutive_failures;
-    // Doubling, capped. `1 << n` is bounded by the cap below rather than by the
-    // shift, so a cursor that has failed thirty times does not overflow it.
-    const int doublings = std::min(entry->consecutive_failures - 1, 8);
-    entry->not_before = Now() + std::min(kMaxRetryBackoff, kRetryBackoff * (1 << doublings));
+    // The one retry curve this client has: doubling, capped, jittered, and
+    // saturating rather than overflowing however many times a cursor has failed
+    // (`retry::Backoff`, M7-2 #37).
+    entry->not_before = Now() + entry->backoff.Fail();
     return true;
   }
 
-  entry->consecutive_failures = 0;
+  entry->backoff.Succeed();
   entry->failure = ipc::Error::kOk;
   if (asked.kind == ipc::ListKind::kPlatforms) {
     entry->platforms = std::move(platforms);

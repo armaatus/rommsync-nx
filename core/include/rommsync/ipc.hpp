@@ -247,11 +247,11 @@ enum class Error {
   /// attempted and nothing changed**, exactly as for `kInvalid`.
   ///
   /// What still answers it, and what removes each one. M5-4 (#31) took the three
-  /// list commands off this list; these two are what is left:
+  /// list commands off this list and M7-2 (#37) took `SyncNow` -- the sysmodule
+  /// has a scheduler to hand a tick to now, so `RequestSync` starts one and
+  /// answers `false` for one reason only, a tick already running. This is what
+  /// is left:
   ///
-  /// - `SyncNow` on a console with no scheduler to hand a tick to, M7-2 (#37).
-  ///   It arrives as `kAlreadyRunning` rather than as this, because
-  ///   `Engine::RequestSync` is a bool with no room for it to say so.
   /// - `StartPair` on a build with **no HTTP transport**. Not the console any
   ///   more: M1-6 (#123) built the engine half and M1-7 (#126) the Horizon
   ///   backend, and `main.cpp` installs it at boot, so a console answers this
