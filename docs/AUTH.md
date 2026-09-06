@@ -498,12 +498,18 @@ code, and the output is searched for both.
   does not touch `device.dat` — see [Client identifier](#client-identifier).
 - **The button asks before it discards, and that inverts the order above.**
   `overlay/source/settings_screen.cpp` sends `StartPair` *first* and `Unpair`
-  only once a pairing is genuinely starting. `SdEngine::StartPairing` still
-  answers `kUnavailable` (nothing owns building it), and a refused `StartPair`
-  writes nothing and touches no token — so the documented order would discard a
-  working pairing on a console that then has no way to pair again. The end state
-  is the one described above; what changes is that a console never passes
-  through "unpaired with nothing to restart". M4-4 (#26) records it.
+  only once a pairing is genuinely starting. A refused `StartPair` writes nothing
+  and touches no token, so the documented order would discard a working pairing
+  on a console that then had no way to pair again. The end state is the one
+  described above; what changes is that a console never passes through "unpaired
+  with nothing to restart". M4-4 (#26) records it, and M1-6 (#123) keeps it:
+  `SdEngine::StartPairing` is real now, so the order is no longer the only thing
+  standing between a user and a destroyed pairing — but an attempt can still be
+  refused, by a console with no `server.url` or by a build with no HTTP
+  transport, and the ordering is what makes those refusals cost nothing.
+  `engine.repairs` is the test: at the instant between the two commands the old
+  token is still on the card, and at the instant after it the new attempt is
+  still live.
 - Revoking on the server (`DELETE /api/client-tokens/{id}`) invalidates it; the
   sysmodule detects `401`, marks itself unauthenticated, and prompts re-pair via
   the overlay status screen.

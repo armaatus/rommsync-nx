@@ -101,13 +101,12 @@ class SettingsScreen : public tsl::Gui {
   /// X: ask once, then do it.
   ///
   /// **`StartPair` goes first and `Unpair` follows it**, which is the opposite
-  /// of the order docs/AUTH.md describes. `SdEngine::StartPairing` is still
-  /// `kUnavailable` and no issue owns it, so a button that discarded the token
-  /// first would leave a console that cannot pair again from the overlay at all
-  /// -- #26's own words. `StartPair` writes nothing and touches no token when it
-  /// refuses, so asking it first is free, and the token is discarded only once a
-  /// pairing is genuinely starting. `overlay_settings_view.hpp` carries the
-  /// rest of the reasoning.
+  /// of the order docs/AUTH.md describes. It was #26's gate on a
+  /// `SdEngine::StartPairing` that answered `kUnavailable` unconditionally, and
+  /// it outlives M1-6 (#123) building that: `StartPair` writes nothing and
+  /// touches no token when it refuses, so asking it first is free, and the token
+  /// is discarded only once a pairing is genuinely starting.
+  /// `overlay_settings_view.hpp` carries the rest of the reasoning.
   void PressRepair();
 
   /// The row the cursor is on, or nullptr when there is none.

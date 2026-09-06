@@ -1,5 +1,8 @@
 #include "engine.hpp"
 
+#include <chrono>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -8,6 +11,7 @@
 #include "rommsync/auth.hpp"
 #include "rommsync/auth_gate.hpp"
 #include "rommsync/config.hpp"
+#include "rommsync/device_identity.hpp"
 #include "rommsync/download.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/list_service.hpp"
@@ -25,6 +29,17 @@ std::string SdEngine::PathTo(const char* file_name) const { return config_dir_ +
 /// of which outlive it because it is a member beside them.
 SdEngine::SdEngine() : lists_(config_, queue_) {}
 
+SdEngine::~SdEngine() {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stopping_ = true;
+  }
+  wake_.notify_all();
+  if (pairing_thread_.joinable()) {
+    pairing_thread_.join();
+  }
+}
+
 void SdEngine::UseServer(http::HttpClient* client, std::string bearer_token) {
   lists_.UseServer(client, std::move(bearer_token));
 }
@@ -34,6 +49,20 @@ void SdEngine::UseCard(fs::FileSystem* filesystem) { lists_.UseCard(filesystem);
 bool SdEngine::PumpLists() { return lists_.Pump(); }
 
 void SdEngine::Load(const std::string& config_dir) {
+  // This reads `token.dat` and `auth.json` and writes `auth_` and `gate_`, so it
+  // takes both locks in the documented order.
+  //
+  // It is the one place `mutex_` is held across I/O, and the header says so.
+  // Whether a pairing thread exists yet depends on the caller: `main()` calls
+  // this *before* `UsePairingBackend`, so on a console there is none; the tests'
+  // `BootPairable` calls `UsePairingBackend` first, so there is. Neither can
+  // stall on these reads. A thread that does not exist is no reader, and one
+  // that does is parked in `AwaitNextPoll` with no attempt to drive, taking
+  // `mutex_` only for the length of a condition-variable predicate. What the
+  // rule is really about -- the frame-polled commands -- cannot reach it either
+  // way, because no `ServiceCore` exists to answer them until this returns.
+  std::lock_guard<std::mutex> card(card_mutex_);
+  std::lock_guard<std::mutex> lock(mutex_);
   config_dir_ = config_dir;
 
   // Presence, not validity: a `token.dat` that will not parse is still a
@@ -117,6 +146,18 @@ void SdEngine::Load(const std::string& config_dir) {
   AdoptConfig(config::LoadConfig(PathTo(config::kConfigFileName)));
 }
 
+void SdEngine::UsePairingBackend(PairingBackend backend) {
+  pairing_backend_ = std::move(backend);
+  if (pairing_backend_.http != nullptr && !pairing_thread_.joinable()) {
+    // See the header: this is the one throwing call in the class, and it happens
+    // at start rather than under a user's finger. It parks on `wake_` until
+    // there is an attempt, so a console that never pairs pays a blocked thread
+    // and its stack -- which is #126's to budget, along with the rest of the
+    // heap the transport needs.
+    pairing_thread_ = std::thread(&SdEngine::DrivePairing, this);
+  }
+}
+
 void SdEngine::AdoptConfig(config::LoadResult loaded) {
   config_ = std::move(loaded.value);
   diagnostics_ = auth_diagnostics_;
@@ -138,7 +179,12 @@ const std::vector<config::Diagnostic>& SdEngine::config_diagnostics() const {
 
 ipc::EngineSnapshot SdEngine::Snapshot() const {
   ipc::EngineSnapshot snapshot;
-  snapshot.auth = auth_;
+  {
+    // The one field here the pairing thread writes: a completed attempt turns a
+    // never-paired console into a paired one without a reload.
+    std::lock_guard<std::mutex> lock(mutex_);
+    snapshot.auth = auth_;
+  }
   // M3-2 (#19): these two come off the queue on the card rather than being the
   // zero a console with no engine reports. `pending()` counts what the worker
   // still has to do, so the finished rows kept for the queue screen do not
@@ -153,7 +199,30 @@ ipc::EngineSnapshot SdEngine::Snapshot() const {
   return snapshot;
 }
 
-auth::PairingStatus SdEngine::pairing_status() const { return auth::PairingStatus{}; }
+auth::PairingStatus SdEngine::pairing_status() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (attempt_ == nullptr) {
+    // `kIdle`: nothing has been started, or a `server.url` change discarded what
+    // had been (`pairing.hpp`).
+    return auth::PairingStatus{};
+  }
+  auth::PairingStatus status = attempt_->session.status();
+  if (status.state == auth::PairingState::kIdle) {
+    // The window `ipc::Engine::StartPairing` documents: the command has handed
+    // the attempt over and `Begin()` has not run yet, so the session still says
+    // `kIdle`. Reporting that would have the overlay tell the user that pressing
+    // Pair did nothing, which is the exact failure `kStarting` exists to prevent.
+    status.state = auth::PairingState::kStarting;
+  }
+  if (!attempt_commit_failure_.empty()) {
+    // The session succeeded and the card did not. It has no way to know that and
+    // would go on reporting `kApproved` -- a console that says it paired and
+    // holds no credentials.
+    status.state = auth::PairingState::kFailed;
+    status.message = attempt_commit_failure_;
+  }
+  return status;
+}
 
 ipc::Error SdEngine::SetSyncEnabled(bool enabled) {
   ipc::ConfigEdit edit;
@@ -204,6 +273,11 @@ bool SdEngine::ReadConfigText(std::string* text,
 
 ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
                                      std::vector<config::Diagnostic>* diagnostics) {
+  // The card lock, because a `server.url` change discards `token.dat`, and that
+  // has to be atomic against the pairing thread committing a grant. `mutex_` is
+  // taken below in slices, for `auth_`, `gate_` and the attempt; `config_` is
+  // this thread's alone and needs neither (`engine.hpp`).
+  std::lock_guard<std::mutex> card(card_mutex_);
   std::string current;
   if (!ReadConfigText(&current, diagnostics)) {
     return ipc::Error::kWriteFailed;
@@ -248,6 +322,20 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
     return ipc::Error::kWriteFailed;
   }
   if (server_changed) {
+    // ...and so is any pairing attempt in flight, which was started against the
+    // server that has just been replaced. Its grant would be a token issued by
+    // one RomM committed under a `config.ini` naming another -- the same
+    // confusion the discard above exists to prevent, arriving a minute later.
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      AbandonPairingLocked();
+    }
+    // Every other write to `attempt_` notifies, and this one has the longest
+    // wait to cut short: the thread is parked in `AwaitNextPoll` until the
+    // session's next deadline, which after a `slow_down` is `max_poll_backoff`
+    // away. Without this it holds the retired attempt alive for that long before
+    // noticing nobody wants it.
+    wake_.notify_all();
     // The verdict was about the token that has just gone, and about the server
     // that issued it. Left behind, it would put a console that has never paired
     // with the *new* server on a "pair again" screen (M1-4, #8). Not a refusal
@@ -255,7 +343,10 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
     // rather than a bearer token pointed at a stranger, and the pairing is
     // already gone by this point.
     auth::ClearBlock(PathTo(auth::kAuthStateFileName));
-    gate_.Reset();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      gate_.Reset();
+    }
   }
 
   const io::WriteResult wrote = io::WriteAtomically(PathTo(config::kConfigFileName), written);
@@ -270,13 +361,17 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
       diagnostics->push_back({config::Severity::kWarning, 0, "server", "url",
                               "this console's pairing was discarded before the write was "
                               "attempted, so it has to be paired again"});
+      std::lock_guard<std::mutex> lock(mutex_);
       auth_ = ipc::AuthState::kNeverPaired;
     }
     return ipc::Error::kWriteFailed;
   }
 
   if (server_changed) {
-    auth_ = ipc::AuthState::kNeverPaired;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auth_ = ipc::AuthState::kNeverPaired;
+    }
     diagnostics->push_back({config::Severity::kNotice, 0, "server", "url",
                             "the server changed, so this console's pairing was discarded -- "
                             "pair again from the overlay"});
@@ -305,9 +400,212 @@ bool SdEngine::RequestSync() {
   return false;
 }
 
-ipc::Error SdEngine::StartPairing() { return ipc::Error::kUnavailable; }
+ipc::Error SdEngine::StartPairing() {
+  // Asked again here rather than trusted from `ServiceCore::StartPair`, which
+  // refuses an unconfigured console before the engine is reached: `Engine` is an
+  // interface anything may drive, and starting an attempt against an empty
+  // origin would spend the console's device identifier on a request to nowhere.
+  if (!config_.configured()) {
+    return ipc::Error::kNotConfigured;
+  }
+  if (pairing_backend_.http == nullptr) {
+    // Nobody called `UsePairingBackend`. On a console that no longer happens --
+    // `main.cpp` installs M1-7 (#126)'s Horizon client at boot -- so this is
+    // reached by a host binary that never wired one, and by the tests that pin
+    // the refusal. Kept rather than asserted away: an engine with no transport
+    // has to answer *something*, and `kUnavailable` says "this build cannot",
+    // which is the sentence the pairing screen draws. Nothing was attempted and
+    // nothing changed, exactly as `ipc.hpp` promises.
+    return ipc::Error::kUnavailable;
+  }
+
+  // Before the attempt, because RomM keys the device on this value and a pairing
+  // begun with an identifier that never reached the card would register a second
+  // console on the next re-pair (`device_identity.hpp`). It touches the card and
+  // not the network, so it is not a wait this command may not make.
+  const auth::IdentityResult identity = auth::LoadOrCreateDeviceIdentity(
+      PathTo(auth::kDeviceIdentityFileName), pairing_backend_.identity_seed);
+  if (!identity.ok()) {
+    // `kUnreadable` is the important one: `device.dat` is there and would not
+    // open, and minting over it is unrecoverable, so this refuses rather than
+    // duplicating the console. `kWriteFailed` for that and for `kPersistFailed`
+    // -- the card is what stopped this, and nothing was written.
+    //
+    // **`kNoSeed` is the one that is not about the card**, which is why it
+    // answers differently. It means the platform layer handed over a seed with
+    // no usable stable value and too little entropy, and `device_identity.hpp`
+    // requires that layer to *fail rather than substitute* -- so reaching here
+    // is a defect in this build, not a state a user is in. `kWriteFailed` would
+    // send them to look at an SD card that is fine. `kInternal` is `ipc.hpp`'s
+    // "failed in a way it could not name", and while this one has a name, the
+    // name is not one the overlay can turn into an action.
+    return identity.error == auth::IdentityError::kNoSeed ? ipc::Error::kInternal
+                                                          : ipc::Error::kWriteFailed;
+  }
+
+  auth::PairingConfig pairing;
+  pairing.server_url = config_.server.url;
+  pairing.client_device_identifier = identity.value.client_device_identifier;
+  // `device_name` and `requested_scopes` are `pairing.hpp`'s defaults on
+  // purpose: the scopes are the least-privilege set `auth.scopes` pins to the
+  // document, and widening them here would be asking for a token that can do
+  // more than this client ever does.
+
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Whatever the last attempt left behind is discarded, which is what the
+    // pairing screen's "Start over" means: a second attempt over a live one is
+    // that, not an error (`PairingSession::Begin`).
+    //
+    // **It is discarded, not interrupted.** `http::HttpClient` has no way to be
+    // cancelled from outside a call -- `CancelToken` is passed *into* one -- and
+    // `PairingSession` owns its requests, so a thread inside the previous
+    // attempt's `Begin()` has to finish it before it picks this one up. The
+    // screen therefore reads "starting" for up to one `request_timeout` after a
+    // second press. Right in every case that matters (a first attempt, or one
+    // whose code is live and only polling) and wrong-looking only on the press
+    // that follows one hung init; fixing it needs a `CancelToken` on
+    // `PairingConfig`, which is `core/`'s to add.
+    attempt_ = std::make_shared<PairingAttempt>(*pairing_backend_.http, std::move(pairing),
+                                                config_.server.url);
+    attempt_commit_failure_.clear();
+  }
+  wake_.notify_all();
+  // `pairing_status()` already answers `kStarting`, which is the contract
+  // `ipc::Engine::StartPairing` states: `ServiceCore::StartPair` reads it one
+  // instant later and must not see `kIdle`.
+  return ipc::Error::kOk;
+}
+
+void SdEngine::AbandonPairingLocked() {
+  attempt_.reset();
+  attempt_commit_failure_.clear();
+}
+
+bool SdEngine::AwaitNextPoll(const std::shared_ptr<PairingAttempt>& attempt) {
+  // Until the session says the next request is due, rather than on a tick of our
+  // own. `PairingSession::Poll` enforces RomM's interval itself and answers a
+  // premature call by doing nothing, so a fixed tick would wake this thread a
+  // few thousand times over a ten-minute code to be told that each time -- on a
+  // process that is resident for the life of the console. Waiting *until* the
+  // deadline it publishes costs one wake-up per poll actually made, and the
+  // condition variable still cuts the wait short for a new attempt or for
+  // shutdown, which is what promptness there actually depends on.
+  const std::chrono::steady_clock::time_point due = attempt->session.next_poll_at();
+  std::unique_lock<std::mutex> lock(mutex_);
+  wake_.wait_until(lock, due, [this, &attempt] { return stopping_ || attempt_ != attempt; });
+  return !stopping_ && attempt_ == attempt;
+}
+
+void SdEngine::DrivePairing() {
+  for (;;) {
+    std::shared_ptr<PairingAttempt> attempt;
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      wake_.wait(lock, [this] { return stopping_ || attempt_ != driven_; });
+      if (stopping_) {
+        return;
+      }
+      driven_ = attempt_;
+      attempt = attempt_;
+      if (attempt == nullptr) {
+        // A `server.url` change abandoned the attempt before this thread ever
+        // picked it up. There is nothing to drive.
+        continue;
+      }
+    }
+
+    // The request `StartPairing` refused to wait for. Everything from here down
+    // is off the IPC thread, so it may take as long as `request_timeout`.
+    auth::PairingState state = attempt->session.Begin();
+    while (!auth::IsTerminal(state) && AwaitNextPoll(attempt)) {
+      state = attempt->session.Poll();
+    }
+    if (state != auth::PairingState::kApproved) {
+      // Denied, expired, failed -- or superseded, in which case the attempt that
+      // replaced this one is what the next turn of this loop picks up. All four
+      // leave the card exactly as it was.
+      continue;
+    }
+    const auth::DeviceTokenResponse* granted = attempt->session.token();
+    if (granted != nullptr) {
+      CommitGrant(attempt, *granted);
+    }
+  }
+}
+
+void SdEngine::CommitGrant(const std::shared_ptr<PairingAttempt>& attempt,
+                           const auth::DeviceTokenResponse& granted) {
+  // The card lock for the whole commit, so an `Unpair` or a `server.url` change
+  // cannot land between the two writes below. `mutex_` is taken inside it, in
+  // slices, and never across a write -- `GetStatus` and `GetPairState` are
+  // polled every frame and may not wait on an SD card (`engine.hpp`).
+  std::lock_guard<std::mutex> card(card_mutex_);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stopping_ || attempt_ != attempt) {
+      // A newer attempt is running, or the engine is going away. The grant is
+      // real and its code is spent, so this does cost the user one approval --
+      // but writing it would put a token on the card that the attempt the
+      // overlay is drawing knows nothing about, and the attempt that replaced
+      // this one will commit its own.
+      //
+      // Checked under `card_mutex_`, which is what settles it against the one
+      // racer that would be dangerous: `ApplyConfigEdit` clears `attempt_` and
+      // discards the token while holding that lock, so a `server.url` change
+      // cannot slip between this check and the write below and leave the new
+      // server's console holding the old server's token.
+      //
+      // It is *not* atomic against `StartPairing`, which replaces `attempt_`
+      // under `mutex_` alone -- deliberately, because a command may not wait on
+      // an SD write (`ipc.hpp`). So a user who presses "start over" in the
+      // moment between this check and the write gets A1's token committed under
+      // A2's screen. That end state is honest rather than wrong: A1 really was
+      // approved, the token really does work, and A2 overwrites it if the user
+      // finishes it. What the lock buys is that the *card* is never spliced.
+      return;
+    }
+  }
+
+  // M1-5 (#9)'s write, unchanged: the record goes to `token.dat.tmp` and is
+  // renamed onto `token.dat`, so a reader sees the previous token or the new one
+  // and never a splice. `device.dat` is untouched -- the identifier has to
+  // survive a re-pair or RomM registers the console twice.
+  const auth::StoredToken record = auth::StoredTokenFrom(attempt->server_url, granted);
+  const auth::StoreResult saved = auth::SaveToken(PathTo(auth::kTokenFileName), record);
+  if (!saved.ok()) {
+    // Said out loud on the pairing screen rather than left to be discovered at
+    // the next sync tick: the approval is spent, so the remedy is to pair again,
+    // and a screen still reading `kApproved` would tell the user the opposite.
+    std::lock_guard<std::mutex> lock(mutex_);
+    attempt_commit_failure_ =
+        std::string("the pairing was approved and the token could not be saved (") +
+        auth::ToString(saved.error) + ") -- pair again";
+    return;
+  }
+
+  // A verdict about the credentials that have just been replaced. Left standing
+  // it would have a worker (M7-2, #37) refuse to call on a console the user has
+  // this second paired. Not a refusal if it fails, for the reason `Unpair`
+  // gives: what a failed clear costs is the next boot reading it back, and
+  // `Load` already declines to honour a verdict over a token it is not about.
+  auth::ClearBlock(PathTo(auth::kAuthStateFileName));
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    gate_.Reset();
+    auth_ = ipc::AuthState::kPaired;
+  }
+}
 
 ipc::Error SdEngine::Unpair() {
+  // The pairing thread commits a grant under this same card lock, so a discard
+  // and a commit cannot interleave: one of them happens whole. `mutex_` is taken
+  // afterwards, for the two assignments only, so nothing polled every frame
+  // waits on these writes. **It does not abandon a live attempt**, and that is
+  // the settings screen's whole design -- "Re-pair" sends `StartPair` first and
+  // `Unpair` only once an attempt is under way, so the console never passes
+  // through "unpaired with nothing to restart" (docs/AUTH.md, M4-4 #26).
+  std::lock_guard<std::mutex> card(card_mutex_);
   // The credentials first: see the header note on the order.
   if (!auth::DiscardToken(PathTo(auth::kTokenFileName))) {
     return ipc::Error::kWriteFailed;
@@ -324,8 +622,11 @@ ipc::Error SdEngine::Unpair() {
   // reading the file back and reporting `kUnauthenticated` over a pairing that
   // is gone -- which `Load` already refuses to do, because there is no token for
   // the verdict to be about.
-  gate_.Reset();
-  auth_ = ipc::AuthState::kNeverPaired;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    gate_.Reset();
+    auth_ = ipc::AuthState::kNeverPaired;
+  }
   return cleared ? ipc::Error::kOk : ipc::Error::kWriteFailed;
 }
 

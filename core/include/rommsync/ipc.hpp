@@ -235,13 +235,28 @@ enum class Error {
   ///
   /// The sysmodule hosts the whole command set from M4-1 (#23) onward, because
   /// the overlay needs a service to talk to, while the machinery behind half of
-  /// it is still being built -- the download queue is M3-2 (#19), live config
-  /// writes M5-3 (#30), list paging M5-4 (#31), the scheduler M7-2. Those
-  /// commands answer this rather than a plausible-looking refusal: an `Enqueue`
-  /// reported as `kQueueFull` sends a user looking for a full queue, and a
-  /// `SetEnabled` reported as `kWriteFailed` sends them looking at their SD
-  /// card. **Nothing was attempted and nothing changed**, exactly as for
-  /// `kInvalid`.
+  /// it is still being built -- the download queue was M3-2 (#19), live config
+  /// writes M5-3 (#30), pairing M1-6 (#123). Those commands answer this rather
+  /// than a plausible-looking refusal: an `Enqueue` reported as `kQueueFull`
+  /// sends a user looking for a full queue, and a `SetEnabled` reported as
+  /// `kWriteFailed` sends them looking at their SD card. **Nothing was
+  /// attempted and nothing changed**, exactly as for `kInvalid`.
+  ///
+  /// What still answers it, and what removes each one. M5-4 (#31) took the three
+  /// list commands off this list; these two are what is left:
+  ///
+  /// - `SyncNow` on a console with no scheduler to hand a tick to, M7-2 (#37).
+  ///   It arrives as `kAlreadyRunning` rather than as this, because
+  ///   `Engine::RequestSync` is a bool with no room for it to say so.
+  /// - `StartPair` on a build with **no HTTP transport**. Not the console any
+  ///   more: M1-6 (#123) built the engine half and M1-7 (#126) the Horizon
+  ///   backend, and `main.cpp` installs it at boot, so a console answers this
+  ///   only if that wiring is removed. It survives for a host binary that never
+  ///   installed one. It is a different sentence from `kNotConfigured`, which is a
+  ///   console with no `server.url` -- one is something the user can fix on the
+  ///   settings screen and the other is not. **Note it is not `kOffline`
+  ///   either**, which is what a *list* answers on the same console: a list has
+  ///   a server it cannot reach, and a pairing attempt has no way to reach one.
   ///
   /// It is appended rather than inserted: `sysmodule::ToResult` maps the
   /// ordinal, so renumbering one would change what an already-built overlay
@@ -869,6 +884,11 @@ class Engine {
   /// about it. An engine that let `kIdle` show through that window would have
   /// the overlay tell the user that pressing Pair did nothing, which is the
   /// exact failure `PairingState::kStarting` exists to prevent (pairing.hpp).
+  ///
+  /// **A refusal writes nothing and touches no token.** That is what lets the
+  /// settings screen's "Re-pair" ask before it discards (M4-4, #26): it sends
+  /// this first, and `Unpair` only once an attempt is genuinely under way, so a
+  /// console never passes through "unpaired with nothing to restart".
   virtual Error StartPairing() = 0;
 
   /// Discard the credentials. `kWriteFailed` if they are still on the card.
@@ -925,7 +945,8 @@ class ServiceCore {
   /// Command 5. Hands work to the engine; never blocks.
   SyncOutcome SyncNow();
 
-  /// Command 6. `kNotConfigured` when there is no server to pair with. The
+  /// Command 6. `kNotConfigured` when there is no server to pair with, and
+  /// `kUnavailable` when the build has no transport to reach one with. The
   /// status it answers with is the attempt as it stands one instant later --
   /// `kStarting`, since the init request has not come back.
   Error StartPair(auth::PairingStatus* status);

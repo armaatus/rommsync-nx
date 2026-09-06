@@ -16,10 +16,12 @@
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "checks.hpp"
 #include "rommsync/host/curl_http_client.hpp"
 #include "rommsync/http.hpp"
+#include "rommsync/json.hpp"
 
 namespace rig {
 
@@ -152,6 +154,64 @@ inline bool WriteFile(const std::string& path, std::string_view content) {
   std::ofstream out(path, std::ios::binary | std::ios::trunc);
   out.write(content.data(), static_cast<std::streamsize>(content.size()));
   return out.good();
+}
+
+// --- being the human at the browser -------------------------------------------
+
+/// Base64, for the one header these helpers send.
+///
+/// Small enough to write here and the only place in the suite that needs it --
+/// nothing this client *ships* speaks Basic auth, so this does not belong in
+/// `core/`.
+inline std::string Base64(std::string_view raw) {
+  static const char kAlphabet[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  for (std::size_t at = 0; at < raw.size(); at += 3) {
+    const std::size_t left = raw.size() - at;
+    const unsigned a = static_cast<unsigned char>(raw[at]);
+    const unsigned b = left > 1 ? static_cast<unsigned char>(raw[at + 1]) : 0u;
+    const unsigned c = left > 2 ? static_cast<unsigned char>(raw[at + 2]) : 0u;
+    const unsigned triple = (a << 16) | (b << 8) | c;
+    out.push_back(kAlphabet[(triple >> 18) & 0x3F]);
+    out.push_back(kAlphabet[(triple >> 12) & 0x3F]);
+    out.push_back(left > 1 ? kAlphabet[(triple >> 6) & 0x3F] : '=');
+    out.push_back(left > 2 ? kAlphabet[triple & 0x3F] : '=');
+  }
+  return out;
+}
+
+/// A POST to `path` as the fixture user, over HTTP Basic.
+///
+/// `/api/auth/device/approve` and `/api/auth/device/deny` are ordinary
+/// authenticated endpoints and take Basic, which is why being the human at the
+/// browser needs no session cookie and no CSRF dance (docs/TESTING.md).
+inline http::Result AsTheUser(http::HttpClient& client, const std::string& base,
+                              const std::string& path, const std::string& body) {
+  http::Request request;
+  request.method = http::Method::kPost;
+  request.url = base + path;
+  request.headers.push_back({"Content-Type", "application/json"});
+  request.headers.push_back(
+      {"Authorization", "Basic " + Base64(std::string(kUser) + ":" + kPassword)});
+  request.body = body;
+  return client.Send(request);
+}
+
+/// Approve a live device code, granting `scopes`.
+inline http::Result ApproveDeviceCode(http::HttpClient& client, const std::string& base,
+                                      const std::string& user_code,
+                                      const std::vector<std::string>& scopes) {
+  return AsTheUser(client, base, "/api/auth/device/approve",
+                   "{\"user_code\":" + rommsync::json::Quote(user_code) +
+                       ",\"approved_scopes\":" + rommsync::json::QuoteArray(scopes) + "}");
+}
+
+/// Refuse one, the way a human who did not recognise the console would.
+inline http::Result DenyDeviceCode(http::HttpClient& client, const std::string& base,
+                                   const std::string& user_code) {
+  return AsTheUser(client, base, "/api/auth/device/deny",
+                   "{\"user_code\":" + rommsync::json::Quote(user_code) + "}");
 }
 
 // --- the rig ------------------------------------------------------------------

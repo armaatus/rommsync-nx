@@ -138,23 +138,23 @@ struct SettingsSection {
 /// What the last "Re-pair" press produced.
 ///
 /// **Nothing here is a prediction.** The button sends `StartPair` *before*
-/// `Unpair`, which is the opposite of the order docs/AUTH.md describes, and the
-/// reason is the state of the sysmodule rather than a preference:
-/// `SdEngine::StartPairing` is still `kUnavailable` (M1-4, #8 built `Unpair`;
-/// no issue owns the other half), so a button that discarded the token first
-/// would leave a console that cannot pair again from the overlay at all. So the
-/// half that can refuse for free goes first -- it writes nothing and touches no
-/// token -- and the token is discarded only once a pairing is genuinely
-/// starting. #26 was told to build `StartPairing` first *or* gate the button on
-/// it; this is the gate.
+/// `Unpair`, which is the opposite of the order docs/AUTH.md describes. #26 was
+/// told to build `StartPairing` first *or* gate the button on it, and this was
+/// the gate: `StartPairing` answered `kUnavailable` unconditionally, so a button
+/// that discarded the token first would have left a console that could not pair
+/// again from the overlay at all. M1-6 (#123) built it, and the order stays --
+/// an attempt is still refusable, for want of a `server.url` or of an HTTP
+/// transport, and the half that can refuse for free is the one to ask first.
 enum class RepairOutcome {
   kNone,  ///< nothing has been pressed since the screen opened
 
   /// `StartPair` answered `kNotConfigured`. Nothing was discarded.
   kNotConfigured,
 
-  /// `StartPair` answered `kUnavailable`: this sysmodule cannot start a
-  /// pairing. Nothing was discarded, which is the whole point of asking first.
+  /// `StartPair` answered `kUnavailable`: this build has no HTTP transport to
+  /// reach the server with, so it cannot start a pairing. A console has one
+  /// since M1-7 (#126), so this is the answer a build with the wiring removed
+  /// gives. Nothing was discarded, which is the whole point of asking first.
   kUnavailable,
 
   /// `StartPair` refused for some other reason. Nothing was discarded.
@@ -176,8 +176,8 @@ Tone RepairOutcomeTone(RepairOutcome outcome);
 /// shape `EnqueueRefusalText` has on the library screen.
 ///
 /// `kNotConfigured` and `kUnavailable` are the two a user can act on -- one is a
-/// missing `server.url`, the other a sysmodule whose pairing half is not built
-/// yet -- and everything else is one sentence, because there is nothing
+/// missing `server.url`, the other a build with no transport to reach one with
+/// -- and everything else is one sentence, because there is nothing
 /// different to do about any of them. **`kOk` is `kRefused` too**: this is only
 /// ever asked about a `StartPair` that failed, and a refusal that named no error
 /// is still a refusal, not a success.

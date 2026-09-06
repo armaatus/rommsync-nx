@@ -195,11 +195,13 @@ asked. A new screen takes a `ScreenFrame` member and calls `Ready()` and
 reached through it (M4-4, #26). A new screen adds an `overlay::Destination` and
 a row there; it does not add a second way in from `main.cpp`.
 
-**"Re-pair" cannot actually re-pair yet.** `SdEngine::StartPairing` returns
-`kUnavailable` and no issue owns building it, so the button sends `StartPair`
-first — which writes nothing when it refuses — and only discards the token once
-a pairing is genuinely starting. Today that means it always answers *"This
-sysmodule cannot start a pairing yet; this console is still paired"*. That is
-the gate #26 asked for, not a screen bug.
+**"Re-pair" asks before it discards.** The button sends `StartPair` first —
+which writes nothing when it refuses — and only discards the token once a
+pairing is genuinely starting. M1-6 (#123) built `SdEngine::StartPairing` and
+M1-7 (#126) the transport under it, so a configured console now starts a real
+attempt and the common path is a pairing screen with a code on it. The order
+still holds, because an attempt is still refusable for want of a `server.url`,
+and that answers *"This sysmodule cannot start a pairing yet; this console is
+still paired"* with nothing lost.
 
 [libultrahand]: https://github.com/ppkantorski/libultrahand

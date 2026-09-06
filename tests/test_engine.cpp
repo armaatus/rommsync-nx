@@ -33,14 +33,23 @@
 //   commands  -- what is still `kUnavailable`, so the list shrinks deliberately
 //   relaunch  -- M6-2: two engines over one card at once, and no lock file
 //   reenable  -- M6-2: the enable switch off and back on, with nothing rebooted
+//   unreachable -- M1-6: a server that answers nothing refuses the attempt and
+//                  leaves the card alone
+//   pairs     -- M1-6: a pairing attempt, start to committed token
+//   nonblocking -- M1-6: `StartPair` returns while the init is still in flight
+//   repairs   -- M1-6: `StartPair` then `Unpair`, with neither instant losing
+//                both the old pairing and the new attempt
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #include "engine.hpp"
@@ -51,6 +60,7 @@
 #include "rommsync/download.hpp"
 #include "rommsync/host/curl_http_client.hpp"
 #include "rommsync/ipc.hpp"
+#include "rommsync/pairing.hpp"
 #include "rommsync/token_store.hpp"
 
 namespace auth = rommsync::auth;
@@ -117,6 +127,25 @@ class Console {
     std::string response;
     Call(ipc::Command::kSyncNow, ipc::EncodeEmpty(), &response);
     return ipc::DecodeSyncOutcome(response).value;
+  }
+
+  /// Command 6, and the status it answers with -- the attempt as it stands one
+  /// instant later, which is what the overlay draws while the init is in flight.
+  ipc::Error StartPair(auth::PairingStatus* status) {
+    std::string response;
+    const ipc::Error answer = Call(ipc::Command::kStartPair, ipc::EncodeEmpty(), &response);
+    if (answer == ipc::Error::kOk) {
+      *status = auth::ParsePairingStatus(response).value;
+    }
+    return answer;
+  }
+
+  /// Command 7, read the way the overlay reads it: off the wire, never off the
+  /// engine's own object.
+  auth::PairingStatus PairState() {
+    std::string response;
+    Call(ipc::Command::kGetPairState, ipc::EncodeEmpty(), &response);
+    return auth::ParsePairingStatus(response).value;
   }
 
   ipc::ConfigView Configured() {
@@ -842,6 +871,339 @@ void Unauthenticated(checks::Checks& c) {
            "which stops nothing: the console will find out by asking");
 }
 
+// --- M1-6: the pairing attempt the console starts -----------------------------
+
+using Clock = std::chrono::steady_clock;
+using namespace std::chrono_literals;
+
+/// How long a scenario may spend waiting for an attempt to settle. Generous
+/// because RomM paces the token endpoint, and every wait here is bounded so a
+/// wedged attempt fails with its own message rather than as a CTest timeout.
+constexpr auto kBudget = 120s;
+
+/// What the client asks for in production, not a convenient subset. `pair.happy`
+/// already proves a live RomM grants all of them; the engine asks for the same.
+const std::vector<std::string>& Scopes() {
+  static const std::vector<std::string> scopes = auth::MinimumScopes();
+  return scopes;
+}
+
+/// A console that has a transport.
+///
+/// The seed is a fixed literal for the reason `test_pairing.cpp` gives: the
+/// identifier derived from it is stable across scenarios, so the fixture RomM
+/// ends up with one device for this test binary rather than one per run.
+sysmodule::PairingBackend Backend(http::HttpClient& client) {
+  sysmodule::PairingBackend backend;
+  backend.http = &client;
+  backend.identity_seed.stable = "rommsync-nx-engine-test";
+  return backend;
+}
+
+/// Point `console` at `server_url`, give it `client` to reach it with, and boot.
+/// The three lines every pairing scenario starts with, in one place.
+void BootPairable(Console& console, checks::Checks& c, http::HttpClient& client,
+                  const std::string& server_url) {
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = " + server_url + "\n"),
+           "the console is configured for " + server_url);
+  console.engine.UsePairingBackend(Backend(client));
+  console.Boot();
+}
+
+/// Poll `GetPairState` until `settled` is happy, or the budget runs out.
+///
+/// Through the command, not through `engine.pairing_status()`: the overlay never
+/// sees a status that did not cross IPC first, and a status that cannot be
+/// serialised is a bug this would otherwise miss.
+auth::PairingStatus Settled(Console& console, checks::Checks& c,
+                            const std::function<bool(const auth::PairingStatus&)>& settled) {
+  const Clock::time_point give_up = Clock::now() + kBudget;
+  auth::PairingStatus status = console.PairState();
+  while (!settled(status) && Clock::now() < give_up) {
+    std::this_thread::sleep_for(100ms);
+    status = console.PairState();
+  }
+  c.Expect(settled(status), std::string("the attempt settled (") +
+                                auth::ToString(status.state) + ": " + status.message + ")");
+  return status;
+}
+
+auth::PairingStatus Terminal(Console& console, checks::Checks& c) {
+  return Settled(console, c, [](const auth::PairingStatus& status) {
+    return auth::IsTerminal(status.state);
+  });
+}
+
+/// Start an attempt and wait until there is a code to show.
+///
+/// RomM allows ten device inits a minute per IP and the whole suite is one IP,
+/// so a rate-limited init is waited out rather than failed -- a console pairs
+/// once, ever, and never comes near that limit. Bounded, so an init broken for
+/// any other reason still fails here.
+auth::PairingStatus BeginAndShow(Console& console, checks::Checks& c) {
+  const Clock::time_point give_up = Clock::now() + kBudget;
+  while (Clock::now() < give_up) {
+    auth::PairingStatus started;
+    const ipc::Error answer = console.StartPair(&started);
+    c.Expect(answer == ipc::Error::kOk,
+             "StartPair is answered rather than refused as unavailable -- which is the whole "
+             "signal that M1-6 replaced M4-1's placeholder");
+    if (answer != ipc::Error::kOk) {
+      return {};
+    }
+    // The contract `ipc::Engine::StartPairing` documents: the command hands the
+    // work to the engine thread, so the status one instant later is *not*
+    // `kIdle`, which the overlay would draw as "nothing happened when you
+    // pressed Pair".
+    //
+    // Asserted as "not idle" rather than as `kStarting` on purpose. `StartPair`
+    // notifies the thread before it returns, so how far that thread has got by
+    // the time this line runs is the scheduler's business: pinning `kStarting`
+    // would be pinning a race, and a test that fails on a preemption teaches the
+    // next reader to re-run it rather than to believe it.
+    c.Expect(started.state != auth::PairingState::kIdle,
+             std::string("the attempt is reported as started, not as idle (") +
+                 auth::ToString(started.state) + ")");
+
+    const auth::PairingStatus status =
+        Settled(console, c, [](const auth::PairingStatus& seen) {
+          return !seen.user_code.empty() || auth::IsTerminal(seen.state);
+        });
+    if (status.state != auth::PairingState::kFailed ||
+        status.message.find("429") == std::string::npos) {
+      return status;
+    }
+    // The limit clears on a rolling minute, so a coarse sleep only overshoots it.
+    std::this_thread::sleep_for(2s);
+  }
+  c.Expect(false, "no code arrived within the budget");
+  return {};
+}
+
+/// init -> a code on the screen -> approve -> a token on the card. The
+/// acceptance criterion the whole issue is about.
+int Pairs(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  Console console(c, "engine-pairs");
+  BootPairable(console, c, client, base);
+  c.Expect(console.Status().auth == ipc::AuthState::kNeverPaired, "and has never paired");
+
+  const auth::PairingStatus showing = BeginAndShow(console, c);
+  c.Expect(showing.state == auth::PairingState::kPending,
+           std::string("the attempt reaches a live code (") + auth::ToString(showing.state) +
+               ": " + showing.message + ")");
+  c.ExpectEq(showing.user_code.size(), std::size_t{8}, "the user code is 8 characters");
+  c.ExpectEq(showing.verification_url, base + "/pair/device",
+             "the verification path is joined onto the configured origin");
+  c.ExpectEq(showing.verification_url_complete,
+             base + "/pair/device?user_code=" + showing.user_code,
+             "and the complete one carries the code");
+  c.Expect(showing.expires_in > 0s, "the code has time left on it");
+  c.Expect(!console.sandbox.Exists("/config/rommsync/token.dat"),
+           "nothing has been written yet: an attempt is not a pairing");
+  c.Expect(console.Status().auth == ipc::AuthState::kNeverPaired,
+           "and the console still reports itself unpaired");
+
+  const http::Result approved = rig::ApproveDeviceCode(client, base, showing.user_code, Scopes());
+  c.Expect(approved.successful(),
+           "approving the code -- HTTP " + std::to_string(approved.response.status));
+
+  const auth::PairingStatus granted = Terminal(console, c);
+  c.Expect(granted.state == auth::PairingState::kApproved,
+           std::string("an approved code yields a token (") + auth::ToString(granted.state) +
+               ": " + granted.message + ")");
+
+  // The half this issue owns: the grant reaches the card, atomically, beside
+  // `device.dat`, and the console reports itself paired with no reload.
+  c.Expect(console.Status().auth == ipc::AuthState::kPaired,
+           "so the console is paired, without a restart");
+  c.Expect(!console.sandbox.Exists("/config/rommsync/token.dat.tmp"),
+           "with no partial file left beside the token");
+  c.Expect(console.sandbox.Exists("/config/rommsync/device.dat"),
+           "and the identifier that has to survive a re-pair is on the card too");
+
+  const auth::LoadedToken stored = auth::LoadToken(console.directory + auth::kTokenFileName);
+  c.Expect(stored.ok(), "the committed token reads back: " + stored.message);
+  c.ExpectEq(stored.value.server_url, base, "against the server that issued it");
+  c.Expect(stored.value.access_token.rfind("rmm_", 0) == 0, "it is a RomM client token");
+  c.Expect(!stored.value.device_id.empty(), "and it names the device every sync call is scoped by");
+
+  // A token nothing ever accepted would make every assertion above a test of
+  // string handling. This is the one that says the pairing is real.
+  http::Request mine;
+  mine.url = base + "/api/users/me";
+  mine.headers.push_back({"Authorization", "Bearer " + stored.value.access_token});
+  const http::Result whoami = client.Send(mine);
+  c.ExpectOk(whoami, "the committed token is used against the RomM that issued it");
+  c.Expect(whoami.response.status == 200,
+           "and it is accepted -- HTTP " + std::to_string(whoami.response.status));
+
+  // The status is still the overlay's to draw, and it still carries no secret.
+  const std::string payload = auth::SerializePairingStatus(console.PairState());
+  c.Expect(payload.find(stored.value.access_token) == std::string::npos,
+           "the pairing payload does not carry the token it just committed");
+  return c.failures();
+}
+
+/// `ipc.hpp` makes "no command waits on the network" a contract, so it is
+/// asserted rather than assumed: the init is stalled by the fault proxy for five
+/// seconds and `StartPair` still has to come back at once.
+int NonBlocking(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  Console console(c, "engine-nonblocking");
+  BootPairable(console, c, client, base);
+
+  harness::Fault stalled(c, client, base,
+                         R"({"mode":"stall","seconds":5,"path":"/api/auth/device/init"})");
+  auth::PairingStatus started;
+  const Clock::time_point sent = Clock::now();
+  const ipc::Error answer = console.StartPair(&started);
+  const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - sent);
+
+  c.Expect(answer == ipc::Error::kOk, "StartPair is answered while the init is still in flight");
+  c.Expect(started.state == auth::PairingState::kStarting,
+           std::string("and reports the attempt as starting (") + auth::ToString(started.state) +
+               ")");
+  // Two orders of magnitude under the stall. The command does an SD read and a
+  // thread hand-off; anything near five seconds means it waited for the socket.
+  c.Expect(took < 1000ms, "and it returned in " + std::to_string(took.count()) +
+                              "ms, without waiting for the server");
+
+  // The attempt is the engine thread's problem from here, and it survives the
+  // stall as a named failure rather than as a wedged screen.
+  const auth::PairingStatus after = Terminal(console, c);
+  c.Expect(after.state == auth::PairingState::kFailed,
+           std::string("a stalled init fails the attempt (") + auth::ToString(after.state) + ")");
+  c.Expect(!after.message.empty(), "with a reason: " + after.message);
+  c.Expect(!console.sandbox.Exists("/config/rommsync/token.dat"),
+           "and a failed attempt writes no credentials");
+  return c.failures();
+}
+
+/// The settings screen's "Re-pair": `StartPair` first, `Unpair` only once an
+/// attempt is genuinely under way (M4-4, #26).
+///
+/// What this pins is the pair of instants between the two commands. An
+/// interruption before `Unpair` leaves the old pairing on the card; one after it
+/// leaves a live attempt. Neither leaves a console with nothing.
+int Repairs(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+
+  Console console(c, "engine-repairs");
+  auth::StoredToken old_token;
+  old_token.server_url = base;
+  old_token.access_token = fixture.token;
+  old_token.device_id = fixture.device_id;
+  const std::string token_path = console.directory + auth::kTokenFileName;
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini", "[server]\nurl = " + base + "\n"),
+           "the console is configured for the fixture RomM");
+  c.Expect(auth::SaveToken(token_path, old_token).ok(), "and already paired with it");
+
+  // Not `BootPairable`: the token has to reach the card *before* `Load` reads
+  // it, so this scenario writes the config itself and boots afterwards.
+  console.engine.UsePairingBackend(Backend(client));
+  console.Boot();
+  c.Expect(console.Status().auth == ipc::AuthState::kPaired, "so it comes up paired");
+
+  const auth::PairingStatus showing = BeginAndShow(console, c);
+  c.Expect(showing.state == auth::PairingState::kPending,
+           std::string("the new attempt reaches a live code (") + auth::ToString(showing.state) +
+               ": " + showing.message + ")");
+  // The first instant: the attempt is under way and the credentials it is meant
+  // to replace are still there. A console interrupted here is exactly the
+  // console it was.
+  c.Expect(auth::LoadToken(token_path).ok(),
+           "starting an attempt touches no token -- an interruption here keeps the old pairing");
+  c.Expect(console.Status().auth == ipc::AuthState::kPaired, "and the console is still paired");
+
+  std::string response;
+  c.Expect(console.Call(ipc::Command::kUnpair, ipc::EncodeEmpty(), &response) == ipc::Error::kOk,
+           "Unpair discards the old credentials");
+  c.Expect(!auth::LoadToken(token_path).ok(), "which are gone from the card");
+  c.Expect(console.Status().auth == ipc::AuthState::kNeverPaired, "so the console reports unpaired");
+  // The second instant: the pairing is gone and the attempt that replaces it is
+  // still live. A console interrupted here has a code on screen to finish with.
+  const auth::PairingStatus surviving = console.PairState();
+  c.Expect(!auth::IsTerminal(surviving.state),
+           std::string("the attempt outlives the discard (") + auth::ToString(surviving.state) +
+               ")");
+  c.ExpectEq(surviving.user_code, showing.user_code, "and it is still the same code on screen");
+
+  // A poll that RomM refuses once, forced -- the interruption a re-pair is most
+  // likely to meet in the field, and the attempt has to survive it rather than
+  // leave the console with neither a pairing nor a way to make one.
+  //
+  // Waited out by `polls` rather than by the clock: RomM sets the interval, so a
+  // fixed sleep either fails on a slow one or disarms a fault the attempt never
+  // met, and a fault nobody used would make the assertion below vacuous.
+  {
+    const int before = console.PairState().polls;
+    harness::Fault refused(c, client, base,
+                           R"({"mode":"status","status":503,"path":"/api/auth/device/token"})");
+    const auth::PairingStatus after =
+        Settled(console, c, [before](const auth::PairingStatus& seen) {
+          return seen.polls > before || auth::IsTerminal(seen.state);
+        });
+    c.Expect(after.polls > before, "the refused poll was actually sent");
+  }
+  c.Expect(!auth::IsTerminal(console.PairState().state),
+           "a 5xx mid-poll backs the attempt off rather than abandoning it");
+  c.Expect(auth::LoadToken(token_path).error != auth::StoreError::kNone,
+           "and it wrote no credentials on the way past");
+
+  const http::Result approved = rig::ApproveDeviceCode(client, base, showing.user_code, Scopes());
+  c.Expect(approved.successful(),
+           "approving the new code -- HTTP " + std::to_string(approved.response.status));
+  const auth::PairingStatus granted = Terminal(console, c);
+  c.Expect(granted.state == auth::PairingState::kApproved,
+           std::string("the re-pair completes (") + auth::ToString(granted.state) + ": " +
+               granted.message + ")");
+  c.Expect(console.Status().auth == ipc::AuthState::kPaired, "and the console is paired again");
+
+  const auth::LoadedToken replaced = auth::LoadToken(token_path);
+  c.Expect(replaced.ok(), "with credentials on the card: " + replaced.message);
+  c.Expect(replaced.value.access_token != fixture.token,
+           "and they are the new ones, not the discarded ones");
+  return c.failures();
+}
+
+/// A server that answers nothing. The attempt is refused, and the refusal is the
+/// attempt's own failure rather than a command that lied about starting one --
+/// and, above all, the card is untouched.
+void Unreachable(checks::Checks& c) {
+  const std::unique_ptr<http::HttpClient> client = rommsync::host::MakeCurlHttpClient();
+  Console console(c, "engine-unreachable");
+  // Port 9 is discard: nothing listens, so the connect is refused at once. A
+  // hostname that does not resolve would test DNS timeouts instead.
+  BootPairable(console, c, *client, "http://127.0.0.1:9");
+
+  auth::PairingStatus started;
+  c.Expect(console.StartPair(&started) == ipc::Error::kOk,
+           "StartPair still starts an attempt: whether the server answers is not something "
+           "this command can know without waiting, which it may not do");
+  // Not `kStarting` exactly: the connect to a closed port is refused in
+  // microseconds, so the thread can reach `kFailed` before this line runs. What
+  // the command promises is that it did not answer `kIdle`.
+  c.Expect(started.state != auth::PairingState::kIdle,
+           std::string("and reports it started (") + auth::ToString(started.state) + ")");
+
+  const auth::PairingStatus settled = Terminal(console, c);
+  c.Expect(settled.state == auth::PairingState::kFailed,
+           std::string("the attempt fails once the connect does (") +
+               auth::ToString(settled.state) + ")");
+  c.Expect(!settled.message.empty(), "with a reason the screen can draw: " + settled.message);
+  c.Expect(!console.sandbox.Exists("/config/rommsync/token.dat"),
+           "and the console holds no credentials it did not earn");
+  c.Expect(console.Status().auth == ipc::AuthState::kNeverPaired,
+           "so it is exactly the console it was");
+}
+
 // --- what is still not built --------------------------------------------------
 
 void Commands(checks::Checks& c) {
@@ -863,6 +1225,25 @@ void Commands(checks::Checks& c) {
   c.Expect(console.Call(ipc::Command::kStartPair, ipc::EncodeEmpty(), &response) ==
                ipc::Error::kNotConfigured,
            "StartPair is refused for want of a server before the engine is asked at all");
+
+  // M1-6 built the engine half. What is left on this list is the *transport*:
+  // `core/` reaches a server through `http::HttpClient` and the console has no
+  // implementation of one yet, so a build with a server to pair with and nothing
+  // to reach it through answers `kUnavailable` -- "this build has no engine
+  // behind that command" -- rather than a plausible refusal about the server or
+  // the card (`ipc.hpp`).
+  Console configured(c, "engine-commands-2");
+  c.Expect(configured.sandbox.Write("/config/rommsync/config.ini",
+                                    "[server]\nurl = https://romm.example.com\n"),
+           "a console with a server and no transport");
+  configured.Boot();
+  c.Expect(configured.Call(ipc::Command::kStartPair, ipc::EncodeEmpty(), &response) ==
+               ipc::Error::kUnavailable,
+           "StartPair says the build has no transport rather than blaming the server");
+  c.Expect(!configured.sandbox.Exists("/config/rommsync/token.dat"),
+           "and a refused attempt writes nothing");
+  c.Expect(!configured.sandbox.Exists("/config/rommsync/device.dat"),
+           "not even the identifier a real attempt would mint");
 
   // What each issue that has landed took off that list, which is the signal
   // `engine.hpp` asks every one of them to give.
@@ -890,6 +1271,28 @@ void Commands(checks::Checks& c) {
            "...and it applies now: M5-3 (#30) built it");
   c.Expect(console.Set(Edit("sync", "saves", "false")).outcome == ipc::WriteOutcome::kApplied,
            "as does SetConfig (#30)");
+}
+
+/// The scenarios that need the docker RomM, by name. A table rather than a
+/// second `if` chain, so the list of them is written down once.
+struct RigScenario {
+  const char* name;
+  int (*run)(http::HttpClient&, const std::string&);
+};
+
+const RigScenario* FindRigScenario(const std::string& name) {
+  static const RigScenario kRigScenarios[] = {
+      {"server", ServerChanged},
+      {"pairs", Pairs},
+      {"nonblocking", NonBlocking},
+      {"repairs", Repairs},
+  };
+  for (const RigScenario& scenario : kRigScenarios) {
+    if (name == scenario.name) {
+      return &scenario;
+    }
+  }
+  return nullptr;
 }
 
 }  // namespace
@@ -922,10 +1325,13 @@ int main(int argc, char** argv) {
     Relaunch(checks);
   } else if (scenario == "reenable") {
     Reenable(checks);
-  } else if (scenario == "server") {
-    // The one scenario here that needs the fixture RomM: what it pins is that a
-    // *live* credential stops being on the card, and a token nothing ever
-    // accepted would prove nothing.
+  } else if (scenario == "unreachable") {
+    Unreachable(checks);
+  } else if (const RigScenario* rig_scenario = FindRigScenario(scenario)) {
+    // The scenarios that need the fixture RomM. `server` pins that a *live*
+    // credential stops being on the card, and the M1-6 three drive a real
+    // device-code attempt -- a token nothing ever issued or accepted would prove
+    // nothing about either.
     const std::string base = rig::BaseUrl();
     std::error_code error;
     std::filesystem::create_directories(rig::ScratchDir(), error);
@@ -935,9 +1341,9 @@ int main(int argc, char** argv) {
                 << "\n  start it with: ./scripts/orca/compose.sh up -d\n";
       return rig::kSkip;
     }
-    const int failures = ServerChanged(*client, base);
+    const int failures = rig_scenario->run(*client, base);
     if (failures == 0) {
-      std::cout << "engine.server ok against " << base << "\n";
+      std::cout << "engine." << scenario << " ok against " << base << "\n";
     }
     return failures == 0 ? 0 : 1;
   } else {
