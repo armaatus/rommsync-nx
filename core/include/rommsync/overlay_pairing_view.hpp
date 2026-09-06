@@ -49,7 +49,9 @@ enum class PairBlock {
   kNoServer,
 
   /// It refused for some other reason. `kUnavailable` is the one this build
-  /// will actually meet until M7-2 fills the engine in.
+  /// will actually meet until the console has an `HttpClient` to reach a server
+  /// with -- M1-6 (#123) built the engine half, and #43's gate still wants the
+  /// Horizon `ssl` backend under it.
   kRefused,
 };
 const char* ToString(PairBlock block);

@@ -5,8 +5,12 @@
 // #23). Since M1-7 (#126) that includes a **transport**: `sys-rommsync` holds an
 // `http::HttpClient` of its own -- the Horizon `ssl` one under `http/` -- so the
 // engine that was proven against a real RomM on a laptop can reach a server from
-// here too. There is still no scheduler (M7-2, #37), so the commands behind that
-// answer `ipc::Error::kUnavailable`.
+// here too. M1-6 (#123) installs it in the pairing seam below, so `StartPair` is
+// answered here rather than refused. There is still no scheduler (M7-2, #37), so
+// the commands behind that answer `ipc::Error::kUnavailable`; what is real today
+// is the console's configuration -- read *and* written, since M5-3 (#30) --
+// whether it has ever paired, the pairing itself, and the build
+// (see `engine.hpp`).
 //
 // The service is registered inside `__appInit`, while `sm` is still up, because
 // a registered port outlives the session that registered it: a resident process
@@ -320,6 +324,16 @@ int main(int, char**) {
   // swaps the live `Config`, which is what makes a setting changed from the
   // overlay take effect without a reboot.
   rommsync::sysmodule::SdEngine engine;
+  // **No `UsePairingBackend` call, and that is the one thing this console still
+  // cannot do.** M1-6 (#123) built `SdEngine::StartPairing`, and it needs an
+  // `http::HttpClient` to run an attempt on; the only implementation of that
+  // interface is libcurl's, which is the host harness's and is never built for
+  // Switch. The Horizon one goes through the `ssl` system service and is the
+  // M8-1 gate item (#43) -- until it exists, `StartPair` answers `kUnavailable`
+  // here, which is the sentence the pairing screen already draws. The identity
+  // seed belongs in the same call, from `setsysGetSerialNumber`: an engine given
+  // one and no transport would mint a `device.dat` for a pairing it can never
+  // start.
   engine.Load();
 
   // **This is where the client goes, and M1-7 (#126) could not put it here.**

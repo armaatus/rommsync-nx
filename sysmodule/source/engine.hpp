@@ -29,11 +29,23 @@
 // M7-2 (#37). The host suite passes a libcurl client and drives the paging
 // through the same seam (`lists.*`).
 //
+// M1-6 (#123) took `StartPair` off that list, and left half of it there. The
+// engine drives a real device-code attempt now -- see `StartPairing` -- but it
+// needs an `http::HttpClient` to drive it on, and the console has no
+// implementation of one: the Horizon `ssl` backend is #43's gate item and is not
+// written. So a console still answers `kUnavailable` to `StartPair`, and the
+// host harness, which has libcurl's, does not (`engine.pairs`).
+//
 // Nothing here has ever run: it is Horizon-side and is exercised in Ryujinx
 // before the M8-1 gate, never on hardware (sysmodule/AGENTS.md).
 #pragma once
 
+#include <condition_variable>
+#include <cstdint>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -56,34 +68,65 @@ namespace rommsync::sysmodule {
 inline constexpr const char* kConfigDir = "sdmc:/config/rommsync/";
 
 /// What a pairing attempt needs that neither `core/` nor this file can supply.
+///
+/// Both are platform facilities. `core/` may not name a transport (hard rule 4),
+/// and the console's stable value for `client_device_identifier` comes from
+/// `setsysGetSerialNumber`, which is a libnx call and so belongs to `main.cpp`
+/// rather than to a file the host build compiles. Injecting them is what lets
+/// `engine.pairs` drive a whole pairing against the docker RomM with no console.
 struct PairingBackend {
-  /// Null means this build has no way to reach a server.
+  /// **Null means this build has no way to reach a server**, which is the
+  /// console's situation today: the Horizon `ssl` `HttpClient` backend is listed
+  /// in the M8-1 gate (#43) and is not written. `StartPairing` answers
+  /// `ipc::Error::kUnavailable` then -- "this build has no engine behind that
+  /// command" -- rather than a refusal that blames the server or the card.
+  ///
+  /// Not owned, and must outlive the engine: the pairing thread holds it for as
+  /// long as an attempt is running.
   http::HttpClient* http = nullptr;
-  /// What `auth::LoadOrCreateDeviceIdentity` derives `device.dat` from.
+
+  /// What `auth::LoadOrCreateDeviceIdentity` derives `device.dat` from the first
+  /// time this console pairs. Consulted only when there is no file, so on every
+  /// boot after the first it does not matter what is in it
+  /// (`device_identity.hpp`).
   auth::IdentitySeed identity_seed;
 };
 
 /// The engine as far as it is built.
 ///
-/// Constructed once at start and driven from the IPC thread. Two things change
-/// after `Load()`: the queue, and -- since M5-3 (#30) -- the configuration,
-/// which `ApplyConfigEdit` writes to the card and re-reads. `download::Queue`
-/// carries its own mutex for the reason `ipc::Engine` states; the config swap
-/// does not, and that is a fact about today rather than a decision to keep:
-/// `ServiceServer::Run` is a single `svcReplyAndReceive` loop, so every command
-/// -- the polls and the write alike -- runs on one thread and the swap races
-/// with nothing.
+/// Constructed once at start and driven from the IPC thread -- and, since M1-6,
+/// from one thread of its own. Three things change after `Load()`: the queue,
+/// the configuration (M5-3, #30), and the pairing state.
 ///
-/// **A mutex is not what makes it safe the day a worker exists.**
-/// `ipc::Engine::config()` hands out a *reference*, so a swap under a lock would
-/// still free a `Config` a caller is holding. The seam to change then is that
-/// signature -- a snapshot, the way `Snapshot()` already answers -- and workers
-/// have to take theirs at a tick boundary, never mid-sync and never
-/// mid-download. The download worker is not started here yet; when it is, this
-/// is already the object it drains.
+/// **`mutex_` guards exactly what the pairing thread can touch**: the attempt
+/// itself, `auth_`, `gate_`, and the writes to `token.dat` and `auth.json`.
+/// Every command that reads or changes one of those takes it, which is what
+/// makes a grant landing on the card and an `Unpair` discarding one two things
+/// that cannot interleave.
+///
+/// `config_` and `queue_` are deliberately *not* under it, and that is still a
+/// fact about today rather than a decision to keep: `ServiceServer::Run` is a
+/// single `svcReplyAndReceive` loop, so every command runs on one thread, and
+/// the pairing thread reads neither -- it is handed the server URL it needs when
+/// the attempt starts. `download::Queue` carries its own mutex for the reason
+/// `ipc::Engine` states.
+///
+/// **A mutex is not what would make `config()` safe the day a worker reads it.**
+/// It hands out a *reference*, so a swap under a lock would still free a
+/// `Config` a caller is holding. The seam to change then is that signature -- a
+/// snapshot, the way `Snapshot()` already answers -- and workers have to take
+/// theirs at a tick boundary, never mid-sync and never mid-download. The
+/// download worker is not started here yet; when it is, this is already the
+/// object it drains.
 class SdEngine : public ipc::Engine {
  public:
   SdEngine();
+
+  /// Stops the pairing thread and waits for it. A request already in flight
+  /// still has to finish -- `http::HttpClient` has no way to be interrupted from
+  /// outside a call -- so this can take as long as one `request_timeout`. The
+  /// console never gets here: `main` never leaves its service loop.
+  ~SdEngine() override;
 
   /// Read `config.ini`, look for `token.dat`, and read `queue.json`. Never
   /// fails: a console with no config is a console with the defaults, one with
@@ -98,7 +141,9 @@ class SdEngine : public ipc::Engine {
   /// alternative is glue that is only ever proven by the fact that it compiles.
   void Load(const std::string& config_dir = kConfigDir);
 
-  /// Give the engine the platform facilities a pairing attempt needs.
+  /// Give the engine the platform facilities a pairing attempt needs. Call it
+  /// before the service starts answering; it is not meant to change under a
+  /// running attempt.
   void UsePairingBackend(PairingBackend backend);
 
   /// The network the library is read over, and the token to read it with.
@@ -157,16 +202,17 @@ class SdEngine : public ipc::Engine {
   /// nothing else lifts that -- `auth::Gate::Reset` is the only exit, by design,
   /// because a client that is not calling cannot be told its token works.
   ///
-  /// **`StartPairing` is still `kUnavailable`, so the other half is not here**,
-  /// and the asymmetry is worth knowing before something presses this: a console
-  /// that unpairs cannot yet pair again from the sysmodule. The settings
-  /// screen's "Re-pair" button (M4-4, #26) is the one caller, and it sends
-  /// `StartPair` **first** for exactly this reason -- a refused `StartPair`
-  /// writes nothing and touches no token, so the console is left as it was,
-  /// while docs/AUTH.md's order would have discarded the token before finding
-  /// out. That is a gate rather than a fix: until `StartPairing` is real the
-  /// button always answers "this sysmodule cannot start a pairing yet", and no
-  /// issue owns building it.
+  /// The other half is `StartPairing`, which M1-6 (#123) built. The settings
+  /// screen's "Re-pair" button (M4-4, #26) is the one caller, and it still sends
+  /// `StartPair` **first** -- a refused `StartPair` writes nothing and touches
+  /// no token, so the console is left as it was, while docs/AUTH.md's order
+  /// would discard the token before finding out. That was a gate on an
+  /// unimplemented half; it survives as the right order, because an attempt is
+  /// still refusable for want of a `server.url` or of a transport.
+  ///
+  /// **This does not abandon a live attempt**, deliberately: the button starts
+  /// one and then discards, so the instant between the two commands has to leave
+  /// the console with a pairing, and the instant after it with an attempt.
   ///
   /// The verdict goes **after** the token, deliberately: the other order leaves
   /// a moment where the card says the pairing is fine and the credentials are
@@ -245,6 +291,35 @@ class SdEngine : public ipc::Engine {
 
   /// Write `queue.json`. False when it did not reach the card.
   bool WriteQueue();
+
+  /// The pairing thread. Runs one attempt at a time: `Begin()`, then `Poll()`
+  /// until the session is terminal, then the commit.
+  ///
+  /// It never holds `mutex_` across a request. What it holds instead is a
+  /// `shared_ptr` to the session, so a `StartPairing` that replaces the attempt
+  /// mid-request frees nothing under it, and a generation counter, so the
+  /// attempt it is driving knows when it has been superseded.
+  void DrivePairing();
+
+  /// Sleep until the next poll is worth making. False when this attempt has been
+  /// superseded or the engine is going away, which is the loop's exit.
+  bool AwaitNextPoll(std::uint64_t generation);
+
+  /// Persist an approved grant, and leave the console reporting itself paired.
+  ///
+  /// The verdict goes after the token for the reason `Unpair` gives in reverse:
+  /// the credentials are what matter, and a stale `auth.json` beside a fresh
+  /// `token.dat` would have a worker refuse to call on a console that has just
+  /// paired.
+  void CommitGrant(const auth::DeviceTokenResponse& granted, const std::string& server_url,
+                   std::uint64_t generation);
+
+  /// Abandon whatever attempt is running. The caller holds `mutex_`.
+  ///
+  /// Bumping the generation is the whole mechanism: the thread notices after its
+  /// current request and drops the session, whose last owner is then the
+  /// `shared_ptr` it is holding.
+  void AbandonPairingLocked();
 
   /// The text of `config.ini` as it stands, or a reason there is none to edit.
   ///
@@ -326,7 +401,46 @@ class SdEngine : public ipc::Engine {
   /// true.
   auth::Gate gate_;
 
+  /// The transport and the identity seed a pairing attempt runs on. Empty on the
+  /// console, which is what makes `StartPairing` answer `kUnavailable` there.
   PairingBackend pairing_backend_;
+
+  /// Guards everything below it, and the auth state above it. Mutable because
+  /// `Snapshot()` and `pairing_status()` are const and both read state the
+  /// pairing thread writes.
+  mutable std::mutex mutex_;
+
+  /// How the pairing thread is told there is something to do, and how it is
+  /// woken early from a poll interval by a new attempt or by shutdown.
+  std::condition_variable wake_;
+
+  /// Started on the first `StartPairing` and never before: a console with no
+  /// transport, which is every console today, creates no thread at all.
+  std::thread pairing_thread_;
+  bool stopping_ = false;
+
+  /// The attempt in flight. A `shared_ptr` because the pairing thread has to
+  /// keep the session alive across a request that a replacing `StartPairing` no
+  /// longer refers to.
+  std::shared_ptr<auth::PairingSession> attempt_;
+
+  /// The server the attempt was started against, kept beside it rather than read
+  /// off `config_` at commit time: a `server.url` edit mid-attempt would
+  /// otherwise write a token under the name of a server that never issued it.
+  std::string attempt_server_url_;
+
+  /// Bumped by every `StartPairing`, and compared by the pairing thread against
+  /// the attempt it picked up. Not a bool, because "a new attempt started while
+  /// the old one was mid-request" and "nothing is running" have to be different
+  /// answers.
+  std::uint64_t attempt_generation_ = 0;
+  std::uint64_t driven_generation_ = 0;
+
+  /// What went wrong *after* the session succeeded -- an approved pairing whose
+  /// token would not reach the card. `PairingSession` cannot know about it and
+  /// would keep reporting `kApproved`, which is a console that says it paired
+  /// and has no credentials.
+  std::string attempt_commit_failure_;
 };
 
 }  // namespace rommsync::sysmodule
