@@ -22,7 +22,8 @@
 #                                  one upload.
 #   test_package.sh upgrade        unzipping over an existing install replaces
 #                                  the artifacts and leaves config.ini,
-#                                  token.dat, device.dat, state.db, queue.json
+#                                  token.dat, device.dat, state.db, queue.json,
+#                                  rommsync.log
 #                                  and the flags/boot2.flag that says the
 #                                  sysmodule is enabled alone.
 #   test_package.sh builds         ...and it packages a real devkitPro build,
@@ -318,7 +319,7 @@ phase_upgrade() {
   printf '{"name":"sys-rommsync","tid":"%s","version":"0.0.1","requires_reboot":false}\n' \
     "$tid" > "$sd/atmosphere/contents/$tid/toolbox.json"
   local user_state
-  for user_state in token.dat device.dat state.db queue.json; do
+  for user_state in token.dat device.dat state.db queue.json rommsync.log; do
     echo "the user's $user_state" > "$sd/config/rommsync/$user_state"
   done
   # Somebody else's homebrew, in the two directories this archive merges into.
