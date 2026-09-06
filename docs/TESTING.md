@@ -813,17 +813,90 @@ dry-run first if more than one clone of this repo is in play.
 
 ## Rung 3 — the v1 gate and real hardware (M8)
 
-Do not begin M8 until **M8-1** is fully checked:
+**M8-1 (#43) is the gate, and [`scripts/v1-gate.sh`](../scripts/v1-gate.sh) is
+where it lives.** It was eight sentences in an issue body, repeated here and
+alluded to in a dozen source comments, and nothing evaluated any of them — which
+is the failure [the M0 exit gate](#the-m0-exit-gate) is written against, one
+milestone down: *a box checked because someone believes it is not checked.* So
+each row below names the command that demonstrates it, and the script is the
+only copy of the eight; this table is checked against it by `gate.doc` so the
+two cannot drift.
 
-- Sync (M2), downloads (M3), auth (M1), config+IPC (M5) all green on host +
-  docker RomM.
-- `ssl` backend proven in an emulator or on an isolated NRO on a backup SD —
-  `tlsprobe/` is the thing to run, and M0-1 left it built and unrun.
-- Backups verified by tests; a tagged v1 build (M6); a known-good NAND/SD backup.
+| id | The claim | What demonstrates it |
+|---|---|---|
+| `sync` | Full sync engine (M2) passes on host + docker RomM, including conflict / partial-failure / resume. | `sync.*`, `execute.*`, `states.*`, `complete.*`, `tick.*`, `scan.*`, `core.state_db`, `core.md5`, `core.sha1*`, and the three the box names by hand: `harness.conflict`, `harness.partial`, `harness.resume` |
+| `downloads` | Downloads (M3) pass with Range resume + hash verify against docker RomM. | `download.*`, `rom.*`, `toggle.download`, `http.range*`, `http.resume*`, `wire.range*`, `wire.resume*`, `harness.content_hash`, `harness.multifile` |
+| `auth` | Auth (M1) full device-code flow + 401/refresh proven on host + docker RomM. | `auth.*`, `pair.*`, `device.*`, `core.token_store`, `core.device_identity`, `harness.expired`, and M1-6's `engine.pairs`, `engine.repairs`, `engine.nonblocking`, `engine.unauthenticated` |
+| `ipc` | Config + IPC (M5) proven on host harness. | `core.config`, `config.*`, `ipc.*`, `lists.*`, `overlay.*`, `engine.config`, `engine.commands` |
+| `ssl` | HttpClient ssl-service backend proven in a Ryujinx NRO (M0-1), or on an isolated NRO on a backup SD. | **Nothing yet.** `switch.builds` and `switch.tlsprobe` prove it compiles and links for aarch64; no handshake has been executed anywhere. See *what the first console decides*. |
+| `backup` | Every save-overwrite path shown to back up first (SYNC_PROTOCOL hard rule) -- verified by tests. | `harness.backup`, `execute.*`, `states.overwrite`, `states.keeps_both`, `tick.backupdir`, `tick.durable` — **and a census** of every `io::CommitStaged`/`CopyAtomically`/`WriteAtomically` call site in `core/`, so a *new* overwrite path fails the gate until somebody classifies it. That census is the word "every"; the tests are the rest. |
+| `release` | A tagged, released v1 build exists (M6). | A `v1` tag reachable from `main` that agrees with `VERSION`, and a published, non-draft release carrying the zip and `SHA256SUMS`. **Failing today: this repository has no tags and no releases.** |
+| `media` | A known-good NAND/SD backup exists; testing will be on a spare/backup SD or emuMMC, not the daily driver. | **Nothing in a repository can attest to this**, and a checkbox that says otherwise is worse than none. See *what the first console decides*. |
 
-Then **M8-2**: on a spare/backup SD or emuMMC, run the NRO first, install the
-sysmodule **disabled**, and only sync against a **disposable** collection with
-`.backup/` populated before ever pointing at the real library.
+### Running it
+
+```bash
+scripts/v1-gate.sh          # run every row's CTest groups, then judge all eight
+scripts/v1-gate.sh --dry    # which rows would be decided, running nothing
+scripts/v1-gate.sh --audit  # is the gate itself still well formed? (ctest -R gate)
+```
+
+The exit code is the answer: **0** every row holds and M8-2 may begin, **1** a
+row this machine can decide is failing, **3** nothing failing but a row is held
+on a console or on a person. 3 is what it answers today.
+
+Two things it refuses to do, both of them the same refusal in different clothes:
+
+- **A skipped test is not a pass.** `rig.smoke` skips when RomM is not running
+  and most of this gate is written against RomM, so a row containing a skipped
+  test comes back HELD with the names. A green `ctest` over a dead rig is the
+  original sin this whole page is about.
+- **It never reports the gate as passing while a row is held.** Six rows are
+  decidable on a laptop and two are not, and no amount of work in this repo
+  changes which is which.
+
+`ctest -R gate` runs `gate.audit`, `gate.rows`, `gate.sites`, `gate.evidence`,
+`gate.release` and `gate.doc`. Those check the gate's *machinery* — every row
+still points at a test that exists, the census still matches `core/`, a skip
+still holds a row, this table still matches the script. They deliberately do not
+report the verdict: `ctest` going green must never be readable as "the gate
+passed", because it has not.
+
+### Where it stands
+
+Six rows are decidable here. Four of them (`sync`, `downloads`, `auth`, `ipc`)
+pass on a run against the rig; `backup` passes, census included; `release`
+**fails**, and it is the only row failing that no console is needed for. The
+machinery is built and tested (`ctest -R 'version|release'`) — what is missing is
+the decision to cut the tag, which is not this gate's to make while M7 is open.
+
+### What the first console decides
+
+The two held rows are an agenda, not a TODO list. `scripts/v1-gate.sh` prints
+them in full; in short:
+
+- **Run [`tlsprobe/`](../tlsprobe/README.md) first** — a manually launched
+  `.nro`, never an auto-boot sysmodule — then a build carrying
+  `sysmodule/source/http/ssl_http_client.cpp`. Three questions the probe never
+  asked and one run answers: whether `sslConnectionPoll` bounds a read the way
+  `SslStream::Wait` assumes, whether `sslConnectionSetIoTimeout` [16.0.0+] does
+  anything, and **who owns the descriptor** when
+  `socketSslConnectionSetSocketDescriptor` returns `-1` with `errno == ENOENT` —
+  if the service did not take it, every failed handshake leaks an fd against a
+  `handle_table_size` of 64, and closing it on a guess would be a double close.
+  The answers go in
+  [DEVELOPMENT.md](DEVELOPMENT.md#m0-1-the-measurement-and-the-decision), beside
+  the measurement they correct.
+- **Two more sentences stop being targets on that same boot**: the compatibility
+  line in [`scripts/release-notes.sh`](../scripts/release-notes.sh)
+  (`ATMOSPHERE_TARGET`), which every release currently publishes as a target
+  followed by a paragraph saying so, and the title id `0x4200000000524D53`, which
+  nothing has checked against an installed set
+  ([sysmodule/README.md](../sysmodule/README.md)).
+
+Then **M8-2** (#44): on a spare/backup SD or emuMMC, run the NRO first, install
+the sysmodule **disabled**, and only sync against a **disposable** collection
+with `.backup/` populated before ever pointing at the real library.
 
 ## What can and can't be tested off-console — honest limits
 

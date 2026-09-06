@@ -174,9 +174,14 @@ First contact with a real modded Switch. **Gated:** nothing here starts until th
 v1 gate passes. Everything below the thin Horizon glue has already been proven on
 host + docker RomM + Ryujinx.
 
-- **M8-1** `risk` **v1 gate — do not touch hardware until this passes.** Checklist:
-  sync/downloads/auth/config+IPC all green on host + docker; `ssl` backend proven
-  in Ryujinx NRO; backups verified by tests; tagged v1 build; NAND/SD backup ready.
+- **M8-1** `risk` **v1 gate — do not touch hardware until this passes.** Eight
+  rows: sync/downloads/auth/config+IPC all green on host + docker; `ssl` backend
+  proven on an NRO; every save-overwrite path backing up first; a tagged v1
+  build; a NAND/SD backup ready. They live in
+  [`scripts/v1-gate.sh`](scripts/v1-gate.sh), which evaluates the six a laptop
+  can decide and says precisely what the other two are waiting for — the gate is
+  a command with an exit code, not a checklist somebody reads. Published as a
+  table in [TESTING.md](docs/TESTING.md#rung-3--the-v1-gate-and-real-hardware-m8).
 - **M8-2** `sysmodule` `risk` **First real-console smoke test** on a backup
   SD/emuMMC: manually-launched NRO first, then sysmodule installed **disabled**,
   first sync against a **disposable** collection with `.backup/` populated. Never

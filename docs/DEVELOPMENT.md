@@ -319,7 +319,9 @@ Six things are worth knowing before you do it:
   `ATMOSPHERE_TARGET` in `scripts/release-notes.sh` is the only place any
   Atmosphère version is written down in this repo, and nothing here has run on a
   console — the notes say so in the release itself. Confirming or correcting it
-  is part of the M8-1 gate (#43); the fix is that one constant.
+  is part of the M8-1 gate (#43), on the `media` row, which prints it beside the
+  NAND backup because the same first boot settles both; the fix is that one
+  constant.
 
 The zip is the only thing to download. `switch-build`'s per-push artifact is the
 three loose files, for debugging; a `.nsp` under its build name installs cleanly
@@ -734,7 +736,11 @@ about the harness, each naming the test or command that demonstrates it, and the
 one that would rot silently — *no test needs a console, an emulator, or a server
 anyone would miss* — is re-checked on every `ctest` by the `policy.*` tests. The
 [v1 gate](TESTING.md#rung-3--the-v1-gate-and-real-hardware-m8) is what hardware
-waits for, and lives in issue **M8-1**.
+waits for. It lives in issue **M8-1** and in
+[`scripts/v1-gate.sh`](../scripts/v1-gate.sh), which owns its eight rows, runs
+the evidence for the six a laptop can decide, and refuses to report a pass while
+the other two have never been executed anywhere. `ctest -R gate` checks that
+machinery; the verdict is the script's exit code, and today it is 3.
 
 ### Worktree isolation
 

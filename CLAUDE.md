@@ -9,8 +9,9 @@ idea to a merged PR — this file is the short form of it.
 ## Hard rules
 
 1. **No real hardware, ever, until the v1 gate passes.** No real Switch, no
-   production RomM, no production library. The gate is issue M8-1. If a task
-   seems to need hardware, it is the wrong task — say so instead of doing it.
+   production RomM, no production library. The gate is issue M8-1, and it is the
+   command `./scripts/v1-gate.sh`. If a task seems to need hardware, it is the
+   wrong task — say so instead of doing it.
 2. **Back up before overwriting a save.** Every path that overwrites a save file
    writes a backup *first* and writes atomically. This is the one guarantee
    standing between a bug and a player's destroyed save. It is tested, not
