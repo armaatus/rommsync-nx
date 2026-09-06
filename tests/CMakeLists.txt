@@ -912,20 +912,18 @@ foreach(scenario
   set_tests_properties(package.${scenario} PROPERTIES TIMEOUT 120)
 endforeach()
 
-# The real cross-compile, packaged inside the same container #34's release job
-# will use. Same image as switch.builds, and its SKIP_RETURN_CODE is left
-# unwrapped for the same reason: the CI host runner has no devkitpro/devkita64
-# and will not pull 2.7GB for one, so wrapping it in if(NOT ROMMSYNC_REQUIRE_RIG)
-# like the other skippable entries would make the host-tests job red on every
-# runner it uses.
+# The real cross-compile, packaged inside the same container the release job
+# uses. Same image as switch.builds, and its SKIP_RETURN_CODE is left unwrapped
+# for the same reason: the CI host runner has no devkitpro/devkita64 and will
+# not pull 2.7GB for one, so wrapping it in if(NOT ROMMSYNC_REQUIRE_RIG) like
+# the other skippable entries would make the host-tests job red on every runner
+# it uses.
 #
-# Unlike switch.builds, this one has NO equivalent in CI yet: `switch-build`
-# builds the three targets and checks their magic bytes, but nothing there runs
-# scripts/package.sh, so today the packaging is only ever exercised here. #34
-# adds the release job that packages on a tag and carries a note asking for a
-# package step in `switch-build` too; until one of those lands, a failure that
-# is specific to packaging in the container -- a missing `zip`, say -- would
-# first appear on a tag. Read this before deciding the coverage is elsewhere.
+# It now has the same enforcement elsewhere that switch.builds has: `switch-build`
+# runs scripts/package.sh on every push, and the `release` job runs it again on a
+# tag (#34). That is what keeps a failure specific to packaging in the container
+# -- a missing `zip`, say -- from first appearing on a tag. `release.ci` is what
+# says that step is still there.
 add_test(NAME package.builds
          COMMAND "${BASH_PROGRAM}" "${PACKAGE_TEST}" builds)
 set_tests_properties(package.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
@@ -953,6 +951,38 @@ foreach(scenario
                    --repo "${CMAKE_SOURCE_DIR}")
   set_tests_properties(docs.install_${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
+
+# --- M6-3: turning a tag into a release --------------------------------------
+# Three files decide whether a `v*` tag publishes something a user can install:
+# VERSION, the release job in .github/workflows/ci.yml, and the notes generator.
+# None of these entries needs Docker, a network or a tag, so none of them skips
+# -- a release path exercised only by releasing is one nobody has tested.
+set(RELEASE_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_release.sh")
+
+# Named version.* rather than release.* on purpose: `ctest -R version` is what
+# the acceptance criteria name, and this is the entry that has to be in it.
+#
+# It reads GITHUB_REF out of the environment, which is why it belongs in ctest
+# rather than only in the workflow: on a tag push GitHub sets that variable for
+# every step, so the `host-tests` job runs this without knowing it exists, and
+# the release job is gated on that job. Locally it is a no-op with one extra
+# assertion -- that VERSION is still semver -- because the prerelease flag and
+# the asset name both read that string structurally.
+add_test(NAME version.tag COMMAND "${BASH_PROGRAM}" "${RELEASE_TEST}" version)
+set_tests_properties(version.tag PROPERTIES TIMEOUT 60)
+
+# The workflow itself: one trigger and not two, a job gated on both test jobs,
+# and the package/checksum/upload chain inside it. The regression it holds is
+# the state this repo shipped in for five milestones -- `on: release:` declared
+# with no job consuming it, so a tag ran the build and published nothing.
+add_test(NAME release.ci COMMAND "${BASH_PROGRAM}" "${RELEASE_TEST}" ci)
+set_tests_properties(release.ci PROPERTIES TIMEOUT 60)
+
+# scripts/release-notes.sh. It reads git history, so it runs here rather than
+# only on a tag: the fallback for "no previous tag" is the path the FIRST
+# release takes, and this repo has no tags, so that is the path exercised.
+add_test(NAME release.notes COMMAND "${BASH_PROGRAM}" "${RELEASE_TEST}" notes)
+set_tests_properties(release.notes PROPERTIES TIMEOUT 60)
 
 # --- the TLS terminator the M0-1 probe aims at -------------------------------
 # The rig is plain HTTP because the host suite reaches it over loopback; the
