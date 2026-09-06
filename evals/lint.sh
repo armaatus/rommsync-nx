@@ -250,6 +250,8 @@ if grep -rnE "^[[:space:]]*track_progress:" .github/workflows/*.yml >/dev/null 2
 else
   ok "no workflow forces tag mode on an automatic review"
 
+fi
+
 # Silence is this workflow's failure mode and it is invisible: the action can
 # burn 35 turns and real money, decide a verdict, and end without ever running
 # `gh pr review` -- is_error false, job green, nothing on the PR. That happened
@@ -270,7 +272,6 @@ if [ -f "$review_wf" ]; then
     fail "the no-verdict notice submits a REVIEW; that would satisfy merge-gate with no judgement"
   fi
   ok "the no-verdict notice is a comment, never a review"
-fi
 fi
 
 echo "== the merge gate"

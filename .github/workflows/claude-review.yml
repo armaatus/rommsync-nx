@@ -204,7 +204,11 @@ jobs:
       # than the silence. It leaves a plain comment -- visible to a person, and
       # not something the gate will ever mistake for a review.
       - name: say so if no verdict was submitted
-        if: steps.token.outputs.have_token == 'true'
+        # `!cancelled()` rather than a bare condition: a step `if` with no status
+        # function gets an implicit `success()`, so this would be SKIPPED exactly
+        # when the review action FAILED -- the case where the silence is loudest
+        # and least visible. Found in review of this PR.
+        if: ${{ !cancelled() && steps.token.outputs.have_token == 'true' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
