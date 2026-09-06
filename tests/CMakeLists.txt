@@ -472,6 +472,8 @@ set(HTTP_SCENARIOS
   truncate          # a clean short close, caught only by the caller's known size
   stall             # total and no-progress timeouts both fire
   cancel            # cancellation from another thread, and nothing left behind
+  redirect_credentials # a bearer token does not follow a redirect off this origin
+  multipart_grows   # a save still being written does not overrun its Content-Length
 )
 
 foreach(scenario IN LISTS HTTP_SCENARIOS)

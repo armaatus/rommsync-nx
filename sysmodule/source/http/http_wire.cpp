@@ -881,10 +881,13 @@ Error ReadChunked(Reader& reader, BodyWriter& writer, std::uint64_t* received) {
     if (!ParseHex(size_text, &remaining)) return Error::kTruncated;
     if (remaining == 0) {
       // Trailers, then a blank line. Read them off so the framing is complete
-      // even though nothing here uses one.
+      // even though nothing here uses one -- and **do not report what happens
+      // while doing it**. The terminating chunk has already arrived, so every
+      // content byte is in; a proxy that appends trailers and then stalls or
+      // drops would otherwise fail a `Send` whose body was complete.
       while (reader.ReadLine(&line, kMaxHeaderBytes, &error) && !line.empty()) {
       }
-      return error;
+      return Error::kNone;
     }
     while (remaining != 0) {
       const char* data = nullptr;

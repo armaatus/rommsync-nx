@@ -20,6 +20,7 @@
 // unreachable off a console -- everything a downloader can get wrong is
 // checked, against the same RomM, by the same eighteen scenarios. A second copy
 // of them would have drifted from this one by the second issue.
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -30,6 +31,7 @@
 #include <thread>
 #include <vector>
 
+#include "loopback_server.hpp"
 #include "rig.hpp"
 
 #ifdef ROMMSYNC_TEST_WIRE_BACKEND
@@ -687,6 +689,166 @@ int Cancel(http::HttpClient& client, const std::string& base, const std::string&
   return checks.failures();
 }
 
+// A redirect off this origin must not carry the caller's credentials.
+//
+// Two loopback origins, because that is what the assertion is *about* and one
+// server cannot be two of them (`loopback_server.hpp`). RomM is one origin and
+// the fault proxy forwards to it, so neither can produce this shape -- but a
+// RomM behind a reverse proxy that redirects a rom download to object storage or
+// a CDN produces it on an ordinary day, and the bearer token that follows it is
+// the user's.
+int RedirectCredentials(http::HttpClient& client) {
+  rig::Checks checks;
+  const std::string kSecret = "Bearer redirect-scenario-token";
+
+  // --- off-origin: the token is dropped ---
+  rig::LoopbackServer elsewhere;
+  std::string seen_by_elsewhere;
+  if (!elsewhere.Start(1, [&](int fd, std::size_t, const std::string& head) {
+        seen_by_elsewhere = head;
+        rig::WriteAll(fd,
+                      "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+      })) {
+    std::cerr << "  could not start the second origin\n";
+    return 1;
+  }
+
+  rig::LoopbackServer origin;
+  const std::string target = elsewhere.origin() + "/moved";
+  if (!origin.Start(1, [&](int fd, std::size_t, const std::string&) {
+        rig::WriteAll(fd, "HTTP/1.1 302 Found\r\nLocation: " + target +
+                              "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+      })) {
+    std::cerr << "  could not start the first origin\n";
+    return 1;
+  }
+
+  http::Request request;
+  request.url = origin.origin() + "/start";
+  request.headers.push_back({"Authorization", kSecret});
+  const http::Result result = client.Send(request);
+
+  origin.Stop();
+  elsewhere.Stop();
+
+  checks.ExpectOk(result, "the redirect was followed");
+  checks.ExpectEq(result.response.status, 200, "and the second origin answered");
+  checks.Expect(!seen_by_elsewhere.empty(), "the second origin saw a request");
+  checks.Expect(seen_by_elsewhere.find(kSecret) == std::string::npos,
+                "and it was NOT sent the caller's bearer token");
+
+  // --- same origin: the token is kept, or every authenticated redirect breaks ---
+  rig::LoopbackServer same;
+  std::string seen_by_second_hop;
+  if (!same.Start(2, [&](int fd, std::size_t index, const std::string& head) {
+        if (index == 0) {
+          rig::WriteAll(fd,
+                        "HTTP/1.1 302 Found\r\nLocation: /second\r\nContent-Length: 0\r\n"
+                        "Connection: close\r\n\r\n");
+          return;
+        }
+        seen_by_second_hop = head;
+        rig::WriteAll(fd,
+                      "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+      })) {
+    std::cerr << "  could not start the same-origin server\n";
+    return 1;
+  }
+
+  http::Request kept;
+  kept.url = same.origin() + "/first";
+  kept.headers.push_back({"Authorization", kSecret});
+  const http::Result stayed = client.Send(kept);
+  same.Stop();
+
+  checks.ExpectOk(stayed, "the same-origin redirect was followed");
+  checks.ExpectEq(stayed.response.status, 200, "status");
+  checks.Expect(seen_by_second_hop.find(kSecret) != std::string::npos,
+                "and the token WAS still sent, because the origin did not change");
+  return checks.failures();
+}
+
+// A file that grows while it is being uploaded must not push the multipart body
+// past the `Content-Length` the client already declared.
+//
+// This is what a save upload is: `sync_execute` and `state_sync` post a file off
+// the card while the game that owns it is still running. The length is fixed
+// when the part is built and the bytes are read afterwards, so a client that
+// reads "whatever the buffer holds" sends more than it promised -- and the
+// server, reading exactly the promised number of bytes, gets a multipart body
+// with its closing boundary cut off.
+//
+// Asserted against a reader that counts, because that is the failure: a server
+// can only answer 4xx afterwards, and what went on the wire is the question.
+int MultipartGrows(http::HttpClient& client) {
+  rig::Checks checks;
+
+  const std::string path = Scratch("multipart-growing.bin");
+  // Bigger than any socket buffer, so the body cannot be handed to the kernel
+  // in one go and read back after the fact -- there has to be a window in which
+  // the file is still being read.
+  if (!rig::WriteFile(path, std::string(2 * 1024 * 1024, 'a'))) {
+    std::cerr << "  could not write " << path << "\n";
+    return 1;
+  }
+
+  std::string tail;
+  std::uint64_t declared = 0;
+  std::uint64_t received = 0;
+  rig::LoopbackServer server;
+  if (!server.Start(1, [&](int fd, std::size_t, const std::string& head) {
+        declared = rig::ContentLengthOf(head);
+        // Slowly, for the reason `ReadExactly` gives: the upload has to still
+        // be in flight while the file underneath it changes.
+        const std::string body =
+            rig::ReadExactly(fd, declared, 32 * 1024, std::chrono::milliseconds{2});
+        received = body.size();
+        tail = body.size() > 128 ? body.substr(body.size() - 128) : body;
+        rig::WriteAll(fd,
+                      "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+      })) {
+    std::cerr << "  could not start the upload server\n";
+    return 1;
+  }
+
+  std::atomic<bool> growing{true};
+  std::thread writer([&] {
+    while (growing.load()) {
+      std::FILE* file = std::fopen(path.c_str(), "ab");
+      if (file != nullptr) {
+        const std::string more(64 * 1024, 'b');
+        std::fwrite(more.data(), 1, more.size(), file);
+        std::fclose(file);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+  });
+
+  http::Request request;
+  request.method = http::Method::kPost;
+  request.url = server.origin() + "/upload";
+  request.form.push_back({"save", "", path, "save.bin", "application/octet-stream"});
+  const http::Result result = client.Send(request);
+
+  growing.store(false);
+  writer.join();
+  server.Stop();
+
+  checks.ExpectOk(result, "the upload completed");
+  checks.ExpectEq(result.response.status, 200, "status");
+  checks.Expect(declared > 0, "the client declared a Content-Length");
+  checks.ExpectEq(received, declared, "and sent exactly that many body bytes");
+  // The whole finding, in one assertion: the closing boundary is the last thing
+  // inside the declared length. A body that overran it is a multipart the server
+  // reads without a terminator.
+  checks.Expect(tail.find("--\r\n") != std::string::npos &&
+                    tail.rfind("--\r\n") == tail.size() - 4,
+                "the multipart terminator is the last thing inside Content-Length");
+  checks.Expect(SizeOf(path) > declared,
+                "and the file really did grow while it was being sent");
+  return checks.failures();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -770,6 +932,10 @@ int main(int argc, char** argv) {
     failures = Stall(*client, base);
   } else if (scenario == "cancel") {
     failures = Cancel(*client, base, asset);
+  } else if (scenario == "redirect_credentials") {
+    failures = RedirectCredentials(*client);
+  } else if (scenario == "multipart_grows") {
+    failures = MultipartGrows(*client);
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;

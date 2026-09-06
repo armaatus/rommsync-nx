@@ -13,7 +13,11 @@ Runs under Atmosphère with a tight heap.
   `SdEngine::Load` takes its config directory for exactly that reason --
   `sdmc:` was the only thing tying the class to a console. This is not a licence
   to move logic here: it is what makes the glue that has to live here provable.
-  Anything that includes `<switch.h>` is devkitPro's alone (`ipc/`, `main.cpp`).
+  Anything that includes `<switch.h>` is devkitPro's alone (`ipc/`, `main.cpp`,
+  `http/ssl_http_client.*`). `http/` is the worked example of the rule since
+  M1-7 (#126): `http_wire.*` and `posix_connection.*` name no libnx type and are
+  driven against the real docker RomM by `wire.*`, and `ssl_http_client.*` is the
+  `ssl` service and is the only part of the transport no test can reach.
 - TLS is the project's biggest technical risk. Use the Horizon `ssl` system
   service through libnx; see `docs/DEVELOPMENT.md#tls-in-a-sysmodule` and issue
   M0-1 before choosing anything else.

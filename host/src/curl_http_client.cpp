@@ -258,6 +258,59 @@ Error Classify(CURLcode code, const Transfer& transfer) {
   }
 }
 
+/// One file part, streamed through a read callback rather than handed to
+/// `curl_mime_filedata`.
+///
+/// The difference is the one thing that matters about it: `filedata` sizes the
+/// part from the file when the request is built and then reads the file until
+/// EOF, so a file that **grows** in between -- which is a save being posted
+/// while the game that owns it is still running (`sync_execute.cpp`,
+/// `state_sync.cpp`) -- puts more bytes on the wire than the `Content-Length`
+/// already promised. The server reads the length it was given, the closing
+/// boundary falls outside it, and the upload is a multipart with no terminator.
+///
+/// `http.multipart_grows` is that, and it fails without the clamp below.
+struct FilePart {
+  std::FILE* file = nullptr;
+  curl_off_t size = 0;       ///< what the part was declared to be
+  curl_off_t remaining = 0;  ///< ...and how much of it is still to send
+};
+
+std::size_t OnFilePartRead(char* buffer, std::size_t size, std::size_t nitems, void* context) {
+  auto* part = static_cast<FilePart*>(context);
+  if (part->remaining <= 0) {
+    return 0;  // the declared length has been sent; anything after it is not ours
+  }
+  const std::size_t want = std::min<std::size_t>(
+      size * nitems, static_cast<std::size_t>(part->remaining));
+  const std::size_t got = std::fread(buffer, 1, want, part->file);
+  if (got == 0) {
+    // Short of what was declared: the file shrank under us, and the body would
+    // end early with the server still owed bytes. Refusing is the only honest
+    // answer -- the request was framed for a file that is no longer there.
+    return CURL_READFUNC_ABORT;
+  }
+  part->remaining -= static_cast<curl_off_t>(got);
+  return got;
+}
+
+int OnFilePartSeek(void* context, curl_off_t offset, int origin) {
+  auto* part = static_cast<FilePart*>(context);
+  if (origin != SEEK_SET || std::fseek(part->file, static_cast<long>(offset), SEEK_SET) != 0) {
+    return CURL_SEEKFUNC_CANTSEEK;
+  }
+  part->remaining = part->size - offset;
+  return CURL_SEEKFUNC_OK;
+}
+
+void OnFilePartFree(void* context) {
+  auto* part = static_cast<FilePart*>(context);
+  if (part->file != nullptr) {
+    std::fclose(part->file);
+  }
+  delete part;
+}
+
 /// Size of an existing file, or zero when it is not there.
 ///
 /// Not ftell: its `long` is not a file offset, and a rom past 2 GiB would come
@@ -555,11 +608,24 @@ class CurlHttpClient final : public http::HttpClient {
         curl_mime_name(slot, part.name.c_str());
         if (!part.file_path.empty()) {
           // Streams from disk. A save -- or a rom -- must never be read into
-          // memory just to be posted.
-          curl_mime_filedata(slot, part.file_path.c_str());
-          if (!part.file_name.empty()) {
-            curl_mime_filename(slot, part.file_name.c_str());
+          // memory just to be posted. Through a callback rather than
+          // `curl_mime_filedata`, so the bytes sent are the bytes declared even
+          // when the file changes underneath -- see `FilePart`.
+          std::FILE* file = std::fopen(part.file_path.c_str(), "rb");
+          if (file == nullptr) {
+            result.error = Error::kInvalidRequest;
+            result.message = "could not open the form part file " + part.file_path;
+            return false;
           }
+          auto* streamed = new FilePart{file, 0, 0};
+          streamed->size = static_cast<curl_off_t>(FileSize(part.file_path));
+          streamed->remaining = streamed->size;
+          curl_mime_data_cb(slot, streamed->size, OnFilePartRead, OnFilePartSeek,
+                            OnFilePartFree, streamed);
+          const std::string name =
+              part.file_name.empty() ? std::filesystem::path(part.file_path).filename().string()
+                                     : part.file_name;
+          curl_mime_filename(slot, name.c_str());
         } else {
           curl_mime_data(slot, part.value.data(), part.value.size());
         }
