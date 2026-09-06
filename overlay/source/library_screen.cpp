@@ -47,6 +47,11 @@ std::string Prompt(const char* glyph, const char* label) {
   return std::string(glyph) + "  " + label;
 }
 
+/// Whether the queue prompt is offered on this view.
+bool ShowsQueuePrompt(const LibraryView& view) {
+  return view.link == Link::kOk && view.level != LibraryLevel::kQueue;
+}
+
 /// What A does on the row under the selection, or nullptr when it does nothing.
 ///
 /// The prompt is drawn from the row rather than from the level, because within
@@ -75,15 +80,23 @@ LibraryScreen::LibraryScreen(IpcClient& client) : client_(client) {
 
 LibraryScreen::~LibraryScreen() {
   model_.Close();
-  // Bounded rather than "until it answers kNone": a sysmodule that has gone
-  // fails every call, and a destructor that looped on that would hang the
-  // overlay on the way out. One pass per cursor is enough for the case this is
-  // for -- a screen closed normally -- and #31's TTL is what covers the rest.
-  for (std::size_t attempt = 0; attempt < model_.open_cursors() + 1; ++attempt) {
-    const LibraryBrowserModel::Command command = model_.Next();
-    if (command.kind == LibraryBrowserModel::Command::Kind::kNone) {
-      return;
-    }
+  // The port and the handshake, as before any other command
+  // (`overlay/AGENTS.md`). A session that has gone has no cursors left to close
+  // and nothing to say about it, so this is where the teardown stops.
+  if (frame_.Ready() != Link::kOk) {
+    return;
+  }
+  // This terminates, and it is worth saying why rather than capping it: after
+  // `Close()` the only command the model will hand out is a `ListEnd` for a
+  // cursor it holds, and every answer retires one -- `OnEnded` and a refused
+  // `ListEnd` both drop it, and a transport failure puts the model behind a
+  // link that is not `kOk`, which answers `kNone`. So each turn of this loop
+  // either closes a cursor or ends the loop, and there are at most three.
+  // A count here would be worse than none: it is the kind that gets read in the
+  // condition while each answer shrinks it, and stops one cursor short.
+  for (LibraryBrowserModel::Command command = model_.Next();
+       command.kind != LibraryBrowserModel::Command::Kind::kNone;
+       command = model_.Next()) {
     Send(command);
   }
 }
@@ -233,6 +246,21 @@ void LibraryScreen::Send(const LibraryBrowserModel::Command& command) {
   }
 }
 
+s32 LibraryScreen::PromptRows() const {
+  s32 rows = 0;
+  if (view_.selected >= 0 &&
+      ActionFor(view_.rows[static_cast<std::size_t>(view_.selected)]) != nullptr) {
+    ++rows;
+  }
+  if (ShowsQueuePrompt(view_)) {
+    ++rows;
+  }
+  if (view_.can_go_back) {
+    ++rows;
+  }
+  return rows;
+}
+
 void LibraryScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
                          s32 height) const {
   // Nothing is drawn past the bounds `CustomDrawer` handed us, and nothing runs
@@ -268,6 +296,14 @@ void LibraryScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
   line(view_.headline, kBodyFont, ColorFor(view_.tone), kHeadlineHeight);
   line(view_.hint, kNoteFont, muted, kNoteHeight);
 
+  // The prompts are reserved *before* the rows, not drawn after them. A list is
+  // longer than the panel in the ordinary case, so a row loop that spent the
+  // whole remaining height would push "Ⓐ Download" and "Ⓑ Back" off the bottom
+  // for every list a user actually scrolls -- a control that is only visible
+  // when the list happens to be short is one they never learn is there.
+  const s32 prompts = PromptRows() * kRowHeight + kRowHeight / 2;
+  const s32 rows_bottom = bottom - prompts;
+
   // The rows, from the selection rather than from the top: the list is longer
   // than the panel and the selected row is the one that has to be visible. Two
   // rows of context above it, so a scroll does not read as a jump.
@@ -280,7 +316,7 @@ void LibraryScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
   row += kRowHeight / 2;
   for (int index = first; index < rows; ++index) {
     const LibraryRow& entry = view_.rows[static_cast<std::size_t>(index)];
-    if (!fits(kRowHeight)) {
+    if (clipped || row + kRowHeight > rows_bottom) {
       break;
     }
     const bool selected = index == view_.selected;
@@ -309,7 +345,7 @@ void LibraryScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
     // with a sentence under every greyed entry is a list a user cannot scan,
     // and the reason is only actionable for the row they are on.
     if (selected && !entry.note.empty()) {
-      if (!fits(kNoteHeight)) {
+      if (row + kNoteHeight > rows_bottom) {
         break;
       }
       renderer->drawString(entry.note, false, x + kRowIndent, row, kNoteFont,
@@ -318,11 +354,12 @@ void LibraryScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
     }
   }
 
-  // The prompts, last. A control that does nothing on this row is not drawn at
-  // all rather than drawn greyed: unlike the sync screen's two fixed buttons,
-  // these change with the selection, and a prompt that appears and disappears
-  // as the user scrolls is what tells them which rows are live.
-  row += kRowHeight / 2;
+  // The prompts, in the space held back for them above. A control that does
+  // nothing on this row is not drawn at all rather than drawn greyed: unlike
+  // the sync screen's two fixed buttons, these change with the selection, and a
+  // prompt that appears and disappears as the user scrolls is what tells them
+  // which rows are live.
+  row = std::max(row, rows_bottom) + kRowHeight / 2;
   if (view_.selected >= 0) {
     const LibraryRow& entry = view_.rows[static_cast<std::size_t>(view_.selected)];
     const char* action = ActionFor(entry);
@@ -331,7 +368,7 @@ void LibraryScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
            kRowHeight);
     }
   }
-  if (view_.link == Link::kOk && view_.level != LibraryLevel::kQueue) {
+  if (ShowsQueuePrompt(view_)) {
     line(Prompt(kGlyphY, "Downloads"), kBodyFont, muted, kRowHeight);
   }
   if (view_.can_go_back) {

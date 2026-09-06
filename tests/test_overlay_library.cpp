@@ -104,17 +104,25 @@ ipc::ListItem Rom(std::int64_t rom_id, const std::string& name, std::int64_t siz
 
 ipc::ListItem QueueEntry(std::int64_t rom_id, const std::string& fs_name,
                          const std::string& state, std::int64_t bytes_done,
-                         std::int64_t size_bytes, const std::string& message) {
+                         std::int64_t size_bytes, const std::string& message,
+                         std::int64_t bytes_per_second = 0, std::int64_t attempts = 1,
+                         const std::string& fs_slug = "gb") {
   ipc::ListItem item;
   item.fields.push_back(
       {std::string(ipc::list_keys::kQueueRomId), ipc::ListValue::Integer(rom_id)});
   item.fields.push_back(
       {std::string(ipc::list_keys::kQueueFsName), ipc::ListValue::Text(fs_name)});
+  item.fields.push_back(
+      {std::string(ipc::list_keys::kQueuePlatformFsSlug), ipc::ListValue::Text(fs_slug)});
   item.fields.push_back({std::string(ipc::list_keys::kQueueState), ipc::ListValue::Text(state)});
   item.fields.push_back(
       {std::string(ipc::list_keys::kQueueBytesDone), ipc::ListValue::Integer(bytes_done)});
   item.fields.push_back(
       {std::string(ipc::list_keys::kQueueSizeBytes), ipc::ListValue::Integer(size_bytes)});
+  item.fields.push_back({std::string(ipc::list_keys::kQueueBytesPerSecond),
+                         ipc::ListValue::Integer(bytes_per_second)});
+  item.fields.push_back(
+      {std::string(ipc::list_keys::kQueueAttempts), ipc::ListValue::Integer(attempts)});
   item.fields.push_back(
       {std::string(ipc::list_keys::kQueueMessage), ipc::ListValue::Text(message)});
   return item;
@@ -265,9 +273,10 @@ void CheckPendingIsNotEmpty(Checks& checks) {
   Begin(checks, model, 11);
 
   Deliver(checks, model, Pending(), 11, "the page that is not there yet");
-  checks.Expect(model.Render().busy, "a pending page reads as busy");
-  checks.Expect(model.Render().rows.empty() || MoreRow(model.Render()) != nullptr,
-                "and draws no library rows");
+  const overlay::LibraryRow* waiting = MoreRow(model.Render());
+  checks.Expect(waiting != nullptr && !waiting->selectable,
+                "a pending page draws the waiting row and nothing to press");
+  checks.Expect(ListRows(model.Render()).empty(), "and no library rows");
 
   Deliver(checks, model, Pending(), 11, "asked again rather than treated as the end");
   Deliver(checks, model, Page(checks, {Platform(1, "Game Boy", "gb", 3, true)}, false), 11,
@@ -275,7 +284,7 @@ void CheckPendingIsNotEmpty(Checks& checks) {
 
   const overlay::LibraryView view = model.Render();
   checks.ExpectEq(ListRows(view).size(), std::size_t{1}, "the page that arrived is drawn");
-  checks.Expect(!view.busy, "and the screen is no longer busy");
+  checks.Expect(MoreRow(view) == nullptr, "and the waiting row is gone");
 }
 
 /// A `ListNext` that fails mid-scroll.
@@ -584,11 +593,17 @@ void CheckRefusalsLandOnTheRow(Checks& checks) {
                     std::string("the row state for ") + ipc::ToString(error));
     sentences.push_back(rows[1].note);
 
-    // Idempotent from the screen's side: the row now says what it says, and the
-    // button stops sending.
+    // Whether a second press asks again is decided by what the refusal was
+    // *about*. `kDuplicate` and `kMultiFile` are facts about the rom -- the
+    // row's state carries them and the button stops, which is #25's
+    // idempotency rule. Everything else is a fact about the moment or the
+    // console, and `CheckATransientRefusalCanBeRetried` holds the other half.
+    const bool about_the_rom = overlay::EnqueueRefusalState(error) != overlay::RowState::kRefused;
     model.Activate();
-    checks.Expect(model.Next().kind == Command::Kind::kNone,
-                  std::string("a second press sends nothing after ") + ipc::ToString(error));
+    const bool asked_again = model.Next().kind == Command::Kind::kEnqueue;
+    checks.Expect(asked_again != about_the_rom,
+                  std::string("a second press asks again only for a refusal about the moment: ") +
+                      ipc::ToString(error));
   }
 
   for (std::size_t left = 0; left < sentences.size(); ++left) {
@@ -892,7 +907,340 @@ void CheckOneCommandAtATime(Checks& checks) {
                 "and once answered the press is retired");
 }
 
+/// The first `ListNext` on an open cursor fails.
+///
+/// There are no loaded rows for the failure to sit under, so it is the whole
+/// screen -- and the headline must say so. Reading the *cursor* rather than the
+/// loaded rows to decide that would leave the headline saying "Loading..." over
+/// a row saying it had stopped, which is the screen contradicting itself.
+void CheckFirstPageFailureIsTheScreen(Checks& checks) {
+  overlay::LibraryBrowserModel model;
+  Begin(checks, model, 211);
+  const Command page = model.Next();
+  checks.Expect(page.kind == Command::Kind::kListNext, "it asks for the first page");
+  model.OnRefused(ipc::Error::kOffline);
+
+  const overlay::LibraryView view = model.Render();
+  checks.Expect(ListRows(view).empty(), "nothing loaded");
+  checks.Expect(!Contains(view.headline, "Loading"),
+                "so the headline does not claim to still be loading");
+  checks.Expect(Contains(view.headline, "could not be loaded"), "it says the list failed");
+  checks.Expect(!view.hint.empty(), "with something to do about it");
+  checks.Expect(model.Next().kind == Command::Kind::kNone, "and it is not retried every frame");
+}
+
+/// Y on the queue does not push a second queue.
+///
+/// A held button would otherwise push a level per frame, and each level opens a
+/// cursor out of the small number #31 allows -- a browser that ran the
+/// sysmodule out of cursors from one button.
+void CheckQueueDoesNotStack(Checks& checks) {
+  overlay::LibraryBrowserModel model;
+  Begin(checks, model, 221);
+  Deliver(checks, model, Page(checks, {Platform(1, "Game Boy", "gb", 4, true)}, false), 221,
+          "the platform page");
+
+  model.OpenQueue();
+  Begin(checks, model, 222);
+  Deliver(checks, model, Page(checks, {}, false), 222, "an empty queue");
+  for (int press = 0; press < 8; ++press) {
+    model.OpenQueue();
+  }
+  checks.Expect(model.Render().level == overlay::LibraryLevel::kQueue, "it is still the queue");
+  checks.Expect(model.Next().kind == Command::Kind::kNone,
+                "and no further press opened a cursor");
+  checks.ExpectEq(model.open_cursors(), std::size_t{2},
+                  "the two levels hold two cursors, not ten");
+  checks.Expect(model.Back(), "and one B leaves the queue");
+  const Command close = model.Next();
+  checks.Expect(close.kind == Command::Kind::kListEnd, "closing the one queue cursor");
+  model.OnEnded();
+  checks.Expect(model.Render().level == overlay::LibraryLevel::kPlatforms,
+                "which lands back on the library");
+}
+
+/// Every cursor a three-level browser holds is closed, not all but one.
+///
+/// The bound on the teardown loop is read once for exactly this: each `ListEnd`
+/// that lands shrinks the count, so re-reading it in the condition would stop
+/// one cursor short every time.
+void CheckCloseEndsEveryCursorOfThree(Checks& checks) {
+  overlay::LibraryBrowserModel model;
+  Begin(checks, model, 231);
+  Deliver(checks, model, Page(checks, {Platform(1, "Game Boy", "gb", 4, true)}, false), 231,
+          "the platform page");
+  model.Activate();
+  Begin(checks, model, 232);
+  Deliver(checks, model, Page(checks, {Rom(1, "Tetris", 1024)}, false), 232, "the rom page");
+  model.OpenQueue();
+  Begin(checks, model, 233);
+  Deliver(checks, model, Page(checks, {}, false), 233, "an empty queue");
+  checks.ExpectEq(model.open_cursors(), std::size_t{3}, "three levels, three cursors");
+
+  model.Close();
+  const std::size_t cursors = model.open_cursors();
+  std::vector<ipc::Cursor> ended;
+  // The shape the screen's destructor uses: pump until `kNone`, with no bound
+  // of its own. The `cursors + 1` here is the *test's* safety net -- it fails
+  // rather than hanging if the loop ever stops terminating.
+  for (std::size_t attempt = 0; attempt <= cursors; ++attempt) {
+    const Command command = model.Next();
+    if (command.kind == Command::Kind::kNone) {
+      break;
+    }
+    checks.Expect(command.kind == Command::Kind::kListEnd,
+                  "a closing screen sends nothing but ListEnd");
+    ended.push_back(command.cursor);
+    model.OnEnded();
+  }
+  checks.ExpectEq(ended.size(), std::size_t{3}, "all three cursors are closed");
+  checks.ExpectEq(model.open_cursors(), std::size_t{0}, "and none is left open");
+  checks.Expect(model.Next().kind == Command::Kind::kNone, "and the pump then stops");
+}
+
+/// A closing screen whose every `ListEnd` is refused still terminates.
+///
+/// The destructor pumps until `kNone` with no bound of its own, so "each turn
+/// retires a cursor or ends the loop" has to hold for a refusal too -- a
+/// `kBadCursor` on a cursor the sysmodule already reclaimed is the ordinary way
+/// this goes (#31), and a destructor that looped on it would hang the overlay
+/// on the way out.
+void CheckCloseTerminatesWhenEveryEndIsRefused(Checks& checks) {
+  overlay::LibraryBrowserModel model;
+  Begin(checks, model, 251);
+  Deliver(checks, model, Page(checks, {Platform(1, "Game Boy", "gb", 4, true)}, false), 251,
+          "the platform page");
+  model.Activate();
+  Begin(checks, model, 252);
+  Deliver(checks, model, Page(checks, {Rom(1, "Tetris", 1024)}, false), 252, "the rom page");
+
+  model.Close();
+  const std::size_t cursors = model.open_cursors();
+  std::size_t sent = 0;
+  for (std::size_t attempt = 0; attempt <= cursors; ++attempt) {
+    const Command command = model.Next();
+    if (command.kind == Command::Kind::kNone) {
+      break;
+    }
+    ++sent;
+    model.OnRefused(ipc::Error::kBadCursor);
+  }
+  checks.ExpectEq(sent, std::size_t{2}, "each refused ListEnd still retires its cursor");
+  checks.ExpectEq(model.open_cursors(), std::size_t{0}, "so the pump drains");
+  checks.Expect(model.Next().kind == Command::Kind::kNone, "and then stops");
+
+  // And the other way it can end: the session went away mid-teardown.
+  overlay::LibraryBrowserModel gone;
+  Begin(checks, gone, 261);
+  Deliver(checks, gone, Page(checks, {Platform(1, "Game Boy", "gb", 4, true)}, false), 261,
+          "the platform page");
+  gone.Close();
+  checks.Expect(gone.Next().kind == Command::Kind::kListEnd, "it asks to close its cursor");
+  gone.OnUnreachable(overlay::Link::kNotRunning);
+  checks.Expect(gone.Next().kind == Command::Kind::kNone,
+                "and a sysmodule that has gone ends the pump rather than looping it");
+}
+
+/// A queue row carries every field the projection pins.
+///
+/// `ipc::list_keys` says a kind carries its fields "and no others", because
+/// `AppendIfItFits` bounds a page by bytes -- so a field pinned and never read
+/// is fewer rows per page for every user, forever. These two are read.
+void CheckQueueRowUsesEveryPinnedField(Checks& checks) {
+  overlay::LibraryBrowserModel model;
+  model.OpenQueue();
+  Begin(checks, model, 241);
+  Deliver(checks, model,
+          Page(checks,
+               {QueueEntry(1, "Tetris.gb", "active", 512 * 1024, 1024 * 1024, "", 1024 * 1024, 1),
+                QueueEntry(2, "Sonic.md", "failed", 0, 0, "the server closed the connection", 0,
+                           4),
+                QueueEntry(3, "", "queued", 0, 0, "", 0, 1, "snes")},
+               false),
+          241, "the queue page");
+
+  const std::vector<overlay::LibraryRow> rows = ListRows(model.Render());
+  checks.ExpectEq(rows.size(), std::size_t{3}, "all three entries are drawn");
+  checks.Expect(Contains(rows[0].value, "1.0 MiB/s"),
+                "a live download shows the rate bytes_per_second carries");
+  checks.Expect(rows[0].note.empty(), "and a first attempt says nothing about attempts");
+  checks.Expect(Contains(rows[1].note, "attempt 4") &&
+                    Contains(rows[1].note, "closed the connection"),
+                "a retried failure shows the attempt count with the reason");
+  checks.Expect(!Contains(rows[1].value, "/s"),
+                "and an entry the worker is not on shows no rate");
+  checks.Expect(Contains(rows[2].label, "snes"),
+                "a row with no file name yet is named by its rom and its platform");
+}
+
+/// A refusal that describes a moment does not kill the row for good.
+///
+/// A full queue drains and a server comes back. A row that took `kQueueFull`
+/// and then refused to send again for the life of the level would leave the
+/// user no way to ask once the queue had emptied -- and #25's idempotency rule
+/// is about `kDuplicate`, which lands as `kQueued` rather than as a refusal.
+void CheckATransientRefusalCanBeRetried(Checks& checks) {
+  for (const ipc::Error error :
+       {ipc::Error::kQueueFull, ipc::Error::kOffline, ipc::Error::kNotConfigured}) {
+    overlay::LibraryBrowserModel model;
+    Begin(checks, model, 271);
+    Deliver(checks, model, Page(checks, {Platform(1, "Game Boy", "gb", 4, true)}, false), 271,
+            "the platform page");
+    model.Activate();
+    Begin(checks, model, 272);
+    Deliver(checks, model, Page(checks, {Rom(1, "Tetris", 1024)}, false), 272, "the rom page");
+
+    model.Activate();
+    checks.Expect(model.Next().kind == Command::Kind::kEnqueue, "A sends Enqueue");
+    model.OnRefused(error);
+    const std::vector<overlay::LibraryRow> refused = ListRows(model.Render());
+    checks.ExpectEq(overlay::ToString(refused[0].state),
+                    overlay::ToString(overlay::RowState::kRefused),
+                    std::string("the row is refused: ") + ipc::ToString(error));
+    checks.Expect(!refused[0].note.empty(), "and says why");
+
+    // The console changed its mind. Pressing again asks again.
+    model.Activate();
+    const Command retry = model.Next();
+    checks.Expect(retry.kind == Command::Kind::kEnqueue,
+                  std::string("and a second press asks again after ") + ipc::ToString(error));
+    model.OnEnqueued(1);
+    checks.ExpectEq(overlay::ToString(ListRows(model.Render())[0].state),
+                    overlay::ToString(overlay::RowState::kQueued),
+                    "and the row that took goes to queued");
+  }
+
+  // `kDuplicate` is the one that must *not* re-send: it is the queued state,
+  // and #25's rule is that the button stops.
+  overlay::LibraryBrowserModel model;
+  Begin(checks, model, 281);
+  Deliver(checks, model, Page(checks, {Platform(1, "Game Boy", "gb", 4, true)}, false), 281,
+          "the platform page");
+  model.Activate();
+  Begin(checks, model, 282);
+  Deliver(checks, model, Page(checks, {Rom(1, "Tetris", 1024)}, false), 282, "the rom page");
+  model.Activate();
+  checks.Expect(model.Next().kind == Command::Kind::kEnqueue, "A sends Enqueue");
+  model.OnRefused(ipc::Error::kDuplicate);
+  model.Activate();
+  checks.Expect(model.Next().kind == Command::Kind::kNone,
+                "and a rom already in the queue stops sending");
+}
+
+/// A level stops loading at `kMaxLoadedRows`, and says it was cut.
+///
+/// The one structure here that would otherwise grow with the size of the
+/// library. "Cut" and "finished" are two different sentences: a user told a
+/// list ended stops looking for what is not in it.
+void CheckLoadedRowsAreBounded(Checks& checks) {
+  overlay::LibraryBrowserModel model;
+  Begin(checks, model, 291);
+
+  // Full pages, forever, exactly as a ten-thousand-rom library would answer.
+  for (int page = 0; page < 64; ++page) {
+    const Command command = model.Next();
+    if (command.kind == Command::Kind::kNone) {
+      break;
+    }
+    checks.Expect(command.kind == Command::Kind::kListNext, "it keeps asking while it has room");
+    std::vector<ipc::ListItem> items;
+    for (int index = 0; index < 32; ++index) {
+      const int id = page * 32 + index + 1;
+      items.push_back(Platform(id, "Platform " + std::to_string(id), "p", 1, true));
+    }
+    model.OnPage(Page(checks, std::move(items), true));
+    // Follow the selection down, which is what asks for the next page.
+    model.MoveSelection(32);
+  }
+
+  const overlay::LibraryView view = model.Render();
+  checks.ExpectEq(static_cast<int>(ListRows(view).size()), overlay::kMaxLoadedRows,
+                  "the level stops at kMaxLoadedRows");
+  checks.Expect(model.Next().kind == Command::Kind::kNone, "and stops asking for more");
+  const overlay::LibraryRow* more = MoreRow(view);
+  checks.Expect(more != nullptr, "with a row saying so");
+  if (more != nullptr) {
+    checks.Expect(Contains(more->label, "Too many"), "and it says the list was cut");
+    checks.Expect(more->tone == overlay::Tone::kWarn, "as a warning rather than as the end");
+  }
+}
+
+/// Items this build cannot read are counted and said out loud.
+///
+/// The two halves ship separately, so a field this build requires and that one
+/// omits empties a whole page. "Nothing in the download queue" over a running
+/// download is the worst possible way to report a contract mismatch.
+void CheckUnreadableItemsAreReported(Checks& checks) {
+  overlay::LibraryBrowserModel model;
+  model.OpenQueue();
+  Begin(checks, model, 301);
+
+  // A queue entry missing `message`, which is the free-text field a producer is
+  // likeliest to leave out when it is empty.
+  ipc::ListItem missing = QueueEntry(1, "Tetris.gb", "active", 0, 0, "");
+  missing.fields.pop_back();
+  Deliver(checks, model, Page(checks, {missing}, false), 301, "a page this build cannot read");
+
+  const overlay::LibraryView view = model.Render();
+  checks.Expect(ListRows(view).empty(), "the item is dropped rather than drawn half-filled");
+  checks.Expect(!Contains(view.headline, "Nothing in the download queue"),
+                "but the screen does not report it as an empty queue");
+  checks.Expect(Contains(view.headline, "cannot read"), "it says what actually happened");
+  checks.Expect(!view.hint.empty(), "with something to do about it");
+  checks.Expect(view.tone == overlay::Tone::kBad, "and reads as the mismatch it is");
+}
+
+/// A page is answered into the level it was asked for, or not at all.
+void CheckAPageCannotLandInTheWrongLevel(Checks& checks) {
+  overlay::LibraryBrowserModel model;
+  Begin(checks, model, 311);
+  Deliver(checks, model, Page(checks, {Platform(1, "Game Boy", "gb", 4, true)}, true), 311,
+          "the platform page");
+
+  // A page is asked for, and the user descends before it is answered.
+  const Command outstanding = model.Next();
+  checks.Expect(outstanding.kind == Command::Kind::kListNext, "a page is in flight");
+  model.Activate();
+  checks.Expect(model.Render().level == overlay::LibraryLevel::kRoms, "and the level changed");
+
+  model.OnPage(Page(checks, {Platform(2, "Mega Drive", "md", 9, true)}, false));
+  checks.Expect(ListRows(model.Render()).empty(),
+                "the platform page is not answered into the rom level");
+  checks.Expect(model.Next().kind == Command::Kind::kListBegin,
+                "which opens its own list instead");
+}
+
 // --- the code rather than the behaviour ---------------------------------------
+
+/// Every non-comment line of `path`, held against a list of symbols it may not
+/// name.
+///
+/// One loop rather than the three the checks below would each carry: opening a
+/// file, skipping its comment lines, and scanning a token table is the shape
+/// they share, and the interesting part of each is its token list.
+///
+/// Comment lines are skipped because these files explain the rules they keep in
+/// prose, and explaining a rule is not breaking it.
+template <std::size_t N>
+void ScanForbidden(Checks& checks, const std::filesystem::path& path,
+                   const char* const (&forbidden)[N], const std::string& why) {
+  std::ifstream file(path);
+  checks.Expect(file.good(), "the source is readable: " + path.string());
+  std::string line;
+  int number = 0;
+  while (std::getline(file, line)) {
+    ++number;
+    const std::size_t first = line.find_first_not_of(" \t");
+    if (first != std::string::npos && line.compare(first, 2, "//") == 0) {
+      continue;
+    }
+    for (const char* token : forbidden) {
+      checks.Expect(!NamesToken(line, token), path.filename().string() + ":" +
+                                                  std::to_string(number) + " names " + token +
+                                                  "; " + why);
+    }
+  }
+}
 
 /// Nothing under `overlay/` writes `config.ini`, and nothing there names a boot
 /// flag.
@@ -918,22 +1266,7 @@ void CheckLibraryScreenWritesNothing(Checks& checks) {
     if (path.filename().string() == "library_screen.cpp") {
       found_the_screen = true;
     }
-    std::ifstream file(path);
-    checks.Expect(file.good(), "the overlay source is readable: " + path.string());
-    std::string line;
-    int number = 0;
-    while (std::getline(file, line)) {
-      ++number;
-      const std::size_t first = line.find_first_not_of(" \t");
-      if (first != std::string::npos && line.compare(first, 2, "//") == 0) {
-        continue;
-      }
-      for (const char* token : kForbidden) {
-        checks.Expect(!Contains(line, token),
-                      path.filename().string() + ":" + std::to_string(number) + " names " +
-                          token + "; the sysmodule owns every write");
-      }
-    }
+    ScanForbidden(checks, path, kForbidden, "the sysmodule owns every write");
   }
   checks.Expect(found_the_screen, "the library screen is in overlay/source/ and was scanned");
 }
@@ -950,24 +1283,9 @@ void CheckLibraryScreenCallsNoEngine(Checks& checks) {
       "http::",      "sync::",  "auth::Gate", "state_db",
   };
 
-  const std::filesystem::path screen =
-      std::filesystem::path(ROMMSYNC_OVERLAY_SOURCE_DIR) / "library_screen.cpp";
-  std::ifstream file(screen);
-  checks.Expect(file.good(), "the library screen is readable");
-  std::string line;
-  int number = 0;
-  while (std::getline(file, line)) {
-    ++number;
-    const std::size_t first = line.find_first_not_of(" \t");
-    if (first != std::string::npos && line.compare(first, 2, "//") == 0) {
-      continue;
-    }
-    for (const char* token : kForbidden) {
-      checks.Expect(!NamesToken(line, token),
-                    "library_screen.cpp:" + std::to_string(number) + " names " + token +
-                        "; the overlay renders what the sysmodule reports and calls no engine");
-    }
-  }
+  ScanForbidden(checks, std::filesystem::path(ROMMSYNC_OVERLAY_SOURCE_DIR) / "library_screen.cpp",
+                kForbidden,
+                "the overlay renders what the sysmodule reports and calls no engine");
 }
 
 /// The model names no libnx and no libultrahand type (hard rule 4).
@@ -976,26 +1294,8 @@ void CheckModelStaysPortable(Checks& checks) {
       "switch.h", "tesla.hpp", "Result", "tsl::", "libnx", "MAKERESULT",
   };
   for (const char* path : {ROMMSYNC_LIBRARY_MODEL_HDR, ROMMSYNC_LIBRARY_MODEL_SRC}) {
-    std::ifstream file(path);
-    checks.Expect(file.good(), std::string("the view model is readable: ") + path);
-    std::string line;
-    int number = 0;
-    while (std::getline(file, line)) {
-      ++number;
-      const std::size_t first = line.find_first_not_of(" \t");
-      if (first != std::string::npos && line.compare(first, 2, "//") == 0) {
-        continue;
-      }
-      const std::size_t doc = line.find_first_not_of(" \t");
-      if (doc != std::string::npos && line.compare(doc, 3, "///") == 0) {
-        continue;
-      }
-      for (const char* token : kForbidden) {
-        checks.Expect(!Contains(line, token),
-                      std::string(path) + ":" + std::to_string(number) + " names " + token +
-                          "; core/ names no host-only or libnx type (hard rule 4)");
-      }
-    }
+    ScanForbidden(checks, path, kForbidden,
+                  "core/ names no host-only or libnx type (hard rule 4)");
   }
 }
 
@@ -1024,6 +1324,15 @@ int main() {
   CheckUnreachableWordingIsShared(checks);
   CheckPagingFollowsTheSelection(checks);
   CheckOneCommandAtATime(checks);
+  CheckFirstPageFailureIsTheScreen(checks);
+  CheckQueueDoesNotStack(checks);
+  CheckCloseEndsEveryCursorOfThree(checks);
+  CheckCloseTerminatesWhenEveryEndIsRefused(checks);
+  CheckATransientRefusalCanBeRetried(checks);
+  CheckLoadedRowsAreBounded(checks);
+  CheckUnreadableItemsAreReported(checks);
+  CheckAPageCannotLandInTheWrongLevel(checks);
+  CheckQueueRowUsesEveryPinnedField(checks);
   CheckLibraryScreenWritesNothing(checks);
   CheckLibraryScreenCallsNoEngine(checks);
   CheckModelStaysPortable(checks);

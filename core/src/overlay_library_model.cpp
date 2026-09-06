@@ -75,15 +75,42 @@ std::string RomCountText(std::int64_t count) {
 /// `size_bytes == 0` is a real answer from a server that declared no length
 /// (#22), so the bytes already moved are shown on their own rather than
 /// against a total that does not exist. Never a synthesised percentage.
+///
+/// The rate is only shown while it means something: `bytes_per_second` is the
+/// live worker's, so it is zero for every entry that is not the one being
+/// downloaded, and "0 B/s" beside a queued row reads as a stalled download.
 std::string QueueProgressText(const std::string& state, std::int64_t bytes_done,
-                              std::int64_t size_bytes) {
-  if (bytes_done <= 0 && size_bytes <= 0) {
-    return state;
+                              std::int64_t size_bytes, std::int64_t bytes_per_second) {
+  std::string text = state;
+  if (bytes_done > 0 || size_bytes > 0) {
+    text += " -- ";
+    text += FormatBytes(bytes_done);
+    if (size_bytes > 0) {
+      text += " of ";
+      text += FormatBytes(size_bytes);
+    }
   }
-  if (size_bytes <= 0) {
-    return state + " -- " + FormatBytes(bytes_done);
+  if (bytes_per_second > 0) {
+    text += " at ";
+    text += FormatBytes(bytes_per_second);
+    text += "/s";
   }
-  return state + " -- " + FormatBytes(bytes_done) + " of " + FormatBytes(size_bytes);
+  return text;
+}
+
+/// What a queue row has to say for itself under its name.
+///
+/// The message is why a rom never arrived, and this screen is the only place a
+/// user can read it (#22): a `failed` row kept in the file with its reason
+/// dropped is a row that says nothing. The attempt count goes in front of it
+/// because a download on its fourth try and one that failed once are different
+/// situations wearing the same message.
+std::string QueueNoteText(const std::string& message, std::int64_t attempts) {
+  if (attempts <= 1) {
+    return message;
+  }
+  const std::string tries = "attempt " + std::to_string(attempts);
+  return message.empty() ? tries : tries + " -- " + message;
 }
 
 }  // namespace
@@ -134,22 +161,21 @@ const char* ToString(RowState state) {
   return "inert";
 }
 
-RowState PredictEnqueue(bool platform_mapped, bool has_multiple_files, bool on_disk,
-                        bool queued) {
+RowState PredictEnqueue(const RomFacts& facts) {
   // A skip reason first, then where the rom already is. A disc set and an
   // unmapped platform are the two reasons it will *never* arrive, and that is
   // what a user needs before "it is already queued" -- a rom sitting in the
   // queue on an unmapped platform is one the worker will settle `kSkipped`.
-  if (has_multiple_files) {
+  if (facts.has_multiple_files) {
     return RowState::kMultiFile;
   }
-  if (!platform_mapped) {
+  if (!facts.platform_mapped) {
     return RowState::kUnmapped;
   }
-  if (on_disk) {
+  if (facts.on_disk) {
     return RowState::kOnDisk;
   }
-  if (queued) {
+  if (facts.queued) {
     return RowState::kQueued;
   }
   return RowState::kReady;
@@ -285,6 +311,7 @@ LibraryBrowserModel::Command LibraryBrowserModel::Next() {
     command.kind = Command::Kind::kListEnd;
     command.cursor = closing_.front();
     issued_ = command.kind;
+    issued_depth_ = stack_.size();
     return command;
   }
 
@@ -305,6 +332,7 @@ LibraryBrowserModel::Command LibraryBrowserModel::Next() {
     // The press is retired by whichever `On...` answers it.
     enqueueing_ = enqueue_wanted_;
     issued_ = command.kind;
+    issued_depth_ = stack_.size();
     return command;
   }
 
@@ -320,6 +348,7 @@ LibraryBrowserModel::Command LibraryBrowserModel::Next() {
     command.request = level.request;
     level.loading = true;
     issued_ = command.kind;
+    issued_depth_ = stack_.size();
     return command;
   }
 
@@ -331,6 +360,7 @@ LibraryBrowserModel::Command LibraryBrowserModel::Next() {
     command.cursor = level.cursor;
     level.loading = true;
     issued_ = command.kind;
+    issued_depth_ = stack_.size();
     return command;
   }
 
@@ -340,11 +370,12 @@ LibraryBrowserModel::Command LibraryBrowserModel::Next() {
 }
 
 void LibraryBrowserModel::OnCursor(ipc::Cursor cursor) {
-  // Only the command that was handed out may be answered. The screen sends
-  // synchronously, so nothing can arrive out of order today -- this is what
-  // keeps that true when something else drives the model, because a page
-  // answered into the wrong level is a rom list drawn as the platform list.
-  if (issued_ != Command::Kind::kListBegin) {
+  // Only the command that was handed out, and only into the level it was asked
+  // for. The screen sends synchronously, so nothing can arrive out of order
+  // today -- this is what keeps that true when something else drives the model,
+  // because a rom page answered into the platform level decodes to no rows at
+  // all and starts that level counting toward `kMaxEmptyPages`.
+  if (issued_ != Command::Kind::kListBegin || issued_depth_ != stack_.size()) {
     return;
   }
   issued_ = Command::Kind::kNone;
@@ -360,7 +391,7 @@ void LibraryBrowserModel::OnCursor(ipc::Cursor cursor) {
 }
 
 void LibraryBrowserModel::OnPage(const ipc::ListPage& page) {
-  if (issued_ != Command::Kind::kListNext) {
+  if (issued_ != Command::Kind::kListNext || issued_depth_ != stack_.size()) {
     return;
   }
   issued_ = Command::Kind::kNone;
@@ -377,6 +408,8 @@ void LibraryBrowserModel::OnPage(const ipc::ListPage& page) {
 
   if (level.replace_rows) {
     level.rows.clear();
+    level.unreadable_items = 0;
+    level.truncated = false;
     level.replace_rows = false;
   }
 
@@ -399,6 +432,13 @@ void LibraryBrowserModel::OnPage(const ipc::ListPage& page) {
       // half-filled, for the reason every decoder in `ipc.hpp` refuses a
       // partial payload: defaulted fields render as a library with odd numbers
       // in it, and a user cannot tell that from a library that is odd.
+      //
+      // Counted rather than only dropped, though. The two halves ship
+      // separately, so a field this build requires and that one omits empties a
+      // whole page -- and a queue screen saying "nothing in the download queue"
+      // while a download is running is the worst possible way to report a
+      // contract mismatch.
+      ++level.unreadable_items;
       continue;
     }
     level.rows.push_back(std::move(row));
@@ -418,6 +458,14 @@ void LibraryBrowserModel::OnPage(const ipc::ListPage& page) {
   }
 
   level.has_more = page.has_more;
+  if (static_cast<int>(level.rows.size()) >= kMaxLoadedRows) {
+    // Bounded, like everything else on this wire (`kMaxLoadedRows`). The row at
+    // the end says the list was *cut* rather than that it ended, which is not
+    // the same sentence: a user who is told a list finished stops looking.
+    level.truncated = level.has_more || level.rows.size() > static_cast<std::size_t>(kMaxLoadedRows);
+    level.has_more = false;
+    level.rows.resize(static_cast<std::size_t>(kMaxLoadedRows));
+  }
   level.loading = false;
   if (level.selected >= static_cast<int>(level.rows.size())) {
     level.selected = level.rows.empty() ? 0 : static_cast<int>(level.rows.size()) - 1;
@@ -572,6 +620,7 @@ void LibraryBrowserModel::Activate() {
       level.has_more = true;
     }
     return;
+
   }
   if (level.selected < 0 || rows == 0) {
     return;
@@ -592,7 +641,14 @@ void LibraryBrowserModel::Activate() {
     }
 
     case RowKind::kRom:
-      if (row.state != RowState::kReady) {
+      // `kRefused` is pressable again on purpose. The four predicted states are
+      // facts about the rom and do not change while the level is open, but a
+      // refusal the sysmodule answered with is often a fact about the *moment*
+      // -- a full queue that drains, a server that comes back -- and a row that
+      // took one and went dead for the life of the screen would leave the user
+      // no way to ask again. #25's idempotency rule is about `kDuplicate`,
+      // which lands as `kQueued` rather than here.
+      if (row.state != RowState::kReady && row.state != RowState::kRefused) {
         // Idempotent from the screen's side (#25): the row already says what
         // this press would achieve, and sending the command to hear the same
         // answer back is a round trip whose only effect is to make the sentence
@@ -625,6 +681,12 @@ bool LibraryBrowserModel::Back() {
 }
 
 void LibraryBrowserModel::OpenQueue() {
+  if (top().kind == LibraryLevel::kQueue) {
+    // Already here. Without this, holding the button pushes a queue level per
+    // press and each one opens a cursor -- #31 caps how many may be open, so an
+    // unbounded stack is a browser that runs the sysmodule out of them.
+    return;
+  }
   Level queue;
   queue.kind = LibraryLevel::kQueue;
   queue.request.kind = ipc::ListKind::kQueue;
@@ -711,7 +773,10 @@ bool LibraryBrowserModel::ReadRom(const ipc::ListItem& item, bool platform_mappe
   row->fs_slug = !fs_slug.empty() ? fs_slug : platform_fs_slug;
   row->platform_id = 0;
   row->selectable = true;
-  row->state = PredictEnqueue(platform_mapped, has_multiple_files, on_disk, queued);
+  row->state = PredictEnqueue({.platform_mapped = platform_mapped,
+                               .has_multiple_files = has_multiple_files,
+                               .on_disk = on_disk,
+                               .queued = queued});
   row->note = RowStateText(row->state, row->fs_slug);
   row->tone = RowStateTone(row->state);
   return true;
@@ -721,27 +786,37 @@ bool LibraryBrowserModel::ReadQueueEntry(const ipc::ListItem& item, LibraryRow* 
   std::int64_t rom_id = 0;
   std::int64_t bytes_done = 0;
   std::int64_t size_bytes = 0;
+  std::int64_t bytes_per_second = 0;
+  std::int64_t attempts = 0;
   std::string fs_name;
+  std::string fs_slug;
   std::string state;
   std::string message;
   if (!ReadInteger(item, keys::kQueueRomId, &rom_id) ||
       !ReadText(item, keys::kQueueFsName, &fs_name) ||
+      !ReadText(item, keys::kQueuePlatformFsSlug, &fs_slug) ||
       !ReadText(item, keys::kQueueState, &state) ||
       !ReadInteger(item, keys::kQueueBytesDone, &bytes_done) ||
       !ReadInteger(item, keys::kQueueSizeBytes, &size_bytes) ||
+      !ReadInteger(item, keys::kQueueBytesPerSecond, &bytes_per_second) ||
+      !ReadInteger(item, keys::kQueueAttempts, &attempts) ||
       !ReadText(item, keys::kQueueMessage, &message)) {
     return false;
   }
 
   row->kind = RowKind::kQueueEntry;
-  row->label = !fs_name.empty() ? fs_name : "Rom " + std::to_string(rom_id);
-  row->value = QueueProgressText(state, bytes_done, size_bytes);
-  // The message is why a rom never arrived, and this screen is the only place a
-  // user can read it (#22): a `failed` row kept in the file with its reason
-  // dropped is a row that says nothing.
-  row->note = message;
-  row->tone = message.empty() ? Tone::kNeutral : Tone::kWarn;
+  // The file, and the platform it is going to when there is no file name yet --
+  // `Enqueue` records a rom id and nothing else, and the worker fills the rest
+  // in (`download.hpp`), so a freshly queued row has an id and a slug.
+  row->label = !fs_name.empty()
+                   ? fs_name
+                   : "Rom " + std::to_string(rom_id) +
+                         (fs_slug.empty() ? std::string() : " on " + fs_slug);
+  row->value = QueueProgressText(state, bytes_done, size_bytes, bytes_per_second);
+  row->note = QueueNoteText(message, attempts);
+  row->tone = row->note.empty() ? Tone::kNeutral : Tone::kWarn;
   row->rom_id = rom_id;
+  row->fs_slug = fs_slug;
   row->platform_id = 0;
   // Read-only in v1: there is no `Dequeue` on this screen, so a queue row is
   // drawn and scrolled past rather than pressed.
@@ -771,11 +846,10 @@ LibraryView LibraryBrowserModel::Render() const {
   view.level = level.kind;
   view.title = level.title.empty() ? std::string(kUnnamed) : level.title;
   view.rows = level.rows;
-  view.busy = level.loading;
   view.can_go_back = stack_.size() > 1;
 
-  const bool has_more_row =
-      level.has_more || level.loading || level.page_error != ipc::Error::kOk;
+  const bool has_more_row = level.has_more || level.loading ||
+                            level.page_error != ipc::Error::kOk || level.truncated;
   if (has_more_row) {
     LibraryRow more;
     more.kind = RowKind::kMore;
@@ -788,6 +862,14 @@ LibraryView LibraryBrowserModel::Render() const {
       more.note = "Press A to try again";
       more.tone = Tone::kWarn;
       more.selectable = true;
+    } else if (level.truncated) {
+      // Cut, not finished. Two different sentences, because a user told a list
+      // ended stops looking for what is not in it (`kMaxLoadedRows`).
+      more.label = "Too many to list here";
+      more.value = std::to_string(level.rows.size()) + " shown";
+      more.note = "Narrowing the library is not in this version";
+      more.tone = Tone::kWarn;
+      more.selectable = false;
     } else {
       more.label = "Loading...";
       more.tone = Tone::kNeutral;
@@ -803,12 +885,28 @@ LibraryView LibraryBrowserModel::Render() const {
                       : std::clamp(level.selected, 0, static_cast<int>(view.rows.size()) - 1);
 
   // The headline. An empty level is a sentence rather than a blank screen, and
-  // a level whose *first* page failed is the one case where the failure is the
-  // whole screen -- there are no loaded rows for it to sit under.
-  if (level.page_error != ipc::Error::kOk && level.cursor == 0) {
+  // a level with **nothing loaded under the failure** is the one case where the
+  // failure is the whole screen. The test is the loaded rows rather than the
+  // cursor: a first `ListNext` that fails on an open cursor has no rows either,
+  // and reading the cursor instead would leave the headline saying "Loading..."
+  // over a row saying it had stopped.
+  if (level.page_error != ipc::Error::kOk && level.rows.empty()) {
     view.headline = "This list could not be loaded";
     view.hint = "Press A to try again";
     view.tone = Tone::kWarn;
+    return view;
+  }
+  if (level.unreadable_items > 0) {
+    // Ahead of the empty-list sentence on purpose: a page whose every item
+    // failed to decode leaves no rows, and "Nothing in the download queue" over
+    // a running download is the worst way to report that the two halves
+    // disagree about a field. It is `kIncompatible`'s diagnosis arriving one
+    // level down, so it reads like it.
+    view.headline = std::to_string(level.unreadable_items) +
+                    (level.unreadable_items == 1 ? " row this overlay cannot read"
+                                                 : " rows this overlay cannot read");
+    view.hint = "Update the overlay: the sysmodule is sending a field it does not know";
+    view.tone = Tone::kBad;
     return view;
   }
   if (level.rows.empty()) {

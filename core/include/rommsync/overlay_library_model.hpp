@@ -138,8 +138,15 @@ struct LibraryRow {
   /// value that went missing.
   std::string value;
 
-  /// Why this row will not download, or what the last press did. Empty exactly
-  /// when `state` is `kReady` or `kInert`.
+  /// The second line: why this row will not download, what the last press did,
+  /// or what a row that is not a rom has to say for itself -- a queue entry's
+  /// message, a failed page's "press A to try again".
+  ///
+  /// It is **not** a proxy for "this cannot be downloaded": a `kInert` queue row
+  /// carries one, and a `kReady` rom carries none. Read `state` for that.
+  /// Non-empty for every `state` that is not `kReady` or `kInert`, which is the
+  /// half of the guarantee that holds: a row that will not download always says
+  /// why.
   std::string note;
 
   Tone tone = Tone::kNeutral;
@@ -181,10 +188,6 @@ struct LibraryView {
 
   /// Into `rows`, and `-1` exactly when `rows` is empty.
   int selected = -1;
-
-  /// A command is in flight or a page is `pending`. The screen draws a quiet
-  /// marker; it does not block, and nothing here ever waits.
-  bool busy = false;
 
   /// `Back()` would move to the level underneath rather than close the screen.
   /// The screen draws the B prompt from it.
@@ -289,7 +292,9 @@ class LibraryBrowserModel {
   /// exception here rather than the rule (#31).
   bool Back();
 
-  /// Open the download queue as a level above this one.
+  /// Open the download queue as a level above this one, unless it is already
+  /// the level on top -- a held button would otherwise push one per frame, and
+  /// each level opens a cursor out of the small number #31 allows.
   void OpenQueue();
 
   /// The screen is going away. Every open cursor is queued for `ListEnd`, so
@@ -333,6 +338,17 @@ class LibraryBrowserModel {
     /// What went wrong with the last page, and nothing about the ones before
     /// it. `kOk` when nothing did.
     ipc::Error page_error = ipc::Error::kOk;
+
+    /// The level stopped at `kMaxLoadedRows` with more still on the server.
+    /// Not the same as reaching the end, and drawn as a different sentence.
+    bool truncated = false;
+
+    /// Items on the pages loaded so far that this build could not read. Kept
+    /// and rendered rather than only dropped: a page whose items all failed to
+    /// decode is otherwise indistinguishable from an empty list, and "Nothing
+    /// in the download queue" over a running download is the worst way to say
+    /// "the two halves disagree about a field".
+    int unreadable_items = 0;
 
     /// Consecutive pages that came back empty with `has_more` still set. A
     /// producer that answered that forever would have the overlay asking
@@ -379,6 +395,12 @@ class LibraryBrowserModel {
   /// What `Next()` last handed out, so `OnRefused` knows what was refused.
   Command::Kind issued_ = Command::Kind::kNone;
 
+  /// How deep the stack was when it was handed out. A page is answered into the
+  /// level it was asked for or not at all: `top()` moves under `Back()`,
+  /// `Activate()` and `OpenQueue()`, and a rom page decoded as a platform page
+  /// drops every item and starts a level counting toward `kMaxEmptyPages`.
+  std::size_t issued_depth_ = 0;
+
   /// `Close()` has been called. The browser asks for nothing further -- a
   /// screen on its way out that re-opened the list it was closing would hold a
   /// cursor nobody will ever end.
@@ -397,6 +419,19 @@ class LibraryBrowserModel {
 /// round trip and possibly a fetch from RomM, and a user holding down on the
 /// stick should not stop at the bottom of every page.
 inline constexpr int kPrefetchRows = 8;
+
+/// How many rows one level may hold before it stops asking for more.
+///
+/// The one structure here that would otherwise grow with the size of the
+/// library, which is the thing `ipc.hpp` bounds everything else against: a
+/// `LibraryRow` is four strings, and a user scrolling a ten-thousand-rom
+/// platform would accumulate one per rom on an overlay's heap. Eight full pages
+/// is more than a person scrolls past looking for a game, and the row at the
+/// end says the list was cut rather than pretending it ended.
+///
+/// Narrowing the list instead of scrolling it is `ListRequest::search`, which
+/// no screen sends yet -- there is no keyboard in v1 (#25). Recorded there.
+inline constexpr int kMaxLoadedRows = 8 * ipc::kMaxPageSize;
 
 /// How many consecutive empty pages with `has_more` still set are tolerated
 /// before the list is treated as ended.
@@ -417,14 +452,26 @@ std::string EnqueueRefusalText(ipc::Error error);
 /// What a refused `Enqueue` leaves the row in.
 RowState EnqueueRefusalState(ipc::Error error);
 
-/// The state a rom row is in before anything is pressed, from its projection
-/// and its platform's `mapped`.
+/// Everything about a rom that decides whether pressing A would achieve
+/// anything.
+///
+/// A struct rather than four `bool` parameters: four same-typed arguments at a
+/// call site are transposable and nothing catches it, and a designated
+/// initialiser reads as the sentence the projection already is.
+struct RomFacts {
+  /// Its platform has a folder in `config.ini`, as the *sysmodule* reads it.
+  bool platform_mapped = true;
+  bool has_multiple_files = false;
+  bool on_disk = false;
+  bool queued = false;
+};
+
+/// The state a rom row is in before anything is pressed.
 ///
 /// The order is a skip reason first, then where the rom already is: a disc set
 /// and an unmapped platform are the reasons it will *never* arrive, which is
 /// what a user needs before "it is already queued".
-RowState PredictEnqueue(bool platform_mapped, bool has_multiple_files, bool on_disk,
-                        bool queued);
+RowState PredictEnqueue(const RomFacts& facts);
 
 /// The sentence for a `RowState` that is not `kReady`, and its tone. Empty for
 /// `kReady` and `kInert`, which have nothing to explain.

@@ -76,6 +76,15 @@ class LibraryScreen : public tsl::Gui {
   /// tell those apart.
   void Send(const LibraryBrowserModel::Command& command);
 
+  /// How many prompt rows this view will draw.
+  ///
+  /// Read before the list is drawn so the space can be held back for them: a
+  /// list is longer than the panel in the ordinary case, and prompts drawn
+  /// after it would only ever appear on a list short enough not to need
+  /// scrolling. One function so the reservation and the drawing cannot
+  /// disagree about how many there are.
+  s32 PromptRows() const;
+
   /// Draw `view_` into the bounds `CustomDrawer` hands us.
   void Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width, s32 height) const;
 
