@@ -315,6 +315,28 @@ except Exception:
 # `--run-hooks` is not optional: without it orca.yaml's archive hook never runs,
 # and the worktree's RomM stack survives under `restart: unless-stopped`, holding
 # two ports forever with nothing left on disk to identify it by.
+# Remove a worktree, judged by whether it is GONE rather than by an exit code.
+#
+# #27 logged "could not remove it" at 02:08 and kept the slot; the very same
+# command, run again by hand, removed it and printed
+# `warning: local branch "..." was kept because Git could not safely delete it`.
+# A non-zero exit here has meant both "nothing happened" and "it worked, with a
+# caveat", and the fleet cannot tell those apart from the code alone. The
+# filesystem can: the directory is there or it is not.
+#
+# This matters more than one stuck worktree. The fleet runs at a cap of three,
+# and a slot held by a worktree whose work is already merged is a slot that never
+# starts the next issue -- the loop quietly runs at two, then one.
+remove_worktree() {
+  local path="$1" attempt
+  for attempt in 1 2; do
+    orca_run_with_deadline 180 /dev/null "$ORCA_CLI" worktree rm \
+      --worktree "path:$path" --run-hooks --json >/dev/null 2>&1
+    [ -d "$path" ] || return 0
+  done
+  return 1
+}
+
 reap_merged() {
   local f num path branch merged unpushed
   for f in "$OWNED_DIR"/*; do
@@ -335,8 +357,7 @@ reap_merged() {
 
     say "#$num: PR #$merged is merged; marking it done and removing the worktree"
     card "$path" --workspace-status completed --comment "#$num: merged in PR #$merged"
-    orca_run_with_deadline 180 /dev/null "$ORCA_CLI" worktree rm \
-      --worktree "path:$path" --run-hooks --json >/dev/null 2>&1 \
+    remove_worktree "$path" \
       || say "  could not remove it; sweep later with ./scripts/orca/reap.sh --yes"
     disown_issue "$num"
   done

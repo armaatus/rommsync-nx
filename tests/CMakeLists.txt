@@ -879,7 +879,8 @@ foreach(phase opens reuses foreign no_romm submits no_draft unstable
               fleet_notices_a_stalled_agent
               open_threads_hides_resolved brief_never_lists_threads_over_rest
               brief_queues_the_merge_at_step_four
-              await_costs_nothing_while_the_review_is_healthy)
+              await_costs_nothing_while_the_review_is_healthy
+              reap_judges_removal_by_the_directory)
   add_test(NAME orca.browser_${phase}
            COMMAND "${BASH_PROGRAM}" "${ORCA_BROWSER_TEST}" ${phase})
   set_tests_properties(orca.browser_${phase} PROPERTIES TIMEOUT 60)

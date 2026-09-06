@@ -805,6 +805,58 @@ GHSTUB
     echo "PASS: no run-list calls while the review check is healthy"
     ;;
 
+  reap_judges_removal_by_the_directory)
+    # #27's worktree removal exited non-zero and the fleet logged "could not
+    # remove it" -- while the same command by hand removed it, warning only that
+    # git would not delete the branch. The slot stayed held, and the fleet ran at
+    # two worktrees instead of three. Removal is judged by whether the directory
+    # is gone, and retried once before it is given up on.
+    make_fixture
+    cp "$REPO_ROOT"/scripts/orca/{fleet.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    stub="$TMPDIR_FIXTURE/stub-bin"; mkdir -p "$stub"
+    target="$TMPDIR_FIXTURE/wt-27"; mkdir -p "$target"
+    # Removes the worktree and THEN exits non-zero, exactly as the real one did.
+    cat >"$stub/orca" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$TMPDIR_FIXTURE/orca-calls.log"
+case "\$1" in
+  --version) exit 0 ;;
+  worktree)  rm -rf "$target"; echo 'warning: local branch was kept' >&2; exit 1 ;;
+  *)         printf '{"ok":true}\n' ;;
+esac
+STUB
+    chmod +x "$stub/orca"
+    : >"$TMPDIR_FIXTURE/orca-calls.log"
+    run_remove() {
+      PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$TMPDIR_FIXTURE/fleet" \
+      bash -c '. '"$TMPDIR_FIXTURE"'/scripts/orca/lib.sh
+               orca_cli_resolve
+               '"$(sed -n '/^remove_worktree()/,/^}/p' "$TMPDIR_FIXTURE/scripts/orca/fleet.sh")"'
+               remove_worktree "'"$1"'"'
+    }
+    run_remove "$target"; rc=$?
+    [ "$rc" = 0 ] \
+      || fail "reported failure for a worktree that IS gone (exit $rc) -- that is the bug that held #27's slot"
+    [ "$(grep -c 'worktree rm' "$TMPDIR_FIXTURE/orca-calls.log")" = 1 ] \
+      || fail "retried a removal that had already succeeded"
+
+    # And a removal that genuinely does nothing must still fail -- after a retry.
+    stuck="$TMPDIR_FIXTURE/wt-stuck"; mkdir -p "$stuck"
+    cat >"$stub/orca" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+  --version) exit 0 ;;
+  *)         exit 1 ;;
+esac
+STUB
+    chmod +x "$stub/orca"
+    run_remove "$stuck"; rc=$?
+    [ "$rc" != 0 ] \
+      || fail "claimed success while the worktree is still on disk"
+    [ -d "$stuck" ] || fail "fixture removed itself; the test proves nothing"
+    echo "PASS: removal is judged by the directory, retried once, and still fails honestly"
+    ;;
+
   *)
     echo "usage: $0 opens|reuses|foreign|no_romm|submits|no_draft|unstable" >&2
     echo "       watch_needs_issue|watch_late_draft|watch_grace|watch_submits|watch_single" >&2
@@ -814,6 +866,7 @@ GHSTUB
     echo "       open_threads_hides_resolved|brief_never_lists_threads_over_rest" >&2
     echo "       brief_queues_the_merge_at_step_four" >&2
     echo "       await_costs_nothing_while_the_review_is_healthy" >&2
+    echo "       reap_judges_removal_by_the_directory" >&2
     exit 2
     ;;
 esac
