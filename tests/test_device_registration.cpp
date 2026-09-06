@@ -419,7 +419,7 @@ int Revoked(http::HttpClient& client, const std::string& base) {
 ///
 /// The finding M2-4 handed to M1-4 (#8): RomM approves what the *user* ticked,
 /// which need not be what was requested, so a 403 is a scope missing from a
-/// pairing that is otherwise working (docs/AUTH.md#scopes-to-request). A user
+/// pairing that is otherwise working (docs/AUTH.md#scopes). A user
 /// told their token was revoked goes looking for something that did not happen,
 /// and a client that discarded `token.dat` over it would re-pair straight back
 /// into the same partial grant.

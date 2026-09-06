@@ -110,10 +110,13 @@ class SdEngine : public ipc::Engine {
   /// a moment where the card says the pairing is fine and the credentials are
   /// gone, and a console that stopped there would report itself paired and 401
   /// on every tick. A token that could not be discarded is `kWriteFailed` with
-  /// nothing changed; a verdict that could not be cleared is `kWriteFailed` with
-  /// the console reported as never paired, which is what actually happened -- the
-  /// credentials really are gone, and the sentence the overlay draws has to be
-  /// able to say so.
+  /// nothing changed. A verdict that could not be *cleared* is `kWriteFailed`
+  /// with the console reported as never paired and the gate reset anyway, which
+  /// is what actually happened: the credentials are gone, so the verdict is
+  /// about a token that no longer exists and leaving it standing would have a
+  /// worker refuse to call on a console the user has just re-paired. What the
+  /// failure costs is the file surviving to the next boot, where `Load` already
+  /// refuses to honour a verdict with no token to be about.
   ipc::Error Unpair() override;
   /// M3-2 (#19). Both are real: the queue is on the card and neither touches
   /// the network, which is `ipc.hpp`'s rule for every command.

@@ -547,7 +547,7 @@ enum class DrainOutcome {
   /// and the drain already wrote two different sentences for the two statuses
   /// before it had two outcomes to put them behind. Both end the drain and both
   /// are fixed by pairing again; only one of them means the pairing is gone
-  /// (docs/AUTH.md#scopes-to-request).
+  /// (docs/AUTH.md#scopes).
   kForbidden,
 
   kStoreFailed,   ///< the queue could not be written; see `store` for which bound

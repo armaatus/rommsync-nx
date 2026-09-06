@@ -127,7 +127,7 @@ std::optional<std::pair<OperationError, std::string>> Refused(const http::Result
   }
   if (status == 403) {
     // The same stop, a different sentence: a scope this pairing was not granted
-    // rather than a pairing that is gone (docs/AUTH.md#scopes-to-request).
+    // rather than a pairing that is gone (docs/AUTH.md#scopes).
     return std::make_pair(OperationError::kForbidden,
                           std::string(what) +
                               " was rejected: HTTP 403; this pairing was not granted the scopes "
@@ -480,6 +480,20 @@ ServerSave DescribeServerSave(http::HttpClient& client, const auth::StoredToken&
                                                       std::to_string(save_id)),
                          token, options.timeout, options.cancel));
   if (!result.successful()) {
+    // A refusal of the *credentials* is named as one. This call cannot fail the
+    // operation -- it only supplies the expected size, and a download with no
+    // expected size is still a download -- so the 401 that follows on the
+    // content request is what actually stops the plan, one request later. What
+    // must not happen in between is a warning saying the save row "could not be
+    // read", which sends whoever reads the log looking at RomM's database
+    // instead of at the pairing.
+    const auth::Answer answer = auth::AnswerOf(result);
+    if (answer == auth::Answer::kRejected || answer == auth::Answer::kForbidden) {
+      warnings->push_back(std::string(where) + ": the server refused the save row with HTTP " +
+                          std::to_string(result.response.status) +
+                          "; this is the pairing, not the save");
+      return described;
+    }
     warnings->push_back(std::string(where) +
                         ": the server's save row could not be read, so the download has no "
                         "expected size to catch a short body with");
@@ -658,8 +672,23 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
     // arbitration is concerned this device still has not seen the save, and a
     // baseline advanced for it (M2-6) would record a sync that the server has
     // no record of.
-    OperationResult failed = Fail(operation, OperationError::kUnconfirmed,
-                                  refused->second + "; the save itself is correct on the card");
+    //
+    // **A 401 or a 403 keeps its own name rather than becoming `kUnconfirmed`.**
+    // This is the one call site that used to flatten every refusal into one
+    // error, and flattening these two would hide them from everything M1-4
+    // added: `ExecutePlan` would not stop, `ExecutionReport::unauthorized` would
+    // stay false, and `AnswerOf` would report silence. The scenario is real --
+    // a pairing granted the read scopes and not the write one this endpoint
+    // needs 403s here on *every* download, having successfully written each save
+    // first -- and it is exactly the case whose remedy is a sentence naming the
+    // missing scope. `message` still says the save is correct on the card,
+    // which is the part a user has to hear either way.
+    const OperationError error = refused->first == OperationError::kUnauthorized ||
+                                         refused->first == OperationError::kForbidden
+                                     ? refused->first
+                                     : OperationError::kUnconfirmed;
+    OperationResult failed =
+        Fail(operation, error, refused->second + "; the save itself is correct on the card");
     failed.sd_path = target->sd_path;
     failed.backup_sd_path = result.backup_sd_path;
     failed.save_id = save_id;

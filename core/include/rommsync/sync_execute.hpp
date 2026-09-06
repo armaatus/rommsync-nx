@@ -207,7 +207,7 @@ enum class OperationError {
   ///
   /// The same stop, and deliberately not the same sentence: RomM approves what
   /// the *user* ticked, so this is a missing scope rather than a revocation
-  /// (docs/AUTH.md#scopes-to-request).
+  /// (docs/AUTH.md#scopes).
   kForbidden,
 
   /// The downloaded bytes are not the save the plan described. They were

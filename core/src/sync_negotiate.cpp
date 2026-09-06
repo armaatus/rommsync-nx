@@ -192,7 +192,7 @@ std::optional<Negotiation> Refused(const http::Result& result) {
     // ticked, which need not be what was requested, so a 403 is a scope missing
     // from a pairing that is otherwise working -- and the client is meant to
     // have read `scopes` back off the token rather than meet it here
-    // (docs/AUTH.md#scopes-to-request). Reporting it as a revocation sends the
+    // (docs/AUTH.md#scopes). Reporting it as a revocation sends the
     // user looking for something that did not happen.
     return Refuse(NegotiateError::kForbidden,
                   "the negotiation was rejected: HTTP 403; this pairing was not granted the "

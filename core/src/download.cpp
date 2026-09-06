@@ -1011,7 +1011,7 @@ Verdict Judge(const http::Result& result, Reason* why) {
     // The same stop, a different sentence and a different outcome: RomM approves
     // what the user ticked, so this is a scope missing from a pairing that
     // otherwise works and not a token that was revoked
-    // (docs/AUTH.md#scopes-to-request).
+    // (docs/AUTH.md#scopes).
     say("this console's token was not granted what a download needs");
     return Verdict::kForbidden;
   }

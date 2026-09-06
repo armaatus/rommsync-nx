@@ -421,9 +421,14 @@ never reached the disk.
 what the client requests, and it is exactly the unconditional list in
 [API_CONTRACT.md](API_CONTRACT.md#scopes-to-request) — pinned to that document by
 the `auth.scopes` test, so the two cannot drift. Every `.write` in it is one the
-client performs; `me.write` is documented for recording play sessions, which
-this client does not do, so it is not requested. RomM may approve a subset, which
-is why the granted set is read back off the token response rather than assumed.
+client performs; don't request a `*.write` you don't use. `me.write` is
+documented for recording play sessions, which this client does not do, so it is
+not requested — add it if and when M7-4 (#39) lands.
+
+**RomM may approve a subset**, which is why the granted set is read back off the
+token response rather than assumed, and why a `403` is a missing scope rather
+than a revoked token ([Re-pairing / revocation](#re-pairing--revocation)). This
+section is what every `docs/AUTH.md#scopes` in the code points at.
 
 ## Token storage
 
@@ -558,9 +563,3 @@ and #37 adds the two lines on the other side — `SaveBlock` when
 same moment so the overlay sees it without waiting for a reboot. Until then a
 console reaches the unauthenticated state within one boot's rejection budget and
 does not remember it across a reboot.
-
-## Scopes
-
-Request the minimum (see [API_CONTRACT.md](API_CONTRACT.md#scopes-to-request)).
-Don't request `*.write` you don't use; add `me.write` only if/when play-session
-recording lands.

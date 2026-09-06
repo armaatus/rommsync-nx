@@ -303,6 +303,10 @@ void States(checks::Checks& c) {
       {auth::RegistrationError::kNone, "none", false, false},
       {auth::RegistrationError::kNotRegistered, "not_registered", false, true},
       {auth::RegistrationError::kUnauthorized, "unauthorized", false, true},
+      // M1-4 (#8) split this off the 401. It is re-pairable and not retryable
+      // for the same reasons, and it is in this table so that folding it back
+      // into `kUnauthorized`, or slipping it into `ShouldRetry`, goes red here.
+      {auth::RegistrationError::kForbidden, "forbidden", false, true},
       {auth::RegistrationError::kNoSuchDevice, "no_such_device", false, true},
       {auth::RegistrationError::kAmbiguous, "ambiguous", false, false},
       {auth::RegistrationError::kSyncDisabled, "sync_disabled", false, false},

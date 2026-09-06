@@ -80,7 +80,7 @@ std::optional<Registration> Refused(const http::Result& result, std::string_view
     // RomM approves what the *user* ticked, which need not be what was
     // requested, so a 403 is a scope missing from a pairing that is otherwise
     // working, and the client is meant to have read `scopes` back off the token
-    // rather than meet it here (docs/AUTH.md#scopes-to-request). Reporting it as
+    // rather than meet it here (docs/AUTH.md#scopes). Reporting it as
     // a revocation sends the user looking for something that did not happen.
     return Fail(RegistrationError::kForbidden,
                 std::string(what) + " was rejected: HTTP 403; this pairing was not granted the "

@@ -114,7 +114,7 @@ enum class RegistrationError {
   /// Kept apart from a revocation, which is the same split `sync::NegotiateError`
   /// makes and for the same reason: RomM approves what the *user* ticked, which
   /// need not be what was requested, so a 403 is a scope missing from an
-  /// otherwise working pairing (docs/AUTH.md#scopes-to-request). Telling that
+  /// otherwise working pairing (docs/AUTH.md#scopes). Telling that
   /// user their token was revoked sends them looking for something that did not
   /// happen, and a client that discarded `token.dat` over it would re-pair
   /// straight back into the same partial grant.

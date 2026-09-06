@@ -291,13 +291,17 @@ ipc::Error SdEngine::Unpair() {
   // freshly re-paired console on the re-pair screen, so this failing is a
   // refusal rather than something to shrug at -- and the token really is gone,
   // which the message the overlay draws has to be able to say.
-  if (!auth::ClearBlock(PathTo(auth::kAuthStateFileName))) {
-    auth_ = ipc::AuthState::kNeverPaired;
-    return ipc::Error::kWriteFailed;
-  }
+  const bool cleared = auth::ClearBlock(PathTo(auth::kAuthStateFileName));
+  // The gate is reset either way, and that is the point: it is a verdict about
+  // a token that no longer exists, so leaving it standing would have a worker
+  // (M7-2, #37) refuse to call on a console the user has just re-paired, with no
+  // way out short of a reboot. What a failed clear costs is the *next boot*
+  // reading the file back and reporting `kUnauthenticated` over a pairing that
+  // is gone -- which `Load` already refuses to do, because there is no token for
+  // the verdict to be about.
   gate_.Reset();
   auth_ = ipc::AuthState::kNeverPaired;
-  return ipc::Error::kOk;
+  return cleared ? ipc::Error::kOk : ipc::Error::kWriteFailed;
 }
 
 ipc::Error SdEngine::Enqueue(std::int64_t rom_id, std::int32_t* position) {

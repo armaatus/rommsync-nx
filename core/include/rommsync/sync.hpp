@@ -448,7 +448,7 @@ enum class NegotiateError {
   /// Not a revocation, and kept apart from one for that reason: RomM approves
   /// what the *user* ticked, which need not be what was requested, so a 403 here
   /// is a scope missing from an otherwise working pairing
-  /// (docs/AUTH.md#scopes-to-request). Telling that user their token was revoked
+  /// (docs/AUTH.md#scopes). Telling that user their token was revoked
   /// sends them looking for something that did not happen.
   kForbidden,
   kNoSuchDevice,     ///< 404 -- the device was deleted in RomM's web UI

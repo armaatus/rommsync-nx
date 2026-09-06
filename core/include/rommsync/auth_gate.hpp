@@ -19,7 +19,7 @@
 //
 // **A 403 is not a revocation.** RomM approves what the *user* ticked, which
 // need not be what was requested, so a 403 is a scope missing from a pairing
-// that is otherwise working (docs/AUTH.md#scopes-to-request). Both send the user
+// that is otherwise working (docs/AUTH.md#scopes). Both send the user
 // back to the pairing flow and neither is retryable, but the sentences differ --
 // "your pairing is gone" and "pair again and approve the scopes sync needs" --
 // and only the first is true of a 401.

@@ -675,7 +675,7 @@ int Refused(http::HttpClient& client, const std::string& base, const Fixture& fi
       // Not a revocation, and not reported as one: RomM approves what the user
       // ticked, so this is a scope missing from a pairing that otherwise works.
       // Telling that user their token was revoked sends them looking for
-      // something that did not happen (docs/AUTH.md#scopes-to-request).
+      // something that did not happen (docs/AUTH.md#scopes).
       {"a scope the user did not approve", 403, "Not enough permissions",
        sync::NegotiateError::kForbidden, false, true},
       // FastAPI's own 404, which is what a `server_url` pointing at something
