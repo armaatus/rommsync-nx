@@ -364,7 +364,13 @@ StatusView RenderUnreachable(Link link, std::uint32_t sysmodule_interface) {
       break;
     case Link::kNotRunning:
       view.headline = "sys-rommsync is not running";
-      view.hint = "Enable it in the sysmodule list and reboot";
+      // No "and reboot": `toolbox.json` declares `requires_reboot: false`, so
+      // that overlay's own button starts the process where it stands (M6-2,
+      // #33, docs/INSTALL.md step 2). This is the answer with no card behind it
+      // -- the overload below says which of the four states it is -- and it is
+      // also `StatusScreen`'s initial `view_`, so it is what the first frame
+      // draws before the first poll returns.
+      view.hint = "Turn it on in ovl-sysmodules";
       break;
     case Link::kUnreadable:
       view.headline = "sysmodule unreachable";
@@ -405,6 +411,18 @@ StatusView RenderUnreachable(Link link, const CardState& card,
   }
 
   Add(&view.lines, "Installed", "Yes", Tone::kGood);
+  if (!card.listable) {
+    // `exefs.nsp` is there and `toolbox.json` is not, which is what an upgrade
+    // from a release before that file shipped leaves, and what a half-landed
+    // unzip leaves. Atmosphère would load this sysmodule; ovl-sysmodules will
+    // not list it, and says nothing about why. "Turn it on in ovl-sysmodules"
+    // would send the user to a screen it is missing from -- the same
+    // misdirection as telling a user with nothing installed to use the
+    // sysmodule list.
+    Add(&view.lines, "Listed by ovl-sysmodules", "No", Tone::kBad);
+    view.hint = "Unpack the release zip again: toolbox.json is missing beside exefs.nsp";
+    return view;
+  }
   Add(&view.lines, "Start at boot", card.set_to_boot ? "On" : "Off",
       card.set_to_boot ? Tone::kGood : Tone::kWarn);
   if (card.set_to_boot) {

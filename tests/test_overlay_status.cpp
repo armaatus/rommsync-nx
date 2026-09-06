@@ -366,6 +366,9 @@ void CheckUnreachable(Checks& checks) {
   checks.ExpectEq(missing.headline, std::string("sys-rommsync is not running"),
                   "and it is what a user who forgot to enable it sees");
   checks.Expect(!missing.hint.empty(), "with something to do about it");
+  checks.Expect(missing.hint.find("reboot") == std::string::npos,
+                "and it does not say 'reboot': toolbox.json declares requires_reboot false, so "
+                "ovl-sysmodules starts the process where it stands (#33)");
   checks.Expect(missing.lines.empty(),
                 "no rows: every one would be a number this overlay does not have");
   checks.Expect(missing.progress.kind == overlay::Progress::Kind::kNone, "and no bar");
@@ -425,9 +428,31 @@ void CheckFourStates(Checks& checks) {
                 "and the remedy is the zip, not the sysmodule list");
   checks.Expect(HasLabel(not_installed, "Installed"), "with the fact it read off the card");
 
+  // `exefs.nsp` there and `toolbox.json` not: what an upgrade from a release
+  // before that file shipped leaves, and what a half-landed unzip leaves.
+  // Atmosphere would load this sysmodule and ovl-sysmodules will not list it,
+  // so "turn it on in ovl-sysmodules" is the same misdirection as telling a
+  // user with nothing installed to use the sysmodule list.
+  overlay::CardState unlisted;
+  unlisted.installed = true;
+  unlisted.listable = false;
+  unlisted.set_to_boot = false;
+  const overlay::StatusView invisible =
+      overlay::RenderUnreachable(overlay::Link::kNotRunning, unlisted);
+  ExpectNothingBlank(checks, invisible, "installed but not listable");
+  checks.Expect(HasLabel(invisible, "Listed by ovl-sysmodules"),
+                "the file ovl-sysmodules actually reads is its own row");
+  checks.Expect(invisible.hint.find("toolbox.json") != std::string::npos,
+                "and the remedy names the file that is missing");
+  checks.Expect(invisible.hint.find("ovl-sysmodules") == std::string::npos,
+                "rather than sending the user to a list this sysmodule is not in");
+  checks.Expect(!HasLabel(invisible, "Start at boot"),
+                "the boot toggle is not offered: there is no row to press it on");
+
   // Installed, and the boot toggle off. This is the row that catches people.
   overlay::CardState off;
   off.installed = true;
+  off.listable = true;
   off.set_to_boot = false;
   off.config_read = true;
   off.sync_enabled = true;
@@ -448,6 +473,7 @@ void CheckFourStates(Checks& checks) {
   // the hint has to be about starting it rather than about enabling it again.
   overlay::CardState flagged;
   flagged.installed = true;
+  flagged.listable = true;
   flagged.set_to_boot = true;
   const overlay::StatusView silent =
       overlay::RenderUnreachable(overlay::Link::kNotRunning, flagged);

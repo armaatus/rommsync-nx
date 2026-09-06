@@ -49,12 +49,17 @@ two switches, is
 [../docs/DEVELOPMENT.md](../docs/DEVELOPMENT.md#the-two-switches) and — for the
 person holding the console — [../docs/INSTALL.md](../docs/INSTALL.md) step 2.
 
-With `[sync] enabled = false` the process is resident, IPC answers, and nothing
-syncs: `sync::RunTick` returns `TickOutcome::kDisabled` before it opens a file or
+With `[sync] enabled = false` the process is resident, IPC answers, and no sync
+runs: `sync::RunTick` returns `TickOutcome::kDisabled` before it opens a file or
 sends a request, and `ServiceCore::SyncNow` answers `SyncOutcome::kDisabled`
 rather than starting one — a user who pressed "Sync now" with the switch off is
 told which switch to flip, not shown a spinner. `SetEnabled(true)` lifts it in
 the running process; nothing here needs a reboot.
+
+`[downloads] enabled` is a separate key and stays where the user left it: a
+console with save sync switched off still drains its download queue
+([../docs/CONFIG.md](../docs/CONFIG.md), `download.disabled`). "Nothing runs"
+is a console with both off.
 
 ## Responsibilities
 

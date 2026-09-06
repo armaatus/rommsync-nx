@@ -184,8 +184,12 @@ enum class TickOutcome {
   /// to keep against `pmshellTerminateProgram` and a relaunch, and a promise
   /// that lives only in a scheduler is one that cannot be tested before that
   /// scheduler exists -- nor kept by a second caller that forgets to ask.
-  /// `download::DrainOutcome::kDisabled` is the same gate on the same switch's
-  /// other half, and it reads the configuration the same way.
+  /// `download::DrainOutcome::kDisabled` is the same shape on the *other*
+  /// switch: `[downloads] enabled`, which is an independent key
+  /// (docs/CONFIG.md) and not this one's other half. A console with
+  /// `[sync] enabled = false` and `[downloads]` untouched still drains its
+  /// download queue, deliberately -- a user who switched save sync off did not
+  /// ask for the rom they queued to stop arriving.
   kDisabled,
 
   /// The sweep put a save back that the scan could not have seen, so this tick's
@@ -217,8 +221,8 @@ const char* ToString(TickOutcome outcome);
 struct TickOptions {
   /// `config::SyncConfig::enabled`, and the whole of what a false one costs:
   /// the tick returns `TickOutcome::kDisabled` before it sweeps, before it
-  /// reads and before it sends -- `download::Drain`'s treatment of
-  /// `[downloads] enabled`, on the switch's other half.
+  /// reads and before it sends -- the treatment `download::Drain` gives its own
+  /// switch, `[downloads] enabled`.
   ///
   /// It defaults to *true* because a caller that has no configuration to
   /// consult -- every unit test of one stage -- is not a console with the

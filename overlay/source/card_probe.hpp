@@ -9,7 +9,7 @@
 //
 // The decision about those facts is `overlay::RenderUnreachable(link, card)` in
 // `core/`, where `ctest -R overlay.status` reaches it. This file is only the
-// three peeks: `core/` may name neither an `sdmc:` path nor a title id (hard
+// peeks: `core/` may name neither an `sdmc:` path nor a title id (hard
 // rule 4), and the platform side is where both live.
 //
 // **Read-only, all of it.** The sysmodule owns every write to `config.ini`, and

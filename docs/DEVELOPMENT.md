@@ -122,9 +122,13 @@ console rather than loudly here:
   whose copy will not parse, and saying nothing about it. Without it the
   sysmodule installs, boots when flagged, and is absent from the one screen the
   install guide sends a user to. See [The two switches](#the-two-switches).
-- **`<TID>` comes out of `sysmodule/sys-rommsync.json`**, never typed. The id is
-  still unconfirmed against the installed homebrew set (`sysmodule/README.md`),
-  so it will move, and a second copy of it is how a move lands in one place only.
+- **`<TID>` comes out of `sysmodule/sys-rommsync.json`**, never typed — with one
+  exception, `kProgramIdHex` in `overlay/source/card_probe.hpp`. The overlay
+  builds a path out of it at runtime and cannot read the NPDM config to get it,
+  so that literal is pinned against `sys-rommsync.json` by
+  `tests/test_package.sh layout` instead. The id is still unconfirmed against the
+  installed homebrew set (`sysmodule/README.md`), so it will move, and every
+  other copy of it is how a move lands in one place only.
 - **No `flags/boot2.flag`, and no `config.ini`.** The sysmodule ships disabled
   (#33), and an upgrade is this same zip unpacked over the top — replacing a
   user's settings is not something a release may do. `token.dat`, `device.dat`,
@@ -181,10 +185,30 @@ So the process is written to be killed. Nothing may live only in RAM:
 - **Relaunch is terminate-then-launch with no gap.** No lock file, no pidfile,
   and no state a fresh process would read as "another instance is running".
 
-`ctest -R toggle` is that list, checked. `sync::TickOptions::enabled` and
-`download::Drain`'s `[downloads] enabled` are the switch's other half: with
-either off, the engine sends nothing at all — asserted by counting the requests
-that reach the fixture, not by reading the code.
+`ctest -R toggle` is the first three of those, checked, plus the relaunch
+itself. The fourth is not a `toggle.*` test and does not need to be:
+`harness::Sandbox` audits every seeded save on teardown, in every scenario that
+uses one, so a save overwritten without its previous bytes under `.backup/` is
+red whether or not the test thought to look.
+
+The enable switch itself is `sync::TickOptions::enabled`: with it off,
+`sync::RunTick` returns `TickOutcome::kDisabled` before it sweeps, opens a file
+or sends — asserted by counting the requests that reach the fixture, not by
+reading the code (`toggle.disabled`).
+
+**It is not the only `enabled` in `config.ini`, and it does not stand for the
+other.** `[downloads] enabled` is an independent key (docs/CONFIG.md) with the
+same shape in `download::Drain` (`download.disabled`). A console with
+`[sync] enabled = false` still drains its download queue over HTTP, deliberately:
+a user who switched save sync off did not ask for the rom they queued to stop
+arriving. So "the sysmodule sends nothing" is true of a console with *both* off,
+and what the overlay's enable switch alone promises is that no sync tick runs.
+
+Nothing in the shipped build calls `RunTick` yet — the scheduler is M7-2 (#37) —
+so today that gate is proven at the seam rather than end to end. #37 sets it
+from `config.sync.enabled` and parks the timer as well; a scheduler that woke up
+every interval only to be refused would still be spending the wakeups this
+project's idle-cost requirement is about.
 
 ### The four states the overlay draws
 
@@ -199,9 +223,17 @@ remedies, so the status screen draws four:
 | Running, sync enabled | on | on | the live status |
 
 The first two are reached only when IPC connect fails, and only the card can
-tell them apart. `overlay::CardState` is what the overlay fills in from the card
-— `exefs.nsp`, `flags/boot2.flag`, and `config.ini` **read-only**, because the
-sysmodule owns every write to it — and `overlay::RenderUnreachable(link, card)`
+tell them apart. There is a third thing the card can say that is not a state of
+the two switches at all: `exefs.nsp` present and `toolbox.json` **absent**, which
+is what an upgrade from a release before that file shipped leaves, and what a
+half-landed unzip leaves. Atmosphère would load that sysmodule; ovl-sysmodules
+will not list it. The screen says so and names the missing file, because "turn it
+on in ovl-sysmodules" is the same misdirection as telling a user with nothing
+installed to use the sysmodule list.
+
+`overlay::CardState` is what the overlay fills in from the card
+— `exefs.nsp`, `toolbox.json`, `flags/boot2.flag`, and `config.ini`
+**read-only**, because the sysmodule owns every write to it — and `overlay::RenderUnreachable(link, card)`
 is the decision made about it, in `core/` where `ctest -R overlay.status` can
 reach it.
 

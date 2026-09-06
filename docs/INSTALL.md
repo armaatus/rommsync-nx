@@ -69,7 +69,9 @@ switch/.overlays/ovl-rommsync.ovl
   reads. Atmosphère ignores it entirely; that overlay builds its list from it,
   and a title id folder without one is a sysmodule that is simply not in the
   list — with nothing on the console saying why. If step 2 cannot find
-  `sys-rommsync`, this is the file to check.
+  `sys-rommsync`, this is the file to check — and ovl-rommsync's own status
+  screen says so when it sees exactly that:
+  **"Unpack the release zip again: toolbox.json is missing beside exefs.nsp"**.
 - `switch/.overlays/ovl-rommsync.ovl` is the overlay. It only appears in the
   menu from that folder.
 - `config/rommsync/config.ini.example` is a starting configuration. It is an

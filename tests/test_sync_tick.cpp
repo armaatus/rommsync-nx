@@ -1317,7 +1317,7 @@ int main(int argc, char** argv) {
   // returned its own count would copy the number out before the audit ran.
   rig::Checks checks;
 
-  // The five that need no server, so they stay checked with docker stopped.
+  // The seven that need no server, so they stay checked with docker stopped.
   if (scenario == "recovery" || scenario == "durable" || scenario == "backupdir" ||
       scenario == "offline" || scenario == "rescan" || scenario == "canceled" ||
       scenario == "disabled") {

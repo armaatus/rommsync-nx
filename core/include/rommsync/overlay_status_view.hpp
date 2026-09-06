@@ -153,6 +153,21 @@ struct CardState {
   /// this screen would tell a user that the zip never landed.
   bool installed = false;
 
+  /// `atmosphere/contents/<TID>/toolbox.json` is on the card, so ovl-sysmodules
+  /// has a row to draw for this sysmodule.
+  ///
+  /// A separate question from `installed`, and the one that catches a half
+  /// landed unzip and an upgrade from a release before that file shipped:
+  /// Atmosphère loads `exefs.nsp` and ignores this, ovl-sysmodules reads this
+  /// and ignores `exefs.nsp`. Installed without it, the boot toggle the hint
+  /// would send a user to is on a screen the module is not on.
+  ///
+  /// Not checked for *validity* -- a `toolbox.json` that is there and will not
+  /// parse is skipped by that overlay just as a missing one is, and an overlay
+  /// that parsed it to say so would be reimplementing the thing it is
+  /// describing. Presence is what turns the common failure into a sentence.
+  bool listable = false;
+
   /// `atmosphere/contents/<TID>/flags/boot2.flag` is on the card, so
   /// Atmosphère launches the sysmodule at boot. Written by ovl-sysmodules and
   /// by nothing here.
