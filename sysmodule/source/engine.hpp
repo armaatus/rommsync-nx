@@ -7,8 +7,9 @@
 // overlay have a service to talk to in the meantime.
 //
 // **It answers only what this build actually knows.** The console's
-// configuration, whether it has ever paired, and -- since M3-2 (#19) -- its
-// download queue are on the SD card and are read from it; everything else is
+// configuration -- which it now writes as well as reads (M5-3) -- whether it has
+// ever paired, and -- since M3-2 (#19) -- its download queue are on the SD card
+// and are read from it; everything else is
 // `ipc::Error::kUnavailable`, which is a sentence the overlay can draw rather
 // than a plausible refusal that sends a user looking for a full queue or a
 // failing SD card. Each of the issues above replaces its own part of this, and
@@ -37,13 +38,22 @@ inline constexpr const char* kConfigDir = "sdmc:/config/rommsync/";
 
 /// The engine as far as it is built.
 ///
-/// Constructed once at start and read from the IPC thread. Everything but the
-/// queue is immutable after `Load()` -- there is no worker to race with yet --
-/// so this takes no lock of its own. The queue is the one part that changes,
-/// and `download::Queue` carries its own mutex for exactly the reason
-/// `ipc::Engine` states: every method is callable from the IPC thread while the
-/// engine's own threads run. The download worker is not started here yet; when
-/// it is, this is already the object it drains.
+/// Constructed once at start and driven from the IPC thread. Two things change
+/// after `Load()`: the queue, and -- since M5-3 (#30) -- the configuration,
+/// which `ApplyConfigEdit` writes to the card and re-reads. `download::Queue`
+/// carries its own mutex for the reason `ipc::Engine` states; the config swap
+/// does not, and that is a fact about today rather than a decision to keep:
+/// `ServiceServer::Run` is a single `svcReplyAndReceive` loop, so every command
+/// -- the polls and the write alike -- runs on one thread and the swap races
+/// with nothing.
+///
+/// **A mutex is not what makes it safe the day a worker exists.**
+/// `ipc::Engine::config()` hands out a *reference*, so a swap under a lock would
+/// still free a `Config` a caller is holding. The seam to change then is that
+/// signature -- a snapshot, the way `Snapshot()` already answers -- and workers
+/// have to take theirs at a tick boundary, never mid-sync and never
+/// mid-download. The download worker is not started here yet; when it is, this
+/// is already the object it drains.
 class SdEngine : public ipc::Engine {
  public:
   /// Read `config.ini`, look for `token.dat`, and read `queue.json`. Never
@@ -64,6 +74,14 @@ class SdEngine : public ipc::Engine {
   ipc::EngineSnapshot Snapshot() const override;
   auth::PairingStatus pairing_status() const override;
 
+  /// M5-3 (#30). `SetSyncEnabled` is one assignment through `ApplyConfigEdit`,
+  /// so the enable switch (#24) and the settings screen (#26) cannot come to
+  /// different conclusions about what a write means.
+  ///
+  /// The whole file's complaints are **not** what comes back in `diagnostics`:
+  /// those belong to `GetConfig`, which the settings screen already polls, and
+  /// returning both would show every one of them twice. What comes back is what
+  /// this edit had to say.
   ipc::Error SetSyncEnabled(bool enabled) override;
   ipc::Error ApplyConfigEdit(const ipc::ConfigEdit& edit,
                              std::vector<config::Diagnostic>* diagnostics) override;
@@ -132,6 +150,30 @@ class SdEngine : public ipc::Engine {
   /// Write `queue.json`. False when it did not reach the card.
   bool WriteQueue();
 
+  /// The text of `config.ini` as it stands, or a reason there is none to edit.
+  ///
+  /// A *missing* file falls back to `config.ini.old`, which is not an
+  /// optimisation: that is the window `io::WriteAtomically`'s two-rename commit
+  /// opens, and an edit applied during it would rebuild the file from nothing
+  /// and lose every setting the user had. A file that exists and will not read
+  /// is refused instead -- settings that cannot be read cannot be preserved, and
+  /// overwriting them is the one outcome worse than refusing the edit.
+  ///
+  /// True when `*text` is what to edit; false leaves a `Diagnostic` behind.
+  bool ReadConfigText(std::string* text, std::vector<config::Diagnostic>* diagnostics) const;
+
+  /// Take `loaded` as the configuration in force.
+  ///
+  /// The queue's complaints go **in front** of the file's rather than being
+  /// dropped. They are not complaints about `config.ini`, and the section says
+  /// so -- but a queue that vanished with nothing anywhere saying why is the
+  /// failure a diagnostic exists to prevent, and the settings screen (#26) is
+  /// the one place on this console a user can read one. In front because
+  /// `ipc::TrimDiagnostics` keeps the first few and summarises the rest, so a
+  /// `config.ini` with a handful of complaints would otherwise push the one
+  /// saying the whole download queue was discarded into the "N more" line.
+  void AdoptConfig(config::LoadResult loaded);
+
   /// One of this client's files, under the directory `Load` was given.
   std::string PathTo(const char* file_name) const;
 
@@ -143,8 +185,13 @@ class SdEngine : public ipc::Engine {
 
   config::Config config_ = config::Defaults();
 
-  /// What was wrong with `config.ini`, and -- see `Load` -- with `queue.json`.
+  /// What was wrong with `config.ini`, and -- see `AdoptConfig` -- with
+  /// `queue.json`. Rebuilt every time the configuration is re-read.
   std::vector<config::Diagnostic> diagnostics_;
+
+  /// The queue's half of that, kept apart so re-reading `config.ini` after a
+  /// write does not silently drop it.
+  std::vector<config::Diagnostic> queue_diagnostics_;
 
   /// The download queue as the card holds it. Loaded once and written by every
   /// command that changes it, so the file and this never disagree by more than

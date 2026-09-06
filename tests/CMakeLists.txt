@@ -134,6 +134,25 @@ target_compile_definitions(test_config PRIVATE
   ROMMSYNC_CONFIG_EXAMPLE="${CMAKE_SOURCE_DIR}/packaging/config.ini.example")
 add_test(NAME core.config COMMAND test_config)
 
+# The write half of `config.ini` (M5-3). Pure text in and text out -- no file,
+# no server -- because what it has to prove is a claim about *bytes*: the one
+# setting changes and every other byte the user typed is the byte it was. A
+# fixture on disk would only make the diff harder to read when it fails.
+add_executable(test_config_write test_config_write.cpp)
+target_link_libraries(test_config_write PRIVATE rommsync::core)
+target_include_directories(test_config_write PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+
+set(CONFIG_WRITE_SCENARIOS
+  roundtrip  # an edit lands and the rest of the file is byte-identical
+  rejects    # a refused edit changes nothing, and never quotes a URL
+  absent     # a missing key, and a missing section, both land where they read
+  removes    # `remove` drops every occurrence and the default comes back
+)
+foreach(scenario IN LISTS CONFIG_WRITE_SCENARIOS)
+  add_test(NAME config.write_${scenario} COMMAND test_config_write ${scenario})
+  set_tests_properties(config.write_${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
 # MD5, against RFC 1321's own vectors. Pure arithmetic, so it never skips -- and
 # it must not: a wrong digest is still 32 plausible hex characters, and the only
 # symptom on a console is every unchanged save negotiating as changed forever.
@@ -1030,9 +1049,23 @@ set(ENGINE_SCENARIOS
   persists  # every change reaches queue.json, and a fresh engine reads it back
   rollback  # a write that cannot happen changes neither the file nor memory
   corrupt   # a queue.json a yanked card left behind never blocks the boot
+  config    # M5-3: an edit lands on the card and on the running engine
+  commit    # M5-3: a commit interrupted between the two renames loses nothing
+  unpairs   # M5-3: a server change discards the pairing before it writes
+  stale     # M5-3: "did the server change" is a question about the card
   commands  # what is still `kUnavailable`, so the list shrinks deliberately
 )
 foreach(scenario IN LISTS ENGINE_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
   set_tests_properties(engine.${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
+
+# M5-3's one scenario that needs the fixture RomM. Repointing `server.url` has to
+# discard the pairing, and a token no server ever accepted would prove nothing
+# about that -- so this one uses the live fixture token and checks it works right
+# up until the edit, and that the console holds nothing afterwards.
+add_test(NAME engine.server COMMAND test_engine server)
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(engine.server PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+set_tests_properties(engine.server PROPERTIES TIMEOUT 120)
