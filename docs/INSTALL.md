@@ -19,10 +19,13 @@ you have installed homebrew on a Switch before and have never seen RomM.
 
 ## Before you start
 
-- **A modded console running Atmosphère 1.5.0 or newer.** That is the floor this
-  project targets; nothing in the build enforces it, and M8-2 is what confirms
-  it. rommsync-nx installs as an Atmosphère sysmodule, so a console booting
-  stock firmware cannot run it.
+- **A modded console running Atmosphère**, new enough to load sysmodules out of
+  `atmosphere/contents/` — the folder this release installs into, and the one
+  Atmosphère has used since **0.14.0**, when that folder was renamed from
+  `titles`.
+  Any current 1.x is far past that. That floor is the layout's, not a tested
+  number: nothing in this repo pins a minimum, and establishing the real one is
+  part of M8-2 ([#44](https://github.com/armaatus/rommsync-nx/issues/44)).
 - **Ultrahand or Tesla already installed and working.** The control UI is an
   overlay; if your overlay menu does not open today, fix that first — none of
   what follows is visible without it.
@@ -70,7 +73,13 @@ switch/.overlays/ovl-rommsync.ovl
 
 There is **no `flags/` directory** in the archive at all — not an empty one, not
 one holding a disabled flag. `atmosphere/contents/4200000000524D53/` arrives
-holding `exefs.nsp` and nothing else. That is deliberate, and step 2 is why.
+holding `exefs.nsp` and nothing else.
+
+That is deliberate. `flags/boot2.flag` is what makes Atmosphère launch the
+sysmodule at boot, so shipping it would mean the next boot after you unpacked
+the zip started a sysmodule that has no server, no token, and a folder map you
+have not checked yet — reading and writing save folders before you had any
+chance to look at which ones. Installed first, started when you say so.
 
 ---
 
@@ -91,18 +100,21 @@ is the single most common way this goes wrong.
 | **ovl-sysmodules' boot toggle** | `atmosphere/contents/4200000000524D53/flags/boot2.flag`, plus a launch/terminate for *right now* | whether the sysmodule **process exists at all** |
 | **ovl-rommsync's enable switch** | `[sync] enabled` in `config/rommsync/config.ini` | whether a running sysmodule **syncs** |
 
-They are not two spellings of the same thing. ovl-sysmodules creates
-`boot2.flag` for you; do not create it by hand, and rommsync-nx never writes it
-itself — two overlays writing the same flag is how they end up disagreeing
-about what is on.
+They are not two spellings of the same thing. `boot2.flag` is ovl-sysmodules'
+to write: do not create it by hand, and rommsync-nx never writes it itself —
+two overlays writing the same flag is how they end up disagreeing about what is
+on. (Whether ovl-sysmodules also *creates* the `flags/` directory, which the
+archive deliberately does not ship, is still being confirmed —
+[#33](https://github.com/armaatus/rommsync-nx/issues/33). If your toggle appears
+to do nothing, that is the first thing to report.)
 
 ### The four states
 
 | What you have | Boot toggle | Enable switch | What is happening |
 |---|---|---|---|
 | **Not installed** | — | — | The files are not on the card. The overlay is not in the menu. |
-| **Installed, not set to boot** | off | (unread) | There is no process. Nothing syncs, nothing answers the overlay, and the overlay reads `config.ini` directly so it can say *"the sysmodule is not running"* rather than mislabelling it *"disabled"*. |
-| **Running, sync disabled** | on | off | The process is resident and answers the overlay. Automatic syncs do not happen. **"Sync now" still works.** |
+| **Installed, not set to boot** | off | (unread) | There is no process. Nothing syncs and nothing answers the overlay, which says **"sys-rommsync is not running"** rather than mislabelling it *disabled* — a switch that does nothing is worse than a missing one. |
+| **Running, sync disabled** | on | off | The process is resident and answers the overlay, and nothing syncs. Automatic syncs stop, and **Sync now** is refused with **"Sync is off"** rather than starting one — the overlay tells you which switch to flip instead of showing a spinner that never moves. |
 | **Running, sync enabled** | on | on | The normal state: syncs on boot, on the timer, and on demand. |
 
 The row that catches people is the second one. Turning rommsync-nx's *own*
@@ -149,12 +161,18 @@ once in a browser, and the console gets a token. No account secret is ever
 entered on the console, and there is nothing to type with a joystick but a
 button press.
 
+> **Not reachable yet.** The pairing screen is built, but the only thing that
+> opens it is **Re-pair** on the Settings screen, which arrives with
+> [#26](https://github.com/armaatus/rommsync-nx/issues/26). Until that lands
+> there is no button in the overlay that starts this. The six steps below are
+> the release that ships once it does.
+
 Six steps:
 
 1. Reboot (or launch the sysmodule from ovl-sysmodules) so `sys-rommsync` is
    actually running.
 2. Open your overlay menu and choose **ovl-rommsync**.
-3. Press **Pair**. The screen says *"Contacting the server"* while it asks RomM
+3. Press **Pair**. The screen says **"Contacting the server"** while it asks RomM
    for a code.
 4. The screen then shows an **address** and an **eight-character code**. Open
    that address in a browser on a phone or a computer, signed in to RomM.
@@ -190,8 +208,11 @@ You do not need any of it to pair.
 ## 5. The first sync
 
 With the sysmodule running, paired, and `[sync] enabled = true`, a sync happens
-on boot and then on the interval in `config.ini`. You can also press **Sync
-now** in the overlay, which works even with the enable switch off.
+on boot and then on the interval in `config.ini`. You will also be able to ask
+for one on demand with **Sync now**, once
+[#24](https://github.com/armaatus/rommsync-nx/issues/24) lands it. That button
+needs the enable switch on: with `[sync] enabled = false` it answers
+**"Sync is off"** rather than syncing.
 
 Two directions, and they use different folders:
 
@@ -212,9 +233,9 @@ repeating here:
 > platform whose saves are silently never found. Correct them in `config.ini`
 > before you rely on the sync.
 
-Note that a `[platform.…]` section **replaces** that platform's defaults rather
-than adding to them: if you write one, list every key you want that platform to
-have. [CONFIG.md](CONFIG.md#defaults--the-folder-map) has the detail.
+One rule to read there before you edit the map: a `[platform.…]` section
+replaces that platform's defaults rather than adding to them
+([CONFIG.md](CONFIG.md#a-platform-section-replaces-that-platforms-defaults)).
 
 ---
 
@@ -262,7 +283,9 @@ client-tokens UI. That is the only thing that actually makes it stop working,
 and it is why a dedicated RomM user is worth the two minutes.
 
 The overlay's **Re-pair** does the client half for you: it discards the stored
-token and restarts the flow from step 4. It leaves `device.dat` alone, so RomM
+token and restarts the flow from step 4. It arrives with the Settings screen
+([#26](https://github.com/armaatus/rommsync-nx/issues/26)), like everything else
+that opens the pairing screen — see the note in step 4. It leaves `device.dat` alone, so RomM
 recognises the same console rather than collecting a new one each time. See
 [AUTH.md](AUTH.md#re-pairing--revocation).
 
@@ -304,7 +327,7 @@ symptom-by-symptom answers live, and this page will link it here rather than
 growing a second copy.
 
 Until it lands, the three things worth checking first are all in this page:
-the overlay saying *"the sysmodule is not running"* is the boot toggle
-([step 2](#2-enable-the-sysmodule)), *"No server set"* is `[server] url`
+the overlay saying **"sys-rommsync is not running"** is the boot toggle
+([step 2](#2-enable-the-sysmodule)), **"No server set"** is `[server] url`
 ([step 3](#3-point-it-at-your-server)), and saves that never appear are almost
 always the folder map ([step 5](#5-the-first-sync)).

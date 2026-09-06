@@ -91,9 +91,11 @@ NEGATIONS = (" no ", " not ", " never ", " without ", " cannot ", " nothing ", "
 CLAUSE_BREAK = re.compile(r"[,;:]|\b(?:but|then|and|or|so|if|when|unless)\b")
 
 # Never acceptable, negated or otherwise: these are not sentences, they are the
-# thing itself, and a user copies them out of a code block without reading.
-FORBIDDEN_LITERALS = ("--insecure", "-k --", "verify_peer = false", "verify=False",
-                      "sslVerify=false", "SSL_VERIFY_NONE")
+# thing itself, and a user copies one out of a code block without reading the
+# paragraph above it. Both are what M0-1 found the console's `ssl` service can
+# be talked into (docs/SECURITY.md#a-self-signed-certificate-on-a-home-server);
+# a curl flag is not, which is why none is listed.
+FORBIDDEN_LITERALS = ("SSL_VERIFY_NONE", "verify_peer = false")
 
 
 def fail(msg: str) -> int:
@@ -129,6 +131,12 @@ def title_id(repo: str) -> str:
     return (tid[2:] if tid[:2].lower() == "0x" else tid).upper()
 
 
+# One expression for a fenced block, used to collect the fences and then to
+# remove them: two copies drift, and the second copy is the one that silently
+# starts letting a path through.
+FENCE = re.compile(r"^```[^\n]*\n(.*?)^```", re.MULTILINE | re.DOTALL)
+
+
 def code_spans(text: str) -> list:
     """Every inline code span, plus every line of every fenced block.
 
@@ -136,11 +144,9 @@ def code_spans(text: str) -> list:
     a path this test cannot see -- which is why the guide writes them as code.
     """
     spans = []
-    fenced = re.findall(r"^```[^\n]*\n(.*?)^```", text, re.MULTILINE | re.DOTALL)
-    for block in fenced:
+    for block in FENCE.findall(text):
         spans.extend(block.splitlines())
-    stripped = re.sub(r"^```[^\n]*\n.*?^```", "", text, flags=re.MULTILINE | re.DOTALL)
-    spans.extend(re.findall(r"`([^`\n]+)`", stripped))
+    spans.extend(re.findall(r"`([^`\n]+)`", FENCE.sub("", text)))
     return spans
 
 
@@ -173,13 +179,19 @@ def slug(heading: str) -> str:
 
 
 def headings(text: str) -> set:
-    return {slug(m) for m in re.findall(r"^#{1,6}\s+(.*?)\s*$", text, re.MULTILINE)}
+    """Every anchor a link may aim at. Fenced blocks are stripped first: a shell
+    comment inside one is not a heading, and accepting it would let a link
+    resolve here that resolves to nothing on GitHub."""
+    body = FENCE.sub("", text)
+    return {slug(m) for m in re.findall(r"^#{1,6}\s+(.*?)\s*$", body, re.MULTILINE)}
 
 
 def sentences(text: str) -> list:
-    """Rough sentence split. A blockquote marker or a table pipe ends one too."""
+    """Rough sentence split. A table cell is its own sentence: a four-column row
+    is four statements on one line, and joining them would let a negation in one
+    cell excuse an instruction in the next."""
     flat = re.sub(r"\s+", " ", text)
-    return [s for s in re.split(r"(?<=[.!?:])\s+|\s*\|\s*|\n", flat) if s.strip()]
+    return [s for s in re.split(r"(?<=[.!?:])\s+|\s*\|\s*", flat) if s.strip()]
 
 
 # --- paths --------------------------------------------------------------------
@@ -208,9 +220,16 @@ def phase_paths(args) -> int:
             f"nor ships a folder for. `scripts/package.sh --list` prints:\n  "
             + "\n  ".join(entries))
 
+    spans = set(code_spans(text))
+    named = named_paths(text)
     for entry in entries:
-        if entry not in text:
-            return fail(f"the archive ships {entry!r} and docs/INSTALL.md never names it")
+        # Asked of the code spans, not of the document: the sweep above only
+        # sees a path the guide wrote as code, so accepting a prose mention here
+        # would let an entry be "named" in a way the other half cannot check.
+        if entry in named or any(entry in span for span in spans):
+            continue
+        return fail(f"the archive ships {entry!r} and docs/INSTALL.md never names it "
+                    "in a code span")
 
     # Redundant with the paths above -- the title id is a path segment in one of
     # them -- and asserted anyway, because #35 asks for it by name and a future
@@ -218,7 +237,7 @@ def phase_paths(args) -> int:
     if tid not in text:
         return fail(f"the title id is {tid} in sysmodule/sys-rommsync.json; "
                     "docs/INSTALL.md does not carry it")
-    for other in re.findall(r"\b4[0-9A-Fa-f]{15}\b", text):
+    for other in re.findall(rf"\b[0-9A-Fa-f]{{{len(tid)}}}\b", text):
         if other.upper() != tid:
             return fail(f"docs/INSTALL.md names title id {other}, but "
                         f"sysmodule/sys-rommsync.json says {tid}")
@@ -270,9 +289,9 @@ def phase_safety(args) -> int:
 
     for sentence in sentences(text):
         for pattern in SHORTCUT_PATTERNS:
-            if not re.search(pattern, sentence, re.IGNORECASE):
-                continue
             m = re.search(pattern, sentence, re.IGNORECASE)
+            if not m:
+                continue
             breaks = [b.end() for b in CLAUSE_BREAK.finditer(sentence.lower(), 0, m.start())]
             clause = f" {sentence.lower()[breaks[-1] if breaks else 0:m.start()]} "
             if any(neg in clause for neg in NEGATIONS):
@@ -299,7 +318,13 @@ def phase_pairing(args) -> int:
     if not body:
         return fail("cannot find `enum class PairingState` in "
                     "core/include/rommsync/pairing.hpp")
-    states = [m[1:].lower() for m in re.findall(r"^\s*(k[A-Za-z]+),", body.group(1), re.MULTILINE)]
+    # The trailing comma is optional: an enumerator added as the LAST entry
+    # without one would otherwise be silently absent from `states`, and both the
+    # missing and the extra check below would pass with the guide never
+    # mentioning it -- a hole in the exact thing this phase is for.
+    states = [m[1:].lower()
+              for m in re.findall(r"^\s*(k[A-Za-z]+)\s*(?:,|/{2,}|\}|$)",
+                                  body.group(1), re.MULTILINE)]
     if not states:
         return fail("PairingState parsed as empty")
 
@@ -331,7 +356,24 @@ def phase_pairing(args) -> int:
     if len(set(headlines.values())) != len(failures):
         return fail(f"the three terminal failures share a headline: {headlines}")
 
-    print(f"the pairing table is exactly {', '.join(states)}, three failures apart")
+    # The third way this page rots is a screen that changed, and unlike the
+    # other two it is not in the archive -- it is a string literal in the view.
+    # Every headline the table promises, and every screen line the prose quotes,
+    # is asserted against the source that draws it. The guide's convention is
+    # that **"..."** is verbatim overlay text and nothing else is; italics are
+    # for a word being discussed, not for a line being quoted.
+    views = "\n".join(read(os.path.join(repo, "core", "src", name))
+                      for name in ("overlay_pairing_view.cpp", "overlay_status_view.cpp"))
+    quoted = {row[0] for row in rows.values()}
+    quoted |= set(re.findall(r'\*\*"([^"]+)"\*\*', text))
+    for line in sorted(quoted):
+        if f'"{line}"' not in views:
+            return fail(f"docs/INSTALL.md quotes the overlay as saying {line!r}; "
+                        "no such string is drawn by core/src/overlay_pairing_view.cpp "
+                        "or core/src/overlay_status_view.cpp")
+
+    print(f"the pairing table is exactly {', '.join(states)}, three failures apart; "
+          f"{len(quoted)} quoted screen lines are drawn by the views")
     return 0
 
 
