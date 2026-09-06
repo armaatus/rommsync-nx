@@ -16,10 +16,13 @@ CONFIG_JSON := sys-rommsync.json
 # aarch64 is what stops core/ from drifting host-only between here and M2.
 ROMMSYNC_USE_CORE := 1
 
-# The IPC binding (M5-2). A separate directory because it is the one part of this
-# target that is *not* portable engine code -- it names `Result`, `HipcRequest`
-# and the tls buffer, which core/ may not (hard rule 4). Object files are named
-# by basename, so nothing in here may share one with core/src.
-SOURCES += source/ipc
+# The IPC binding (M5-2) and the Horizon HTTP backend (M1-7, #126). Separate
+# directories because they are the parts of this target that are *not* portable
+# engine code -- `ipc/` names `Result`, `HipcRequest` and the tls buffer, and
+# `http/ssl_http_client.cpp` names the `ssl` service, none of which core/ may
+# (hard rule 4). Object files are named by basename, so nothing in either may
+# share one with core/src -- which is why the backend is `http_wire.cpp` and
+# `ssl_http_client.cpp` rather than the `http.cpp` core/src already has.
+SOURCES += source/ipc source/http
 
 include $(TOPDIR)/../switch.mk

@@ -23,10 +23,16 @@ break by accident.
 - Sources are globbed by `core/CMakeLists.txt` — add a `.cpp`, no CMake edit.
 - Streaming, not buffering: a rom may be gigabytes and the sysmodule heap is
   tiny. Write to a file as bytes arrive.
-- **A stack buffer here gets 16 KiB in total.** `sysmodule/sys-rommsync.json`
-  sets `main_thread_stack_size` to `0x4000`, and the inner heap is `0x80000`
-  (512 KiB). A chunk size picked for how it felt on a desktop — 32 KiB, 64 KiB —
-  is a stack overflow on the console and compiles and passes on the host. The
+- **A stack buffer here gets 16 KiB, and should assume less.**
+  `sysmodule/sys-rommsync.json` sets `main_thread_stack_size` to `0x8000` — 32
+  KiB, raised from the template's `0x4000` by M1-7 (#126) because
+  `json::kMaxDepth` is 64 and `SdEngine::Load` parses documents off a card on
+  that thread — and the inner heap is `0xC0000` (768 KiB). Half of that stack is
+  already spoken for by the deepest parse, and a worker thread gets whatever its
+  creator asked for rather than this number at all, so the budget to write
+  against is unchanged. A chunk size picked for how it felt on a desktop — 32
+  KiB, 64 KiB — is a stack overflow on the console and compiles and passes on
+  the host. The
   convention in this directory is a 4 KiB stack chunk (`atomic_file.cpp`,
   `state_db.cpp`); anything bigger goes on the heap, deliberately. Hashing a file
   has one implementation of that loop -- `crypto::StreamFile` in `hash_file.hpp`,

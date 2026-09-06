@@ -9,7 +9,7 @@
 //
 // ## Why a page at a time at all
 //
-// The sysmodule's inner heap is `0x80000` and the trimmed bsd transfer memory
+// The sysmodule's inner heap is `0xC0000` and the trimmed bsd transfer memory
 // takes 116 KiB of it (docs/DEVELOPMENT.md#m0-1-the-measurement-and-the-decision).
 // A library of ten thousand roms is never materialised -- not from RomM, not in
 // an IPC buffer, not in a cache here. What is held is one page and, for

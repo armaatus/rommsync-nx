@@ -238,13 +238,24 @@ ctest --test-dir build --output-on-failure
 - Every save-overwrite test asserts a backup is written **first**
   ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md) hard rule).
 - The `http.*` tests cover the native `HttpClient` backend end to end: `get`,
-  `status`, `post_json`, `post_form`, `multipart`, `download`, `range`, `drop`,
-  `resume`, `resume_no_range`, `truncate`, `stall`, `cancel`. One CTest entry
-  each, so a red run names the behaviour rather than "the http tests". They run
-  `RUN_SERIAL` because the fault proxy holds one armed scenario for all
-  clients. The streaming ones pull RomM's own frontend bundle — the only large
-  resource the rig serves that does not first need a library scan, which is
-  socket.io-driven rig work belonging to M0-5.
+  `status`, `post_json`, `post_form`, `multipart`, `download`, `progress`,
+  `range`, `drop`, `resume`, `resume_no_range`, `resume_empty_body`,
+  `resume_stale_range`, `range_expected_size`, `not_found`, `truncate`, `stall`,
+  `cancel`. One CTest entry each, so a red run names the behaviour rather than
+  "the http tests". They run `RUN_SERIAL` because the fault proxy holds one
+  armed scenario for all clients. The streaming ones pull RomM's own frontend
+  bundle — the only large resource the rig serves that does not first need a
+  library scan, which is socket.io-driven rig work belonging to M0-5.
+- **`wire.*` is the same eighteen scenarios against the console's backend**
+  (M1-7, #126), out of the same source file compiled twice rather than a copy of
+  it. `sysmodule/source/http/http_wire.cpp` is the HTTP half of the Horizon
+  client and names no libnx type, so CMake compiles it and
+  `tests/tcp_connector.hpp` gives it a plain-TCP `Connection` to the rig. What
+  that does *not* prove is the `ssl` service underneath
+  (`ssl_http_client.cpp`) — nothing off a console can, which is what the M8-1
+  gate (#43) is for. What it does prove is everything a downloader can get
+  wrong: framing, chunked bodies, `Range` resume, the `.part` file, the three
+  timeouts, cancellation, and the progress contract.
 - The `pair.*` tests cover the device-code flow end to end (M1-1): `happy`,
   `starting`, `mid_poll`, `denied`, `expired`, `retry`, `unauthorized`,
   `rejection_streak`, `stall`, `drop`, `lost_grant`, `payload`. `starting` is

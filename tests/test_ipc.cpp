@@ -951,7 +951,7 @@ config::Config PathologicalConfig() {
 }
 
 /// Nothing on this wire may grow with the size of the user's library or the size
-/// of their `config.ini`. The heap is `0x80000` with a download buffer and the
+/// of their `config.ini`. The heap is `0xC0000` with a download buffer and the
 /// `state.db` baseline already claimed out of it, so a payload that scales with
 /// a file is a payload that is one bad edit away from not being sendable.
 ///
