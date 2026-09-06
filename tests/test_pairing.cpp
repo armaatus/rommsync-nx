@@ -62,15 +62,11 @@ const std::vector<std::string> kScopes = auth::MinimumScopes();
 constexpr auto kBudget = 90s;
 
 /// Be the human at the browser. `rig::` owns the Basic-auth POST both this file
-/// and `test_engine.cpp` make; these two name the scopes this client asks for.
+/// and `test_engine.cpp` make; this binds the scopes this client asks for.
+/// Denials go straight to `rig::DenyDeviceCode`, which needs none.
 http::Result Approve(http::HttpClient& client, const std::string& base,
                      const std::string& user_code) {
   return rig::ApproveDeviceCode(client, base, user_code, kScopes);
-}
-
-http::Result Deny(http::HttpClient& client, const std::string& base,
-                  const std::string& user_code) {
-  return rig::DenyDeviceCode(client, base, user_code);
 }
 
 auth::PairingConfig Config(const std::string& base) {
@@ -300,7 +296,7 @@ int Denied(http::HttpClient& client, const std::string& base) {
   auth::PairingSession session(client, Config(base));
   const std::string user_code = BeginAndShow(session, checks, base);
 
-  ExpectSucceeded(checks, Deny(client, base, user_code), "denying the code");
+  ExpectSucceeded(checks, rig::DenyDeviceCode(client, base, user_code), "denying the code");
   ExpectState(checks, RunUntilTerminal(session, checks), auth::PairingState::kDenied,
               "a denied code ends as denied, not as expired");
   checks.Expect(session.token() == nullptr, "a denied pairing carries no token");

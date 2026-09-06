@@ -205,7 +205,7 @@ auth::PairingStatus SdEngine::pairing_status() const {
     // had been (`pairing.hpp`).
     return auth::PairingStatus{};
   }
-  auth::PairingStatus status = attempt_->status();
+  auth::PairingStatus status = attempt_->session.status();
   if (status.state == auth::PairingState::kIdle) {
     // The window `ipc::Engine::StartPairing` documents: the command has handed
     // the attempt over and `Begin()` has not run yet, so the session still says
@@ -425,10 +425,19 @@ ipc::Error SdEngine::StartPairing() {
     // Whatever the last attempt left behind is discarded, which is what the
     // pairing screen's "Start over" means: a second attempt over a live one is
     // that, not an error (`PairingSession::Begin`).
-    attempt_ = std::make_shared<auth::PairingSession>(*pairing_backend_.http, std::move(pairing));
-    attempt_server_url_ = config_.server.url;
+    //
+    // **It is discarded, not interrupted.** `http::HttpClient` has no way to be
+    // cancelled from outside a call -- `CancelToken` is passed *into* one -- and
+    // `PairingSession` owns its requests, so a thread inside the previous
+    // attempt's `Begin()` has to finish it before it picks this one up. The
+    // screen therefore reads "starting" for up to one `request_timeout` after a
+    // second press. Right in every case that matters (a first attempt, or one
+    // whose code is live and only polling) and wrong-looking only on the press
+    // that follows one hung init; fixing it needs a `CancelToken` on
+    // `PairingConfig`, which is `core/`'s to add.
+    attempt_ = std::make_shared<PairingAttempt>(*pairing_backend_.http, std::move(pairing),
+                                                config_.server.url);
     attempt_commit_failure_.clear();
-    ++attempt_generation_;
     if (!pairing_thread_.joinable()) {
       pairing_thread_ = std::thread(&SdEngine::DrivePairing, this);
     }
@@ -442,34 +451,28 @@ ipc::Error SdEngine::StartPairing() {
 
 void SdEngine::AbandonPairingLocked() {
   attempt_.reset();
-  attempt_server_url_.clear();
   attempt_commit_failure_.clear();
-  ++attempt_generation_;
 }
 
-bool SdEngine::AwaitNextPoll(std::uint64_t generation) {
+bool SdEngine::AwaitNextPoll(const std::shared_ptr<PairingAttempt>& attempt) {
   std::unique_lock<std::mutex> lock(mutex_);
   wake_.wait_for(lock, kPairingTick,
-                 [this, generation] { return stopping_ || attempt_generation_ != generation; });
-  return !stopping_ && attempt_generation_ == generation;
+                 [this, &attempt] { return stopping_ || attempt_ != attempt; });
+  return !stopping_ && attempt_ == attempt;
 }
 
 void SdEngine::DrivePairing() {
   for (;;) {
-    std::shared_ptr<auth::PairingSession> session;
-    std::string server_url;
-    std::uint64_t generation = 0;
+    std::shared_ptr<PairingAttempt> attempt;
     {
       std::unique_lock<std::mutex> lock(mutex_);
-      wake_.wait(lock, [this] { return stopping_ || attempt_generation_ != driven_generation_; });
+      wake_.wait(lock, [this] { return stopping_ || attempt_ != driven_; });
       if (stopping_) {
         return;
       }
-      generation = attempt_generation_;
-      driven_generation_ = generation;
-      session = attempt_;
-      server_url = attempt_server_url_;
-      if (session == nullptr) {
+      driven_ = attempt_;
+      attempt = attempt_;
+      if (attempt == nullptr) {
         // A `server.url` change abandoned the attempt before this thread ever
         // picked it up. There is nothing to drive.
         continue;
@@ -478,9 +481,9 @@ void SdEngine::DrivePairing() {
 
     // The request `StartPairing` refused to wait for. Everything from here down
     // is off the IPC thread, so it may take as long as `request_timeout`.
-    auth::PairingState state = session->Begin();
-    while (!auth::IsTerminal(state) && AwaitNextPoll(generation)) {
-      state = session->Poll();
+    auth::PairingState state = attempt->session.Begin();
+    while (!auth::IsTerminal(state) && AwaitNextPoll(attempt)) {
+      state = attempt->session.Poll();
     }
     if (state != auth::PairingState::kApproved) {
       // Denied, expired, failed -- or superseded, in which case the attempt that
@@ -488,17 +491,17 @@ void SdEngine::DrivePairing() {
       // leave the card exactly as it was.
       continue;
     }
-    const auth::DeviceTokenResponse* granted = session->token();
+    const auth::DeviceTokenResponse* granted = attempt->session.token();
     if (granted != nullptr) {
-      CommitGrant(*granted, server_url, generation);
+      CommitGrant(attempt, *granted);
     }
   }
 }
 
-void SdEngine::CommitGrant(const auth::DeviceTokenResponse& granted, const std::string& server_url,
-                           std::uint64_t generation) {
+void SdEngine::CommitGrant(const std::shared_ptr<PairingAttempt>& attempt,
+                           const auth::DeviceTokenResponse& granted) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (stopping_ || attempt_generation_ != generation) {
+  if (stopping_ || attempt_ != attempt) {
     // A newer attempt is running, or the engine is going away. The grant is
     // real and its code is spent, so this does cost the user one approval --
     // but writing it would put a token on the card that the attempt the overlay
@@ -511,7 +514,7 @@ void SdEngine::CommitGrant(const auth::DeviceTokenResponse& granted, const std::
   // renamed onto `token.dat`, so a reader sees the previous token or the new one
   // and never a splice. `device.dat` is untouched -- the identifier has to
   // survive a re-pair or RomM registers the console twice.
-  const auth::StoredToken record = auth::StoredTokenFrom(server_url, granted);
+  const auth::StoredToken record = auth::StoredTokenFrom(attempt->server_url, granted);
   const auth::StoreResult saved = auth::SaveToken(PathTo(auth::kTokenFileName), record);
   if (!saved.ok()) {
     // Said out loud on the pairing screen rather than left to be discovered at

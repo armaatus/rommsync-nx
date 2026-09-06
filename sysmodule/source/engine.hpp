@@ -292,18 +292,37 @@ class SdEngine : public ipc::Engine {
   /// Write `queue.json`. False when it did not reach the card.
   bool WriteQueue();
 
+  /// One pairing attempt: the session, and the server it was started against.
+  ///
+  /// The URL is kept beside the session rather than read off `config_` when the
+  /// grant arrives, because a `server.url` edit mid-attempt would otherwise
+  /// commit a token under the name of a server that never issued it.
+  ///
+  /// The constructor exists because `auth::PairingSession` is neither copyable
+  /// nor movable -- it carries the mutex `status()` is safe under -- so the
+  /// session has to be built in place rather than assigned into an aggregate.
+  struct PairingAttempt {
+    PairingAttempt(http::HttpClient& client, auth::PairingConfig config, std::string url)
+        : session(client, std::move(config)), server_url(std::move(url)) {}
+
+    auth::PairingSession session;
+    std::string server_url;
+  };
+
   /// The pairing thread. Runs one attempt at a time: `Begin()`, then `Poll()`
   /// until the session is terminal, then the commit.
   ///
   /// It never holds `mutex_` across a request. What it holds instead is a
-  /// `shared_ptr` to the session, so a `StartPairing` that replaces the attempt
-  /// mid-request frees nothing under it, and a generation counter, so the
-  /// attempt it is driving knows when it has been superseded.
+  /// `shared_ptr` to the attempt, which does two jobs: a `StartPairing` that
+  /// replaces the attempt mid-request frees nothing under it, and comparing that
+  /// pointer against `attempt_` is how the thread finds out it was superseded.
+  /// Identity is safe to compare precisely because the thread's own copy keeps
+  /// the old object alive, so no new attempt can land on its address.
   void DrivePairing();
 
   /// Sleep until the next poll is worth making. False when this attempt has been
   /// superseded or the engine is going away, which is the loop's exit.
-  bool AwaitNextPoll(std::uint64_t generation);
+  bool AwaitNextPoll(const std::shared_ptr<PairingAttempt>& attempt);
 
   /// Persist an approved grant, and leave the console reporting itself paired.
   ///
@@ -311,14 +330,14 @@ class SdEngine : public ipc::Engine {
   /// the credentials are what matter, and a stale `auth.json` beside a fresh
   /// `token.dat` would have a worker refuse to call on a console that has just
   /// paired.
-  void CommitGrant(const auth::DeviceTokenResponse& granted, const std::string& server_url,
-                   std::uint64_t generation);
+  void CommitGrant(const std::shared_ptr<PairingAttempt>& attempt,
+                   const auth::DeviceTokenResponse& granted);
 
   /// Abandon whatever attempt is running. The caller holds `mutex_`.
   ///
-  /// Bumping the generation is the whole mechanism: the thread notices after its
-  /// current request and drops the session, whose last owner is then the
-  /// `shared_ptr` it is holding.
+  /// Dropping `attempt_` is the whole mechanism: the thread notices after its
+  /// current request that the attempt it is holding is no longer the engine's,
+  /// and stops driving it.
   void AbandonPairingLocked();
 
   /// The text of `config.ini` as it stands, or a reason there is none to edit.
@@ -416,25 +435,27 @@ class SdEngine : public ipc::Engine {
 
   /// Started on the first `StartPairing` and never before: a console with no
   /// transport, which is every console today, creates no thread at all.
+  ///
+  /// **Its stack is not sized here, and on Horizon that is a number somebody
+  /// has to derive.** devkitA64's default comes out of the 512 KiB inner heap
+  /// (`kInnerHeapSize`, `main.cpp`), which sysmodule/AGENTS.md budgets for one
+  /// in-flight download buffer plus a TLS context and nothing else. It costs
+  /// nothing today, because no console reaches this line; it is #126's to settle
+  /// along with the rest of the heap, since that is the issue that gives a
+  /// console a transport and so the first attempt that ever runs.
   std::thread pairing_thread_;
   bool stopping_ = false;
 
-  /// The attempt in flight. A `shared_ptr` because the pairing thread has to
-  /// keep the session alive across a request that a replacing `StartPairing` no
+  /// The attempt in flight, or null. A `shared_ptr` because the pairing thread
+  /// has to keep it alive across a request that a replacing `StartPairing` no
   /// longer refers to.
-  std::shared_ptr<auth::PairingSession> attempt_;
+  std::shared_ptr<PairingAttempt> attempt_;
 
-  /// The server the attempt was started against, kept beside it rather than read
-  /// off `config_` at commit time: a `server.url` edit mid-attempt would
-  /// otherwise write a token under the name of a server that never issued it.
-  std::string attempt_server_url_;
-
-  /// Bumped by every `StartPairing`, and compared by the pairing thread against
-  /// the attempt it picked up. Not a bool, because "a new attempt started while
-  /// the old one was mid-request" and "nothing is running" have to be different
-  /// answers.
-  std::uint64_t attempt_generation_ = 0;
-  std::uint64_t driven_generation_ = 0;
+  /// The one the pairing thread has picked up. Different from `attempt_` exactly
+  /// while there is a new attempt waiting to be driven, which is what the thread
+  /// waits on -- and null-vs-null is "nothing is running", which that wait has to
+  /// tell apart from "a new attempt started while the old one was mid-request".
+  std::shared_ptr<PairingAttempt> driven_;
 
   /// What went wrong *after* the session succeeded -- an approved pairing whose
   /// token would not reach the card. `PairingSession` cannot know about it and

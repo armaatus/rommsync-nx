@@ -900,6 +900,17 @@ sysmodule::PairingBackend Backend(http::HttpClient& client) {
   return backend;
 }
 
+/// Point `console` at `server_url`, give it `client` to reach it with, and boot.
+/// The three lines every pairing scenario starts with, in one place.
+void BootPairable(Console& console, checks::Checks& c, http::HttpClient& client,
+                  const std::string& server_url) {
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = " + server_url + "\n"),
+           "the console is configured for " + server_url);
+  console.engine.UsePairingBackend(Backend(client));
+  console.Boot();
+}
+
 /// Poll `GetPairState` until `settled` is happy, or the budget runs out.
 ///
 /// Through the command, not through `engine.pairing_status()`: the overlay never
@@ -970,10 +981,7 @@ auth::PairingStatus BeginAndShow(Console& console, checks::Checks& c) {
 int Pairs(http::HttpClient& client, const std::string& base) {
   rig::Checks c;
   Console console(c, "engine-pairs");
-  c.Expect(console.sandbox.Write("/config/rommsync/config.ini", "[server]\nurl = " + base + "\n"),
-           "the console is configured for the fixture RomM");
-  console.engine.UsePairingBackend(Backend(client));
-  console.Boot();
+  BootPairable(console, c, client, base);
   c.Expect(console.Status().auth == ipc::AuthState::kNeverPaired, "and has never paired");
 
   const auth::PairingStatus showing = BeginAndShow(console, c);
@@ -1039,10 +1047,7 @@ int Pairs(http::HttpClient& client, const std::string& base) {
 int NonBlocking(http::HttpClient& client, const std::string& base) {
   rig::Checks c;
   Console console(c, "engine-nonblocking");
-  c.Expect(console.sandbox.Write("/config/rommsync/config.ini", "[server]\nurl = " + base + "\n"),
-           "the console is configured for the fixture RomM");
-  console.engine.UsePairingBackend(Backend(client));
-  console.Boot();
+  BootPairable(console, c, client, base);
 
   harness::Fault stalled(c, client, base,
                          R"({"mode":"stall","seconds":5,"path":"/api/auth/device/init"})");
@@ -1086,16 +1091,17 @@ int Repairs(http::HttpClient& client, const std::string& base) {
   }
 
   Console console(c, "engine-repairs");
-  c.Expect(console.sandbox.Write("/config/rommsync/config.ini", "[server]\nurl = " + base + "\n"),
-           "the console is configured for the fixture RomM");
-
   auth::StoredToken old_token;
   old_token.server_url = base;
   old_token.access_token = fixture.token;
   old_token.device_id = fixture.device_id;
   const std::string token_path = console.directory + auth::kTokenFileName;
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini", "[server]\nurl = " + base + "\n"),
+           "the console is configured for the fixture RomM");
   c.Expect(auth::SaveToken(token_path, old_token).ok(), "and already paired with it");
 
+  // Not `BootPairable`: the token has to reach the card *before* `Load` reads
+  // it, so this scenario writes the config itself and boots afterwards.
   console.engine.UsePairingBackend(Backend(client));
   console.Boot();
   c.Expect(console.Status().auth == ipc::AuthState::kPaired, "so it comes up paired");
@@ -1170,11 +1176,7 @@ void Unreachable(checks::Checks& c) {
   Console console(c, "engine-unreachable");
   // Port 9 is discard: nothing listens, so the connect is refused at once. A
   // hostname that does not resolve would test DNS timeouts instead.
-  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
-                                 "[server]\nurl = http://127.0.0.1:9\n"),
-           "the console is configured for a server that is not there");
-  console.engine.UsePairingBackend(Backend(*client));
-  console.Boot();
+  BootPairable(console, c, *client, "http://127.0.0.1:9");
 
   auth::PairingStatus started;
   c.Expect(console.StartPair(&started) == ipc::Error::kOk,
@@ -1223,7 +1225,7 @@ void Commands(checks::Checks& c) {
   // the card (`ipc.hpp`).
   Console configured(c, "engine-commands-2");
   c.Expect(configured.sandbox.Write("/config/rommsync/config.ini",
-                                    "[server]\nurl = http://romm.example.com\n"),
+                                    "[server]\nurl = https://romm.example.com\n"),
            "a console with a server and no transport");
   configured.Boot();
   c.Expect(configured.Call(ipc::Command::kStartPair, ipc::EncodeEmpty(), &response) ==
@@ -1262,6 +1264,28 @@ void Commands(checks::Checks& c) {
            "as does SetConfig (#30)");
 }
 
+/// The scenarios that need the docker RomM, by name. A table rather than a
+/// second `if` chain, so the list of them is written down once.
+struct RigScenario {
+  const char* name;
+  int (*run)(http::HttpClient&, const std::string&);
+};
+
+const RigScenario* FindRigScenario(const std::string& name) {
+  static const RigScenario kRigScenarios[] = {
+      {"server", ServerChanged},
+      {"pairs", Pairs},
+      {"nonblocking", NonBlocking},
+      {"repairs", Repairs},
+  };
+  for (const RigScenario& scenario : kRigScenarios) {
+    if (name == scenario.name) {
+      return &scenario;
+    }
+  }
+  return nullptr;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1294,8 +1318,7 @@ int main(int argc, char** argv) {
     Reenable(checks);
   } else if (scenario == "unreachable") {
     Unreachable(checks);
-  } else if (scenario == "server" || scenario == "pairs" || scenario == "nonblocking" ||
-             scenario == "repairs") {
+  } else if (const RigScenario* rig_scenario = FindRigScenario(scenario)) {
     // The scenarios that need the fixture RomM. `server` pins that a *live*
     // credential stops being on the card, and the M1-6 three drive a real
     // device-code attempt -- a token nothing ever issued or accepted would prove
@@ -1309,16 +1332,7 @@ int main(int argc, char** argv) {
                 << "\n  start it with: ./scripts/orca/compose.sh up -d\n";
       return rig::kSkip;
     }
-    int failures = 0;
-    if (scenario == "server") {
-      failures = ServerChanged(*client, base);
-    } else if (scenario == "pairs") {
-      failures = Pairs(*client, base);
-    } else if (scenario == "nonblocking") {
-      failures = NonBlocking(*client, base);
-    } else {
-      failures = Repairs(*client, base);
-    }
+    const int failures = rig_scenario->run(*client, base);
     if (failures == 0) {
       std::cout << "engine." << scenario << " ok against " << base << "\n";
     }
