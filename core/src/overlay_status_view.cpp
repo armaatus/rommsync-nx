@@ -383,4 +383,50 @@ StatusView RenderUnreachable(Link link, std::uint32_t sysmodule_interface) {
   return view;
 }
 
+StatusView RenderUnreachable(Link link, const CardState& card,
+                             std::uint32_t sysmodule_interface) {
+  StatusView view = RenderUnreachable(link, sysmodule_interface);
+  if (view.link != Link::kNotRunning) {
+    // The card has nothing to add. A sysmodule that answered at all is
+    // installed and running, so `exefs.nsp` and `boot2.flag` would only repeat
+    // what the session already proved.
+    return view;
+  }
+
+  if (!card.installed) {
+    // The state the old sentence could not say. "Enable it in the sysmodule
+    // list" sends a user to a list `sys-rommsync` is not in, and ovl-sysmodules
+    // lists what has a `toolbox.json` beside its `exefs.nsp` -- so an install
+    // that half landed looks exactly like a toggle that will not stay on.
+    view.headline = "sys-rommsync is not installed";
+    view.hint = "Unpack the release zip onto the root of the SD card";
+    Add(&view.lines, "Installed", "No", Tone::kBad);
+    return view;
+  }
+
+  Add(&view.lines, "Installed", "Yes", Tone::kGood);
+  Add(&view.lines, "Start at boot", card.set_to_boot ? "On" : "Off",
+      card.set_to_boot ? Tone::kGood : Tone::kWarn);
+  if (card.set_to_boot) {
+    // Installed, flagged, and still silent. Not a state a working console
+    // reaches: either this boot predates the flag, or the process aborted at
+    // start. Both are answered by starting it, and ovl-sysmodules is where
+    // that button is.
+    view.hint = "It is set to start at boot but is not answering -- start it in ovl-sysmodules";
+  } else {
+    view.hint = "Turn sys-rommsync on in ovl-sysmodules";
+  }
+
+  if (card.config_read) {
+    // Deliberately labelled as the file rather than as the state: this console
+    // is not syncing whatever the line says, and a bare "Sync: On" over a
+    // process that does not exist is the mislabelling the four states exist to
+    // prevent (#33). It is worth drawing anyway -- a user who has already
+    // turned this switch off needs to know they will have to turn it back on.
+    Add(&view.lines, "Sync switch in config.ini", card.sync_enabled ? "On" : "Off",
+        card.sync_enabled ? Tone::kNeutral : Tone::kWarn);
+  }
+  return view;
+}
+
 }  // namespace rommsync::overlay

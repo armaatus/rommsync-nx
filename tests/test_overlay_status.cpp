@@ -402,6 +402,87 @@ void CheckUnreachable(Checks& checks) {
                 "and what this overlay speaks");
 }
 
+// --- the four states, not two (M6-2, #33) -------------------------------------
+
+/// A console whose sysmodule did not answer is in one of two very different
+/// places, and only the card can say which: the files are not installed, or they
+/// are and the boot toggle is off. Two different things to do about them, so two
+/// different sentences.
+///
+/// The other half of the criterion is what this must NOT say. `[sync] enabled`
+/// is on the card and readable, and drawing it as the console's state would
+/// report a console that is not running as merely "disabled" -- the switch that
+/// does nothing, which is what the four states exist to keep apart.
+void CheckFourStates(Checks& checks) {
+  overlay::CardState absent;
+  absent.installed = false;
+  const overlay::StatusView not_installed =
+      overlay::RenderUnreachable(overlay::Link::kNotRunning, absent);
+  ExpectNothingBlank(checks, not_installed, "not installed");
+  checks.ExpectEq(not_installed.headline, std::string("sys-rommsync is not installed"),
+                  "an overlay installed on its own says so, rather than 'not running'");
+  checks.Expect(not_installed.hint.find("zip") != std::string::npos,
+                "and the remedy is the zip, not the sysmodule list");
+  checks.Expect(HasLabel(not_installed, "Installed"), "with the fact it read off the card");
+
+  // Installed, and the boot toggle off. This is the row that catches people.
+  overlay::CardState off;
+  off.installed = true;
+  off.set_to_boot = false;
+  off.config_read = true;
+  off.sync_enabled = true;
+  const overlay::StatusView not_booting =
+      overlay::RenderUnreachable(overlay::Link::kNotRunning, off);
+  ExpectNothingBlank(checks, not_booting, "not set to boot");
+  checks.ExpectEq(not_booting.headline, std::string("sys-rommsync is not running"),
+                  "an installed sysmodule that is off is 'not running'");
+  checks.Expect(not_booting.hint.find("ovl-sysmodules") != std::string::npos,
+                "and the remedy names the overlay that owns that switch");
+  checks.Expect(HasLabel(not_booting, "Start at boot"), "the boot toggle is drawn");
+  checks.Expect(!HasLabel(not_booting, "Sync"),
+                "and the enable switch is NOT drawn as 'Sync': nothing is syncing");
+  checks.Expect(HasLabel(not_booting, "Sync switch in config.ini"),
+                "it is drawn as the file it was read from");
+
+  // Flagged to boot and still silent: not a state a working console reaches, and
+  // the hint has to be about starting it rather than about enabling it again.
+  overlay::CardState flagged;
+  flagged.installed = true;
+  flagged.set_to_boot = true;
+  const overlay::StatusView silent =
+      overlay::RenderUnreachable(overlay::Link::kNotRunning, flagged);
+  ExpectNothingBlank(checks, silent, "flagged but silent");
+  checks.Expect(silent.hint.find("not answering") != std::string::npos,
+                "a flagged sysmodule that says nothing is a different sentence again");
+  checks.Expect(!HasLabel(silent, "Sync switch in config.ini"),
+                "and a config.ini that would not read adds no row at all");
+
+  // The two states where the sysmodule DID answer are the ordinary status
+  // screen, and `CheckOfflineAndOff` covers them. What matters here is that the
+  // card adds nothing to a link that is not `kNotRunning`: a sysmodule that
+  // answered is installed and running by definition, and repeating it off the
+  // card would be two sources for one fact.
+  overlay::CardState anything;
+  anything.installed = false;
+  for (const overlay::Link link : {overlay::Link::kUnreadable, overlay::Link::kIncompatible}) {
+    const overlay::StatusView with = overlay::RenderUnreachable(link, anything, 99);
+    const overlay::StatusView without = overlay::RenderUnreachable(link, 99);
+    checks.ExpectEq(with.headline, without.headline,
+                    "a link that is not 'not running' reads the same with the card and without");
+    checks.ExpectEq(with.hint, without.hint, "hint too");
+    checks.Expect(with.lines.empty(), "and it still draws no rows");
+  }
+
+  // `kOk` reaching either overload is a caller that had a `Status` and should
+  // have rendered it. Both soften it the same way rather than aborting: an
+  // overlay that took the sysmodule down with it is the worse failure.
+  const overlay::StatusView wrong =
+      overlay::RenderUnreachable(overlay::Link::kOk, absent);
+  checks.Expect(wrong.link == overlay::Link::kUnreadable,
+                "kOk is reported as unreadable rather than asserted on");
+  checks.Expect(wrong.lines.empty(), "and it does not fall into the not-installed branch");
+}
+
 // --- the pieces the screen is made of -----------------------------------------
 
 void CheckFormatting(Checks& checks) {
@@ -457,6 +538,7 @@ int main() {
   CheckConfigErrors(checks);
   CheckDownloads(checks);
   CheckUnreachable(checks);
+  CheckFourStates(checks);
   CheckFormatting(checks);
 
   if (checks.failures() > 0) {
