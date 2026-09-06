@@ -1,14 +1,15 @@
 // ovl-rommsync entry point.
 //
 // One `tsl::Overlay` holding one session on `sys-rommsync` and, for now, one
-// screen loaded at start: the status screen (M4-1, #23). The library / queue,
-// sync and settings screens are M4-2..M4-4 and are added beside it.
+// screen loaded at start: the status screen (M4-1, #23). The library / queue
+// and settings screens are M4-3 and M4-4 and are added beside it.
 //
-// `PairingScreen` (M4-5, #27) is built and nothing pushes it yet. The settings
-// screen's "Re-pair" (M4-4, #26) is the one place the flow is reached from --
-// an overlay that opened on the pairing screen would be asking a paired console
-// for a code it does not need -- so until #26 lands it compiles here and
-// `--gc-sections` drops it from the image.
+// `PairingScreen` (M4-5, #27) and `SyncScreen` (M4-2, #24) are built and
+// nothing pushes either yet: this overlay has no root menu, and writing one in
+// three parallel worktrees is the merge conflict CLAUDE.md says to serialise
+// around. The settings screen (M4-4, #26) is where both are reached from -- its
+// "Re-pair" for the one, a menu entry for the other -- so until #26 lands they
+// compile here and `--gc-sections` drops them from the image. Recorded on #26.
 //
 // The session is owned here rather than by a screen because every screen shares
 // it: `smGetService` per screen would be a handle per screen, and an overlay

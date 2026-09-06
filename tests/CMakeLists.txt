@@ -284,6 +284,24 @@ target_compile_definitions(test_overlay_pairing PRIVATE
   ROMMSYNC_PAIRING_VIEW_SRC="${CMAKE_SOURCE_DIR}/core/src/overlay_pairing_view.cpp")
 add_test(NAME overlay.pairing COMMAND test_overlay_pairing)
 
+# --- the overlay's sync screen -----------------------------------------------
+# M4-2. The two controls the overlay exists for, and the one thing about them
+# that is a decision: which control may be pressed. The screen greys "Sync now"
+# by predicting what `SyncNow` would answer, so the suite holds `PredictSyncNow`
+# against a real `ipc::ServiceCore` over a fake `Engine` rather than against a
+# second copy of the table -- a prediction one branch out of step is a button
+# that refuses a sync the console would have run.
+#
+# The overlay's source directory is compiled in because one criterion is about
+# the code rather than about its behaviour: nothing under `overlay/` may write
+# `config.ini` or name a boot flag, and only a grep can say so.
+add_executable(test_overlay_sync test_overlay_sync.cpp)
+target_link_libraries(test_overlay_sync PRIVATE rommsync::core)
+target_include_directories(test_overlay_sync PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_overlay_sync PRIVATE
+  ROMMSYNC_OVERLAY_SOURCE_DIR="${CMAKE_SOURCE_DIR}/overlay/source")
+add_test(NAME overlay.sync_actions COMMAND test_overlay_sync)
+
 # --- rig smoke test: proves docker RomM + fault proxy + ctest all work -------
 # Uses libcurl directly on purpose. It tests the RIG, not our code, and must
 # keep working while M0-2 replaces it as the way production code speaks HTTP.

@@ -8,6 +8,7 @@
 #include "rommsync/ipc.hpp"
 #include "rommsync/overlay_pairing_view.hpp"
 #include "rommsync/pairing.hpp"
+#include "screen_frame.hpp"
 
 namespace rommsync::overlay {
 namespace {
@@ -29,28 +30,6 @@ constexpr s32 kRowHeight = 26;
 constexpr s32 kCodeHeight = 58;
 /// How far short of the drawer's right edge a line stops.
 constexpr s32 kInset = 8;
-
-/// The renderer's palette for a `Tone`. `core/` names no colour (hard rule 4),
-/// so this is the only place the two vocabularies meet -- and it uses
-/// libultrahand's theme variables rather than literals so a user's theme still
-/// applies.
-///
-/// Through `Renderer::a`, which folds in the overlay's fade animation alpha:
-/// without it the frame's chrome fades on open and close while everything this
-/// file draws stays opaque and pops (libtesla's own convention).
-tsl::Color ColorFor(Tone tone) {
-  switch (tone) {
-    case Tone::kGood:
-      return tsl::gfx::Renderer::a(tsl::healthyRamTextColor);
-    case Tone::kWarn:
-      return tsl::gfx::Renderer::a(tsl::warningTextColor);
-    case Tone::kBad:
-      return tsl::gfx::Renderer::a(tsl::badRamTextColor);
-    case Tone::kNeutral:
-      break;
-  }
-  return tsl::gfx::Renderer::a(tsl::defaultTextColor);
-}
 
 }  // namespace
 
@@ -86,39 +65,14 @@ bool PairingScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidAna
 }
 
 bool PairingScreen::Ready() {
-  if (!client_.open()) {
-    if (R_FAILED(client_.Open())) {
-      // No `rommsync` port. Not installed, not enabled, or it aborted at boot --
-      // and it is the state a user who forgot to switch it on is in, so it is
-      // drawn as a screen rather than reported as an error.
-      view_ = RenderPairingUnreachable(Link::kNotRunning);
-      return false;
-    }
-    version_checked_ = false;
-  }
-  if (version_checked_) {
+  // The port and the version handshake, both of which every screen needs and
+  // none of which is this screen's own (`screen_frame.hpp`).
+  const Link link = frame_.Ready();
+  if (link == Link::kOk) {
     return true;
   }
-  // Command 0 first, always: its encoding is frozen, so it is the only call
-  // that is safe to make before knowing whether this build can decode the
-  // others (`ipc::Command`). A mismatch is "update the sysmodule", not a decode
-  // failure, and telling those apart is the whole reason it exists.
-  std::uint32_t sysmodule_interface = 0;
-  if (R_FAILED(client_.GetInterfaceVersion(&sysmodule_interface))) {
-    // Not "not running": the port answered, so something is there. Which of the
-    // two sentences is true is decided by whether the port is still openable.
-    view_ = Reopen();
-    return false;
-  }
-  if (sysmodule_interface != ipc::kVersion) {
-    // Left unchecked, so this is re-derived on every frame rather than latched:
-    // a user who exits the overlay, updates the sysmodule and comes back gets a
-    // working screen without rebooting.
-    view_ = RenderPairingUnreachable(Link::kIncompatible, sysmodule_interface);
-    return false;
-  }
-  version_checked_ = true;
-  return true;
+  view_ = RenderPairingUnreachable(link, frame_.sysmodule_interface());
+  return false;
 }
 
 void PairingScreen::Poll() {
@@ -133,8 +87,9 @@ void PairingScreen::Poll() {
     blocked_ = false;
     // A payload this build cannot read is distinct from a sysmodule that is
     // gone, and distinct from a half-parsed status: the screen says so instead
-    // of drawing defaulted fields as though they were an answer.
-    view_ = rc == MalformedResponse() ? RenderPairingUnreachable(Link::kUnreadable) : Reopen();
+    // of drawing defaulted fields as though they were an answer. Which of the
+    // two it is is `Diagnose`'s to say.
+    view_ = RenderPairingUnreachable(frame_.Diagnose(rc), frame_.sysmodule_interface());
     return;
   }
 
@@ -177,23 +132,13 @@ void PairingScreen::Start() {
   // server to pair with. See the note on `Start` in the header for why the
   // `Result` itself is not decoded here.
   ipc::Status console;
-  if (R_FAILED(client_.GetStatus(&console))) {
-    view_ = Reopen();
+  const Result status_rc = client_.GetStatus(&console);
+  if (R_FAILED(status_rc)) {
+    view_ = RenderPairingUnreachable(frame_.Diagnose(status_rc), frame_.sysmodule_interface());
     return;
   }
   view_ = RenderPairingBlocked(console.configured ? PairBlock::kRefused : PairBlock::kNoServer);
   blocked_ = true;
-}
-
-PairingView PairingScreen::Reopen() {
-  // The session is not trusted after a transport failure, so it is dropped and
-  // re-opened here rather than on the next frame: whether the port is still
-  // there is exactly what decides which of the two sentences the user gets, and
-  // deferring it would draw one of them for a frame on no evidence.
-  client_.Close();
-  version_checked_ = false;
-  return R_SUCCEEDED(client_.Open()) ? RenderPairingUnreachable(Link::kUnreadable)
-                                     : RenderPairingUnreachable(Link::kNotRunning);
 }
 
 void PairingScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
@@ -205,7 +150,7 @@ void PairingScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
   // a ~448px panel.
   const s32 bottom = y + height;
   const s32 line_width = width > kInset ? width - kInset : 0;
-  const tsl::Color muted = tsl::gfx::Renderer::a(tsl::infoTextColor);
+  const tsl::Color muted = MutedColor();
 
   s32 row = y;
   const auto fits = [&](s32 needed) { return row + needed <= bottom; };
