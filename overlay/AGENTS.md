@@ -12,8 +12,8 @@ Ultrahand overlay list.
   none of it. Two things it does link: the IPC codecs — `rommsync/ipc.hpp`,
   shared with the sysmodule so one copy of the field names serves both halves —
   and the screens' view models — `rommsync/overlay_status_view.hpp`,
-  `rommsync/overlay_pairing_view.hpp`, `rommsync/overlay_sync_actions.hpp` and
-  whatever M4-3/M4-4 add beside them. `--gc-sections` drops the engine no screen
+  `rommsync/overlay_pairing_view.hpp`, `rommsync/overlay_sync_actions.hpp`,
+  `rommsync/overlay_library_model.hpp` and whatever M4-4 adds beside them. `--gc-sections` drops the engine no screen
   references. The rule above is about ownership, not about the link map.
 - **A screen is two halves, and only one of them is in this directory.** What
   the screen *says* — which sentence a never-paired console gets, what a
@@ -37,6 +37,12 @@ Ultrahand overlay list.
   handshake is how a version check gets fixed in two screens out of four. What
   stays per-screen is the layout block, because M8-2 (#44) adjusts it against a
   real panel one screen at a time.
+- **A refusal the sysmodule named is not a transport failure.** Both arrive as a
+  failing `Result`; `overlay::DecodeError(rc, &error)` is what tells them apart,
+  and only what it refuses goes to `ScreenFrame::Diagnose`. A screen that sent
+  every failure to `Diagnose` would draw "sys-rommsync is not running" over a rom
+  that was simply already queued (M4-3, #25). The three screens before it have no
+  command whose refusal carries meaning, which is why it did not exist until now.
 - All IPC goes through `source/ipc_client.*`. A screen never builds a payload
   itself; if a screen needs something the client cannot answer, the command
   belongs in `docs/DEVELOPMENT.md#ipc` and in `rommsync/ipc.hpp` first.

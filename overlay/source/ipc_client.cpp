@@ -12,6 +12,21 @@
 
 namespace rommsync::overlay {
 
+bool DecodeError(Result rc, ipc::Error* out) {
+  if (R_SUCCEEDED(rc) || R_MODULE(rc) != ipc::kResultModule) {
+    return false;
+  }
+  ipc::Error error = ipc::Error::kOk;
+  if (!ipc::IsError(R_DESCRIPTION(rc), &error) || error == ipc::Error::kOk) {
+    // Our module, and a description this build has no name for. That is a
+    // sysmodule from a newer release rather than a refusal to invent, and
+    // `ScreenFrame::Diagnose` is what has a sentence for it.
+    return false;
+  }
+  *out = error;
+  return true;
+}
+
 IpcClient::IpcClient() { response_.resize(ipc::kMaxPayloadBytes); }
 
 IpcClient::~IpcClient() { Close(); }
