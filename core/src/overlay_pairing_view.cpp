@@ -187,11 +187,15 @@ PairingView RenderPairingBlocked(PairBlock block) {
       // The status screen's sentence for the same console, for the same reason
       // `RenderPairingUnreachable` borrows its wording.
       view.headline = "No server set";
-      view.hint = "Set server.url in config.ini";
+      // Pair is offered, and the hint puts it second. A refusal is latched by
+      // the screen -- nothing polls behind one to keep saying it -- so a state
+      // with no action left is a screen that stays wrong after the user has
+      // fixed `config.ini`, until they close the overlay and open it again.
+      // Asking again is the one thing that can be right here, even though the
+      // answer is the same until the file changes.
+      view.hint = "Set server.url in config.ini, then press Pair";
       view.tone = Tone::kWarn;
-      // No Pair button: there is nothing to pair with, and a button that
-      // answers the same refusal every time is a button that teaches the user
-      // the overlay is broken.
+      view.start = true;
       return view;
     case PairBlock::kRefused:
       view.headline = "Could not start pairing";
