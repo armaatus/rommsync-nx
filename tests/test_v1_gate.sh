@@ -510,6 +510,23 @@ $out" ;;
     || fail "--dry did not hold the release row it declined to look up:
 $(echo "$out" | grep -A3 'release ')"
   echo "ok: --dry does not look a release up, and holds the row rather than judging it"
+
+  # ...but --dry still reports what it already KNOWS is wrong. The case above
+  # cannot see this: its tag agrees with VERSION, so the local `ok` flag is 0
+  # either way and the branch that could discard it is never exercised. A tag
+  # that disagrees is a finding this machine has already made without a network,
+  # and "not looked up" must not swallow it.
+  release_repo "$dir/dry-bad" 1.1.0 v1.0.0 ""
+  out="$(cd "$dir/dry-bad" && "$dir/dry-bad/scripts/v1-gate.sh" --dry --build-dir "$build" 2>&1)"
+  echo "$out" | grep -q "^\[FAIL\] release " \
+    || fail "--dry reported an already-known bad tag as merely undecided:
+$(echo "$out" | grep -A4 'release ')"
+  case "$out" in
+    *"disagrees with VERSION"*) ;;
+    *) fail "--dry did not say what it already knew was wrong:
+$out" ;;
+  esac
+  echo "ok: --dry still fails a row on what it already knows, rather than holding it"
 }
 
 # --- the published table ------------------------------------------------------
