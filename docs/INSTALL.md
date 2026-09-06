@@ -285,9 +285,9 @@ and it is why a dedicated RomM user is worth the two minutes.
 The overlay's **Re-pair** does the client half for you: it discards the stored
 token and restarts the flow from step 4. It arrives with the Settings screen
 ([#26](https://github.com/armaatus/rommsync-nx/issues/26)), like everything else
-that opens the pairing screen — see the note in step 4. It leaves `device.dat` alone, so RomM
-recognises the same console rather than collecting a new one each time. See
-[AUTH.md](AUTH.md#re-pairing--revocation).
+that opens the pairing screen — see the note in step 4. It leaves `device.dat`
+alone, so RomM recognises the same console rather than collecting a new one each
+time. See [AUTH.md](AUTH.md#re-pairing--revocation).
 
 ---
 
