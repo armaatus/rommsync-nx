@@ -1210,6 +1210,70 @@ void CheckAPageCannotLandInTheWrongLevel(Checks& checks) {
                 "which opens its own list instead");
 }
 
+/// A page that lands does not move the selection onto a row under it.
+///
+/// The `kMore` row is addressed by the index one past the last loaded row, and
+/// an arriving page takes that index for its first new row. Re-clamping only
+/// when the index goes *out of range* leaves it in range and silently pointing
+/// at a rom the user never scrolled to -- "Loading..." becomes a Download
+/// prompt with no input, and the next A press enqueues that rom. The one
+/// screen whose whole job is that a press never does something invisible.
+void CheckAnArrivingPageDoesNotMoveTheSelection(Checks& checks) {
+  overlay::LibraryBrowserModel model;
+  Begin(checks, model, 321);
+  Deliver(checks, model, Page(checks, {Platform(1, "Game Boy", "gb", 4, true)}, true), 321,
+          "a short first page with more behind it");
+
+  // Down onto the `kMore` row, which is how a user reaches "Loading...".
+  model.MoveSelection(1);
+  const overlay::LibraryView waiting = model.Render();
+  checks.Expect(waiting.selected >= 0, "there is a selection");
+  checks.ExpectEq(overlay::ToString(waiting.rows[static_cast<std::size_t>(waiting.selected)].kind),
+                  overlay::ToString(overlay::RowKind::kMore),
+                  "the selection is resting on the more row");
+
+  // The page the level was already fetching arrives.
+  Deliver(checks, model, Page(checks, {Platform(2, "Mega Drive", "md", 9, true)}, true), 321,
+          "the next page");
+
+  const overlay::LibraryView after = model.Render();
+  checks.Expect(after.selected >= 0, "there is still a selection");
+  checks.ExpectEq(overlay::ToString(after.rows[static_cast<std::size_t>(after.selected)].kind),
+                  overlay::ToString(overlay::RowKind::kMore),
+                  "and it is still on the more row, not on the rom that arrived under it");
+
+  // And the last page, where the more row goes away entirely: the selection
+  // lands on the last real row rather than off the end.
+  Deliver(checks, model, Page(checks, {Platform(3, "SNES", "snes", 4, true)}, false), 321,
+          "the last page");
+  const overlay::LibraryView done = model.Render();
+  checks.Expect(MoreRow(done) == nullptr, "the more row is gone");
+  checks.ExpectEq(done.selected, static_cast<int>(ListRows(done).size()) - 1,
+                  "and the selection settles on the last row");
+
+  // The same, one level down, where a press would enqueue: the selection must
+  // not be sitting on a rom the user never chose.
+  overlay::LibraryBrowserModel roms;
+  Begin(checks, roms, 331);
+  Deliver(checks, roms, Page(checks, {Platform(1, "Game Boy", "gb", 4, true)}, false), 331,
+          "the platform page");
+  roms.Activate();
+  Begin(checks, roms, 332);
+  Deliver(checks, roms, Page(checks, {Rom(1, "First", 1024)}, true), 332, "a short rom page");
+  roms.MoveSelection(1);
+  Deliver(checks, roms, Page(checks, {Rom(2, "Second", 2048)}, true), 332, "the next rom page");
+  const overlay::LibraryView rom_view = roms.Render();
+  checks.ExpectEq(
+      overlay::ToString(rom_view.rows[static_cast<std::size_t>(rom_view.selected)].kind),
+      overlay::ToString(overlay::RowKind::kMore),
+      "the selection is still on the more row, not on the rom that arrived under it");
+  roms.Activate();
+  // Not `kNone`: the level still has pages behind it, so it is asking for the
+  // next one. What matters is that the press produced no `Enqueue`.
+  checks.Expect(roms.Next().kind != Command::Kind::kEnqueue,
+                "A on the more row enqueues no rom the user never selected");
+}
+
 // --- the code rather than the behaviour ---------------------------------------
 
 /// Every non-comment line of `path`, held against a list of symbols it may not
@@ -1332,6 +1396,7 @@ int main() {
   CheckLoadedRowsAreBounded(checks);
   CheckUnreadableItemsAreReported(checks);
   CheckAPageCannotLandInTheWrongLevel(checks);
+  CheckAnArrivingPageDoesNotMoveTheSelection(checks);
   CheckQueueRowUsesEveryPinnedField(checks);
   CheckLibraryScreenWritesNothing(checks);
   CheckLibraryScreenCallsNoEngine(checks);

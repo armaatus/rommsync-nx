@@ -367,6 +367,17 @@ class LibraryBrowserModel {
   Level& top();
   const Level& top() const;
 
+  /// Whether this level draws the `kMore` row under its loaded ones.
+  ///
+  /// Shared by `MoveSelection`, `OnPage` and `Render` because all three have to
+  /// agree about whether the index one past the last loaded row addresses
+  /// something: a selection resting there while the other two think it does not
+  /// is a cursor on a row nobody drew.
+  static bool HasMoreRow(const Level& level);
+
+  /// The last loaded row's index, or `0` for a level with none.
+  static int LastRowIndex(const Level& level);
+
   /// Fill in a row from one `ipc::ListItem`, or answer false for an item this
   /// build cannot read. A malformed item is dropped rather than rendered
   /// half-filled, for `ipc::Decoded`'s reason: three defaulted fields render as

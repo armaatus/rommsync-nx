@@ -21,6 +21,12 @@ namespace keys = ipc::list_keys;
 /// state, including a rom list opened from a platform whose `name` was empty.
 constexpr const char* kUnnamed = "Unnamed";
 
+/// What a refusal with no sentence of its own says. One copy, because the two
+/// places that answer it -- a row state with no recorded error, and an error
+/// this build has no wording for -- are the same sentence and would otherwise
+/// drift apart.
+constexpr const char* kRefusedFallback = "The sysmodule refused this download";
+
 /// One field, or nullptr. A wrapper only so the three readers below read as
 /// three lists of fields rather than as three loops.
 const ipc::ListValue* Field(const ipc::ListItem& item, std::string_view key,
@@ -198,7 +204,7 @@ std::string RowStateText(RowState state, std::string_view fs_slug) {
     case RowState::kRefused:
       // The caller has the error and its own sentence; this is the fallback for
       // a row whose reason was not recorded, and it still says something.
-      return "The sysmodule refused this download";
+      return kRefusedFallback;
     case RowState::kReady:
     case RowState::kInert:
       return std::string();
@@ -245,7 +251,7 @@ std::string EnqueueRefusalText(ipc::Error error) {
     default:
       break;
   }
-  return "The sysmodule refused this download";
+  return kRefusedFallback;
 }
 
 RowState EnqueueRefusalState(ipc::Error error) {
@@ -280,6 +286,15 @@ void LibraryBrowserModel::Reset() {
   platforms.request.kind = ipc::ListKind::kPlatforms;
   platforms.title = "Library";
   stack_.push_back(std::move(platforms));
+}
+
+bool LibraryBrowserModel::HasMoreRow(const Level& level) {
+  return level.has_more || level.loading || level.page_error != ipc::Error::kOk ||
+         level.truncated;
+}
+
+int LibraryBrowserModel::LastRowIndex(const Level& level) {
+  return level.rows.empty() ? 0 : static_cast<int>(level.rows.size()) - 1;
 }
 
 LibraryBrowserModel::Level& LibraryBrowserModel::top() { return stack_.back(); }
@@ -406,6 +421,18 @@ void LibraryBrowserModel::OnPage(const ipc::ListPage& page) {
     return;
   }
 
+  // Was the selection resting on the `kMore` row? `MoveSelection` lets it,
+  // because that row is how a user reaches "Loading..." and "press A to try
+  // again" -- and the row is addressed by an index one past the last loaded
+  // one, which the page about to be appended is going to take.
+  //
+  // The empty case is not it. A level that has loaded nothing has its selection
+  // at `0`, which is the sentinel's index *and* the first row's; reading that
+  // as "resting on the sentinel" would push the selection past the whole first
+  // page of every list the browser opens.
+  const bool was_on_more =
+      !level.rows.empty() && level.selected >= static_cast<int>(level.rows.size());
+
   if (level.replace_rows) {
     level.rows.clear();
     level.unreadable_items = 0;
@@ -467,8 +494,20 @@ void LibraryBrowserModel::OnPage(const ipc::ListPage& page) {
     level.rows.resize(static_cast<std::size_t>(kMaxLoadedRows));
   }
   level.loading = false;
-  if (level.selected >= static_cast<int>(level.rows.size())) {
-    level.selected = level.rows.empty() ? 0 : static_cast<int>(level.rows.size()) - 1;
+
+  // Keep the selection on the thing it was on, not on the index it was at.
+  //
+  // A selection resting on the `kMore` row is at index `rows.size()`, and a page
+  // that lands takes that index for its first new row. Re-clamping only when the
+  // index goes *out of range* leaves it in range and silently pointing at a rom
+  // the user never scrolled to -- so "Loading..." becomes "Ⓐ Download <some
+  // rom>" under the cursor with no input, and the next A press enqueues it.
+  // That is the invisible press this screen exists not to make.
+  if (was_on_more) {
+    level.selected = HasMoreRow(level) ? static_cast<int>(level.rows.size())
+                                       : LastRowIndex(level);
+  } else if (level.selected >= static_cast<int>(level.rows.size())) {
+    level.selected = LastRowIndex(level);
   }
 }
 
@@ -597,9 +636,7 @@ void LibraryBrowserModel::MoveSelection(int delta) {
   // The `kMore` row is drawn below the loaded ones when there is one, so the
   // selection may stand on it -- that is how a failed page is retried.
   const int rows = static_cast<int>(level.rows.size());
-  const bool has_more_row =
-      level.has_more || level.loading || level.page_error != ipc::Error::kOk;
-  const int last = rows + (has_more_row ? 1 : 0) - 1;
+  const int last = rows + (HasMoreRow(level) ? 1 : 0) - 1;
   if (last < 0) {
     level.selected = 0;
     return;
@@ -848,9 +885,7 @@ LibraryView LibraryBrowserModel::Render() const {
   view.rows = level.rows;
   view.can_go_back = stack_.size() > 1;
 
-  const bool has_more_row = level.has_more || level.loading ||
-                            level.page_error != ipc::Error::kOk || level.truncated;
-  if (has_more_row) {
+  if (HasMoreRow(level)) {
     LibraryRow more;
     more.kind = RowKind::kMore;
     more.state = RowState::kInert;
