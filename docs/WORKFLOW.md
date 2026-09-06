@@ -167,6 +167,16 @@ Then it builds, with three things that are not negotiable:
 - **Verification is part of "done".** Run `ctest` and read the output. If
   `rig.smoke` reports **Skipped**, RomM is not running and most of the suite is
   meaningless.
+- **When `main` moves under you, rebase onto it — never merge it in.**
+  `scripts/release-notes.sh` builds the notes with `git log --no-merges`, because
+  a squash-merge repo has no merge commits worth listing, so a merge commit at
+  the head of a branch is a commit the notes cannot see: `release.notes` goes
+  red saying the notes do not list the commit at HEAD, and the branch's own work
+  is missing from them. The failure names the symptom and not the cause, which
+  is why it is written here. Rebasing costs resolving the same region once per
+  commit; do that. Whatever you resolve, diff the result against a tree you have
+  actually run — `git add -A` on a round where a second file was also conflicted
+  is how conflict markers reach a commit that still builds.
 
 The [`verifier`](../.claude/agents/verifier.md) subagent is the packaged final
 check: a fresh context that builds, runs the suite, hunts for the test that would
