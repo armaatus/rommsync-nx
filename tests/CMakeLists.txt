@@ -583,8 +583,14 @@ endforeach()
 # consecutive passes afterwards, alone and in groups, so it is a race rather
 # than a regression, and it is currently what makes `main` red.
 #
-# Same QUARANTINE, same terms, as harness.partial below: retried, named,
-# with the issue on it, and removed the day #85 closes. Green with the retry is
+# Same QUARANTINE, same terms, as harness.partial below: retried, named, and
+# with the issue on it.
+#
+# It does NOT come out when #85 closes -- #85 is closed, and this is still here.
+# It comes out when someone measures a rate rather than sampling one: #119 is
+# that experiment (`--repeat until-fail:50`, proxy unfixed then fixed). Three
+# green runs cannot tell "fixed" from "under 1 in 3", which is exactly what a
+# retry hides. Green with the retry is
 # not evidence the race is gone -- green WITHOUT it is.
 set_tests_properties(execute.occupied PROPERTIES REPEAT UNTIL_PASS:3)
 
@@ -840,7 +846,13 @@ endforeach()
 # So this is a QUARANTINE, not a fix: retry it rather than leave `main` red on a
 # race nobody has explained. It is deliberately narrow -- one test, named, with
 # the issue on it -- because a repo that retries tests by default has stopped
-# being able to tell flaky from broken. Remove this the day #76 closes.
+# being able to tell flaky from broken.
+#
+# Do NOT remove this because #76 is closed. It is closed, and the retry is still
+# here: closing the issue did not measure anything. #119 is the experiment that
+# would justify removing it, and #109 -- the fault proxy replaying a stalled
+# request into a later test -- is a real defect that was fixed WITHOUT being
+# shown to cause this one.
 set_tests_properties(harness.partial PROPERTIES REPEAT UNTIL_PASS:3)
 
 # --- the committed API captures still match a live RomM ----------------------

@@ -37,8 +37,10 @@ Scenario fields::
               ``drop`` still sends the real Content-Length and then resets, the
               way a genuinely dropped transfer looks; ``truncate`` sends no
               length at all, so only the caller's own expected size can catch it
-    seconds   hold the connection open this long and then drop it, WITHOUT
-              forwarding -- a stalled request never reaches RomM
+    seconds   hold the connection open this long, then close it without
+              answering and WITHOUT forwarding -- a stalled request never
+              reaches RomM at all. Unlike ``drop`` this is an ordinary close,
+              not a reset: there is no half-sent response to make unmistakable
                                                 (mode=stall, default 30)
 
 Example -- make the 3rd call to /api/sync/negotiate fail with 401, once::
@@ -238,8 +240,8 @@ class Handler(BaseHTTPRequestHandler):
             # -- see #109. This is a defect on its own terms either way.
             #
             # Nothing observes what happens after the sleep, so there is no
-            # fidelity to lose: dropping the connection is what a server that
-            # accepted a connection and then said nothing finally does.
+            # fidelity to lose: closing the connection unanswered is what a
+            # server that accepted one and then said nothing finally does.
             time.sleep(float(fault.get("seconds", 30)))
             self.close_connection = True
             return

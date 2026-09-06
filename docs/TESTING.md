@@ -32,7 +32,7 @@ one thing about a genuine response:
 | `status` | Return an arbitrary status (401 mid-sync, 500, …) instead of forwarding |
 | `truncate` | Forward the real response but cut the body short, cleanly, with no `Content-Length` to compare against |
 | `drop` | Cut the body short, keep the real `Content-Length`, and abort the connection with a TCP reset |
-| `stall` | Delay past the client's timeout |
+| `stall` | Hold the connection past the client's timeout, then close it unanswered — an ordinary close, not `drop`'s reset — and never forward it, so a stalled request does not reach RomM at all (#109) |
 
 Scenarios can target a path prefix, skip the first N matching requests
 (`after`), and apply a fixed number of times before auto-disarming (`count`), so
@@ -399,10 +399,11 @@ ctest --test-dir build --output-on-failure
   `ok()` tells them apart; a clean short
   body is a named `json` error and no plan; a stall times out, is retried, and
   the backoff doubles. The wait is injected rather than slept, so `stalled`
-  proves the backoff without spending it — and it asserts the retry as a
-  *property* (at least one, each wait double the last) rather than an exact
-  count, because the proxy's abandoned stall thread answers late and how many
-  stalls a client actually meets is a race with its own timeout. `refused`
+  proves the backoff without spending it — and it asserts an exact
+  `attempts == 3`: two stalls armed against a budget of three, so two are
+  retried past and the third lands. That was a hedged "at least one" until
+  #109, because the proxy replayed a stalled request after the client had
+  given up and how many stalls a client actually met was a scheduling race. `refused`
   covers the answers that are not "the network" at all: a 404 carrying RomM's
   `Device with ID … not found`, the plain `Not Found` a wrong `server_url`
   produces — which must **not** be read as a deleted device, since re-pairing
@@ -457,7 +458,11 @@ ctest --test-dir build --output-on-failure
   rom, then a `Range` resume, compared **byte for byte** against the file RomM
   is serving), `truncate` (a clean short body over a save — caught only by the
   caller's own expected size, which the scenario proves by showing the same body
-  accepted without one), `stall`, `multifile` (the two-disc fixture: the zip with
+  accepted without one), `stall`, `stall_dropped` (the other half of the same
+  claim, and the one that needs the server to answer it: after a stalled request
+  the client abandoned, RomM must hold no new save row and no new sync session —
+  it fails against a proxy that forwards one, which is what #109 was),
+  `multifile` (the two-disc fixture: the zip with
   no length, the rom digest that is neither disc's, the unscoped `/files/content/`
   id, the `?file_ids=` route a v2 would take, and the nested single-file rom the
   skip must not fire on), `backup`, and `content_hash` (M2-3's digest, checked
