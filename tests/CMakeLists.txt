@@ -656,6 +656,59 @@ foreach(scenario IN LISTS HARNESS_SCENARIOS)
   set_tests_properties(harness.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 endforeach()
 
+# --- M2-8: save states, which the server does not arbitrate ------------------
+# The other M2 suites can lean on RomM to be right -- negotiate hands back an
+# `action` and the client obeys. There is no negotiate for a state, so what these
+# pin is the client's own policy, and the failure it is written against is the
+# one an obvious implementation makes: `POST /api/states` upserts on
+# `(rom_id, file_name)`, so posting a local state over a name the server already
+# holds destroys somebody's session and RomM answers 200.
+#
+# The four unit scenarios are deliberately NOT skippable. `silent` is the
+# off-by-default promise -- no directory read, no request sent -- and it is the
+# one that has to stay checked with docker stopped, because a console reading
+# state folders the user never opted into is silent in every other way. `naming`
+# is the backup path a state has no slot to build from, `scanning` is the
+# ambiguity and duplicate-name rules, and `decides` is the whole decision table
+# including every keep-both branch.
+add_executable(test_state_sync test_state_sync.cpp)
+target_link_libraries(test_state_sync PRIVATE rommsync::host)
+target_include_directories(test_state_sync PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_state_sync PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+
+set(STATES_UNIT_SCENARIOS
+  silent    # sync.states = false reads no directory and sends no request
+  naming    # a state has no slot, so its backup name is built from its own name
+  scanning  # an ambiguous state is skipped, and two of one name are one state
+  decides   # the decision table, keep-both branches included
+)
+foreach(scenario IN LISTS STATES_UNIT_SCENARIOS)
+  add_test(NAME states.${scenario} COMMAND test_state_sync ${scenario})
+  set_tests_properties(states.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
+set(STATES_RIG_SCENARIOS
+  upsert     # POST /api/states replaces the row with that name, in place
+  roundtrip  # local -> server -> a second sandbox -> identical bytes
+  overwrite  # the server's copy moved: back up first, then replace
+  truncate   # a clean short body never replaces a local state
+  keeps_both # both sides moved: nothing is transferred, both survive
+)
+foreach(scenario IN LISTS STATES_RIG_SCENARIOS)
+  add_test(NAME states.${scenario} COMMAND test_state_sync ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(states.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  # RUN_SERIAL for the reason every rig test has it: the fault proxy holds one
+  # armed scenario for every client, and these upload and delete states on the
+  # shared fixture, so two at once would read each other's listing -- which for
+  # states is the whole input to the decision.
+  set_tests_properties(states.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+endforeach()
+
 # --- step 3: completing the session and committing the baseline --------------
 # M2-6. `complete` is accounting rather than a commit point -- the transfers
 # already landed on the server -- so what these prove is that the counts are

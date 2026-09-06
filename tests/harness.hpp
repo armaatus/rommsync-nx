@@ -51,10 +51,12 @@
 #include "rig.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/sync.hpp"
+#include "rommsync/state_sync.hpp"
 #include "rommsync/sync_execute.hpp"
 
 namespace harness {
 
+namespace auth = rommsync::auth;
 namespace http = rommsync::http;
 namespace json = rommsync::json;
 namespace sync = rommsync::sync;
@@ -69,11 +71,17 @@ namespace sync = rommsync::sync;
 inline constexpr const char* kConfigDir = "/config/rommsync";
 inline constexpr const char* kBackupDir = "/config/rommsync/.backup";
 inline constexpr const char* kSavesDir = "/retroarch/saves";
+inline constexpr const char* kStatesDir = "/retroarch/states";
 
 /// A save path on the card. `/retroarch/saves` is a real entry in the default
 /// folder map (config.cpp), not a path invented by a test.
 inline std::string SavePath(const std::string& file_name) {
   return std::string(kSavesDir) + "/" + file_name;
+}
+
+/// The same for a save state. `/retroarch/states` is the other real entry.
+inline std::string StatePath(const std::string& file_name) {
+  return std::string(kStatesDir) + "/" + file_name;
 }
 
 /// Wait long enough that two server timestamps are distinguishable.
@@ -119,6 +127,7 @@ class Sandbox {
     MakeDirs(kConfigDir);
     MakeDirs(kBackupDir);
     MakeDirs(kSavesDir);
+    MakeDirs(kStatesDir);
   }
 
   ~Sandbox() {
@@ -185,6 +194,33 @@ class Sandbox {
     return Write(sd_path, bytes);
   }
 
+  /// Replace the bytes a seeded file is judged against.
+  ///
+  /// For the scenario that *itself* edits a file it seeded -- a state the player
+  /// carried on playing -- where the audit would otherwise demand a backup of
+  /// bytes the test replaced rather than the code under test. The rule stays in
+  /// force from the new bytes onwards.
+  bool Reseed(std::string_view sd_path, std::string_view bytes) {
+    for (Baseline& seeded : baselines_) {
+      if (seeded.sd_path == sd_path) {
+        seeded.bytes = std::string(bytes);
+        return Write(sd_path, bytes);
+      }
+    }
+    return SeedSave(sd_path, bytes);
+  }
+
+  /// The same for a save state, and audited by exactly the same rule.
+  ///
+  /// It is a separate name rather than a second call to `SeedSave` because the
+  /// audit is what M2-8 had to extend: hard rule 2 is about "a save file", and a
+  /// state is one -- a snapshot of a core's memory that a player expects to load
+  /// again. A state overwritten with no backup under `.backup/` fails this
+  /// teardown exactly as a `.srm` does.
+  bool SeedState(std::string_view sd_path, std::string_view bytes) {
+    return SeedSave(sd_path, bytes);
+  }
+
   /// The hard rule from docs/SYNC_PROTOCOL.md, checked rather than assumed:
   /// **every seeded save whose bytes are no longer the bytes it started with
   /// must have those previous bytes under `.backup/`.**
@@ -240,6 +276,16 @@ class Sandbox {
                             std::string_view file_name) const {
     const std::int64_t now = sync::UnixSeconds(std::chrono::system_clock::now());
     return std::string(kBackupDir) + "/" + sync::BackupFileName(rom_id, slot, file_name, now);
+  }
+
+  /// ...and where a *state's* backup goes. A state has no slot, so the middle
+  /// segment is `sync::StateBackupDiscriminator`'s -- see sync_execute.hpp for
+  /// why passing a null slot instead would make every state of one rom share a
+  /// name.
+  std::string StateBackupPathFor(std::int64_t rom_id, std::string_view file_name) const {
+    const std::int64_t now = sync::UnixSeconds(std::chrono::system_clock::now());
+    return std::string(kBackupDir) + "/" +
+           sync::BackupNameFor(rom_id, sync::StateBackupDiscriminator(file_name), file_name, now);
   }
 
  private:
@@ -608,6 +654,78 @@ inline void DeleteSave(http::HttpClient& client, const std::string& base, const 
   if (save_id != 0) {
     PostJson(client, base + "/api/saves/delete", fixture,
              "{\"saves\":[" + std::to_string(save_id) + "]}");
+  }
+}
+
+// --- save states --------------------------------------------------------------
+//
+// Deliberately thin, and deliberately not built on the save helpers above:
+// `/api/states` is a different contract, and the differences are the point.
+// There is no `slot`, no `device_id`, no `session_id` and no `overwrite` -- and
+// `POST /api/states` **upserts on `(rom_id, file_name)`**, so these helpers are
+// how a scenario arranges "another console moved the server's copy" without
+// going through the client's own policy.
+
+/// `POST /api/states`, streaming `local_path` as the `stateFile` part.
+///
+/// `out_id` is the row it landed on, which for a name the rom already has is the
+/// row that was already there -- see `states.upsert`.
+inline bool UploadState(::checks::Checks& checks, http::HttpClient& client,
+                        const std::string& base, const Fixture& fixture, std::int64_t rom_id,
+                        const std::string& emulator, const std::string& local_path,
+                        const std::string& file_name, sync::ServerState* out) {
+  const std::string url = base + "/api/states?rom_id=" + std::to_string(rom_id) +
+                          "&emulator=" + UrlEncode(emulator);
+  http::Request request = Authed(http::Method::kPost, url, fixture);
+  http::FormPart part;
+  part.name = "stateFile";
+  part.file_path = local_path;
+  part.file_name = file_name;
+  part.content_type = "application/octet-stream";
+  request.form.push_back(part);
+
+  const http::Result result = client.Send(request);
+  if (!result.successful()) {
+    checks.Expect(false, "the harness could not upload a state: HTTP " +
+                             std::to_string(result.response.status));
+    return false;
+  }
+  // The engine's own reader, not a second copy of it: a harness that read the
+  // row differently could hide a drift the client would meet.
+  const auth::Parsed<sync::ServerState> parsed = sync::ParseState(result.response.body);
+  if (!parsed.ok()) {
+    checks.Expect(false, "the harness could not read the state row: " + parsed.error.Describe());
+    return false;
+  }
+  *out = parsed.value;
+  return true;
+}
+
+/// `GET /api/states?rom_id=` -- what the server holds for one rom.
+inline std::vector<sync::ServerState> ListStates(::checks::Checks& checks,
+                                                 http::HttpClient& client, const std::string& base,
+                                                 const Fixture& fixture, std::int64_t rom_id) {
+  const http::Result result = client.Send(Authed(
+      http::Method::kGet, base + "/api/states?rom_id=" + std::to_string(rom_id), fixture));
+  if (!result.successful()) {
+    checks.Expect(false, "the harness could not list states: HTTP " +
+                             std::to_string(result.response.status));
+    return {};
+  }
+  const auth::Parsed<std::vector<sync::ServerState>> parsed =
+      sync::ParseStateList(result.response.body);
+  checks.Expect(parsed.ok(), "the harness could read the state listing: " + parsed.error.Describe());
+  return parsed.value;
+}
+
+/// `POST /api/states/delete`. The client never calls this -- "never delete a
+/// state" is its policy -- so it exists only to leave the fixture as it was
+/// found.
+inline void DeleteState(http::HttpClient& client, const std::string& base, const Fixture& fixture,
+                        std::int64_t state_id) {
+  if (state_id != 0) {
+    PostJson(client, base + "/api/states/delete", fixture,
+             "{\"states\":[" + std::to_string(state_id) + "]}");
   }
 }
 

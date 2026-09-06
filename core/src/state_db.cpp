@@ -117,6 +117,66 @@ bool Usable(const SaveRecord& record, std::string* why) {
   return true;
 }
 
+/// The bar a state row is held to, in both directions and for `Usable`'s
+/// reasons.
+///
+/// It differs from a save's in the two places the kinds differ: the key is
+/// `(rom_id, file_name)` rather than `(rom_id, slot)`, and the server half is
+/// *required* -- a state row exists only because a transfer landed, so a row
+/// naming no server state is a row nothing can arbitrate against.
+bool Usable(const StateRecord& record, std::string* why) {
+  if (record.rom_id <= 0) {
+    *why = "rom_id must be a positive RomM rom id";
+    return false;
+  }
+  if (record.file_name.empty() || record.file_name.find('\0') != std::string::npos) {
+    // Emptiness is checked here rather than left to `IsSingleFileName`, which
+    // accepts it -- for a save, `sync::Validate` is what refuses an empty name,
+    // and a state never goes through one. A NUL for `Usable(SaveRecord)`'s
+    // reason: every C API downstream stops at it, so the value that gets used
+    // would not be the value that was validated.
+    *why = "file_name must be a name; a row is keyed on it";
+    return false;
+  }
+  if (!sync::IsSingleFileName(record.file_name)) {
+    // A name with a separator in it would be read back as the pairing key and
+    // then joined into a URL and a backup path. `sync::IsSingleFileName` is the
+    // same bar `ClientSaveState::file_name` is held to.
+    *why = "file_name must be a single file name, not a path";
+    return false;
+  }
+  if (record.emulator.find('\0') != std::string::npos) {
+    *why = "emulator carries a NUL";
+    return false;
+  }
+  if (!LowercaseHexDigest(record.content_hash)) {
+    *why = "content_hash must be " + std::to_string(sync::kContentHashDigits) +
+           " lowercase hex digits (MD5)";
+    return false;
+  }
+  if (!SecondsInRange(sync::UnixSeconds(record.mtime))) {
+    *why = "mtime is outside the range a state can claim";
+    return false;
+  }
+  if (record.file_size_bytes < 0) {
+    *why = "file_size_bytes is negative";
+    return false;
+  }
+  if (record.server_state_id <= 0) {
+    *why = "server_state_id must be the positive id of the RomM state row this is paired with";
+    return false;
+  }
+  if (!SecondsInRange(sync::UnixSeconds(record.server_updated_at))) {
+    *why = "server_updated_at is outside the range a state can claim";
+    return false;
+  }
+  if (record.server_file_size_bytes < 0) {
+    *why = "server_file_size_bytes is negative";
+    return false;
+  }
+  return true;
+}
+
 std::string SerializeRecord(const SaveRecord& record) {
   std::string out("{\"rom_id\":");
   out += std::to_string(record.rom_id);
@@ -139,6 +199,35 @@ std::string SerializeRecord(const SaveRecord& record) {
   out += ",\"server_content_hash\":";
   out += record.server_content_hash.has_value() ? json::Quote(*record.server_content_hash)
                                                 : std::string("null");
+  out += "}";
+  return out;
+}
+
+/// A state row. `"kind"` comes first so a reader can see what it is holding
+/// before it reads anything else, and a save row carries no `kind` at all --
+/// which keeps it byte-identical to the v1 row it replaced (state_db.hpp).
+std::string SerializeRecord(const StateRecord& record) {
+  std::string out("{\"kind\":\"state\",\"rom_id\":");
+  out += std::to_string(record.rom_id);
+  out += ",\"file_name\":";
+  out += json::Quote(record.file_name);
+  out += ",\"emulator\":";
+  // `null` rather than `""`, for the reason `sync::Validate` refuses the empty
+  // string: "the directory implied no emulator" is an answer, and a reader that
+  // could not tell it from an emulator called nothing would have to guess.
+  out += record.emulator.empty() ? std::string("null") : json::Quote(record.emulator);
+  out += ",\"content_hash\":";
+  out += json::Quote(record.content_hash);
+  out += ",\"mtime\":";
+  out += std::to_string(sync::UnixSeconds(record.mtime));
+  out += ",\"file_size_bytes\":";
+  out += std::to_string(record.file_size_bytes);
+  out += ",\"server_state_id\":";
+  out += std::to_string(record.server_state_id);
+  out += ",\"server_updated_at\":";
+  out += std::to_string(sync::UnixSeconds(record.server_updated_at));
+  out += ",\"server_file_size_bytes\":";
+  out += std::to_string(record.server_file_size_bytes);
   out += "}";
   return out;
 }
@@ -167,16 +256,10 @@ bool ReadNullableSeconds(const json::Value& object, std::string_view key,
   return true;
 }
 
-bool ParseRecord(std::string_view line, SaveRecord* out, std::string* why) {
-  const json::ParseResult document = json::Parse(line);
-  if (!document.ok()) {
-    *why = document.error.Describe();
-    return false;
-  }
-
+bool ParseSaveRecord(const json::Value& object, SaveRecord* out, std::string* why) {
   SaveRecord record;
   std::int64_t mtime = 0;
-  json::Reader reader(document.value, "state row");
+  json::Reader reader(object, "state row");
   reader.Required("rom_id", &record.rom_id);
   reader.RequiredNullable("slot", &record.slot);
   reader.Required("content_hash", &record.content_hash);
@@ -196,7 +279,7 @@ bool ParseRecord(std::string_view line, SaveRecord* out, std::string* why) {
     return false;
   }
   record.mtime = FromUnixSeconds(mtime);
-  if (!ReadNullableSeconds(document.value, "server_updated_at", &record.server_updated_at, why)) {
+  if (!ReadNullableSeconds(object, "server_updated_at", &record.server_updated_at, why)) {
     return false;
   }
   if (!Usable(record, why)) {
@@ -205,6 +288,67 @@ bool ParseRecord(std::string_view line, SaveRecord* out, std::string* why) {
 
   *out = std::move(record);
   return true;
+}
+
+bool ParseStateRecord(const json::Value& object, StateRecord* out, std::string* why) {
+  StateRecord record;
+  std::int64_t mtime = 0;
+  std::int64_t server_updated_at = 0;
+  std::optional<std::string> emulator;
+  json::Reader reader(object, "state row");
+  reader.Required("rom_id", &record.rom_id);
+  reader.Required("file_name", &record.file_name);
+  reader.RequiredNullable("emulator", &emulator);
+  reader.Required("content_hash", &record.content_hash);
+  reader.Required("mtime", &mtime);
+  reader.Required("file_size_bytes", &record.file_size_bytes);
+  reader.Required("server_state_id", &record.server_state_id);
+  reader.Required("server_updated_at", &server_updated_at);
+  reader.Required("server_file_size_bytes", &record.server_file_size_bytes);
+  if (!reader.ok()) {
+    *why = reader.error().Describe();
+    return false;
+  }
+  // Both before the conversion, never after: see `SecondsInRange`.
+  if (!SecondsInRange(mtime)) {
+    *why = "field mtime: outside the range a state can claim";
+    return false;
+  }
+  if (!SecondsInRange(server_updated_at)) {
+    *why = "field server_updated_at: outside the range a state can claim";
+    return false;
+  }
+  record.mtime = FromUnixSeconds(mtime);
+  record.server_updated_at = FromUnixSeconds(server_updated_at);
+  record.emulator = emulator.value_or(std::string());
+  if (!Usable(record, why)) {
+    return false;
+  }
+  *out = std::move(record);
+  return true;
+}
+
+/// Which kind of row a line holds, or a reason it holds neither.
+///
+/// An absent `kind` is a save; `"state"` is a state. Anything else is a row this
+/// build cannot read, and -- like every other unreadable row here -- it discards
+/// the whole file rather than half-understanding it.
+enum class RowKind { kSave, kState, kUnknown };
+
+RowKind KindOf(const json::Value& object, std::string* why) {
+  const json::Value* kind = object.Find("kind");
+  if (kind == nullptr) {
+    return RowKind::kSave;
+  }
+  if (!kind->is_string()) {
+    *why = "field kind: expected a string";
+    return RowKind::kUnknown;
+  }
+  if (kind->string() == "state") {
+    return RowKind::kState;
+  }
+  *why = "field kind: \"" + kind->string() + "\" is not a kind of row this build knows";
+  return RowKind::kUnknown;
 }
 
 /// The version line a well-formed file opens with.
@@ -248,6 +392,20 @@ bool Baseline::Erase(std::int64_t rom_id, const std::optional<std::string>& slot
   return rows_.erase(Key{rom_id, slot}) != 0;
 }
 
+const StateRecord* Baseline::FindState(std::int64_t rom_id, std::string_view file_name) const {
+  const auto found = states_.find(StateKey{rom_id, std::string(file_name)});
+  return found == states_.end() ? nullptr : &found->second;
+}
+
+void Baseline::SetState(StateRecord record) {
+  const StateKey key{record.rom_id, record.file_name};
+  states_[key] = std::move(record);
+}
+
+bool Baseline::EraseState(std::int64_t rom_id, std::string_view file_name) {
+  return states_.erase(StateKey{rom_id, std::string(file_name)}) != 0;
+}
+
 std::string LoadedBaseline::DescribeDiagnostics() const {
   std::string out;
   for (const std::string& diagnostic : diagnostics) {
@@ -289,6 +447,14 @@ std::string SerializeBaseline(const Baseline& baseline) {
   std::string out = FormatHeader();
   out += "\n";
   for (const auto& [key, record] : baseline.rows()) {
+    (void)key;
+    out += SerializeRecord(record);
+    out += "\n";
+  }
+  // States after saves, in their own key order. The two blocks are stable and
+  // never interleave, so a baseline rewritten with nothing changed still
+  // produces byte-identical contents.
+  for (const auto& [key, record] : baseline.state_rows()) {
     (void)key;
     out += SerializeRecord(record);
     out += "\n";
@@ -338,18 +504,46 @@ LoadedBaseline ParseBaseline(std::string_view text) {
       Add(&complaints, "state.db line " + std::to_string(at + 1) + " is blank");
       continue;
     }
-    SaveRecord record;
+    const json::ParseResult document = json::Parse(lines[at]);
+    if (!document.ok()) {
+      Add(&complaints,
+          "state.db line " + std::to_string(at + 1) + ": " + document.error.Describe());
+      continue;
+    }
     std::string why;
-    if (!ParseRecord(lines[at], &record, &why)) {
-      Add(&complaints, "state.db line " + std::to_string(at + 1) + ": " + why);
-      continue;
+    switch (KindOf(document.value, &why)) {
+      case RowKind::kSave: {
+        SaveRecord record;
+        if (!ParseSaveRecord(document.value, &record, &why)) {
+          Add(&complaints, "state.db line " + std::to_string(at + 1) + ": " + why);
+          continue;
+        }
+        if (baseline.Find(record.rom_id, record.slot) != nullptr) {
+          Add(&complaints, "state.db line " + std::to_string(at + 1) +
+                               ": a second row for the same (rom_id, slot)");
+          continue;
+        }
+        baseline.Set(std::move(record));
+        break;
+      }
+      case RowKind::kState: {
+        StateRecord record;
+        if (!ParseStateRecord(document.value, &record, &why)) {
+          Add(&complaints, "state.db line " + std::to_string(at + 1) + ": " + why);
+          continue;
+        }
+        if (baseline.FindState(record.rom_id, record.file_name) != nullptr) {
+          Add(&complaints, "state.db line " + std::to_string(at + 1) +
+                               ": a second row for the same (rom_id, file_name) state");
+          continue;
+        }
+        baseline.SetState(std::move(record));
+        break;
+      }
+      case RowKind::kUnknown:
+        Add(&complaints, "state.db line " + std::to_string(at + 1) + ": " + why);
+        continue;
     }
-    if (baseline.Find(record.rom_id, record.slot) != nullptr) {
-      Add(&complaints, "state.db line " + std::to_string(at + 1) +
-                           ": a second row for the same (rom_id, slot)");
-      continue;
-    }
-    baseline.Set(std::move(record));
   }
 
   if (!complaints.empty()) {
@@ -451,6 +645,17 @@ StoreResult SaveBaseline(const std::string& path, const Baseline& baseline) {
     }
     writable.Set(record);
   }
+  for (const auto& [key, record] : baseline.state_rows()) {
+    (void)key;
+    std::string why;
+    if (!Usable(record, &why)) {
+      Add(&result.skipped, "rom " + std::to_string(record.rom_id) + " state \"" +
+                               record.file_name + "\": " + why +
+                               "; this state is hashed again next tick");
+      continue;
+    }
+    writable.SetState(record);
+  }
 
   // The file-level bounds *are* refusals: a file over either of them is one
   // `ParseBaseline` discards whole, so writing it would trade one loud failure
@@ -534,6 +739,56 @@ HashOutcome ContentHashFor(const Baseline& baseline, std::int64_t rom_id,
     return outcome;
   }
   return HashFile(path);
+}
+
+HashOutcome ContentHashForState(const Baseline& baseline, std::int64_t rom_id,
+                                std::string_view file_name, const std::string& path,
+                                sync::Timestamp mtime, std::int64_t file_size_bytes) {
+  const StateRecord* stored = baseline.FindState(rom_id, file_name);
+  // Both, not either -- `ContentHashFor`'s reasoning, and it matters more here:
+  // a state is tens of megabytes, so a stale digest costs a needless upload of
+  // all of them.
+  if (stored != nullptr && sync::UnixSeconds(stored->mtime) == sync::UnixSeconds(mtime) &&
+      stored->file_size_bytes == file_size_bytes) {
+    HashOutcome outcome;
+    outcome.content_hash = stored->content_hash;
+    outcome.reused = true;
+    return outcome;
+  }
+  return HashFile(path);
+}
+
+bool ReadBackFile(fs::FileSystem& files, fs::Directories& directories, const std::string& sd_path,
+                  FileFacts* out, std::string* why) {
+  if (sd_path.empty()) {
+    *why = "the operation named no local file";
+    return false;
+  }
+  const fs::Entry* entry = directories.Find(sd_path, why);
+  if (entry == nullptr) {
+    return false;
+  }
+  if (!SecondsInRange(entry->modified_unix)) {
+    // The same window `sync::Validate` holds a save's mtime to. `SaveBaseline`
+    // would skip the row anyway; refusing it here is what names the file.
+    *why = "its mtime of " + std::to_string(entry->modified_unix) +
+           " is not one this client can claim";
+    return false;
+  }
+  const std::string resolved = files.Resolve(sd_path);
+  if (resolved.empty()) {
+    *why = sd_path + " is not a path on this card";
+    return false;
+  }
+  const HashOutcome hashed = HashFile(resolved);
+  if (!hashed.ok()) {
+    *why = hashed.message;
+    return false;
+  }
+  out->content_hash = hashed.content_hash;
+  out->mtime = FromUnixSeconds(entry->modified_unix);
+  out->file_size_bytes = entry->size_bytes;
+  return true;
 }
 
 }  // namespace rommsync::state

@@ -96,6 +96,29 @@ state::SaveRecord NoHistory() {
   return record;
 }
 
+/// The version line this build writes. Derived rather than spelled, so a bump
+/// moves every fixture below with it -- and the ones that are deliberately
+/// *not* this version are spelled out, because that is what they are testing.
+std::string Header() {
+  return std::string(state::kFormatMagic) + " " + std::to_string(state::kFormatVersion) + "\n";
+}
+
+/// A state row with every field populated. Every one of them is required: a
+/// state row exists only because a transfer landed (state_db.hpp).
+state::StateRecord FullState() {
+  state::StateRecord record;
+  record.rom_id = 12;
+  record.file_name = "Game (USA).state";
+  record.emulator = "retroarch";
+  record.content_hash = crypto::Md5Hex("Game (USA).state contents");
+  record.mtime = At(1757000100);
+  record.file_size_bytes = 4 * 1024 * 1024;
+  record.server_state_id = 7;
+  record.server_updated_at = At(1757000090);
+  record.server_file_size_bytes = 4 * 1024 * 1024;
+  return record;
+}
+
 bool Mentions(const state::LoadedBaseline& loaded, const std::string& fragment) {
   return loaded.DescribeDiagnostics().find(fragment) != std::string::npos;
 }
@@ -144,6 +167,133 @@ void EveryFieldRoundTrips(checks::Checks& c) {
 /// A slot is user data. RomM takes whatever the client sends, and a filesystem
 /// allows a tab, a quote and a backslash in a name -- which is the whole reason
 /// the rows are JSON rather than a separator-delimited record.
+/// The version bump's whole point: a state row and a save row in one file,
+/// keyed on different things, neither able to be read as the other.
+void StateRowsAreTheirOwnKind(checks::Checks& c) {
+  state::Baseline baseline;
+  baseline.Set(Full());
+  baseline.Set(NoHistory());
+  baseline.SetState(FullState());
+
+  // The pair a state is keyed on, spelled to collide with the save's if the two
+  // ever shared a key: same rom, and a name whose base is the save's slot.
+  state::StateRecord second = FullState();
+  second.file_name = "autosave";
+  second.server_state_id = 8;
+  baseline.SetState(second);
+
+  const std::string text = state::SerializeBaseline(baseline);
+  c.Expect(text.find("\"kind\":\"state\"") != std::string::npos,
+           "a state row carries its kind");
+  c.Expect(text.find("{\"rom_id\":12,\"slot\":\"autosave\"") != std::string::npos,
+           "and a save row carries none, so it is the v1 row it replaced");
+
+  const state::LoadedBaseline loaded = state::ParseBaseline(text);
+  c.Expect(loaded.diagnostics.empty(),
+           "the two kinds round-trip together -- " + loaded.DescribeDiagnostics());
+  c.ExpectEq(loaded.value.rows().size(), std::size_t{2}, "both save rows came back");
+  c.ExpectEq(loaded.value.state_rows().size(), std::size_t{2}, "and both state rows");
+  c.ExpectEq(loaded.value.size(), std::size_t{4}, "size() is what kMaxRecords bounds: the file");
+
+  const state::StateRecord* found = loaded.value.FindState(12, "Game (USA).state");
+  c.Expect(found != nullptr, "a state is found by (rom_id, file_name)");
+  if (found != nullptr) {
+    c.ExpectEq(found->emulator, std::string("retroarch"), "its emulator survives");
+    c.ExpectEq(found->server_state_id, std::int64_t{7}, "and the row it is paired with");
+    c.ExpectEq(sync::UnixSeconds(found->server_updated_at), std::int64_t{1757000090},
+               "and the instant that row was last at");
+    c.ExpectEq(found->server_file_size_bytes, std::int64_t{4 * 1024 * 1024},
+               "and the size it was then");
+  }
+
+  // The collision the version bump exists to prevent: the save whose slot is
+  // `autosave` and the state whose *name* is `autosave` are two rows, and
+  // neither lookup finds the other.
+  c.Expect(loaded.value.Find(12, std::optional<std::string>("autosave")) != nullptr,
+           "the save keyed on the slot autosave is still there");
+  c.Expect(loaded.value.FindState(12, "autosave") != nullptr,
+           "and so is the state whose file name is autosave");
+  c.Expect(loaded.value.FindState(12, "Game (USA).srm") == nullptr,
+           "a save's file name is not a state key");
+
+  state::Baseline pruned = loaded.value;
+  c.Expect(pruned.EraseState(12, "autosave"), "a state row can be dropped");
+  c.Expect(pruned.FindState(12, "autosave") == nullptr, "and is then gone");
+  c.Expect(pruned.Find(12, std::optional<std::string>("autosave")) != nullptr,
+           "and dropping it left the save alone");
+}
+
+/// A state row the writer would not read back is skipped, and the rest of the
+/// file is written -- `SkipsARowItCouldNotReadBack`'s rule, over the fields only
+/// a state has.
+void SkipsAStateRowItCouldNotReadBack(checks::Checks& c) {
+  struct Case {
+    const char* what;
+    state::StateRecord record;
+  };
+  auto with = [](auto&& mutate) {
+    state::StateRecord record = FullState();
+    mutate(record);
+    return record;
+  };
+  const Case kCases[] = {
+      {"a rom id that is not one", with([](state::StateRecord& r) { r.rom_id = 0; })},
+      {"a name that is a path",
+       with([](state::StateRecord& r) { r.file_name = "sub/Game.state"; })},
+      {"a name that is empty", with([](state::StateRecord& r) { r.file_name.clear(); })},
+      {"a SHA1 where the MD5 goes",
+       with([](state::StateRecord& r) { r.content_hash = std::string(40, 'a'); })},
+      {"an unset clock", with([](state::StateRecord& r) { r.mtime = At(0); })},
+      // The one a save row is allowed and a state row is not: with no server
+      // row there is nothing to arbitrate against, so there is no row to write.
+      {"no server row", with([](state::StateRecord& r) { r.server_state_id = 0; })},
+      {"a server instant a state cannot claim",
+       with([](state::StateRecord& r) { r.server_updated_at = At(0); })},
+  };
+
+  for (const Case& one : kCases) {
+    state::Baseline baseline;
+    baseline.Set(Full());
+    baseline.SetState(one.record);
+    const std::string path = FreshPath("skips-state.db").string();
+    const state::StoreResult stored = state::SaveBaseline(path, baseline);
+    c.Expect(stored.ok(), std::string("the file is still written with ") + one.what);
+    c.ExpectEq(stored.rows_written, std::size_t{1},
+               std::string("only the save reached it with ") + one.what);
+    c.Expect(!stored.skipped.empty(), std::string("and the skip is named with ") + one.what);
+  }
+}
+
+/// The digest reuse a state gets, which is the same rule and a different key.
+void AnUnchangedStateIsNotRehashed(checks::Checks& c) {
+  const std::filesystem::path file = ScratchDir() / "unchanged.state";
+  WriteWhole(file.string(), "a save state, or near enough");
+  const state::HashOutcome fresh = state::HashFile(file.string());
+  c.Expect(fresh.ok(), "the state hashes");
+
+  state::StateRecord row = FullState();
+  row.content_hash = fresh.content_hash;
+  row.mtime = At(1757000200);
+  row.file_size_bytes = 28;
+  state::Baseline baseline;
+  baseline.SetState(row);
+
+  const state::HashOutcome reused = state::ContentHashForState(
+      baseline, row.rom_id, row.file_name, file.string(), row.mtime, row.file_size_bytes);
+  c.Expect(reused.reused, "an unchanged state is not re-opened");
+  c.ExpectEq(reused.content_hash, fresh.content_hash, "and answers the stored digest");
+
+  const state::HashOutcome moved = state::ContentHashForState(
+      baseline, row.rom_id, row.file_name, file.string(), At(1757000201), row.file_size_bytes);
+  c.Expect(!moved.reused, "a new mtime is re-hashed");
+  const state::HashOutcome resized = state::ContentHashForState(
+      baseline, row.rom_id, row.file_name, file.string(), row.mtime, row.file_size_bytes + 1);
+  c.Expect(!resized.reused, "and so is a new size, at the same mtime");
+  const state::HashOutcome other = state::ContentHashForState(
+      baseline, row.rom_id, "Another.state", file.string(), row.mtime, row.file_size_bytes);
+  c.Expect(!other.reused, "and a different name is a different state");
+}
+
 void AwkwardSlotsSurvive(checks::Checks& c) {
   state::Baseline baseline;
   for (const std::string& slot : {std::string("with\ttab"), std::string("with\"quote"),
@@ -345,6 +495,36 @@ void TheTwoBoundsAgree(checks::Checks& c) {
                std::to_string(state::kMaxStateBytes));
   c.Expect(state::ParseBaseline(text).diagnostics.empty(),
            "and a full baseline reads back clean");
+
+  // ...and the same claim for the worst mix the scan bounds can actually
+  // produce, because `kMaxRecords` is the budget for saves *and* states and a
+  // state row is the longer of the two -- it carries a file name and an
+  // emulator where a save carries a slot. `scan::kMaxStates` states plus enough
+  // saves to reach the row bound is the file `sync::TrimStates` trims down to,
+  // so it is the one that has to fit.
+  constexpr std::size_t kStates = state::kMaxRecords / 4;  // scan::kMaxStates
+  state::Baseline mixed;
+  for (std::size_t at = 0; at < state::kMaxRecords - kStates; ++at) {
+    state::SaveRecord record = Full();
+    record.rom_id = static_cast<std::int64_t>(at) + 1;
+    record.slot = "autosave-" + std::string(23, 'x');
+    mixed.Set(record);
+  }
+  for (std::size_t at = 0; at < kStates; ++at) {
+    state::StateRecord record = FullState();
+    record.rom_id = static_cast<std::int64_t>(at) + 1;
+    // A name longer than any real one, so the headroom is real -- "Super Game
+    // Bros. 3 (USA) (Rev 1).state" is thirty-eight characters.
+    record.file_name = "Game (USA) (Rev 1) " + std::string(24, 'x') + ".state";
+    mixed.SetState(record);
+  }
+  const std::string mixed_text = state::SerializeBaseline(mixed);
+  c.ExpectEq(mixed.size(), state::kMaxRecords, "the mix is exactly a full baseline");
+  c.Expect(mixed_text.size() <= state::kMaxStateBytes,
+           "a full baseline of saves and states fits too -- " + std::to_string(mixed_text.size()) +
+               " vs " + std::to_string(state::kMaxStateBytes));
+  c.Expect(state::ParseBaseline(mixed_text).diagnostics.empty(),
+           "and a full mixed baseline reads back clean");
 }
 
 void NamesAMissingDirectory(checks::Checks& c) {
@@ -379,20 +559,30 @@ void CorruptFilesAreAnEmptyBaselineAndADiagnostic(checks::Checks& c) {
   const Case kCases[] = {
       {"an empty file", ""},
       {"no version line", good.substr(good.find('\n') + 1)},
-      {"a future version", "rommsync-state 2\n"},
+      {"a future version",
+       "rommsync-state " + std::to_string(state::kFormatVersion + 1) + "\n"},
+      // The one that will actually happen: an upgrade meets the v1 file the
+      // release before it wrote. state_db.hpp calls this the designed cost of
+      // the version line -- a re-hash, once -- rather than a migration.
+      {"a version 1 file, from before states",
+       "rommsync-state 1\n{\"rom_id\":12,\"slot\":null,\"content_hash\":\"" + crypto::Md5Hex("x") +
+           "\",\"mtime\":1757000000,\"file_size_bytes\":1,\"server_updated_at\":null,"
+           "\"server_content_hash\":null}\n"},
+      {"a row whose kind this build does not know",
+       Header() + "{\"kind\":\"screenshot\",\"rom_id\":12}\n"},
       {"a truncated header", "rommsync-sta"},
-      {"a row that is not JSON", "rommsync-state 1\n{\"rom_id\":12,\n"},
+      {"a row that is not JSON", Header() + "{\"rom_id\":12,\n"},
       {"a row cut off mid-line", good.substr(0, good.size() - 20)},
       {"a field of the wrong type",
-       "rommsync-state 1\n{\"rom_id\":\"12\",\"slot\":null,\"content_hash\":\"" +
+       Header() + "{\"rom_id\":\"12\",\"slot\":null,\"content_hash\":\"" +
            crypto::Md5Hex("x") +
            "\",\"mtime\":1757000000,\"file_size_bytes\":1,\"server_updated_at\":null,"
            "\"server_content_hash\":null}\n"},
       {"a missing field",
-       "rommsync-state 1\n{\"rom_id\":12,\"slot\":null,\"content_hash\":\"" + crypto::Md5Hex("x") +
+       Header() + "{\"rom_id\":12,\"slot\":null,\"content_hash\":\"" + crypto::Md5Hex("x") +
            "\",\"mtime\":1757000000,\"file_size_bytes\":1}\n"},
       {"a SHA1 where the MD5 goes",
-       "rommsync-state 1\n{\"rom_id\":12,\"slot\":null,\"content_hash\":\"" + std::string(40, 'a') +
+       Header() + "{\"rom_id\":12,\"slot\":null,\"content_hash\":\"" + std::string(40, 'a') +
            "\",\"mtime\":1757000000,\"file_size_bytes\":1,\"server_updated_at\":null,"
            "\"server_content_hash\":null}\n"},
       {"a second row for the same (rom_id, slot)", good + good.substr(good.find('\n') + 1)},
@@ -465,7 +655,7 @@ void AHugeTimestampIsDiagnosedNotOverflowed(checks::Checks& c) {
 
   const std::string digest = crypto::Md5Hex("x");
   auto row = [&digest](const std::string& mtime, const std::string& server_updated_at) {
-    return "rommsync-state 1\n{\"rom_id\":12,\"slot\":null,\"content_hash\":\"" + digest +
+    return Header() + "{\"rom_id\":12,\"slot\":null,\"content_hash\":\"" + digest +
            "\",\"mtime\":" + mtime + ",\"file_size_bytes\":1,\"server_updated_at\":" +
            server_updated_at + ",\"server_content_hash\":null}\n";
   };
@@ -667,6 +857,9 @@ void ALostBaselineCostsTimeNotCorrectness(checks::Checks& c) {
 int main() {
   checks::Checks c;
   EveryFieldRoundTrips(c);
+  StateRowsAreTheirOwnKind(c);
+  SkipsAStateRowItCouldNotReadBack(c);
+  AnUnchangedStateIsNotRehashed(c);
   AwkwardSlotsSurvive(c);
   TheOrderIsStable(c);
   AWriteLeavesNothingBeside(c);

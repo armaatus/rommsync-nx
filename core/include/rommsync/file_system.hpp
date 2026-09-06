@@ -171,4 +171,45 @@ class FileSystem {
   FileSystem() = default;
 };
 
+/// The directory part of an SD path, and the leaf under it.
+///
+/// `/retroarch/saves/Game.srm` -> `/retroarch/saves` + `Game.srm`. False for a
+/// path with no separator, or one that ends in one: neither has a directory to
+/// list and a leaf to find in it.
+bool SplitPath(const std::string& sd_path, std::string* directory, std::string* leaf);
+
+/// The most recent directory listing, and nothing older.
+///
+/// `core/` has no single-file stat -- `FileSystem` reads directories and
+/// resolves paths, and nothing else -- so the mtime and the size of a file the
+/// engine just rewrote come out of a listing of its folder.
+///
+/// **One entry, not a map.** A `Listing` may hold up to `kMaxDirectoryEntries`
+/// names, each of them a heap `std::string`, and the sysmodule's inner heap is
+/// 512 KiB (core/AGENTS.md). Keeping one listing per directory for the length of
+/// a tick is unbounded in exactly the dimension that is scarce, and it would be
+/// unbounded on the tick that is already the most expensive -- the one that
+/// downloaded a lot of files. Keeping the last one costs a single listing and
+/// still collapses the case that matters, which is several files in the same
+/// folder.
+class Directories {
+ public:
+  explicit Directories(FileSystem& files) : files_(&files) {}
+
+  /// The entry for `sd_path`, or nullptr with the reason in `why`.
+  ///
+  /// The pointer is into this object and is invalidated by the next call for a
+  /// different directory, so a caller reads it immediately.
+  const Entry* Find(const std::string& sd_path, std::string* why);
+
+ private:
+  FileSystem* files_;
+
+  /// Empty until the first listing. `SplitPath` never produces an empty
+  /// directory -- the shortest it answers is `/` -- so this cannot collide with
+  /// a real one.
+  std::string directory_;
+  Listing listing_;
+};
+
 }  // namespace rommsync::fs

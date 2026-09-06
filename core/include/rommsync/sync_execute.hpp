@@ -102,6 +102,36 @@ std::string BackupFileName(std::int64_t rom_id, const std::optional<std::string>
                            std::string_view file_name, std::int64_t unix_seconds,
                            int uniquifier = 0);
 
+/// The same name built from a discriminator that is already a string.
+///
+/// The middle segment of a backup name exists to separate two files of one rom
+/// backed up in the same second, and for a save that separator is its slot. A
+/// **state has no slot**: RomM keys one `(rom_id, file_name)` and gives it no
+/// slot at all, so passing `std::nullopt` above would spell `archival` for every
+/// state of one rom and leave only the uniquifier -- `-1`, `-2` -- to tell them
+/// apart, which makes the backups indistinguishable to whatever has to show them
+/// to a user (M7-1). `StateBackupDiscriminator` supplies one built from the
+/// state's own name instead, on exactly the reasoning that put the slot there.
+std::string BackupNameFor(std::int64_t rom_id, std::string_view discriminator,
+                          std::string_view file_name, std::int64_t unix_seconds,
+                          int uniquifier = 0);
+
+/// A save's discriminator: its sanitised slot, or `archival` for a null one.
+/// Exposed alongside the state's so the two spellings of "what separates two
+/// files of one rom" sit next to each other.
+std::string SlotBackupDiscriminator(const std::optional<std::string>& slot);
+
+/// `state-<name>`, reduced to `[A-Za-z0-9._-]` and bounded, for a state's
+/// backup name.
+///
+/// The `state-` prefix is not a guarantee of uniqueness against a save's slot --
+/// a slot on an operation is whatever some other client chose, so no literal is
+/// impossible there -- it is a label that makes a `.backup/` listing readable.
+/// The guarantee is `BackUpFirst`'s uniquifier walk, which never writes over a
+/// name that is already taken.
+std::string StateBackupDiscriminator(std::string_view file_name);
+
+
 /// One local save an operation may act on.
 ///
 /// Produced from a `scan::SaveFile` by the caller -- the scan is step 0 and
@@ -234,6 +264,28 @@ const char* ToString(OperationError error);
 /// What this error says about the credentials, for `auth::Gate`. The same
 /// question `sync::AnswerOf(NegotiateError)` answers, over one operation.
 auth::Answer AnswerOf(OperationError error);
+
+/// Copy whatever is at `sd_path` into `backup_dir` under a name built from
+/// `discriminator`, and say where it went. **Step 3 of the four**.
+///
+/// Shared by saves and states rather than spelled twice, because it is the step
+/// docs/SYNC_PROTOCOL.md's hard rule is about: streamed with `io::CopyAtomically`
+/// (the file may be tens of megabytes and the sysmodule heap is 512 KiB), and
+/// stepping past a name that is already taken rather than over it -- a name that
+/// is there is a backup of *something*, and this does not get to decide it is
+/// worthless.
+///
+/// `OperationError::kNone` with `*backup_sd_path` left empty is success with
+/// nothing to show for it: there is no file at `sd_path`, so the write that
+/// follows overwrites nothing and there is nothing to protect. Every other
+/// failure is a refusal to go on -- including a missing `backup_dir`, which
+/// `core/` cannot create and which therefore stops the overwrite instead of
+/// proceeding without a copy.
+OperationError BackUpFirst(fs::FileSystem& files, const std::string& backup_dir,
+                           const std::string& sd_path, std::int64_t rom_id,
+                           std::string_view discriminator, std::string_view file_name,
+                           std::int64_t unix_seconds, std::string* backup_sd_path,
+                           std::string* message);
 
 /// One operation, and what became of it.
 struct OperationResult {

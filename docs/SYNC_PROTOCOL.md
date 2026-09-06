@@ -251,6 +251,13 @@ than being written over. `sync::BackupFileName` is the one spelling of that,
 and `harness::Sandbox::BackupPathFor` calls it so the audit and the code under
 test cannot disagree.
 
+**A state has no slot**, so its middle segment is built from its own name
+instead — `sync::StateBackupDiscriminator`, giving
+`<rom_id>-state-<name>-<ts>.<ext>`. Passing a null slot for one would spell
+`archival` for every state of a rom, which is the collision this scheme exists to
+prevent, one asset kind over
+([Save states](#save-states)).
+
 **The backup promises ordering, and — once the platform layer has said how —
 durability too.** The copy is flushed, closed, made durable and only then renamed
 into place, before the save is touched: no reader ever sees half a backup, no
@@ -378,9 +385,108 @@ sync: a lost baseline costs time, not correctness.
 
 ## Save states
 
-Same flow via `/api/states` (field `stateFile`). **Off by default** — states are
-core- and version-specific; only enable when your devices run matching cores.
+**Not the same flow.** This section used to say "same flow via `/api/states`",
+and that was wrong in the way that matters: there is no negotiation for a state,
+so the server decides nothing and the client has to. Verified against a live
+5.2.0 and pinned by `server/contract/captures/states-post.json` and
+`states-list.json` — see [API_CONTRACT.md](API_CONTRACT.md#save-states) for the
+endpoints.
+
+What 5.2.0 actually offers:
+
+- `SyncNegotiatePayload` carries **only** `saves`. A state never appears in a
+  negotiate request or in a plan.
+- `StateSchema` has no `slot`, no `content_hash`, no `origin_device_id` and no
+  `device_syncs`. There is no per-device sync history for a state and no digest
+  to verify a download against.
+- There is no `POST /api/states/{id}/downloaded`.
+- `POST /api/states` takes `rom_id` and `emulator` and a multipart `stateFile`
+  (plus an optional `screenshotFile`). No `slot`, no `device_id`, no
+  `session_id`, no `overwrite`.
+
+...and two behaviours that shape everything the client does:
+
+- **`POST /api/states` is an upsert keyed on `(rom_id, file_name)` alone.** A
+  second POST under a name the rom already has replaces that row's bytes in
+  place, keeps its `id`, and *moves* its `emulator` to whatever the new request
+  said. It does not create a second row the way `POST /api/saves` does. So a POST
+  **is an overwrite of somebody's state**, and the emulator is not part of the
+  key.
+- **RomM does not rename a state on ingest.** A save sent as `probe.srm` is
+  stored as `probe [2026-09-04_11-12-27].srm`; a state sent as `probe.state` is
+  stored as `probe.state`. The server's name and the client's are the same
+  string, which is what makes `(rom_id, file_name)` a usable pairing key on both
+  sides.
+
+### The policy
+
+Hard rule 3 — the server is the source of truth — has nothing to be the source
+of truth *with* here, so the client arbitrates, conservatively:
+
+**Upload freely, overwrite only on an unambiguous baseline match, keep both on
+anything else, and never delete a state.** Losing a duplicate costs disk; losing
+a state costs the session.
+
+For one local state, keyed `(rom_id, file_name)`:
+
+| `state.db` row | server row under that name | local file | → |
+|---|---|---|---|
+| none    | none            | —         | upload |
+| none    | present         | —         | **keep both** |
+| id X    | none            | —         | upload (this is how a state deleted elsewhere comes back) |
+| id X    | id ≠ X          | —         | **keep both** |
+| id X    | id X, unmoved   | unchanged | no-op |
+| id X    | id X, unmoved   | changed   | upload |
+| id X    | id X, moved     | unchanged | download |
+| id X    | id X, moved     | changed   | **keep both** |
+
+A server state no local file claimed is *placed* — a new local file, so it
+overwrites nothing. Where it goes is the caller's
+(`sync::StateSyncOptions::place`), because the folder depends on the rom's
+platform and on which emulator the state belongs to.
+
+"Keep both" means exactly that: nothing is transferred, the local file is not
+touched, the server row is not written, and the run says so in a warning. It is
+counted apart from both `completed` and `failed`, because it is the policy
+working rather than a failure.
+
+Two local states of one rom that share a file name are **one** state to RomM, so
+the scan reports the first and skips the second with `duplicate name` — the same
+reasoning that put the emulator in a save's slot, applied to a key the server
+enforces without one.
+
+### Backups and verification
+
+A state that is replaced goes through the same four steps as a save, using the
+same two `io` primitives: fetch to `io::TempPathFor(<state>)`, check it, back it
+up with `io::CopyAtomically` into `.backup/`, then `io::CommitStaged` it into
+place. The `harness::Sandbox` teardown audit covers a state exactly as it covers
+a `.srm`.
+
+The backup name carries a discriminator built from the state's own name —
+`<rom_id>-state-<name>-<unix seconds>[-<n>].<ext>` — because a state has no slot.
+Passing a null slot instead would spell `archival` for every state of one rom,
+leaving only the uniquifier to separate them (see
+[Backups](#backups)).
+
+**A downloaded state can be checked against `file_size_bytes` and nothing else.**
+RomM computes no digest for a state, so there is no MD5 to compare — a length
+match is *not* an integrity check, and every state download says so in a warning
+rather than letting a reader assume the save path's verification is in play.
+
+### Off by default means silent
+
+`sync.states` is `false` unless the user sets it. With it off, the state
+directories are never walked and `/api/states` is never called —
+`sync::SyncStates` returns before either. States are core- and
+version-specific: a state synced onto a console running a different build is how
+a player loses a session they thought was safe, so it is opt-in.
 Config: `sync.states = true`.
+
+`state.db` holds a state row beside a save row, discriminated by `"kind"`, in
+format version **2**. A version 1 file is discarded and re-hashed once — the
+designed cost of the version line, not a migration
+([state_db.hpp](../core/include/rommsync/state_db.hpp)).
 
 ## One tick, and what interrupting it may leave
 

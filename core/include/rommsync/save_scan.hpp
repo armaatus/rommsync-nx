@@ -1,5 +1,5 @@
-// Step 0 of docs/SYNC_PROTOCOL.md: the SD card, as a list of saves that have a
-// rom id.
+// Step 0 of docs/SYNC_PROTOCOL.md: the SD card, as a list of saves -- and, when
+// the user has opted in, save states -- that have a rom id.
 //
 // The scanner walks the folders `config::Config::SaveScanDirs()` hands it,
 // strips each file's extension, asks `roms::RomIndex` which rom that name is,
@@ -16,6 +16,15 @@
 //     path, is a skip with a reason rather than an entry that turns into a 422
 //     -- or worse, into a save the server accepts and arbitrates as something
 //     the client did not mean.
+//
+// **A state is scanned by the same walk and paired on a different key.** RomM
+// keys a save `(rom_id, slot)` and a state `(rom_id, file_name)` -- verified
+// against a live 5.2.0, docs/API_CONTRACT.md#save-states -- so `ScanStates`
+// emits `StateFile` rather than `SaveFile` and its duplicate rule is about the
+// name rather than the slot. Everything else about the walk is shared, because
+// everything else about it is the same decision: an ambiguous name is skipped,
+// a folder listed under a dozen platforms is walked once, and a file whose
+// mtime the card would not give up costs one file rather than the tick.
 //
 // The digest is M2-3's arithmetic and this module's responsibility. Every save
 // is handed to `state::ContentHashFor`, which reuses the baseline's digest when
@@ -43,6 +52,12 @@
 #include "rommsync/sync.hpp"
 
 namespace rommsync::scan {
+
+/// Which of a platform's folder lists a scan is walking.
+enum class Folders {
+  kSaves,
+  kStates,
+};
 
 /// One local save file, matched.
 struct SaveFile {
@@ -94,6 +109,45 @@ struct SaveFile {
       std::optional<std::string> content_hash = std::nullopt) const;
 };
 
+/// One local save **state** file, matched.
+///
+/// Deliberately not a `SaveFile` with the slot left empty. The two are paired on
+/// different keys, and a struct that could be read as either is a struct a
+/// caller eventually pairs on the wrong one -- which for a state is another
+/// console's session overwritten.
+struct StateFile {
+  std::int64_t rom_id = 0;
+
+  /// Where it is, SD-root absolute.
+  std::string sd_path;
+
+  /// The file's own name, `Game (USA).state`. Never a path -- and this is the
+  /// pairing key with `rom_id`, on both sides: RomM stores a state under the
+  /// name it was sent, without the ingest tag it stamps on a save.
+  std::string file_name;
+
+  /// `retroarch` or `tico`, when the directory said so; empty when it did not.
+  /// Sent as the `emulator` query parameter and used to place a download, but
+  /// never part of the key -- see `SkipReason::kDuplicateName`.
+  std::string emulator;
+
+  /// The rom's platform, for callers that lay files out by it.
+  std::string platform_fs_slug;
+
+  /// The state's **MD5**, from `state::ContentHashForState` -- computed or
+  /// reused from the baseline. Empty only when the bytes could not be read.
+  ///
+  /// Local only. RomM computes no digest for a state, so this is never compared
+  /// against a server value; it is how *this* client tells a state it has
+  /// already uploaded from one that has changed since.
+  std::string content_hash;
+
+  std::int64_t size_bytes = 0;
+
+  /// mtime, whole seconds since the Unix epoch, UTC.
+  std::int64_t modified_unix = 0;
+};
+
 /// Why a file in a save directory did not become a `SaveFile`.
 enum class SkipReason {
   kUnmatched,       ///< no rom carries the name; usually not a save at all
@@ -103,6 +157,20 @@ enum class SkipReason {
   kDirectoryFailed, ///< a mapped folder could not be read; its files are simply absent
   kTooManySaves,    ///< the scan hit `kMaxSaves` and stopped
   kUnhashed,        ///< reported, but with no digest: its bytes could not be read
+
+  /// A state whose `(rom_id, file_name)` an earlier state already claimed.
+  ///
+  /// `kDuplicateSlot`'s reasoning on the key RomM actually enforces for a
+  /// state: two local files landing on the same pair would overwrite each other
+  /// *through RomM* -- its `POST /api/states` replaces the row with that name in
+  /// place rather than making a second one -- on alternating ticks, forever. The
+  /// realistic pair is one game's `Game.state` under RetroArch and under Tico,
+  /// which is why the emulator is deliberately not part of the key: the server
+  /// ignores it, so a client that keyed on it would be arranging exactly that
+  /// alternation.
+  kDuplicateName,
+
+  kTooManyStates,   ///< the state scan hit `kMaxStates` and stopped
 };
 
 /// Stable, log-friendly name. Never null.
@@ -142,8 +210,28 @@ struct Skip {
 inline constexpr std::size_t kMaxSaves = state::kMaxRecords;
 inline constexpr std::size_t kMaxSkipsReported = 64;
 
+/// How many states one tick will report.
+///
+/// A share of `state::kMaxRecords` rather than a bound of its own, because the
+/// baseline holds saves and states in one file and it is the *file* the writer
+/// refuses over. A quarter, because states are opt-in and a console that has
+/// turned them on still holds far more saves than states -- and because the
+/// alternative, halving the save budget for a feature that is off by default,
+/// would cost every console something to buy one console this.
+///
+/// It is a scan bound, not the whole story: `sync::SyncStates` trims its own
+/// rows before a save's when the two together would still exceed the file's
+/// bound. A save is what hard rule 2 protects.
+inline constexpr std::size_t kMaxStates = state::kMaxRecords / 4;
+
 struct ScanResult {
+  /// Filled by `ScanSaves`; empty from `ScanStates`.
   std::vector<SaveFile> saves;
+
+  /// Filled by `ScanStates`; empty from `ScanSaves`. One result type for both
+  /// walks, so the skip and diagnostic machinery below is shared rather than
+  /// spelled a second way.
+  std::vector<StateFile> states;
 
   /// The first `kMaxSkipsReported` skips, in scan order.
   std::vector<Skip> skipped;
@@ -198,6 +286,18 @@ struct ScanResult {
 ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
                      fs::FileSystem& files, const state::Baseline& baseline);
 
+/// The same walk over `config::Config::StateScanDirs()`, emitting states.
+///
+/// **It does not consult `sync.states`.** `StateScanDirs()` answers regardless
+/// of the toggle because whether to scan is the engine's decision rather than
+/// the map's (config.hpp), and the engine makes it in `sync::SyncStates` -- one
+/// place, where the same `if` also decides whether `/api/states` is called at
+/// all. A second copy of that check here would be a second thing to get wrong,
+/// and the failure mode of getting it wrong is silent: a console reading state
+/// directories the user never opted into.
+ScanResult ScanStates(const config::Config& config, const roms::RomIndex& index,
+                      fs::FileSystem& files, const state::Baseline& baseline);
+
 // --- the pieces, exposed because they are the parts worth testing directly ----
 
 /// `Game (USA).srm` -> `Game (USA)`. A name with no extension is its own base,
@@ -225,6 +325,7 @@ std::string SlotFor(std::string_view emulator, std::string_view file_name);
 /// several -- RetroArch's flat `saves/` -- implies nothing and maps to an empty
 /// string, which is what makes its files match across the whole library and
 /// makes a two-platform name an ambiguity rather than a coin toss.
-std::map<std::string, std::string, std::less<>> PlatformHints(const config::Config& config);
+std::map<std::string, std::string, std::less<>> PlatformHints(
+    const config::Config& config, Folders folders = Folders::kSaves);
 
 }  // namespace rommsync::scan

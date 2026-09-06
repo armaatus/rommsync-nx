@@ -76,6 +76,24 @@ Skip MakeSkip(SkipReason reason, std::string sd_path, std::string message) {
   return skip;
 }
 
+/// A file reported *without* a digest, rather than dropped.
+///
+/// A save the card would not open this once is still the user's save, and the
+/// server compares it on timestamps -- less precisely, and it will plan an
+/// upload for bytes it may already have, which is why this is counted. A state
+/// with no digest is the same shape of answer for a different reason: with no
+/// digest this client cannot tell whether the local file has changed, so it
+/// re-uploads it.
+void RecordUnhashed(ScanResult* result, const std::string& sd_path,
+                    const state::HashOutcome& hashed) {
+  ++result->unhashed_total;
+  if (result->unhashed.size() < kMaxSkipsReported) {
+    result->unhashed.push_back(MakeSkip(
+        SkipReason::kUnhashed, sd_path,
+        hashed.message.empty() ? std::string(state::ToString(hashed.error)) : hashed.message));
+  }
+}
+
 std::string Join(std::string_view directory, std::string_view name) {
   std::string path(directory);
   if (path.empty() || path.back() != '/') {
@@ -103,6 +121,10 @@ const char* ToString(SkipReason reason) {
       return "too many saves";
     case SkipReason::kUnhashed:
       return "unhashed";
+    case SkipReason::kDuplicateName:
+      return "duplicate name";
+    case SkipReason::kTooManyStates:
+      return "too many states";
   }
   return "unknown";
 }
@@ -190,10 +212,13 @@ std::string SlotFor(std::string_view emulator, std::string_view file_name) {
   return LowerAscii(emulator) + "-" + extension;
 }
 
-std::map<std::string, std::string, std::less<>> PlatformHints(const config::Config& config) {
+std::map<std::string, std::string, std::less<>> PlatformHints(const config::Config& config,
+                                                              Folders which) {
   std::map<std::string, std::string, std::less<>> hints;
   for (const auto& [slug, folders] : config.platforms) {
-    for (const std::string& directory : folders.saves) {
+    const std::vector<std::string>& directories =
+        which == Folders::kStates ? folders.states : folders.saves;
+    for (const std::string& directory : directories) {
       const auto found = hints.find(directory);
       if (found == hints.end()) {
         hints.emplace(directory, slug);
@@ -241,27 +266,35 @@ sync::ClientSaveState SaveFile::ToClientSaveState(std::optional<std::string> con
   return state;
 }
 
-ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
-                     fs::FileSystem& files, const state::Baseline& baseline) {
-  ScanResult result;
-  result.index_truncated = index.truncated();
-  const std::map<std::string, std::string, std::less<>> hints = PlatformHints(config);
+namespace {
 
-  // `(rom_id, slot)` is what the server pairs on, so two local files landing on
-  // the same pair would overwrite each other *through RomM*, on alternating
-  // ticks, forever. The first one in scan order keeps it and the second is
-  // reported -- which is only deterministic because the directory order is the
-  // config's and each directory's entries are sorted below.
-  std::set<std::pair<std::int64_t, std::string>> claimed;
-
-  const auto record_skip = [&result](SkipReason reason, std::string sd_path, std::string message) {
-    ++result.skipped_total;
-    if (result.skipped.size() < kMaxSkipsReported) {
-      result.skipped.push_back(MakeSkip(reason, std::move(sd_path), std::move(message)));
+/// The half of both walks that is the same, which is nearly all of it.
+///
+/// It reads each directory once, sorts its entries, resolves the platform hint,
+/// matches the base name against the rom index and range-checks the mtime --
+/// then hands what survived to `on_match`, which returns whether it emitted a
+/// record. Every decision in here is one docs/SYNC_PROTOCOL.md states about the
+/// scan rather than about saves in particular, which is why a state gets the
+/// same one instead of a second copy that could drift from it.
+///
+/// `limit` is how many records the caller may emit before the walk stops and
+/// says so; the two kinds have different budgets against one shared baseline
+/// file (`scan::kMaxSaves`, `scan::kMaxStates`).
+template <class OnMatch>
+void Walk(const std::vector<std::string>& directories,
+          const std::map<std::string, std::string, std::less<>>& hints,
+          const roms::RomIndex& index, fs::FileSystem& files, std::size_t limit,
+          SkipReason limit_reason, const std::string& limit_message, ScanResult* result,
+          const OnMatch& on_match) {
+  const auto record_skip = [result](SkipReason reason, std::string sd_path, std::string message) {
+    ++result->skipped_total;
+    if (result->skipped.size() < kMaxSkipsReported) {
+      result->skipped.push_back(MakeSkip(reason, std::move(sd_path), std::move(message)));
     }
   };
 
-  for (const std::string& directory : config.SaveScanDirs()) {
+  std::size_t emitted = 0;
+  for (const std::string& directory : directories) {
     fs::Listing listing = files.List(directory);
     if (!listing.ok() && listing.error != fs::ListError::kMissing) {
       // A *missing* folder is a normal card -- a platform mapped to a Tico
@@ -277,9 +310,9 @@ ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
       // dropping it: the files that were read are still saves.
     }
 
-    // `readdir` promises no order, and a scan whose duplicate-slot resolution
-    // depends on the card's directory layout resolves it differently after an
-    // unrelated file is deleted.
+    // `readdir` promises no order, and a scan whose duplicate resolution depends
+    // on the card's directory layout resolves it differently after an unrelated
+    // file is deleted.
     std::sort(listing.entries.begin(), listing.entries.end(),
               [](const fs::Entry& left, const fs::Entry& right) { return left.name < right.name; });
 
@@ -292,14 +325,12 @@ ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
       if (entry.is_directory || entry.name.empty()) {
         continue;  // the walk is not recursive; see file_system.hpp
       }
-      ++result.files_seen;
+      ++result->files_seen;
       const std::string sd_path = Join(directory, entry.name);
 
-      if (result.saves.size() >= kMaxSaves) {
-        record_skip(SkipReason::kTooManySaves, sd_path,
-                    "the scan stopped at " + std::to_string(kMaxSaves) +
-                        " saves; the rest of this card was not read");
-        return result;
+      if (emitted >= limit) {
+        record_skip(limit_reason, sd_path, limit_message);
+        return;
       }
 
       const roms::Match match = index.Find(BaseName(entry.name), platform_hint);
@@ -312,7 +343,7 @@ ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
         // and reporting it flatly would send a user looking for a library
         // problem that is really this client's bound.
         record_skip(SkipReason::kUnmatched, sd_path,
-                    result.index_truncated
+                    result->index_truncated
                         ? match.reason + "; the rom index is incomplete, so this may be a rom "
                                          "that was never read rather than one you do not have"
                         : match.reason);
@@ -333,68 +364,156 @@ ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
         continue;
       }
 
-      SaveFile save;
-      save.rom_id = match.rom->id;
-      save.sd_path = sd_path;
-      save.file_name = entry.name;
-      save.slot = SlotFor(emulator, entry.name);
-      save.emulator = emulator;
-      save.platform_fs_slug = match.rom->platform_fs_slug;
-      save.size_bytes = entry.size_bytes;
-      save.modified_unix = entry.modified_unix;
-
-      // Checked here rather than left to the encoder: a save that cannot be
-      // expressed faithfully must cost one file, not the whole request body --
-      // `EncodeNegotiateRequest` stops at the first bad entry, so one unreadable
-      // mtime would otherwise take the tick's every other save with it.
-      // Built once and reused below: it copies three strings, and the scan
-      // needs it for the validation, the slot and the mtime alike.
-      const sync::ClientSaveState negotiated = save.ToClientSaveState();
-      if (const json::Error error = sync::Validate(negotiated); !error.ok()) {
-        record_skip(SkipReason::kUnusable, sd_path, error.Describe());
-        continue;
+      if (on_match(sd_path, entry, *match.rom, emulator, record_skip)) {
+        ++emitted;
       }
-
-      if (!claimed.emplace(save.rom_id, save.slot).second) {
-        record_skip(SkipReason::kDuplicateSlot, sd_path,
-                    "rom " + std::to_string(save.rom_id) + " already has a save in slot \"" +
-                        save.slot + "\" this tick; only the first is synced");
-        continue;
-      }
-
-      // Hashed last, after the record is known to be one that will be reported:
-      // `ContentHashFor` reads the file when the baseline cannot answer, and
-      // reading a save that is about to be skipped is the one cost of this walk
-      // that is measured in card I/O rather than in string compares.
-      //
-      // The path is resolved by the backend, not built here. `sd_path` is
-      // SD-root absolute and means nothing to `fopen` on either platform.
-      const std::string real_path = files.Resolve(save.sd_path);
-      const state::HashOutcome hashed =
-          real_path.empty()
-              ? state::HashOutcome{{}, state::HashError::kUnreadable, false,
-                                   save.sd_path + ": not a path on this card"}
-              : state::ContentHashFor(baseline, save.rom_id, negotiated.slot, real_path,
-                                      negotiated.updated_at, save.size_bytes);
-      if (hashed.ok()) {
-        save.content_hash = hashed.content_hash;
-      } else {
-        // Reported without a digest rather than dropped. A save the card would
-        // not open this once is still the user's save, and the server compares
-        // it on timestamps -- less precisely, and it will plan an upload for
-        // bytes it may already have, which is why this is counted.
-        ++result.unhashed_total;
-        if (result.unhashed.size() < kMaxSkipsReported) {
-          result.unhashed.push_back(MakeSkip(SkipReason::kUnhashed, save.sd_path,
-                                             hashed.message.empty()
-                                                 ? std::string(state::ToString(hashed.error))
-                                                 : hashed.message));
-        }
-      }
-
-      result.saves.push_back(std::move(save));
     }
   }
+}
+
+}  // namespace
+
+ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
+                     fs::FileSystem& files, const state::Baseline& baseline) {
+  ScanResult result;
+  result.index_truncated = index.truncated();
+
+  // `(rom_id, slot)` is what the server pairs on, so two local files landing on
+  // the same pair would overwrite each other *through RomM*, on alternating
+  // ticks, forever. The first one in scan order keeps it and the second is
+  // reported -- which is only deterministic because the directory order is the
+  // config's and each directory's entries are sorted by `Walk`.
+  std::set<std::pair<std::int64_t, std::string>> claimed;
+
+  Walk(config.SaveScanDirs(), PlatformHints(config, Folders::kSaves), index, files, kMaxSaves,
+       SkipReason::kTooManySaves,
+       "the scan stopped at " + std::to_string(kMaxSaves) +
+           " saves; the rest of this card was not read",
+       &result,
+       [&](const std::string& sd_path, const fs::Entry& entry, const roms::Rom& rom,
+           const std::string& emulator, const auto& record_skip) {
+         SaveFile save;
+         save.rom_id = rom.id;
+         save.sd_path = sd_path;
+         save.file_name = entry.name;
+         save.slot = SlotFor(emulator, entry.name);
+         save.emulator = emulator;
+         save.platform_fs_slug = rom.platform_fs_slug;
+         save.size_bytes = entry.size_bytes;
+         save.modified_unix = entry.modified_unix;
+
+         // Checked here rather than left to the encoder: a save that cannot be
+         // expressed faithfully must cost one file, not the whole request body
+         // -- `EncodeNegotiateRequest` stops at the first bad entry, so one
+         // unreadable mtime would otherwise take the tick's every other save
+         // with it. Built once and reused below: it copies three strings, and
+         // the scan needs it for the validation, the slot and the mtime alike.
+         const sync::ClientSaveState negotiated = save.ToClientSaveState();
+         if (const json::Error error = sync::Validate(negotiated); !error.ok()) {
+           record_skip(SkipReason::kUnusable, sd_path, error.Describe());
+           return false;
+         }
+
+         if (!claimed.emplace(save.rom_id, save.slot).second) {
+           record_skip(SkipReason::kDuplicateSlot, sd_path,
+                       "rom " + std::to_string(save.rom_id) + " already has a save in slot \"" +
+                           save.slot + "\" this tick; only the first is synced");
+           return false;
+         }
+
+         // Hashed last, after the record is known to be one that will be
+         // reported: `ContentHashFor` reads the file when the baseline cannot
+         // answer, and reading a save that is about to be skipped is the one
+         // cost of this walk that is measured in card I/O rather than in string
+         // compares.
+         //
+         // The path is resolved by the backend, not built here. `sd_path` is
+         // SD-root absolute and means nothing to `fopen` on either platform.
+         const std::string real_path = files.Resolve(save.sd_path);
+         const state::HashOutcome hashed =
+             real_path.empty()
+                 ? state::HashOutcome{{}, state::HashError::kUnreadable, false,
+                                      save.sd_path + ": not a path on this card"}
+                 : state::ContentHashFor(baseline, save.rom_id, negotiated.slot, real_path,
+                                         negotiated.updated_at, save.size_bytes);
+         if (hashed.ok()) {
+           save.content_hash = hashed.content_hash;
+         } else {
+           RecordUnhashed(&result, save.sd_path, hashed);
+         }
+
+         result.saves.push_back(std::move(save));
+         return true;
+       });
+  return result;
+}
+
+ScanResult ScanStates(const config::Config& config, const roms::RomIndex& index,
+                      fs::FileSystem& files, const state::Baseline& baseline) {
+  ScanResult result;
+  result.index_truncated = index.truncated();
+
+  // `(rom_id, file_name)` and deliberately not `(rom_id, emulator, file_name)`:
+  // `POST /api/states` upserts on the name alone and *moves* the emulator of the
+  // row it finds, so two local states of one rom sharing a name are one server
+  // row however different their directories are. Claiming the pair here is what
+  // stops the RetroArch copy and the Tico copy taking turns destroying each
+  // other through RomM (`SkipReason::kDuplicateName`).
+  std::set<std::pair<std::int64_t, std::string>> claimed;
+
+  Walk(config.StateScanDirs(), PlatformHints(config, Folders::kStates), index, files, kMaxStates,
+       SkipReason::kTooManyStates,
+       "the scan stopped at " + std::to_string(kMaxStates) +
+           " states; the rest of this card was not read",
+       &result,
+       [&](const std::string& sd_path, const fs::Entry& entry, const roms::Rom& rom,
+           const std::string& emulator, const auto& record_skip) {
+         StateFile file;
+         file.rom_id = rom.id;
+         file.sd_path = sd_path;
+         file.file_name = entry.name;
+         file.emulator = emulator;
+         file.platform_fs_slug = rom.platform_fs_slug;
+         file.size_bytes = entry.size_bytes;
+         file.modified_unix = entry.modified_unix;
+
+         // The name is the key on both sides, so it is held to the bar a key has
+         // to meet before anything joins it into a URL or a backup path. There
+         // is no `sync::Validate` for a state -- states never appear in a
+         // negotiate payload -- so this is the whole of it.
+         if (!sync::IsSingleFileName(file.file_name)) {
+           record_skip(SkipReason::kUnusable, sd_path,
+                       "its name is not one this client can use as a pairing key");
+           return false;
+         }
+
+         if (!claimed.emplace(file.rom_id, file.file_name).second) {
+           record_skip(SkipReason::kDuplicateName, sd_path,
+                       "rom " + std::to_string(file.rom_id) + " already has a state called \"" +
+                           file.file_name +
+                           "\" this tick; RomM stores one state per name, so only the first is "
+                           "synced");
+           return false;
+         }
+
+         const std::string real_path = files.Resolve(file.sd_path);
+         const state::HashOutcome hashed =
+             real_path.empty()
+                 ? state::HashOutcome{{}, state::HashError::kUnreadable, false,
+                                      file.sd_path + ": not a path on this card"}
+                 : state::ContentHashForState(
+                       baseline, file.rom_id, file.file_name, real_path,
+                       sync::Timestamp{} + std::chrono::seconds(file.modified_unix),
+                       file.size_bytes);
+         if (hashed.ok()) {
+           file.content_hash = hashed.content_hash;
+         } else {
+           RecordUnhashed(&result, file.sd_path, hashed);
+         }
+
+         result.states.push_back(std::move(file));
+         return true;
+       });
   return result;
 }
 

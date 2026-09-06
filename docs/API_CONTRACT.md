@@ -451,7 +451,16 @@ operation.
 | GET | `/api/saves/identifiers` | lightweight id/hash listing |
 | POST | `/api/saves/{id}/downloaded` | `{device_id}` — record that this device now holds this save |
 | POST | `/api/saves/delete` | `{saves: [id, …]}` |
-| GET/POST | `/api/states` (+ `/{id}/content`) | same shape for save states; field **`stateFile`** |
+| GET | `/api/states` | list; filter `rom_id, platform_id` — **no `device_id`, no `slot`** |
+| POST | `/api/states` | upload; query `rom_id*, emulator`; multipart field **`stateFile`** (+ optional `screenshotFile`) |
+| PUT | `/api/states/{id}` | replace one state's bytes in place |
+| GET | `/api/states/{id}` | one state → `StateSchema` |
+| GET | `/api/states/{id}/content` | download raw state bytes |
+| POST | `/api/states/delete` | `{states: [id, …]}` — the client never calls this |
+
+**A state is not a save with a different field name.** See
+[Save states](#save-states) below; the row in this table is deliberately not the
+save row with `state` substituted.
 
 `SaveSchema`, the real response to an upload (`captures/saves-post.json`):
 ```json
@@ -562,6 +571,56 @@ endpoint exist for, and which is a reason not to re-post an upload inside a tick
 `PUT /api/saves/{id}` also moves a row forward, and unlike either POST it takes
 no `slot`, so it is what a test uses to change the server's copy without
 touching a device's history.
+
+## Save states
+
+`captures/states-post.json` and `captures/states-list.json` are the real
+responses; `contract.captures` re-checks both against a live server on every
+`ctest`. What follows is what 5.2.0 does, verified, and it differs from
+`/api/saves` in every way that matters to a client.
+
+**`StateSchema` carries no `slot`, no `content_hash`, no `origin_device_id` and
+no `device_syncs`.** Its fields are `id, rom_id, user_id, file_name,
+file_name_no_tags, file_name_no_ext, file_extension, file_path, file_size_bytes,
+full_path, download_path, missing_from_fs, created_at, updated_at, emulator,
+is_public, screenshot`. There is no digest to verify a downloaded state against
+and no per-device sync history to arbitrate one with.
+
+**There is no `POST /api/states/{id}/downloaded`.** Nothing records that a device
+holds a state, so the only record of it is the client's own `state.db`.
+
+**`SyncNegotiatePayload` has only `saves`.** A state never appears in a negotiate
+request, in a plan, or in the counts `POST /api/sync/sessions/{id}/complete`
+carries. There is no server-side arbitration for a state at all.
+
+**Verified — `POST /api/states` is an upsert keyed on `(rom_id, file_name)`
+alone.** A second POST under a name the rom already has replaces that row's bytes
+**in place**: the `id` is unchanged, `file_size_bytes` and `updated_at` move, and
+the row's `emulator` is *moved* to whatever the second request said — so the
+emulator is not part of the key, and two local states of one rom sharing a name
+are one row on the server however different their folders are. Measured
+directly, and `states.upsert` asserts it against the live fixture; the probe
+fails loudly if it ever stops being true.
+
+This is the opposite of `POST /api/saves`, which accretes a row per upload (see
+above), and it is what makes an unconditional POST dangerous: it destroys
+whatever was under that name, and RomM answers `200`. The client therefore only
+ever POSTs to a name the rom does not have, or to the row its own baseline names
+and has found unmoved
+([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#save-states)).
+
+**Verified — RomM does not rename a state on ingest.** A save sent as
+`probe.srm` is stored as `probe [2026-09-04_11-12-27].srm`; a state sent as
+`probe-6694c595.state` is stored under exactly that name (`captures/states-post.json`).
+The server's `file_name` and the client's are the same string, which is what
+makes `(rom_id, file_name)` usable as a pairing key on both sides — and it is why
+nothing in the state path needs the tag-stripping a save's `file_name` demands.
+
+**Scopes.** `assets.read` for the listing and the content, `assets.write` for the
+upload — both already in [Scopes to request](#scopes-to-request), so states need
+no re-pairing. A pairing that was granted the read scopes and not the write one
+gets a `403` on every upload, which the client reports as a missing scope rather
+than as a revocation.
 
 ## Library & downloads (the "browse + get games" side)
 

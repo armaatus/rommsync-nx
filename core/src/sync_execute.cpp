@@ -45,6 +45,27 @@ constexpr const char* kSavesPath = "/api/saves";
 /// overwriting a save on.
 constexpr int kMaxBackupAttempts = 1000;
 
+/// How much of a state's own name goes into its backup name. See
+/// `StateBackupDiscriminator`.
+constexpr std::size_t kMaxStateDiscriminator = 64;
+
+/// `[A-Za-z0-9._-]`, with every other byte becoming `_`.
+///
+/// Applied to anything off the card or off another client that becomes part of
+/// a path: a `/` in a slot or a state's name would put the backup somewhere
+/// other than `.backup/`.
+std::string Sanitize(std::string_view value) {
+  std::string out;
+  out.reserve(value.size());
+  for (const char character : value) {
+    const unsigned char byte = static_cast<unsigned char>(character);
+    const bool keep = (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+                      (byte >= '0' && byte <= '9') || byte == '-' || byte == '_' || byte == '.';
+    out.push_back(keep ? character : '_');
+  }
+  return out;
+}
+
 /// Percent-encode one query-string value.
 ///
 /// A `slot` is derived (`retroarch-srm`) but an `emulator` is a folder name a
@@ -290,23 +311,14 @@ auth::Answer AnswerOf(OperationError error) {
   return auth::Answer::kSilent;
 }
 
-std::string BackupFileName(std::int64_t rom_id, const std::optional<std::string>& slot,
-                           std::string_view file_name, std::int64_t unix_seconds,
-                           int uniquifier) {
-  std::string safe_slot;
-  if (slot.has_value()) {
-    for (const char character : *slot) {
-      const unsigned char byte = static_cast<unsigned char>(character);
-      const bool keep = (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
-                        (byte >= '0' && byte <= '9') || byte == '-' || byte == '_' || byte == '.';
-      safe_slot.push_back(keep ? character : '_');
-    }
-  }
+std::string SlotBackupDiscriminator(const std::optional<std::string>& slot) {
   if (!slot.has_value()) {
     // Archival, which pairs with nothing. It cannot collide with a derived slot
     // because `scan::SlotFor` always carries an emulator and an extension.
-    safe_slot = "archival";
-  } else if (safe_slot.empty() || safe_slot == "." || safe_slot == "..") {
+    return "archival";
+  }
+  std::string safe_slot = Sanitize(*slot);
+  if (safe_slot.empty() || safe_slot == "." || safe_slot == "..") {
     // A slot that survives sanitising as one of the two names a join treats as
     // a directory still needs a name that is a name -- and a *different* one
     // from `archival`, because a save with a `..` slot and a save with no slot
@@ -316,11 +328,44 @@ std::string BackupFileName(std::int64_t rom_id, const std::optional<std::string>
     }
     safe_slot = safe_slot.empty() ? "slot" : safe_slot;
   }
-  std::string name = std::to_string(rom_id) + "-" + safe_slot + "-" + std::to_string(unix_seconds);
+  return safe_slot;
+}
+
+std::string BackupFileName(std::int64_t rom_id, const std::optional<std::string>& slot,
+                           std::string_view file_name, std::int64_t unix_seconds,
+                           int uniquifier) {
+  return BackupNameFor(rom_id, SlotBackupDiscriminator(slot), file_name, unix_seconds,
+                       uniquifier);
+}
+
+std::string BackupNameFor(std::int64_t rom_id, std::string_view discriminator,
+                          std::string_view file_name, std::int64_t unix_seconds,
+                          int uniquifier) {
+  std::string name =
+      std::to_string(rom_id) + "-" + std::string(discriminator) + "-" + std::to_string(unix_seconds);
   if (uniquifier > 0) {
     name += "-" + std::to_string(uniquifier);
   }
   return name + std::string(ExtensionOf(file_name));
+}
+
+std::string StateBackupDiscriminator(std::string_view file_name) {
+  // The extension is already the backup's own suffix, so the discriminator
+  // carries the base name and nothing else -- otherwise every state of one rom
+  // would read `...-Game_state-...state`.
+  std::string base = Sanitize(file_name.substr(0, file_name.size() - ExtensionOf(file_name).size()));
+  if (base.size() > kMaxStateDiscriminator) {
+    // Bounded because it comes off the card: FAT32 allows a 255-character name,
+    // and two of them plus a rom id and a timestamp is a name no filesystem has
+    // to accept. Truncating can make two long names share a discriminator; the
+    // uniquifier walk in `BackUpFirst` is what keeps that from being a lost
+    // backup.
+    base.resize(kMaxStateDiscriminator);
+  }
+  if (base.empty() || base == "." || base == "..") {
+    base = "state";
+  }
+  return "state-" + base;
 }
 
 const SaveTarget* MatchTarget(const std::vector<SaveTarget>& targets,
@@ -333,24 +378,14 @@ const SaveTarget* MatchTarget(const std::vector<SaveTarget>& targets,
   return nullptr;
 }
 
-namespace {
-
-/// Copy whatever is at `sd_path` into `backup_dir`, and say where it went.
-///
-/// Streamed (`io::CopyAtomically`), because the file is a save and the
-/// sysmodule heap is 512 KiB.
-///
-/// `kSourceMissing` is success with nothing to show for it: a download for a
-/// save the client does not have yet overwrites nothing, so there is nothing to
-/// protect. Every other failure is a refusal to go on -- including a missing
-/// `.backup/`, which `core/` cannot create and which therefore stops the
-/// overwrite instead of proceeding without a copy.
-OperationError BackUp(fs::FileSystem& files, const ExecuteOptions& options,
-                      const SyncOperation& operation, const SaveTarget& target,
-                      std::string* backup_sd_path, std::string* message) {
-  const std::string source = files.Resolve(target.sd_path);
+OperationError BackUpFirst(fs::FileSystem& files, const std::string& backup_dir,
+                           const std::string& sd_path, std::int64_t rom_id,
+                           std::string_view discriminator, std::string_view file_name,
+                           std::int64_t unix_seconds, std::string* backup_sd_path,
+                           std::string* message) {
+  const std::string source = files.Resolve(sd_path);
   if (source.empty()) {
-    *message = "the local save " + target.sd_path + " is not a path on this card";
+    *message = "the local file " + sd_path + " is not a path on this card";
     return OperationError::kUnreadableCard;
   }
 
@@ -360,15 +395,13 @@ OperationError BackUp(fs::FileSystem& files, const ExecuteOptions& options,
   // handle table, an emulator holding it, an EIO -- reads as absent, and
   // "absent" here would mean overwriting the only copy with no backup. The copy
   // reads `errno` and says `kSourceMissing` for ENOENT/ENOTDIR alone.
-  const std::int64_t stamp =
-      UnixSeconds(options.now != nullptr ? options.now() : std::chrono::system_clock::now());
   for (int attempt = 0; attempt < kMaxBackupAttempts; ++attempt) {
-    const std::string sd_path =
-        options.backup_dir + "/" +
-        BackupFileName(operation.rom_id, operation.slot, target.file_name, stamp, attempt);
-    const std::string destination = files.Resolve(sd_path);
+    const std::string backup_path =
+        backup_dir + "/" +
+        BackupNameFor(rom_id, discriminator, file_name, unix_seconds, attempt);
+    const std::string destination = files.Resolve(backup_path);
     if (destination.empty()) {
-      *message = "the backup directory " + options.backup_dir + " is not a path on this card";
+      *message = "the backup directory " + backup_dir + " is not a path on this card";
       return OperationError::kUnreadableCard;
     }
     if (io::Exists(destination)) {
@@ -381,20 +414,34 @@ OperationError BackUp(fs::FileSystem& files, const ExecuteOptions& options,
     }
     const io::CopyResult copied = io::CopyAtomically(source, destination);
     if (copied.error == io::CopyError::kSourceMissing) {
-      // There is no save at that path -- a download for a save this client does
+      // There is nothing at that path -- a download for a save this client does
       // not have yet. It overwrites nothing, so there is nothing to preserve.
       return OperationError::kNone;
     }
     if (!copied.ok()) {
-      *message = "the save's previous bytes could not be preserved: " + copied.message;
+      *message = "the previous bytes could not be preserved: " + copied.message;
       return OperationError::kBackupFailed;
     }
-    *backup_sd_path = sd_path;
+    *backup_sd_path = backup_path;
     return OperationError::kNone;
   }
-  *message = "there are already " + std::to_string(kMaxBackupAttempts) +
-             " backups of this save under " + options.backup_dir + " for this second";
+  *message = "there are already " + std::to_string(kMaxBackupAttempts) + " backups of " + sd_path +
+             " under " + backup_dir + " for this second";
   return OperationError::kBackupFailed;
+}
+
+namespace {
+
+/// `BackUpFirst` with a save's discriminator and this execution's clock filled
+/// in. The order and the primitives are the shared ones; only the name differs.
+OperationError BackUp(fs::FileSystem& files, const ExecuteOptions& options,
+                      const SyncOperation& operation, const SaveTarget& target,
+                      std::string* backup_sd_path, std::string* message) {
+  const std::int64_t stamp =
+      UnixSeconds(options.now != nullptr ? options.now() : std::chrono::system_clock::now());
+  return BackUpFirst(files, options.backup_dir, target.sd_path, operation.rom_id,
+                     SlotBackupDiscriminator(operation.slot), target.file_name, stamp,
+                     backup_sd_path, message);
 }
 
 /// `POST /api/saves?...&overwrite=true` with the local file as `saveFile`.
