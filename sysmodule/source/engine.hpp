@@ -379,16 +379,37 @@ class SdEngine : public ipc::Engine {
   ipc::Error ListConflicts(const ipc::ConflictQuery& query, ipc::ConflictPage* page) override;
   ipc::Error RestoreBackup(std::int64_t entry_id, conflicts::RestoreReport* report) override;
 
-  /// Serialises `history_` between the IPC thread and the worker.
+  /// Serialises `history_` -- the vector, and nothing else.
   ///
   /// M7-1 (#36) left `history_` under no lock and said exactly what would change
   /// that: a second writer of `.backup/`, which is the scheduler running a tick
   /// (M7-2, #37). This is it. It is deliberately **not** `card_mutex_`: taking
   /// that for a restore would make a pairing grant wait behind a save-state copy
   /// of tens of megabytes, which is the thing the two-lock split exists to
-  /// prevent. It is never held across a network call -- only across the append
-  /// or the restore itself.
+  /// prevent. It is held for an append or for one restore, never across a
+  /// network call -- which is what keeps `ListConflicts`, on the IPC thread,
+  /// from waiting out a tick.
   mutable std::mutex history_mutex_;
+
+  /// **The right to write a save file.** Held by the worker for the whole of a
+  /// tick's transfers, and *try*-locked by a restore.
+  ///
+  /// A second lock rather than a wider `history_mutex_`, because the two have
+  /// opposite requirements: the history has to be readable while a tick runs, so
+  /// its lock may not be held across the network, and the save bytes have to be
+  /// exclusive *for* the length of a tick. One mutex cannot be both.
+  ///
+  /// **Try-locked and never waited on**, on the IPC thread's side. Both writers
+  /// are individually atomic, so the collision they make is a lost update rather
+  /// than a corrupt file -- restored bytes replaced moments later by an
+  /// in-flight download, and the tick's `.backup/` copy taken of a half-restored
+  /// state -- and neither is something to hand a player. But *waiting* would
+  /// park the IPC thread behind a whole tick, which `ipc.hpp` forbids in as many
+  /// words. So a restore that arrives mid-tick is refused with a sentence, and
+  /// the user presses again.
+  ///
+  /// Order is this one, then `history_mutex_`, on both sides.
+  mutable std::mutex save_write_mutex_;
 
   /// The conflict history, for the tick that writes it.
   ///

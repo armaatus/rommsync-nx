@@ -1634,6 +1634,7 @@ set(ENGINE_SCENARIOS
   commands  # what is still `kUnavailable`, so the list shrinks deliberately
   unreachable  # M1-6: a server that answers nothing refuses the attempt, and writes nothing
   syncnow   # M7-2: Sync now starts a tick and says so, instead of "one is already running"
+  restore_race  # M7-2: a restore pressed while a tick is writing saves is refused, not interleaved
 )
 foreach(scenario IN LISTS ENGINE_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})

@@ -835,6 +835,12 @@ void SdEngine::RunOneTick() {
     return place(operation.rom_id, operation.file_name);
   };
 
+  // **Every save byte this tick writes happens under this**, so a restore
+  // arriving from the overlay is refused rather than interleaved
+  // (`save_write_mutex_`). Held across the transfers and the states half, and
+  // released before the counters go under `mutex_`.
+  std::unique_lock<std::mutex> writing(save_write_mutex_);
+
   const sync::TickResult tick =
       sync::RunTick(*client, *files, token, reported, targets, loaded.value, options);
   ObserveAnswer(tick.answer);
@@ -878,6 +884,7 @@ void SdEngine::RunOneTick() {
     std::lock_guard<std::mutex> history(history_mutex_);
     conflicts::RecordStates(&history_, states, record);
   }
+  writing.unlock();
 
   std::lock_guard<std::mutex> lock(mutex_);
   scheduler_.Finished(tick);
@@ -1259,12 +1266,8 @@ ipc::Error SdEngine::ListConflicts(const ipc::ConflictQuery& query, ipc::Conflic
 }
 
 ipc::Error SdEngine::RestoreBackup(std::int64_t entry_id, conflicts::RestoreReport* report) {
-  // Held across the restore, which copies two files on the card: a tick
-  // appending an entry underneath a restore reading one would be a race on the
-  // same vector.
-  std::lock_guard<std::mutex> history(history_mutex_);
-
-  // **Refused while a tick is running**, because both write saves.
+  // **Refused while a tick is writing saves**, because both write the same
+  // bytes.
   //
   // Until M7-2 (#37) this was the only thing in the sysmodule that wrote a save,
   // so there was nothing to be atomic against. Now the worker runs
@@ -1274,19 +1277,28 @@ ipc::Error SdEngine::RestoreBackup(std::int64_t entry_id, conflicts::RestoreRepo
   // later by an in-flight download, and the tick's `.backup/` copy taken of a
   // half-restored state -- and neither is something to hand a player.
   //
-  // Refused rather than serialised: waiting would park the **IPC thread** behind
-  // a whole tick, which `ipc.hpp` forbids in as many words. `kBackupFailed` is
-  // the outcome whose promise is exactly what holds here -- nothing was written
-  // -- and the sentence beside it is what the screen draws, so the user is told
-  // to try again rather than told their backup is gone.
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (sync_in_progress_) {
-      report->outcome = conflicts::RestoreOutcome::kBackupFailed;
-      report->message = "a sync is running; try the restore again when it finishes";
-      return ipc::Error::kOk;
-    }
+  // **The lock is taken for the whole check-and-act, not consulted and
+  // dropped.** A flag read under a lock that is then released is a race with a
+  // handful of instructions in it rather than an unbounded one, which is not the
+  // same as no race: the worker could take the flag and start writing in exactly
+  // that gap. Holding `save_write_mutex_` until the restore has finished is what
+  // actually excludes it.
+  //
+  // Try-locked rather than waited on: waiting would park the **IPC thread**
+  // behind a whole tick, which `ipc.hpp` forbids in as many words.
+  // `kBackupFailed` is the outcome whose promise is exactly what holds here --
+  // nothing was written -- and the sentence beside it is what the screen draws,
+  // so the user is told to press again rather than told their backup is gone.
+  std::unique_lock<std::mutex> writing(save_write_mutex_, std::try_to_lock);
+  if (!writing.owns_lock()) {
+    report->outcome = conflicts::RestoreOutcome::kBackupFailed;
+    report->message = "a sync is running; try the restore again when it finishes";
+    return ipc::Error::kOk;
   }
+
+  // The vector, for the read and the entry it hands back. Inside the write lock,
+  // which is the order both sides take them in.
+  std::lock_guard<std::mutex> history(history_mutex_);
 
   if (card_ == nullptr) {
     // Nothing implements `fs::FileSystem` for Horizon yet (`engine.hpp`).
