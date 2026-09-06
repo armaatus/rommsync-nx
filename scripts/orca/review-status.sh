@@ -47,7 +47,10 @@ query($owner:String!,$name:String!,$pr:Int!){
   repository(owner:$owner,name:$name){
     pullRequest(number:$pr){
       reviews(last:50){ nodes{ state submittedAt commit{oid} author{login} } }
-      reviewThreads(first:100){ nodes{ isResolved path line } }
+      reviewThreads(first:100){
+        nodes{ id isResolved isOutdated path line
+               comments(first:1){ nodes{ author{login} body } } }
+      }
     }
   }
 }' >"$payload" 2>/dev/null || { echo "could not read the PR's reviews" >&2; exit 2; }
@@ -65,9 +68,22 @@ problems = []
 
 unresolved = [t for t in pull["reviewThreads"]["nodes"] if not t["isResolved"]]
 if unresolved:
+    # The whole thread, not just where it is. An agent that has to go and fetch
+    # each body separately reaches for
+    # `gh api repos/{owner}/{repo}/pulls/<n>/comments`, which cannot report
+    # isResolved and hands back every comment ever left -- the already-fixed
+    # ones mixed in with the live one. #88 and #89 each sat blocked on exactly
+    # one unresolved thread lost in that noise. The id is here because it is
+    # what `resolveReviewThread` takes, so nothing has to be looked up twice.
     problems.append(f"{len(unresolved)} unresolved review thread(s):")
     for t in unresolved:
-        problems.append(f"    {t.get('path')}:{t.get('line')}")
+        first = ((t.get("comments") or {}).get("nodes") or [{}])[0]
+        who = ((first.get("author") or {}).get("login")) or "?"
+        stale = "  (outdated -- still open)" if t.get("isOutdated") else ""
+        problems.append(f"    {t.get('path')}:{t.get('line')}  by {who}{stale}")
+        problems.append(f"      thread: {t.get('id')}")
+        for line in (first.get("body") or "").splitlines():
+            problems.append(f"      {line}")
 
 on_head = [r for r in pull["reviews"]["nodes"]
            if (r.get("commit") or {}).get("oid") == head]

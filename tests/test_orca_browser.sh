@@ -552,10 +552,563 @@ JSON
     echo "PASS: a broken orca wrapper on PATH is skipped for one that answers"
     ;;
 
+  await_reports_failed_review)
+    # A review job that FAILED is not a review that is late. Waiting out the
+    # 45-minute deadline for one and then saying "nothing arrived" is what
+    # happened on PR #80, where the reviewer had already died on "Reached
+    # maximum number of turns" four minutes in.
+    make_fixture
+    # The script under test goes INTO the fixture, like every other phase here.
+    # await-review.sh derives its own repo root from its location, so running
+    # the checkout's copy makes it cd to the real working tree -- and then
+    # `orca_fleet_stopped` reads the developer's own ~/.rommsync-fleet/STOP. If
+    # that file happens to exist the script exits 3 before it ever reaches the
+    # branch under test, and the failure blames the feature rather than the
+    # fixture. Found in review of this PR.
+    cp "$REPO_ROOT"/scripts/orca/{await-review.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    stub="$TMPDIR_FIXTURE/stub-bin"
+    mkdir -p "$stub"
+    cat >"$stub/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"pr list"*)  printf '[{"number":80}]\n' ;;
+  *"run list"*) printf '4242\n' ;;
+  *"run view"*) printf '##[error] Execution failed: Reached maximum number of turns (30)\n' ;;
+  # The rollup is what the script asks first: the review CHECK is dead, so it
+  # goes looking for the run behind it. Nothing else here is failing, so the
+  # red-build branch must not fire -- this has to exit 6, never 7.
+  *statusCheckRollup*)
+    printf '{"statusCheckRollup":[{"name":"review against REVIEW.md","conclusion":"FAILURE"},{"name":"host-tests","conclusion":"SUCCESS"}]}\n' ;;
+  *"pr view"*)  printf '{"reviews":[]}\n' ;;
+  *)            printf '\n' ;;
+esac
+GHSTUB
+    chmod +x "$stub/gh"
+    ( cd "$TMPDIR_FIXTURE" && git init -q . && git commit -q --allow-empty -m fixture ) 2>/dev/null
+    out="$(cd "$TMPDIR_FIXTURE" &&
+           PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$TMPDIR_FIXTURE/fleet" \
+           AWAIT_REVIEW_DEADLINE=5 AWAIT_REVIEW_POLL=1 \
+           bash "$TMPDIR_FIXTURE/scripts/orca/await-review.sh" 80 2>&1)"
+    rc=$?
+    grep -q "maximum number of turns" <<<"$out" \
+      || fail "did not report why the review job failed; got: $out"
+    [ "$rc" = 6 ] \
+      || fail "expected exit 6 for a failed review job, got $rc: $out"
+    echo "PASS: a failed review job is reported at once, not waited out"
+    ;;
+
+  await_finds_the_failed_run_under_newer_skipped_ones)
+    # The phase above proves the report happens; this one proves it is still
+    # reachable on a real PR. `claude review` fires on pull_request_review and
+    # pull_request_review_comment as well as on the push, and those runs no-op
+    # with `skipped`. So the FAILED run sinks: on this PR every single head had
+    # a skipped review-event run as its newest `claude review` run, with the
+    # real one four or five entries below. Asking for `--limit 1` therefore
+    # returns a skipped run forever, the failure is never seen, and the wait
+    # runs its full 45 minutes to report that nothing arrived -- which is #80,
+    # the exact failure this check exists to end.
+    #
+    # The stub models GitHub's ordering rather than answering a constant: it
+    # builds five skipped runs ahead of the failure, truncates to whatever
+    # --limit the script asked for, and then applies the same select the real
+    # --jq applies. A window too small to reach the failure yields nothing,
+    # exactly as gh would.
+    make_fixture
+    cp "$REPO_ROOT"/scripts/orca/{await-review.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    stub="$TMPDIR_FIXTURE/stub-bin"
+    mkdir -p "$stub"
+    cat >"$stub/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"pr list"*)  printf '[{"number":80}]\n' ;;
+  *"run list"*)
+    limit=1
+    for a in "$@"; do
+      [ "$prev" = "--limit" ] && limit="$a"
+      prev="$a"
+    done
+    echo "$limit" >>"$LIMIT_LOG"
+    # Five skipped runs sit ahead of the failure, as they do on a real PR.
+    if [ "$limit" -gt 5 ]; then printf '4242\n'; else printf '\n'; fi ;;
+  *"run view"*) printf '##[error] Execution failed: Reached maximum number of turns (30)\n' ;;
+  *statusCheckRollup*)
+    printf '{"statusCheckRollup":[{"name":"review against REVIEW.md","conclusion":"FAILURE"},{"name":"host-tests","conclusion":"SUCCESS"}]}\n' ;;
+  *"pr view"*)  printf '{"reviews":[]}\n' ;;
+  *)            printf '\n' ;;
+esac
+GHSTUB
+    chmod +x "$stub/gh"
+    ( cd "$TMPDIR_FIXTURE" && git init -q . && git commit -q --allow-empty -m fixture ) 2>/dev/null
+    limitlog="$TMPDIR_FIXTURE/limits.log"; : >"$limitlog"
+    out="$(cd "$TMPDIR_FIXTURE" &&
+           PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$TMPDIR_FIXTURE/fleet" \
+           LIMIT_LOG="$limitlog" \
+           AWAIT_REVIEW_DEADLINE=5 AWAIT_REVIEW_POLL=1 \
+           bash "$TMPDIR_FIXTURE/scripts/orca/await-review.sh" 80 2>&1)"
+    rc=$?
+    [ -s "$limitlog" ] || fail "never asked for the run list at all; the fixture proves nothing"
+    [ "$rc" = 6 ] \
+      || fail "a failed review run buried under newer skipped runs was never found (exit $rc, asked for --limit $(head -1 "$limitlog")); the wait would run its full deadline and blame no one: $out"
+    grep -q "maximum number of turns" <<<"$out" \
+      || fail "found the run but did not say why it failed; got: $out"
+    echo "PASS: the failed run is found even under newer skipped runs"
+    ;;
+
+  await_throttles_the_lookup_when_the_run_is_never_found)
+    # The third way this same call has now been made expensive, and the subtlest.
+    # The review check is dead, so `review_dead` is correctly true -- but the run
+    # behind it is never found: a transient error swallowed by `2>/dev/null`, or
+    # a failure further back than the window. The loop therefore does NOT exit 6,
+    # and `review_dead` stays true until the next throttled recheck.
+    #
+    # Gated on `review_dead` alone, the lookup then re-fires on every poll for as
+    # long as that lasts -- the per-poll cost the throttle exists to prevent,
+    # moved one call downstream of the fix rather than removed. Gated on the
+    # throttle too, an unfound run costs one call per cycle.
+    #
+    # The other two await phases cannot see this: one exits 6 on the first try
+    # so the loop never repeats, and the recovery phase only counts calls made
+    # AFTER the rollup reports recovery, not the ones made while review_dead is
+    # correctly still true.
+    make_fixture
+    cp "$REPO_ROOT"/scripts/orca/{await-review.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    stub="$TMPDIR_FIXTURE/stub-bin"
+    mkdir -p "$stub"
+    cat >"$stub/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"pr list"*)  printf '[{"number":80}]\n' ;;
+  # The review check stays dead all the way through, so review_dead is true on
+  # every poll after the first throttled check.
+  *statusCheckRollup*)
+    printf '{"statusCheckRollup":[{"name":"review against REVIEW.md","conclusion":"FAILURE"},{"name":"host-tests","conclusion":"SUCCESS"}]}\n' ;;
+  # ...and the run behind it is never found, so the loop never exits 6.
+  *"run list"*) echo x >>"$RUNLIST_LOG"; printf '\n' ;;
+  *"pr view"*)  printf '{"reviews":[]}\n' ;;
+  *)            printf '\n' ;;
+esac
+GHSTUB
+    chmod +x "$stub/gh"
+    ( cd "$TMPDIR_FIXTURE" && git init -q . && git commit -q --allow-empty -m fixture ) 2>/dev/null
+    runlog="$TMPDIR_FIXTURE/runlist.log"; : >"$runlog"
+    # 12 polls at one second: three throttled checks (polls 1, 5, 9), so a
+    # correctly throttled lookup spends three calls and a per-poll one spends
+    # about twelve.
+    ( cd "$TMPDIR_FIXTURE" &&
+      PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$TMPDIR_FIXTURE/fleet" RUNLIST_LOG="$runlog" \
+      AWAIT_REVIEW_DEADLINE=12 AWAIT_REVIEW_POLL=1 \
+      bash "$TMPDIR_FIXTURE/scripts/orca/await-review.sh" 80 >/dev/null 2>&1 )
+    calls="$(wc -l <"$runlog" | tr -d ' ')"
+    [ "${calls:-0}" -ge 1 ] \
+      || fail "never looked for the failed run at all; the fixture proves nothing"
+    [ "${calls:-0}" -le 4 ] \
+      || fail "spent $calls run-list call(s) over 12 polls while the run stayed unfound; the lookup is running per poll, not per throttle cycle"
+    echo "PASS: an unfound run costs one lookup per throttle cycle, not one per poll"
+    ;;
+
+  await_reports_a_red_build)
+    # #88 sat in await-review.sh while host-tests failed on its own new test.
+    # A review cannot fix a red build, and waiting for one costs 45 minutes and
+    # then reports the wrong thing.
+    make_fixture
+    cp "$REPO_ROOT"/scripts/orca/{await-review.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    stub="$TMPDIR_FIXTURE/stub-bin"; mkdir -p "$stub"
+    cat >"$stub/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"pr list"*)              printf '[{"number":88}]\n' ;;
+  *statusCheckRollup*)      printf '{"statusCheckRollup":[{"name":"host-tests","conclusion":"FAILURE"},{"name":"merge-gate","conclusion":"FAILURE"}]}\n' ;;
+  *"pr view"*)              printf '{"reviews":[]}\n' ;;
+  *"run list"*)             printf '\n' ;;
+  *)                        printf '\n' ;;
+esac
+GHSTUB
+    chmod +x "$stub/gh"
+    ( cd "$TMPDIR_FIXTURE" && git init -q . && git commit -q --allow-empty -m fixture ) 2>/dev/null
+    out="$(cd "$TMPDIR_FIXTURE" &&
+           PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$TMPDIR_FIXTURE/fleet" \
+           AWAIT_REVIEW_DEADLINE=12 AWAIT_REVIEW_POLL=1 \
+           bash "$TMPDIR_FIXTURE/scripts/orca/await-review.sh" 88 2>&1)"
+    rc=$?
+    grep -q "host-tests" <<<"$out" || fail "did not name the failing check: $out"
+    grep -q "two consecutive checks" <<<"$out" \
+      || fail "acted on a single sighting; a known flake would send an agent chasing it: $out"
+    grep -q "#76" <<<"$out" \
+      || fail "did not point at the known flake as the first thing to rule out: $out"
+    grep -q "merge-gate" <<<"$out" \
+      && fail "reported merge-gate, which is red by design until a review exists: $out"
+    [ "$rc" = 7 ] || fail "expected exit 7 for a red build, got $rc: $out"
+    echo "PASS: a red build is reported at once, and merge-gate is not mistaken for one"
+    ;;
+
+  fleet_notices_a_stalled_agent)
+    # The other half of this PR, which shipped untested and should not have.
+    # An agent in `waiting` is at a prompt, not working -- the board still reads
+    # `in-progress` and the time-box has hours to run. The fleet has to say so,
+    # once, rather than once per poll.
+    make_fixture
+    cp "$REPO_ROOT"/scripts/orca/{fleet.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    stub="$TMPDIR_FIXTURE/stub-bin"; mkdir -p "$stub"
+    state="$TMPDIR_FIXTURE/fleet"; mkdir -p "$state/worktrees"
+    printf '%s\n' "$TMPDIR_FIXTURE" >"$state/worktrees/29"
+    cat >"$stub/orca" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$TMPDIR_FIXTURE/orca-calls.log"
+case "\$1" in
+  --version) exit 0 ;;
+  worktree)
+    printf '{"ok":true,"result":{"worktrees":[{"path":"$TMPDIR_FIXTURE","linkedIssue":29,"agents":[{"state":"waiting"}]}]}}\n' ;;
+  *) printf '{"ok":true,"result":{}}\n' ;;
+esac
+STUB
+    chmod +x "$stub/orca"
+    : >"$TMPDIR_FIXTURE/orca-calls.log"
+    out="$(PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$state" \
+           bash -c '. '"$TMPDIR_FIXTURE"'/scripts/orca/lib.sh
+                    orca_cli_resolve
+                    STATE_DIR="'"$state"'"; OWNED_DIR="$STATE_DIR/worktrees"
+                    say() { echo "$*"; }
+                    notify() { echo "NOTIFY: $*"; }
+                    orca_json() { local o; o="$(mktemp)"; orca_run_with_deadline 10 "$o" "$ORCA_CLI" "$@" --json; cat "$o"; rm -f "$o"; }
+                    card() { echo "CARD: $*"; }
+                    '"$(sed -n '/^notice_stalled()/,/^}/p' "$TMPDIR_FIXTURE/scripts/orca/fleet.sh")"'
+                    notice_stalled
+                    echo "--- second pass ---"
+                    notice_stalled' 2>&1)"
+    grep -q "waiting for input" <<<"$out" \
+      || fail "the fleet did not notice an agent sitting at a prompt: $out"
+    grep -q "NOTIFY:" <<<"$out" || fail "no notification for a stalled agent: $out"
+    grep -q "CARD:" <<<"$out" || fail "the card was not updated for a stalled agent: $out"
+    # Count the LOG line, not the phrase: the card comment repeats it, so
+    # matching "waiting for input" counts two for a single notice.
+    [ "$(grep -c "in auto mode nothing should be asking" <<<"$out")" -eq 1 ] \
+      || fail "said it more than once; it must be once per stall, not per poll: $out"
+    echo "PASS: a stalled agent is reported once, on the card and in a notification"
+    ;;
+
+  review_status_shows_the_open_thread)
+    # The brief used to list feedback with the REST comments endpoint, which
+    # cannot say whether a thread is resolved. On round two that returns every
+    # comment ever left -- the fixed ones mixed in with the live one -- and a
+    # thread lost in that noise is exactly what left #88 and #89 blocked.
+    make_fixture
+    cp "$REPO_ROOT"/scripts/orca/{review-status.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    stub="$TMPDIR_FIXTURE/stub-bin"
+    mkdir -p "$stub"
+    cat >"$stub/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"repo view"*) printf 'armaatus/rommsync-nx\n' ;;
+  *headRefOid*)  printf 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n' ;;
+  *statusCheckRollup*) printf '{"statusCheckRollup":[{"name":"host-tests","conclusion":"SUCCESS"}]}\n' ;;
+  *graphql*)
+    cat <<'JSON'
+{"data":{"repository":{"pullRequest":{
+ "reviews":{"nodes":[{"state":"COMMENTED","submittedAt":"2026-09-06T00:00:00Z",
+                      "commit":{"oid":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"},
+                      "author":{"login":"claude"}}]},
+ "reviewThreads":{"nodes":[
+  {"id":"T_settled","isResolved":true,"isOutdated":false,"path":"core/src/old.cpp","line":10,
+   "comments":{"nodes":[{"author":{"login":"claude"},"body":"ALREADY FIXED LAST ROUND"}]}},
+  {"id":"T_live","isResolved":false,"isOutdated":true,"path":"core/src/sync.cpp","line":288,
+   "comments":{"nodes":[{"author":{"login":"claude"},"body":"THE ONE STILL OPEN"}]}}
+]}}}}}
+JSON
+    ;;
+  *) printf '\n' ;;
+esac
+GHSTUB
+    chmod +x "$stub/gh"
+    ( cd "$TMPDIR_FIXTURE" && git init -q . && git commit -q --allow-empty -m fixture ) 2>/dev/null
+    out="$(cd "$TMPDIR_FIXTURE" &&
+           PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$TMPDIR_FIXTURE/fleet" \
+           bash "$TMPDIR_FIXTURE/scripts/orca/review-status.sh" 83 2>&1)"
+    rc=$?
+    [ "$rc" = 1 ] || fail "expected exit 1 (an unresolved thread is not ready), got $rc: $out"
+    grep -q "THE ONE STILL OPEN" <<<"$out" \
+      || fail "did not print the unresolved thread; got: $out"
+    grep -q "ALREADY FIXED LAST ROUND" <<<"$out" \
+      && fail "printed a RESOLVED thread -- that is the REST behaviour this replaces: $out"
+    grep -q "T_live" <<<"$out" \
+      || fail "did not print the thread ID resolveReviewThread needs: $out"
+    grep -q "core/src/sync.cpp:288" <<<"$out" \
+      || fail "did not say where the thread is: $out"
+    # An outdated thread still blocks the merge, so it must still be listed.
+    grep -q "outdated -- still open" <<<"$out" \
+      || fail "an outdated-but-unresolved thread must be shown as still open: $out"
+    echo "PASS: only unresolved threads are listed, with the ID needed to resolve them"
+    ;;
+
+  brief_never_lists_threads_over_rest)
+    # The brief IS the fleet's operating instruction; a wrong command in it is a
+    # defect in the same sense a wrong line of C++ is. This pins the endpoint it
+    # must not go back to.
+    brief="$REPO_ROOT/scripts/orca/issue-command.sh"
+    grep -q "review-status.sh" "$brief" \
+      || fail "step 5 no longer points at review-status.sh"
+    # The REST endpoint may be NAMED (the brief warns against it) but never as
+    # the command to run: the warning line is the only place it may appear.
+    while IFS= read -r line; do
+      case "$line" in
+        *"pulls/<n>/comments"*)
+          case "$line" in
+            *"Do NOT"*|*"cannot"*) ;;
+            *) fail "the brief still tells the agent to run: $line" ;;
+          esac ;;
+      esac
+    done <"$brief"
+    echo "PASS: the brief lists threads through review-status.sh, not the REST comments list"
+    ;;
+
+  brief_queues_the_merge_at_step_four)
+    # #90 went green with nothing queued to merge it: GitHub refuses auto-merge
+    # on an ALREADY-mergeable PR ("Pull request is in clean status"), and the
+    # guard forbids merging by hand, so the PR sat clean and untouched. The brief
+    # is the fleet's operating instruction -- a forward reference ("see step 6")
+    # is not an instruction to run anything, and an agent reading in order would
+    # queue it late and reproduce the bug. The command has to BE in step 4.
+    brief="$REPO_ROOT/scripts/orca/issue-command.sh"
+    step4="$(awk '/^\*\*4\. /{on=1} /^\*\*5\. /{on=0} on' "$brief")"
+    [ -n "$step4" ] || fail "could not find step 4 in the brief"
+    grep -q -- "--auto" <<<"$step4" \
+      || fail "step 4 does not carry the auto-merge command itself:
+$step4"
+    grep -q "gh pr merge" <<<"$step4" \
+      || fail "step 4 never names gh pr merge:
+$step4"
+    echo "PASS: the brief queues auto-merge in step 4, not by forward reference"
+    ;;
+
+  await_costs_nothing_while_the_review_is_healthy)
+    # The failed-review check used to spend a `gh run list` on EVERY poll -- up
+    # to 90 extra calls per waiting worktree over a 45-minute wait, times three
+    # worktrees, against the same secondary rate limit the red-build check is
+    # throttled to respect. Worse, a rate-limited answer is indistinguishable
+    # from "nothing failed", which is how #80 defeated the previous check. It now
+    # reads the rollup it already fetched, and asks about runs only once that
+    # rollup says the review check is dead.
+    make_fixture
+    cp "$REPO_ROOT"/scripts/orca/{await-review.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    stub="$TMPDIR_FIXTURE/stub-bin"
+    mkdir -p "$stub"
+    cat >"$stub/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+# Everything green and no review yet: the healthy wait.
+case "$*" in
+  *"pr list"*)          printf '[{"number":80}]
+' ;;
+  *"run list"*)         echo "$*" >>"$RUNLIST_LOG"; printf '
+' ;;
+  *statusCheckRollup*)  printf '{"statusCheckRollup":[{"name":"host-tests","conclusion":"SUCCESS"}]}
+' ;;
+  *"pr view"*)          printf '{"reviews":[]}
+' ;;
+  *)                    printf '
+' ;;
+esac
+GHSTUB
+    chmod +x "$stub/gh"
+    ( cd "$TMPDIR_FIXTURE" && git init -q . && git commit -q --allow-empty -m fixture ) 2>/dev/null
+    runlog="$TMPDIR_FIXTURE/runlist.log"; : >"$runlog"
+    ( cd "$TMPDIR_FIXTURE" &&
+      PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$TMPDIR_FIXTURE/fleet" RUNLIST_LOG="$runlog" \
+      AWAIT_REVIEW_DEADLINE=6 AWAIT_REVIEW_POLL=1 \
+      bash "$TMPDIR_FIXTURE/scripts/orca/await-review.sh" 80 >/dev/null 2>&1 )
+    calls="$(grep -c "claude review" "$runlog" || true)"
+    [ "${calls:-0}" = 0 ] \
+      || fail "spent $calls run-list call(s) while the review check was green; the rollup already said nothing failed"
+    echo "PASS: no run-list calls while the review check is healthy"
+    ;;
+
+  await_stops_paying_once_the_review_recovers)
+    # The other half of the throttle: not "never dead" but dead and then ALIVE
+    # again. A review job that failed can be re-run, and when it comes back the
+    # `gh run list` behind it has to stop -- otherwise a single dead check early
+    # in the wait buys an unthrottled call on every poll for the remaining 45
+    # minutes, which is the cost the throttle exists to remove.
+    #
+    # This is the transition the other four await tests do not cross: they cover
+    # dead-from-the-first-check, never-dead, and the red-build path. In each of
+    # those the value carried between checks happens to equal the correct one,
+    # so a `review_dead` that never cleared would pass all of them.
+    #
+    # The stub answers FAILURE on the first rollup and SUCCESS on every one
+    # after it, and stamps each `gh run list` with the number of rollups that
+    # preceded it. Any call stamped 2 or higher is one made after the rollup
+    # said the review had recovered.
+    make_fixture
+    cp "$REPO_ROOT"/scripts/orca/{await-review.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    stub="$TMPDIR_FIXTURE/stub-bin"
+    mkdir -p "$stub"
+    cat >"$stub/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"pr list"*)
+    printf '[{"number":80}]\n' ;;
+  *"run list"*)
+    # Stamped with how many rollups have been served, so the assertion can tell
+    # a call made while the check was dead from one made after it recovered.
+    printf '%s\n' "$(cat "$ROLLUP_COUNT")" >>"$RUNLIST_LOG"
+    printf '\n' ;;
+  *statusCheckRollup*)
+    n=$(( $(cat "$ROLLUP_COUNT") + 1 )); printf '%s' "$n" >"$ROLLUP_COUNT"
+    if [ "$n" = 1 ]; then
+      # The review job died. Nothing else is failing, so the red-build path
+      # (which needs the same non-review check twice running) never fires and
+      # cannot end the wait early.
+      printf '{"statusCheckRollup":[{"name":"review against REVIEW.md","conclusion":"FAILURE"}]}\n'
+    else
+      printf '{"statusCheckRollup":[{"name":"review against REVIEW.md","conclusion":"SUCCESS"}]}\n'
+    fi ;;
+  *"pr view"*)
+    printf '{"reviews":[]}\n' ;;
+  *)
+    printf '\n' ;;
+esac
+GHSTUB
+    chmod +x "$stub/gh"
+    ( cd "$TMPDIR_FIXTURE" && git init -q . && git commit -q --allow-empty -m fixture ) 2>/dev/null
+    runlog="$TMPDIR_FIXTURE/runlist.log"; : >"$runlog"
+    counter="$TMPDIR_FIXTURE/rollups"; printf '0' >"$counter"
+    # Long enough to cross at least two throttle checks (they fire on polls
+    # 1, 5, 9 ...), so the recovery at check 2 is actually reached.
+    ( cd "$TMPDIR_FIXTURE" &&
+      PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$TMPDIR_FIXTURE/fleet" \
+      RUNLIST_LOG="$runlog" ROLLUP_COUNT="$counter" \
+      AWAIT_REVIEW_DEADLINE=9 AWAIT_REVIEW_POLL=1 \
+      bash "$TMPDIR_FIXTURE/scripts/orca/await-review.sh" 80 >/dev/null 2>&1 )
+    [ "$(cat "$counter")" -ge 2 ] \
+      || fail "the wait never reached a second throttle check ($(cat "$counter")) -- the fixture proves nothing"
+    late="$(awk '$1 >= 2' "$runlog" | wc -l | tr -d ' ')"
+    [ "${late:-0}" = 0 ] \
+      || fail "spent $late run-list call(s) after the rollup said the review check had recovered; review_dead never cleared"
+    echo "PASS: the run-list stops once the review check recovers"
+    ;;
+
+  reap_judges_removal_by_the_directory)
+    # #27's worktree removal exited non-zero and the fleet logged "could not
+    # remove it" -- while the same command by hand removed it, warning only that
+    # git would not delete the branch. The slot stayed held, and the fleet ran at
+    # two worktrees instead of three. Removal is judged by whether the directory
+    # is gone, and retried once before it is given up on.
+    make_fixture
+    cp "$REPO_ROOT"/scripts/orca/{fleet.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    stub="$TMPDIR_FIXTURE/stub-bin"; mkdir -p "$stub"
+    target="$TMPDIR_FIXTURE/wt-27"; mkdir -p "$target"
+    # Removes the worktree and THEN exits non-zero, exactly as the real one did.
+    cat >"$stub/orca" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$TMPDIR_FIXTURE/orca-calls.log"
+case "\$1" in
+  --version) exit 0 ;;
+  worktree)  rm -rf "$target"; echo 'warning: local branch was kept' >&2; exit 1 ;;
+  *)         printf '{"ok":true}\n' ;;
+esac
+STUB
+    chmod +x "$stub/orca"
+    : >"$TMPDIR_FIXTURE/orca-calls.log"
+    run_remove() {
+      PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$TMPDIR_FIXTURE/fleet" \
+      bash -c '. '"$TMPDIR_FIXTURE"'/scripts/orca/lib.sh
+               orca_cli_resolve
+               '"$(sed -n '/^remove_worktree()/,/^}/p' "$TMPDIR_FIXTURE/scripts/orca/fleet.sh")"'
+               remove_worktree "'"$1"'"'
+    }
+    run_remove "$target"; rc=$?
+    [ "$rc" = 0 ] \
+      || fail "reported failure for a worktree that IS gone (exit $rc) -- that is the bug that held #27's slot"
+    [ "$(grep -c 'worktree rm' "$TMPDIR_FIXTURE/orca-calls.log")" = 1 ] \
+      || fail "retried a removal that had already succeeded"
+
+    # And a removal that genuinely does nothing must still fail -- after a retry.
+    stuck="$TMPDIR_FIXTURE/wt-stuck"; mkdir -p "$stuck"
+    cat >"$stub/orca" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+  --version) exit 0 ;;
+  *)         exit 1 ;;
+esac
+STUB
+    chmod +x "$stub/orca"
+    run_remove "$stuck"; rc=$?
+    [ "$rc" != 0 ] \
+      || fail "claimed success while the worktree is still on disk"
+    [ -d "$stuck" ] || fail "fixture removed itself; the test proves nothing"
+    echo "PASS: removal is judged by the directory, retried once, and still fails honestly"
+    ;;
+
+  brief_warns_about_human_merge_paths)
+    # #96 is issue #34, "Versioning + Releases from CI" -- its scope IS
+    # .github/workflows/ci.yml, which merge_gate.py refuses by design. The agent
+    # did nothing wrong and cannot merge, and without being told so it burns its
+    # three review rounds trying to turn a gate green that never will be. The
+    # brief has to name the paths and say what "done" looks like for them.
+    brief="$REPO_ROOT/scripts/orca/issue-command.sh"
+    for path in ".github/workflows/" ".github/scripts/" ".claude/"; do
+      grep -q -- "$path" "$brief" \
+        || fail "the brief never mentions $path, which merge-gate refuses"
+    done
+    grep -qi "needs a human merge" "$brief" \
+      || fail "the brief does not say what done looks like for a human-merge PR"
+    # The gate and the brief must name the SAME paths -- a brief that warns about
+    # a different set than the gate enforces is worse than no warning.
+    gate="$REPO_ROOT/.github/scripts/merge_gate.py"
+    if [ -f "$gate" ]; then
+      # EVERY place that makes the claim, not just one of them. The brief says
+      # it twice -- once in step 4 and once in the closing notes -- and CLAUDE.md
+      # says it a third time. Checking only that each path appears SOMEWHERE
+      # passes while a second, narrower list sits a few lines further down
+      # contradicting the first, which is exactly what was found here: the
+      # closing note named two of the three paths, so an agent whose PR touched
+      # only .github/scripts/ read the correct warning and then the one that
+      # said it was fine, with nothing to say which governs.
+      python3 - "$gate" "$brief" "$REPO_ROOT/CLAUDE.md" <<'PYCHECK' || fail "a human-merge-path claim names fewer paths than merge_gate.py refuses"
+import re, sys
+gate = open(sys.argv[1]).read()
+block = re.search(r"HUMAN_ONLY_PREFIXES\s*=\s*\((.*?)\)", gate, re.S)
+paths = re.findall(r'"([^"]+)"', block.group(1)) if block else []
+if not paths:
+    print("could not read HUMAN_ONLY_PREFIXES from the gate", file=sys.stderr)
+    raise SystemExit(1)
+
+# A paragraph that both names one of the refused paths and asserts something
+# about merging is making the claim, and has to make it in full.
+claim = re.compile(r"auto-merge|merges? itself|never merges", re.I)
+bad = False
+for doc in sys.argv[2:]:
+    text = open(doc).read()
+    for para in re.split(r"\n\s*\n", text):
+        if not claim.search(para):
+            continue
+        named = [p for p in paths if p in para]
+        if not named:
+            continue
+        missing = [p for p in paths if p not in para]
+        if missing:
+            print(f"{doc}: a paragraph claiming {named} never auto-merges "
+                  f"omits {missing}:\n    " + "\n    ".join(para.strip().splitlines()),
+                  file=sys.stderr)
+            bad = True
+raise SystemExit(1 if bad else 0)
+PYCHECK
+    fi
+    echo "PASS: every human-merge-path claim names the full set merge-gate refuses"
+    ;;
+
   *)
     echo "usage: $0 opens|reuses|foreign|no_romm|submits|no_draft|unstable" >&2
     echo "       watch_needs_issue|watch_late_draft|watch_grace|watch_submits|watch_single" >&2
     echo "       watch_bare_url|watch_full_draft_untouched|cli_broken" >&2
+    echo "       await_reports_failed_review|await_reports_a_red_build" >&2
+    echo "       await_finds_the_failed_run_under_newer_skipped_ones" >&2
+    echo "       await_throttles_the_lookup_when_the_run_is_never_found" >&2
+    echo "       fleet_notices_a_stalled_agent" >&2
+    echo "       review_status_shows_the_open_thread|brief_never_lists_threads_over_rest" >&2
+    echo "       brief_queues_the_merge_at_step_four" >&2
+    echo "       await_costs_nothing_while_the_review_is_healthy" >&2
+    echo "       await_stops_paying_once_the_review_recovers" >&2
+    echo "       reap_judges_removal_by_the_directory" >&2
+    echo "       brief_warns_about_human_merge_paths" >&2
     exit 2
     ;;
 esac

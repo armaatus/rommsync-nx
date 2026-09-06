@@ -17,6 +17,8 @@
 #   3  the fleet was stopped while waiting
 #   4  nothing arrived before the deadline -- look at Actions
 #   5  the third round is over; stop and say what is unresolved
+#   6  the review job failed on this commit; the reason is printed
+#   7  the PR's build is red; a review cannot fix that
 #
 # The round cap is counted HERE rather than left to the agent to remember. Three
 # rounds is more than almost any PR needs, and a fourth is not what a
@@ -36,8 +38,10 @@ MAX_ROUNDS="${AWAIT_REVIEW_MAX_ROUNDS:-3}"
 ROUNDS_FILE="$REPO_ROOT/.orca/review-rounds"
 
 pr="${1:-}"
+branch="$(git rev-parse --abbrev-ref HEAD)"
+head="$(git rev-parse HEAD)"
 [ -n "$pr" ] || pr="$(orca_pr_for_branch)" || {
-  echo "no open PR for branch $(git rev-parse --abbrev-ref HEAD)" >&2; exit 2; }
+  echo "no open PR for branch $branch" >&2; exit 2; }
 
 mkdir -p "$REPO_ROOT/.orca"
 round=0
@@ -80,11 +84,142 @@ echo "  (polling every ${POLL_SECONDS}s; stop everything with ./scripts/orca/sto
 
 payload="$(mktemp)"; trap 'rm -f "$payload"' EXIT
 waited=0
+checks_due=0
+broken_before=""
+# Set from the rollup inside the throttled block below; declared here so a poll
+# that skips the block still has a value under `set -u`.
+review_dead=""
 while [ "$waited" -lt "$DEADLINE_SECONDS" ]; do
   if orca_fleet_stopped; then
     echo
     echo "STOPPED: $ORCA_FLEET_STOP exists. Put the work down and report where you got to."
     exit 3
+  fi
+
+  # A PR whose build is red does not need a review, it needs a fix. Waiting
+  # here for one is how #88 sat parked while `host-tests` was failing on its own
+  # new test -- the agent watching for a review that could never help. Ignores
+  # merge-gate (red until a review exists, by design) and the review job itself
+  # (handled just below).
+  # Every fourth poll, and acted on only when TWO consecutive checks agree.
+  #
+  # Every fourth because these are extra `gh` calls on a 30-second loop that can
+  # run 45 minutes, and this repo is careful about gh's secondary rate limit
+  # (see count_startable in fleet.sh).
+  #
+  # Twice because `harness.partial` is a known intermittent race (#76, reopened)
+  # that runs inside host-tests. A single sighting is not evidence the PR is
+  # broken, and sending an agent to fix something that is not theirs costs it a
+  # whole cycle. The comparison is between CHECKS, not polls -- an earlier
+  # version reset its memory on the polls in between and could never see the
+  # same failure twice.
+  checks_due=$((checks_due + 1))
+  if [ "$((checks_due % 4))" = "1" ]; then
+    rollup="$(GH_PAGER=cat gh pr view "$pr" --json statusCheckRollup 2>/dev/null \
+              | python3 -c "
+import json, sys
+try:
+    checks = json.load(sys.stdin).get('statusCheckRollup') or []
+except Exception:
+    raise SystemExit
+skip = ('merge-gate', 'review against REVIEW.md')
+dead = ('FAILURE', 'TIMED_OUT', 'ACTION_REQUIRED')
+bad = [c.get('name') for c in checks
+       if (c.get('conclusion') or '') in dead and c.get('name') not in skip]
+review_dead = any(c.get('name') == 'review against REVIEW.md'
+                  and (c.get('conclusion') or '') in dead for c in checks)
+print(', '.join(n for n in bad if n))
+print('REVIEW_FAILED' if review_dead else '')
+" 2>/dev/null)"
+    # Two lines out of one capture: the failing check names, then the marker
+    # saying the review check itself is among the dead. Read from `rollup` rather
+    # than from `broken` -- reusing one name as both the here-string source and
+    # the first read target works, but reads like a bug.
+    #
+    # Cleared first, and that is deliberate. `$(...)` strips ALL trailing
+    # newlines, so a healthy answer -- whose second line is empty -- comes back
+    # as ONE line, and the second `read` then hits EOF. bash assigns the empty
+    # line it did not get and returns non-zero, so `review_dead` does end up
+    # empty (verified on 3.2.57 and 5.3.15, the oldest and newest bash this repo
+    # can meet). But the recovery path depends entirely on that: if `read` left
+    # the variable untouched on EOF, a `REVIEW_FAILED` set on one throttle check
+    # would survive every later one, and the `gh run list` below would run on
+    # every poll for the rest of the 45-minute wait -- reintroducing exactly the
+    # cost the throttle above exists to remove. One assignment makes the
+    # recovery explicit instead of a consequence of how `read` handles EOF.
+    # `await_stops_paying_once_the_review_recovers` pins it.
+    review_dead=""
+    { IFS= read -r broken; IFS= read -r review_dead; } <<<"$rollup" || true
+    if [ -n "$broken" ] && [ "$broken" = "$broken_before" ]; then
+      cat <<RED
+
+CI is failing on this PR, on two consecutive checks: $broken
+
+No review will fix a red build. Reproduce it locally:
+  ctest --test-dir build --output-on-failure
+then fix it, re-run the local reviews, ./scripts/orca/record-review.sh for the
+new commit, push, and come back here.
+
+One thing to rule out first: if the only failure is harness.partial, that is a
+known intermittent race (#76) and NOT yours. Re-run the job rather than
+changing code:  gh run rerun <run-id>
+RED
+      exit 7
+    fi
+    broken_before="$broken"
+  fi
+
+  # A review job that FAILED is not a review that is late. Waiting out the full
+  # deadline for one costs 45 minutes and then says only "nothing arrived" --
+  # which is what happened on PR #80, where the reviewer had already died on
+  # `Reached maximum number of turns (30)` four minutes in. Say the real reason
+  # immediately.
+  #
+  # The rollup fetched just above already knows the check is dead, so this asks
+  # it rather than spending a `gh run list` on every poll. That mattered: an
+  # earlier version ran two extra calls per 30-second poll for up to 45 minutes,
+  # times three worktrees, against the same secondary rate limit the throttle
+  # above exists to respect -- and a rate-limited answer is indistinguishable
+  # from "nothing yet", which is precisely how #80 defeated the old check.
+  # Nothing is spent until there is a failure to explain.
+  # `--limit 25`, not 1, and that is the whole check working at all. The review
+  # workflow fires on `pull_request_review` and `pull_request_review_comment` as
+  # well as on the push, and those runs no-op with `skipped` -- so a run that
+  # genuinely FAILED is buried under every skipped run posted since. On this PR
+  # that was not an edge case but the shape of every head: each one's newest
+  # `claude review` run was a skipped review-event run, with the real one four
+  # or five entries down. `--limit 1` would have found nothing, fallen through
+  # to "no failed run found", and waited out the full 45 minutes to report that
+  # nothing arrived -- #80 exactly, the failure this check was written to end,
+  # reintroduced through the list window instead of through a rate limit.
+  # The `--jq` already selects on this head AND conclusion == failure, so the
+  # only job of the limit is to make sure the matching run is inside the window.
+  #
+  # Throttled on the SAME poll as the rollup that set `review_dead`, not merely
+  # on `review_dead` being true. The usual path exits 6 on the first try and the
+  # distinction never shows; it shows when the lookup comes back empty and
+  # `review_dead` stays true -- a transient error swallowed by `2>/dev/null`, or
+  # a failure sitting further back than the window. Gated on the flag alone this
+  # would then re-ask on every poll until the next throttled recheck, and for as
+  # long as the run stays unfound, which is the per-poll cost the throttle exists
+  # to prevent -- moved one call downstream of the fix rather than removed.
+  # A slow-to-appear run now costs one extra call per throttle cycle.
+  failed_run=""
+  if [ -n "$review_dead" ] && [ "$((checks_due % 4))" = "1" ]; then
+    failed_run="$(GH_PAGER=cat gh run list --branch "$branch" --workflow "claude review" \
+                    --limit 25 --json conclusion,databaseId,headSha \
+                    --jq "[.[] | select(.headSha==\"$head\" and .conclusion==\"failure\")][0].databaseId" \
+                  2>/dev/null)"
+  fi
+  if [ -n "$failed_run" ] && [ "$failed_run" != "null" ]; then
+    echo
+    echo "The review job FAILED on this commit -- it is not coming. Run $failed_run:"
+    GH_PAGER=cat gh run view "$failed_run" --log 2>/dev/null \
+      | grep -iE "\[error\]|maximum number of turns|validation|not installed|OIDC" \
+      | sed 's/^/    /' | cut -c1-200 | head -5
+    echo
+    echo "Fix the cause, push, and run this again. Do not wait for it."
+    exit 6
   fi
 
   # Written to a file and read back, never spliced into a Python source string:

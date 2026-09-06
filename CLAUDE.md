@@ -153,8 +153,8 @@ and say so in the PR body. Never edit them as a side effect of rewording a body.
    unblock dependent issues, so the wording matters.
 5. `gh pr merge --auto --squash` — that asks GitHub to merge once the required
    checks pass, and `merge-gate` is one of them, so the rules decide. Never merge
-   directly. A PR touching `.claude/` or `.github/workflows/` never auto-merges;
-   a person merges those.
+   directly. A PR touching `.claude/`, `.github/workflows/` or `.github/scripts/`
+   never auto-merges; a person merges those.
 
 ## What is watching you
 

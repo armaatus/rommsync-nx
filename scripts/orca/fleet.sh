@@ -124,7 +124,9 @@ for t in json.load(sys.stdin)["result"]["terminals"]:
 # --------------------------------------------------------------- the state ---
 own()          { printf '%s\n' "$2" >"$OWNED_DIR/$1"; date +%s >"$STARTED_DIR/$1"; }
 owned_path()   { cat "$OWNED_DIR/$1" 2>/dev/null; }
-disown_issue() { rm -f "$OWNED_DIR/$1" "$STARTED_DIR/$1"; }
+# ...including the stall marker, which notice_stalled writes once per stall and
+# nothing else removed -- one small file leaked per issue that ever stalled.
+disown_issue() { rm -f "$OWNED_DIR/$1" "$STARTED_DIR/$1" "$STATE_DIR/stalled-$1"; }
 
 # Non-zero when the answer could not be read, which is NOT the same as "nothing
 # is running". Reading a failed CLI call as zero live worktrees is how one
@@ -313,6 +315,28 @@ except Exception:
 # `--run-hooks` is not optional: without it orca.yaml's archive hook never runs,
 # and the worktree's RomM stack survives under `restart: unless-stopped`, holding
 # two ports forever with nothing left on disk to identify it by.
+# Remove a worktree, judged by whether it is GONE rather than by an exit code.
+#
+# #27 logged "could not remove it" at 02:08 and kept the slot; the very same
+# command, run again by hand, removed it and printed
+# `warning: local branch "..." was kept because Git could not safely delete it`.
+# A non-zero exit here has meant both "nothing happened" and "it worked, with a
+# caveat", and the fleet cannot tell those apart from the code alone. The
+# filesystem can: the directory is there or it is not.
+#
+# This matters more than one stuck worktree. The fleet runs at a cap of three,
+# and a slot held by a worktree whose work is already merged is a slot that never
+# starts the next issue -- the loop quietly runs at two, then one.
+remove_worktree() {
+  local path="$1" attempt
+  for attempt in 1 2; do
+    orca_run_with_deadline 180 /dev/null "$ORCA_CLI" worktree rm \
+      --worktree "path:$path" --run-hooks --json >/dev/null 2>&1
+    [ -d "$path" ] || return 0
+  done
+  return 1
+}
+
 reap_merged() {
   local f num path branch merged unpushed
   for f in "$OWNED_DIR"/*; do
@@ -333,10 +357,46 @@ reap_merged() {
 
     say "#$num: PR #$merged is merged; marking it done and removing the worktree"
     card "$path" --workspace-status completed --comment "#$num: merged in PR #$merged"
-    orca_run_with_deadline 180 /dev/null "$ORCA_CLI" worktree rm \
-      --worktree "path:$path" --run-hooks --json >/dev/null 2>&1 \
+    remove_worktree "$path" \
       || say "  could not remove it; sweep later with ./scripts/orca/reap.sh --yes"
     disown_issue "$num"
+  done
+}
+
+# ---------------------------------------------------------- stalled agents ---
+# An agent sitting at a confirmation prompt is not working, and nothing said so.
+# #23 stopped inside two minutes on a `git submodule add` the auto-mode
+# classifier wanted confirmed, while the board still read `in-progress` and the
+# time-box had three hours to run. In auto mode nothing should be asking -- so
+# when one does, say so once, on the card and in a notification, and let a
+# person decide. The alternative is a worktree that looks busy for three hours.
+notice_stalled() {
+  local f num path state listing
+  # ONE listing per poll, matched against every owned worktree -- not one CLI
+  # round-trip per worktree, which is three 30-second-deadline calls a minute
+  # for an answer that arrives in a single response.
+  listing="$(orca_json worktree ps 2>/dev/null)" || return 0
+  for f in "$OWNED_DIR"/*; do
+    [ -e "$f" ] || continue
+    num="$(basename "$f")"; path="$(cat "$f")"
+    [ -d "$path" ] || continue
+    state="$(printf '%s' "$listing" | python3 -c "
+import json, sys
+try:
+    for w in json.load(sys.stdin)['result']['worktrees']:
+        if w.get('path') == sys.argv[1]:
+            print(((w.get('agents') or [{}])[0]).get('state') or '')
+            break
+except Exception:
+    pass
+" "$path" 2>/dev/null)"
+    [ "$state" = "waiting" ] || { rm -f "$STATE_DIR/stalled-$num"; continue; }
+    # Once per stall, not once per poll.
+    [ -e "$STATE_DIR/stalled-$num" ] && continue
+    : >"$STATE_DIR/stalled-$num"
+    say "#$num is waiting for input -- in auto mode nothing should be asking"
+    card "$path" --comment "#$num: waiting for input -- needs you"
+    notify "#$num needs you" "It is sitting at a prompt, not working."
   done
 }
 
@@ -513,6 +573,7 @@ cmd_run() {
 
     reap_merged
     enforce_timebox
+    notice_stalled
 
     local live
     if ! live="$(live_count)"; then
