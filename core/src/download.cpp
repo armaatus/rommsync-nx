@@ -1287,6 +1287,11 @@ class Drainer {
     // sentence rather than a transfer that fails later: a disc set served over
     // `content` is a zip with no length at all (docs/API_CONTRACT.md), and a rom
     // missing from the server's own filesystem 404s part way in.
+    //
+    // The disc-set test is `has_multiple_files` and nothing else. A rom whose
+    // `fs_name` is a directory on the server is not by itself one -- a nested
+    // single-file rom is a directory too, and downloads normally
+    // (rom_index.hpp, `download.nested`).
     if (detail.has_multiple_files) {
       return Settle(std::move(entry), QueueState::kSkipped,
                     "this rom is a disc set; rommsync v1 downloads single-file roms only");

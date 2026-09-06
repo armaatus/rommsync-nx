@@ -569,7 +569,7 @@ touching a device's history.
 |---|---|---|
 | GET | `/api/roms` | paged; filters incl. `collection_id`, `platform_ids`, `search_term`, `limit`, `offset`, `order_by` |
 | GET | `/api/roms/{id}` | `DetailedRomSchema` |
-| GET | `/api/roms/{id}/content/{file_name}` | download a single-file rom (`fs_name`) — a **zip** for a multi-file one, see below |
+| GET | `/api/roms/{id}/content/{file_name}` | download a single-file rom (`fs_name`) — a **zip** for a multi-file one, see below; `?file_ids=` selects files, and a single id serves that file raw |
 | GET | `/api/roms/{id}/files` | list files of a multi-file rom |
 | GET | `/api/roms/{id}/files/content/{file_name}` | download one file — `{id}` is the **RomFile** id, not the rom's |
 | GET | `/api/collections` | user collections (curate a "Switch" collection to mirror) |
@@ -587,16 +587,31 @@ An unscanned or metadata-less library leaves most of the ~70 other fields
 `null` — the capture is from a fixture with no metadata providers, which is the
 worst case the client must survive.
 
-### Multi-file roms, and the two things that are not what they look like
+### Multi-file roms, and the three things that are not what they look like
 
-Verified against a live 5.2.0 by `harness.multifile`:
+**The v1 decision: detect and skip.** A rom with `has_multiple_files` is never
+downloaded. `download::EnqueueRom` refuses it with `ipc::Error::kMultiFile` from
+the rom index the engine already holds, and the worker is the backstop for an
+entry that reached the queue anyway — it settles `kSkipped` with a sentence
+naming the disc set, so the overlay can say why nothing arrived. Verified
+against a live 5.2.0 by `harness.multifile`, `download.multifile` and
+`download.nested`; [ARCHITECTURE.md](ARCHITECTURE.md#explicitly-out-of-scope-v1)
+records the same decision.
+
+Three things here are silent, and together they are the reason:
 
 - `GET /api/roms/{id}/content/{file_name}` on a rom with `has_multiple_files`
   does **not** serve a rom. It serves a zip RomM builds on the fly, with
   `Content-Type: application/zip` and **no `Content-Length`** — so a client that
   treats it like any other rom writes an archive to the SD under the rom's name
-  and has nothing to verify its length against. This is a large part of why
-  multi-file roms are skipped rather than downloaded (M3-4).
+  and has nothing to verify its length against.
+- **The rom-level digest is not the digest of anything you can download.** On
+  the seeded two-disc fixture the rom reports `sha1_hash: 3aa785a3…` while its
+  two discs report `4ee43964…` and `9b5aaf68…`; the per-file digests do match
+  the bytes each `files[].id` serves, and the rom's matches neither. So the
+  archive above cannot be checked against anything either. This, not effort, is
+  why v1 skips: the alternative is an unverifiable file on the card under a
+  rom's name, and the failure is silent — the client would report success.
 - In `GET /api/roms/{id}/files/content/{file_name}` the `{id}` is the
   **`files[].id`**, not the rom id, and the `{file_name}` segment selects
   nothing at all — it only decorates the download name. Building that URL from a
@@ -607,6 +622,48 @@ Verified against a live 5.2.0 by `harness.multifile`:
 `has_multiple_files` is on the **list** schema as well as the detail one, so a
 client can decide to skip without a second call per rom. `files[]` is not: it is
 present and always empty on the list, and only `GET /api/roms/{id}` fills it.
+
+#### The route a v2 would take
+
+Recorded rather than built, and pinned by `harness.multifile` so that "recorded"
+keeps meaning "still true". Two per-file paths exist on 5.2.0; both are keyed on
+a **`files[].id`**, and they are not equally safe:
+
+| Path | Notes |
+|---|---|
+| `GET /api/roms/{id}/content/{file_name}?file_ids=<one files[].id>` | **The one to use.** `{id}` is the **rom** id. With a single id it serves that file *raw*: `application/octet-stream`, a real `Content-Length`, `Accept-Ranges: bytes` (a `Range` request comes back `206`), and a `content-disposition` naming that file. Verify against that entry's `sha1_hash`. A `file_ids` value that is not this rom's file is a **404** — the id is scoped to the rom |
+| `GET /api/roms/{id}/content/{file_name}?file_ids=a,b` | Two or more ids is the on-the-fly **zip** again, so `file_ids` is not a way around it: a v2 makes one call per file |
+| `GET /api/roms/{id}/files/content/{file_name}` | Same bytes, but `{id}` is a **`files[].id`** and nothing scopes it to a rom, so a wrong id is somebody else's file with a `200`. Prefer the row above |
+
+The HTTP is the easy half. What is actually missing for a disc set is on the
+card: an `.m3u` listing the discs, a per-emulator folder layout to put them in,
+and per-file verification. `config::ValidRomFileName()` is the check to reuse
+for `files[].file_name` — those names come off the server's filesystem exactly
+as `fs_name` does, and nothing else validates them.
+
+#### `has_nested_single_file` is not a disc set
+
+A rom is exactly one of `has_simple_single_file`, `has_nested_single_file` and
+`has_multiple_files`. The middle one is a **directory holding exactly one
+file**, and it is an ordinary download — the skip must not fire on it. Pinned by
+`harness.multifile` and `download.nested` against the seeded
+`Synthetic Nested Game`:
+
+- the whole-rom `content` endpoint serves **the file itself** —
+  `application/octet-stream`, a real `Content-Length` equal to
+  `fs_size_bytes`, and `Accept-Ranges: bytes`, so Range resume works as usual;
+- the rom-level `sha1_hash` **is** that file's digest, so the download verifies
+  the way any other rom's does.
+
+One consequence, and it is a real one: `fs_name` is the **directory's** name and
+`fs_extension` is `""`, so the rom lands on the card *without* the inner file's
+extension — `Synthetic Nested Game`, not `Synthetic Nested Game.bin`. The bytes
+are right and the digest verifies them, so the entry settles `kDone` while
+RetroArch and hbmenu, which pick a core by extension, will not load it. M3-4
+pinned this with `download.nested` rather than changing it — the name is also
+what `AlreadyOnTheCard` looks for and what the overlay renders — and **#92**
+carries the decision. The name a fix would use is `files[0].file_name` from
+`GET /api/roms/{id}`.
 
 ### Platform → folder mapping
 

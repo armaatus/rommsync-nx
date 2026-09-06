@@ -6,10 +6,14 @@ Two cases in the backlog cannot be covered by a downloaded ROM:
 * **Range resume (M3-3)** needs a file large enough that a download can be
   interrupted and resumed part-way. Real homebrew ROMs are tens of kilobytes.
 * **Multi-file roms (M3-4)** needs a rom directory holding several files, so the
-  client's ``has_multiple_files`` skip path can be exercised.
+  client's ``has_multiple_files`` skip path can be exercised -- and, beside it, a
+  rom directory holding exactly *one* file, which RomM reports as
+  ``has_nested_single_file`` with ``has_multiple_files: false``. That one is a
+  normal download, and it is what proves the skip does not over-trigger on every
+  rom that happens to be a directory.
 
-Both are generated from a fixed seed, so every machine and every run produces
-byte-identical files and therefore stable SHA1/SHA256 hashes.
+All of them are generated from a fixed seed, so every machine and every run
+produces byte-identical files and therefore stable SHA1/SHA256 hashes.
 """
 
 from __future__ import annotations
@@ -45,18 +49,35 @@ def make_multifile(directory: Path) -> None:
         (directory / name).write_bytes(f"synthetic disc {disc} fixture\n".encode())
 
 
+def make_nested(directory: Path) -> None:
+    """Write a rom directory holding exactly one file.
+
+    RomM reports this as ``has_nested_single_file: true`` with
+    ``has_multiple_files: false``, and serves the file itself -- not a zip --
+    from the whole-rom ``content`` endpoint. The client downloads it like any
+    other rom; the fixture exists so that "like any other rom" is asserted rather
+    than assumed.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{directory.name}.bin").write_bytes(
+        b"synthetic nested single-file fixture\n")
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--multi", required=True, type=Path,
                         help="rom directory to fill with a two-disc set")
+    parser.add_argument("--nested", required=True, type=Path,
+                        help="rom directory to fill with a single nested file")
     parser.add_argument("--large", type=Path,
-                        help="large fixture to write; omit to generate only --multi")
+                        help="large fixture to write; omit to generate only the rom directories")
     parser.add_argument("--size-mb", type=int, default=120)
     args = parser.parse_args(argv[1:])
 
     if args.large is not None:
         make_large(args.large, args.size_mb)
     make_multifile(args.multi)
+    make_nested(args.nested)
     return 0
 
 

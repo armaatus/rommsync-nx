@@ -40,6 +40,7 @@
 #include "harness.hpp"
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/md5.hpp"
+#include "rommsync/sha1.hpp"
 #include "rommsync/state_db.hpp"
 
 namespace {
@@ -55,9 +56,16 @@ using harness::Fixture;
 using harness::Sandbox;
 
 /// The seeded fixtures these scenarios need by name. Generated deterministically
-/// by server/testing/make_fixtures.py, so both are byte-identical everywhere.
+/// by server/testing/make_fixtures.py, so all three are byte-identical
+/// everywhere.
 constexpr const char* kLargeRom = "synthetic-large.gba";
 constexpr const char* kMultiRom = "Synthetic Two Disc Game";
+constexpr const char* kNestedRom = "Synthetic Nested Game";
+
+/// The one file inside the nested rom's directory, for the byte-for-byte check
+/// that the whole-rom endpoint serves *it* and not an archive of it.
+constexpr const char* kNestedRomSource =
+    ROMMSYNC_FIXTURE_LIBRARY "/roms/psx/Synthetic Nested Game/Synthetic Nested Game.bin";
 
 /// The large rom as it sits in the library RomM serves, for a byte-for-byte
 /// comparison against what a download produced.
@@ -828,23 +836,37 @@ void Stall(rig::Checks& checks, http::HttpClient& client, const std::string& bas
 
 // --- multifile ----------------------------------------------------------------
 //
-// The two-disc fixture. M3-4 skips these, and this is what the skip hangs off.
+// The two-disc fixture, and the line M3-4 draws around it. This is what the
+// skip hangs off, so everything the decision rests on is pinned here: a RomM
+// upgrade that moves any of it turns this red rather than turning a skip into a
+// silently wrong download.
 //
-// Two things here are not what a reading of the endpoint names suggests, and
-// both are silent:
+// Three things here are not what a reading of the endpoint names suggests, and
+// all three are silent:
 //
 //   * `GET /api/roms/{id}/content/{file_name}` on a multi-file rom does not
 //     serve a rom. It serves a **zip RomM builds on the fly**, with no
 //     `Content-Length` -- so a client that treats it like any other rom writes
 //     an archive to the SD under the rom's name and has nothing to verify the
 //     length against.
+//   * the rom-level `sha1_hash` on a multi-file rom is **not the digest of
+//     anything that can be downloaded**: not of the zip, and not of either
+//     disc. So the archive above cannot be verified either. That, and not
+//     effort, is why v1 skips rather than downloads.
 //   * the `{id}` in `/api/roms/{id}/files/content/{file_name}` is the **RomFile
 //     id**, not the rom id, and the `{file_name}` segment selects nothing at
 //     all. Building that URL from a rom id and a file name returns 200 and the
 //     bytes of whatever file happens to carry that id.
+//
+// And the negative, which matters as much: a rom directory holding exactly
+// *one* file is `has_nested_single_file`, not `has_multiple_files`. It is a
+// normal download -- the whole-rom endpoint serves the file itself, with a
+// length, and the rom's digest *is* that file's. A skip that fired on it would
+// refuse a rom this client can handle perfectly well.
 
 void MultiFile(rig::Checks& checks, http::HttpClient& client, const std::string& base,
-               const Fixture& fixture, const harness::Rom& multi, const harness::Rom& single) {
+               const Fixture& fixture, const harness::Rom& multi, const harness::Rom& single,
+               const harness::Rom& nested) {
 
   // The signal is on the LIST schema, not only the detail one, so a client can
   // skip a rom without a second call per rom.
@@ -852,6 +874,17 @@ void MultiFile(rig::Checks& checks, http::HttpClient& client, const std::string&
                 "the two-disc fixture reports has_multiple_files from GET /api/roms");
   checks.Expect(!single.has_multiple_files, "and a single-file rom does not");
   checks.ExpectEq(multi.files.size(), std::size_t{2}, "with one entry per disc");
+
+  // The three shapes are exclusive, and only the first is a skip. A client that
+  // read "is a directory" instead of `has_multiple_files` would refuse the
+  // nested rom too, so the flags are asserted against each other rather than
+  // one at a time.
+  checks.Expect(!multi.has_simple_single_file && !multi.has_nested_single_file,
+                "and a disc set is neither of the single-file shapes");
+  checks.Expect(single.has_simple_single_file,
+                "a rom that is one file on disk is has_simple_single_file");
+  checks.Expect(nested.has_nested_single_file && !nested.has_multiple_files,
+                "and a directory holding one file is has_nested_single_file, not multi-file");
 
   // The whole-rom download is an archive with nothing to verify against.
   http::Request whole = harness::Authed(http::Method::kGet, base + multi.ContentPath(), fixture);
@@ -895,6 +928,125 @@ void MultiFile(rig::Checks& checks, http::HttpClient& client, const std::string&
   checks.ExpectEq(mislabelled.response.body, contents[0],
                   "the id selects the file and the name selects nothing -- so the name in that "
                   "URL cannot be trusted to say what arrived");
+
+  // The fact the whole decision rests on. The rom carries a `sha1_hash` and it
+  // looks like every other rom's, but it is the digest of nothing a client can
+  // fetch: not the zip above, and not either disc. There is therefore no way to
+  // verify a multi-file download, which is why M3-4 skips instead of writing an
+  // archive nothing checked to the card.
+  checks.Expect(!multi.sha1_hash.empty(),
+                "the disc set carries a rom-level sha1_hash, like any other rom");
+  for (const harness::RomFile& file : multi.files) {
+    checks.Expect(!file.sha1_hash.empty(),
+                  "each disc carries its own sha1_hash: " + file.file_name);
+    checks.Expect(multi.sha1_hash != file.sha1_hash,
+                  "and the rom's digest is not it -- " + file.file_name);
+  }
+  checks.Expect(multi.files.size() == 2 && multi.files[0].sha1_hash != multi.files[1].sha1_hash,
+                "nor are the two discs' digests each other's");
+  checks.ExpectEq(crypto::Sha1Hex(contents[0]), multi.files[0].sha1_hash,
+                  "the bytes each file id served do hash to that file's digest");
+  checks.ExpectEq(crypto::Sha1Hex(contents[1]), multi.files[1].sha1_hash,
+                  "...both of them, so the per-file digests are the ones a v2 would check");
+
+  // The route a v2 would take, pinned so that "recorded" means "still true".
+  // `file_ids` on the ROM endpoint, carrying a single `files[].id`, is the
+  // per-file download: the raw bytes, a real length, `Accept-Ranges`, and a
+  // digest in `files[]` to check them against -- everything the whole-rom zip
+  // above lacks. It is also *scoped to the rom*, which the `/files/content/`
+  // path is not.
+  for (std::size_t at = 0; at < multi.files.size(); ++at) {
+    const harness::RomFile& file = multi.files[at];
+    const http::Result one = client.Send(harness::Authed(
+        http::Method::kGet,
+        base + multi.ContentPath() + "?file_ids=" + std::to_string(file.id), fixture));
+    checks.Expect(one.successful(), "one disc by file_ids: " + file.file_name);
+    const std::string* one_type = http::FindHeader(one.response.headers, "Content-Type");
+    checks.Expect(one_type != nullptr && one_type->find("octet-stream") != std::string::npos,
+                  "...served raw rather than zipped, unlike the whole rom");
+    checks.ExpectEq(one.response.declared_size, static_cast<std::uint64_t>(file.size),
+                    "...with the length the file declared");
+    const std::string* ranges = http::FindHeader(one.response.headers, "Accept-Ranges");
+    checks.Expect(ranges != nullptr && ranges->find("bytes") != std::string::npos,
+                  "...and Accept-Ranges, so a v2 resumes a disc the way M3-3 resumes a rom");
+    const std::string* disposition =
+        http::FindHeader(one.response.headers, "content-disposition");
+    checks.Expect(disposition != nullptr &&
+                      disposition->find(harness::UrlEncode(file.file_name)) != std::string::npos,
+                  "...named after the file the id selected, not the rom");
+    checks.ExpectEq(one.response.body, contents[at],
+                    "...and the same bytes the file id served on the other path");
+    checks.ExpectEq(crypto::Sha1Hex(one.response.body), file.sha1_hash,
+                    "...which its own sha1_hash verifies -- what a v2 would check");
+
+    // `Accept-Ranges` is a claim; this is the answer to a `Range` request that
+    // takes it up, because a header a server advertises and does not honour is
+    // the one a resume discovers at the wrong moment.
+    http::Request tail = harness::Authed(
+        http::Method::kGet, base + multi.ContentPath() + "?file_ids=" + std::to_string(file.id),
+        fixture);
+    // `substr` and not a slice of whatever arrived: a body shorter than the
+    // offset is a failed check, not an uncaught `std::out_of_range` that takes
+    // the whole scenario's output with it.
+    constexpr std::size_t kResumeFrom = 10;
+    if (contents[at].size() > kResumeFrom) {
+      tail.range_start = kResumeFrom;
+      const http::Result resumed = client.Send(tail);
+      checks.ExpectEq(resumed.response.status, 206, "...and a Range request on it comes back 206");
+      checks.ExpectEq(resumed.response.body, contents[at].substr(kResumeFrom),
+                      "...carrying exactly the bytes that were missing");
+    }
+  }
+
+  // Both ids is the archive again, so `file_ids` is not a way around the zip:
+  // one call per file is what a v2 makes.
+  const http::Result both = client.Send(harness::Authed(
+      http::Method::kGet,
+      base + multi.ContentPath() + "?file_ids=" + std::to_string(multi.files[0].id) + "," +
+          std::to_string(multi.files[1].id),
+      fixture));
+  const std::string* both_type = http::FindHeader(both.response.headers, "Content-Type");
+  checks.Expect(both_type != nullptr && both_type->find("zip") != std::string::npos,
+                "asking for both files at once is the zip, not a concatenation");
+
+  // ...and unlike `/api/roms/{files[].id}/files/content/`, this one refuses a
+  // file id that is not this rom's rather than serving somebody else's bytes.
+  if (!nested.files.empty()) {
+    const http::Result foreign = client.Send(harness::Authed(
+        http::Method::kGet,
+        base + multi.ContentPath() + "?file_ids=" + std::to_string(nested.files[0].id), fixture));
+    checks.ExpectEq(foreign.response.status, 404,
+                    "a file id belonging to another rom is refused, not served");
+  }
+
+  // The negative. `has_nested_single_file` is a directory too, and the whole-rom
+  // endpoint on it behaves like any other rom's: the file itself, a length to
+  // check it against, and a rom-level digest that is the digest of exactly those
+  // bytes. Nothing here would be true of the disc set above.
+  http::Request whole_nested =
+      harness::Authed(http::Method::kGet, base + nested.ContentPath(), fixture);
+  const http::Result served = client.Send(whole_nested);
+  checks.Expect(served.successful(), "the whole-rom endpoint answers for a nested single-file rom");
+  const std::string* nested_type = http::FindHeader(served.response.headers, "Content-Type");
+  checks.Expect(nested_type != nullptr && nested_type->find("octet-stream") != std::string::npos,
+                "...with the file, not a zip");
+  checks.ExpectEq(served.response.declared_size, static_cast<std::uint64_t>(nested.size),
+                  "and a Content-Length equal to the rom's fs_size_bytes");
+  const std::string* nested_ranges = http::FindHeader(served.response.headers, "Accept-Ranges");
+  checks.Expect(nested_ranges != nullptr && nested_ranges->find("bytes") != std::string::npos,
+                "and Accept-Ranges, so M3-3's resume works on it like any other rom");
+  checks.ExpectEq(served.response.body, rig::ReadFile(kNestedRomSource),
+                  "the bytes are the one file inside the rom's directory, exactly");
+  checks.ExpectEq(crypto::Sha1Hex(served.response.body), nested.sha1_hash,
+                  "and the rom's own sha1_hash verifies them -- unlike a disc set's");
+  checks.ExpectEq(nested.files.size(), std::size_t{1}, "its files[] holds the one file");
+  if (nested.files.size() == 1) {
+    checks.ExpectEq(nested.files[0].sha1_hash, nested.sha1_hash,
+                    "whose digest is the rom's, because there is only the one");
+    checks.Expect(nested.files[0].file_name != nested.fs_name,
+                  "and whose name is not the rom's -- the rom is the directory, so a download "
+                  "under fs_name lands without the file's extension");
+  }
 }
 
 
@@ -1129,6 +1281,7 @@ int main(int argc, char** argv) {
     harness::Rom small;
     harness::Rom large;
     harness::Rom multi;
+    harness::Rom nested;
     if (!harness::FindRom(*client, base, fixture, "gb240p.gb", &small)) {
       std::cerr << "the fixture library holds no roms\n"
                    "  scan it with: ./.venv/bin/python server/testing/provision.py\n";
@@ -1156,12 +1309,17 @@ int main(int argc, char** argv) {
       Resume(checks, *client, base, fixture, large);
     } else if (scenario == "multifile") {
       if (!harness::FindRom(*client, base, fixture, kMultiRom, &multi) ||
+          !harness::FindRom(*client, base, fixture, kNestedRom, &nested) ||
           !harness::FindRom(*client, base, fixture, kLargeRom, &large)) {
-        std::cerr << "the library has no " << kMultiRom
-                  << "; re-seed it with: ./server/testing/seed.sh\n";
+        std::cerr << "the library is missing one of " << kMultiRom << ", " << kNestedRom << ", "
+                  << kLargeRom
+                  << ". Re-seed AND rescan -- seed.sh only stages files, RomM does not import "
+                     "them until the scan runs:\n"
+                     "  ./server/testing/seed.sh && ./.venv/bin/python "
+                     "server/testing/provision.py\n";
         return rig::kSkip;
       }
-      MultiFile(checks, *client, base, fixture, multi, large);
+      MultiFile(checks, *client, base, fixture, multi, large, nested);
     } else {
       std::cerr << "unknown scenario: " << scenario << "\n";
       return 2;

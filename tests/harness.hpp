@@ -378,6 +378,14 @@ inline std::int64_t Number(const json::Value& object, const char* key) {
   return value != nullptr && value->is_integer() ? value->integer() : 0;
 }
 
+/// False for a key that is absent, null, or not a boolean. Every flag read
+/// through this is one RomM sets on every rom, so absent means the body is not
+/// the schema -- which the scenario asserting on the flag is what catches.
+inline bool Boolean(const json::Value& object, const char* key) {
+  const json::Value* value = object.Find(key);
+  return value != nullptr && value->boolean();
+}
+
 /// A slot nobody else is using. RomM pairs saves on `(rom_id, slot)`, so a
 /// constant would make one run's leftovers another run's sync history -- and a
 /// run that failed before its cleanup does leave one behind. A timestamp alone
@@ -419,6 +427,10 @@ struct RomFile {
   std::int64_t id = 0;
   std::string file_name;
   std::int64_t size = 0;
+
+  /// The scan's digest of *this* file. It is not the rom's -- see the
+  /// `multifile` scenario, which is the reason multi-file roms are skipped.
+  std::string sha1_hash;
 };
 
 /// One rom, as the download worker will read it.
@@ -430,6 +442,14 @@ struct Rom {
   /// RomM's own multi-file signal. It is on the *list* schema as well as the
   /// detail one, so a client can skip without a second call per rom.
   bool has_multiple_files = false;
+
+  /// The other two shapes on the same schema. A rom is exactly one of the
+  /// three, and only `has_multiple_files` is a skip: `has_nested_single_file`
+  /// is a directory holding one file and downloads like any other rom, so a
+  /// scenario that could not tell the two apart could not show the skip stays
+  /// off it.
+  bool has_simple_single_file = false;
+  bool has_nested_single_file = false;
 
   /// The digests RomM's scan recorded, lowercase hex, or empty for a library
   /// that has none. Both are on the list schema too. A scenario that has to hand
@@ -466,11 +486,17 @@ inline bool FindRom(http::HttpClient& client, const std::string& base, const Fix
     if (Field(item, "fs_name") != fs_name) {
       continue;
     }
+    // Cleared rather than filled in place: `files` is appended to below, so a
+    // caller reusing one `Rom` across two lookups would otherwise get both
+    // roms' files in one vector -- and every `files.size() == 2` assertion
+    // downstream would still pass.
+    *out = Rom{};
     out->id = Number(item, "id");
-    out->fs_name = fs_name;
+    out->fs_name = std::string(fs_name);
     out->size = Number(item, "fs_size_bytes");
-    const json::Value* multi = item.Find("has_multiple_files");
-    out->has_multiple_files = multi != nullptr && multi->boolean();
+    out->has_multiple_files = Boolean(item, "has_multiple_files");
+    out->has_simple_single_file = Boolean(item, "has_simple_single_file");
+    out->has_nested_single_file = Boolean(item, "has_nested_single_file");
     out->sha1_hash = Field(item, "sha1_hash");
     out->md5_hash = Field(item, "md5_hash");
     if (out->id == 0) {
@@ -486,8 +512,8 @@ inline bool FindRom(http::HttpClient& client, const std::string& base, const Fix
     const json::Value* files = detailed.successful() && rom.ok() ? rom.value.Find("files") : nullptr;
     if (files != nullptr) {
       for (const json::Value& file : files->elements()) {
-        out->files.push_back(
-            {Number(file, "id"), Field(file, "file_name"), Number(file, "file_size_bytes")});
+        out->files.push_back({Number(file, "id"), Field(file, "file_name"),
+                              Number(file, "file_size_bytes"), Field(file, "sha1_hash")});
       }
     }
     return true;

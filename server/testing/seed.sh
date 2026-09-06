@@ -6,9 +6,10 @@
 # ($ROM_CACHE, see scripts/orca/env.sh) and reused by every worktree. Never add
 # a commercial ROM: this script runs in public CI.
 #
-# Two fixtures are generated instead of downloaded, because no real homebrew rom
-# exercises them -- a large file for Range resume (M3-3) and a multi-file rom
-# directory for the has_multiple_files skip (M3-4). See make_fixtures.py.
+# Three fixtures are generated instead of downloaded, because no real homebrew
+# rom exercises them -- a large file for Range resume (M3-3), a multi-file rom
+# directory for the has_multiple_files skip (M3-4), and a single-file rom
+# directory for the nested rom that skip must NOT fire on. See make_fixtures.py.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -50,16 +51,18 @@ done < "$MANIFEST"
 # --- generated fixtures ----------------------------------------------------
 large="$ROM_CACHE/synthetic-large-${LARGE_MB}mb.bin"
 multi="$LIBRARY/roms/psx/Synthetic Two Disc Game"
+nested="$LIBRARY/roms/psx/Synthetic Nested Game"
 # $ROM_CACHE is shared across worktrees (orca.yaml), so generate only when
 # missing and publish atomically -- an in-place rewrite lets a concurrent
 # worktree copy a half-written file and fail the M3-3 resume test with a bogus
 # hash mismatch.
 if [ ! -f "$large" ]; then
   echo "  generating ${LARGE_MB}MiB synthetic rom (Range-resume fixture)"
-  python3 server/testing/make_fixtures.py --large "$large.tmp" --size-mb "$LARGE_MB" --multi "$multi"
+  python3 server/testing/make_fixtures.py --large "$large.tmp" --size-mb "$LARGE_MB" \
+    --multi "$multi" --nested "$nested"
   mv -f "$large.tmp" "$large"
 else
-  python3 server/testing/make_fixtures.py --multi "$multi"
+  python3 server/testing/make_fixtures.py --multi "$multi" --nested "$nested"
 fi
 mkdir -p "$LIBRARY/roms/gba"
 cp -f "$large" "$LIBRARY/roms/gba/synthetic-large.gba"

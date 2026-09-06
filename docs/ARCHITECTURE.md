@@ -128,8 +128,31 @@ worker: GET /api/roms/{id} → resolve fs_name, platform_fs_slug, size, sha1
 
 ## Explicitly out of scope (v1)
 
-- Multi-file / disc-set roms (`has_multiple_files`) — detect and skip with a
-  clear message; revisit later.
+- Multi-file / disc-set roms (`has_multiple_files`) — **detect and skip**, with
+  a message the overlay can render; never download the zip.
+  `download::EnqueueRom` refuses one at the door with `ipc::Error::kMultiFile`
+  from the rom index the engine already holds, so nothing is queued and the
+  overlay can say so while the user is still looking at the rom; the worker is
+  the backstop and settles such an entry `kSkipped` with a reason rather than
+  dropping it silently.
+
+  The reason is not effort. `GET /content` on a disc set serves a zip RomM
+  builds on the fly with **no `Content-Length`**, and the rom-level `sha1_hash`
+  is the digest of *neither* disc — so there is nothing to check the archive
+  against, and an unverified file would land on the card under the rom's name
+  looking like a rom.
+
+  A v2 downloads the discs one at a time with
+  `GET /api/roms/{id}/content/{file_name}?file_ids=<one files[].id>` — raw
+  bytes, a real length, `Range` resume, and a per-file `sha1_hash` to verify
+  against — and then has the part that is not HTTP to do: an `.m3u`, a
+  per-emulator folder layout, and per-file verification. Route and traps:
+  [API_CONTRACT.md](API_CONTRACT.md#multi-file-roms-and-the-three-things-that-are-not-what-they-look-like).
+
+  `has_nested_single_file` — a directory holding exactly **one** file — is *not*
+  this case. It is an ordinary download and the skip must not fire on it
+  (`download.nested`). It does land under the *directory's* name, so without the
+  inner file's extension; #92 carries that.
 - Save **states** sync on by default (fragile across cores) — supported but
   opt-in.
 - Installing NSP/XCI Switch titles — this project is emulator content only;

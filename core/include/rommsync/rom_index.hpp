@@ -54,6 +54,15 @@ struct Rom {
 
   /// RomM's own multi-file signal, on the *list* schema as well as the detail
   /// one -- so M3 can skip one without a second call per rom.
+  ///
+  /// The schema carries `has_simple_single_file` and `has_nested_single_file`
+  /// beside it and this index reads neither, on purpose. A rom is exactly one
+  /// of the three, and only the first is out of scope: a *nested* single-file
+  /// rom is a directory on the server holding one file, and it downloads like
+  /// any other rom -- same whole-rom endpoint, a real `Content-Length`, and a
+  /// `sha1_hash` that is the digest of the bytes that arrive. Reading "is a
+  /// directory" rather than this field is the mistake that would refuse it, and
+  /// `download.nested` is there to fail if anything starts to.
   bool has_multiple_files = false;
 };
 

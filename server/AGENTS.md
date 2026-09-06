@@ -23,5 +23,6 @@ Nothing here runs on a Switch, and nothing here is built with devkitPro.
 - The compose stack is disposable by design — ports and project name come from
   `.env`, per worktree. Never point it at a production volume.
 - Fixtures that no real ROM can provide (a large file for Range resume, a
-  multi-file rom) are generated deterministically in `make_fixtures.py`, so
-  hashes are stable across machines.
+  multi-file rom, and the nested single-file rom the multi-file skip must not
+  fire on) are generated deterministically in `make_fixtures.py`, so hashes are
+  stable across machines.
