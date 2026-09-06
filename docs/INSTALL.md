@@ -114,8 +114,8 @@ to do nothing, that is the first thing to report.)
 |---|---|---|---|
 | **Not installed** | — | — | The files are not on the card. The overlay is not in the menu. |
 | **Installed, not set to boot** | off | (unread) | There is no process. Nothing syncs and nothing answers the overlay, which says **"sys-rommsync is not running"** rather than mislabelling it *disabled* — a switch that does nothing is worse than a missing one. |
-| **Running, sync disabled** | on | off | The process is resident and answers the overlay, and nothing syncs. Automatic syncs stop, and **Sync now** is refused with **"Sync is off"** rather than starting one — the overlay tells you which switch to flip instead of showing a spinner that never moves. |
-| **Running, sync enabled** | on | on | The normal state: syncs on boot, on the timer, and on demand. |
+| **Running, sync disabled** | on | off | The process is resident and answers the overlay, and nothing syncs. Automatic syncs stop, and the engine refuses an on-demand one with **"Sync is off"** rather than starting it — you are told which switch to flip instead of being shown a spinner that never moves. (The **Sync now** button that asks for one arrives with [#24](https://github.com/armaatus/rommsync-nx/issues/24); see step 5.) |
+| **Running, sync enabled** | on | on | The normal state: syncs on boot and on the timer — and on demand too, once [#24](https://github.com/armaatus/rommsync-nx/issues/24) lands **Sync now**. |
 
 The row that catches people is the second one. Turning rommsync-nx's *own*
 enable switch on while the boot toggle is off does nothing, because there is no
