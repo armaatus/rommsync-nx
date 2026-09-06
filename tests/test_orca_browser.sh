@@ -857,6 +857,37 @@ STUB
     echo "PASS: removal is judged by the directory, retried once, and still fails honestly"
     ;;
 
+  brief_warns_about_human_merge_paths)
+    # #96 is issue #34, "Versioning + Releases from CI" -- its scope IS
+    # .github/workflows/ci.yml, which merge_gate.py refuses by design. The agent
+    # did nothing wrong and cannot merge, and without being told so it burns its
+    # three review rounds trying to turn a gate green that never will be. The
+    # brief has to name the paths and say what "done" looks like for them.
+    brief="$REPO_ROOT/scripts/orca/issue-command.sh"
+    for path in ".github/workflows/" ".github/scripts/" ".claude/"; do
+      grep -q -- "$path" "$brief" \
+        || fail "the brief never mentions $path, which merge-gate refuses"
+    done
+    grep -qi "needs a human merge" "$brief" \
+      || fail "the brief does not say what done looks like for a human-merge PR"
+    # The gate and the brief must name the SAME paths -- a brief that warns about
+    # a different set than the gate enforces is worse than no warning.
+    gate="$REPO_ROOT/.github/scripts/merge_gate.py"
+    if [ -f "$gate" ]; then
+      python3 - "$gate" "$brief" <<'PYCHECK' || fail "the brief and merge_gate.py disagree about the human-merge paths"
+import re, sys
+gate, brief = open(sys.argv[1]).read(), open(sys.argv[2]).read()
+block = re.search(r"HUMAN_ONLY_PREFIXES\s*=\s*\((.*?)\)", gate, re.S)
+paths = re.findall(r'"([^"]+)"', block.group(1)) if block else []
+missing = [p for p in paths if p not in brief]
+if missing:
+    print("not warned about in the brief:", missing, file=sys.stderr)
+    raise SystemExit(1)
+PYCHECK
+    fi
+    echo "PASS: the brief names every path merge-gate refuses, and what done means for them"
+    ;;
+
   *)
     echo "usage: $0 opens|reuses|foreign|no_romm|submits|no_draft|unstable" >&2
     echo "       watch_needs_issue|watch_late_draft|watch_grace|watch_submits|watch_single" >&2
@@ -867,6 +898,7 @@ STUB
     echo "       brief_queues_the_merge_at_step_four" >&2
     echo "       await_costs_nothing_while_the_review_is_healthy" >&2
     echo "       reap_judges_removal_by_the_directory" >&2
+    echo "       brief_warns_about_human_merge_paths" >&2
     exit 2
     ;;
 esac

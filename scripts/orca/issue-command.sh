@@ -101,6 +101,14 @@ the Orca board where the work is:
     orca worktree set --worktree active --workspace-status in-review \
       --comment "#__ISSUE__: PR #<n>, waiting on review"
 
+**If your issue's scope is `.github/workflows/`, `.github/scripts/` or
+`.claude/`, this PR will never merge itself, and that is not a failure.**
+`merge-gate` refuses those paths on purpose: a PR that could rewrite the rules
+judging PRs is not merged by the machinery those rules govern. Take it to a
+reviewed, green PR with every thread resolved, set the board comment to
+"#__ISSUE__: ready, needs a human merge -- touches <path>", and stop there.
+Do not spend review rounds trying to turn that gate green.
+
 **5. Wait for the independent review.** One blocking call, which costs nothing
 while it waits:
 
