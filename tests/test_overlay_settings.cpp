@@ -550,6 +550,48 @@ void CheckEveryRepairOutcomeIsDrawn(Checks& checks) {
                 "nothing pressed says nothing");
 }
 
+/// Every refusal the sysmodule can name is read the same way on and off console.
+///
+/// `overlay/AGENTS.md`: what a screen *says* is a decision and lives in `core/`,
+/// where a host test can reach it. This mapping was written inside
+/// `settings_screen.cpp` first, which put the difference between "this console
+/// is still paired" and a sentence that does not say so beyond the reach of
+/// every test in this file.
+void CheckEveryRefusalIsRead(Checks& checks) {
+  checks.Expect(overlay::RepairOutcomeFor(ipc::Error::kNotConfigured) ==
+                    overlay::RepairOutcome::kNotConfigured,
+                "a console with no server is told which of the two it is");
+  checks.Expect(
+      overlay::RepairOutcomeFor(ipc::Error::kUnavailable) == overlay::RepairOutcome::kUnavailable,
+      "and so is one whose sysmodule cannot start a pairing -- the outcome this button is gated "
+      "on");
+
+  // Everything else, including `kOk`: this is only asked about a `StartPair`
+  // that failed, so there is no arm that reads as a success -- and every arm
+  // has to leave the console described as still paired, because the token is
+  // not discarded until `StartPair` has answered.
+  for (const ipc::Error error : ipc::kAllErrors) {
+    const overlay::RepairOutcome outcome = overlay::RepairOutcomeFor(error);
+    if (error == ipc::Error::kNotConfigured || error == ipc::Error::kUnavailable) {
+      continue;
+    }
+    checks.Expect(outcome == overlay::RepairOutcome::kRefused,
+                  std::string("a refusal this screen has no separate sentence for is one "
+                              "sentence: ") +
+                      ipc::ToString(error));
+  }
+  for (const ipc::Error error : ipc::kAllErrors) {
+    const overlay::RepairOutcome outcome = overlay::RepairOutcomeFor(error);
+    checks.Expect(outcome != overlay::RepairOutcome::kNone,
+                  std::string("a refusal is never read as 'nothing was pressed': ") +
+                      ipc::ToString(error));
+    checks.Expect(outcome != overlay::RepairOutcome::kUnpairFailed,
+                  std::string("nor as a token that was discarded -- a refused StartPair never "
+                              "reached Unpair: ") +
+                      ipc::ToString(error));
+  }
+}
+
 /// The no-server headline comes first, and Re-pair is still there under it.
 void CheckNoServerLeadsAndStillOffersRepair(Checks& checks) {
   // A file with a warning *and* no usable server: the warning is real and is
@@ -764,6 +806,7 @@ int main() {
   CheckEditableRowsAreMarked(checks);
   CheckRepairConfirmsBeforeItAsks(checks);
   CheckEveryRepairOutcomeIsDrawn(checks);
+  CheckEveryRefusalIsRead(checks);
   CheckNoServerLeadsAndStillOffersRepair(checks);
   CheckUnreachable(checks);
   CheckIntervalWording(checks);

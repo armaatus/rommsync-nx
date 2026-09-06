@@ -159,6 +159,21 @@ enum class RepairOutcome {
 std::string RepairOutcomeText(RepairOutcome outcome);
 Tone RepairOutcomeTone(RepairOutcome outcome);
 
+/// Which of the three "nothing was discarded" outcomes a refused `StartPair` is.
+///
+/// Here rather than in `settings_screen.cpp` for the reason the sentences are
+/// (overlay/AGENTS.md): reading a refusal is a decision, and a decision inside
+/// a `tsl::Gui` is untestable until somebody has a console. It is the same
+/// shape `EnqueueRefusalText` has on the library screen.
+///
+/// `kNotConfigured` and `kUnavailable` are the two a user can act on -- one is a
+/// missing `server.url`, the other a sysmodule whose pairing half is not built
+/// yet -- and everything else is one sentence, because there is nothing
+/// different to do about any of them. **`kOk` is `kRefused` too**: this is only
+/// ever asked about a `StartPair` that failed, and a refusal that named no error
+/// is still a refusal, not a success.
+RepairOutcome RepairOutcomeFor(ipc::Error error);
+
 /// Where the "Re-pair" button is between presses.
 ///
 /// Carried in rather than latched inside the view, for `LastCommand`'s reason
