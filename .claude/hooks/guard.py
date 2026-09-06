@@ -755,6 +755,37 @@ def _stateful_checks():
 
 
 def selftest():
+    """Every assertion below, run against a fleet state this function controls.
+
+    The stateless cases assert what the guard does for an ordinary developer --
+    "an ordinary push is fine", "the guards are writable by hand". Run with the
+    real fleet directory those are not merely untrue inside a fleet worktree,
+    they are untrue BY DESIGN: that is what _stateful_checks exercises
+    separately, with a throwaway fleet it builds itself.
+
+    Left alone, the selftest therefore passed on a laptop and failed inside every
+    agent's worktree, which is where it matters most -- `ctest -R agent.config`
+    red for every agent all night, passing only on CI runners that are nobody's
+    fleet. A test that is red where the work happens teaches people to ignore a
+    red suite.
+
+    So: point the fleet at an empty directory for the duration. Nothing is owned,
+    nothing is stopped, and each case asserts the one thing it says it does.
+    """
+    import tempfile
+
+    global STOP_FILE, OWNED_DIR
+    saved = (STOP_FILE, OWNED_DIR)
+    with tempfile.TemporaryDirectory() as empty:
+        STOP_FILE = os.path.join(empty, "STOP")
+        OWNED_DIR = os.path.join(empty, "worktrees")
+        try:
+            return _selftest_body()
+        finally:
+            STOP_FILE, OWNED_DIR = saved
+
+
+def _selftest_body():
     failures = 0
     for tool, tool_input, want, what in SELFTEST:
         try:
