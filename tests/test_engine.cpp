@@ -10,9 +10,12 @@
 // M3-2 (#19) is the first issue to put real behaviour behind one of these
 // commands, and the reason this file exists: `Enqueue` and `Dequeue` change a
 // file on the card, so "it compiles" is no longer a description of what they
-// do. Everything else in `SdEngine` is still `kUnavailable`, and `commands`
-// pins that too — each of #30, #31 and M7-2 replaces its own part, and the last
-// `kUnavailable` to go is what says the engine is finished (`engine.hpp`).
+// do. M5-3 (#30) is the second: `SetConfig` and `SetEnabled` now write
+// `config.ini` and re-read it, so a setting changed from the overlay is in force
+// before the call returns. What is left in `SdEngine` is still `kUnavailable`,
+// and `commands` pins that too — each of #31 and M7-2 replaces its own part, and
+// the last `kUnavailable` to go is what says the engine is finished
+// (`engine.hpp`).
 //
 // Driven through `ipc::Dispatch` rather than by calling the methods, because
 // the dispatch table is what the console actually runs.
@@ -21,6 +24,8 @@
 //   persists  -- every change reaches queue.json, and a fresh engine reads it back
 //   rollback  -- a write that cannot happen changes neither the file nor memory
 //   corrupt   -- a queue.json a yanked card left behind never blocks the boot
+//   config    -- M5-3: an edit lands on the card and on the running engine
+//   server    -- M5-3: changing the server discards the token it does not own
 //   commands  -- what is still `kUnavailable`, so the list shrinks deliberately
 #include <cstddef>
 #include <cstdint>
@@ -34,11 +39,17 @@
 
 #include "engine.hpp"
 #include "harness.hpp"
+#include "rig.hpp"
+#include "rommsync/auth.hpp"
 #include "rommsync/download.hpp"
+#include "rommsync/host/curl_http_client.hpp"
 #include "rommsync/ipc.hpp"
+#include "rommsync/token_store.hpp"
 
+namespace auth = rommsync::auth;
 namespace config = rommsync::config;
 namespace download = rommsync::download;
+namespace http = rommsync::http;
 namespace ipc = rommsync::ipc;
 namespace sysmodule = rommsync::sysmodule;
 
@@ -81,6 +92,24 @@ class Console {
   ipc::Error Dequeue(std::int64_t rom_id) {
     std::string response;
     return Call(ipc::Command::kDequeue, ipc::EncodeRomId(rom_id), &response);
+  }
+
+  ipc::ConfigResult Set(const ipc::ConfigEdit& edit) {
+    std::string response;
+    Call(ipc::Command::kSetConfig, ipc::EncodeConfigEdit(edit), &response);
+    return ipc::DecodeConfigResult(response).value;
+  }
+
+  ipc::EnabledResult SetEnabled(bool enabled) {
+    std::string response;
+    Call(ipc::Command::kSetEnabled, ipc::EncodeEnabled(enabled), &response);
+    return ipc::DecodeEnabledResult(response).value;
+  }
+
+  ipc::ConfigView Configured() {
+    std::string response;
+    Call(ipc::Command::kGetConfig, ipc::EncodeEmpty(), &response);
+    return ipc::DecodeConfigView(response).value;
   }
 
   ipc::Status Status() {
@@ -272,6 +301,208 @@ void Corrupt(checks::Checks& c) {
   c.Expect(survived, "and the queue's complaint survived the trim rather than being summarised");
 }
 
+// --- the commands M5-3 makes real ---------------------------------------------
+
+/// One assignment, the shape the settings screen sends.
+ipc::ConfigEdit Edit(std::string section, std::string key, std::string value) {
+  ipc::ConfigEdit edit;
+  edit.assignments.push_back({std::move(section), std::move(key), std::move(value), false});
+  return edit;
+}
+
+void ConfigWrites(checks::Checks& c) {
+  Console console(c, "engine-config");
+  const std::string original =
+      "; the box in the cupboard\n"
+      "[server]\n"
+      "url = https://romm.example.com\n"
+      "\n"
+      "[sync]\n"
+      "enabled      = true\n"
+      "interval_min = 30\n";
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini", original),
+           "a config.ini is on the card");
+  console.Boot();
+  c.ExpectEq(console.Configured().config.sync.interval_min, 30, "and the engine is running on it");
+
+  // The acceptance this issue exists for: an edit over IPC takes effect on the
+  // *running* engine, with nothing rebooted in between. `GetConfig` is answered
+  // from `config_`, so reading 45 out of it is reading it out of the live
+  // configuration and not off the card.
+  const ipc::ConfigResult applied = console.Set(Edit("sync", "interval_min", "45"));
+  c.Expect(applied.outcome == ipc::WriteOutcome::kApplied, "the edit was applied");
+  c.ExpectEq(console.Configured().config.sync.interval_min, 45,
+             "and the running engine is using it, with no restart");
+
+  // ...and it reached the card, with the rest of the file exactly as the user
+  // left it. This is the whole reason `ApplyEdit` edits text.
+  const std::string on_card = console.sandbox.Read("/config/rommsync/config.ini");
+  c.ExpectEq(on_card, std::string("; the box in the cupboard\n"
+                                  "[server]\n"
+                                  "url = https://romm.example.com\n"
+                                  "\n"
+                                  "[sync]\n"
+                                  "enabled      = true\n"
+                                  "interval_min = 45\n"),
+             "the card holds the edit and every other byte the user wrote");
+  c.Expect(!console.sandbox.Exists("/config/rommsync/config.ini.tmp"), "no .tmp is left behind");
+  c.Expect(!console.sandbox.Exists("/config/rommsync/config.ini.old"), "and no .old");
+
+  // `SetEnabled` is the same path, and answers with the state read back rather
+  // than the one it was asked for (#24).
+  const ipc::EnabledResult off = console.SetEnabled(false);
+  c.Expect(off.outcome == ipc::WriteOutcome::kApplied, "the switch was written");
+  c.Expect(!off.enabled, "and answers with the state that took");
+  c.Expect(!console.Status().enabled, "which is what the status screen draws");
+  c.Expect(console.sandbox.Read("/config/rommsync/config.ini")
+                   .find("enabled      = false") != std::string::npos,
+           "the alignment of the line it rewrote is the user's own");
+
+  // A refused edit is a successful call carrying the refusal, and the card is
+  // untouched -- the two halves of `kInvalid`.
+  const std::string before = console.sandbox.Read("/config/rommsync/config.ini");
+  const ipc::ConfigResult refused = console.Set(Edit("sync", "interval_min", "-5"));
+  c.Expect(refused.outcome == ipc::WriteOutcome::kInvalid, "a negative interval is refused");
+  c.Expect(!refused.diagnostics.empty(), "with a diagnostic saying so");
+  c.ExpectEq(console.sandbox.Read("/config/rommsync/config.ini"), before,
+             "and config.ini is byte-identical");
+  c.ExpectEq(console.Configured().config.sync.interval_min, 45, "as is the running engine");
+
+  // A `config.ini` this console cannot read is not one to replace: the user's
+  // settings are probably still in it. A directory where the file should be
+  // gives `fopen` EISDIR, which is `kUnreadable` rather than `kMissing`.
+  std::error_code error;
+  std::filesystem::remove(console.sandbox.Host("/config/rommsync/config.ini"), error);
+  console.sandbox.MakeDirs("/config/rommsync/config.ini");
+  const ipc::ConfigResult unreadable = console.Set(Edit("sync", "saves", "false"));
+  c.Expect(unreadable.outcome == ipc::WriteOutcome::kWriteFailed,
+           "an unreadable config.ini is a write that did not happen");
+  c.Expect(!unreadable.diagnostics.empty(), "and says which file");
+  std::filesystem::remove(console.sandbox.Host("/config/rommsync/config.ini"), error);
+}
+
+void InterruptedCommit(checks::Checks& c) {
+  Console console(c, "engine-commit");
+  const std::string settings =
+      "[server]\n"
+      "url = https://romm.example.com\n"
+      "[sync]\n"
+      "interval_min = 90\n";
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini", settings),
+           "a config.ini is on the card");
+
+  // `io::WriteAtomically` commits with two renames, because Horizon's rename
+  // refuses a destination that exists: the live file is moved to `.old` first.
+  // Power cut there and this is exactly what the card holds -- the settings
+  // under the other name and nothing under the real one.
+  std::error_code error;
+  std::filesystem::rename(console.sandbox.Host("/config/rommsync/config.ini"),
+                          console.sandbox.Host("/config/rommsync/config.ini.old"), error);
+  c.Expect(!error, "the commit is interrupted between the two renames");
+  c.Expect(!console.sandbox.Exists("/config/rommsync/config.ini"), "config.ini is not there");
+
+  console.Boot();
+  c.ExpectEq(console.Configured().config.sync.interval_min, 90,
+             "a console booting into that window finds the previous settings under .old");
+
+  // ...and an edit made in that window keeps them, rather than rebuilding the
+  // file from one line. This is the case that would quietly cost a user their
+  // whole folder map.
+  const ipc::ConfigResult applied = console.Set(Edit("sync", "saves", "false"));
+  c.Expect(applied.outcome == ipc::WriteOutcome::kApplied, "an edit in that window is applied");
+  const std::string recovered = console.sandbox.Read("/config/rommsync/config.ini");
+  c.Expect(recovered.find("url = https://romm.example.com") != std::string::npos,
+           "and the server they had configured is still configured");
+  c.Expect(recovered.find("interval_min = 90") != std::string::npos, "as is everything else");
+  c.Expect(recovered.find("saves = false") != std::string::npos, "with the edit in it");
+}
+
+// --- the token belongs to the server that issued it ---------------------------
+
+/// A `server.url` change discards the pairing, asserted against the real RomM.
+///
+/// The token in `token.dat` was issued by one RomM and the record says which
+/// (`token_store.hpp`). Repointing the console at another host and keeping it
+/// would send a stranger's server this console's bearer token, so the pairing
+/// goes with the URL. The fixture token is a live one, which is what makes the
+/// discard mean something: it works against the docker RomM right up until the
+/// edit, and afterwards the console holds nothing to send anywhere.
+int ServerChanged(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+
+  Console console(c, "engine-server");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = " + base + "\n"),
+           "the console is configured for the fixture RomM");
+
+  auth::StoredToken token;
+  token.server_url = base;
+  token.access_token = fixture.token;
+  token.device_id = fixture.device_id;
+  token.scopes = {"roms.read"};
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+           "and paired with it");
+
+  console.Boot();
+  c.Expect(console.Status().auth == ipc::AuthState::kPaired, "so the console reports paired");
+
+  // The token is real: the server it belongs to accepts it. Without this the
+  // discard below would be a test of deleting a string.
+  const http::Result mine =
+      client.Send(harness::Authed(http::Method::kGet, base + "/api/users/me", fixture));
+  c.Expect(mine.successful() && mine.response.status == 200,
+           "the pairing on the card works against the RomM that issued it");
+
+  const ipc::ConfigResult moved =
+      console.Set(Edit("server", "url", "https://elsewhere.example.com"));
+  c.Expect(moved.outcome == ipc::WriteOutcome::kApplied, "the server is repointed");
+  c.ExpectEq(console.Configured().config.server.url,
+             std::string("https://elsewhere.example.com"), "and the engine is using the new one");
+
+  // Nothing is left for a request to the new host to carry -- not under
+  // `token.dat`, and not under the `.tmp`/`.old` an interrupted commit leaves
+  // beside it, which is why this goes through `DiscardToken` rather than an
+  // unlink.
+  c.Expect(!console.sandbox.Exists("/config/rommsync/token.dat"), "token.dat is gone");
+  c.Expect(!console.sandbox.Exists("/config/rommsync/token.dat.old"), "and so is any .old");
+  c.Expect(!console.sandbox.Exists("/config/rommsync/token.dat.tmp"), "and any .tmp");
+  c.Expect(!auth::LoadToken(console.directory + auth::kTokenFileName).ok(),
+           "and there is no credential left to load");
+  c.Expect(console.Status().auth == ipc::AuthState::kNeverPaired,
+           "so the overlay is told to pair again rather than shown a working console");
+
+  // ...and "no credential" is not a state a RomM waves through: the request this
+  // console could still build reaches the server as an anonymous one and is
+  // refused, which is what says the discard actually costs the session.
+  http::Request anonymous;
+  anonymous.method = http::Method::kGet;
+  anonymous.url = base + "/api/users/me";
+  const http::Result refused = client.Send(anonymous);
+  c.Expect(refused.ok(), "the server answered");
+  c.Expect(refused.response.status == 401 || refused.response.status == 403,
+           "and refuses a request carrying no token");
+
+  // A second edit that does not move the server leaves the pairing alone -- the
+  // discard is tied to the URL changing, not to writing the file.
+  auth::StoredToken again = token;
+  again.server_url = "https://elsewhere.example.com";
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, again).ok(),
+           "the console is paired with the new server");
+  console.Boot();
+  c.Expect(console.Set(Edit("sync", "saves", "false")).outcome == ipc::WriteOutcome::kApplied,
+           "an unrelated edit is applied");
+  c.Expect(console.sandbox.Exists("/config/rommsync/token.dat"),
+           "and leaves the pairing where it is");
+  c.Expect(console.Status().auth == ipc::AuthState::kPaired, "the console is still paired");
+
+  return c.failures();
+}
+
 // --- what is still not built --------------------------------------------------
 
 void Commands(checks::Checks& c) {
@@ -283,12 +514,6 @@ void Commands(checks::Checks& c) {
   // command that quietly started answering something plausible instead would
   // send a user looking for a problem that is not there (`engine.hpp`).
   std::string response;
-  c.Expect(console.Call(ipc::Command::kSetEnabled, ipc::EncodeEnabled(true), &response) ==
-               ipc::Error::kOk,
-           "SetEnabled answers inside a successful reply, whatever it did");
-  c.Expect(ipc::DecodeEnabledResult(response).value.outcome != ipc::WriteOutcome::kApplied,
-           "...and it did not apply: M5-3 (#30) is what makes it real");
-
   ipc::ListRequest listing;
   listing.kind = ipc::ListKind::kQueue;
   c.Expect(console.Call(ipc::Command::kListBegin, ipc::EncodeListRequest(listing), &response) ==
@@ -304,11 +529,18 @@ void Commands(checks::Checks& c) {
                ipc::Error::kNotConfigured,
            "StartPair is refused for want of a server before the engine is asked at all");
 
-  // The two this issue owns are not on that list any more, which is the signal
-  // #19 asked for.
+  // What each issue that has landed took off that list, which is the signal
+  // `engine.hpp` asks every one of them to give.
   std::int32_t position = 0;
-  c.Expect(console.Enqueue(4, &position) != ipc::Error::kUnavailable, "Enqueue is built");
-  c.Expect(console.Dequeue(4) != ipc::Error::kUnavailable, "and so is Dequeue");
+  c.Expect(console.Enqueue(4, &position) != ipc::Error::kUnavailable, "Enqueue is built (#19)");
+  c.Expect(console.Dequeue(4) != ipc::Error::kUnavailable, "and so is Dequeue (#19)");
+  c.Expect(console.Call(ipc::Command::kSetEnabled, ipc::EncodeEnabled(true), &response) ==
+               ipc::Error::kOk,
+           "SetEnabled answers inside a successful reply, whatever it did");
+  c.Expect(ipc::DecodeEnabledResult(response).value.outcome == ipc::WriteOutcome::kApplied,
+           "...and it applies now: M5-3 (#30) built it");
+  c.Expect(console.Set(Edit("sync", "saves", "false")).outcome == ipc::WriteOutcome::kApplied,
+           "as does SetConfig (#30)");
 }
 
 }  // namespace
@@ -325,8 +557,30 @@ int main(int argc, char** argv) {
     Rollback(checks);
   } else if (scenario == "corrupt") {
     Corrupt(checks);
+  } else if (scenario == "config") {
+    ConfigWrites(checks);
+  } else if (scenario == "commit") {
+    InterruptedCommit(checks);
   } else if (scenario == "commands") {
     Commands(checks);
+  } else if (scenario == "server") {
+    // The one scenario here that needs the fixture RomM: what it pins is that a
+    // *live* credential stops being on the card, and a token nothing ever
+    // accepted would prove nothing.
+    const std::string base = rig::BaseUrl();
+    std::error_code error;
+    std::filesystem::create_directories(rig::ScratchDir(), error);
+    const std::unique_ptr<http::HttpClient> client = rommsync::host::MakeCurlHttpClient();
+    if (!rig::Reachable(*client, base)) {
+      std::cerr << "rig unreachable at " << base
+                << "\n  start it with: ./scripts/orca/compose.sh up -d\n";
+      return rig::kSkip;
+    }
+    const int failures = ServerChanged(*client, base);
+    if (failures == 0) {
+      std::cout << "engine.server ok against " << base << "\n";
+    }
+    return failures == 0 ? 0 : 1;
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;

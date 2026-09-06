@@ -21,9 +21,6 @@ std::string SdEngine::PathTo(const char* file_name) const { return config_dir_ +
 
 void SdEngine::Load(const std::string& config_dir) {
   config_dir_ = config_dir;
-  const config::LoadResult loaded = config::LoadConfig(PathTo(config::kConfigFileName));
-  config_ = loaded.value;
-  diagnostics_ = loaded.diagnostics;
 
   // Presence, not validity: a `token.dat` that will not parse is still a
   // console that has been paired, and telling that user they have never paired
@@ -47,26 +44,27 @@ void SdEngine::Load(const std::string& config_dir) {
   download::LoadedQueue queued = download::LoadQueue(PathTo(download::kQueueFileName));
   queue_.Reset(std::move(queued.entries));
   queue_trusted_ = queued.trusted;
-  // Carried on the config's diagnostics rather than dropped. It is not a
-  // complaint about `config.ini`, and the section says so -- but a queue that
-  // vanished with nothing anywhere saying why is the failure a diagnostic
-  // exists to prevent, and the settings screen (#26) is the one place on this
-  // console a user can read one. A field of its own is #22's to add.
-  //
-  // **In front, not appended.** `ipc::TrimDiagnostics` keeps the first few and
-  // summarises the rest, so a `config.ini` with a handful of complaints would
-  // otherwise push the one saying the whole download queue was discarded into
-  // the "N more" line -- and that is the one a user cannot infer from anything
-  // else on the screen.
-  std::vector<config::Diagnostic> ordered;
-  ordered.reserve(queued.diagnostics.size() + diagnostics_.size());
+  // Kept rather than folded into `diagnostics_` on the spot, because
+  // `ApplyConfigEdit` rebuilds that list from the file it just wrote and would
+  // otherwise drop the one complaint no other screen can show. A field of its
+  // own on the wire is #22's to add.
+  queue_diagnostics_.clear();
+  queue_diagnostics_.reserve(queued.diagnostics.size());
   for (std::string& complaint : queued.diagnostics) {
-    ordered.push_back({config::Severity::kWarning, 0, "downloads", "", std::move(complaint)});
+    queue_diagnostics_.push_back(
+        {config::Severity::kWarning, 0, "downloads", "", std::move(complaint)});
   }
-  for (config::Diagnostic& diagnostic : diagnostics_) {
-    ordered.push_back(std::move(diagnostic));
+
+  AdoptConfig(config::LoadConfig(PathTo(config::kConfigFileName)));
+}
+
+void SdEngine::AdoptConfig(config::LoadResult loaded) {
+  config_ = std::move(loaded.value);
+  diagnostics_ = queue_diagnostics_;
+  diagnostics_.reserve(diagnostics_.size() + loaded.diagnostics.size());
+  for (config::Diagnostic& diagnostic : loaded.diagnostics) {
+    diagnostics_.push_back(std::move(diagnostic));
   }
-  diagnostics_ = std::move(ordered);
 }
 
 bool SdEngine::WriteQueue() {
@@ -98,10 +96,118 @@ ipc::EngineSnapshot SdEngine::Snapshot() const {
 
 auth::PairingStatus SdEngine::pairing_status() const { return auth::PairingStatus{}; }
 
-ipc::Error SdEngine::SetSyncEnabled(bool) { return ipc::Error::kUnavailable; }
+ipc::Error SdEngine::SetSyncEnabled(bool enabled) {
+  ipc::ConfigEdit edit;
+  edit.assignments.push_back({"sync", "enabled", enabled ? "true" : "false", false});
+  // Down the same path as the settings screen rather than a shortcut of its
+  // own: `ServiceCore::SetEnabled` answers with the state read back off the
+  // config, and the two would have to agree about what a failed write left
+  // behind anyway. The diagnostics go nowhere because `EnabledResult` carries
+  // none -- a switch that did not move is the whole message (#24).
+  std::vector<config::Diagnostic> unread;
+  return ApplyConfigEdit(edit, &unread);
+}
 
-ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit&, std::vector<config::Diagnostic>*) {
-  return ipc::Error::kUnavailable;
+bool SdEngine::ReadConfigText(std::string* text,
+                              std::vector<config::Diagnostic>* diagnostics) const {
+  const std::string path = PathTo(config::kConfigFileName);
+  const io::BoundedRead outcome = io::ReadBounded(path, config::kMaxConfigBytes, text);
+  if (outcome == io::BoundedRead::kOk) {
+    return true;
+  }
+  if (outcome == io::BoundedRead::kMissing) {
+    // The one moment `config.ini` legitimately does not exist is the window
+    // `io::WriteAtomically`'s two-rename commit opens, and in that window the
+    // user's settings are sitting intact under the other name. Editing an empty
+    // string instead would write a `config.ini` holding one line and call the
+    // rest of their configuration gone. `LoadConfig` recovers from exactly the
+    // same window, for exactly the same reason.
+    std::string previous;
+    if (io::ReadBounded(io::PreviousPathFor(path), config::kMaxConfigBytes, &previous) ==
+        io::BoundedRead::kOk) {
+      *text = std::move(previous);
+      return true;
+    }
+    // Nothing under either name: a console nobody has configured yet, which is
+    // a file to create rather than a failure.
+    text->clear();
+    return true;
+  }
+  // It is there and the bytes would not come out of it, or it is too large to
+  // be one. Settings that cannot be read cannot be preserved, and writing a
+  // fresh file over them is the one outcome worse than refusing the edit.
+  diagnostics->push_back(
+      {config::Severity::kError, 0, "", "",
+       std::string(config::kConfigFileName) + " could not be read (" +
+           io::ToString(outcome) + "), so it was not edited; your settings are still on the card"});
+  return false;
+}
+
+ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
+                                     std::vector<config::Diagnostic>* diagnostics) {
+  std::string current;
+  if (!ReadConfigText(&current, diagnostics)) {
+    return ipc::Error::kWriteFailed;
+  }
+
+  std::string written;
+  if (!config::ApplyEdit(current, edit, &written, diagnostics)) {
+    // `kInvalid` promises the file is untouched, and it is: nothing below has
+    // run (`ipc.hpp`).
+    return ipc::Error::kInvalid;
+  }
+
+  // **A `server.url` change invalidates the session.** The token in `token.dat`
+  // was issued by the old RomM and the record says which one
+  // (`token_store.hpp`), so carrying it to a new host would send a stranger's
+  // server this console's bearer token. That is a security bug rather than a UX
+  // one, so it is decided by what the file will actually parse to and not by
+  // which assignments the overlay happened to send.
+  //
+  // The token goes **before** the write, deliberately. The other order leaves a
+  // moment where the card names the new server and still holds the old
+  // credential, and a discard that failed there would leave it there for good.
+  const bool server_changed =
+      config::ParseConfig(written).value.server.url != config_.server.url;
+  if (server_changed && !auth::DiscardToken(PathTo(auth::kTokenFileName))) {
+    diagnostics->push_back({config::Severity::kError, 0, "server", "url",
+                            "the pairing for the previous server could not be discarded, so the "
+                            "server was not changed"});
+    return ipc::Error::kWriteFailed;
+  }
+
+  const io::WriteResult wrote = io::WriteAtomically(PathTo(config::kConfigFileName), written);
+  if (!wrote.ok()) {
+    diagnostics->push_back({config::Severity::kError, 0, "", "",
+                            std::string(config::kConfigFileName) + " was not written (" +
+                                io::ToString(wrote.error) + "); your settings are unchanged"});
+    if (server_changed) {
+      // Said out loud rather than left for the user to discover at the pairing
+      // screen: the safe order above has already cost them the pairing, and the
+      // server they are paired to did not change after all.
+      diagnostics->push_back({config::Severity::kWarning, 0, "server", "url",
+                              "this console's pairing was discarded before the write was "
+                              "attempted, so it has to be paired again"});
+      auth_ = ipc::AuthState::kNeverPaired;
+    }
+    return ipc::Error::kWriteFailed;
+  }
+
+  if (server_changed) {
+    auth_ = ipc::AuthState::kNeverPaired;
+    diagnostics->push_back({config::Severity::kNotice, 0, "server", "url",
+                            "the server changed, so this console's pairing was discarded -- "
+                            "pair again from the overlay"});
+  }
+
+  // Read back rather than kept: the file on the card is the source of truth for
+  // what the engine is configured with, and an in-memory `Config` built from the
+  // edit would be the one thing in this process that never went through
+  // `ParseConfig`. This is also what makes the change take effect with no
+  // reboot -- `GetStatus` and `GetConfig` read `config_`, and it is now the new
+  // one.
+  AdoptConfig(config::LoadConfig(PathTo(config::kConfigFileName)));
+  return ipc::Error::kOk;
 }
 
 bool SdEngine::RequestSync() {

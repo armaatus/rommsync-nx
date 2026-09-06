@@ -4,8 +4,8 @@
 // IPC service, and spends the rest of the process's life answering it (M4-1,
 // #23). There is still no scheduler and no networking -- those are M2 and M7 --
 // so the commands behind them answer `ipc::Error::kUnavailable`; what is real
-// today is the console's configuration, whether it has ever paired, and the
-// build (see `engine.hpp`).
+// today is the console's configuration -- read *and* written, since M5-3 (#30)
+// -- whether it has ever paired, and the build (see `engine.hpp`).
 //
 // The service is registered inside `__appInit`, while `sm` is still up, because
 // a registered port outlives the session that registered it: a resident process
@@ -123,8 +123,10 @@ int main(int, char**) {
 
   // Read once, here rather than per request: `GetStatus` and `GetConfig` are
   // documented never to fail and are polled every frame by the status screen,
-  // so neither may go near the SD card (`ipc.hpp`). Re-reading `config.ini`
-  // when it changes is M5-3's (#30).
+  // so neither may go near the SD card (`ipc.hpp`). Since M5-3 (#30) the one
+  // command that *does* -- `SetConfig` -- re-reads the file it just wrote and
+  // swaps the live `Config`, which is what makes a setting changed from the
+  // overlay take effect without a reboot.
   rommsync::sysmodule::SdEngine engine;
   engine.Load();
 

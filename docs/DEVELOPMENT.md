@@ -324,7 +324,9 @@ still being built. A command whose engine does not exist yet answers
 `kUnavailable` -- nothing attempted, nothing changed -- rather than a plausible
 refusal that would send a user looking for a full queue or a failing SD card.
 Each of M3-2, M5-3, M5-4 and M7-2 removes its own use of it, and the last one to
-go is what says the engine is finished (`sysmodule/source/engine.hpp`).
+go is what says the engine is finished (`sysmodule/source/engine.hpp`). M3-2
+took the queue commands off that list and M5-3 took `SetConfig` and `SetEnabled`;
+what is left is `Unpair`, `StartPairing` and the three list commands.
 
 `SyncNow` is the one command that cannot say it, and the reason is the seam
 rather than a choice: `ipc::Engine::RequestSync()` is a `bool`, so an engine

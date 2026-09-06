@@ -20,8 +20,12 @@
 // the only honest one after a bad edit.
 //
 // Writes belong to the sysmodule, not here (docs/ARCHITECTURE.md): the overlay
-// asks it to change a value over IPC and it persists the file. This module only
-// reads. Serialising a `Config` back to `config.ini` is M5-3's.
+// asks it to change a value over IPC and it persists the file. This module owns
+// what an edit *means* -- `ApplyEdit` (M5-3) -- and the sysmodule owns getting
+// the result onto the card.
+//
+// `ApplyEdit` is not a serialiser and there is deliberately no `Config` ->
+// `config.ini`. See it for why.
 #pragma once
 
 #include <cstddef>
@@ -366,6 +370,108 @@ LoadResult ParseConfig(std::string_view text);
 /// Only a missing file takes it -- a file that exists and will not open is a bad
 /// moment, not evidence that the previous record is the current one.
 LoadResult LoadConfig(const std::string& path);
+
+// --- the write path ----------------------------------------------------------
+//
+// **Validation here is strict, and on the read path it cannot be.** `LoadConfig`
+// may never refuse to produce a config, because a console with no screen and no
+// keyboard cannot be talked through a parse error and nothing may block boot.
+// `ApplyEdit` refuses, because there is a person watching the overlay who can be
+// told which value was wrong and what the limit is -- and because writing a
+// value the next boot would drop is a setting that appears to have been saved
+// and was not. The clearest case is `sync.interval_min` above the one-week
+// ceiling: the read path clamps it, this one rejects it.
+
+/// How many assignments one `ApplyEdit` may carry.
+///
+/// An edit is applied as a unit, so an unbounded list is an unbounded amount of
+/// work between reading `config.ini` and writing it back -- on the IPC thread of
+/// a sysmodule, between a request and its reply. `ipc::kMaxAssignments` is this
+/// number: the wire and the applier agree by construction rather than by
+/// comment.
+inline constexpr std::size_t kMaxEditAssignments = 64;
+
+/// One `key = value` under one section, spelled the way `config.ini` spells it.
+///
+/// Spelled that way rather than as a field of `Config` so that validation goes
+/// through the parser's own rules instead of a second grammar, and so a refusal
+/// comes back with the same section/key a `Diagnostic` from the boot path
+/// carries. It is also the shape an edit arrives in over IPC (`ipc.hpp`).
+struct Assignment {
+  /// As written minus the brackets: `sync`, `platform.snes`. Case-insensitive
+  /// except for the slug of a `platform.` section, which is a directory name on
+  /// the server's filesystem. Never empty.
+  std::string section;
+
+  /// Case-insensitive. Never empty.
+  std::string key;
+
+  /// Exactly the text that would follow the `=`, before normalising. An empty
+  /// string is a legal value -- `roms =` is the documented way to say "nowhere"
+  /// -- which is why removal is `remove` and not an empty `value`.
+  std::string value;
+
+  /// Drop the key instead of setting it. What "reset to this build's default"
+  /// does, since a key that is not in the file is the default.
+  bool remove = false;
+};
+
+/// One edit, applied as a unit: all of it lands or none of it does.
+struct Edit {
+  std::vector<Assignment> assignments;
+};
+
+/// Apply `edit` to the text of a `config.ini`, or refuse it.
+///
+/// **It edits the text; it does not round-trip through `Config`.** `config.ini`
+/// is the one file a human edits, and regenerating it from a parsed struct would
+/// silently delete their comments, their blank lines, their `[platform.x]`
+/// ordering and every section this build does not know about. So the one line is
+/// rewritten -- keeping its indentation, the spacing around its `=` and any
+/// trailing `; comment` -- and every other byte of the file is carried through
+/// untouched, BOM and CRLF included.
+///
+/// Where a line goes when there is not one already:
+///
+///   - the key is present  -> the **last** assignment of it in that section is
+///     rewritten, because that is the one `ParseConfig` resolves to; earlier
+///     duplicates are already dead and are left alone.
+///   - the section is present -> the line is inserted after that section's last
+///     `key = value`, ahead of any trailing blank or comment lines, which are
+///     usually the next section's preamble.
+///   - neither -> a blank line, `[section]` and the assignment, at the end. For
+///     a `[platform.<slug>]` this build maps by default, the **rest of that
+///     mapping goes in with it**: a platform section replaces the built-in entry
+///     rather than adding to it (docs/CONFIG.md), so a section created to move
+///     `saves` would otherwise unmap that platform's `roms` folder as a side
+///     effect of one edit. The change lands on what was in force, which is what
+///     the precedence chain says it does, and a `kNotice` says it happened.
+///   - `remove` -> **every** occurrence in that section goes, not the last:
+///     leaving an earlier one would resurface a value the user asked to be rid
+///     of.
+///
+/// Values are normalised on the way in -- through `NormalizeServerUrl`,
+/// `NormalizeSdPath` and `ParseBool`, the validators the parser uses -- so the
+/// file on the card is what the engine loads back: a URL with a trailing slash
+/// is stored without it, and `YES` is stored as `true`.
+///
+/// Refused, with a `Diagnostic` and **nothing written**: a value any of those
+/// validators rejects, an `interval_min` outside `[kMinIntervalMinutes,
+/// kMaxIntervalMinutes]`, a section or key this build does not know, an empty
+/// section or key, the same section and key twice in one edit, more than
+/// `kMaxEditAssignments` assignments, and a normalised value that would not
+/// survive being read back -- a folder path carrying a comment marker after a
+/// space is a legal SD path and an illegal `config.ini` value.
+///
+/// No diagnostic from here ever quotes a `server.url`, the rule `Diagnostic`
+/// documents: the refusals carry `NormalizeServerUrl`'s reason, which never
+/// quotes its input.
+///
+/// True when `*out_text` holds the new file. False leaves `*out_text` untouched;
+/// either way `diagnostics` is appended to and never cleared, so a caller can
+/// collect across steps.
+bool ApplyEdit(std::string_view current_text, const Edit& edit, std::string* out_text,
+               std::vector<Diagnostic>* diagnostics);
 
 /// Normalise one SD path from the folder map, or fail.
 ///

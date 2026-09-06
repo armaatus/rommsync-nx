@@ -432,39 +432,30 @@ inline constexpr std::size_t kMaxDiagnosticTextBytes = 240;
 /// `SetConfig` answers with.
 std::vector<config::Diagnostic> TrimDiagnostics(const std::vector<config::Diagnostic>& diagnostics);
 
-/// One `key = value` under one section, as `config.ini` spells it.
+/// One `key = value` under one section, as `config.ini` spells it, and the edit
+/// they arrive in.
 ///
 /// `SetConfig` is a list of these rather than a whole `Config` for two reasons:
 /// a whole map does not fit the payload cap, and an overlay that sends back
 /// everything it was shown would silently overwrite a section the running
-/// sysmodule has since re-read. M5-3 (#30) owns what merging one means and what
-/// it refuses; this header owns only the shape it arrives in.
-struct ConfigAssignment {
-  /// As written minus the brackets: `sync`, `platform.snes`. Never empty.
-  std::string section;
-
-  /// Never empty.
-  std::string key;
-
-  /// Exactly the text that would follow the `=`. An empty string is a legal
-  /// value (a folder key set to nothing), which is why removal is `remove`
-  /// rather than an empty `value`.
-  std::string value;
-
-  /// Drop the key instead of setting it -- what "reset to default" does.
-  bool remove = false;
-};
+/// sysmodule has since re-read.
+///
+/// They are `config::`'s own types rather than copies of them. M5-3 (#30) owns
+/// what applying one means and what it refuses (`config::ApplyEdit`), and a
+/// second struct here would be a second place for the wire's bounds and the
+/// applier's rules to drift apart -- the encoded bytes are the same either way,
+/// and the field names are the ones `ipc.cpp` already writes.
+using ConfigAssignment = config::Assignment;
+using ConfigEdit = config::Edit;
 
 /// How many assignments one `SetConfig` may carry.
 ///
 /// Bounded for `kMaxPayloadBytes`'s reason and one more: an edit is applied as a
 /// unit, so an unbounded list is an unbounded amount of work between reading
-/// `config.ini` and writing it back.
-inline constexpr std::size_t kMaxAssignments = 64;
-
-struct ConfigEdit {
-  std::vector<ConfigAssignment> assignments;
-};
+/// `config.ini` and writing it back. It is `config::kMaxEditAssignments`, since
+/// a decoder that accepted one more than the applier does would answer
+/// `kInvalid` to a payload this contract said was legal.
+inline constexpr std::size_t kMaxAssignments = config::kMaxEditAssignments;
 
 /// What `SyncNow` did with the request. Never "failed": the command hands work
 /// to the engine thread and returns, so it reports what it *did with the ask*,

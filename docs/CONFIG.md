@@ -215,3 +215,61 @@ back to `config.ini` by the sysmodule).
 "Override" is per platform for the folder map — a `[platform.x]` section
 replaces the built-in entry for `x` and leaves every other platform alone — and
 per key everywhere else.
+
+## Editing from the overlay
+
+The overlay never writes this file. It sends the sysmodule one `SetConfig` — a
+short list of `section`, `key`, `value` — and the sysmodule validates it,
+rewrites the file and re-reads it, so the change is in force before the call
+comes back. No restart, and no second copy of the settings anywhere.
+
+**Your file survives the edit.** One line changes; every other byte is the byte
+you typed. Comments, blank lines, the order of your `[platform.x]` sections, a
+section this build has never heard of, a UTF-8 BOM and CRLF endings all come
+through untouched, because the file is edited as text rather than regenerated
+from what the parser understood of it. A key that is set twice has its **last**
+line rewritten, which is the one the parser uses; a key that is not there yet is
+added to the end of its section; a section that is not there is added to the end
+of the file.
+
+Three things do change beyond the one line:
+
+- the value is stored **normalised** — the form the client actually loads. A URL
+  keeps no trailing slash, `YES` is stored as `true`, and a folder list is
+  stored deduplicated with its paths tidied.
+- "reset to default" removes the key, and removes **every** occurrence of it in
+  that section. Leaving an earlier one would hand the old value straight back on
+  the next boot.
+- setting a folder for a platform that has **no section in your file yet** writes
+  that platform's built-in mapping out with your change applied on top, and says
+  so. A `[platform.x]` section replaces the built-in entry rather than adding to
+  it, so writing only the key you changed would unmap that platform's other
+  folders as a side effect. Emptying one on purpose is still `roms =`.
+
+**An edit is refused where the boot path would carry on.** Nothing in this file
+can stop the client from starting, so a bad line already on the card is dropped
+or clamped and reported. An edit arriving from the overlay is different: there
+is somebody looking at the screen who can be told, and writing a value the next
+boot would drop is a setting that looks saved and is not. So an edit is refused
+outright — with the reason, and **nothing at all written** — when it carries a
+`url` that is not a usable server address, a folder path that is not absolute or
+that contains `..`, a boolean that is not one, an `interval_min` that is
+negative or **above the 10080-minute maximum** (the read path clamps that one;
+this one tells you the ceiling), a section or key this client does not have, or
+a folder name that could not be read back — `/roms/great #2` is a legal SD path
+and an illegal value here, because a `#` after a space starts a comment.
+
+An edit is applied as a unit. A settings screen that sends four values and gets
+one of them wrong leaves the card exactly as it was, rather than three-quarters
+changed.
+
+**Changing `url` un-pairs the console.** The token in `token.dat` was issued by
+the RomM you were pointed at and is meaningless to any other — so pointing the
+client at a different server discards it rather than sending your bearer token
+to a host that never issued it. Pair again from the overlay. Editing anything
+else leaves the pairing alone.
+
+If the write itself cannot happen — no card, a full one — the answer says so and
+nothing changed: the file is committed with the same two-rename write the token
+and device records use, so an interrupted one leaves your previous settings
+under `config.ini.old` and the next boot reads them from there.
