@@ -248,6 +248,12 @@ $out"
     "the file that defines the helper" "$build"
   no_backup_call_fails core/src/state_sync.cpp 's/^      BackUpFirst(/      NoBackupAtAll(/' \
     "the save-state path" "$build"
+  # M7-1's restore, which lands on a save through CopyAtomically rather than
+  # CommitStaged -- the census names the landing call per row for exactly this
+  # reason, since a check hardcoded to CommitStaged would not see this path.
+  no_backup_call_fails core/src/conflict_record.cpp \
+    's/      sync::BackUpFirst(/      sync::NoBackupAtAll(/' \
+    "the conflict restore" "$build"
 
   # The tree as it stands is the positive case, and it is checked last so a
   # green here cannot be an artefact of the copies above.
@@ -545,7 +551,33 @@ $script_ids"
   done <<EOF
 $("$GATE" --rows)
 EOF
-  echo "ok: docs/TESTING.md publishes the same eight rows the gate evaluates"
+  # ...and the EVIDENCE column, not only the claim. This is the half that drifted:
+  # the table listed three of the four edge cases the sync row names, and nothing
+  # noticed, because ids and claim heads both matched. Each CTest pattern the
+  # script names is reduced to a literal token -- `^harness\.same_timestamp$`
+  # becomes `harness.same_timestamp`, `^http\.range` becomes `http.range` -- and
+  # that token has to appear in the doc's row. It cannot check the reverse (a
+  # doc naming evidence the script does not), which `--audit` covers from the
+  # other side by refusing a pattern that matches no registered test.
+  local row_line pattern token
+  while IFS='|' read -r id kind claim; do
+    [ "$kind" = "suite" ] || continue
+    row_line="$(echo "$section" | grep "^| \`$id\` |")"
+    [ -n "$row_line" ] || fail "the Rung 3 table has no row for '$id'"
+    while IFS= read -r pattern; do
+      [ -n "$pattern" ] || continue
+      token="$(echo "$pattern" | sed -e 's/[$^]//g' -e 's/\\//g')"
+      case "$row_line" in
+        *"$token"*) ;;
+        *) fail "the Rung 3 table's '$id' row does not name '$token', which the gate counts as its evidence" ;;
+      esac
+    done <<PATTERNS
+$("$GATE" --rows >/dev/null; sed -n "/^    $id)\$/,/^      ;;\$/p" "$GATE" | sed -n 's/^\(\^[^ ]*\)$/\1/p')
+PATTERNS
+  done <<EOF
+$("$GATE" --rows)
+EOF
+  echo "ok: docs/TESTING.md publishes the same eight rows, claims and evidence the gate evaluates"
 }
 
 case "${1:-}" in

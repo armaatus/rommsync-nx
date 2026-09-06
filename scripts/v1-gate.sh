@@ -198,22 +198,32 @@ T
 
 # Every place in `core/` that commits bytes over an existing file, counted per
 # file and per helper and classified. This is the word "every" in the box above,
-# which nothing checked before: the tests prove the two save paths back up
-# first, and this proves there are still only two.
+# which nothing checked before: the tests prove that each save path backs up
+# first, and this proves the set of them is still the set somebody classified.
 #
 # Pinned per file rather than per line, so editing inside a function does not
 # move it. The limit is honest and worth stating: two call sites swapping files
 # would balance out and pass. What it does catch is the thing that actually
 # happens -- a new overwrite path appearing in a file that had none, or in a
 # file of its own.
-SAVE_SITE_CENSUS='core/src/auth_gate.cpp|0|0|1|not a save: the auth backoff record
-core/src/device_identity.cpp|0|0|2|not a save: device.dat
-core/src/download.cpp|1|0|1|not a save: rom bytes, and the queue record
-core/src/state_db.cpp|0|0|1|not a save: the sync baseline
-core/src/state_sync.cpp|1|0|0|SAVE STATE: sync::BackUpFirst runs first
-core/src/sync_execute.cpp|1|1|0|SAVE: sync::BackUpFirst runs first, and is itself the CopyAtomically
-core/src/token_store.cpp|0|0|1|not a save: token.dat
-sysmodule/source/engine.cpp|0|0|1|not a save: config.ini, written back by the engine'
+# file | CommitStaged | CopyAtomically | WriteAtomically | the call that lands
+# ON A SAVE, empty when none does | what it is
+#
+# The fifth field is what makes this more than a headcount: a row that names a
+# landing call is a save-overwrite path, and the check below insists a CALL to
+# `sync::BackUpFirst` comes before it in the file. Adding a save path is then a
+# census edit rather than a code edit -- which is the point, since the row this
+# serves is the one that says there are only these.
+SAVE_SITE_CENSUS='core/src/auth_gate.cpp|0|0|1||not a save: the auth backoff record
+core/src/conflict_log.cpp|0|0|1||not a save: the conflict log M7-1 writes
+core/src/conflict_record.cpp|0|1|0|io::CopyAtomically|SAVE (M7-1 restore): putting a backup back IS an overwrite, so sync::BackUpFirst runs first
+core/src/device_identity.cpp|0|0|2||not a save: device.dat
+core/src/download.cpp|1|0|1||not a save: rom bytes, and the queue record
+core/src/state_db.cpp|0|0|1||not a save: the sync baseline
+core/src/state_sync.cpp|1|0|0|io::CommitStaged|SAVE STATE: sync::BackUpFirst runs first
+core/src/sync_execute.cpp|1|1|0|io::CommitStaged|SAVE: sync::BackUpFirst runs first, and IS the CopyAtomically here
+core/src/token_store.cpp|0|0|1||not a save: token.dat
+sysmodule/source/engine.cpp|0|0|1||not a save: config.ini, written back by the engine'
 
 # Where the census looks. `core/` is where the engine lives and where a save
 # path belongs, but the box says EVERY save-overwrite path and the two Horizon
@@ -225,8 +235,8 @@ SAVE_SITE_ROOTS='core/src sysmodule/source overlay/source'
 # these helpers are discussed in prose in files that never call them, so the
 # prose has to go -- but anchoring at the left instead (`^[^/]*io::X(`) refuses
 # any line carrying a `/` before the call, which `dir / name` does, and a save
-# path written that way would be invisible to the one check that says there are
-# only two of them.
+# path written that way would be invisible to the one check that says which files
+# can land on a save at all.
 #
 # `://` is left alone so that a `"http://"` in a string does not eat the rest of
 # its own line. Multi-line /* */ blocks are not handled and there are none in
@@ -246,7 +256,7 @@ repo_backup() {
   local ok=0 line file want_commit want_copy want_write why
   local got_commit got_copy got_write f rel
 
-  while IFS='|' read -r file want_commit want_copy want_write why; do
+  while IFS='|' read -r file want_commit want_copy want_write lands why; do
     [ -n "$file" ] || continue
     if [ ! -f "$REPO_ROOT/$file" ]; then
       echo "    census names $file, which is not in the tree"
@@ -287,7 +297,7 @@ EOF
     done
   done
 
-  # ...and the two that ARE saves still CALL the backup, ahead of the commit.
+  # ...and every row that lands on a save still CALLS the backup, ahead of it.
   #
   # A call and not a mention, and not the definition either: `BackUpFirst` is
   # defined in sync_execute.cpp, so a pattern that accepts any occurrence is
@@ -303,21 +313,28 @@ EOF
   #
   # Line order is a crude proof and is not pretending otherwise; what it holds is
   # that deleting the backup call cannot go unnoticed.
-  for rel in core/src/sync_execute.cpp core/src/state_sync.cpp; do
-    local backup_line commit_line
-    backup_line="$(strip_comments "$REPO_ROOT/$rel" | grep -n "BackUpFirst(" \
+  local saves=0
+  while IFS='|' read -r file want_commit want_copy want_write lands why; do
+    [ -n "$lands" ] || continue
+    [ -f "$REPO_ROOT/$file" ] || continue
+    saves=$((saves + 1))
+    local backup_line land_line
+    backup_line="$(strip_comments "$REPO_ROOT/$file" | grep -n "BackUpFirst(" \
                    | grep -vE '^[0-9]+:[A-Za-z_]' | head -1 | cut -d: -f1)"
-    commit_line="$(strip_comments "$REPO_ROOT/$rel" | grep -n "io::CommitStaged(" \
-                   | head -1 | cut -d: -f1)"
-    if [ -z "$backup_line" ] || [ -z "$commit_line" ] || [ "$backup_line" -ge "$commit_line" ]; then
-      echo "    $rel commits onto a save with no CALL to BackUpFirst ahead of it"
+    land_line="$(strip_comments "$REPO_ROOT/$file" | grep -n "$lands(" \
+                 | head -1 | cut -d: -f1)"
+    if [ -z "$backup_line" ] || [ -z "$land_line" ] || [ "$backup_line" -ge "$land_line" ]; then
+      echo "    $file writes onto a save with no CALL to BackUpFirst ahead of it"
       ok=1
     fi
-  done
+  done <<EOF
+$SAVE_SITE_CENSUS
+EOF
+  [ "$saves" -ge 1 ] || { echo "    the census names no save-overwrite path at all"; ok=1; }
 
   local counted
   counted="$(echo "$SAVE_SITE_CENSUS" | grep -c .)"
-  [ "$ok" -eq 0 ] && echo "    $counted files in core/ commit over an existing file; two of them can land on a save, and both back up first"
+  [ "$ok" -eq 0 ] && echo "    $counted files commit over an existing file; $saves of them can land on a save, and each calls BackUpFirst first"
   return "$ok"
 }
 
@@ -357,7 +374,11 @@ repo_release() {
   # behind it installs nothing.
   if [ "$MODE" = "dry" ]; then
     echo "    whether $tag was published is not looked up in --dry"
-    return 2
+    # Unknown only if nothing already known is wrong: a tag off main, or one that
+    # disagrees with VERSION, is a finding this machine has already made, and
+    # reporting it as "not looked up" would lose it.
+    [ "$ok" -eq 0 ] && return 2
+    return 1
   fi
   local view=""
   if command -v gh >/dev/null 2>&1; then
