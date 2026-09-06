@@ -314,7 +314,7 @@ void SetRepair(SettingsView* view, const ipc::ConfigView& config, const RepairSt
     // the notice rather than the button's `refusal`, which is what a press that
     // will not go through says.
     //
-    // It names the pairing *first* because that is the order the press runs in
+    // It puts the *new* pairing first because that is the order the press runs in
     // and the order that decides what a refusal costs: nothing is discarded
     // until a new pairing is genuinely starting, so a press that gets no
     // further leaves the console exactly as it was. A sentence promising the

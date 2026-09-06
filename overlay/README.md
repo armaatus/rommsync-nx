@@ -2,8 +2,9 @@
 
 The control UI. It opens the sysmodule's IPC service and draws the **status
 screen** — connection, pairing, last sync, counts, current download and queue
-depth. It holds no sync logic of its own; the engine lives behind
-`sys-rommsync` and the overlay talks to it over IPC.
+depth — with **Y** opening the settings screen, which is the root menu the other
+three are reached from. It holds no sync logic of its own; the engine lives
+behind `sys-rommsync` and the overlay talks to it over IPC.
 
 ```bash
 git submodule update --init --recursive   # lib/libultrahand, once
