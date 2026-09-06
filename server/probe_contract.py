@@ -587,6 +587,19 @@ def sync_scenarios(s, base, cap, rom_id):
                   f"it does not own precisely because the POST destroys what is there.",
                   file=sys.stderr)
             sys.exit(1)
+        # The emulator move is ASSERTED, not merely printed. API_CONTRACT.md says
+        # of this endpoint that "the probe fails loudly if it ever stops being
+        # true", and that sentence covers the emulator clause too -- it was the
+        # one part only reported, so a RomM that stopped moving the emulator
+        # would have scrolled past in the output. Found in review of #99.
+        if replaced.get("emulator") != "probe-other-emulator":
+            print(f"!! a second POST /api/states did not move the row's emulator: "
+                  f"sent 'probe-other-emulator', the row still reads "
+                  f"{replaced.get('emulator')!r}. API_CONTRACT.md states the "
+                  f"emulator is not part of the upsert key, and M2-8's naming "
+                  f"rules are built on that.",
+                  file=sys.stderr)
+            sys.exit(1)
         print(f"  same id ({replaced['id']}), {state['file_size_bytes']} -> "
               f"{replaced['file_size_bytes']} bytes, emulator "
               f"{state['emulator']!r} -> {replaced['emulator']!r}")
