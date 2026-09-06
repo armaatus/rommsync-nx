@@ -149,6 +149,38 @@ class NativeFileSystem final : public fs::FileSystem {
     return listing;
   }
 
+  fs::MakeDirResult CreateDirectory(std::string_view sd_path) override {
+    fs::MakeDirResult result;
+    std::filesystem::path resolved;
+    if (!ResolveUnderRoot(root_, sd_path, &resolved)) {
+      result.error = fs::MakeDirError::kNotOnThisCard;
+      result.message = std::string(sd_path) + ": not a path on this card";
+      return result;
+    }
+
+    std::error_code error;
+    if (std::filesystem::is_directory(resolved, error)) {
+      return result;  // already there, which is what the caller wanted
+    }
+    if (std::filesystem::exists(resolved, error)) {
+      result.error = fs::MakeDirError::kNotADirectory;
+      result.message = std::string(sd_path) + ": is a file, not a directory";
+      return result;
+    }
+
+    // `create_directories` reports false for "it already existed", which the
+    // check above has ruled out, so the error code is the only answer worth
+    // reading -- and a directory that appeared between the two is still the
+    // outcome the caller asked for.
+    std::filesystem::create_directories(resolved, error);
+    std::error_code again;
+    if (error && !std::filesystem::is_directory(resolved, again)) {
+      result.error = fs::MakeDirError::kUnwritable;
+      result.message = std::string(sd_path) + ": " + error.message();
+    }
+    return result;
+  }
+
   std::string Resolve(std::string_view sd_path) const override {
     std::filesystem::path resolved;
     if (!ResolveUnderRoot(root_, sd_path, &resolved)) {

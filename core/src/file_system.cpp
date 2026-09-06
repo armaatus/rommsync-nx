@@ -18,4 +18,18 @@ const char* ToString(ListError error) {
   return "unknown";
 }
 
+const char* ToString(MakeDirError error) {
+  switch (error) {
+    case MakeDirError::kNone:
+      return "none";
+    case MakeDirError::kNotOnThisCard:
+      return "not on this card";
+    case MakeDirError::kNotADirectory:
+      return "not a directory";
+    case MakeDirError::kUnwritable:
+      return "unwritable";
+  }
+  return "unknown";
+}
+
 }  // namespace rommsync::fs

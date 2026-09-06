@@ -139,6 +139,28 @@ class FakeFileSystem final : public fs::FileSystem {
     return found->second;
   }
 
+  /// The scanner never creates a directory -- `sync::RunTick` does, for
+  /// `.backup/` (#16) -- so this is the interface's requirement met and nothing
+  /// more. It makes the real directory, because `Resolve` hands out real paths
+  /// and a fake that only remembered would let a caller write into nothing.
+  fs::MakeDirResult CreateDirectory(std::string_view sd_path) override {
+    fs::MakeDirResult result;
+    const std::string path = Resolve(sd_path);
+    if (path.empty()) {
+      result.error = fs::MakeDirError::kNotOnThisCard;
+      result.message = std::string(sd_path) + ": not a path on this card";
+      return result;
+    }
+    std::error_code error;
+    std::filesystem::create_directories(path, error);
+    std::error_code again;
+    if (error && !std::filesystem::is_directory(path, again)) {
+      result.error = fs::MakeDirError::kUnwritable;
+      result.message = std::string(sd_path) + ": " + error.message();
+    }
+    return result;
+  }
+
   std::string Resolve(std::string_view sd_path) const override {
     // The same refusal the interface requires and the native backend makes: a
     // fake that resolved a `..` would let a test pass over a backend that does

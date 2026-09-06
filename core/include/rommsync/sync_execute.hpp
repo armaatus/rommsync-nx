@@ -46,8 +46,9 @@
 // plan describes a state the server may have moved on from, so the arbiter of
 // that is a fresh negotiation rather than this client -- which is what
 // docs/SYNC_PROTOCOL.md's failure rules already say: count the operation
-// failed, leave that save alone, let the next tick negotiate again. M2-7 owns
-// the schedule between ticks.
+// failed, leave that save alone, let the next tick negotiate again.
+// `sync_tick.hpp` owns the order of one tick and M7-2 the schedule between
+// them.
 #pragma once
 
 #include <chrono>

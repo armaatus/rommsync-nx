@@ -165,9 +165,11 @@ http::Request Authed(http::Method method, std::string url, const auth::StoredTok
 ///
 /// `Fetch` has five ways out between staging a body and committing it, and each
 /// one has to remove those bytes -- an unverified or unplaceable download is not
-/// a save. One branch forgetting would leave a `<save>.tmp` for the next tick to
-/// reason about, and a `.tmp` beside a save is supposed to mean "verified bytes
-/// that never landed" (issue #16).
+/// a save. One branch forgetting would leave a `<save>.tmp` for M2-7's sweep to
+/// find, and that sweep can only *discard* one: the rename onto this path
+/// happens the instant the body ends, before the digest is checked and before
+/// anything is backed up, so a `.tmp` a crash left behind may hold the wrong
+/// save and the plan that could have settled it is gone (sync_tick.hpp).
 class StagedFile {
  public:
   explicit StagedFile(std::string path) : path_(std::move(path)) {}

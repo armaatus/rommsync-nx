@@ -39,6 +39,7 @@
 
 #include "harness.hpp"
 #include "rommsync/atomic_file.hpp"
+#include "rommsync/host/file_sync.hpp"
 #include "rommsync/md5.hpp"
 #include "rommsync/sha1.hpp"
 #include "rommsync/state_db.hpp"
@@ -1225,6 +1226,11 @@ void Backup(rig::Checks& checks, http::HttpClient& client, const std::string& ba
 }  // namespace
 
 int main(int argc, char** argv) {
+  // The durability hook the sysmodule installs from its own `main` (M2-7). A
+  // suite that left it null would be proving the weaker of the two promises
+  // `io::CopyAtomically` can make, on the very path a backup depends on.
+  rommsync::host::InstallPosixFileSync();
+
   const std::string scenario = argc > 1 ? argv[1] : "sandbox";
   const std::string base = rig::BaseUrl();
 

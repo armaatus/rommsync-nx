@@ -191,8 +191,8 @@ which were watched taking ~50s. Time the test yourself.
   (`http.*`, `pair.*`, `harness.*`); each edge case is then covered by the
   milestone that implements the behaviour. M0-5 has since landed on exactly that
   line: `harness.*` produces every one of those cases on demand and pins what the
-  *server* does in each, and the client's response to them stays M2-5's and
-  M2-7's to write — against a harness that is already there to write it in.
+  *server* does in each, and the client's response to them was M2-5's and
+  M2-7's to write — against a harness that was already there to write it in.
 
 ### Where it stands
 
@@ -409,6 +409,41 @@ ctest --test-dir build --output-on-failure
   cannot fix a typo in a URL — a 403, which is a scope the user did not approve
   rather than a revoked token, sync switched off for the device, another 400,
   and the 503/429 that mean "not now".
+- The `tick.*` scenarios (M2-7) are the only ones that run a **whole** tick,
+  `sync::RunTick`, and every one of them asks the same question afterwards: is
+  the card holding the saves it started with, or a strictly completed subset of
+  them? Five need no server and never skip. `recovery` builds each of the three
+  leftovers a *crash* can leave beside a save -- a `.tmp.part`, a `.tmp`, and a
+  `.old` with the save missing -- and checks the sweep discards the first two,
+  puts the third back, leaves `.backup/` alone and leaves a rom download's
+  resumable `.part` alone. `durable` is the platform `fsync` hard rule 2 depends
+  on, and it pins the sequence: the backup's bytes go to the card *before* the
+  rename publishes them and the destination's **directory** goes after it, since
+  on POSIX a name is not durable until the directory holding it is. A hook that
+  refuses fails the copy rather than leaving a backup that holds nothing, and the
+  same seam serves `WriteAtomically`. `backupdir` is the
+  directory `core/` could not create until this issue. `offline` points a tick at
+  a closed loopback port and compares the whole sandbox -- directories included,
+  so "no `.backup/` was created either" is part of it -- byte for byte before and
+  after. `rescan` is the one case the sweep cannot simply carry on past: a save
+  it put back is a save the scan never saw, so the tick stops before the network
+  rather than reporting that save as absent and having RomM plan a download over
+  it. `canceled` fires the token first and counts the requests: zero.
+- The rig half is one CTest entry per (stage, fault mode), so a red run names the
+  stage and the way it broke rather than "the tick": `negotiate_5xx`,
+  `negotiate_drop`, `upload_5xx`, `upload_truncate`, `upload_drop`,
+  `upload_stall`, `download_5xx`, `download_stall`, `download_401`,
+  `complete_drop`, `complete_stall`, `resumes`. Two of them are worth reading
+  together, because they are the two halves of the duplication hazard: a
+  `truncate` at an upload is a *completed* upload whose `save_id` is simply
+  unknown -- failing it would have the next tick send the same bytes again, which
+  RomM stores as a second row -- while a `drop` at an upload is the row already
+  existing with no way for the client to know it, which is exactly why there is
+  no retry inside a tick. Both assert the row count on the server afterwards.
+  `resumes` is the acceptance in full: a reset mid-download, then a second tick,
+  and the save ends correct with **one** row rather than two. Every one of them
+  runs inside a `harness::Sandbox`, so the backup-before-overwrite audit judges
+  it on teardown, and ends on `harness::ExpectDisarmed`.
 - The `harness.*` scenarios (M0-5) are the same idea applied to the *edge cases*:
   every row of that issue's table, forced deterministically against the real
   server. `expired` (a 401 arriving mid-flow, and that it is a response rather

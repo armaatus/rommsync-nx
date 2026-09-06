@@ -22,6 +22,68 @@
 
 namespace rommsync::io {
 
+/// The platform's "these bytes are on the card", not merely in a buffer.
+///
+/// `rename` gives atomicity; it gives nothing about durability, and neither
+/// `fsync` nor Horizon's `fsFsCommit` is reachable from `core/`, which has only
+/// standard headers (core/AGENTS.md). So the platform layer installs one of
+/// these and the two writers below call it on the staged file -- after it is
+/// closed and *before* the rename that publishes it.
+///
+/// **What it buys is hard rule 2 on a console that loses power.**
+/// `CopyAtomically` is how a save's previous bytes reach `.backup/` before the
+/// save is overwritten. Without this the rename can be durable while the bytes
+/// it published are not, leaving a backup that reads as present and holds
+/// nothing -- which is exactly the state the backup exists to rule out
+/// (docs/SYNC_PROTOCOL.md#backups).
+///
+/// It takes the **path** rather than an open handle because the two platforms
+/// do not agree on what durability is a property of: the host syncs one file
+/// descriptor, and Horizon commits the whole `sdmc:` filesystem
+/// (`fsdevCommitDevice`; devkitA64's newlib exports no `fsync` at all). A hook
+/// that ignores the path and commits everything is a correct implementation of
+/// this contract.
+///
+/// **The path handed over is sometimes a directory.** `rename` publishes a
+/// *name*, and on POSIX a name is not durable until the directory holding it is
+/// synced, so `CommitStaged` calls the hook once more on the destination's
+/// directory after the rename. A host hook must therefore be able to open a
+/// directory; `fsync` on one is exactly the POSIX idiom for this. That second
+/// call is best effort -- the rename has already happened, so failing it would
+/// describe a commit that did not occur.
+///
+/// Returning false fails the write. That is the right direction for the caller
+/// this exists for: bytes that could not be put on the card are not a backup,
+/// and a backup that did not happen must stop the overwrite rather than be
+/// counted as one.
+///
+/// Null -- the default -- keeps the older, weaker promise: no reader ever sees
+/// half a file. Nothing here fails for want of a hook.
+using FileSync = bool (*)(const std::string& path);
+
+/// Install the hook, process-wide.
+///
+/// Meant to be called once from `main` before the engine's threads exist:
+/// `rommsync::host::InstallPosixFileSync()` on a laptop, the Horizon equivalent
+/// in `sysmodule/source/main.cpp`. Stored in an atomic so a late call cannot be
+/// a data race, not so that swapping it mid-write is a supported thing to do.
+///
+/// **Why a process-wide hook and not an injected interface**, which is how every
+/// other platform facility here is reached (`http::HttpClient`,
+/// `fs::FileSystem`). Those are objects a caller already holds; this one belongs
+/// to two *free functions* that a dozen call sites reach for without holding
+/// anything, so injecting it would mean a durability parameter on
+/// `WriteAtomically`, `CopyAtomically`, and every signature that reaches them --
+/// `token_store`, `device_identity`, `config`, `state_db`, `sync_execute` -- to
+/// carry one decision that is the same for the whole process. The cost of the
+/// hook is that the guarantee depends on `main` having installed one, so the
+/// tests install it too: every suite that backs a save up runs the same code the
+/// sysmodule does.
+void SetFileSync(FileSync sync);
+
+/// The installed hook, or null. For a test that wants to put its own back.
+FileSync GetFileSync();
+
 /// Why a write did not complete.
 ///
 /// `kOpenFailed` and `kWriteFailed` leave the destination exactly as it was --
@@ -110,9 +172,11 @@ std::string PreviousPathFor(std::string_view path);
 /// platform layer's job, not something the portable engine can do with only
 /// standard headers. A missing one is `kOpenFailed`, named.
 ///
-/// What `rename` gives is atomicity, not durability: surviving a power cut
-/// needs an `fsync` the C++ standard library does not expose. The promise here
-/// is that no reader ever sees a partial record.
+/// What `rename` gives is atomicity; durability is `FileSync`'s, and only when
+/// the platform layer has installed one. With no hook the promise here is the
+/// weaker one -- no reader ever sees a partial record -- and with one the bytes
+/// are on the card before the rename publishes them. A hook that refuses is
+/// `kWriteFailed`, and the destination is untouched.
 WriteResult WriteAtomically(const std::string& path, std::string_view contents);
 
 /// Move a file that is already staged on disk onto `path`, atomically.
@@ -123,6 +187,10 @@ WriteResult WriteAtomically(const std::string& path, std::string_view contents);
 /// one and the reasoning behind it is the same one -- Horizon's rename refuses
 /// an existing destination, so a file already at `path` is moved to
 /// `PreviousPathFor(path)` first and put back if the second rename fails.
+///
+/// On success the destination's *directory* is handed to `FileSync` as well, so
+/// the published name is as durable as the bytes behind it. Best effort: the
+/// rename has happened either way.
 ///
 /// `staged` is consumed: it is renamed away on success and removed on failure,
 /// so a caller never has to decide what to do with a half-committed pair. That
@@ -179,13 +247,14 @@ struct CopyResult {
 /// It is a copy and not a move: the point of the caller is that both files
 /// exist afterwards.
 ///
-/// **Atomicity, not durability**, the same limit `WriteAtomically` states and
-/// worth restating because of what this one copies. The `fsync` that would make
-/// the backup's *data* durable before the save is overwritten is not exposed by
-/// the C++ standard library, so a card yanked between the copy and the
-/// overwrite can leave the rename durable and the copied bytes not. No reader
-/// ever sees half a backup; surviving a power cut at that instant needs a
-/// platform hook, and is issue #16's (docs/SYNC_PROTOCOL.md#backups).
+/// **Durability is `FileSync`'s**, and worth restating here because of what this
+/// one copies. Without a hook installed, a card yanked between the copy and the
+/// overwrite can leave the rename durable and the copied bytes not -- a backup
+/// that reads as present and holds nothing, which is the one state hard rule 2
+/// is supposed to rule out. With one, the bytes are on the card before the
+/// rename, and a refusal to put them there is `kWriteFailed` rather than a
+/// backup that did not happen being counted as one
+/// (docs/SYNC_PROTOCOL.md#backups).
 CopyResult CopyAtomically(const std::string& from, const std::string& to);
 
 /// Read a whole file.

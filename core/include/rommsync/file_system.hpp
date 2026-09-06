@@ -88,6 +88,36 @@ struct Listing {
   bool ok() const { return error == ListError::kNone; }
 };
 
+/// Why a directory could not be created.
+enum class MakeDirError {
+  kNone,
+
+  /// `sd_path` is not a path on this card, so nothing was tried.
+  ///
+  /// Deliberately **not** spelled `kMissing`, which is what its neighbour
+  /// `ListError` calls "there is no such path". Here there is no such *card*
+  /// path to have, which is a refusal rather than something a caller answers by
+  /// creating one -- the same line `fs::FileSystem::Resolve` draws when it
+  /// returns empty.
+  kNotOnThisCard,
+
+  kNotADirectory,  ///< something is already there and it is a file
+  kUnwritable,     ///< the card refused it -- full, read-only, or a bad moment
+};
+
+/// Stable, log-friendly name. Never null.
+const char* ToString(MakeDirError error);
+
+/// What `CreateDirectory` did, or why it did not.
+struct MakeDirResult {
+  MakeDirError error = MakeDirError::kNone;
+
+  /// For logs. Names the path and what went wrong.
+  std::string message;
+
+  bool ok() const { return error == MakeDirError::kNone; }
+};
+
 /// The one directory-reading surface the engine is allowed to use.
 ///
 /// Non-recursive on purpose. The scanner walks the folders a human listed in
@@ -106,6 +136,21 @@ class FileSystem {
   /// a scan whose output depends on the card's directory layout is a scan whose
   /// output changes when a file is deleted somewhere else.
   virtual Listing List(std::string_view sd_path) = 0;
+
+  /// Create `sd_path`, and every parent of it that is missing.
+  ///
+  /// It exists because of one directory: `sdmc:/config/rommsync/.backup/`. No
+  /// backup means no overwrite (docs/SYNC_PROTOCOL.md), so on a card that has
+  /// never run this client every download would fail with
+  /// `sync::OperationError::kBackupFailed` until something made that folder --
+  /// and `io::WriteAtomically` cannot, because creating a directory needs a
+  /// platform facility and `core/` has only standard headers (core/AGENTS.md).
+  /// This is that facility, behind the interface that already owns the card.
+  ///
+  /// **A directory that is already there is success**, not `kNotADirectory`.
+  /// Every caller wants the directory to exist afterwards rather than to have
+  /// been the one that made it, and a tick runs this on entry every time.
+  virtual MakeDirResult CreateDirectory(std::string_view sd_path) = 0;
 
   /// The platform path `sd_path` names -- `sdmc:/retroarch/saves/Game.srm` on
   /// Horizon, a path under the card's root on the host.
