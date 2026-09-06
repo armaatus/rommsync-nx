@@ -784,6 +784,73 @@ endif()
 # which holds one armed scenario for all clients.
 set_tests_properties(rom.library PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 
+# --- the conflict history, the restore, and the screen over them -------------
+# M7-1 (#36). Six scenarios need no server and must stay checked with docker
+# stopped: what they pin is the file format a yanked card leaves behind, the two
+# recorders, a restore that owes hard rule 2 the same backup a download does, and
+# the screen's decisions. A healthy RomM cannot produce a truncated `conflicts.db`
+# and cannot be asked to kill a process mid-write.
+#
+# `conflicts.recorded` is the one that needs the rig, because the acceptance
+# criterion is a *real* conflict producing an entry with both hashes and a backup
+# path that exists -- a hand-built plan proves the recorder, not the contract.
+#
+# `sysmodule/source/engine.cpp` is compiled in for `lists.*`'s reason: the engine
+# names no libnx type, and driving the two commands through the object that ships
+# is worth more than driving the store the object holds.
+#
+# The view model's two paths and the overlay source directory are compiled in
+# because four criteria are about the code rather than about its behaviour: the
+# screen may not write `config.ini`, it may not restore a backup itself, the view
+# model may not name a libnx or libultrahand type, and nothing in the recording
+# path may read `conflict_show`.
+add_executable(test_conflicts test_conflicts.cpp
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/engine.cpp")
+target_link_libraries(test_conflicts PRIVATE rommsync::host)
+target_include_directories(test_conflicts PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}"
+  "${CMAKE_SOURCE_DIR}/sysmodule/source")
+target_compile_definitions(test_conflicts PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env"
+  ROMMSYNC_OVERLAY_SOURCE_DIR="${CMAKE_SOURCE_DIR}/overlay/source"
+  ROMMSYNC_CONFLICT_LOG_HDR="${CMAKE_SOURCE_DIR}/core/include/rommsync/conflict_log.hpp"
+  ROMMSYNC_CONFLICT_LOG_SRC="${CMAKE_SOURCE_DIR}/core/src/conflict_log.cpp"
+  ROMMSYNC_CONFLICT_RECORD_HDR="${CMAKE_SOURCE_DIR}/core/include/rommsync/conflict_record.hpp"
+  ROMMSYNC_CONFLICT_RECORD_SRC="${CMAKE_SOURCE_DIR}/core/src/conflict_record.cpp"
+  ROMMSYNC_CONFLICTS_VIEW_HDR="${CMAKE_SOURCE_DIR}/core/include/rommsync/overlay_conflicts_view.hpp"
+  ROMMSYNC_CONFLICTS_VIEW_SRC="${CMAKE_SOURCE_DIR}/core/src/overlay_conflicts_view.cpp")
+if(UNIX)
+  # "kill the process mid-restore" is an acceptance criterion, and forcing it
+  # needs fork() and RLIMIT_FSIZE -- `core.token_store`'s reason, and its
+  # mechanism. The host rig is POSIX (docs/TESTING.md); on anything else the
+  # scenario fails loudly rather than quietly not running.
+  target_compile_definitions(test_conflicts PRIVATE ROMMSYNC_CAN_FORK=1)
+endif()
+
+set(CONFLICT_UNIT_SCENARIOS
+  store        # the file: round-trip, bounded, survives a reboot, one bad row costs one row
+  record       # a tick's reports become entries -- both conflict reasons, and the state kinds
+  restore      # the old bytes exactly, and a new backup written FIRST (the sandbox audit checks it)
+  interrupted  # a restore killed mid-write leaves old or new, never a splice, and no .tmp
+  service      # both commands through ipc::Dispatch over a real SdEngine
+  overlay      # the screen's decisions, and the greps overlay/AGENTS.md owes
+)
+foreach(scenario IN LISTS CONFLICT_UNIT_SCENARIOS)
+  add_test(NAME conflicts.${scenario} COMMAND test_conflicts ${scenario})
+  set_tests_properties(conflicts.${scenario} PROPERTIES TIMEOUT 120)
+endforeach()
+
+add_test(NAME conflicts.recorded COMMAND test_conflicts recorded)
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(conflicts.recorded PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+# RUN_SERIAL for the reason every rig test needs it: the fault proxy holds one
+# armed scenario for all clients, and this uploads and deletes saves on the
+# shared fixture device.
+set_tests_properties(conflicts.recorded PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+
 # --- the host harness, and the edge cases only the fault proxy can force -----
 # M0-5. One CTest entry per scenario, same shape as the rest of this file, so a
 # red run names the behaviour rather than "the harness tests".

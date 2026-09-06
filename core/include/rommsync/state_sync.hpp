@@ -226,8 +226,18 @@ struct StateOperationResult {
   /// The server row afterwards.
   std::optional<std::int64_t> state_id;
 
-  /// That row in full, for an upload: the timestamp and size the *next* tick
-  /// compares against. Default-constructed unless `outcome` is `kUploaded`.
+  /// That row in full: the timestamp and size the *next* tick compares
+  /// against, and the only description of the server's copy there is -- RomM
+  /// computes no digest for a state.
+  ///
+  /// Set for an upload (the row the upload created), for a download (the row
+  /// that was fetched) and for a keep-both that had a row to keep both *of*.
+  /// Default-constructed otherwise, which `id == 0` says: a keep-both decided
+  /// because the server has nothing, and every failure.
+  ///
+  /// The download and keep-both halves are M7-1's (#36): the conflict screen
+  /// shows both sides of what it overwrote, and a state's server side is this
+  /// row or nothing at all.
   ServerState server;
 };
 

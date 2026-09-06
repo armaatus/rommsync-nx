@@ -13,8 +13,9 @@ Ultrahand overlay list.
   shared with the sysmodule so one copy of the field names serves both halves —
   the screens' view models — `rommsync/overlay_status_view.hpp`,
   `rommsync/overlay_pairing_view.hpp`, `rommsync/overlay_sync_actions.hpp`,
-  `rommsync/overlay_library_model.hpp` and `rommsync/overlay_settings_view.hpp`
-  — and, since M6-2 (#33), `config::LoadConfig` in exactly one file,
+  `rommsync/overlay_library_model.hpp`, `rommsync/overlay_settings_view.hpp` and
+  `rommsync/overlay_conflicts_view.hpp` — and, since M6-2 (#33),
+  `config::LoadConfig` in exactly one file,
   `source/card_probe.cpp`, which reads `config.ini` off the card when the
   sysmodule is not there to be asked. `--gc-sections` drops the engine no screen
   references. The rule above is about ownership, not about the link map.
@@ -48,8 +49,10 @@ Ultrahand overlay list.
   command whose refusal carries meaning, which is why it did not exist until now.
 - **The settings screen is the root menu, and it is the only one.** The overlay
   opens on the status screen; **Y** there pushes `SettingsScreen`, and that
-  screen's first section pushes the sync, library and pairing screens with
-  `tsl::changeTo`. Until M4-4 (#26) nothing pushed any gui at all, so three
+  screen's first section pushes the sync, library, conflicts and pairing screens
+  with `tsl::changeTo`. **Conflicts is the one row that is conditional**:
+  `[sync] conflict_show` decides whether it is drawn, which is the whole of what
+  that setting does (docs/CONFIG.md). Until M4-4 (#26) nothing pushed any gui at all, so three
   landed screens compiled and `--gc-sections` dropped them from the image. A new
   screen is reached by adding an `overlay::Destination` and a row to that
   section -- not by a second entry point, which is how one overlay grows two
@@ -67,6 +70,12 @@ Ultrahand overlay list.
   view model produces carries text.
 - Keep IPC payloads small and page large lists (platforms, roms, queue) rather
   than sending them whole. See `docs/DEVELOPMENT.md#ipc`.
+- **The overlay writes no save either, and restores no backup.** M7-1 (#36)
+  added the one screen with a button that replaces a file on the card, and the
+  button sends `RestoreBackup` -- a restore is a save overwrite that owes a
+  backup first (hard rule 2), so it lives on the service and never here.
+  `ctest -R conflicts.overlay` greps this directory for `conflicts::Restore` and
+  `BackUpFirst` rather than leaving it reviewed.
 - The sysmodule owns writes to `config.ini`; the overlay asks it to change
   settings and never writes the file itself. `ctest -R overlay.sync_actions`
   greps this directory for the write path rather than leaving it reviewed, and

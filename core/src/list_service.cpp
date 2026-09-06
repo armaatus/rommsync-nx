@@ -1,5 +1,7 @@
 #include "rommsync/list_service.hpp"
 
+#include "rommsync/text.hpp"
+
 #include <algorithm>
 #include <cstdio>
 #include <string>
@@ -115,17 +117,11 @@ std::int64_t FileSizeBytes(const std::string& path) {
 }  // namespace
 
 std::string Shorten(std::string_view text) {
-  if (text.size() <= kMaxRowTextBytes) {
-    return std::string(text);
-  }
-  // Back off to a UTF-8 boundary: cutting mid-sequence leaves a byte no decoder
-  // on the console can draw, and the overlay is handed this to render rather
-  // than to interpret.
-  std::size_t cut = kMaxRowTextBytes;
-  while (cut > 0 && (static_cast<unsigned char>(text[cut]) & 0xC0) == 0x80) {
-    --cut;
-  }
-  return std::string(text.substr(0, cut)) + "...";
+  // The UTF-8 boundary is `text::Shorten`'s, shared rather than spelled a
+  // fourth time (`rommsync/text.hpp`): cutting mid-sequence leaves a byte no
+  // decoder on the console can draw, and the overlay is handed this to render
+  // rather than to interpret. What stays here is the bound.
+  return text::Shorten(text, kMaxRowTextBytes);
 }
 
 json::Error ParseRomPage(std::string_view body, RomPage* out) {

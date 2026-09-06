@@ -163,4 +163,16 @@ Result IpcClient::ListEnd(ipc::Cursor cursor) {
   return Call(ipc::Command::kListEnd, ipc::EncodeCursor(cursor));
 }
 
+Result IpcClient::ListConflicts(const ipc::ConflictQuery& query, ipc::ConflictPage* page) {
+  return CallAndDecode(ipc::Command::kListConflicts, ipc::EncodeConflictQuery(query),
+                       ipc::DecodeConflictPage, page);
+}
+
+Result IpcClient::RestoreBackup(std::int64_t entry_id, conflicts::RestoreReport* report) {
+  // Decoded rather than fire-and-forget: `RestoreBackup` never fails at the
+  // transport, so the whole of what happened is in the answer (ipc.hpp).
+  return CallAndDecode(ipc::Command::kRestoreBackup, ipc::EncodeEntryId(entry_id),
+                       ipc::DecodeRestoreReport, report);
+}
+
 }  // namespace rommsync::overlay

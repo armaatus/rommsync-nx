@@ -120,6 +120,11 @@ class IpcClient {
   Result ListNext(ipc::Cursor cursor, ipc::ListPage* page);
   Result ListEnd(ipc::Cursor cursor);
 
+  /// M7-1 (#36). Neither touches the network: the history is what an earlier
+  /// tick wrote, and a restore is one copy between two files on the card.
+  Result ListConflicts(const ipc::ConflictQuery& query, ipc::ConflictPage* page);
+  Result RestoreBackup(std::int64_t entry_id, conflicts::RestoreReport* report);
+
  private:
   /// One command: a request payload in, `response_` out.
   ///

@@ -9,6 +9,7 @@
 
 #include "rommsync/config.hpp"
 #include "rommsync/json.hpp"
+#include "rommsync/text.hpp"
 #include "rommsync/pairing.hpp"
 #include "rommsync/sync.hpp"
 
@@ -229,6 +230,12 @@ constexpr ListKind kAllListKinds[] = {
     ListKind::kQueue,
 };
 
+constexpr conflicts::RestoreOutcome kAllRestoreOutcomes[] = {
+    conflicts::RestoreOutcome::kRestored,      conflicts::RestoreOutcome::kNoSuchEntry,
+    conflicts::RestoreOutcome::kNothingToRestore, conflicts::RestoreOutcome::kBackupMissing,
+    conflicts::RestoreOutcome::kBackupFailed,  conflicts::RestoreOutcome::kWriteFailed,
+};
+
 constexpr config::Severity kAllSeverities[] = {
     config::Severity::kNotice,
     config::Severity::kWarning,
@@ -428,17 +435,7 @@ bool ReadPlatformMap(const json::Value& object, config::Config* config, json::Er
 ///
 /// The ellipsis is three ASCII dots rather than U+2026 for the same reason: it
 /// is one byte per character whatever the encoding around it.
-void Shorten(std::string* text) {
-  if (text->size() <= kMaxDiagnosticTextBytes) {
-    return;
-  }
-  std::size_t cut = kMaxDiagnosticTextBytes;
-  while (cut > 0 && (static_cast<unsigned char>((*text)[cut]) & 0xC0) == 0x80) {
-    --cut;
-  }
-  text->resize(cut);
-  *text += "...";
-}
+void Shorten(std::string* text) { text::ShortenInPlace(text, kMaxDiagnosticTextBytes); }
 
 }  // namespace
 
@@ -503,6 +500,10 @@ const char* ToString(Command command) {
       return "ListNext";
     case Command::kListEnd:
       return "ListEnd";
+    case Command::kListConflicts:
+      return "ListConflicts";
+    case Command::kRestoreBackup:
+      return "RestoreBackup";
   }
   return "Unknown";
 }
@@ -1156,6 +1157,162 @@ bool AppendIfItFits(ListPage* page, ListItem item) {
     return true;
   }
   page->items.pop_back();
+  return false;
+}
+
+// --- the conflict history -----------------------------------------------------
+
+std::string EncodeConflictQuery(const ConflictQuery& query) {
+  std::string out("{");
+  AppendInteger(&out, "offset", query.offset, /*first=*/true);
+  AppendInteger(&out, "limit", query.limit);
+  out += '}';
+  return out;
+}
+
+Decoded<ConflictQuery> DecodeConflictQuery(std::string_view text) {
+  return DecodeObject<ConflictQuery>(
+      text, "conflict query", [](const json::Value& object, ConflictQuery* out, json::Error* error) {
+        std::int64_t offset = 0;
+        std::int64_t limit = 0;
+        // Both clamped by `ServiceCore::ListConflicts`, not here --
+        // `DecodeListRequest`'s rule and its reason: what the client *wanted* is
+        // a legitimate thing to say, and refusing an offset past the end here
+        // would make `ListConflicts` fail, which `ipc::Engine` documents it never
+        // does. `kMaxRequestedPageSize` is the same wide bound that one uses; the
+        // only value with no meaning at all is a limit of zero.
+        if (!ReadInteger(object, "offset", &offset, 0, kMaxRequestedPageSize, error) ||
+            !ReadInteger(object, "limit", &limit, 1, kMaxRequestedPageSize, error)) {
+          return;
+        }
+        out->offset = static_cast<std::int32_t>(offset);
+        out->limit = static_cast<std::int32_t>(limit);
+      });
+}
+
+std::string EncodeConflictPage(const ConflictPage& page) {
+  std::string out("{");
+  AppendKey(&out, "entries", /*first=*/true);
+  out += '[';
+  bool first = true;
+  for (const ConflictRow& row : page.entries) {
+    if (!first) {
+      out += ',';
+    }
+    first = false;
+    // The store's own spelling for the entry, never a second one (see
+    // `conflicts::SerializeEntry`), with the one fact that is not in the file
+    // beside it rather than mixed into it.
+    out += "{\"entry\":";
+    out += conflicts::SerializeEntry(row.entry);
+    AppendBool(&out, "backup_present", row.backup_present);
+    out += '}';
+  }
+  out += ']';
+  AppendInteger(&out, "offset", page.offset);
+  AppendBool(&out, "has_more", page.has_more);
+  AppendInteger(&out, "total", page.total);
+  out += '}';
+  return out;
+}
+
+Decoded<ConflictPage> DecodeConflictPage(std::string_view text) {
+  return DecodeObject<ConflictPage>(
+      text, "conflict page", [](const json::Value& object, ConflictPage* out, json::Error* error) {
+        const json::Value* entries =
+            ReadArray(object, "entries", static_cast<std::size_t>(kMaxConflictPage), error);
+        if (entries == nullptr) {
+          return;
+        }
+        for (const json::Value& element : entries->elements()) {
+          if (!element.is_object()) {
+            Fail(error, "entries", "holds something that is not an entry");
+            return;
+          }
+          const json::Value* body = ReadObject(element, "entry", error);
+          if (body == nullptr) {
+            return;
+          }
+          ConflictRow row;
+          if (!ReadBool(element, "backup_present", &row.backup_present, error)) {
+            return;
+          }
+          std::string why;
+          if (!conflicts::ParseEntry(*body, &row.entry, &why)) {
+            // A whole-page refusal rather than a page missing a row, which is
+            // `json::Reader`'s rule one level up: a screen that silently dropped
+            // the entry it could not read would offer a restore list with a hole
+            // in it and no way to know.
+            Fail(error, "entries", "holds an entry this build cannot read: " + why);
+            return;
+          }
+          out->entries.push_back(std::move(row));
+        }
+        std::int64_t offset = 0;
+        std::int64_t total = 0;
+        if (!ReadInteger(object, "offset", &offset, 0,
+                         static_cast<std::int64_t>(conflicts::kMaxEntries), error) ||
+            !ReadBool(object, "has_more", &out->has_more, error) ||
+            !ReadInteger(object, "total", &total, 0,
+                         static_cast<std::int64_t>(conflicts::kMaxEntries), error)) {
+          return;
+        }
+        out->offset = static_cast<std::int32_t>(offset);
+        out->total = static_cast<std::int32_t>(total);
+      });
+}
+
+std::string EncodeEntryId(std::int64_t entry_id) {
+  std::string out("{");
+  AppendInteger(&out, "entry_id", entry_id, /*first=*/true);
+  out += '}';
+  return out;
+}
+
+Decoded<std::int64_t> DecodeEntryId(std::string_view text) {
+  return DecodeObject<std::int64_t>(
+      text, "entry id", [](const json::Value& object, std::int64_t* out, json::Error* error) {
+        // Positive: `0` is never an entry id (conflict_log.hpp), so a
+        // default-constructed request cannot address one.
+        ReadInteger(object, "entry_id", out, 1, kMaxId, error);
+      });
+}
+
+std::string EncodeRestoreReport(const conflicts::RestoreReport& report) {
+  std::string out("{");
+  AppendText(&out, "outcome", conflicts::ToString(report.outcome), /*first=*/true);
+  AppendText(&out, "message", report.message);
+  AppendText(&out, "backup_sd_path", report.backup_sd_path);
+  out += '}';
+  return out;
+}
+
+Decoded<conflicts::RestoreReport> DecodeRestoreReport(std::string_view text) {
+  return DecodeObject<conflicts::RestoreReport>(
+      text, "restore report",
+      [](const json::Value& object, conflicts::RestoreReport* out, json::Error* error) {
+        if (!ReadEnum(object, "outcome", kAllRestoreOutcomes, conflicts::ToString,
+                      "a restore outcome", &out->outcome, error)) {
+          return;
+        }
+        // Both may be empty: a restore that replaced nothing wrote no backup,
+        // and a message is a sentence rather than a field a caller derives from.
+        if (!ReadText(object, "message", &out->message, error) ||
+            !ReadText(object, "backup_sd_path", &out->backup_sd_path, error)) {
+          return;
+        }
+      });
+}
+
+bool AppendIfItFits(ConflictPage* page, ConflictRow row) {
+  if (page->entries.size() >= static_cast<std::size_t>(kMaxConflictPage)) {
+    return false;
+  }
+  page->entries.push_back(std::move(row));
+  if (Fits(EncodeConflictPage(*page))) {
+    return true;
+  }
+  page->entries.pop_back();
   return false;
 }
 

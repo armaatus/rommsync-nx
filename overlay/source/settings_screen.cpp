@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <string>
 
+#include "conflicts_screen.hpp"
 #include "ipc_client.hpp"
 #include "library_screen.hpp"
 #include "pairing_screen.hpp"
@@ -103,6 +104,13 @@ bool SettingsScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidAn
         return true;
       case Destination::kLibrary:
         tsl::changeTo<LibraryScreen>(client_);
+        return true;
+      case Destination::kConflicts:
+        // The row is only drawn when `[sync] conflict_show` is on
+        // (`overlay_settings_view.hpp`), so there is nothing to check here: a
+        // second gate in the renderer would be a second place for the setting
+        // to be read.
+        tsl::changeTo<ConflictsScreen>(client_);
         return true;
       case Destination::kPairing:
         // The way to the pairing screen that discards nothing: it polls

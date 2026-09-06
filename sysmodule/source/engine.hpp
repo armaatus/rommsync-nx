@@ -55,6 +55,7 @@
 #include "rommsync/auth.hpp"
 #include "rommsync/auth_gate.hpp"
 #include "rommsync/config.hpp"
+#include "rommsync/conflict_log.hpp"
 #include "rommsync/device_identity.hpp"
 #include "rommsync/download.hpp"
 #include "rommsync/file_system.hpp"
@@ -69,6 +70,15 @@ namespace rommsync::sysmodule {
 /// `core/`, which owns the file *names* and may not know an SD path (hard
 /// rule 4, and the `sdmc:` prefix is libnx's).
 inline constexpr const char* kConfigDir = "sdmc:/config/rommsync/";
+
+/// What an SD-root path from `core/` is prefixed with to open it here.
+///
+/// The mapping `fs::FileSystem::Resolve` performs, spelled once for the callers
+/// that have no `fs::FileSystem` to ask -- which on the console today is all of
+/// them, because nothing implements one for Horizon yet. `kConfigDir` is this
+/// plus the directory `core/` names, and is kept as its own constant because it
+/// is what `Load` is *given* rather than something it derives.
+inline constexpr const char* kSdRoot = "sdmc:";
 
 /// What a pairing attempt needs that neither `core/` nor this file can supply.
 ///
@@ -108,6 +118,16 @@ struct PairingBackend {
 /// `auth_`, `gate_` -- and is never held across I/O, so the commands the
 /// overlay polls every frame never wait on an SD card. Order is `card_mutex_`
 /// then `mutex_`, never the reverse.
+///
+/// **`history_` and a restore are under neither, and that is deliberate.** M7-1
+/// (#36) added two commands that touch the card from the IPC thread, and they
+/// share no file with the pairing thread: that one writes `token.dat` and
+/// `auth.json` under `card_mutex_`, a restore writes a save and a copy under
+/// `.backup/`. Taking `card_mutex_` for a restore would make a pairing grant
+/// wait behind a save-state copy of tens of megabytes, which is the thing the
+/// two-lock split exists to prevent. What would change that is a second writer
+/// of `.backup/` -- the scheduler running a tick (M7-2, #37) -- and that is the
+/// moment `history_` needs a lock of its own, not this one.
 ///
 /// `config_` and `queue_` are deliberately *not* under it, and that is still a
 /// fact about today rather than a decision to keep: `ServiceServer::Run` is a
@@ -272,6 +292,26 @@ class SdEngine : public ipc::Engine {
   ipc::Error ListBegin(const ipc::ListRequest& request, ipc::Cursor* cursor) override;
   ipc::Error ListNext(ipc::Cursor cursor, ipc::ListPage* page) override;
   ipc::Error ListEnd(ipc::Cursor cursor) override;
+
+  /// M7-1 (#36). Both are served from `conflicts.db` beside `state.db` and
+  /// neither touches the network -- the history is what a *previous* tick wrote,
+  /// and a restore is one copy between two files on the card.
+  ipc::Error ListConflicts(const ipc::ConflictQuery& query, ipc::ConflictPage* page) override;
+  ipc::Error RestoreBackup(std::int64_t entry_id, conflicts::RestoreReport* report) override;
+
+  /// The conflict history, for the tick that writes it.
+  ///
+  /// **Nothing in this build drives a tick**, so nothing appends to it here yet
+  /// -- the scheduler is M7-2 (#37), and it is written there that
+  /// `conflicts::RecordSaves` and `conflicts::RecordStates` are what it owes
+  /// this file after each half of a tick. What this build does is load it at
+  /// boot and serve it, which is what makes an entry written by an earlier
+  /// release readable by this one.
+  conflicts::History& history() { return history_; }
+
+  /// Whether the backup `entry` names is still on the card, for
+  /// `ipc::ConflictRow::backup_present`.
+  bool BackupPresent(const conflicts::Entry& entry) const;
 
  private:
   /// Apply `change` to the queue and write the file, or leave both exactly as
@@ -442,6 +482,25 @@ class SdEngine : public ipc::Engine {
   /// The three lists the overlay browses (M5-4, #31). Declared after `config_`
   /// and `queue_` because it holds a reference to each.
   lists::Service lists_;
+
+  /// What has been overwritten on this card, newest first (M7-1, #36). Reloaded
+  /// by `Load`, which is also what points it at the right directory.
+  conflicts::History history_{std::string(conflicts::kHistorySdPath)};
+
+  /// The card, for a restore. The same pointer `UseCard` hands `lists_`, kept
+  /// here too because a restore opens two files through it.
+  ///
+  /// **Null on the console today**: nothing implements `fs::FileSystem` for
+  /// Horizon yet (`UseCard`). A restore then refuses with
+  /// `RestoreOutcome::kBackupFailed`, whose promise -- nothing was written -- is
+  /// exactly what a build that cannot open the card manages to keep. Listing is
+  /// not affected: `BackupPresent` falls back to `kSdRoot`, because *reading*
+  /// whether a file is there needs one `io::Exists` and no interface at all.
+  ///
+  /// Installing a Horizon `fs::FileSystem` is what makes the restore work on a
+  /// console, and it is not this issue's: it is the same seam the download
+  /// worker and the scheduler need (M7-2, #37).
+  fs::FileSystem* card_ = nullptr;
 
   /// The verdict `auth.json` holds, and what a worker consults before calling.
   ///
