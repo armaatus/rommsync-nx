@@ -274,6 +274,7 @@ is in the archive:
 | `config/rommsync/device.dat` | survives — the console keeps its identity |
 | `config/rommsync/state.db` | survives — the sync baseline is kept |
 | `config/rommsync/queue.json` | survives — a queued download is still queued |
+| `config/rommsync/rommsync.log` | survives — so does `rommsync.log.old`, and the new build appends to it |
 | `atmosphere/contents/4200000000524D53/flags/boot2.flag` | survives — the sysmodule stays enabled |
 
 The only file the upgrade overwrites that you might have edited is
@@ -341,13 +342,14 @@ belongs to a user you can revoke, and revoking it is what ends it —
 
 ## When it does not work
 
-There is a dedicated troubleshooting guide, arriving in M7-3 —
-[#38](https://github.com/armaatus/rommsync-nx/issues/38). It is where the
-symptom-by-symptom answers live, and this page will link it here rather than
-growing a second copy.
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md) is the symptom-by-symptom page: every
+failure this client knows how to have, the line it writes in
+`config/rommsync/rommsync.log` when it has one, and the fix. Start there, with
+the log file beside you.
 
-Until it lands, the three things worth checking first are all in this page:
-the overlay saying **"sys-rommsync is not running"** is the boot toggle
+Three things are answered on *this* page rather than that one, because they are
+about the install rather than about a sync: the overlay saying
+**"sys-rommsync is not running"** is the boot toggle
 ([step 2](#2-enable-the-sysmodule)), **"No server set"** is `[server] url`
 ([step 3](#3-point-it-at-your-server)), and saves that never appear are almost
 always the folder map ([step 5](#5-the-first-sync)).

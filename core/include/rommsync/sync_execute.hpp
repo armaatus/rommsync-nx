@@ -358,8 +358,12 @@ struct ExecutionReport {
   /// completed one is worth saying out loud -- a download that could not be
   /// verified because the server holds no usable digest for it.
   ///
-  /// `core/` has no logger (docs/ARCHITECTURE.md), so these are handed up the
-  /// same way `SyncPlan::warnings` are.
+  /// Handed up rather than written down here, the same way `SyncPlan::warnings`
+  /// are. There is a logger since M7-3 (`rommsync/log.hpp`) and this module
+  /// still does not use it: what a line is worth saying about depends on the
+  /// tick around it -- `SdEngine::RunOneTick` writes these under
+  /// `log::Event::kSaveFailed`, and a unit test of one execution wants them as
+  /// data.
   std::vector<std::string> warnings;
 };
 

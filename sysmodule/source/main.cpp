@@ -28,7 +28,6 @@
 #include <switch.h>
 
 #include <cstdio>
-#include <cstring>
 #include <memory>
 #include <string>
 
@@ -42,7 +41,9 @@
 #include "rommsync/device_identity.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/list_service.hpp"
+#include "rommsync/log.hpp"
 #include "rommsync/state_db.hpp"
+#include "rommsync/version.hpp"
 
 namespace {
 
@@ -57,8 +58,9 @@ namespace {
 //   | one in-flight transfer buffer            | 0x4000  |  16 KiB |
 //   | the largest buffered list response        | 0x32000 | 200 KiB |
 //   | two worker thread stacks (M1-6, M7-2)    | 0x10000 |  64 KiB |
+//   | the log's in-memory tail (M7-3)          | 0x1800  |   6 KiB |
 //   | newlib arena overhead and fragmentation  | 0x8000  |  32 KiB |
-//   | **peak**                                 | 0xA7000 | 668 KiB |
+//   | **peak**                                 | 0xA8800 | 674 KiB |
 //
 // The old 0x80000 does not cover that, and the two terms it is short by are the
 // two that are easiest to miss:
@@ -76,11 +78,17 @@ namespace {
 //   * **Two threads, not one.** M1-6 (#123) starts a pairing thread and M7-2
 //     (#37) starts the worker that drives `PumpLists` and the sync tick; each
 //     costs its stack out of this heap.
+//   * **The log keeps its last lines in RAM**, so `GetLog` can answer without
+//     going near the card (log.hpp). It is `kTailLines * kMaxLineBytes` at
+//     worst, and it is a term here rather than a cost nobody added up. That is
+//     the **content**: the per-`std::string` header and the deque's blocks are
+//     allocator overhead and belong to the newlib term below, which is what that
+//     term is for.
 //
-// 0xC0000 leaves 0x19000 -- 100 KiB -- over that peak, which is the margin a
+// 0xC0000 leaves 0x17800 -- 94 KiB -- over that peak, which is the margin a
 // process nobody can attach a debugger to needs: a `bad_alloc` here is
 // `std::terminate`, since the sysmodule builds `-fno-exceptions` (`switch.mk`).
-// The `static_assert` below is tighter still and leaves 0x15000 -- 84 KiB --
+// The `static_assert` below is tighter still and leaves 0x13800 -- 78 KiB --
 // because it writes the baseline term as twice `kMaxStateBytes`; that, not this
 // sentence, is the margin the build actually enforces.
 //
@@ -94,7 +102,9 @@ namespace {
 //   * the transfer buffer is `kTransferBufferSize` in `http/http_wire.hpp` --
 //     one per in-flight request, because roms stream to file and never sit in
 //     RAM whole;
-//   * the list response is `lists::kMaxPlatforms` times the row estimate below.
+//   * the list response is `lists::kMaxPlatforms` times the row estimate below;
+//   * the tail is `log::kTailLines` times `log::kMaxLineBytes`, and
+//     `ipc::kMaxLogLines` is the first of those rather than a second number.
 constexpr size_t kInnerHeapSize = 0xC0000;
 
 // What one platform's JSON weighs on the wire. Measured against the fixture
@@ -119,6 +129,7 @@ static_assert(rommsync::sysmodule::ExpectedBsdTransferMemory({}) +
                       2 * rommsync::state::kMaxStateBytes +
                       rommsync::sysmodule::kTransferBufferSize +
                       rommsync::lists::kMaxPlatforms * kPlatformJsonBytes +
+                      rommsync::log::kTailLines * rommsync::log::kMaxLineBytes +
                       2 * 0x8000 /* worker thread stacks */ +
                       0x8000 /* newlib arena overhead */ <
                   kInnerHeapSize,
@@ -156,6 +167,18 @@ std::unique_ptr<rommsync::http::HttpClient> g_http;
 /// reason: the worker holds it for the life of the process, and there is only
 /// ever one.
 std::unique_ptr<rommsync::fs::FileSystem> g_card;
+
+/// `sdmc:/config/rommsync/rommsync.log`, and the reason there is one (M7-3,
+/// #38). File scope for `g_http`'s reason: it outlives every caller, every
+/// thread writes through it, and there is only ever one.
+///
+/// **It is installed in `main`, not in `__appInit`.** Nothing may block boot,
+/// and this opens a file on the card -- but more to the point, the directory has
+/// to exist first, and making it needs the `fs::FileSystem` backend that is
+/// built below. What is written before it is installed is not lost: the log
+/// keeps its last lines in memory whether a sink exists or not (log.hpp), so
+/// `GetLog` answers them and only the *file* starts where the sink does.
+std::unique_ptr<rommsync::log::FileSink> g_log;
 
 /// Whether this console has an internet connection, right now.
 ///
@@ -222,7 +245,16 @@ rommsync::auth::IdentitySeed ConsoleIdentitySeed() {
   return seed;
 }
 
-void Log(const std::string& line) { svcOutputDebugString(line.c_str(), line.size()); }
+/// One boot line, to a debugger and to the card.
+///
+/// `svcOutputDebugString` is what a Ryujinx run and an attached debugger see and
+/// is all this process had before M7-3 (#38); the log is what a *user* can read,
+/// and what docs/TROUBLESHOOTING.md asks them to attach. Both, because they
+/// reach different people and neither is a superset of the other.
+void Log(const std::string& line) {
+  svcOutputDebugString(line.c_str(), line.size());
+  rommsync::log::Info(rommsync::log::Event::kBoot, line);
+}
 
 }  // namespace
 
@@ -343,14 +375,48 @@ void __appExit(void) {
 }  // extern "C"
 
 int main(int, char**) {
-  // A crash dump or a debug log that cannot say which build produced it costs
-  // an afternoon, and version() is the cheapest possible answer.
-  const char* ua = rommsync::version();
-  svcOutputDebugString(ua, std::strlen(ua));
-
   // Before anything writes, and once: `io::SetFileSync` is process-wide and is
-  // not meant to be swapped while a write is in flight (atomic_file.hpp).
+  // not meant to be swapped while a write is in flight (atomic_file.hpp). First
+  // in `main` since M7-3 (#38) rather than after the boot lines, because the
+  // card is now built above them and an ordering where a hook is installed after
+  // the first thing that touches the card is one somebody eventually relies on.
   rommsync::io::SetFileSync(&HorizonFileSync);
+
+  // The card, and the log on it, before anything else says anything (M7-3, #38).
+  //
+  // `MakeSdCard` is built here rather than where M7-2 (#37) built it -- it holds
+  // no handle and no state (`card.hpp`), so making it early costs nothing -- and
+  // `CreateDirectory` is here because `log::FileSink` cannot make its own:
+  // `core/` has only standard headers, and a first boot on a fresh card would
+  // otherwise drop exactly the lines a new user is asked for.
+  //
+  // **A card that refuses is not fatal and is not reported.** There is nowhere
+  // left to report it to, and the log's in-memory tail still answers `GetLog` --
+  // a client that stopped syncing over a log file it could not write would have
+  // the tail wagging the dog. `fsdevMountSdmc` has already run, in `__appInit`.
+  //
+  // **What this costs at boot**, stated rather than left to be measured: one
+  // `mkdir` and one append of a few dozen bytes. It is SD I/O on the boot path
+  // and it is bounded -- `engine.Load()` a few lines below already reads five
+  // files off the same card, and the rule that matters is that nothing here
+  // touches the *network* (CLAUDE.md, "Never block boot"), which is still true.
+  // Nothing in this block waits on anything.
+  g_card = rommsync::sysmodule::MakeSdCard();
+  static_cast<void>(g_card->CreateDirectory(rommsync::sysmodule::kConfigSdDir));
+  g_log = std::make_unique<rommsync::log::FileSink>(
+      std::string(rommsync::sysmodule::kConfigDir) + rommsync::log::kLogFileName);
+  rommsync::log::SetSink(g_log.get());
+
+  // A crash dump or a debug log that cannot say which build produced it costs
+  // an afternoon, and this is the cheapest possible answer. It goes to the
+  // debugger and to the card, which is `Log`'s whole job -- and it is the first
+  // line of the file docs/TROUBLESHOOTING.md asks a user to attach.
+  //
+  // `kUserAgent` rather than `version()`: they differ by the `rommsync-nx/`
+  // prefix, and the prefixed one is what RomM records against every request
+  // this console makes (`version.hpp`). A support thread that has the server's
+  // logs and the console's should be reading the same string in both.
+  Log(rommsync::kUserAgent);
 
   // Which way this console's `client_device_identifier` will be derived, and
   // whether this build has a transport at all. Two lines at boot because they
@@ -385,7 +451,8 @@ int main(int, char**) {
   // overlay's pairing screen has a code to draw.
   engine.UsePairingBackend({g_http.get(), seed});
 
-  // The other three seams, and the worker that makes them safe -- M7-2 (#37).
+  // The other two seams, and the worker that makes them safe -- M7-2 (#37). The
+  // card itself was built above, because the log needed it first.
   //
   // **`UseServer` and `StartWorker` are one commit and have to stay one line
   // apart.** `lists::Service` answers a page that needs a request with `kOk` and
@@ -394,7 +461,6 @@ int main(int, char**) {
   // into "pending" forever, which it cannot (`list_service.hpp`). The token is
   // left empty deliberately: `token.dat` is the engine's to read, and it re-reads
   // it when a pairing commits (`SdEngine::UseServer`).
-  g_card = rommsync::sysmodule::MakeSdCard();
   engine.UseServer(g_http.get(), "");
   engine.UseCard(g_card.get());
   engine.UseNetworkProbe(&NetworkUp);

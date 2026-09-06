@@ -18,6 +18,7 @@
 #include "rommsync/download.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/list_service.hpp"
+#include "rommsync/log.hpp"
 #include "rommsync/pairing.hpp"
 #include "rommsync/rom_index.hpp"
 #include "rommsync/save_scan.hpp"
@@ -29,6 +30,55 @@
 #include "rommsync/token_store.hpp"
 
 namespace rommsync::sysmodule {
+namespace {
+
+/// The log level a `config::Diagnostic` is worth.
+///
+/// The two scales are the same three steps by design (`log::Level` says so), so
+/// this is the mapping and not a judgement -- named because it is applied to
+/// every diagnostic in a loop and a nested conditional there reads as a
+/// decision being made per line.
+log::Level LevelFor(config::Severity severity) {
+  switch (severity) {
+    case config::Severity::kError:
+      return log::Level::kError;
+    case config::Severity::kWarning:
+      return log::Level::kWarn;
+    case config::Severity::kNotice:
+      return log::Level::kInfo;
+  }
+  return log::Level::kInfo;
+}
+
+/// True when a status says the server has stopped accepting this console.
+///
+/// 401 and 403 are different sentences to a user -- a revocation and a scope the
+/// user did not tick (docs/AUTH.md#scopes) -- and the same answer to everything
+/// in here: stop, and ask `auth::Gate`. Spelled once because the tick asks twice
+/// in consecutive statements, and two copies is how they come to disagree.
+bool StoppedAccepting(int status) { return status == 401 || status == 403; }
+
+/// The one line every tick ends with, whatever ended it.
+///
+/// **Every path out of `RunOneTick` writes one**, including the four that return
+/// before a plan exists. docs/TROUBLESHOOTING.md teaches a user that a tick ends
+/// with this line and that `outcome=` is where to start; a tick that skipped it
+/// on the commonest failures -- offline, unpaired, unconfigured, blocked --
+/// would be teaching that for the cases it is least true. The counts are all
+/// zero on those paths, which is the accurate thing to say: nothing was
+/// attempted and nothing was stored.
+void LogTickEnd(sync::TickOutcome outcome, int completed = 0, int failed = 0,
+                int states_completed = 0, int states_failed = 0, bool baseline = false) {
+  log::Info(log::Event::kSyncTick,
+            std::string("outcome=") + sync::ToString(outcome) +
+                " completed=" + std::to_string(completed) +
+                " failed=" + std::to_string(failed) +
+                " states_completed=" + std::to_string(states_completed) +
+                " states_failed=" + std::to_string(states_failed) +
+                " baseline=" + (baseline ? "stored" : "not stored"));
+}
+
+}  // namespace
 
 /// One of this client's files, as a path the SD card understands. `core/` owns
 /// the file names and may not know an SD path (hard rule 4), so joining them is
@@ -206,14 +256,60 @@ void SdEngine::Load(const std::string& config_dir) {
 
   // Beside `state.db`, and read the same way: a file that is not there is a
   // console that has overwritten nothing, which is a history and not a failure.
-  // The complaints go nowhere yet -- `core/` has no logger and this is not a
-  // `config.ini` problem, so putting them on `config_diagnostics()` would be the
-  // placeholder M5-4 took off the settings screen. They are returned by `Load`
-  // for the scheduler (M7-2, #37) to log when there is somewhere to log to.
+  // The complaints still go nowhere, and now for one reason rather than two.
+  // M7-3 (#38) built the log, so "there is nowhere to write them" no longer
+  // holds -- what does is that a corrupt `conflicts.db` is not a `config.ini`
+  // problem, so putting it on `config_diagnostics()` would be the placeholder
+  // M5-4 took off the settings screen, and it has no event of its own in
+  // `log::Event` because #38's scope is the eight failure modes
+  // docs/TROUBLESHOOTING.md answers. An empty Conflicts screen on a card whose
+  // history will not parse is worth a line; adding one belongs with #36's
+  // screen rather than here.
   history_ = conflicts::History(PathTo(conflicts::kHistoryFileName));
   static_cast<void>(history_.Load());
 
-  AdoptConfigLocked(config::LoadConfig(PathTo(config::kConfigFileName)));
+  // The two lines a bug report starts with, and the whole reason M7-3 (#38)
+  // wired a logger into this class rather than into `core/`: this is the one
+  // place that holds the card's answers to "which server, which device, which
+  // scopes" and "what is wrong with `config.ini`" at the same moment.
+  //
+  // `DescribeStoredToken` is the safe rendering of the credentials and is
+  // designed for exactly this (`token_store.hpp`) -- and `log::Write` redacts on
+  // top of it, so even the `token=` field it renders as a length never reaches
+  // the card. A console that has never paired logs nothing here, because there
+  // is nothing to describe.
+  if (!token_.access_token.empty() || !token_.device_id.empty()) {
+    log::Info(log::Event::kStoredToken, auth::DescribeStoredToken(token_));
+  }
+
+  config::LoadResult loaded = config::LoadConfig(PathTo(config::kConfigFileName));
+  // One line per complaint, at the severity the complaint carries, so a user
+  // reading the file can `grep config.diagnostic` and get the same list the
+  // settings screen draws. A `kError` here is the client not doing its job; a
+  // `kWarning` is a line that did not take effect as written; a `kNotice` is a
+  // console with no `config.ini` yet, which is normal on a first boot and is
+  // said out loud once rather than not at all.
+  for (const config::Diagnostic& note : loaded.diagnostics) {
+    log::Write(LevelFor(note.severity), log::Event::kConfigDiagnostic, note.Describe());
+  }
+  if (!loaded.value.configured()) {
+    // Named as its own event rather than left to be inferred from a diagnostic,
+    // because it is the one misconfiguration that stops *everything*: with no
+    // usable origin there is nothing to negotiate with, and the tick below
+    // returns before it sends anything. **The URL is not quoted**, which is the
+    // rule `config::Diagnostic` already keeps (config.hpp).
+    log::Error(log::Event::kNoServer,
+               "no usable [server] url; nothing will sync until one is set");
+  } else if (loaded.value.SaveScanDirs().empty()) {
+    // The commonest misconfiguration by a distance, and invisible without this
+    // line: `[platform.snes]` *replaces* that platform's defaults, so a section
+    // listing only `roms` leaves that platform with no save folders at all
+    // (docs/CONFIG.md). A console in this state downloads roms and silently
+    // syncs nothing.
+    log::Warn(log::Event::kNoSaveDirs,
+              "the folder map yields no save directories; no save will be synced");
+  }
+  AdoptConfigLocked(std::move(loaded));
 }
 
 void SdEngine::UsePairingBackend(PairingBackend backend) {
@@ -693,6 +789,26 @@ std::string PlaceUnder(const std::vector<std::string>& folders, std::string_view
   return folders.front() + "/" + std::string(file_name);
 }
 
+/// Write the one line that says why this console could not reach its server.
+///
+/// Split on `http::Error::kTls` and nothing else, because that is where the
+/// user's remedy divides: everything else here comes right on its own when the
+/// link does, and a TLS failure is a certificate, a hostname or a protocol
+/// version that will still be wrong in half an hour
+/// (`sync::Negotiation::transport` says the same at length, and
+/// `SchedulerConfig::max_tls_attempts` is what acts on it).
+/// docs/TROUBLESHOOTING.md has a section per event and this is what keys them.
+void LogTransportFailure(http::Error transport, const std::string& where,
+                         const std::string& detail) {
+  const std::string message =
+      where + ": " + http::ToString(transport) + (detail.empty() ? "" : "; " + detail);
+  if (transport == http::Error::kTls) {
+    log::Error(log::Event::kNetTls, message);
+  } else {
+    log::Warn(log::Event::kNetOffline, message);
+  }
+}
+
 }  // namespace
 
 void SdEngine::RecordFailedTickLocked() {
@@ -734,6 +850,15 @@ void SdEngine::RunOneTick() {
     // "Sync now", and there the gate's real guarantee is the one that holds:
     // three rejections and it is blocked, so a user leaning on the button costs
     // three requests and then this branch.
+    // Said out loud every tick, and that is the point rather than noise: once
+    // the gate blocks, this branch is the *only* thing that happens, so a silent
+    // one leaves a console whose log shows a few `auth.rejected` lines from
+    // hours ago and then nothing at all -- and the ring keeps only
+    // `log::kTailLines`, so before long it shows nothing. One line per
+    // `interval_min` is what makes the steady state readable.
+    log::Error(log::Event::kAuthRejected,
+               "this console is blocked until it is paired again; no request will be made");
+    LogTickEnd(sync::TickOutcome::kUnauthorized);
     std::lock_guard<std::mutex> lock(mutex_);
     scheduler_.Finished(sync::TickOutcome::kUnauthorized);
     RecordFailedTickLocked();
@@ -747,6 +872,22 @@ void SdEngine::RunOneTick() {
     // the answer -- back off and try again later -- is the same one a console on
     // a train gets. The status screen says which of the four it is; the schedule
     // does not need to know.
+    // Which of the four it is, said out loud: the scheduler does not need to
+    // know and a user does. `config.no_server` is the one with a fix on the
+    // settings screen, so it is its own event rather than a sentence inside
+    // `net.offline`.
+    if (!config->configured()) {
+      log::Error(log::Event::kNoServer, "tick skipped: no usable [server] url");
+    } else if (token.access_token.empty()) {
+      log::Error(log::Event::kAuthRejected,
+                 "tick skipped: this console has no usable token; pair it again");
+    } else {
+      log::Warn(log::Event::kNetOffline,
+                std::string("tick skipped: ") +
+                    (client == nullptr ? "this build has no transport"
+                                       : "no SD card backend is installed"));
+    }
+    LogTickEnd(sync::TickOutcome::kOffline);
     std::lock_guard<std::mutex> lock(mutex_);
     scheduler_.Finished(sync::TickOutcome::kOffline);
     RecordFailedTickLocked();
@@ -771,10 +912,23 @@ void SdEngine::RunOneTick() {
   const roms::FetchResult library = roms::FetchRomIndex(*client, fetch);
   ObserveAnswer(roms::AnswerOf(library));
   if (!library.ok()) {
+    if (StoppedAccepting(library.status)) {
+      log::Error(log::Event::kAuthRejected,
+                 "GET /api/roms answered " + std::to_string(library.status) + "; " +
+                     library.message);
+    } else if (library.transport != http::Error::kNone) {
+      LogTransportFailure(library.transport, "GET /api/roms", library.message);
+    } else {
+      // A status this client cannot proceed from, or a 200 that was not a rom
+      // page. Retrying does not change either, which is what `sync.refused`
+      // says and `net.offline` would not.
+      log::Warn(log::Event::kSyncRefused, "GET /api/roms: " + library.message);
+    }
+    LogTickEnd(StoppedAccepting(library.status) ? sync::TickOutcome::kUnauthorized
+                                                : sync::TickOutcome::kOffline);
     std::lock_guard<std::mutex> lock(mutex_);
-    scheduler_.Finished(library.status == 401 || library.status == 403
-                            ? sync::TickOutcome::kUnauthorized
-                            : sync::TickOutcome::kOffline,
+    scheduler_.Finished(StoppedAccepting(library.status) ? sync::TickOutcome::kUnauthorized
+                                                         : sync::TickOutcome::kOffline,
                         library.transport);
     RecordFailedTickLocked();
     return;
@@ -783,6 +937,12 @@ void SdEngine::RunOneTick() {
   const std::string baseline_path = files->Resolve(sync::kStateSdPath);
   const state::LoadedBaseline loaded = state::LoadBaseline(baseline_path);
   const scan::ScanResult scanned = scan::ScanSaves(*config, library.index, *files, loaded.value);
+  // One line per file the scan would not report, at the spelling the scanner
+  // already renders for a log -- an unmatched name, a name on two platforms with
+  // no platform hint, a save reported without a digest. Never guessed at
+  // (docs/SYNC_PROTOCOL.md step 0), and until now never said out loud either:
+  // this is the only place a user can find out that a save is being skipped.
+  log::WriteEach(log::Level::kWarn, log::Event::kScanSkipped, scanned.DescribeSkipped());
 
   std::vector<sync::ClientSaveState> reported;
   std::vector<sync::SaveTarget> targets;
@@ -885,6 +1045,72 @@ void SdEngine::RunOneTick() {
     conflicts::RecordStates(&history_, states, record);
   }
   writing.unlock();
+
+  // Everything the tick has to say, before the counters go under `mutex_`: a
+  // sink writes to the SD card, and holding the lock the frame-polled `GetStatus`
+  // needs across that would make the status screen wait on the card.
+  //
+  // Why the negotiation is classified again here rather than trusted from
+  // `tick.outcome`: `kOffline` collapses "the link is down" and "the certificate
+  // is wrong", which is right for a scheduler -- both mean back off -- and
+  // useless to a user, because only one of them comes right on its own.
+  // `Negotiation::transport` is the field that keeps them apart, and it is
+  // carried for exactly this (sync.hpp).
+  switch (tick.outcome) {
+    case sync::TickOutcome::kOffline:
+      // **`kOffline` is two things and only one of them has a transport error.**
+      // `OutcomeOf` folds `NegotiateError::kUnreachable` and `kServerError` into
+      // it (sync_tick.cpp), because a scheduler's answer to both is the same --
+      // back off. Only the first sets `Negotiation::transport`; the second is a
+      // 5xx, a 429 or a 408, and leaves it `kNone`, whose `ToString` is **"ok"**.
+      // Handing that to `LogTransportFailure` produced the line
+      // `net.offline negotiate: ok`, which reads as the client blaming a
+      // successful request.
+      if (tick.negotiated.transport != http::Error::kNone) {
+        LogTransportFailure(tick.negotiated.transport, "negotiate", tick.negotiated.message);
+      } else {
+        // The server answered and could not serve. Still `net.offline` rather
+        // than `sync.refused`, because the next tick genuinely may work -- which
+        // is the line the guide draws between the two events.
+        log::Warn(log::Event::kNetOffline,
+                  "negotiate: " + std::string(sync::ToString(tick.negotiated.error)) + "; " +
+                      tick.negotiated.message);
+      }
+      break;
+    case sync::TickOutcome::kUnauthorized:
+      log::Error(log::Event::kAuthRejected,
+                 "the server stopped accepting this console's token: " + tick.negotiated.message);
+      break;
+    case sync::TickOutcome::kRefused:
+      log::Warn(log::Event::kSyncRefused,
+                sync::ToString(tick.negotiated.error) + std::string(": ") +
+                    tick.negotiated.message);
+      break;
+    case sync::TickOutcome::kCompleted:
+    case sync::TickOutcome::kPartial:
+    case sync::TickOutcome::kUnreported:
+    case sync::TickOutcome::kCanceled:
+    case sync::TickOutcome::kDisabled:
+    case sync::TickOutcome::kRescanNeeded:
+      break;
+  }
+
+  // Every operation that did not do what the plan asked, and every leftover the
+  // sweep could not deal with. These are the lines `ExecutionReport::warnings`
+  // and `RecoveryReport::warnings` were built for and had nowhere to go: a card
+  // that is full shows up here as a backup that could not be taken, and a backup
+  // that could not be taken is an overwrite that did not happen (hard rule 2).
+  log::WriteEach(log::Level::kError, log::Event::kSaveFailed, tick.executed.warnings);
+  log::WriteEach(log::Level::kError, log::Event::kSaveFailed, tick.finished.warnings);
+  log::WriteEach(log::Level::kWarn, log::Event::kSaveFailed, tick.recovered.warnings);
+  if (states.ran) {
+    log::WriteEach(log::Level::kWarn, log::Event::kScanSkipped, states.scan.DescribeSkipped());
+  }
+
+  // The one line a user is asked for first. Last, so it reads as the summary of
+  // everything above it.
+  LogTickEnd(tick.outcome, tick.executed.completed, tick.executed.failed, states.completed,
+             states.failed, tick.finished.stored.ok());
 
   std::lock_guard<std::mutex> lock(mutex_);
   scheduler_.Finished(tick);

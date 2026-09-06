@@ -79,6 +79,16 @@ namespace rommsync::sysmodule {
 /// rule 4, and the `sdmc:` prefix is libnx's).
 inline constexpr const char* kConfigDir = "sdmc:/config/rommsync/";
 
+/// The same directory as an **SD-root** path, for the one caller that has to
+/// make it rather than open something in it: `fs::FileSystem::CreateDirectory`
+/// takes SD-root paths, the `sdmc:` prefix being the backend's (file_system.hpp).
+///
+/// It exists because of the log (M7-3, #38). `log::FileSink` cannot create its
+/// own directory -- `core/` has only standard headers -- so on a card where
+/// `/config/rommsync/` has never existed the first boot's lines would be dropped
+/// silently, which is exactly the boot a user is most likely to be asked for.
+inline constexpr const char* kConfigSdDir = "/config/rommsync";
+
 /// What an SD-root path from `core/` is prefixed with to open it here.
 ///
 /// The mapping `fs::FileSystem::Resolve` performs, spelled once for the callers

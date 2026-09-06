@@ -124,6 +124,22 @@ overlay.
   (`core/include/rommsync/conflict_log.hpp`). `[sync] conflict_show` hides the
   *screen* and never the recording.
 
+- `sdmc:/config/rommsync/rommsync.log` — what went wrong, in the words
+  docs/TROUBLESHOOTING.md is written against (M7-3). One line per event:
+  `<ordinal> <level> <event> <detail>`, where the event is one of a closed set
+  (`core/include/rommsync/log.hpp`) and the ordinal, not a clock, is what orders
+  the file — Horizon has no usable time until `timeInitialize`, and a console
+  whose clock never comes up is a supported state. **Bounded**: the live file is
+  capped at `log::kMaxFileBytes` and rotates to one `rommsync.log.old`, so the
+  pair is twice that and never more. **Never carries a secret**: `log::Redact`
+  runs inside the writer, not at the call sites, so a bearer token, a
+  `device_code` and a `user:password@` cannot reach the card from a call site
+  nobody reviewed. Written by `SdEngine`, which is the half that holds a whole
+  tick's outcome; `core/` builds the sentences and hands them up. Not durable,
+  deliberately — `io::FileSync` commits the whole card and a log is not worth
+  that, so a power cut costs the tail. Served to the overlay by `GetLog` from an
+  in-memory copy, so reading it needs neither an SD reader nor a card read.
+
 The overlay and sysmodule both read config; the **sysmodule owns writes** to
 token/state to avoid races — the overlay asks it to change things via IPC.
 

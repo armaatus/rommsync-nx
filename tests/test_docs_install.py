@@ -54,7 +54,8 @@ RUNTIME_SUBDIRS = ("flags",)
 
 # Runtime state that lives beside the shipped config, and is named by the guide
 # precisely because it is NOT in the archive: an upgrade must leave it alone.
-RUNTIME_FILES = ("config.ini", "token.dat", "device.dat", "state.db", "queue.json")
+RUNTIME_FILES = ("config.ini", "token.dat", "device.dat", "state.db", "queue.json",
+                 "rommsync.log", "rommsync.log.old")
 
 # The ten sections of #35, in the order a user meets them.
 SECTIONS = [

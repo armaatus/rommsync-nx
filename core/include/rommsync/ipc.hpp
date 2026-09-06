@@ -58,6 +58,15 @@
 // message, which is the rule `config::Diagnostic` already keeps because a
 // diagnostic goes to a log.
 //
+// `GetLog` (M7-3, #38) is the third and last carrier, and it is the exception
+// that shows what the rule is for. The line it carries is
+// `auth::DescribeStoredToken`'s -- which server, which device, which scopes --
+// because "which server is this console paired to" is the first question of
+// every bug report, and #38 asks for that line by name. What keeps it safe is
+// not the boundary but `log::Redact`, which runs inside `log::Write` and takes
+// out a bearer token, a `device_code` and a `user:password@` whatever the call
+// site wrote. `ipc.secrets` asserts both halves over this command.
+//
 // ## What never blocks
 //
 // No command waits on the network. `SyncNow` and `StartPair` hand work to the
@@ -77,6 +86,7 @@
 #include "rommsync/config.hpp"
 #include "rommsync/conflict_log.hpp"
 #include "rommsync/json.hpp"
+#include "rommsync/log.hpp"
 #include "rommsync/pairing.hpp"
 
 namespace rommsync::ipc {
@@ -162,6 +172,7 @@ enum class Command : std::uint32_t {
   kListEnd = 13,
   kListConflicts = 14,
   kRestoreBackup = 15,
+  kGetLog = 16,
 };
 
 /// Every command, in id order. The dispatch table and the documentation are both
@@ -173,7 +184,7 @@ inline constexpr std::array kAllCommands = {
     Command::kStartPair,           Command::kGetPairState, Command::kUnpair,
     Command::kEnqueue,             Command::kDequeue,      Command::kListBegin,
     Command::kListNext,            Command::kListEnd,      Command::kListConflicts,
-    Command::kRestoreBackup,
+    Command::kRestoreBackup,       Command::kGetLog,
 };
 
 /// Stable, log-friendly name -- `GetStatus`. Never null; "Unknown" for an id
@@ -839,6 +850,44 @@ bool AppendIfItFits(ConflictPage* page, ConflictRow row);
 /// card lets it be.
 inline constexpr std::size_t kMaxRestoreMessageBytes = 512;
 
+// --- the log tail -------------------------------------------------------------
+
+/// How many log lines one `GetLog` may answer with.
+///
+/// `log::kTailLines` and not a number of this header's own: the sysmodule keeps
+/// exactly that many in memory (log.hpp), so a larger cap here would promise a
+/// page nothing can fill and a smaller one would hide lines the console is
+/// holding. A request over it is **clamped**, the way `ConflictQuery::limit` is,
+/// rather than refused.
+inline constexpr std::int32_t kMaxLogLines = static_cast<std::int32_t>(log::kTailLines);
+
+/// The end of the log, as the overlay draws it.
+///
+/// Rendered lines rather than a decomposed record. The line is already one flat
+/// string with its ordinal, level and event tag in it (log.hpp), it is already
+/// bounded, and the thing a user is asked to do with it is *read it and paste
+/// it* -- so a struct-per-line would be three fields the overlay would have to
+/// join back together before showing anything, and a second spelling of a format
+/// docs/TROUBLESHOOTING.md pins.
+struct LogTail {
+  /// Oldest first, which is the order a log is read in. **What is dropped when
+  /// the answer will not fit is the oldest**, so the end of the log -- the part
+  /// that says why the last tick failed -- is the part that always arrives.
+  std::vector<std::string> lines;
+
+  /// How many lines this process has written in all, kept or not. What tells a
+  /// screen that it is looking at a tail rather than at the whole log, and what
+  /// makes "it logged nothing at all" distinguishable from "I dropped them".
+  std::int64_t total = 0;
+};
+
+/// Add `line` to `tail` unless doing so would break a bound.
+///
+/// `AppendIfItFits(ConflictPage*, ConflictRow)`'s job and its reasoning: a log
+/// line carries a file path and a `Diagnostic`, which are the user's data, so
+/// `kMaxLogLines` is not a size. Returns false without touching `tail`.
+bool AppendIfItFits(LogTail* tail, std::string line);
+
 // --- codecs -------------------------------------------------------------------
 //
 // Every one of these round-trips losslessly and every decoder refuses a payload
@@ -915,6 +964,17 @@ Decoded<std::int64_t> DecodeEntryId(std::string_view text);
 
 std::string EncodeRestoreReport(const conflicts::RestoreReport& report);
 Decoded<conflicts::RestoreReport> DecodeRestoreReport(std::string_view text);
+
+/// `{"lines":<int>}` -- `GetLog`'s request: how many of the last lines to send.
+///
+/// Spelled apart from every other bare integer on this wire for `EncodeEntryId`'s
+/// reason, and clamped to `[1, kMaxLogLines]` by `ServiceCore::GetLog` rather
+/// than refused here.
+std::string EncodeLogRequest(std::int32_t lines);
+Decoded<std::int32_t> DecodeLogRequest(std::string_view text);
+
+std::string EncodeLogTail(const LogTail& tail);
+Decoded<LogTail> DecodeLogTail(std::string_view text);
 
 /// The payload of a command that carries none: `{}`. A shape rather than an
 /// empty buffer, so every decoder on both sides can assume a JSON object.
@@ -1106,6 +1166,25 @@ class ServiceCore {
 
   /// Command 15. Never fails; the outcome is in the answer.
   conflicts::RestoreReport RestoreBackup(std::int64_t entry_id);
+
+  /// Command 16. The last `lines` lines of this process's log, clamped to
+  /// `[0, kMaxLogLines]`. Never fails: a console that has logged nothing has an
+  /// empty tail, and that is itself an answer -- it says the sysmodule is
+  /// running and has not got as far as a tick.
+  ///
+  /// `0` is an empty tail with the total still filled in, which is the cheap
+  /// question "has this console logged anything" -- not one line. The wire
+  /// refuses `0` outright (`DecodeLogRequest`), so that answer is only ever an
+  /// in-process caller's.
+  ///
+  /// **Answered from `log::Tail` rather than through `Engine`.** The log is
+  /// process state, like `io::FileSync`, and not something the engine holds --
+  /// so routing it through the seam would be a method every implementation of
+  /// `Engine` had to write the same way, in front of a global they all share.
+  /// It is also what keeps this command off the SD card: the tail is in memory,
+  /// so a console whose card refused the log file still answers this
+  /// (`log::FileSink` is silent about its own failures for the same reason).
+  LogTail GetLog(std::int32_t lines) const;
 
  private:
   /// A pairing status cut to what a payload carries. See the definition: the

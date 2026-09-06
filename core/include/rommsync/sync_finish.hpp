@@ -94,8 +94,8 @@ struct BaselineUpdate {
 
   /// One line per save that could not be advanced, bounded by
   /// `state::kMaxDiagnostics`. Never an error: every one of them costs a re-hash
-  /// on the next tick and nothing else. `core/` has no logger, so they are
-  /// handed up (docs/ARCHITECTURE.md).
+  /// on the next tick and nothing else. Handed up rather than logged here, for
+  /// `ExecutionReport::warnings`' reason; the caller writes them.
   std::vector<std::string> warnings;
 };
 
