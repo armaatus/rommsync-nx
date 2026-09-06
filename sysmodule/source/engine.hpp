@@ -40,6 +40,7 @@
 #include "rommsync/auth.hpp"
 #include "rommsync/auth_gate.hpp"
 #include "rommsync/config.hpp"
+#include "rommsync/device_identity.hpp"
 #include "rommsync/download.hpp"
 #include "rommsync/file_system.hpp"
 #include "rommsync/http.hpp"
@@ -53,6 +54,14 @@ namespace rommsync::sysmodule {
 /// `core/`, which owns the file *names* and may not know an SD path (hard
 /// rule 4, and the `sdmc:` prefix is libnx's).
 inline constexpr const char* kConfigDir = "sdmc:/config/rommsync/";
+
+/// What a pairing attempt needs that neither `core/` nor this file can supply.
+struct PairingBackend {
+  /// Null means this build has no way to reach a server.
+  http::HttpClient* http = nullptr;
+  /// What `auth::LoadOrCreateDeviceIdentity` derives `device.dat` from.
+  auth::IdentitySeed identity_seed;
+};
 
 /// The engine as far as it is built.
 ///
@@ -88,6 +97,9 @@ class SdEngine : public ipc::Engine {
   /// engine behind `ipc::Dispatch`, against a directory, with no console. The
   /// alternative is glue that is only ever proven by the fact that it compiles.
   void Load(const std::string& config_dir = kConfigDir);
+
+  /// Give the engine the platform facilities a pairing attempt needs.
+  void UsePairingBackend(PairingBackend backend);
 
   /// The network the library is read over, and the token to read it with.
   ///
@@ -313,6 +325,8 @@ class SdEngine : public ipc::Engine {
   /// `auth::AnswerOf(...)`, and persist the block the moment `blocked()` turns
   /// true.
   auth::Gate gate_;
+
+  PairingBackend pairing_backend_;
 };
 
 }  // namespace rommsync::sysmodule

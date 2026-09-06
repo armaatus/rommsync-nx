@@ -117,6 +117,10 @@ void SdEngine::Load(const std::string& config_dir) {
   AdoptConfig(config::LoadConfig(PathTo(config::kConfigFileName)));
 }
 
+void SdEngine::UsePairingBackend(PairingBackend backend) {
+  pairing_backend_ = std::move(backend);
+}
+
 void SdEngine::AdoptConfig(config::LoadResult loaded) {
   config_ = std::move(loaded.value);
   diagnostics_ = auth_diagnostics_;

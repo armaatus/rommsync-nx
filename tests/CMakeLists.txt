@@ -1501,6 +1501,9 @@ target_compile_definitions(test_engine PRIVATE
   ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
   ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
   ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+# M1-6 put a thread of its own inside `SdEngine`, and the scenarios that drive a
+# pairing wait on it from the calling thread.
+target_link_libraries(test_engine PRIVATE Threads::Threads)
 
 set(ENGINE_SCENARIOS
   queue     # enqueue, dequeue, and the depth the status screen reads
@@ -1513,11 +1516,17 @@ set(ENGINE_SCENARIOS
   stale     # M5-3: "did the server change" is a question about the card
   unauthenticated  # M1-4: the verdict the card carries, and the re-pair that lifts it
   commands  # what is still `kUnavailable`, so the list shrinks deliberately
+  unreachable  # M1-6: a server that answers nothing refuses the attempt, and writes nothing
 )
 foreach(scenario IN LISTS ENGINE_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
   set_tests_properties(engine.${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
+# `unreachable` waits for an attempt to settle rather than for a file, and its own
+# budget is longer than the sixty seconds the rest of this group needs. Given its
+# own so a broken one fails on the assertion that names the behaviour instead of
+# on a CTest timeout that names nothing.
+set_tests_properties(engine.unreachable PROPERTIES TIMEOUT 180)
 
 # M6-2 (#33), under `toggle.` with the rest of that issue's acceptance. Both are
 # about the two switches rather than about the queue this file otherwise pins:
@@ -1537,3 +1546,22 @@ if(NOT ROMMSYNC_REQUIRE_RIG)
   set_tests_properties(engine.server PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 set_tests_properties(engine.server PROPERTIES TIMEOUT 120)
+
+# M1-6's three, which drive a real device-code attempt through the engine: the
+# codes are RomM's, the approval goes through RomM's own
+# `/api/auth/device/approve`, and the interruptions are the fault proxy's. Serial
+# for the same reason `pair.*` is -- the proxy holds one armed scenario for every
+# client, and RomM paces the token endpoint -- and generous on time because two
+# of them wait out real poll intervals.
+set(ENGINE_RIG_SCENARIOS
+  pairs        # start to committed token, and the token works against the server
+  nonblocking  # `StartPair` returns while the init is stalled: `ipc.hpp`'s contract
+  repairs      # `StartPair` then `Unpair`, with neither instant leaving nothing
+)
+foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
+  add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(engine.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  set_tests_properties(engine.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+endforeach()

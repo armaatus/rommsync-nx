@@ -61,54 +61,16 @@ const std::vector<std::string> kScopes = auth::MinimumScopes();
 /// fails with its own message rather than as a CTest timeout.
 constexpr auto kBudget = 90s;
 
-std::string Base64(std::string_view raw) {
-  static const char kAlphabet[] =
-      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  std::string out;
-  for (std::size_t at = 0; at < raw.size(); at += 3) {
-    const std::size_t left = raw.size() - at;
-    const unsigned a = static_cast<unsigned char>(raw[at]);
-    const unsigned b = left > 1 ? static_cast<unsigned char>(raw[at + 1]) : 0u;
-    const unsigned c = left > 2 ? static_cast<unsigned char>(raw[at + 2]) : 0u;
-    const unsigned triple = (a << 16) | (b << 8) | c;
-    out.push_back(kAlphabet[(triple >> 18) & 0x3F]);
-    out.push_back(kAlphabet[(triple >> 12) & 0x3F]);
-    out.push_back(left > 1 ? kAlphabet[(triple >> 6) & 0x3F] : '=');
-    out.push_back(left > 2 ? kAlphabet[triple & 0x3F] : '=');
-  }
-  return out;
-}
-
-/// Be the human at the browser.
-///
-/// `/api/auth/device/approve` and `/api/auth/device/deny` are ordinary
-/// authenticated endpoints, and they take HTTP Basic -- which is why these need
-/// no session cookie and no CSRF dance. That is the whole trick that makes the
-/// grant testable unattended (docs/TESTING.md).
-http::Result AsTheUser(http::HttpClient& client, const std::string& base, const std::string& path,
-                       const std::string& body) {
-  http::Request request;
-  request.method = http::Method::kPost;
-  request.url = base + path;
-  request.headers.push_back({"Content-Type", "application/json"});
-  request.headers.push_back(
-      {"Authorization",
-       "Basic " + Base64(std::string(rig::kUser) + ":" + rig::kPassword)});
-  request.body = body;
-  return client.Send(request);
-}
-
+/// Be the human at the browser. `rig::` owns the Basic-auth POST both this file
+/// and `test_engine.cpp` make; these two name the scopes this client asks for.
 http::Result Approve(http::HttpClient& client, const std::string& base,
                      const std::string& user_code) {
-  return AsTheUser(client, base, "/api/auth/device/approve",
-                   "{\"user_code\":" + json::Quote(user_code) +
-                       ",\"approved_scopes\":" + json::QuoteArray(kScopes) + "}");
+  return rig::ApproveDeviceCode(client, base, user_code, kScopes);
 }
 
 http::Result Deny(http::HttpClient& client, const std::string& base,
                   const std::string& user_code) {
-  return AsTheUser(client, base, "/api/auth/device/deny",
-                   "{\"user_code\":" + json::Quote(user_code) + "}");
+  return rig::DenyDeviceCode(client, base, user_code);
 }
 
 auth::PairingConfig Config(const std::string& base) {
