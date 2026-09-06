@@ -241,7 +241,7 @@ void ConflictsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width
       first = std::max(0, view_.selected - 2);
     }
     for (int index = first; index < rows; ++index) {
-      const ConflictRow& entry = view_.rows[static_cast<std::size_t>(index)];
+      const ConflictListRow& entry = view_.rows[static_cast<std::size_t>(index)];
       if (clipped || row + kRowHeight > body_bottom) {
         break;
       }

@@ -623,6 +623,10 @@ StateOperationResult KeepBoth(std::int64_t rom_id, const std::string& file_name,
   result.sd_path = sd_path;
   result.outcome = StateOutcome::kKeptBoth;
   if (server != nullptr) {
+    // Both, not just the row: `state_id` and `server` describe the same thing,
+    // and setting one without the other is a report that says the server has a
+    // copy and cannot say which. The `kNoOp` branch beside this one already
+    // fills `state_id` for exactly that reason.
     result.state_id = server->id;
     result.server = *server;
   }

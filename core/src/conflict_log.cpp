@@ -1,4 +1,8 @@
-// The conflict history: the format, the two recorders, and the restore.
+// The conflict history: the entry, the format, and the store.
+//
+// The recorders and the restore are `conflict_record.cpp` next door -- they
+// need the sync engine's report types and nothing here does, which is why the
+// module is two files (conflict_log.hpp, "Where the halves live").
 //
 // See conflict_log.hpp for what this is for. What is worth saying here is what
 // the file *is*: a header line carrying the magic, the format version and the
@@ -18,6 +22,7 @@
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/config.hpp"
 #include "rommsync/json.hpp"
+#include "rommsync/text.hpp"
 
 namespace rommsync::conflicts {
 namespace {
@@ -262,16 +267,10 @@ const char* ToString(RestoreOutcome outcome) {
 }
 
 std::string Shorten(std::string_view text) {
-  if (text.size() <= kMaxTextBytes) {
-    return std::string(text);
-  }
-  // On a UTF-8 boundary: a page of these crosses the IPC wire, and half a code
-  // point there is a row a renderer draws as a replacement glyph or refuses.
-  std::size_t cut = kMaxTextBytes;
-  while (cut > 0 && (static_cast<unsigned char>(text[cut]) & 0xC0) == 0x80) {
-    --cut;
-  }
-  return std::string(text.substr(0, cut)) + "...";
+  // On a UTF-8 boundary, and `text::Shorten`'s rather than a fourth copy of the
+  // walk: a page of these crosses the IPC wire, and half a code point there is a
+  // row a renderer draws as a replacement glyph or refuses outright.
+  return text::Shorten(text, kMaxTextBytes);
 }
 
 std::string SerializeHistory(const std::vector<Entry>& entries, std::int64_t next_id) {
@@ -370,36 +369,35 @@ LoadedHistory ParseHistory(std::string_view text) {
 }
 
 LoadedHistory LoadHistory(const std::string& path) {
-  io::ReadResult read = io::ReadFile(path);
-  if (read.error == io::ReadError::kMissing) {
+  // **Bounded, not `ReadFile`.** `state::LoadBaseline`'s rule, and its reason:
+  // this file sits on a FAT32 card that gets yanked mid-write, so a corrupt
+  // directory entry claiming four gigabytes has to be a named refusal rather
+  // than a `bad_alloc` on a 512 KiB heap before the diagnostic exists.
+  std::string contents;
+  io::BoundedRead outcome = io::ReadBounded(path, kMaxHistoryBytes, &contents);
+  if (outcome == io::BoundedRead::kMissing) {
     // The window between `io::WriteAtomically`'s two renames, where the previous
     // file is intact under `.old`. `state::LoadBaseline` makes the same
     // recovery, and only for a *missing* file: one that exists and will not open
     // is a bad moment rather than a commit window.
-    const io::ReadResult previous = io::ReadFile(io::PreviousPathFor(path));
-    if (previous.error != io::ReadError::kNone) {
+    outcome = io::ReadBounded(io::PreviousPathFor(path), kMaxHistoryBytes, &contents);
+    if (outcome == io::BoundedRead::kMissing) {
       LoadedHistory loaded;
       loaded.diagnostics.push_back(
           Describe(path, "there is no conflict history yet; nothing has been overwritten on this "
                          "console, or it has never synced"));
       return loaded;
     }
-    read = previous;
-  } else if (read.error != io::ReadError::kNone) {
-    LoadedHistory loaded;
-    loaded.diagnostics.push_back(read.message + "; the conflict history is empty for this boot, "
-                                                "and the backups under .backup/ are untouched");
-    return loaded;
   }
-  if (read.contents.size() > kMaxHistoryBytes) {
+  if (outcome != io::BoundedRead::kOk) {
     LoadedHistory loaded;
     loaded.diagnostics.push_back(
-        Describe(path, "is larger than the " + std::to_string(kMaxHistoryBytes) +
-                           " bytes a conflict history may be; it is discarded, and the backups "
-                           "under .backup/ are untouched"));
+        Describe(path, std::string(io::ToString(outcome)) +
+                           ": the conflict history is empty for this boot, and the backups under "
+                           ".backup/ are untouched"));
     return loaded;
   }
-  return ParseHistory(read.contents);
+  return ParseHistory(contents);
 }
 
 History::History(std::string path) : path_(std::move(path)) {}

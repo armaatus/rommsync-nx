@@ -92,14 +92,28 @@ enum class Restorability {
   /// sides kept. Not a failure -- it is the policy working.
   kNothingToRestore,
 
-  /// The entry names a backup and it is not on the card any more. Deleted by
-  /// hand, or a card swapped. **Drawn as unrestorable rather than tried** (#36).
+  /// **An overwrite whose backup cannot be found.** Either the entry names one
+  /// and it is not on the card any more -- deleted by hand, or a card swapped --
+  /// or it recorded none at all, which a `BackUpFirst` that failed after the
+  /// write would produce.
+  ///
+  /// Both are one state on purpose: the fact a user needs is that bytes were
+  /// replaced and the copy is not reachable, and the difference between "gone"
+  /// and "never recorded" changes nothing they can do. What it must **not** be
+  /// is `kNothingToRestore`, whose sentence says the file was not touched.
+  ///
+  /// **Drawn as unrestorable rather than tried** (#36).
   kBackupGone,
 };
 const char* ToString(Restorability restorability);
 
 /// One drawn row of the list.
-struct ConflictRow {
+///
+/// `ConflictListRow` and not `ConflictRow`, because `ipc::ConflictRow` is a
+/// different thing that is in scope everywhere this one is: that one is an
+/// entry off the wire plus `backup_present`, this one is text and a tone. Two
+/// types of one name in two namespaces compile and read as one.
+struct ConflictListRow {
   /// What `RestoreBackup` takes. Never zero.
   std::int64_t entry_id = 0;
 
@@ -160,7 +174,7 @@ struct ConflictsView {
   Tone tone = Tone::kNeutral;
 
   /// `kList`.
-  std::vector<ConflictRow> rows;
+  std::vector<ConflictListRow> rows;
 
   /// `kDetail` and `kConfirm`.
   std::vector<ConflictDetailLine> detail;
@@ -236,8 +250,13 @@ class ConflictsModel {
   void OnPage(const ipc::ConflictPage& page);
 
   /// `RestoreBackup` answered. The screen stays on the entry and says what
-  /// happened; the list is re-read, because the entry's backup situation has
-  /// changed and so has the card.
+  /// happened.
+  ///
+  /// **The loaded pages are not re-read.** A restore rewrites nothing in the
+  /// history and deletes nothing from `.backup/`, so every row is as true as it
+  /// was; and a refetch would start at offset 0, which for a restore below the
+  /// first page would replace the rows under the open detail. See the
+  /// definition.
   void OnRestored(const conflicts::RestoreReport& report);
 
   /// The sysmodule refused the command `Next()` handed out.
@@ -299,12 +318,6 @@ class ConflictsModel {
 
   /// A page is in flight.
   bool loading_ = false;
-
-  /// The next page to arrive replaces the loaded rows rather than extending
-  /// them. Set after a restore, which changes what is on the card and therefore
-  /// every row's `backup_present`. The rows stay on screen until then, so a
-  /// restore is not a screen that blinks empty.
-  bool replace_rows_ = false;
 
   /// Consecutive pages that came back empty with `has_more` still set. A
   /// producer that answered that forever would have the overlay asking forever,

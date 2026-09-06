@@ -23,7 +23,7 @@ namespace rommsync::overlay {
 namespace {
 
 /// What a row falls back to when the history recorded no rom name. Never a
-/// blank: `ConflictRow::label` is non-empty in every state.
+/// blank: `ConflictListRow::label` is non-empty in every state.
 constexpr const char* kUnnamed = "Unnamed";
 
 /// What a value the history did not record reads as. One copy, because half a
@@ -42,13 +42,16 @@ constexpr const char* kNoServerDigest =
 
 std::string Number(std::int64_t value) { return std::to_string(value); }
 
-/// `1234 bytes`, or `not recorded` for a size nothing measured.
+/// `1234 bytes`. Bytes rather than a rounded unit: the number is here so a user
+/// can tell two copies apart, and "2 KB" and "2 KB" are the same string for two
+/// files that differ.
 ///
-/// Bytes rather than a rounded unit: the number is here so a user can tell two
-/// copies apart, and "2 KB" and "2 KB" are the same string for files that
-/// differ.
-std::string Size(std::int64_t bytes) {
-  if (bytes <= 0) {
+/// `known` is what separates **an empty file from a size nothing measured** --
+/// both are `0` on the entry, and on the one screen whose job is telling two
+/// copies apart they are not the same fact. An emulator that truncated a save to
+/// nothing is a very good reason to want the backup.
+std::string Size(std::int64_t bytes, bool known) {
+  if (!known) {
     return kNotRecorded;
   }
   return Number(bytes) + (bytes == 1 ? " byte" : " bytes");
@@ -75,10 +78,19 @@ const char* EventText(conflicts::Event event, conflicts::EntryKind kind) {
 }
 
 Restorability RestorabilityOf(const ipc::ConflictRow& row) {
-  if (!row.entry.restorable()) {
+  if (!conflicts::Overwrote(row.entry.event)) {
+    // Nothing was replaced -- a state both sides kept. The only case where
+    // "there is nothing to put back" is the *policy* rather than a loss.
     return Restorability::kNothingToRestore;
   }
-  return row.backup_present ? Restorability::kReady : Restorability::kBackupGone;
+  if (row.entry.backup_sd_path.empty() || !row.backup_present) {
+    // An overwrite is here either way, so the sentence has to be the one about a
+    // backup that cannot be found -- not "nothing was overwritten", which would
+    // tell a user their save is intact when it is the one that was replaced. An
+    // entry that recorded no path at all is the same fact one step earlier.
+    return Restorability::kBackupGone;
+  }
+  return Restorability::kReady;
 }
 
 }  // namespace
@@ -195,7 +207,6 @@ void ConflictsModel::Reset() {
   restoring_ = 0;
   restored_ = false;
   last_restore_ = {};
-  replace_rows_ = false;
   issued_ = Command::Kind::kNone;
 }
 
@@ -249,7 +260,15 @@ void ConflictsModel::OnPage(const ipc::ConflictPage& page) {
   if (page.offset != offset_) {
     // Answered into a place this model did not ask about. The history can shrink
     // under an open screen; appending it anyway would leave a hole rather than a
-    // short list. Ask again from where we are.
+    // short list, so it is dropped and asked for again from where we are.
+    //
+    // Counted against `kConflictMaxEmptyPages` for the reason an empty page with
+    // `has_more` is: a producer that echoes the wrong offset forever would have
+    // the overlay asking once a frame, on the sysmodule's IPC thread, with
+    // nothing to draw for it.
+    if (++empty_pages_ >= kConflictMaxEmptyPages) {
+      has_more_ = false;
+    }
     return;
   }
   total_ = page.total;
@@ -257,22 +276,10 @@ void ConflictsModel::OnPage(const ipc::ConflictPage& page) {
     if (page.has_more && ++empty_pages_ < kConflictMaxEmptyPages) {
       return;  // ask again; see `kConflictMaxEmptyPages`
     }
-    if (replace_rows_) {
-      // A re-read that came back with nothing: the history really is empty now,
-      // so the stale rows go.
-      rows_.clear();
-      selected_ = 0;
-      replace_rows_ = false;
-    }
     has_more_ = false;
     return;
   }
   empty_pages_ = 0;
-  if (replace_rows_) {
-    rows_.clear();
-    selected_ = 0;
-    replace_rows_ = false;
-  }
   for (const ipc::ConflictRow& row : page.entries) {
     if (rows_.size() >= conflicts::kMaxEntries) {
       break;
@@ -288,6 +295,7 @@ void ConflictsModel::OnRestored(const conflicts::RestoreReport& report) {
     return;
   }
   issued_ = Command::Kind::kNone;
+  const std::int64_t restored = restoring_;
   restore_wanted_ = 0;
   restoring_ = 0;
   restored_ = true;
@@ -295,16 +303,26 @@ void ConflictsModel::OnRestored(const conflicts::RestoreReport& report) {
   // Back to the entry, with the outcome on it. Staying on the confirmation
   // would invite a second press of a thing that has already happened.
   mode_ = ConflictsMode::kDetail;
-  // The card changed, so `backup_present` on every loaded row is now one poll
-  // old. Re-read the list -- but **keep the rows until the fresh ones arrive**:
-  // the detail the user is looking at is one of them, and dropping it now would
-  // replace the outcome they just got with "that conflict is no longer in the
-  // history". `LibraryBrowserModel`'s reclaimed-cursor rule, for its reason.
-  offset_ = 0;
-  has_more_ = true;
-  loading_ = false;
-  empty_pages_ = 0;
-  replace_rows_ = true;
+
+  // **The loaded pages are not re-read**, and that is not laziness. A restore
+  // rewrites nothing in the history and deletes nothing from `.backup/`: it
+  // writes the save and adds a *new* backup, which is deliberately not an entry
+  // (conflict_log.hpp). So every row's `backup_present` is as true as it was.
+  //
+  // Refetching would also be actively wrong. There is only ever one page in
+  // flight and it would start at offset 0, so a restore of the tenth conflict
+  // would replace the loaded rows with the first eight -- and the open detail,
+  // found by id, would vanish underneath the outcome the user is reading.
+  //
+  // The one fact that *did* change is the entry this restore could not find.
+  if (report.outcome == conflicts::RestoreOutcome::kBackupMissing) {
+    for (ipc::ConflictRow& row : rows_) {
+      if (row.entry.id == restored) {
+        row.backup_present = false;
+        break;
+      }
+    }
+  }
 }
 
 void ConflictsModel::OnRefused(ipc::Error error) {
@@ -354,7 +372,17 @@ void ConflictsModel::MoveSelection(int delta) {
     return;
   }
   const int last = static_cast<int>(rows_.size()) - 1;
+  const int before = selected_;
   selected_ = std::clamp(selected_ + delta, 0, last);
+  if (selected_ != before) {
+    // **Scrolling is the retry.** A page that failed part way down a list left
+    // `page_error_` set, and `Next()` gates every later fetch on it, so without
+    // this the rest of the history is unreachable for the life of the screen.
+    // A on a loaded list opens the row under it, so it cannot also be the retry;
+    // moving toward the missing rows is the gesture that already means "I want
+    // more of these".
+    page_error_ = ipc::Error::kOk;
+  }
 }
 
 void ConflictsModel::Activate() {
@@ -433,7 +461,7 @@ ConflictsView ConflictsModel::Render() const {
   if (mode_ == ConflictsMode::kList) {
     for (const ipc::ConflictRow& row : rows_) {
       const conflicts::Entry& entry = row.entry;
-      ConflictRow drawn;
+      ConflictListRow drawn;
       drawn.entry_id = entry.id;
       drawn.label = entry.rom_name.empty()
                         ? (entry.file_name.empty() ? std::string(kUnnamed) : entry.file_name)
@@ -455,7 +483,7 @@ ConflictsView ConflictsModel::Render() const {
     }
     view.selected = view.rows.empty() ? -1 : selected_;
 
-    if (page_error_ != ipc::Error::kOk) {
+    if (page_error_ != ipc::Error::kOk && view.rows.empty()) {
       view.headline = "The conflict history could not be read";
       view.hint = std::string(ipc::ToString(page_error_)) + " -- press A to try again";
       view.tone = Tone::kBad;
@@ -473,6 +501,15 @@ ConflictsView ConflictsModel::Render() const {
     }
     view.headline = "Showing " + Number(static_cast<std::int64_t>(view.rows.size())) + " of " +
                     Number(total_) + (total_ == 1 ? " conflict" : " conflicts");
+    if (page_error_ != ipc::Error::kOk) {
+      // The rows already loaded are still the history, and they stay. What the
+      // hint must not say is "press A", which opens the selected row -- see
+      // `MoveSelection`.
+      view.hint = std::string("The next page could not be loaded (") +
+                  ipc::ToString(page_error_) + ") -- scroll on to try again";
+      view.tone = Tone::kWarn;
+      return view;
+    }
     view.hint = "A opens one; the local bytes are under .backup/";
     return view;
   }
@@ -517,15 +554,26 @@ ConflictsView ConflictsModel::Render() const {
   // Both sides, side by side. This is the whole reason the screen exists, and
   // the reason every value has a sentence when it is missing: a blank next to
   // "This console" reads as "the same as the other one".
-  line("This console", Size(entry.local_size_bytes));
+  // The local side was recorded when *anything* about it was: a save an
+  // emulator truncated has a size of zero, an mtime and a digest.
+  const bool local_known = entry.local_size_bytes > 0 || entry.local_modified > 0 ||
+                           !entry.local_content_hash.empty();
+  line("This console", Size(entry.local_size_bytes, local_known));
   line("  its MD5", Hash(entry.local_content_hash));
   line("  changed", entry.local_modified == 0 ? std::string(kNotRecorded)
                                               : Number(entry.local_modified) + " (unix)");
+  // The two labels differ because the two quantities do. A state has no server
+  // digest at all, so the row a save spends on one is a *size* here -- and the
+  // line under it says why, rather than letting "The server" over a number read
+  // as a comparison that was made.
   if (entry.kind == conflicts::EntryKind::kState) {
-    line("The server", Size(entry.server_size_bytes));
+    // A state's server side is a length and an `updated_at` and nothing else,
+    // so "recorded at all" is whether either of them is there.
+    line("Server size", Size(entry.server_size_bytes,
+                             entry.server_size_bytes > 0 || !entry.server_updated_at.empty()));
     line("  its digest", kNoServerDigest, Tone::kNeutral);
   } else {
-    line("The server", entry.server_content_hash.has_value() ? *entry.server_content_hash
+    line("Server MD5", entry.server_content_hash.has_value() ? *entry.server_content_hash
                                                              : std::string(kNotRecorded));
   }
   line("  updated", Text(entry.server_updated_at));

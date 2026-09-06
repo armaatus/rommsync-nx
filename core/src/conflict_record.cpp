@@ -196,9 +196,20 @@ RestoreReport Restore(fs::FileSystem& files, const History& history, std::int64_
     return report;
   }
 
-  const std::string backup = files.Resolve(entry->backup_sd_path);
+  // The two are checked apart, because they fail differently and a user reads
+  // the difference: `kBackupMissing` naming the backup when it is the *save's*
+  // path that will not resolve would send them looking for the wrong file, and
+  // would claim a backup is gone that is sitting there.
   const std::string destination = files.Resolve(entry->sd_path);
-  if (backup.empty() || destination.empty()) {
+  if (destination.empty()) {
+    report.outcome = RestoreOutcome::kWriteFailed;
+    report.message = entry->sd_path +
+                     ": not a path this card can open, so nothing was written and the backup is "
+                     "untouched";
+    return report;
+  }
+  const std::string backup = files.Resolve(entry->backup_sd_path);
+  if (backup.empty()) {
     report.outcome = RestoreOutcome::kBackupMissing;
     report.message = entry->backup_sd_path + ": not a path this card can open";
     return report;

@@ -662,20 +662,24 @@ ipc::Error SdEngine::ListNext(ipc::Cursor cursor, ipc::ListPage* page) {
 
 ipc::Error SdEngine::ListEnd(ipc::Cursor cursor) { return lists_.ListEnd(cursor); }
 
-/// Whether the backup an entry names is still on the card.
+/// Whether the backup an entry names is still on the card
+/// (`ipc::ConflictRow::backup_present`).
 ///
-/// **A build with no `fs::FileSystem` cannot look**, and answers "as far as I
-/// can tell" rather than "it is gone" -- see `ipc::ConflictRow::backup_present`.
-/// The restore itself then refuses with `kBackupFailed`, which is the honest
-/// sentence for a console that cannot open the card at all.
+/// **This looks, with or without an `fs::FileSystem`.** Reading whether a file
+/// is there is one `io::Exists`, and this file already opens `sdmc:` paths
+/// directly for `config.ini`, `token.dat` and `queue.json` -- so a build with no
+/// card interface installed still answers honestly rather than claiming the
+/// backup is there. Answering "yes" blind would draw every entry as restorable
+/// and fail at the press, which is the outcome #36 exists to replace.
+///
+/// A `card_` is preferred when there is one because the host suite's is rooted
+/// at a sandbox rather than at `sdmc:`.
 bool SdEngine::BackupPresent(const conflicts::Entry& entry) const {
   if (!entry.restorable()) {
     return false;
   }
-  if (card_ == nullptr) {
-    return true;
-  }
-  const std::string resolved = card_->Resolve(entry.backup_sd_path);
+  const std::string resolved = card_ != nullptr ? card_->Resolve(entry.backup_sd_path)
+                                                : std::string(kSdRoot) + entry.backup_sd_path;
   return !resolved.empty() && io::Exists(resolved);
 }
 

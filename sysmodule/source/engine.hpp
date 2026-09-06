@@ -55,10 +55,10 @@
 #include "rommsync/auth.hpp"
 #include "rommsync/auth_gate.hpp"
 #include "rommsync/config.hpp"
+#include "rommsync/conflict_log.hpp"
 #include "rommsync/device_identity.hpp"
 #include "rommsync/download.hpp"
 #include "rommsync/file_system.hpp"
-#include "rommsync/conflict_log.hpp"
 #include "rommsync/http.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/list_service.hpp"
@@ -70,6 +70,15 @@ namespace rommsync::sysmodule {
 /// `core/`, which owns the file *names* and may not know an SD path (hard
 /// rule 4, and the `sdmc:` prefix is libnx's).
 inline constexpr const char* kConfigDir = "sdmc:/config/rommsync/";
+
+/// What an SD-root path from `core/` is prefixed with to open it here.
+///
+/// The mapping `fs::FileSystem::Resolve` performs, spelled once for the callers
+/// that have no `fs::FileSystem` to ask -- which on the console today is all of
+/// them, because nothing implements one for Horizon yet. `kConfigDir` is this
+/// plus the directory `core/` names, and is kept as its own constant because it
+/// is what `Load` is *given* rather than something it derives.
+inline constexpr const char* kSdRoot = "sdmc:";
 
 /// What a pairing attempt needs that neither `core/` nor this file can supply.
 ///
@@ -474,7 +483,13 @@ class SdEngine : public ipc::Engine {
   /// **Null on the console today**: nothing implements `fs::FileSystem` for
   /// Horizon yet (`UseCard`). A restore then refuses with
   /// `RestoreOutcome::kBackupFailed`, whose promise -- nothing was written -- is
-  /// exactly what a build that cannot open the card manages to keep.
+  /// exactly what a build that cannot open the card manages to keep. Listing is
+  /// not affected: `BackupPresent` falls back to `kSdRoot`, because *reading*
+  /// whether a file is there needs one `io::Exists` and no interface at all.
+  ///
+  /// Installing a Horizon `fs::FileSystem` is what makes the restore work on a
+  /// console, and it is not this issue's: it is the same seam the download
+  /// worker and the scheduler need (M7-2, #37).
   fs::FileSystem* card_ = nullptr;
 
   /// The verdict `auth.json` holds, and what a worker consults before calling.

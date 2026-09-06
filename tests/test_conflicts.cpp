@@ -87,6 +87,9 @@ using harness::StatePath;
 
 constexpr std::int64_t kWhen = 1'757'000'000;
 
+/// Enough rounds to walk past `kConflictMaxEmptyPages` and see the loop stop.
+constexpr int kConflictMaxEmptyPagesRounds = overlay::kConflictMaxEmptyPages + 2;
+
 /// A clock that does not move, for every scenario that pins a stamp.
 ///
 /// Not a convenience: a backup name carries a second, and a test that let the
@@ -830,6 +833,28 @@ void Service(checks::Checks& c) {
     c.Expect(sandbox.Exists(backup), "and every backup still on the card");
   }
 
+  // **A build with no `fs::FileSystem` still looks.** `SdEngine` opens `sdmc:`
+  // paths directly for every other record it holds, so answering
+  // `backup_present` blind would draw every entry as restorable and fail at the
+  // press -- the outcome #36 exists to replace. Here the sandbox is not under
+  // `sdmc:`, so an engine with no card reports every backup as missing, which is
+  // the honest answer for a card it cannot reach.
+  {
+    sysmodule::SdEngine cardless;
+    cardless.Load(directory);
+    ipc::ServiceCore blind(cardless);
+    query.offset = 0;
+    c.Expect(Call(blind, ipc::Command::kListConflicts, ipc::EncodeConflictQuery(query),
+                  &response) == ipc::Error::kOk,
+             "an engine with no card still serves the history");
+    const ipc::ConflictPage seen = ipc::DecodeConflictPage(response).value;
+    c.ExpectEq(seen.entries.size(), std::size_t{2}, "with every entry on it");
+    for (const ipc::ConflictRow& row : seen.entries) {
+      c.Expect(!row.backup_present,
+               "and never claims a backup is there when it could not find it");
+    }
+  }
+
   // A reboot: the entries and the ids survive it.
   {
     sysmodule::SdEngine rebooted;
@@ -910,13 +935,40 @@ void Overlay(checks::Checks& c) {
              "the second's backup is gone");
     c.Expect(view.rows[2].restorable == overlay::Restorability::kNothingToRestore,
              "and the keep-both replaced nothing");
-    for (const overlay::ConflictRow& row : view.rows) {
+    c.Expect(view.rows[2].note.find("Nothing was overwritten") != std::string::npos,
+             "which is the sentence for a keep-both, and only for one: " + view.rows[2].note);
+    c.Expect(view.rows[1].note.find("no longer on the card") != std::string::npos,
+             "a conflict whose backup is gone says the backup is gone, not that the save was "
+             "left alone: " + view.rows[1].note);
+    for (const overlay::ConflictListRow& row : view.rows) {
       c.Expect(!row.label.empty(), "every row has a label, in every state");
       if (row.restorable != overlay::Restorability::kReady) {
         c.Expect(!row.note.empty(), "and a row that will not restore always says why");
       }
     }
     c.Expect(!view.can_restore, "the list itself restores nothing");
+
+    // An overwrite that recorded no backup path at all -- a `BackUpFirst` that
+    // failed after the write would produce one. It must not read as "nothing
+    // was overwritten", which would tell a user their save is intact when it is
+    // the one that was replaced.
+    {
+      overlay::ConflictsModel unbacked;
+      unbacked.Next();
+      ipc::ConflictPage orphaned;
+      orphaned.offset = 0;
+      orphaned.total = 1;
+      conflicts::Entry lost = SaveEntry(4, "lost.srm");
+      lost.id = 11;
+      lost.backup_sd_path.clear();
+      orphaned.entries = {Row(lost, false)};
+      unbacked.OnPage(orphaned);
+      const overlay::ConflictsView drawn = unbacked.Render();
+      c.Expect(drawn.rows[0].restorable == overlay::Restorability::kBackupGone,
+               "a conflict with no backup path recorded is unrestorable, not untouched");
+      c.Expect(drawn.rows[0].note.find("Nothing was overwritten") == std::string::npos,
+               "and never says the save was left alone: " + drawn.rows[0].note);
+    }
 
     // A press on an entry whose backup is gone opens it and stops there.
     model.MoveSelection(1);
@@ -979,9 +1031,10 @@ void Overlay(checks::Checks& c) {
     c.Expect(view.headline.find("Restored") != std::string::npos,
              "and says what happened: " + view.headline);
     c.Expect(!view.can_restore, "with the restore no longer on offer");
-    // The card changed, so the loaded rows are one poll old and are re-read.
-    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kListConflicts,
-             "and the list is read again, because backup_present just changed");
+    // Nothing is re-read: a restore rewrites no entry and deletes no backup, so
+    // every loaded row is as true as it was (`OnRestored`).
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
+             "and nothing needs re-reading, because a restore changed no entry");
   }
 
   // A refused page is a page that failed, and says so with a way out.
@@ -993,6 +1046,151 @@ void Overlay(checks::Checks& c) {
     c.Expect(!view.headline.empty() && !view.hint.empty(),
              "a failed page has both a headline and something to do about it");
     c.Expect(view.tone == overlay::Tone::kBad, "and reads as a failure");
+    c.Expect(view.hint.find("press A") != std::string::npos,
+             "on an empty list A is the retry: " + view.hint);
+    model.Activate();
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kListConflicts,
+             "and A asks again");
+  }
+
+  // A page that failed **part way down a loaded list** must not make the rest of
+  // the history unreachable, and must not tell the user to press A -- which on a
+  // loaded list opens the row under the selection.
+  {
+    overlay::ConflictsModel model;
+    model.Next();
+    ipc::ConflictPage first;
+    first.offset = 0;
+    first.total = 12;
+    first.has_more = true;
+    for (int index = 0; index < ipc::kMaxConflictPage; ++index) {
+      conflicts::Entry entry = SaveEntry(4, "page-one-" + std::to_string(index) + ".srm");
+      entry.id = 100 + index;
+      first.entries.push_back(Row(entry, true));
+    }
+    model.OnPage(first);
+    c.ExpectEq(model.loaded(), static_cast<std::size_t>(ipc::kMaxConflictPage),
+               "the first page is loaded");
+
+    model.MoveSelection(ipc::kMaxConflictPage);  // to the bottom; asks for the next
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kListConflicts,
+             "scrolling toward the end asks for the next page");
+    model.OnRefused(ipc::Error::kInternal);
+
+    overlay::ConflictsView view = model.Render();
+    c.ExpectEq(view.rows.size(), static_cast<std::size_t>(ipc::kMaxConflictPage),
+               "the rows already loaded stay -- a failed page is a failed page");
+    c.Expect(view.hint.find("press A") == std::string::npos,
+             "and the hint does not tell the user to press A, which opens a row: " + view.hint);
+    c.Expect(view.hint.find("scroll") != std::string::npos,
+             "...it says what actually retries: " + view.hint);
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
+             "nothing is asked for while the failure stands");
+
+    model.MoveSelection(-1);
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kListConflicts,
+             "and scrolling is the retry: the rest of the history is reachable again");
+  }
+
+  // A restore of an entry **below the first page** keeps the detail and its
+  // outcome. A model that re-read the list here would fetch offset 0, replace
+  // the loaded rows, and lose the entry the user is looking at.
+  {
+    overlay::ConflictsModel model;
+    model.Next();
+    ipc::ConflictPage first;
+    first.offset = 0;
+    first.total = 12;
+    first.has_more = true;
+    for (int index = 0; index < ipc::kMaxConflictPage; ++index) {
+      conflicts::Entry entry = SaveEntry(4, "first-" + std::to_string(index) + ".srm");
+      entry.id = 200 + index;
+      first.entries.push_back(Row(entry, true));
+    }
+    model.OnPage(first);
+    // The prefetch fires within `kConflictPrefetchRows` of the end, not at the
+    // top of a freshly loaded page.
+    model.MoveSelection(ipc::kMaxConflictPage - overlay::kConflictPrefetchRows);
+    const overlay::ConflictsModel::Command prefetch = model.Next();
+    c.Expect(prefetch.kind == overlay::ConflictsModel::Command::Kind::kListConflicts,
+             "scrolling toward the end asks for the second page");
+    c.ExpectEq(prefetch.query.offset, ipc::kMaxConflictPage, "starting where the first ended");
+    ipc::ConflictPage second;
+    second.offset = ipc::kMaxConflictPage;
+    second.total = 12;
+    for (int index = 0; index < 4; ++index) {
+      conflicts::Entry entry = SaveEntry(5, "second-" + std::to_string(index) + ".srm");
+      entry.id = 300 + index;
+      second.entries.push_back(Row(entry, true));
+    }
+    model.OnPage(second);
+    c.ExpectEq(model.loaded(), std::size_t{12}, "both pages are loaded");
+
+    model.MoveSelection(9 - (ipc::kMaxConflictPage - overlay::kConflictPrefetchRows));
+    model.Activate();        // open it
+    model.Activate();        // confirm
+    model.Activate();        // send
+    const overlay::ConflictsModel::Command sent = model.Next();
+    c.Expect(sent.kind == overlay::ConflictsModel::Command::Kind::kRestore,
+             "the restore is sent for an entry on the second page");
+    c.ExpectEq(sent.entry_id, std::int64_t{301}, "the one that was open");
+
+    conflicts::RestoreReport report;
+    report.outcome = conflicts::RestoreOutcome::kRestored;
+    report.backup_sd_path = "/config/rommsync/.backup/4-retroarch-srm-1757000500.srm";
+    model.OnRestored(report);
+    const overlay::ConflictsView after = model.Render();
+    c.Expect(after.mode == overlay::ConflictsMode::kDetail, "the detail stays open");
+    c.Expect(after.headline.find("Restored") != std::string::npos,
+             "showing what happened, not that the entry has gone: " + after.headline);
+    c.ExpectEq(model.loaded(), std::size_t{12},
+               "and the loaded rows are untouched -- a restore rewrites no entry");
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
+             "so nothing needs re-reading");
+  }
+
+  // ...except the one fact a restore does settle: a backup it could not find.
+  {
+    overlay::ConflictsModel model;
+    model.Next();
+    ipc::ConflictPage page;
+    page.offset = 0;
+    page.total = 1;
+    conflicts::Entry entry = SaveEntry(4, "vanished.srm");
+    entry.id = 44;
+    page.entries = {Row(entry, true)};
+    model.OnPage(page);
+    model.Activate();
+    model.Activate();
+    model.Activate();
+    model.Next();
+    conflicts::RestoreReport gone;
+    gone.outcome = conflicts::RestoreOutcome::kBackupMissing;
+    model.OnRestored(gone);
+    c.Expect(model.Back(), "back to the list");
+    const overlay::ConflictsView view = model.Render();
+    c.Expect(view.rows[0].restorable == overlay::Restorability::kBackupGone,
+             "a restore that could not find the backup marks the row it was for");
+  }
+
+  // A producer that echoes the wrong offset forever must not be asked forever.
+  {
+    overlay::ConflictsModel model;
+    for (int round = 0; round < kConflictMaxEmptyPagesRounds; ++round) {
+      if (model.Next().kind != overlay::ConflictsModel::Command::Kind::kListConflicts) {
+        break;
+      }
+      ipc::ConflictPage wrong;
+      wrong.offset = 99;  // not what was asked for
+      wrong.has_more = true;
+      conflicts::Entry entry = SaveEntry(4, "wrong.srm");
+      entry.id = 5;
+      wrong.entries = {Row(entry, true)};
+      model.OnPage(wrong);
+    }
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
+             "a producer answering into the wrong place is not asked once a frame forever");
+    c.ExpectEq(model.loaded(), std::size_t{0}, "and none of its pages were appended");
   }
 
   // A sysmodule that is not there is a first-class state, drawn with the same

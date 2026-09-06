@@ -22,6 +22,7 @@
 #include "rommsync/core.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/json.hpp"
+#include "rommsync/text.hpp"
 #include "rommsync/pairing.hpp"
 
 namespace rommsync::ipc {
@@ -43,17 +44,7 @@ config::Diagnostic Note(config::Severity severity, std::string section, std::str
 /// other places a value the client does not control reaches a payload: a rom's
 /// `fs_name`, which comes off a RomM library, and a verification path, which
 /// comes off a server response.
-void Shorten(std::string* text, std::size_t limit) {
-  if (text->size() <= limit) {
-    return;
-  }
-  std::size_t cut = limit;
-  while (cut > 0 && (static_cast<unsigned char>((*text)[cut]) & 0xC0) == 0x80) {
-    --cut;
-  }
-  text->resize(cut);
-  *text += "...";
-}
+void Shorten(std::string* text, std::size_t limit) { text::ShortenInPlace(text, limit); }
 
 /// `WriteOutcome` for what the engine reported.
 ///
@@ -355,6 +346,12 @@ ConflictPage ServiceCore::ListConflicts(const ConflictQuery& query) {
   }
   if (clamped.offset < 0) {
     clamped.offset = 0;
+  }
+  if (clamped.offset > static_cast<std::int32_t>(conflicts::kMaxEntries)) {
+    // Past the end of anything a history can hold. Answered as the empty page it
+    // would be rather than refused: a screen whose history shrank under it sends
+    // one of these, and `ListConflicts` never fails.
+    clamped.offset = static_cast<std::int32_t>(conflicts::kMaxEntries);
   }
   ConflictPage page;
   page.offset = clamped.offset;

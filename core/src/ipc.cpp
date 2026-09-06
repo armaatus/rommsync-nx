@@ -9,6 +9,7 @@
 
 #include "rommsync/config.hpp"
 #include "rommsync/json.hpp"
+#include "rommsync/text.hpp"
 #include "rommsync/pairing.hpp"
 #include "rommsync/sync.hpp"
 
@@ -434,17 +435,7 @@ bool ReadPlatformMap(const json::Value& object, config::Config* config, json::Er
 ///
 /// The ellipsis is three ASCII dots rather than U+2026 for the same reason: it
 /// is one byte per character whatever the encoding around it.
-void Shorten(std::string* text) {
-  if (text->size() <= kMaxDiagnosticTextBytes) {
-    return;
-  }
-  std::size_t cut = kMaxDiagnosticTextBytes;
-  while (cut > 0 && (static_cast<unsigned char>((*text)[cut]) & 0xC0) == 0x80) {
-    --cut;
-  }
-  text->resize(cut);
-  *text += "...";
-}
+void Shorten(std::string* text) { text::ShortenInPlace(text, kMaxDiagnosticTextBytes); }
 
 }  // namespace
 
@@ -1184,13 +1175,14 @@ Decoded<ConflictQuery> DecodeConflictQuery(std::string_view text) {
       text, "conflict query", [](const json::Value& object, ConflictQuery* out, json::Error* error) {
         std::int64_t offset = 0;
         std::int64_t limit = 0;
-        // The offset is bounded by what a history can hold rather than left to
-        // an `int64_t`: a page past the end is an empty page, and a caller that
-        // asked for one four billion entries in has sent something this build
-        // has no answer for.
-        if (!ReadInteger(object, "offset", &offset, 0,
-                         static_cast<std::int64_t>(conflicts::kMaxEntries), error) ||
-            !ReadInteger(object, "limit", &limit, 1, kMaxConflictPage, error)) {
+        // Both clamped by `ServiceCore::ListConflicts`, not here --
+        // `DecodeListRequest`'s rule and its reason: what the client *wanted* is
+        // a legitimate thing to say, and refusing an offset past the end here
+        // would make `ListConflicts` fail, which `ipc::Engine` documents it never
+        // does. `kMaxRequestedPageSize` is the same wide bound that one uses; the
+        // only value with no meaning at all is a limit of zero.
+        if (!ReadInteger(object, "offset", &offset, 0, kMaxRequestedPageSize, error) ||
+            !ReadInteger(object, "limit", &limit, 1, kMaxRequestedPageSize, error)) {
           return;
         }
         out->offset = static_cast<std::int32_t>(offset);
