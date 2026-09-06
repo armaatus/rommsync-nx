@@ -72,9 +72,12 @@ namespace {
 //     (#37) starts the worker that drives `PumpLists` and the sync tick; each
 //     costs its stack out of this heap.
 //
-// 0xC0000 leaves 108 KiB over that peak, which is the margin a process nobody
-// can attach a debugger to needs: a `bad_alloc` here is `std::terminate`, since
-// the sysmodule builds `-fno-exceptions` (`switch.mk`).
+// 0xC0000 leaves 0x19000 -- 100 KiB -- over that peak, which is the margin a
+// process nobody can attach a debugger to needs: a `bad_alloc` here is
+// `std::terminate`, since the sysmodule builds `-fno-exceptions` (`switch.mk`).
+// The `static_assert` below is tighter still and leaves 0x15000 -- 84 KiB --
+// because it writes the baseline term as twice `kMaxStateBytes`; that, not this
+// sentence, is the margin the build actually enforces.
 //
 // Every term is a bound something else enforces, and each of them moves with
 // this constant rather than independently:
