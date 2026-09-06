@@ -110,6 +110,13 @@ class CountingFileSystem final : public fs::FileSystem {
     return inner_->List(sd_path);
   }
 
+  // `CreateDirectory` joined fs::FileSystem on main while this branch was open.
+  // Forwarded like the rest: this double counts listings, it does not change
+  // what the filesystem does.
+  fs::MakeDirResult CreateDirectory(std::string_view sd_path) override {
+    return inner_->CreateDirectory(sd_path);
+  }
+
   std::string Resolve(std::string_view sd_path) const override { return inner_->Resolve(sd_path); }
 
   std::vector<std::string> listed;

@@ -30,6 +30,7 @@ const char* ToString(MakeDirError error) {
       return "unwritable";
   }
   return "unknown";
+}
 
 bool SplitPath(const std::string& sd_path, std::string* directory, std::string* leaf) {
   const std::size_t slash = sd_path.rfind('/');
