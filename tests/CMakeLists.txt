@@ -664,13 +664,17 @@ endforeach()
 # `(rom_id, file_name)`, so posting a local state over a name the server already
 # holds destroys somebody's session and RomM answers 200.
 #
-# The four unit scenarios are deliberately NOT skippable. `silent` is the
+# The eight unit scenarios are deliberately NOT skippable. `silent` is the
 # off-by-default promise -- no directory read, no request sent -- and it is the
 # one that has to stay checked with docker stopped, because a console reading
 # state folders the user never opted into is silent in every other way. `naming`
 # is the backup path a state has no slot to build from, `scanning` is the
 # ambiguity and duplicate-name rules, and `decides` is the whole decision table
-# including every keep-both branch.
+# including every keep-both branch. `trims`, `placing`, `listing` and
+# `recording` came out of the self-review and need no server either: the shared
+# baseline budget, a state this console lacks being created rather than written
+# over, a listing the client cannot work from stopping the run, and an upload's
+# row coming from the scan.
 add_executable(test_state_sync test_state_sync.cpp)
 target_link_libraries(test_state_sync PRIVATE rommsync::host)
 target_include_directories(test_state_sync PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
