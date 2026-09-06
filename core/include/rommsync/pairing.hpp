@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "rommsync/auth.hpp"
+#include "rommsync/backoff.hpp"
 #include "rommsync/http.hpp"
 
 namespace rommsync::auth {
@@ -226,10 +227,18 @@ class PairingSession {
 
   /// Schedule the next poll `delay` from now, never sooner than the server's
   /// interval.
-  void ScheduleIn(std::chrono::seconds delay);
+  void ScheduleIn(std::chrono::milliseconds delay);
 
-  /// Back off after a transient failure: the interval doubled once per
-  /// consecutive failure, capped by `max_poll_backoff`.
+  /// Back off after a transient failure.
+  ///
+  /// The policy is `retry::Backoff` and is no longer spelled here: the interval
+  /// doubled once per consecutive failure, capped by `max_poll_backoff`, and --
+  /// since M7-2 (#37) -- jittered, so two consoles polling the same RomM do not
+  /// stay in lockstep through a bad minute (backoff.hpp).
+  ///
+  /// The curve is configured here rather than at construction because its floor
+  /// is the `interval` the *server* answered `init` with, which is not known
+  /// until `Begin()` has run.
   void BackOff();
 
   http::HttpClient& client_;
@@ -242,7 +251,11 @@ class PairingSession {
   std::optional<DeviceTokenResponse> token_;
   TimePoint deadline_{};
   TimePoint next_poll_{};
-  int transient_failures_ = 0;
+
+  /// The one retry curve in this client, shared with the scheduler (M7-2, #37).
+  /// Its failure count is what `transient_failures_` used to be.
+  retry::Backoff backoff_;
+
   int rejected_polls_ = 0;
 };
 

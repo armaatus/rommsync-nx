@@ -1011,6 +1011,36 @@ foreach(scenario IN LISTS COMPLETE_RIG_SCENARIOS)
   set_tests_properties(complete.${scenario} PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
 endforeach()
 
+# --- M7-2: when a tick runs ---------------------------------------------------
+# The scheduler and the one backoff curve it shares with `auth::PairingSession`.
+# Every scenario drives an injected steady clock and an injected wall clock, so
+# an interval, a suspend and a day of retries are arithmetic rather than a wait.
+#
+# **None of these may ever need a server**, and that is the point rather than a
+# convenience: what they pin is that the schedule does *not* fire -- a claim
+# about requests that were never made, which no running RomM can witness.
+# `sched.idle` is the battery one and `sched.suspend` the one a console produces
+# several times a day.
+add_executable(test_scheduler test_scheduler.cpp)
+target_link_libraries(test_scheduler PRIVATE rommsync::core)
+target_include_directories(test_scheduler PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+
+set(SCHEDULER_SCENARIOS
+  backoff   # doubles, caps, jitters, and never falls below the floor
+  interval  # exactly one tick per interval, whatever the poll rate
+  ondemand  # interval_min = 0: boot and Sync now, and no timer
+  disabled  # the switch: never fires, and refuses a request rather than queueing it
+  suspend   # a clock advanced past several intervals is ONE catch-up tick
+  skew      # a wall clock corrected in either direction: no storm, no stall
+  failures  # backoff after a failed tick, floor again after a success
+  tls       # a handshake failure is capped rather than retried forever
+  idle      # a day switched off costs no wakeups; a day offline costs tens of ticks
+)
+foreach(scenario IN LISTS SCHEDULER_SCENARIOS)
+  add_test(NAME sched.${scenario} COMMAND test_scheduler ${scenario})
+  set_tests_properties(sched.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
 # --- M2-7: an interrupted tick ------------------------------------------------
 # The stages are individually safe since M2-4/5/6; what these check is what is
 # left on the card *between* them. Every rig scenario runs `sync::RunTick` inside

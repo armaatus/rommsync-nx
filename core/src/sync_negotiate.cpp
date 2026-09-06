@@ -174,10 +174,14 @@ std::optional<Negotiation> Refused(const http::Result& result) {
                                               : result.message));
   }
   if (!result.ok()) {
-    return Refuse(NegotiateError::kUnreachable,
-                  std::string("the negotiation did not complete: ") +
-                      http::ToString(result.error) +
-                      (result.message.empty() ? "" : " (" + result.message + ")"));
+    Negotiation refused =
+        Refuse(NegotiateError::kUnreachable,
+               std::string("the negotiation did not complete: ") + http::ToString(result.error) +
+                   (result.message.empty() ? "" : " (" + result.message + ")"));
+    // Kept for the one caller that treats a handshake failure differently from a
+    // dropped connection: the scheduler (`Negotiation::transport`).
+    refused.transport = result.error;
+    return refused;
   }
 
   const int status = result.response.status;
