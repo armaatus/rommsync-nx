@@ -47,6 +47,23 @@ constexpr Result MalformedResponse() {
   return MAKERESULT(Module_Libnx, LibnxError_InvalidCmifOutHeader);
 }
 
+/// The `ipc::Error` a failing `Result` carries, when it carries one.
+///
+/// The sysmodule maps every refusal onto `MAKERESULT(ipc::kResultModule, <the
+/// enum's ordinal>)` (`sysmodule/source/ipc/service.hpp`), and until this
+/// existed the overlay threw that away: `Enqueue` answering `kDuplicate` and a
+/// sysmodule that is not running both reached a screen as "a `Result` that
+/// failed", so `ScreenFrame::Diagnose` read the first as the second and drew
+/// "sys-rommsync is not running" over a rom that was simply already queued.
+/// M4-3 (#25) is the first screen whose refusals mean different things.
+///
+/// True when `rc` is one of ours and `out` now holds it -- the *command*
+/// refused, and the sysmodule is there. False for anything else, including a
+/// description in our module that this build has no `Error` for: a sysmodule
+/// from a newer release, which is `Diagnose`'s to name rather than a refusal to
+/// invent. `kOk` is never reported here; a `Result` of 0 has not failed.
+bool DecodeError(Result rc, ipc::Error* out);
+
 /// A session on `sys-rommsync`.
 ///
 /// `Open` assumes `smInitialize()` has already been called -- Tesla does it

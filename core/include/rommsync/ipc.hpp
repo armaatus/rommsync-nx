@@ -113,6 +113,23 @@ inline constexpr std::uint32_t kVersion = 2;
 /// answered something enormous is a named refusal rather than an allocation.
 inline constexpr std::size_t kMaxPayloadBytes = 8 * 1024;
 
+/// The Horizon result module `Error` is reported under, and the one number on
+/// this wire that `core/` states without being able to name its type.
+///
+/// It is here rather than in `sysmodule/source/ipc/service.hpp`, where it was
+/// written, because **both** halves need it: the sysmodule maps an `Error` onto
+/// `MAKERESULT(kResultModule, <the enum's ordinal>)`, and the overlay has to map
+/// it back -- a `kDuplicate` and a sysmodule that is not running arrive at a
+/// screen as two failing `Result`s and nothing else (`overlay/ipc_client.hpp`,
+/// `DecodeError`). Two copies of the number is the two halves disagreeing about
+/// a wire constant, which is what this header exists to prevent.
+///
+/// Arbitrary, and ours: nothing allocates module numbers to homebrew, so what
+/// matters is only that it is not one a caller would confuse for somebody
+/// else's. Deliberately not `Module_Libnx` (345), which is what a libnx call
+/// itself failing reports.
+inline constexpr std::uint32_t kResultModule = 420;
+
 // --- the command set ----------------------------------------------------------
 
 /// The commands, by id.
@@ -234,6 +251,28 @@ enum class Error {
 
 /// Stable, log-friendly name -- `queue_full`. Never null.
 const char* ToString(Error error);
+
+/// Every error, in ordinal order. The same reason `kAllCommands` exists: an
+/// enum whose extent is written down once cannot drift from a second copy of
+/// the list.
+inline constexpr std::array kAllErrors = {
+    Error::kOk,          Error::kInvalid,       Error::kWriteFailed,
+    Error::kNotConfigured, Error::kUnknownRom,  Error::kQueueFull,
+    Error::kDuplicate,   Error::kMultiFile,     Error::kNotQueued,
+    Error::kBadCursor,   Error::kOffline,       Error::kUnknownCommand,
+    Error::kMalformedRequest, Error::kTooLarge, Error::kInternal,
+    Error::kUnavailable,
+};
+
+/// True when `ordinal` names an error this build knows, in which case `out`
+/// holds it.
+///
+/// The inverse of the sysmodule's `Error` -> `Result` mapping, which is by
+/// ordinal (`sysmodule/source/ipc/service.hpp`), and the reason the ordinals
+/// are append-only: this is how the *overlay* reads a refusal back off a
+/// failing `Result` (`overlay::DecodeError`). An ordinal from a newer sysmodule
+/// is false rather than guessed.
+bool IsError(std::uint32_t ordinal, Error* out = nullptr);
 
 /// A value and the reason there isn't one: `value` is default-constructed on
 /// failure and must not be used -- check `ok()`.
@@ -522,6 +561,77 @@ enum class ListKind {
   kQueue,      ///< served from `queue.json`, never from RomM
 };
 const char* ToString(ListKind kind);
+
+/// The field names each `ListKind`'s items carry, pinned once.
+///
+/// An item is a flat object of scalars and `ListItem::Find` reads one *by name*
+/// (below), so a producer and a consumer that spell the same field differently
+/// do not fail to build -- they render a page of empty rows on a console. The
+/// producer is M5-4 (#31) and the first consumer is M4-3's `LibraryBrowserModel`
+/// (`overlay_library_model.hpp`); they were written in different worktrees, so
+/// the names live here, where the rest of this wire's field names already do.
+///
+/// **These are the projections, whole.** A kind carries these fields and no
+/// others: `AppendIfItFits` bounds a page by *bytes*, so an extra field on a rom
+/// is fewer roms per page for every user, forever.
+///
+/// #25 and #31 named two of them differently before this was written down --
+/// `rom_id`/`id` and `size_bytes`/`fs_size_bytes`. Settled as `rom_id` and
+/// `size_bytes`: the queue kind has to say `rom_id` because that is what a
+/// `download::QueueEntry` is keyed by and what `EncodeRomId` puts on the wire
+/// for `Enqueue`, and `core/` already renames RomM's `fs_size_bytes` to
+/// `size_bytes` in `roms::Rom` and `download::RomDetail`. One name for one
+/// thing, across all three kinds.
+namespace list_keys {
+
+/// `kPlatforms`. `mapped` is `config::Config::Platform(fs_slug) != nullptr` as
+/// the *sysmodule* reads it -- the overlay never opens `config.ini` to decide
+/// whether a platform has a folder, and a platform with none is drawn as
+/// skipped with the reason rather than hidden (#25).
+/// RomM's row id, which is what `ListRequest::platform_id` takes. #25's scope
+/// named only the slug; the slug is what `config::Config::platforms` is keyed
+/// by and what a user reads, and the id is what opens the rom list, so the
+/// projection carries both.
+inline constexpr std::string_view kPlatformId = "id";
+inline constexpr std::string_view kPlatformFsSlug = "fs_slug";
+inline constexpr std::string_view kPlatformName = "name";
+inline constexpr std::string_view kPlatformRomCount = "rom_count";
+inline constexpr std::string_view kPlatformMapped = "mapped";
+
+/// `kRoms`.
+///
+/// `on_disk` and `queued` are what let the browser grey a row *before* a press
+/// rather than after one: neither is an `Error` -- `Enqueue` accepts both and
+/// the worker settles them `kDone`/`kSkipped` (`download.hpp`) -- so without
+/// them a user would queue a rom that is already on the card and see nothing
+/// happen.
+///
+/// `fs_name` is the *directory's* name for a nested single-file rom and
+/// therefore carries no extension (#21). It is not a file name to derive
+/// anything from.
+inline constexpr std::string_view kRomId = "rom_id";
+inline constexpr std::string_view kRomName = "name";
+inline constexpr std::string_view kRomFsName = "fs_name";
+inline constexpr std::string_view kRomPlatformFsSlug = "platform_fs_slug";
+inline constexpr std::string_view kRomSizeBytes = "size_bytes";
+inline constexpr std::string_view kRomHasMultipleFiles = "has_multiple_files";
+inline constexpr std::string_view kRomOnDisk = "on_disk";
+inline constexpr std::string_view kRomQueued = "queued";
+
+/// `kQueue`, which is served from `queue.json` and never from RomM (#31), so
+/// every one of these is a `download::QueueEntry` field of the same name.
+/// `state` is `download::ToString(QueueState)`.
+inline constexpr std::string_view kQueueRomId = "rom_id";
+inline constexpr std::string_view kQueueFsName = "fs_name";
+inline constexpr std::string_view kQueuePlatformFsSlug = "platform_fs_slug";
+inline constexpr std::string_view kQueueState = "state";
+inline constexpr std::string_view kQueueBytesDone = "bytes_done";
+inline constexpr std::string_view kQueueSizeBytes = "size_bytes";
+inline constexpr std::string_view kQueueBytesPerSecond = "bytes_per_second";
+inline constexpr std::string_view kQueueAttempts = "attempts";
+inline constexpr std::string_view kQueueMessage = "message";
+
+}  // namespace list_keys
 
 /// How many items one page may hold, whatever the client asks for.
 ///

@@ -312,6 +312,15 @@ to a failure would be attaching them to something nobody can read. Commands
 whose failure carries nothing -- `Unpair`, `Enqueue`, `ListNext` -- keep
 reporting it as an `ipc::Error`, which the sysmodule maps to a `Result`.
 
+The mapping is by ordinal -- `MAKERESULT(ipc::kResultModule, <the enum's
+ordinal>)` -- and it runs in **both** directions. The sysmodule maps an
+`ipc::Error` onto a `Result` (`sysmodule/source/ipc/service.cpp`) and the
+overlay maps it back (`overlay::DecodeError`), because otherwise a refusal and a
+sysmodule that is not running reach a screen as the same failing `Result`: an
+`Enqueue` answering `kDuplicate` would be drawn as "sys-rommsync is not
+running". That is why the ordinals are append-only and why `ipc::kResultModule`
+lives in `core/` rather than beside the mapping.
+
 Three more errors belong to the transport rather than to any one command:
 `kUnknownCommand` (an id this build does not implement -- the two halves are
 different releases), `kMalformedRequest` (a request payload that did not decode)
@@ -356,6 +365,8 @@ progress rides on the `queue` list kind (M5-4).
 | `overlay/source/ipc_client.*` | `smGetService("rommsync")` and the *same* codecs |
 | `core/include/rommsync/overlay_status_view.hpp` | what the status screen *says*, decided off the framebuffer (`overlay.status`) |
 | `core/include/rommsync/overlay_pairing_view.hpp` | the same for the pairing screen: the code, the address, the countdown, and which of four sentences a dead pairing gets (`overlay.pairing`) |
+| `core/include/rommsync/overlay_sync_actions.hpp` | the sync screen: which control may be pressed, and what a refused press says (`overlay.sync_actions`) |
+| `core/include/rommsync/overlay_library_model.hpp` | the library browser: the cursor stack, the loaded pages, the selection and the per-row answer to a press (`overlay.library`) |
 
 `core/` may not name a libnx type (hard rule 4), so the errors are a portable
 `ipc::Error` and the sysmodule maps them to a Horizon `Result` at the boundary.
@@ -390,7 +401,11 @@ Nothing on this wire may grow with the size of the library or of `config.ini`:
 
 - Lists page. `kMaxPageSize` is a count cap and is *not* the binding one -- a
   rom's name is the user's data -- so a producer fills a page with
-  `ipc::AppendIfItFits`, which stops on whichever bound comes first.
+  `ipc::AppendIfItFits`, which stops on whichever bound comes first. Each list
+  kind's item is a flat object of scalars with a fixed set of field names,
+  pinned once in `ipc::list_keys` because the producer (M5-4) and the consumer
+  (M4-3) were written in different worktrees and a field spelled two ways does
+  not fail to build -- it renders a page of empty rows on a console.
 - `GetConfig` never fails, so a `[platform.*]` map too large to send is dropped
   whole and flagged (`platforms_truncated`) rather than refused or served
   half-empty, and diagnostics are trimmed to `kMaxDiagnosticsInPayload` with a

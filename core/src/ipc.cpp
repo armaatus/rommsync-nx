@@ -519,6 +519,18 @@ bool IsCommand(std::uint32_t id, Command* out) {
   return false;
 }
 
+bool IsError(std::uint32_t ordinal, Error* out) {
+  for (const Error candidate : kAllErrors) {
+    if (static_cast<std::uint32_t>(candidate) == ordinal) {
+      if (out != nullptr) {
+        *out = candidate;
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
 const char* ToString(Error error) {
   switch (error) {
     case Error::kOk:

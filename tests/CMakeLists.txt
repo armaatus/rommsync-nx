@@ -302,6 +302,33 @@ target_compile_definitions(test_overlay_sync PRIVATE
   ROMMSYNC_OVERLAY_SOURCE_DIR="${CMAKE_SOURCE_DIR}/overlay/source")
 add_test(NAME overlay.sync_actions COMMAND test_overlay_sync)
 
+# --- the overlay's library browser -------------------------------------------
+# M4-3. The one screen with state: a cursor stack, a set of loaded pages, a
+# selection and a per-row answer to a press, spread across as many IPC round
+# trips as the user scrolls. `LibraryBrowserModel` calls nothing -- it asks for
+# one command at a time and is told what came back -- which is what lets this
+# suite drive it through paging cases a console would need a ten-thousand-rom
+# library to reproduce: an exact page boundary, an empty page, a `pending` one,
+# a page that fails mid-scroll, and a cursor the sysmodule reclaimed.
+#
+# The pages go through `AppendIfItFits` and the real codec rather than being
+# hand-filled: the model reads its fields *by name* (`ipc::list_keys`), so a
+# suite that skipped the wire would agree with itself while a real page decoded
+# to empty rows.
+#
+# The overlay's source directory and the view model's two paths are compiled in
+# because three criteria are about the code rather than about its behaviour: the
+# screen may not write `config.ini`, it may not call an engine, and the model
+# may not name a libnx or libultrahand type. Only a grep can say so.
+add_executable(test_overlay_library test_overlay_library.cpp)
+target_link_libraries(test_overlay_library PRIVATE rommsync::core)
+target_include_directories(test_overlay_library PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_overlay_library PRIVATE
+  ROMMSYNC_OVERLAY_SOURCE_DIR="${CMAKE_SOURCE_DIR}/overlay/source"
+  ROMMSYNC_LIBRARY_MODEL_HDR="${CMAKE_SOURCE_DIR}/core/include/rommsync/overlay_library_model.hpp"
+  ROMMSYNC_LIBRARY_MODEL_SRC="${CMAKE_SOURCE_DIR}/core/src/overlay_library_model.cpp")
+add_test(NAME overlay.library COMMAND test_overlay_library)
+
 # --- rig smoke test: proves docker RomM + fault proxy + ctest all work -------
 # Uses libcurl directly on purpose. It tests the RIG, not our code, and must
 # keep working while M0-2 replaces it as the way production code speaks HTTP.
