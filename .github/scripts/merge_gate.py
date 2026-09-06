@@ -39,6 +39,11 @@ import sys
 # `.github/scripts/` is in here for the same reason as the other two: this file
 # IS the gate, so a PR that changes what "may merge" means must not be able to
 # merge itself on the strength of its own new rules.
+# Shorter than any real review and longer than "test", "lgtm" or a stray
+# newline. A number rather than a heuristic, because the alternative is judging
+# review quality, which this script cannot do and should not pretend to.
+MIN_REVIEW_BODY = 40
+
 HUMAN_ONLY_PREFIXES = (".claude/", ".github/workflows/", ".github/scripts/")
 
 # What the PR body has to show. These are the two local passes CLAUDE.md
@@ -75,6 +80,31 @@ def evaluate(head_sha, pull_request, changed_files):
         if ((r.get("author") or {}).get("login") or "").lower() != pr_author
     ]
     on_head = [r for r in reviews if ((r.get("commit") or {}).get("oid") == head_sha)]
+
+    # A review RECORD is not a review. PR #95 merged on one whose entire body was
+    # the word "test": the reviewer posted it at 02:45:34, this gate went green
+    # 13 seconds later, and the real review -- 3812 characters, CHANGES_REQUESTED
+    # -- arrived at 03:01, six minutes after the code was already on main.
+    #
+    # So a review has to carry something a person could act on: a body with
+    # substance, or at least one inline comment. Empty COMMENTED records are
+    # routine and harmless in themselves -- every thread reply creates one -- but
+    # they must not be what satisfies the independence requirement.
+    #
+    # The bar is deliberately low. It is here to catch nothing-at-all, not to
+    # judge quality, which no substring test can do.
+    substantive = [
+        r for r in on_head
+        if len((r.get("body") or "").strip()) >= MIN_REVIEW_BODY
+        or ((r.get("comments") or {}).get("totalCount") or 0) > 0
+    ]
+    if on_head and not substantive:
+        problems.append(
+            f"the only reviews on {head_sha[:8]} are empty -- no body worth "
+            "reading and no inline comment. A review record is not a review: "
+            "PR #95 merged on one whose body was the word \"test\". Wait for the "
+            "review job to actually submit its findings."
+        )
     if not on_head:
         problems.append(
             f"no independent review has been submitted against the current head "
@@ -132,7 +162,7 @@ SELFTEST = [
             "body": "## Review findings\n/code-review high\nmattpocock-skills:code-review\n",
             "reviews": {"nodes": [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
-                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}},
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
             "reviewThreads": {"nodes": []},
         },
@@ -146,7 +176,7 @@ SELFTEST = [
             "body": "just some prose",
             "reviews": {"nodes": [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
-                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}},
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
             "reviewThreads": {"nodes": []},
         },
@@ -160,7 +190,7 @@ SELFTEST = [
             "body": "/code-review\nmattpocock-skills:code-review",
             "reviews": {"nodes": [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
-                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}},
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
             "reviewThreads": {"nodes": []},
         },
@@ -174,7 +204,7 @@ SELFTEST = [
             "body": "/code-review\nmattpocock-skills:code-review",
             "reviews": {"nodes": [
                 {"state": "CHANGES_REQUESTED", "submittedAt": "2026-09-05T10:00:00Z",
-                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}},
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
             "reviewThreads": {"nodes": []},
         },
@@ -190,9 +220,9 @@ SELFTEST = [
             "body": "/code-review\nmattpocock-skills:code-review",
             "reviews": {"nodes": [
                 {"state": "CHANGES_REQUESTED", "submittedAt": "2026-09-05T10:00:00Z",
-                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}},
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T11:00:00Z",
-                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}},
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
             "reviewThreads": {"nodes": []},
         },
@@ -206,7 +236,7 @@ SELFTEST = [
             "body": "/code-review\nmattpocock-skills:code-review",
             "reviews": {"nodes": [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
-                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}},
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
             "reviewThreads": {"nodes": [
                 {"isResolved": False, "path": "core/src/sync.cpp", "line": 42},
@@ -223,7 +253,7 @@ SELFTEST = [
             "body": "/code-review\nmattpocock-skills:code-review",
             "reviews": {"nodes": [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
-                 "commit": {"oid": "abc123"}, "author": {"login": "armaatus"}},
+                 "commit": {"oid": "abc123"}, "author": {"login": "armaatus"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
             "reviewThreads": {"nodes": []},
         },
@@ -238,7 +268,7 @@ SELFTEST = [
             "body": "/code-review\nmattpocock-skills:code-review",
             "reviews": {"nodes": [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
-                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}},
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
             "reviewThreads": {"nodes": []},
         },
@@ -252,7 +282,7 @@ SELFTEST = [
             "body": "/code-review\nmattpocock-skills:code-review",
             "reviews": {"nodes": [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
-                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}},
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
             "reviewThreads": {"nodes": []},
         },
@@ -266,7 +296,7 @@ SELFTEST = [
             "body": "/code-review\nmattpocock-skills:code-review",
             "reviews": {"nodes": [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
-                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}},
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
             "reviewThreads": {"nodes": []},
         },
@@ -280,12 +310,43 @@ SELFTEST = [
             "body": "/code-review\nmattpocock-skills:code-review",
             "reviews": {"nodes": [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
-                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}},
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
             "reviewThreads": {"nodes": []},
         },
         [".github/workflows/ci.yml"],
         False,
+    ),
+    (
+        "a review with nothing in it does not count",
+        "abc123",
+        {
+            "body": "## Review findings\n/code-review high\nmattpocock-skills:code-review\n",
+            "reviews": {"nodes": [
+                # PR #95 merged on exactly this: body "test", no inline comments.
+                {"state": "COMMENTED", "submittedAt": "2026-09-06T02:45:34Z",
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"},
+                 "body": "test"},
+            ]},
+            "reviewThreads": {"nodes": []},
+        },
+        ["core/src/sync.cpp"],
+        False,
+    ),
+    (
+        "...but an empty body with an inline comment does",
+        "abc123",
+        {
+            "body": "## Review findings\n/code-review high\nmattpocock-skills:code-review\n",
+            "reviews": {"nodes": [
+                {"state": "COMMENTED", "submittedAt": "2026-09-06T02:45:34Z",
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"},
+                 "body": "", "comments": {"totalCount": 1}},
+            ]},
+            "reviewThreads": {"nodes": []},
+        },
+        ["core/src/sync.cpp"],
+        True,
     ),
 ]
 
