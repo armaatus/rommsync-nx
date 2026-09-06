@@ -827,7 +827,7 @@ two cannot drift.
 | `sync` | Full sync engine (M2) passes on host + docker RomM, including conflict / partial-failure / resume. | `sync.*`, `execute.*`, `states.*`, `complete.*`, `tick.*`, `scan.*`, `core.state_db`, `core.md5`, `core.sha1*`, and the three the box names by hand: `harness.conflict`, `harness.partial`, `harness.resume` |
 | `downloads` | Downloads (M3) pass with Range resume + hash verify against docker RomM. | `download.*`, `rom.*`, `toggle.download`, `http.range*`, `http.resume*`, `wire.range*`, `wire.resume*`, `harness.content_hash`, `harness.multifile` |
 | `auth` | Auth (M1) full device-code flow + 401/refresh proven on host + docker RomM. | `auth.*`, `pair.*`, `device.*`, `core.token_store`, `core.device_identity`, `harness.expired`, and M1-6's `engine.pairs`, `engine.repairs`, `engine.nonblocking`, `engine.unauthenticated` |
-| `ipc` | Config + IPC (M5) proven on host harness. | `core.config`, `config.*`, `ipc.*`, `lists.*`, `overlay.*`, `engine.config`, `engine.commands` |
+| `ipc` | Config + IPC (M5) proven on host harness. | `core.config`, `config.*`, `ipc.*`, `lists.*`, `overlay.*`, `engine.config`, `engine.commands`. What these prove is the protocol; `sysmodule/source/ipc/server.cpp` is libnx `cmif` glue that no test reaches either, and it is verified with the rest of the Horizon glue at M8-2. |
 | `ssl` | HttpClient ssl-service backend proven in a Ryujinx NRO (M0-1), or on an isolated NRO on a backup SD. | **Nothing yet.** `switch.builds` and `switch.tlsprobe` prove it compiles and links for aarch64; no handshake has been executed anywhere. See *what the first console decides*. |
 | `backup` | Every save-overwrite path shown to back up first (SYNC_PROTOCOL hard rule) -- verified by tests. | `harness.backup`, `execute.*`, `states.overwrite`, `states.keeps_both`, `tick.backupdir`, `tick.durable` — **and a census** of every `io::CommitStaged`/`CopyAtomically`/`WriteAtomically` call site in `core/`, so a *new* overwrite path fails the gate until somebody classifies it. That census is the word "every"; the tests are the rest. |
 | `release` | A tagged, released v1 build exists (M6). | A `v1` tag reachable from `main` that agrees with `VERSION`, and a published, non-draft release carrying the zip and `SHA256SUMS`. **Failing today: this repository has no tags and no releases.** |
@@ -843,20 +843,30 @@ scripts/v1-gate.sh --audit  # is the gate itself still well formed? (ctest -R ga
 
 The exit code is the answer: **0** every row holds and M8-2 may begin, **1** a
 row this machine can decide is failing, **3** nothing failing but a row is held
-on a console or on a person. 3 is what it answers today.
+on a console or on a person. 3 is what it answers today — and **0 is unreachable
+until somebody edits the script.** There is no flag, file or environment variable
+that ticks a `console` row, deliberately: no input a script can take is evidence
+that a handshake happened on a console, so accepting one would be a checkbox
+impersonating a measurement. When a console answers a row, the answer goes into
+the docs and the row stops being a `console` row in the same commit. A reviewed
+edit, by a person, is the attestation.
 
 Two things it refuses to do, both of them the same refusal in different clothes:
 
-- **A skipped test is not a pass.** `rig.smoke` skips when RomM is not running
-  and most of this gate is written against RomM, so a row containing a skipped
-  test comes back HELD with the names. A green `ctest` over a dead rig is the
-  original sin this whole page is about.
+- **A skipped test is not a pass**, and neither is one that never reported at
+  all. `rig.smoke` skips when RomM is not running and most of this gate is
+  written against RomM, so a row containing a skipped test comes back HELD with
+  the names; a run that stopped early — ctest aborting, a `^C`, a crashed rig —
+  leaves rows naming tests that produced no result, and those rows FAIL rather
+  than inheriting a pass from the absence of a failure. A green `ctest` over a
+  dead rig is the original sin this whole page is about.
 - **It never reports the gate as passing while a row is held.** Six rows are
   decidable on a laptop and two are not, and no amount of work in this repo
   changes which is which.
 
-`ctest -R gate` runs `gate.audit`, `gate.rows`, `gate.sites`, `gate.evidence`,
-`gate.release` and `gate.doc`. Those check the gate's *machinery* — every row
+`ctest -R '^gate\.'` runs `gate.audit`, `gate.rows`, `gate.sites`,
+`gate.evidence`, `gate.release` and `gate.doc` (anchored, since a bare `gate`
+also matches `auth.gate_*`). Those check the gate's *machinery* — every row
 still points at a test that exists, the census still matches `core/`, a skip
 still holds a row, this table still matches the script. They deliberately do not
 report the verdict: `ctest` going green must never be readable as "the gate

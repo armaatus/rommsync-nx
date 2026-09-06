@@ -739,8 +739,8 @@ anyone would miss* — is re-checked on every `ctest` by the `policy.*` tests. T
 waits for. It lives in issue **M8-1** and in
 [`scripts/v1-gate.sh`](../scripts/v1-gate.sh), which owns its eight rows, runs
 the evidence for the six a laptop can decide, and refuses to report a pass while
-the other two have never been executed anywhere. `ctest -R gate` checks that
-machinery; the verdict is the script's exit code, and today it is 3.
+the other two have never been executed anywhere. `ctest -R '^gate\.'` checks
+that machinery; the verdict is the script's exit code, and today it is not 0.
 
 ### Worktree isolation
 

@@ -171,8 +171,12 @@ M0-5's wording that belong to the milestone writing that engine.
 ## M8 — Hardware bring-up (after proven v1)
 
 First contact with a real modded Switch. **Gated:** nothing here starts until the
-v1 gate passes. Everything below the thin Horizon glue has already been proven on
-host + docker RomM + Ryujinx.
+v1 gate passes — `./scripts/v1-gate.sh` is that gate, and it exits non-zero.
+Everything below the thin Horizon glue has already been proven on host + docker
+RomM. **Not on Ryujinx:** that rung turned out not to be available here at all
+(it needs `prod.keys` and a firmware dump, which hard rule 1 forbids), and it
+could not have settled the certificate half anyway
+([DEVELOPMENT.md](docs/DEVELOPMENT.md#m0-1-the-measurement-and-the-decision)).
 
 - **M8-1** `risk` **v1 gate — do not touch hardware until this passes.** Eight
   rows: sync/downloads/auth/config+IPC all green on host + docker; `ssl` backend

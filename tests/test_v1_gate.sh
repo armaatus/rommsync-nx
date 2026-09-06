@@ -56,11 +56,16 @@ build_dir() {
 # Everything mutated by a negative case is mutated here rather than in the
 # checkout -- a test that edits core/ to prove a check works is a test that can
 # leave the tree wrong.
+# The census reads all three source roots, not just core/, so all three are
+# copied -- a fixture missing one would fail for the wrong reason and say so in
+# words that look like the finding under test.
 fake_repo() {
   local root="$1"
-  mkdir -p "$root/scripts" "$root/core"
+  mkdir -p "$root/scripts" "$root/core" "$root/sysmodule" "$root/overlay"
   cp "$GATE" "$root/scripts/v1-gate.sh"
   cp -R "$REPO_ROOT/core/src" "$root/core/src"
+  cp -R "$REPO_ROOT/sysmodule/source" "$root/sysmodule/source"
+  cp -R "$REPO_ROOT/overlay/source" "$root/overlay/source"
   cp "$REPO_ROOT/VERSION" "$root/VERSION"
   chmod +x "$root/scripts/v1-gate.sh"
 }
@@ -135,24 +140,32 @@ phase_rows() {
 
 # --- the save-overwrite census ------------------------------------------------
 
-census_must_fail() {
-  local what="$1" expect="$2"
-  local root="$3" out status
-  out="$("$root/scripts/v1-gate.sh" --rows >/dev/null 2>&1; cd "$root" && "$root/scripts/v1-gate.sh" --audit --build-dir "${4:-}" 2>&1)"
-  status=$?
-  [ "$status" -ne 0 ] || fail "$what: the census accepted core/ as it now is:
+# Deletes exactly one call to BackUpFirst -- never the definition, never a
+# mention in a comment -- and insists the census notices. `$expr` is the sed that
+# removes the call in `$file`.
+no_backup_call_fails() {
+  local file="$1" expr="$2" what="$3" build="$4"
+  local root out
+  root="$(scratch)/no-backup-$(basename "$file" .cpp)"
+  rm -rf "$root"; fake_repo "$root"
+  sed "$expr" "$root/$file" > "$root/$file.edited"
+  mv "$root/$file.edited" "$root/$file"
+  grep -q "NoBackupAtAll(" "$root/$file" \
+    || fail "$what: the fixture did not remove a call -- '$expr' matched nothing in $file"
+  out="$("$root/scripts/v1-gate.sh" --audit --build-dir "$build" 2>&1)"
+  [ $? -ne 0 ] || fail "$what: a save path with no call to BackUpFirst passed the census:
 $out"
   case "$out" in
-    *"$expect"*) ;;
-    *) fail "$what: expected '$expect', got:
+    *"no CALL to BackUpFirst ahead of it"*) ;;
+    *) fail "$what: expected the census to name the missing backup, got:
 $out" ;;
   esac
-  echo "ok: $what"
+  echo "ok: removing only the call, in $what, fails the census"
 }
 
 phase_sites() {
-  local build="${1:-}"
-  local root out status
+  local build; build="$(build_dir "${1:-}")" || exit 1
+  local root out
 
   # A second commit onto bytes, added to a file the census already knows. This
   # is what a new save-writing path looks like on the day somebody writes one,
@@ -161,7 +174,7 @@ phase_sites() {
   cat >> "$root/core/src/state_db.cpp" <<'EOF'
 namespace { void ProbeSite() { io::CommitStaged("a", "b"); } }
 EOF
-  out="$("$root/scripts/v1-gate.sh" --audit ${build:+--build-dir "$build"} 2>&1)"
+  out="$("$root/scripts/v1-gate.sh" --audit --build-dir "$build" 2>&1)"
   [ $? -ne 0 ] || fail "a new commit site in state_db.cpp did not fail the census:
 $out"
   case "$out" in
@@ -178,7 +191,7 @@ $out" ;;
 #include "rommsync/atomic_file.hpp"
 namespace { void ProbeSite() { io::CommitStaged("a", "b"); } }
 EOF
-  out="$("$root/scripts/v1-gate.sh" --audit ${build:+--build-dir "$build"} 2>&1)"
+  out="$("$root/scripts/v1-gate.sh" --audit --build-dir "$build" 2>&1)"
   [ $? -ne 0 ] || fail "a commit site in a brand new file did not fail the census:
 $out"
   case "$out" in
@@ -188,24 +201,57 @@ $out" ;;
   esac
   echo "ok: a commit site in an uncensused file fails"
 
-  # And the half that matters most: a save path that stopped backing up first.
-  # Deleting the call leaves a file that still compiles and still commits.
-  root="$(scratch)/no-backup"; rm -rf "$root"; fake_repo "$root"
-  sed -i.bak 's/BackUpFirst(/BackUpLater(/g' "$root/core/src/sync_execute.cpp"
-  rm -f "$root/core/src/sync_execute.cpp.bak"
-  out="$("$root/scripts/v1-gate.sh" --audit ${build:+--build-dir "$build"} 2>&1)"
-  [ $? -ne 0 ] || fail "a save path with no BackUpFirst passed the census:
+  # A commit whose line carries a `/` before it -- `dir / name`, which is how
+  # anyone writing a path in C++20 writes it. Anchoring the census at the left
+  # of the line to skip comments refuses this line too, so a brand new save path
+  # written in the obvious style was invisible to the check whose whole job is
+  # to say there are only two of them.
+  root="$(scratch)/site-slash"; rm -rf "$root"; fake_repo "$root"
+  cat > "$root/core/src/probe_slash_path.cpp" <<'EOF'
+#include "rommsync/atomic_file.hpp"
+namespace {
+void ProbeSite(const std::string& dir, const std::string& name) {
+  if (auto st = fs::Stat(dir + "/" + name); st.exists) io::CommitStaged(dir, dir + "/" + name);
+}
+}  // namespace
+EOF
+  out="$("$root/scripts/v1-gate.sh" --audit --build-dir "$build" 2>&1)"
+  [ $? -ne 0 ] || fail "a commit site on a line carrying a slash escaped the census:
 $out"
   case "$out" in
-    *"without a BackUpFirst ahead of it"*) ;;
-    *) fail "expected the census to name the missing backup, got:
+    *"is not in the census"*) ;;
+    *) fail "expected the census to say the file is unknown to it, got:
 $out" ;;
   esac
-  echo "ok: a save commit with no backup ahead of it fails"
+  echo "ok: a commit site on a line with a slash in it fails"
+
+  # ...while a MENTION in prose is still not a call. The prose is why the census
+  # cannot simply grep for the name.
+  root="$(scratch)/site-prose"; rm -rf "$root"; fake_repo "$root"
+  cat > "$root/core/src/probe_prose.cpp" <<'EOF'
+// This file discusses io::CommitStaged( and io::WriteAtomically( at length,
+/// including in a doc comment, and calls neither.
+namespace { void ProbeSite() {} }  // io::CopyAtomically( is not called here
+EOF
+  out="$("$root/scripts/v1-gate.sh" --audit --build-dir "$build" 2>&1)"
+  [ $? -eq 0 ] || fail "prose naming the helpers was counted as calling them:
+$out"
+  echo "ok: a file that only talks about the helpers is not a commit site"
+
+  # And the half that matters most: a save path that stopped backing up first.
+  # Removing only the CALL leaves a file that still compiles, still commits onto
+  # a save, and -- in sync_execute.cpp -- still contains the word BackUpFirst,
+  # because that file DEFINES the helper. A check that accepts any occurrence
+  # sits green through exactly this edit, which is the one that destroys a save.
+  # Both save paths get the case; the definition only exists in one of them.
+  no_backup_call_fails core/src/sync_execute.cpp 's/return BackUpFirst(/return NoBackupAtAll(/' \
+    "the file that defines the helper" "$build"
+  no_backup_call_fails core/src/state_sync.cpp 's/^      BackUpFirst(/      NoBackupAtAll(/' \
+    "the save-state path" "$build"
 
   # The tree as it stands is the positive case, and it is checked last so a
   # green here cannot be an artefact of the copies above.
-  out="$("$GATE" --audit ${build:+--build-dir "$build"} 2>&1)"
+  out="$("$GATE" --audit --build-dir "$build" 2>&1)"
   [ $? -eq 0 ] || fail "the census refuses core/ as it is:
 $out"
   echo "ok: core/ as it stands is censused and both save paths back up first"
@@ -213,10 +259,14 @@ $out"
 
 # --- what counts as evidence --------------------------------------------------
 
-# A recorded ctest run, in the format ctest prints. `status` is what the line
-# should read: Passed, ***Skipped or ***Failed.
+# A recorded ctest run, in the format ctest actually prints. The `#` matters:
+# ctest right-aligns `#N:` in a five-wide field -- `Test   #1:`, `Test  #42:`,
+# `Test #121:` -- and the gate's awk requires that shape. A fixture that padded
+# after the `#` instead (`Test # 42:`) would be silently unparsable for every
+# one- and two-digit index, which is most of the suite, and this file would then
+# be testing the gate against a hundred lines it never reads.
 transcript_line() {
-  printf '%3d/303 Test #%3d: %s %s%s    0.01 sec\n' "$2" "$2" "$1" \
+  printf '%3d/303 Test %5s %s %s%s    0.01 sec\n' "$2" "#$2:" "$1" \
     "$(printf '%.0s.' $(seq 1 $((40 - ${#1}))))" "$3"
 }
 
@@ -289,6 +339,37 @@ $out" ;;
   [ "$status" -ne 0 ] || fail "a run with a skipped test reported the gate as passing"
   echo "ok: a skipped test holds its row instead of passing it"
 
+  # 3b. The same, for a LOW-numbered test. ctest pads `#N:` differently at one,
+  #     two and three digits, and rig.smoke -- the test this whole rule is named
+  #     after -- is #42. A fixture that only parses at three digits would let
+  #     every one of these assertions pass while reading nothing.
+  local low
+  low="$(ctest --test-dir "$build" -N 2>/dev/null | sed -n 's/^ *Test *#[0-9]*: //p' | sed -n '19p')"
+  [ -n "$low" ] || fail "could not find a low-numbered test to pin the format with"
+  transcript "$build" "$low" "***Failed" > "$dir/low-red"
+  out="$(ROMMSYNC_GATE_TRANSCRIPT="$dir/low-red" "$GATE" --build-dir "$build" 2>&1)"
+  echo "$out" | grep -q "failing:.*$low" \
+    || fail "a failing '$low' (a two-digit index) was not seen at all:
+$out"
+  echo "ok: a two-digit test index parses, so the fixture is in ctest's own format"
+
+  # 3c. A run that stopped early. Every name the row matched but that never
+  #     reported anything is the case that reads as green if you only look at
+  #     the failures -- ctest erroring out, or a run interrupted part way.
+  head -40 "$dir/all-green" > "$dir/truncated"
+  out="$(ROMMSYNC_GATE_TRANSCRIPT="$dir/truncated" "$GATE" --build-dir "$build" 2>&1)"
+  status=$?
+  echo "$out" | grep -q "^\[FAIL\] sync " \
+    || fail "a run that stopped after 40 tests left the sync row reading as decided:
+$out"
+  case "$out" in
+    *"never reported a result"*) ;;
+    *) fail "the gate did not say which tests said nothing:
+$out" ;;
+  esac
+  [ "$status" -eq 1 ] || fail "expected exit 1 for a run that never finished, got $status"
+  echo "ok: a test that reported nothing is not a test that passed"
+
   # 4. --dry decides nothing, and says so rather than printing four PASSes for
   #    tests it never ran.
   out="$("$GATE" --dry --build-dir "$build" 2>&1)"
@@ -341,12 +422,13 @@ EOF
 release_says() {
   local root="$1" expect="$2" want_status="$3" what="$4" build="$5"
   local out status
-  # The stub goes first on PATH; when there is no stub the row reports the fact
-  # that it could not ask, which is its offline answer and also a failing one.
-  # --dry, because this row is about the repository and not about the suite --
-  # and the build directory is the real one, since the throwaway repo has none.
-  out="$(cd "$root" && PATH="$root/bin:$PATH" \
-         "$root/scripts/v1-gate.sh" --dry --build-dir "$build" 2>&1)"
+  # The stub goes first on PATH; a stub that refuses is what an absent or offline
+  # gh looks like from here. NOT --dry: --dry deliberately does not look a
+  # release up, so it cannot exercise these branches. An empty transcript stands
+  # in for the suite instead -- it makes the four suite rows fail for want of
+  # results, which is true and is not what any of these assertions read.
+  out="$(cd "$root" && PATH="$root/bin:$PATH" ROMMSYNC_GATE_TRANSCRIPT=/dev/null \
+         "$root/scripts/v1-gate.sh" --build-dir "$build" 2>&1)"
   status=$?
   echo "$out" | grep -q "^\[$want_status\] release " \
     || fail "$what: expected the release row to be $want_status:
@@ -399,13 +481,29 @@ $out" ;;
   # A `gh` that cannot answer -- no network, no remote, not installed. All of
   # those leave the same thing unknown, and an unknown is not a pass.
   release_repo "$dir/no-gh" 1.0.0 v1.0.0 "REFUSE"
-  release_says "$dir/no-gh" "is visible from here" FAIL \
-    "a tag whose release cannot be seen is not a released build" "$build"
+  # HELD, not FAIL: "we could not ask" and "we asked and the answer is no" are
+  # different answers, and only one of them is a finding. Either way the gate
+  # does not open.
+  release_says "$dir/no-gh" "is visible from here" HELD \
+    "a tag whose release cannot be seen holds the row rather than failing it" "$build"
 
   # A 0.x tag is not a v1 build, however published it is.
   release_repo "$dir/zero" 0.9.0 v0.9.0 "$published"
   release_says "$dir/zero" "no v1 tag in this repository" FAIL \
     "a 0.x tag does not satisfy a row that says v1" "$build"
+
+  # ...and --dry does not reach for the network at all. The stub here fails the
+  # test if it is called, which is the only way to assert an absence.
+  release_repo "$dir/dry" 1.0.0 v1.0.0 "$published"
+  printf '#!/bin/sh\ntouch "%s/called"\nexit 1\n' "$dir/dry" > "$dir/dry/bin/gh"
+  chmod +x "$dir/dry/bin/gh"
+  out="$(cd "$dir/dry" && PATH="$dir/dry/bin:$PATH" \
+         "$dir/dry/scripts/v1-gate.sh" --dry --build-dir "$build" 2>&1)"
+  [ -e "$dir/dry/called" ] && fail "--dry looked a release up over the network"
+  echo "$out" | grep -q "^\[HELD\] release " \
+    || fail "--dry did not hold the release row it declined to look up:
+$(echo "$out" | grep -A3 'release ')"
+  echo "ok: --dry does not look a release up, and holds the row rather than judging it"
 }
 
 # --- the published table ------------------------------------------------------
@@ -432,14 +530,18 @@ $script_ids"
 
   # ...and the claims, not only the ids: a table that renamed a row's meaning
   # while keeping its id would pass the check above.
-  local id claim
+  # ...and the claims, not only the ids, and only within the gate's own section:
+  # a claim head that happens to appear elsewhere on the page would otherwise
+  # satisfy this while the table said something else.
+  local section id claim head
+  section="$(awk '/^## Rung 3/,/^## What can/' "$doc")"
   while IFS='|' read -r id _ claim; do
     [ -n "$id" ] || continue
     # The first few words are enough, and are what survives a table cell being
     # wrapped differently from the script's line.
-    local head; head="$(echo "$claim" | cut -c1-28)"
-    grep -qF "$head" "$doc" \
-      || fail "docs/TESTING.md does not carry row '$id' -- looked for: $head"
+    head="$(echo "$claim" | cut -c1-28)"
+    echo "$section" | grep -qF "$head" \
+      || fail "the Rung 3 table does not carry row '$id' -- looked for: $head"
   done <<EOF
 $("$GATE" --rows)
 EOF

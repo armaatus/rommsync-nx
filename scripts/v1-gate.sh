@@ -34,10 +34,17 @@
 #   2   usage.
 #   3   nothing failing, but a row is HELD -- it needs a console, or a person.
 #
-# 3 is the expected answer today and will be until somebody runs the probe on a
-# console. It is deliberately not 0: a gate that exits 0 while two of its rows
-# have never been executed anywhere is the same green-that-checked-nothing this
-# file exists to prevent.
+# 3 is the expected answer today. It is deliberately not 0: a gate that exits 0
+# while two of its rows have never been executed anywhere is the same
+# green-that-checked-nothing this file exists to prevent.
+#
+# AND 0 IS UNREACHABLE UNTIL SOMEBODY EDITS THIS FILE. There is no flag, file or
+# environment variable that ticks a `console` row, and that is the design rather
+# than an omission: no input a script can take is evidence that a handshake
+# happened on a console, so accepting one would be a checkbox pretending to be a
+# measurement. When a console has answered a row, the answer goes into the docs
+# and the row stops being `console` in the same commit -- a reviewed edit, by a
+# person, is the attestation. Each console row says where its answer goes.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -46,8 +53,11 @@ MODE="run"
 
 die() { echo "v1-gate.sh: $*" >&2; exit 2; }
 
+# The header comment above, minus its leading `#`, up to the first blank line
+# that is not part of it. Reading BASH_SOURCE rather than rebuilding the path
+# means a copy of this script under another name still prints its own header.
 usage() {
-  sed -n '2,30p' "$REPO_ROOT/scripts/v1-gate.sh" | sed 's/^# \{0,1\}//'
+  sed -n '2,/^set -uo pipefail$/p' "${BASH_SOURCE[0]}" | sed 's/^#\{1,\} \{0,1\}//; /^set -uo/d'
 }
 
 while [ $# -gt 0 ]; do
@@ -182,7 +192,9 @@ T
 
 # --- repo predicates ----------------------------------------------------------
 # Each prints its reasoning on stdout and answers with an exit status: 0 holds,
-# 1 does not. They never touch the network except where they say so.
+# 1 does not, **2 is not known from here**. The third is not a courtesy: a row
+# nobody can decide is HELD, and calling that FAIL would make "we could not ask"
+# indistinguishable from "we asked and the answer is no".
 
 # Every place in `core/` that commits bytes over an existing file, counted per
 # file and per helper and classified. This is the word "every" in the box above,
@@ -200,14 +212,33 @@ core/src/download.cpp|1|0|1|not a save: rom bytes, and the queue record
 core/src/state_db.cpp|0|0|1|not a save: the sync baseline
 core/src/state_sync.cpp|1|0|0|SAVE STATE: sync::BackUpFirst runs first
 core/src/sync_execute.cpp|1|1|0|SAVE: sync::BackUpFirst runs first, and is itself the CopyAtomically
-core/src/token_store.cpp|0|0|1|not a save: token.dat'
+core/src/token_store.cpp|0|0|1|not a save: token.dat
+sysmodule/source/engine.cpp|0|0|1|not a save: config.ini, written back by the engine'
 
-# Calls, not mentions: the leading `[^/]*` keeps a line whose first non-space is
-# a comment marker out of the count, which matters because these helpers are
-# discussed in prose in files that never call them.
+# Where the census looks. `core/` is where the engine lives and where a save
+# path belongs, but the box says EVERY save-overwrite path and the two Horizon
+# targets can write files too -- sysmodule/source/engine.cpp already does. A
+# census that only read core/ would answer a narrower question than the row asks.
+SAVE_SITE_ROOTS='core/src sysmodule/source overlay/source'
+
+# Comments stripped, then matched anywhere on the line. Calls, not mentions:
+# these helpers are discussed in prose in files that never call them, so the
+# prose has to go -- but anchoring at the left instead (`^[^/]*io::X(`) refuses
+# any line carrying a `/` before the call, which `dir / name` does, and a save
+# path written that way would be invisible to the one check that says there are
+# only two of them.
+#
+# `://` is left alone so that a `"http://"` in a string does not eat the rest of
+# its own line. Multi-line /* */ blocks are not handled and there are none in
+# `core/`; the inline `/*first=*/true` form is, since it never spans a line.
+strip_comments() {
+  sed -e 's,^[[:space:]]*//.*,,' -e 's,\([^:/]\)//.*,\1,' "$1"
+}
+
 count_calls() {
   local n
-  n="$(grep -c "^[^/]*io::$2(" "$REPO_ROOT/$1" 2>/dev/null)"
+  [ -f "$REPO_ROOT/$1" ] || { echo 0; return 0; }
+  n="$(strip_comments "$REPO_ROOT/$1" | grep -c "io::$2(")"
   echo "${n:-0}"
 }
 
@@ -239,10 +270,13 @@ EOF
 
   # A file that calls one of the three and is not in the census at all is the
   # case the loop above cannot see, and is the one a new overwrite path takes.
-  for f in "$REPO_ROOT"/core/src/*.cpp; do
-    rel="core/src/$(basename "$f")"
+  local root
+  for root in $SAVE_SITE_ROOTS; do
+    [ -d "$REPO_ROOT/$root" ] || continue
+    for f in $(find "$REPO_ROOT/$root" -name '*.cpp' 2>/dev/null); do
+    rel="${f#$REPO_ROOT/}"
     [ "$rel" = "core/src/atomic_file.cpp" ] && continue   # it defines them
-    if grep -q "^[^/]*io::\(CommitStaged\|CopyAtomically\|WriteAtomically\)(" "$f"; then
+    if strip_comments "$f" | grep -q "io::\(CommitStaged\|CopyAtomically\|WriteAtomically\)("; then
       case "$SAVE_SITE_CENSUS" in
         *"$rel|"*) ;;
         *) echo "    $rel commits over a file and is not in the census"
@@ -250,17 +284,33 @@ EOF
            ok=1 ;;
       esac
     fi
+    done
   done
 
-  # ...and the two that ARE saves still name the backup, ahead of the commit.
-  # Line order is a crude proof and is not pretending otherwise; what it holds
-  # is that deleting the backup call cannot go unnoticed.
+  # ...and the two that ARE saves still CALL the backup, ahead of the commit.
+  #
+  # A call and not a mention, and not the definition either: `BackUpFirst` is
+  # defined in sync_execute.cpp, so a pattern that accepts any occurrence is
+  # satisfied by the definition and would sit green through the deletion of the
+  # only call to it -- in the one file where that deletion destroys a save.
+  # Definitions and declarations start in column 1 (a return type); calls are
+  # indented. `strip_comments` takes the prose, since both files discuss the
+  # helper at length. Line numbers survive it -- it blanks lines, never drops
+  # them -- which is what makes the ordering below mean anything.
+  #
+  # POSIX classes rather than \s throughout: BSD grep reads \s as a literal `s`,
+  # which is not a filter at all on the machine most of this is written on.
+  #
+  # Line order is a crude proof and is not pretending otherwise; what it holds is
+  # that deleting the backup call cannot go unnoticed.
   for rel in core/src/sync_execute.cpp core/src/state_sync.cpp; do
     local backup_line commit_line
-    backup_line="$(grep -n "BackUpFirst(" "$REPO_ROOT/$rel" | grep -v '^\s*[0-9]*:\s*//' | head -1 | cut -d: -f1)"
-    commit_line="$(grep -n "^[^/]*io::CommitStaged(" "$REPO_ROOT/$rel" | head -1 | cut -d: -f1)"
+    backup_line="$(strip_comments "$REPO_ROOT/$rel" | grep -n "BackUpFirst(" \
+                   | grep -vE '^[0-9]+:[A-Za-z_]' | head -1 | cut -d: -f1)"
+    commit_line="$(strip_comments "$REPO_ROOT/$rel" | grep -n "io::CommitStaged(" \
+                   | head -1 | cut -d: -f1)"
     if [ -z "$backup_line" ] || [ -z "$commit_line" ] || [ "$backup_line" -ge "$commit_line" ]; then
-      echo "    $rel commits onto a save without a BackUpFirst ahead of it"
+      echo "    $rel commits onto a save with no CALL to BackUpFirst ahead of it"
       ok=1
     fi
   done
@@ -305,6 +355,10 @@ repo_release() {
   # "gh could not answer" are one branch on purpose: both leave whether the tag
   # was published UNKNOWN, and an unknown is not a pass. A tag with no release
   # behind it installs nothing.
+  if [ "$MODE" = "dry" ]; then
+    echo "    whether $tag was published is not looked up in --dry"
+    return 2
+  fi
   local view=""
   if command -v gh >/dev/null 2>&1; then
     view="$(GH_PAGER=cat gh release view "$tag" --json isDraft,assets 2>/dev/null)"
@@ -312,7 +366,9 @@ repo_release() {
   if [ -z "$view" ]; then
     echo "    no published release for $tag is visible from here -- gh is absent"
     echo "    or could not answer, and a tag on its own installs nothing"
-    ok=1
+    # Unknown, not refused. Either way it does not open hardware.
+    [ "$ok" -eq 0 ] && return 2
+    return 1
   else
     case "$view" in
       *'"isDraft":true'*) echo "    the release for $tag is still a DRAFT"; ok=1 ;;
@@ -369,7 +425,9 @@ row_note() {
          failed handshake leaks an fd against a handle_table_size of 64. The
          backend closes nothing and says so in a comment, because closing on a
          guess is a double close.
-    The answers go in docs/DEVELOPMENT.md, beside the measurement they correct.
+    The answers go in docs/DEVELOPMENT.md, beside the measurement they correct,
+    and this row stops being a `console` row in that same commit. Nothing this
+    script can be handed will tick it.
 NOTE
       ;;
     media)
@@ -384,6 +442,10 @@ NOTE
     result: the compatibility line in scripts/release-notes.sh
     (ATMOSPHERE_TARGET) and the title id 0x4200000000524D53, which nothing has
     checked against an installed set (sysmodule/README.md).
+
+    As with `ssl`: nothing this script can be handed ticks this row. It stops
+    being a `console` row in the commit that records what was actually done,
+    reviewed like any other change.
 NOTE
       ;;
     *) : ;;
@@ -415,6 +477,8 @@ matching() { echo "$REGISTERED" | grep -E "$1" || true; }
 # pass is precisely the failure docs/TESTING.md's M0 gate was written against.
 RAN_FAILED=""
 RAN_SKIPPED=""
+RAN_SEEN=""
+RAN_STATUS=0
 
 # $ROMMSYNC_GATE_TRANSCRIPT is a seam, and the only one: a file holding what a
 # `ctest` run printed, used instead of running it. It exists so tests/test_v1_gate.sh
@@ -424,8 +488,10 @@ run_groups() {
   local regex="$1" out
   if [ -n "${ROMMSYNC_GATE_TRANSCRIPT:-}" ]; then
     out="$(cat "$ROMMSYNC_GATE_TRANSCRIPT")"
+    RAN_STATUS=0
   else
     out="$(ctest --test-dir "$BUILD_DIR" -R "$regex" --output-on-failure 2>&1)"
+    RAN_STATUS=$?
   fi
   echo "$out" | awk '
     /Test +#[0-9]+:/ {
@@ -445,7 +511,7 @@ HELD=0
 
 evaluate_row() {
   local id="$1" kind="$2" claim="$3"
-  local status="PASS" detail="" pattern hits missing="" bad="" skipped=""
+  local status="PASS" detail="" pattern hits missing="" bad="" skipped="" silent=""
 
   if [ "$kind" = "console" ]; then
     status="HELD"
@@ -465,6 +531,14 @@ evaluate_row() {
           [ -n "$name" ] || continue
           case "$RAN_FAILED" in *"|$name|"*) bad="$bad $name" ;; esac
           case "$RAN_SKIPPED" in *"|$name|"*) skipped="$skipped $name" ;; esac
+          # ...and a test that reported NOTHING. Reading "not in the failures"
+          # as "passed" makes an aborted run -- ctest dying, a run interrupted
+          # after thirty of two hundred tests -- come back as five green rows
+          # over evidence nobody ever saw.
+          case "$RAN_SEEN" in
+            *"|$name|"*) ;;
+            *) silent="$silent $name" ;;
+          esac
         done <<EOF
 $hits
 EOF
@@ -481,6 +555,13 @@ EOF
       status="FAIL"
       detail="$detail
     failing:$bad"
+    fi
+    if [ -n "$silent" ]; then
+      status="FAIL"
+      detail="$detail
+    named by this row and never reported a result:$silent
+    the run did not finish (ctest exited $RAN_STATUS) -- rerun it; a test that
+    said nothing is not a test that passed"
     fi
     if [ "$MODE" = "dry" ] && [ "$status" != "FAIL" ]; then
       status="HELD"
@@ -500,7 +581,14 @@ EOF
   local repo_out repo_status
   repo_out="$(row_repo "$id")"
   repo_status=$?
-  if [ "$repo_status" -ne 0 ] && [ "$status" != "HELD" ]; then
+  # A repo predicate that says no fails the row outright, even when the row was
+  # already HELD for another reason. `backup` is a suite row WITH a predicate:
+  # if its tests skipped because RomM is down -- the ordinary case -- a census
+  # breach would otherwise print its text under a HELD heading and never be
+  # counted, which is a save-overwrite path going unclassified in silence.
+  if [ "$repo_status" -eq 2 ]; then
+    [ "$status" = "FAIL" ] || status="HELD"
+  elif [ "$repo_status" -ne 0 ]; then
     status="FAIL"
   fi
   if [ -n "$repo_out" ]; then
@@ -607,6 +695,7 @@ EOF
   results="$(run_groups "$union")"
   RAN_FAILED="|$(echo "$results" | sed -n 's/^FAIL //p' | tr '\n' '|')"
   RAN_SKIPPED="|$(echo "$results" | sed -n 's/^SKIP //p' | tr '\n' '|')"
+  RAN_SEEN="|$(echo "$results" | sed -n 's/^[A-Z]* //p' | tr '\n' '|')"
 fi
 
 echo "The v1 gate -- M8-1 (#43). Hardware work begins when every row is PASS."
