@@ -63,6 +63,9 @@
 #include "rommsync/ipc.hpp"
 #include "rommsync/list_service.hpp"
 #include "rommsync/pairing.hpp"
+#include "rommsync/scheduler.hpp"
+#include "rommsync/sync_tick.hpp"
+#include "rommsync/token_store.hpp"
 
 namespace rommsync::sysmodule {
 
@@ -192,6 +195,43 @@ class SdEngine : public ipc::Engine {
   /// to install the half that is ready.
   void UsePairingBackend(PairingBackend backend);
 
+  /// Start the worker: the one thread that runs sync ticks and drives the list
+  /// paging (M7-2, #37).
+  ///
+  /// Call it **after** `Load` and after whichever of `UseServer` and `UseCard`
+  /// this build has, because those are what decide whether the loop has anything
+  /// to do. Starting it twice does nothing.
+  ///
+  /// **It is one thread, not two.** `sync::RunTick` and `lists::Service::Pump`
+  /// both want a thread that is not the IPC one and neither wants a thread of
+  /// its own: a list page is one request and a tick is a handful, and two
+  /// threads would cost two stacks out of a 512 KiB heap to serialise on the
+  /// same `http::HttpClient` anyway (`main.cpp`'s budget). The loop pumps the
+  /// lists first, because a human is waiting at a screen for one of those and
+  /// nobody is waiting for a tick.
+  ///
+  /// **Nothing here blocks boot.** The thread is started and `main` returns; the
+  /// wait for the network happens on this thread (`WaitForNetwork`), not before
+  /// the service comes up.
+  ///
+  /// Like `UsePairingBackend`, the `std::thread` constructor is the one throwing
+  /// call and it happens at start rather than under a user's thumb
+  /// (`-fno-exceptions`, `switch.mk`).
+  void StartWorker();
+
+  /// What the worker waits for before its first tick.
+  ///
+  /// **Injected, because `nifm` is libnx and this file names no libnx type.**
+  /// `main.cpp` passes a function that asks `nifmGetInternetConnectionStatus`;
+  /// the host suite passes one that answers immediately, and a build that passes
+  /// nothing gets "the network is up", which is what a laptop is.
+  ///
+  /// It is called on the **worker thread** and may block. That is the whole
+  /// point: a console that comes up with no Wi-Fi must not hold `main`, and
+  /// `sys-rommsync` registered its port before this class existed.
+  using NetworkWait = std::function<void()>;
+  void UseNetworkWait(NetworkWait wait);
+
   /// The network the library is read over, and the token to read it with.
   ///
   /// **Null and empty on the console today, and no longer for want of a
@@ -203,6 +243,12 @@ class SdEngine : public ipc::Engine {
   /// served in full. The host suite passes a libcurl client and the fixture
   /// token, which is what proves the paging (`lists.*`). **M7-2 (#37) fills this
   /// seam and starts that worker in the same commit**; neither alone is correct.
+  /// **An empty `bearer_token` means "the one on the card"**, which is what the
+  /// console passes: `token.dat` is this class's to read, it is re-read when a
+  /// pairing commits, and a `main.cpp` that had to fish the token out of it
+  /// would be a second reader of the one file that must not be read twice
+  /// differently. The host suite passes the fixture token explicitly, which is
+  /// what proves the paging against a server this class never paired with.
   void UseServer(http::HttpClient* client, std::string bearer_token);
 
   /// Where a rom already on the card is looked for, for a rom row's `on_disk`.
@@ -238,6 +284,17 @@ class SdEngine : public ipc::Engine {
   ipc::Error SetSyncEnabled(bool enabled) override;
   ipc::Error ApplyConfigEdit(const ipc::ConfigEdit& edit,
                              std::vector<config::Diagnostic>* diagnostics) override;
+  /// M7-2 (#37). True when a tick was started, false when one is already
+  /// running -- **exactly that and nothing else**, which is what keeps this and
+  /// `Status::sync_in_progress` the same fact. An implementation that answered
+  /// false for some other reason would put the overlay's button and the
+  /// sysmodule back out of step (`ipc.hpp`, and `overlay.sync_actions` is what
+  /// would go red).
+  ///
+  /// A console with no transport, no token or no server still answers true: the
+  /// tick starts, finds it cannot negotiate, and the status screen says so.
+  /// Refusing here would report "a sync is already running" for a console that
+  /// is merely offline, which is the sentence this issue exists to remove.
   bool RequestSync() override;
   ipc::Error StartPairing() override;
 
@@ -299,6 +356,17 @@ class SdEngine : public ipc::Engine {
   ipc::Error ListConflicts(const ipc::ConflictQuery& query, ipc::ConflictPage* page) override;
   ipc::Error RestoreBackup(std::int64_t entry_id, conflicts::RestoreReport* report) override;
 
+  /// Serialises `history_` between the IPC thread and the worker.
+  ///
+  /// M7-1 (#36) left `history_` under no lock and said exactly what would change
+  /// that: a second writer of `.backup/`, which is the scheduler running a tick
+  /// (M7-2, #37). This is it. It is deliberately **not** `card_mutex_`: taking
+  /// that for a restore would make a pairing grant wait behind a save-state copy
+  /// of tens of megabytes, which is the thing the two-lock split exists to
+  /// prevent. It is never held across a network call -- only across the append
+  /// or the restore itself.
+  mutable std::mutex history_mutex_;
+
   /// The conflict history, for the tick that writes it.
   ///
   /// **Nothing in this build drives a tick**, so nothing appends to it here yet
@@ -312,6 +380,17 @@ class SdEngine : public ipc::Engine {
   /// Whether the backup `entry` names is still on the card, for
   /// `ipc::ConflictRow::backup_present`.
   bool BackupPresent(const conflicts::Entry& entry) const;
+
+  /// The configuration in force, as a snapshot that stays alive for as long as
+  /// the caller holds it.
+  ///
+  /// **This is what `config()` cannot be.** That one hands out a reference, and
+  /// `ApplyConfigEdit` replaces the whole `Config` on the IPC thread -- which is
+  /// harmless while every reader is that same thread and a data race the moment
+  /// one is not. The worker and `lists::Service::Pump` take one of these at an
+  /// operation boundary and read it to the end of the operation, never
+  /// mid-tick.
+  std::shared_ptr<const config::Config> ConfigSnapshot() const;
 
  private:
   /// Apply `change` to the queue and write the file, or leave both exactly as
@@ -406,6 +485,32 @@ class SdEngine : public ipc::Engine {
   void CommitGrant(const std::shared_ptr<PairingAttempt>& attempt,
                    const auth::DeviceTokenResponse& granted);
 
+  /// The worker: park until something is due, then do it. `StartWorker` starts
+  /// it and the destructor stops it.
+  void RunWorker();
+
+  /// One scheduled tick, start to finish: scan, `sync::RunTick`, record.
+  ///
+  /// **Not a second tick loop.** `sync::RunTick` is the loop (sync_tick.hpp) and
+  /// this is the half it deliberately does not own: step 0's scan on the way in,
+  /// and `conflicts::RecordSaves`/`RecordStates` on the way out -- which live
+  /// here because `conflict_record.hpp` includes `state_sync.hpp`, so recording
+  /// from inside the tick would be a cycle.
+  void RunOneTick(sync::Trigger trigger);
+
+  /// Record what one exchange said about the credentials, and persist the
+  /// verdict the moment it becomes one.
+  ///
+  /// The two lines M1-4 (#8) left for this issue, in one place so no caller can
+  /// do half of it: `auth::SaveBlock` when `blocked()` first turns true, and
+  /// `auth_` set in the same moment so the overlay draws "pair this console
+  /// again" without waiting for a reboot. Idempotent -- a gate that was already
+  /// blocked writes nothing.
+  void ObserveAnswer(auth::Answer answer);
+
+  /// `[sync]` as the scheduler wants it, clamped the way `config.hpp` says.
+  static sync::SchedulerConfig ScheduleFrom(const config::Config& config);
+
   /// Abandon whatever attempt is running. The caller holds `mutex_`.
   ///
   /// Dropping `attempt_` is the whole mechanism: the thread notices after its
@@ -435,7 +540,11 @@ class SdEngine : public ipc::Engine {
   /// `ipc::TrimDiagnostics` keeps the first few and summarises the rest, so a
   /// `config.ini` with a handful of complaints would otherwise push it into the
   /// "N more" line.
-  void AdoptConfig(config::LoadResult loaded);
+  /// The caller holds `mutex_`: this swaps the pointer every other thread reads
+  /// the configuration through, and hands the new `[sync]` section to the
+  /// scheduler in the same breath, so a changed interval takes effect without a
+  /// reboot and a changed `server.url` lifts a TLS park.
+  void AdoptConfigLocked(config::LoadResult loaded);
 
   /// One of this client's files, under the directory `Load` was given.
   std::string PathTo(const char* file_name) const;
@@ -446,7 +555,15 @@ class SdEngine : public ipc::Engine {
   /// after a read that failed on a file that is there -- see `Commit`.
   bool queue_trusted_ = true;
 
-  config::Config config_ = config::Defaults();
+  /// The configuration in force, behind a pointer.
+  ///
+  /// A pointer rather than a value because it is **replaced** rather than
+  /// edited: the worker holds a snapshot for the length of a tick and
+  /// `lists::Service` for the length of a page, and an assignment into a shared
+  /// `Config` underneath either of them is a race on every string in it. Swapped
+  /// under `mutex_`; never modified in place.
+  std::shared_ptr<const config::Config> config_ =
+      std::make_shared<const config::Config>(config::Defaults());
 
   /// What was wrong with `config.ini`, and -- see `AdoptConfig` -- with
   /// `auth.json`. Rebuilt every time the configuration is re-read.
@@ -501,6 +618,47 @@ class SdEngine : public ipc::Engine {
   /// console, and it is not this issue's: it is the same seam the download
   /// worker and the scheduler need (M7-2, #37).
   fs::FileSystem* card_ = nullptr;
+
+  /// The credentials as `token.dat` holds them, re-read whenever it changes.
+  ///
+  /// Kept rather than re-read per tick because negotiate needs `device_id` as
+  /// well as the bearer token, and because a card having a bad moment must not
+  /// turn a paired console into an unpaired one for one tick. Empty until this
+  /// console has paired.
+  auth::StoredToken token_;
+
+  /// When a tick may run at all, and how long to wait after one that did not
+  /// work (M7-2, #37). Driven only by the worker thread and by the commands that
+  /// wake it, both under `mutex_`.
+  sync::Scheduler scheduler_;
+
+  /// Fired by the destructor, and passed to every stage of a tick, so a shutdown
+  /// ends the tick at an operation boundary rather than mid-write
+  /// (`sync::TickOptions::cancel`). One token per process, because there is one
+  /// tick at a time.
+  http::CancelToken tick_cancel_;
+
+  /// What `Status::sync_in_progress` draws, and the same fact `RequestSync`
+  /// answers false on.
+  bool sync_in_progress_ = false;
+
+  /// The last tick's outcome, as the status screen reads it.
+  std::int64_t last_sync_at_ = 0;
+  ipc::SyncResult last_sync_result_ = ipc::SyncResult::kNever;
+  std::int64_t uploaded_ = 0;
+  std::int64_t downloaded_ = 0;
+  std::int64_t conflicts_ = 0;
+  std::int64_t failed_ = 0;
+
+  /// The transport a tick runs on, and the token the *lists* read with. Both
+  /// null/empty until `UseServer`.
+  http::HttpClient* server_ = nullptr;
+  std::string list_token_;
+
+  /// What the worker waits for before its first tick. Null means "up".
+  NetworkWait network_wait_;
+
+  std::thread worker_thread_;
 
   /// The verdict `auth.json` holds, and what a worker consults before calling.
   ///

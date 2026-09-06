@@ -32,6 +32,7 @@
 #include <memory>
 #include <string>
 
+#include "card.hpp"
 #include "engine.hpp"
 #include "http/http_wire.hpp"
 #include "http/ssl_http_client.hpp"
@@ -151,6 +152,47 @@ char g_serial[0x18] = {};
 /// the socket are made when a request is (`ssl_http_client.cpp`).
 std::unique_ptr<rommsync::http::HttpClient> g_http;
 
+/// The card, behind `fs::FileSystem` (M7-2, #37). File scope for `g_http`'s
+/// reason: the worker holds it for the life of the process, and there is only
+/// ever one.
+std::unique_ptr<rommsync::fs::FileSystem> g_card;
+
+/// How long the worker waits for `nifm` to report a connection before its first
+/// tick, and how often it asks.
+///
+/// It gives up rather than waiting forever, and that is the point: a console
+/// that comes up on a coffee table with no Wi-Fi would otherwise hold a thread
+/// on a condition that may not be met for a week. Giving up costs one tick,
+/// which fails with `TickOutcome::kOffline` and is rescheduled on the backoff --
+/// which is the same battery-friendly curve every other offline console is on
+/// (`sync::Scheduler`). Waiting at all is what stops the *first* tick from being
+/// a guaranteed failure on every boot, because Horizon brings the link up a few
+/// seconds after a sysmodule starts.
+constexpr u64 kNetworkWaitNanoseconds = 120ull * 1000 * 1000 * 1000;
+constexpr u64 kNetworkPollNanoseconds = 2ull * 1000 * 1000 * 1000;
+
+/// Block until the console has an internet connection, or until the budget above
+/// runs out.
+///
+/// **Runs on the worker thread, never on the main one.** `main` registers the
+/// service and enters its loop with no network call in front of it, which is
+/// CLAUDE.md's "never block boot" -- a console with no Wi-Fi still has an
+/// overlay that opens, settings that read and a queue that draws.
+void WaitForNetwork() {
+  const u64 started = armGetSystemTick();
+  const u64 budget = armNsToTicks(kNetworkWaitNanoseconds);
+  while (armGetSystemTick() - started < budget) {
+    NifmInternetConnectionType type = static_cast<NifmInternetConnectionType>(0);
+    u32 strength = 0;
+    NifmInternetConnectionStatus status = static_cast<NifmInternetConnectionStatus>(0);
+    if (R_SUCCEEDED(nifmGetInternetConnectionStatus(&type, &strength, &status)) &&
+        status == NifmInternetConnectionStatus_Connected) {
+      return;
+    }
+    svcSleepThread(kNetworkPollNanoseconds);
+  }
+}
+
 /// The Horizon half of `io::FileSync` (#16): make what was just written
 /// durable, before the rename that publishes it.
 ///
@@ -263,6 +305,25 @@ void __appInit(void) {
   }
   fsdevMountSdmc();
 
+  // **`core/` calls `std::chrono::system_clock::now()`**, in `sync_execute.cpp`,
+  // `state_sync.cpp` and `download.cpp`, and on Horizon that answers nothing at
+  // all until time is initialised -- which has to happen here, while `sm` is
+  // still open. M1-7 (#126) dropped `time:s` from the NPDM because nothing in
+  // that build called it; the scheduler is what makes it matter, because a save
+  // stamped from an uninitialised clock is one docs/SYNC_PROTOCOL.md refuses as
+  // an epoch `updated_at` (M7-2, #37).
+  //
+  // Not fatal. A console whose clock will not initialise is one whose saves
+  // cannot be stamped, and every path that needs a stamp already refuses an
+  // epoch one -- where refusing to *start* would take the overlay, the settings
+  // and the queue down with it.
+  timeInitialize();
+
+  // What the worker waits on before its first tick. `nifm:u` was already in the
+  // NPDM; this is the session that uses it (docs/ARCHITECTURE.md §1: boot, after
+  // the network is up).
+  nifmInitialize(NifmServiceType_User);
+
   // The transport, here rather than on first use, because `socketInitialize`
   // and `sslInitialize` are `sm` lookups and `sm` is about to close. Its
   // failure is deliberately *not* fatal: a console with no network is one the
@@ -288,6 +349,8 @@ void __appInit(void) {
 }
 
 void __appExit(void) {
+  nifmExit();
+  timeExit();
   rommsync::sysmodule::NetworkExit();
   fsdevUnmountAll();
   fsExit();
@@ -338,15 +401,20 @@ int main(int, char**) {
   // overlay's pairing screen has a code to draw.
   engine.UsePairingBackend({g_http.get(), seed});
 
-  // The other seam, `UseServer`, is deliberately **not** used, and the reason is
-  // worth reading before anyone tries it: `lists::Service` answers a page that
-  // needs a request with `kOk` and `ListPage::pending`, and makes the request in
-  // `Pump()` -- on a thread this build does not have (`list_service.hpp`).
-  // Handing it a client without also starting that worker would turn "offline",
-  // which the browser draws, into "pending" forever, which it cannot. Starting
-  // the worker is M7-2 (#37), and it is written there. That is also why the two
-  // setters are still two: this one is safe to call the moment a client exists,
-  // and that one is not.
+  // The other three seams, and the worker that makes them safe -- M7-2 (#37).
+  //
+  // **`UseServer` and `StartWorker` are one commit and have to stay one line
+  // apart.** `lists::Service` answers a page that needs a request with `kOk` and
+  // `ListPage::pending` and makes the request in `Pump()`, so a client handed
+  // over with no worker driving it turns "offline", which the browser draws,
+  // into "pending" forever, which it cannot (`list_service.hpp`). The token is
+  // left empty deliberately: `token.dat` is the engine's to read, and it re-reads
+  // it when a pairing commits (`SdEngine::UseServer`).
+  g_card = rommsync::sysmodule::MakeSdCard();
+  engine.UseServer(g_http.get(), "");
+  engine.UseCard(g_card.get());
+  engine.UseNetworkWait(&WaitForNetwork);
+  engine.StartWorker();
 
   rommsync::ipc::ServiceCore core(engine);
   rommsync::sysmodule::ServiceServer server(core, g_service_port);

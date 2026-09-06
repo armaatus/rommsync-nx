@@ -27,6 +27,7 @@
 #include <string_view>
 #include <vector>
 
+#include "rommsync/auth_gate.hpp"
 #include "rommsync/http.hpp"
 #include "rommsync/json.hpp"
 
@@ -210,5 +211,16 @@ struct FetchResult {
 /// something smaller than was asked for is paged through rather than truncated
 /// at its first answer.
 FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options);
+
+/// What a library fetch said about this console's credentials, for
+/// `auth::Gate::Observe`.
+///
+/// The `AnswerOf` overload beside this file's error shape, the way there is one
+/// beside every other (auth_gate.hpp states the rule they all follow). Only a
+/// library that actually parsed is `kAccepted`: a transport failure, a 5xx and a
+/// 200 that was not a rom page are all `kSilent`, because anything in front of
+/// RomM answers those and clearing a rejection count on one would let a proxy
+/// keep a console asking forever.
+auth::Answer AnswerOf(const FetchResult& fetched);
 
 }  // namespace rommsync::roms

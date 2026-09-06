@@ -73,11 +73,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "rommsync/auth_gate.hpp"
+#include "rommsync/backoff.hpp"
 #include "rommsync/config.hpp"
 #include "rommsync/download.hpp"
 #include "rommsync/file_system.hpp"
@@ -150,6 +153,14 @@ inline constexpr std::chrono::milliseconds kRequestTimeout{15'000};
 inline constexpr std::chrono::milliseconds kRetryBackoff{1'000};
 inline constexpr std::chrono::milliseconds kMaxRetryBackoff{8'000};
 
+/// How much a cursor's retry window may be stretched by, as a fraction.
+///
+/// Small, because unlike the scheduler's this window is one a human is waiting
+/// out at a screen. It is here at all because the curve is `retry::Backoff` --
+/// the one this client has (M7-2, #37) -- and a caller that switched the jitter
+/// off would be re-introducing the lockstep that object exists to prevent.
+inline constexpr double kRetryJitter = 0.1;
+
 /// One platform, cut to what a row draws. See `ipc::list_keys`.
 struct PlatformRow {
   std::int64_t id = 0;
@@ -211,18 +222,65 @@ std::string Shorten(std::string_view text);
 /// mutex, and no network call is ever made while it is held.
 class Service {
  public:
+  /// Where the configuration is read from, and why this is a function rather
+  /// than the reference it used to be.
+  ///
+  /// `Pump()` runs on the engine's worker thread while `ipc::Engine::SetConfig`
+  /// replaces the configuration on the IPC thread (M5-3, #30), and a page built
+  /// from a `Config` that is being assigned into underneath it is a data race
+  /// on every string and vector in it. So the worker takes a **snapshot**: the
+  /// engine swaps a whole `Config` behind a pointer and hands out the pointer,
+  /// and a page keeps the one it started with. `sysmodule/source/engine.hpp`
+  /// named this seam and what would have to change to close it; this is it.
+  ///
+  /// It is asked once per operation rather than held, so a `SetConfig` between
+  /// two pages of the same list is answered by the second page -- which is what
+  /// "the answer to *is this platform mapped* has to be the one in force now"
+  /// already promised.
+  using ConfigSource = std::function<std::shared_ptr<const config::Config>()>;
+
+  /// A source over a `Config` the caller owns and never replaces.
+  ///
+  /// For every caller that has one thread, which is the suite and anything
+  /// driving this directly. `config` must outlive the service; nothing is
+  /// copied and nothing is owned.
+  static ConfigSource FixedConfig(const config::Config& config);
+
+  /// What one of this service's requests said about the credentials, for
+  /// `auth::Gate::Observe`.
+  ///
+  /// **The reason this exists**: `Pump()` maps every non-2xx to
+  /// `ipc::Error::kOffline`, because the fixed error set has no
+  /// `kUnauthenticated` and widening it would be invisible to an overlay built
+  /// before the new ordinal -- the overlay reads an error by ordinal off a
+  /// `Result` (#31 left this open and named M7-2 as the owner). So a console
+  /// whose token was revoked would be told its server is unreachable on every
+  /// page while `GetStatus` still reported it paired, and nothing anywhere would
+  /// count the rejection.
+  ///
+  /// Rather than a second 401 path, the answer goes where every other call's
+  /// already goes: `auth::AnswerOf(result)` into the one `auth::Gate`. The
+  /// *page* still says `kOffline`, which is the honest sentence for a screen
+  /// with no library to draw; what changes is that the console stops calling
+  /// after the third one and the overlay's re-pair prompt comes up.
+  ///
+  /// Called from the worker thread, outside this object's lock, immediately
+  /// after the request. Null means nothing is observing, which is every caller
+  /// that has no gate.
+  using AuthObserver = std::function<void(auth::Answer)>;
+  void UseAuthObserver(AuthObserver observer);
   /// Injectable so the TTL, the eviction and the backoff are testable without
   /// waiting them out -- `auth::PairingSession::Clock`'s reason, and monotonic
   /// for it: a user setting the console clock must not reclaim a live cursor.
   using Clock = std::function<std::chrono::steady_clock::time_point()>;
 
-  /// `config` and `queue` must outlive the service.
+  /// `queue` must outlive the service, and so must whatever `config` reads.
   ///
-  /// `config` is held by reference because the engine re-reads it on every
-  /// `SetConfig` and the answer to "is this platform mapped" has to be the one
-  /// in force now, not the one in force when the list was opened. A null
-  /// `clock` means `steady_clock`.
-  Service(const config::Config& config, download::Queue& queue, Clock clock = nullptr);
+  /// `config` is asked on every operation rather than captured once, because the
+  /// engine re-reads the configuration on every `SetConfig` and the answer to
+  /// "is this platform mapped" has to be the one in force now, not the one in
+  /// force when the list was opened. A null `clock` means `steady_clock`.
+  Service(ConfigSource config, download::Queue& queue, Clock clock = nullptr);
 
   Service(const Service&) = delete;
   Service& operator=(const Service&) = delete;
@@ -307,7 +365,11 @@ class Service {
     /// The last failure, kept after it has been reported so a retry inside the
     /// backoff window can answer it again without a request.
     ipc::Error failure = ipc::Error::kOk;
-    int consecutive_failures = 0;
+
+    /// The retry curve for this cursor: the one `retry::Backoff` the client has,
+    /// per cursor because the count is per cursor. `failures()` is what
+    /// `consecutive_failures` used to be.
+    retry::Backoff backoff{{kRetryBackoff, kMaxRetryBackoff, kRetryJitter}};
     TimePoint not_before{};
 
     /// `kPlatforms` only: the whole list, trimmed, fetched once.
@@ -336,12 +398,13 @@ class Service {
   /// filesystem copied out under the lock, so a `UseCard` during a fetch cannot
   /// swap it mid-page.
   ipc::ListPage BuildRomPage(const RomPage& fetched, std::int64_t offset,
-                             std::int32_t page_size, fs::FileSystem* card) const;
+                             std::int32_t page_size, fs::FileSystem* card,
+                             const config::Config& config) const;
 
   /// True when this rom's bytes look like they are already on the card.
-  bool OnDisk(const RomRow& rom, fs::FileSystem* card) const;
+  static bool OnDisk(const RomRow& rom, fs::FileSystem* card, const config::Config& config);
 
-  const config::Config& config_;
+  const ConfigSource config_;
   download::Queue& queue_;
   const Clock clock_;
 
@@ -354,6 +417,10 @@ class Service {
   http::HttpClient* client_ = nullptr;
   std::string bearer_token_;
   fs::FileSystem* filesystem_ = nullptr;
+
+  /// Swapped under `mutex_` and copied out with the two backends, for `Pump()`'s
+  /// reason: it is called from the worker thread, outside the lock.
+  AuthObserver auth_observer_;
 };
 
 }  // namespace rommsync::lists

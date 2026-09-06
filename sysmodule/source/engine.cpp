@@ -9,6 +9,13 @@
 
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/auth.hpp"
+#include "rommsync/rom_index.hpp"
+#include "rommsync/save_scan.hpp"
+#include "rommsync/scheduler.hpp"
+#include "rommsync/state_db.hpp"
+#include "rommsync/state_sync.hpp"
+#include "rommsync/sync_finish.hpp"
+#include "rommsync/sync_tick.hpp"
 #include "rommsync/auth_gate.hpp"
 #include "rommsync/config.hpp"
 #include "rommsync/conflict_log.hpp"
@@ -29,21 +36,49 @@ std::string SdEngine::PathTo(const char* file_name) const { return config_dir_ +
 
 /// The service reads the configuration in force and the queue on the card, both
 /// of which outlive it because it is a member beside them.
-SdEngine::SdEngine() : lists_(config_, queue_) {}
+/// The service reads the configuration in force through a snapshot rather than a
+/// reference, because `Pump()` runs on the worker while `SetConfig` replaces the
+/// whole `Config` on the IPC thread (`ConfigSnapshot`).
+SdEngine::SdEngine() : lists_([this] { return ConfigSnapshot(); }, queue_) {}
 
 SdEngine::~SdEngine() {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     stopping_ = true;
   }
+  // Before the join, not after it: a tick already in flight ends at its next
+  // operation boundary rather than being waited out in full, which on the link
+  // whose loss is usually why the process is going away is three timeouts and
+  // two backoffs saved (`sync::TickOptions::cancel`).
+  tick_cancel_.Cancel();
   wake_.notify_all();
+  if (worker_thread_.joinable()) {
+    worker_thread_.join();
+  }
   if (pairing_thread_.joinable()) {
     pairing_thread_.join();
   }
 }
 
 void SdEngine::UseServer(http::HttpClient* client, std::string bearer_token) {
-  lists_.UseServer(client, std::move(bearer_token));
+  std::lock_guard<std::mutex> lock(mutex_);
+  server_ = client;
+  // Empty means "the one on the card", which is what the console passes. See the
+  // header: `token.dat` is this class's to read and re-read, and a `main.cpp`
+  // that fished the token out of it would be a second reader of the one file
+  // that must not be read two different ways.
+  list_token_ = bearer_token.empty() ? token_.access_token : std::move(bearer_token);
+  lists_.UseServer(client, list_token_);
+  // Every answer this service gets is now counted towards the one verdict --
+  // the seam #31 left open, where a revoked token read as "your server is
+  // unreachable" on every page and nothing anywhere counted it
+  // (`lists::Service::UseAuthObserver`).
+  lists_.UseAuthObserver([this](auth::Answer answer) { ObserveAnswer(answer); });
+}
+
+void SdEngine::UseNetworkWait(NetworkWait wait) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  network_wait_ = std::move(wait);
 }
 
 void SdEngine::UseCard(fs::FileSystem* filesystem) {
@@ -85,6 +120,18 @@ void SdEngine::Load(const std::string& config_dir) {
   const io::ReadResult record = io::ReadFile(PathTo(auth::kTokenFileName));
   auth_ = record.error == io::ReadError::kMissing ? ipc::AuthState::kNeverPaired
                                                   : ipc::AuthState::kPaired;
+
+  // The credentials themselves, for the worker: negotiate needs `device_id` as
+  // well as the bearer token (M7-2, #37). A record that is there and will not
+  // parse leaves this empty and `auth_` at `kPaired`, which is the honest pair
+  // of answers -- the console *has* paired and this build cannot use it, and a
+  // tick that cannot negotiate says so on the status screen.
+  const auth::LoadedToken credentials = auth::LoadToken(PathTo(auth::kTokenFileName));
+  token_ = credentials.ok() ? credentials.value : auth::StoredToken{};
+  if (server_ != nullptr) {
+    list_token_ = token_.access_token;
+    lists_.UseServer(server_, list_token_);
+  }
 
   // M1-4 (#8): the one state that cannot be worked out from the card alone is
   // read off the card anyway, because a *previous* boot asked the server and
@@ -157,7 +204,7 @@ void SdEngine::Load(const std::string& config_dir) {
   history_ = conflicts::History(PathTo(conflicts::kHistoryFileName));
   static_cast<void>(history_.Load());
 
-  AdoptConfig(config::LoadConfig(PathTo(config::kConfigFileName)));
+  AdoptConfigLocked(config::LoadConfig(PathTo(config::kConfigFileName)));
 }
 
 void SdEngine::UsePairingBackend(PairingBackend backend) {
@@ -172,8 +219,11 @@ void SdEngine::UsePairingBackend(PairingBackend backend) {
   }
 }
 
-void SdEngine::AdoptConfig(config::LoadResult loaded) {
-  config_ = std::move(loaded.value);
+void SdEngine::AdoptConfigLocked(config::LoadResult loaded) {
+  config_ = std::make_shared<const config::Config>(std::move(loaded.value));
+  // In the same breath, so a changed interval takes effect with no reboot and a
+  // changed `server.url` lifts a TLS park (`sync::Scheduler::Reconfigure`).
+  scheduler_.Reconfigure(ScheduleFrom(*config_));
   diagnostics_ = auth_diagnostics_;
   diagnostics_.reserve(diagnostics_.size() + loaded.diagnostics.size());
   for (config::Diagnostic& diagnostic : loaded.diagnostics) {
@@ -185,7 +235,12 @@ bool SdEngine::WriteQueue() {
   return download::SaveQueue(PathTo(download::kQueueFileName), queue_).ok();
 }
 
-const config::Config& SdEngine::config() const { return config_; }
+const config::Config& SdEngine::config() const { return *config_; }
+
+std::shared_ptr<const config::Config> SdEngine::ConfigSnapshot() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return config_;
+}
 
 const std::vector<config::Diagnostic>& SdEngine::config_diagnostics() const {
   return diagnostics_;
@@ -194,10 +249,24 @@ const std::vector<config::Diagnostic>& SdEngine::config_diagnostics() const {
 ipc::EngineSnapshot SdEngine::Snapshot() const {
   ipc::EngineSnapshot snapshot;
   {
-    // The one field here the pairing thread writes: a completed attempt turns a
-    // never-paired console into a paired one without a reload.
+    // Everything the two worker threads write, in one slice under one lock --
+    // which is what `EngineSnapshot` asks for: a consistent read, taken as a
+    // value, never a reference into live worker state.
     std::lock_guard<std::mutex> lock(mutex_);
     snapshot.auth = auth_;
+    snapshot.sync_in_progress = sync_in_progress_;
+    snapshot.last_sync_at = last_sync_at_;
+    snapshot.last_sync_result = last_sync_result_;
+    snapshot.uploaded = uploaded_;
+    snapshot.downloaded = downloaded_;
+    snapshot.conflicts = conflicts_;
+    snapshot.failed = failed_;
+    // "The last thing this console did reached the server." Deliberately not a
+    // live probe: `GetStatus` is polled every frame and may not go near the
+    // network (`ipc.hpp`), so what the screen draws is the last tick's evidence
+    // rather than a fresh answer nobody asked for.
+    snapshot.online = last_sync_result_ == ipc::SyncResult::kOk ||
+                      last_sync_result_ == ipc::SyncResult::kPartial;
   }
   // M3-2 (#19): these two come off the queue on the card rather than being the
   // zero a console with no engine reports. `pending()` counts what the worker
@@ -314,7 +383,7 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
   // Compared against the **card**, not against `config_`. Those two part company
   // exactly when `config.ini` was there and unreadable at boot: `LoadConfig`
   // answers with the built-in defaults then (it may never refuse), so
-  // `config_.server.url` is empty while the file names a perfectly good server.
+  // `config_->server.url` is empty while the file names a perfectly good server.
   // Comparing against that would make the next edit of any kind -- a plain
   // `SetEnabled` toggle included -- look like a server change and shred a
   // working pairing over an SD card that had one bad moment.
@@ -401,17 +470,381 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
   //
   // This is what makes the change take effect with no reboot: `GetStatus` and
   // `GetConfig` read `config_`, and it is now the new one.
-  AdoptConfig(std::move(parsed));
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    AdoptConfigLocked(std::move(parsed));
+  }
+  // The scheduler may now have something due -- a shortened interval, a switch
+  // turned back on, or a park lifted -- and the worker is asleep on a deadline
+  // that was computed from the configuration before this one.
+  wake_.notify_all();
   return ipc::Error::kOk;
 }
 
 bool SdEngine::RequestSync() {
-  // False, which `ServiceCore::SyncNow` reports as `kAlreadyRunning`. That is
-  // the one answer in this file that is not quite the truth, and it is forced:
-  // `RequestSync` is a bool, so there is no `kUnavailable` to return. M7-2 is
-  // what makes it true; until then the screen shows a tick that never starts
-  // rather than one that claims to have.
-  return false;
+  bool taken = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (sync_in_progress_) {
+      // The one thing this is allowed to mean, and the same fact
+      // `Status::sync_in_progress` carries: a tick is running. The overlay greys
+      // the button off that field without pressing anything, so any other reason
+      // to answer false here would put the two out of step (`ipc.hpp`).
+      return false;
+    }
+    taken = scheduler_.RequestNow();
+  }
+  // Outside the lock: the worker takes `mutex_` the moment it wakes.
+  wake_.notify_all();
+  return taken;
+}
+
+sync::SchedulerConfig SdEngine::ScheduleFrom(const config::Config& config) {
+  sync::SchedulerConfig schedule;
+  schedule.enabled = config.sync.enabled;
+  schedule.on_boot = config.sync.on_boot;
+  // Clamped here rather than trusted: `LoadConfig` clamps what it reads, and an
+  // `ApplyConfigEdit` rejects what is out of range -- but this is the one place
+  // the number becomes a timer, and a timer is where a bad value costs a
+  // battery (config.hpp's `kMinIntervalMinutes`/`kMaxIntervalMinutes`).
+  int minutes = config.sync.interval_min;
+  minutes = minutes < config::kMinIntervalMinutes ? config::kMinIntervalMinutes : minutes;
+  minutes = minutes > config::kMaxIntervalMinutes ? config::kMaxIntervalMinutes : minutes;
+  schedule.interval = std::chrono::minutes{minutes};
+  return schedule;
+}
+
+void SdEngine::StartWorker() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (worker_thread_.joinable()) {
+    return;
+  }
+  scheduler_.Reconfigure(ScheduleFrom(*config_));
+  worker_thread_ = std::thread(&SdEngine::RunWorker, this);
+}
+
+void SdEngine::ObserveAnswer(auth::Answer answer) {
+  bool persist = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const bool was_blocked = gate_.blocked();
+    gate_.Observe(answer);
+    persist = gate_.blocked() && !was_blocked;
+    if (gate_.blocked()) {
+      // Set in the same moment as the file is written, so the overlay draws
+      // "pair this console again" on its next poll rather than after a reboot
+      // (M1-4, #8 left both halves here).
+      auth_ = ipc::AuthState::kUnauthenticated;
+    }
+  }
+  if (!persist) {
+    return;
+  }
+  // Outside `mutex_`, which is never held across an SD write, and under
+  // `card_mutex_`, which is what serialises this against a pairing grant landing
+  // at the same instant.
+  std::lock_guard<std::mutex> card(card_mutex_);
+  auth::Block block = auth::Block::kNone;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    block = gate_.block();
+  }
+  if (block == auth::Block::kNone) {
+    // An `Unpair` landed between the two locks and reset the gate. Writing the
+    // verdict now would be a file about credentials this console no longer
+    // holds, which is exactly what `Load` refuses to honour.
+    return;
+  }
+  // A failure is not reported anywhere: the file holds nothing that cannot be
+  // worked out again by asking, and the cost of losing it is the rejection
+  // budget on the next boot (auth_gate.hpp).
+  auth::SaveBlock(PathTo(auth::kAuthStateFileName), block);
+}
+
+void SdEngine::RunWorker() {
+  {
+    // The wait for the network happens **here**, on this thread, and never in
+    // `main`: a console that comes up with no Wi-Fi must not hold boot
+    // (CLAUDE.md, docs/ARCHITECTURE.md §1). A null waiter is "the network is
+    // up", which is what every host build is.
+    NetworkWait wait;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (stopping_) {
+        return;
+      }
+      wait = network_wait_;
+    }
+    if (wait) {
+      wait();
+    }
+  }
+
+  std::unique_lock<std::mutex> lock(mutex_);
+  while (!stopping_) {
+    const sync::Decision decision = scheduler_.Poll();
+    if (decision.run()) {
+      sync_in_progress_ = true;
+      lock.unlock();
+      RunOneTick(decision.trigger);
+      lock.lock();
+      sync_in_progress_ = false;
+      continue;
+    }
+
+    // A list page is one request and somebody is looking at a screen waiting for
+    // it, so it is pumped between ticks rather than on a thread of its own
+    // (`StartWorker`). `Pump()` returns false immediately when there is nothing
+    // to do, so an idle loop pays one function call.
+    lock.unlock();
+    const bool pumped = PumpLists();
+    lock.lock();
+    if (pumped) {
+      continue;
+    }
+
+    if (stopping_) {
+      break;
+    }
+    if (decision.parked) {
+      // No deadline at all. This is the idle cost the whole scheduler exists to
+      // avoid: a switched-off or boot-only console waits to be woken by a
+      // command and costs nothing in between (scheduler.hpp).
+      wake_.wait(lock);
+    } else {
+      wake_.wait_for(lock, decision.sleep_for);
+    }
+  }
+}
+
+namespace {
+
+/// Where a save or a state the console has no local copy of should be written.
+///
+/// Empty when there is nowhere to put it, which is what `ExecuteOptions::place`
+/// and `StateSyncOptions::place` both document as "fail this one rather than
+/// guessing" -- and it is the honest answer for a rom this client's index does
+/// not hold, or a platform the user never mapped a folder for.
+///
+/// **The server's file name is never trusted.** A `file_name` carrying a
+/// separator, or one that is `.` or `..`, would let a sync plan name a path
+/// outside the folder the user mapped; `sync::Validate` refuses the same shapes
+/// on the way in, and this refuses them again on the way out because this is the
+/// call that turns a name into a path.
+std::string PlaceUnder(const std::vector<std::string>& folders, std::string_view file_name) {
+  if (folders.empty() || file_name.empty() || file_name == "." || file_name == ".." ||
+      file_name.find('/') != std::string_view::npos ||
+      file_name.find('\\') != std::string_view::npos) {
+    return {};
+  }
+  // The first entry is the write target; the rest are only ever consulted when
+  // asking whether something is already there (config.hpp).
+  return folders.front() + "/" + std::string(file_name);
+}
+
+}  // namespace
+
+void SdEngine::RunOneTick(sync::Trigger trigger) {
+  (void)trigger;
+
+  const std::shared_ptr<const config::Config> config = ConfigSnapshot();
+  http::HttpClient* client = nullptr;
+  fs::FileSystem* files = nullptr;
+  auth::StoredToken token;
+  bool blocked = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    client = server_;
+    files = card_;
+    token = token_;
+    blocked = gate_.blocked();
+  }
+
+  if (blocked) {
+    // The server has stopped accepting these credentials and the remedy is a
+    // person at a pairing screen. `auth::Gate` is the only thing that lifts it,
+    // and `kUnauthorized` is what tells the scheduler not to invent a backoff
+    // over a decision that is not its (scheduler.hpp).
+    std::lock_guard<std::mutex> lock(mutex_);
+    scheduler_.Finished(sync::TickOutcome::kUnauthorized);
+    return;
+  }
+  if (client == nullptr || files == nullptr || token.access_token.empty() ||
+      !config->configured()) {
+    // A build with no transport, a console with no card backend, one that has
+    // never paired, or one with no `server.url`. **`kOffline` rather than a
+    // member of its own**: nothing was written, nothing reached a server, and
+    // the answer -- back off and try again later -- is the same one a console on
+    // a train gets. The status screen says which of the four it is; the schedule
+    // does not need to know.
+    std::lock_guard<std::mutex> lock(mutex_);
+    scheduler_.Finished(sync::TickOutcome::kOffline);
+    last_sync_result_ = ipc::SyncResult::kFailed;
+    return;
+  }
+
+  // Step 0, the half `sync::RunTick` deliberately does not own: the library the
+  // scan matches against, and the scan itself.
+  roms::FetchOptions fetch;
+  fetch.base_url = config->server.url;
+  fetch.bearer_token = token.access_token;
+  const roms::FetchResult library = roms::FetchRomIndex(*client, fetch);
+  ObserveAnswer(roms::AnswerOf(library));
+  if (!library.ok()) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    scheduler_.Finished(library.status == 401 || library.status == 403
+                            ? sync::TickOutcome::kUnauthorized
+                            : sync::TickOutcome::kOffline,
+                        library.transport);
+    last_sync_result_ = ipc::SyncResult::kFailed;
+    return;
+  }
+
+  const std::string baseline_path = files->Resolve(sync::kStateSdPath);
+  const state::LoadedBaseline loaded = state::LoadBaseline(baseline_path);
+  const scan::ScanResult scanned = scan::ScanSaves(*config, library.index, *files, loaded.value);
+
+  std::vector<sync::ClientSaveState> reported;
+  std::vector<sync::SaveTarget> targets;
+  reported.reserve(scanned.saves.size());
+  targets.reserve(scanned.saves.size());
+  for (const scan::SaveFile& save : scanned.saves) {
+    reported.push_back(save.ToClientSaveState());
+    sync::SaveTarget target;
+    target.rom_id = save.rom_id;
+    target.slot = save.slot;
+    target.sd_path = save.sd_path;
+    target.file_name = save.file_name;
+    targets.push_back(std::move(target));
+  }
+
+  sync::TickOptions options;
+  // The switch, passed **into** the tick rather than re-decided here: the gate
+  // one level down is what makes "a disabled sysmodule makes no network call"
+  // true against a second caller (M6-2, #33). The scheduler never gets this far
+  // with it off, which is the other half of the same promise.
+  options.enabled = config->sync.enabled;
+  options.execute.backup_dir = sync::kBackupDir;
+  options.finish.state_sd_path = sync::kStateSdPath;
+  options.cancel = &tick_cancel_;
+  // The save folders and `.backup/`, and deliberately **not** `/config/rommsync`
+  // itself: those records recover from their own `.old` when they are read, and
+  // the overlay writes `config.ini` from another thread, where a sweep removing
+  // a `.tmp` between the write and its rename would cost a setting the user had
+  // just changed (`sync::RecoverStaging`).
+  options.recover_dirs = config->SaveScanDirs();
+  options.recover_dirs.push_back(std::string(sync::kBackupDir));
+  const roms::RomIndex* index = &library.index;
+  options.execute.place = [index, config](const sync::SyncOperation& operation) -> std::string {
+    const roms::Rom* rom = index->ById(operation.rom_id);
+    if (rom == nullptr) {
+      return {};
+    }
+    const config::PlatformFolders* folders = config->Platform(rom->platform_fs_slug);
+    return folders == nullptr ? std::string() : PlaceUnder(folders->saves, operation.file_name);
+  };
+
+  const sync::TickResult tick =
+      sync::RunTick(*client, *files, token, reported, targets, loaded.value, options);
+  ObserveAnswer(tick.answer);
+
+  // M7-1 (#36)'s call site, which nothing in this build had. It is outside
+  // `sync::RunTick` because `conflict_record.hpp` includes `state_sync.hpp`, so
+  // recording from inside would be a cycle -- the same reason persisting the
+  // baseline after `SyncStates` is the caller's.
+  conflicts::RecordOptions record;
+  record.rom_name = [index](std::int64_t rom_id) -> std::string {
+    const roms::Rom* rom = index->ById(rom_id);
+    // The index carries `fs_name_no_ext` and no display name at all
+    // (rom_index.hpp), so that is what a row gets. An empty answer is not a
+    // failure: the screen falls back to the file name.
+    return rom == nullptr ? std::string() : rom->fs_name_no_ext;
+  };
+  {
+    std::lock_guard<std::mutex> history(history_mutex_);
+    conflicts::RecordSaves(&history_, tick.negotiated.plan, tick.executed, reported, record);
+  }
+
+  sync::StateSyncReport states;
+  if (config->sync.states && tick.outcome != sync::TickOutcome::kCanceled &&
+      tick.outcome != sync::TickOutcome::kDisabled) {
+    // The baseline is re-read rather than carried: `sync::RunTick` persisted its
+    // own copy on the way out, and `SyncStates` advances the same file. Reading
+    // it back is one small file and is what keeps the two halves from writing
+    // over each other's rows.
+    state::Baseline baseline = state::LoadBaseline(baseline_path).value;
+    sync::StateSyncOptions state_options;
+    state_options.backup_dir = sync::kBackupDir;
+    state_options.cancel = &tick_cancel_;
+    state_options.place = [index, config](const sync::ServerState& server) -> std::string {
+      const roms::Rom* rom = index->ById(server.rom_id);
+      if (rom == nullptr) {
+        return {};
+      }
+      const config::PlatformFolders* folders = config->Platform(rom->platform_fs_slug);
+      return folders == nullptr ? std::string() : PlaceUnder(folders->states, server.file_name);
+    };
+    states = sync::SyncStates(*client, *files, token, *config, library.index, &baseline,
+                              state_options);
+    // Persisting it is the caller's, deliberately (state_sync.hpp).
+    state::SaveBaseline(baseline_path, baseline);
+    std::lock_guard<std::mutex> history(history_mutex_);
+    conflicts::RecordStates(&history_, states, record);
+  }
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  scheduler_.Finished(tick);
+  last_sync_at_ = static_cast<std::int64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(
+          scheduler_.last_tick_at().time_since_epoch())
+          .count());
+  // Counted off the operations rather than off `TickCompletion::counts`, which
+  // carries only what the *server* is told -- completed and failed -- and not
+  // which way each transfer went. The status screen draws three separate
+  // numbers (`ipc::Status`), and a conflict is an overwrite the server arbitrated
+  // rather than a fourth outcome, so it is counted where the backup was written.
+  uploaded_ = 0;
+  downloaded_ = 0;
+  conflicts_ = 0;
+  for (const sync::OperationResult& operation : tick.executed.operations) {
+    if (operation.outcome == sync::OperationOutcome::kUploaded) {
+      ++uploaded_;
+    } else if (operation.outcome == sync::OperationOutcome::kDownloaded) {
+      ++downloaded_;
+    }
+    if (!operation.backup_sd_path.empty()) {
+      ++conflicts_;
+    }
+  }
+  for (const sync::StateOperationResult& operation : states.operations) {
+    if (operation.outcome == sync::StateOutcome::kUploaded) {
+      ++uploaded_;
+    } else if (operation.outcome == sync::StateOutcome::kDownloaded) {
+      ++downloaded_;
+    }
+  }
+  failed_ = static_cast<std::int64_t>(tick.executed.failed) +
+            static_cast<std::int64_t>(states.failed);
+  switch (tick.outcome) {
+    case sync::TickOutcome::kCompleted:
+      last_sync_result_ = states.failed > 0 ? ipc::SyncResult::kPartial : ipc::SyncResult::kOk;
+      break;
+    case sync::TickOutcome::kPartial:
+    case sync::TickOutcome::kUnreported:
+      last_sync_result_ = ipc::SyncResult::kPartial;
+      break;
+    case sync::TickOutcome::kCanceled:
+    case sync::TickOutcome::kDisabled:
+    case sync::TickOutcome::kRescanNeeded:
+      // Nothing happened that a status screen should report as a sync. The last
+      // result stands, which for a first boot is `kNever`.
+      break;
+    case sync::TickOutcome::kOffline:
+    case sync::TickOutcome::kRefused:
+    case sync::TickOutcome::kUnauthorized:
+      last_sync_result_ = ipc::SyncResult::kFailed;
+      break;
+  }
 }
 
 ipc::Error SdEngine::StartPairing() {
@@ -419,7 +852,7 @@ ipc::Error SdEngine::StartPairing() {
   // refuses an unconfigured console before the engine is reached: `Engine` is an
   // interface anything may drive, and starting an attempt against an empty
   // origin would spend the console's device identifier on a request to nowhere.
-  if (!config_.configured()) {
+  if (!config_->configured()) {
     return ipc::Error::kNotConfigured;
   }
   if (pairing_backend_.http == nullptr) {
@@ -458,7 +891,7 @@ ipc::Error SdEngine::StartPairing() {
   }
 
   auth::PairingConfig pairing;
-  pairing.server_url = config_.server.url;
+  pairing.server_url = config_->server.url;
   pairing.client_device_identifier = identity.value.client_device_identifier;
   // `device_name` and `requested_scopes` are `pairing.hpp`'s defaults on
   // purpose: the scopes are the least-privilege set `auth.scopes` pins to the
@@ -481,7 +914,7 @@ ipc::Error SdEngine::StartPairing() {
     // that follows one hung init; fixing it needs a `CancelToken` on
     // `PairingConfig`, which is `core/`'s to add.
     attempt_ = std::make_shared<PairingAttempt>(*pairing_backend_.http, std::move(pairing),
-                                                config_.server.url);
+                                                config_->server.url);
     attempt_commit_failure_.clear();
   }
   wake_.notify_all();
@@ -608,7 +1041,19 @@ void SdEngine::CommitGrant(const std::shared_ptr<PairingAttempt>& attempt,
     std::lock_guard<std::mutex> lock(mutex_);
     gate_.Reset();
     auth_ = ipc::AuthState::kPaired;
+    // The credentials the worker and the lists use, replaced in the same slice
+    // as the state that says the console is paired -- so the first tick after a
+    // pairing runs on the token that pairing just produced rather than on
+    // whatever was there at boot (M7-2, #37).
+    token_ = record;
+    list_token_ = record.access_token;
+    if (server_ != nullptr) {
+      lists_.UseServer(server_, list_token_);
+    }
   }
+  // A paired console usually has a tick due: `[sync] on_boot` fired long before
+  // there were credentials to fire it with.
+  wake_.notify_all();
 }
 
 ipc::Error SdEngine::Unpair() {
@@ -640,6 +1085,14 @@ ipc::Error SdEngine::Unpair() {
     std::lock_guard<std::mutex> lock(mutex_);
     gate_.Reset();
     auth_ = ipc::AuthState::kNeverPaired;
+    // The token is off the card, so the copies in memory go with it. A worker
+    // holding the discarded credentials would keep negotiating with them until
+    // the next boot.
+    token_ = auth::StoredToken{};
+    list_token_.clear();
+    if (server_ != nullptr) {
+      lists_.UseServer(server_, list_token_);
+    }
   }
   return cleared ? ipc::Error::kOk : ipc::Error::kWriteFailed;
 }
@@ -684,6 +1137,9 @@ bool SdEngine::BackupPresent(const conflicts::Entry& entry) const {
 }
 
 ipc::Error SdEngine::ListConflicts(const ipc::ConflictQuery& query, ipc::ConflictPage* page) {
+  // The worker appends to this after every half of a tick now (M7-2, #37), so
+  // reading it is no longer a single-threaded read.
+  std::lock_guard<std::mutex> history(history_mutex_);
   const std::vector<conflicts::Entry>& entries = history_.entries();
   page->offset = query.offset;
   page->total = static_cast<std::int32_t>(entries.size());
@@ -707,6 +1163,10 @@ ipc::Error SdEngine::ListConflicts(const ipc::ConflictQuery& query, ipc::Conflic
 }
 
 ipc::Error SdEngine::RestoreBackup(std::int64_t entry_id, conflicts::RestoreReport* report) {
+  // Held across the restore, which copies two files on the card: a tick
+  // appending an entry underneath a restore reading one would be a race on the
+  // same vector.
+  std::lock_guard<std::mutex> history(history_mutex_);
   if (card_ == nullptr) {
     // Nothing implements `fs::FileSystem` for Horizon yet (`engine.hpp`).
     // `kBackupFailed` rather than a transport failure: its promise is that
