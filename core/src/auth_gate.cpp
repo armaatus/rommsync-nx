@@ -74,48 +74,47 @@ const char* Describe(Block block) {
 }
 
 void Gate::Observe(Answer answer) {
-  switch (answer) {
-    case Answer::kSilent:
-      // Deliberately nothing: see `Answer::kSilent`.
-      return;
-    case Answer::kAccepted:
-      rejections_ = 0;
-      pending_ = Block::kNone;
-      return;
-    case Answer::kRejected:
-      pending_ = Block::kRevoked;
-      break;
-    case Answer::kForbidden:
-      pending_ = Block::kScopeDenied;
-      break;
+  if (answer == Answer::kSilent) {
+    // Deliberately nothing: see `Answer::kSilent`.
+    return;
   }
-
+  if (answer == Answer::kAccepted) {
+    revocations_ = 0;
+    denials_ = 0;
+    return;
+  }
   if (blocked()) {
     // The verdict is already in, and a caller that kept asking anyway must not
     // be able to run the count up past the budget it is compared against.
     return;
   }
-  ++rejections_;
-  if (rejections_ >= config_.max_consecutive_rejections) {
-    block_ = pending_;
+  if (answer == Answer::kRejected) {
+    ++revocations_;
+  } else {
+    ++denials_;
+  }
+  if (rejections() >= config_.max_consecutive_rejections) {
+    // The majority of the run, ties to `kRevoked` -- see `Observe`'s comment.
+    block_ = revocations_ >= denials_ ? Block::kRevoked : Block::kScopeDenied;
   }
 }
 
 std::chrono::milliseconds Gate::backoff() const {
+  const int rejections = this->rejections();
   if (blocked()) {
     // There is nothing left to wait for -- `blocked()` is what decides whether a
     // call may be made at all -- so this is a pace for whatever loop is still
     // turning, and the slowest one is the right one.
     return config_.max_backoff;
   }
-  if (rejections_ <= 0) {
+  if (rejections <= 0) {
     return std::chrono::milliseconds{0};
   }
   std::chrono::milliseconds delay = config_.backoff;
   // Doubled per rejection past the first, by repeated addition rather than a
-  // shift: `rejections_` is bounded by the budget, and a shift wide enough to
+  // shift: the count is bounded by the budget, and a shift wide enough to
   // overflow a `rep` is the one way a backoff becomes a negative wait.
-  for (int doubled = 1; doubled < rejections_; ++doubled) {
+  for (int doubled = 1; doubled < rejections; ++doubled) {
     if (delay >= config_.max_backoff) {
       break;
     }
@@ -130,15 +129,17 @@ void Gate::Restore(Block block) {
     return;
   }
   block_ = block;
-  pending_ = block;
-  // The count that produced it is not in the file and does not need to be: a
+  // The run that produced it is not in the file and does not need to be: a
   // blocked gate is asked `blocked()`, and the budget has already been spent.
-  rejections_ = config_.max_consecutive_rejections;
+  // It is booked to the kind the verdict names so `rejections()` adds up and a
+  // later `Observe` cannot flip the sentence out from under a stored verdict.
+  revocations_ = block == Block::kRevoked ? config_.max_consecutive_rejections : 0;
+  denials_ = block == Block::kScopeDenied ? config_.max_consecutive_rejections : 0;
 }
 
 void Gate::Reset() {
-  rejections_ = 0;
-  pending_ = Block::kNone;
+  revocations_ = 0;
+  denials_ = 0;
   block_ = Block::kNone;
 }
 

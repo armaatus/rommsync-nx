@@ -151,7 +151,9 @@ bool ShouldRetry(RegistrationError error);
 /// user approves the scope that is missing, so the remedy really is to pair
 /// again -- but "pair again and approve the scopes this needs" is not "your
 /// pairing is gone", and only the second is true of a 401
-/// (`auth::Describe(Block)` carries both). Distinct from `ShouldRetry` on purpose: the overlay's two sentences
+/// (`auth::Describe(Block)` carries both).
+///
+/// Distinct from `ShouldRetry` on purpose: the overlay's two sentences
 /// are "your server is unreachable, this will retry" and "pair this console
 /// again", and sending a user to the second over a dropped connection is how a
 /// working pairing gets thrown away. An error that is in neither -- sync turned

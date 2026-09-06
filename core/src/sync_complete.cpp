@@ -213,15 +213,14 @@ auth::Answer AnswerOf(CompleteError error) {
       return auth::Answer::kRejected;
     case CompleteError::kForbidden:
       return auth::Answer::kForbidden;
-    // Accepted only where the answer is proof RomM read the token: a session, and
-    // the three refusals gated on RomM's own `detail` text.
+    // Accepted only where the answer is proof RomM read the token: a session,
+    // and the three refusals gated on RomM's own `detail` text (auth_gate.hpp).
     case CompleteError::kNone:
     case CompleteError::kNoSuchSession:
     case CompleteError::kAlreadyCompleted:
     case CompleteError::kSuperseded:
       return auth::Answer::kAccepted;
-    // The rest say nothing -- `kRejected` among them, for the reason the
-    // negotiate one is: a bare 4xx is an answer anything in front of RomM gives.
+    // The rest say nothing, `kRejected` -- a bare 4xx -- included.
     case CompleteError::kRejected:
     case CompleteError::kNotRegistered:
     case CompleteError::kNoSession:

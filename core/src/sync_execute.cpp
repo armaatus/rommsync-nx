@@ -268,13 +268,11 @@ auth::Answer AnswerOf(OperationError error) {
       return auth::Answer::kRejected;
     case OperationError::kForbidden:
       return auth::Answer::kForbidden;
-    // An operation that did what the plan asked did it with this token.
+    // The one acceptance: an operation that did what the plan asked did it with
+    // this token (the rule is on `auth::AnswerOf(const http::Result&)`).
     case OperationError::kNone:
       return auth::Answer::kAccepted;
-    // The rest say nothing about the credentials. `kRefused` is among them for
-    // the reason `NegotiateError::kRefused` is: a bare 4xx is an answer anything
-    // in front of RomM gives, and clearing a rejection count on one would let a
-    // proxy alternating statuses keep a console asking forever.
+    // The rest say nothing, `kRefused` -- a bare 4xx -- included.
     case OperationError::kNoLocalSave:
     case OperationError::kNoSaveId:
     case OperationError::kUnreadableCard:

@@ -64,8 +64,20 @@ const char* ToString(Answer answer);
 /// The "detect a 401 on **any** call" primitive: it takes an `http::Result` and
 /// so works for a call whose failure enum nobody has written yet. Callers that
 /// already hold a classified error have an `AnswerOf` overload beside that enum
-/// -- `auth::AnswerOf(RegistrationError)`, `sync::AnswerOf(NegotiateError)` and
-/// the rest -- so a status is read here once rather than at each call site.
+/// -- `auth::AnswerOf(RegistrationError)`, `sync::AnswerOf(NegotiateError)`,
+/// `sync::AnswerOf(CompleteError)`, `sync::AnswerOf(OperationError)`,
+/// `download::AnswerOf(DrainOutcome)` -- so a status is read here once rather
+/// than at each call site.
+///
+/// **The rule every one of those overloads follows**, stated here rather than
+/// restated in each: a member is `kAccepted` only where the answer is *proof*
+/// the server read the token -- a parsed device, a plan, a session, a drained
+/// queue, or a refusal gated on RomM's own `detail` text. A bare 4xx, a 5xx and
+/// a 429 are `kSilent`, because anything in front of RomM answers those and
+/// clearing a rejection count on one would let a proxy alternating statuses keep
+/// a console asking forever. The overloads are separate functions rather than
+/// one table because each enum's `kSilent` set is genuinely different; what they
+/// must not do is disagree, which is what `auth.gate_answers` pins.
 Answer AnswerOf(const http::Result& result);
 
 /// Why the client has stopped calling, or `kNone` while it has not.
@@ -125,6 +137,16 @@ class Gate {
   /// asked about this token, and treating it as a recovery would let the console
   /// slip back to a token the server has stopped accepting. `Reset()` is the
   /// only exit, and re-pairing is what calls it.
+  ///
+  /// **Rejections of both kinds share one budget, and the majority decides the
+  /// sentence.** They share a budget because the guarantee is "stop calling",
+  /// and a proxy alternating 401 with 403 would otherwise never fill either
+  /// counter and never stop -- the tight retry loop this exists to prevent. The
+  /// majority decides the sentence because the sentences are the whole reason
+  /// the two are kept apart (see the header note), and "the most recent one
+  /// wins" would tell a user who was refused twice for a revoked token to go and
+  /// approve a scope. A tie is `kRevoked`: it says the server has stopped
+  /// accepting the token, which is the true half of a run that is half of each.
   void Observe(Answer answer);
 
   /// The same, reading the status off `result`. See `AnswerOf`.
@@ -135,9 +157,9 @@ class Gate {
   /// No further call may be made with these credentials. The remedy is pairing.
   bool blocked() const { return block_ != Block::kNone; }
 
-  /// Consecutive rejections since the last acceptance or reset. Reaches
-  /// `config().max_consecutive_rejections` and stops there.
-  int rejections() const { return rejections_; }
+  /// Consecutive rejections of either kind since the last acceptance or reset.
+  /// Reaches `config().max_consecutive_rejections` and stops there.
+  int rejections() const { return revocations_ + denials_; }
 
   /// How long to wait before asking again -- zero when nothing has been
   /// rejected.
@@ -160,12 +182,12 @@ class Gate {
 
  private:
   GateConfig config_{};
-  int rejections_ = 0;
 
-  /// Which kind the rejections have been, so the block that follows carries the
-  /// right sentence. The most recent one wins: a run that turned from 401 into
-  /// 403 ends on the answer the server is giving now.
-  Block pending_ = Block::kNone;
+  /// The current run, split by kind so the majority can decide the sentence.
+  /// Their sum is `rejections()`, and it is the sum that is compared against the
+  /// budget -- see `Observe`.
+  int revocations_ = 0;  ///< 401s
+  int denials_ = 0;      ///< 403s
 
   Block block_ = Block::kNone;
 };
@@ -230,8 +252,15 @@ LoadedBlock ParseBlock(std::string_view text);
 /// window `io::WriteAtomically`'s two-rename commit opens.
 LoadedBlock LoadBlock(const std::string& path);
 
-/// Write `block` to `path`, atomically. `kNone` is `kUnusableToken` and writes
-/// nothing -- clearing a verdict removes the file, which is `ClearBlock`.
+/// Write `block` to `path`, atomically.
+///
+/// `kNone` writes nothing and is refused -- clearing a verdict removes the file,
+/// which is `ClearBlock`. The refusal borrows `auth::StoreError`, whose
+/// `kUnusableToken` is its "the record would not have been readable back;
+/// nothing was written" member; the name says *token* because `token.dat` is
+/// where that enum was born, and a second store-error enum for a file this small
+/// would be worse than the borrowed name. The message says what was actually
+/// refused.
 StoreResult SaveBlock(const std::string& path, Block block);
 
 /// Remove the verdict at `path`, and the `.tmp`/`.old` an interrupted commit

@@ -325,13 +325,12 @@ auth::Answer AnswerOf(NegotiateError error) {
     case NegotiateError::kForbidden:
       return auth::Answer::kForbidden;
     // Accepted only where the answer is proof RomM read the token: a plan, and
-    // the two refusals gated on RomM's own `detail` text.
+    // the two refusals gated on RomM's own `detail` text (auth_gate.hpp).
     case NegotiateError::kNone:
     case NegotiateError::kNoSuchDevice:
     case NegotiateError::kSyncDisabled:
       return auth::Answer::kAccepted;
-    // The rest say nothing. `kRejected` is a bare 4xx, which anything in front
-    // of RomM can answer, so it does not clear a count either.
+    // The rest say nothing, `kRejected` -- a bare 4xx -- included.
     case NegotiateError::kRejected:
     case NegotiateError::kUnusablePayload:
     case NegotiateError::kNotRegistered:

@@ -305,16 +305,16 @@ Answer AnswerOf(RegistrationError error) {
       return Answer::kRejected;
     case RegistrationError::kForbidden:
       return Answer::kForbidden;
-    // Accepted only where the answer is proof RomM read the token: each of these
-    // comes off a device record or a device list this client parsed.
+    // Accepted only where the answer is proof RomM read the token (the rule is
+    // stated once, on `AnswerOf(const http::Result&)`): each of these comes off
+    // a device record or a device list this client parsed.
     case RegistrationError::kNone:
     case RegistrationError::kSyncDisabled:
     case RegistrationError::kAmbiguous:
       return Answer::kAccepted;
-    // The rest are not evidence either way. `kNoSuchDevice` is among them
-    // because it is also a bare 404, which a `server.url` pointing at something
-    // that is not RomM answers -- and reading that as an acceptance would clear
-    // a count the next 401 should have finished.
+    // The rest are not evidence either way. `kNoSuchDevice` is the one worth
+    // naming: it is also a bare 404, which a `server.url` pointing at something
+    // that is not RomM answers.
     case RegistrationError::kNoSuchDevice:
     case RegistrationError::kNotRegistered:
     case RegistrationError::kUnreachable:

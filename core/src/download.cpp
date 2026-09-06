@@ -928,14 +928,13 @@ auth::Answer AnswerOf(DrainOutcome outcome) {
       return auth::Answer::kRejected;
     case DrainOutcome::kForbidden:
       return auth::Answer::kForbidden;
-    // Every pending entry reached a terminal state, which took a rom body out of
-    // RomM with this token.
+    // The one acceptance: every pending entry reached a terminal state, which
+    // took a rom body out of RomM with this token (auth_gate.hpp states the
+    // rule).
     case DrainOutcome::kCompleted:
       return auth::Answer::kAccepted;
-    // The rest are not evidence either way, and the direction matters: a 500 or
-    // a shutdown that cleared a rejection count would let a proxy alternating
-    // 401 with 500 keep a console asking forever. A cancel can even come before
-    // the first request.
+    // The rest are not evidence either way -- a cancel can even come before the
+    // first request.
     case DrainOutcome::kRetryable:
     case DrainOutcome::kCanceled:
     case DrainOutcome::kIdle:

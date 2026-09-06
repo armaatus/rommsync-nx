@@ -531,8 +531,9 @@ So the counting lives in [`auth_gate.hpp`](../core/include/rommsync/auth_gate.hp
   `sync::CompleteError`, `sync::OperationError`, `auth::RegistrationError` and
   `download::DrainOutcome` each split them.
 
-The verdict is persisted to `sdmc:/config/rommsync/auth.json`, one small object
-that **exists only while the server has stopped accepting the token**:
+The verdict is meant to be persisted to `sdmc:/config/rommsync/auth.json`, one
+small object that **exists only while the server has stopped accepting the
+token**:
 
 ```json
 {"format":"rommsync-auth","version":1,"block":"revoked"}
@@ -546,6 +547,17 @@ at all, and the worst it costs is those requests. That is the opposite call from
 `token.dat`, and rightly: this file holds nothing that cannot be worked out again
 by asking. `Unpair` clears it along with the token, and a `server.url` change
 clears it too, since the token it judged is gone.
+
+**Nothing writes it yet, and that is a seam rather than an omission.** Writing it
+needs something that makes the calls the counting is over, and the sysmodule has
+no scheduler until M7-2 (#37): `SdEngine` holds no `HttpClient` and does not
+start the download worker. So M1-4 shipped `auth::SaveBlock`, the read-back in
+`SdEngine::Load` and the `ipc::AuthState::kUnauthenticated` that comes off it,
+and #37 adds the two lines on the other side — `SaveBlock` when
+`SdEngine::gate_` first reports `blocked()`, and `SdEngine::auth_` set at the
+same moment so the overlay sees it without waiting for a reboot. Until then a
+console reaches the unauthenticated state within one boot's rejection budget and
+does not remember it across a reboot.
 
 ## Scopes
 

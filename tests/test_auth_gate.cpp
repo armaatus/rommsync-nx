@@ -7,7 +7,8 @@
 // is `harness.expired`, and it is the reason this file counts at all.
 //
 //   answers  -- a status becomes an `Answer`, and every error enum agrees
-//   counts   -- three consecutive rejections is a verdict; two is not
+//   counts   -- three consecutive rejections is a verdict; one is not, and the
+//               majority of a mixed run decides which sentence it earns
 //   backoff  -- the wait doubles, caps, and is zero while nothing is wrong
 //   persists -- the verdict round-trips through `auth.json`, and is cleared
 #include <chrono>
@@ -217,12 +218,46 @@ void Counts(checks::Checks& c) {
   }
 
   {
-    // A run that turns from 401 into 403 ends on what the server is saying now.
+    // A mixed run, and the reason the two kinds share one budget: a proxy
+    // alternating 401 with 403 must still stop the console. What decides the
+    // *sentence* is the majority, not whichever arrived last -- telling a user
+    // refused twice for a revoked token to go and approve a scope is the
+    // misdirection the split exists to prevent.
+    auth::Gate revoked;
+    revoked.Observe(Answer::kRejected);
+    revoked.Observe(Answer::kRejected);
+    revoked.Observe(Answer::kForbidden);
+    c.Expect(revoked.blocked(), "a mixed run still spends the budget");
+    c.Expect(revoked.block() == Block::kRevoked, "and two 401s outvote one 403");
+
+    auth::Gate denied;
+    denied.Observe(Answer::kForbidden);
+    denied.Observe(Answer::kRejected);
+    denied.Observe(Answer::kForbidden);
+    c.Expect(denied.block() == Block::kScopeDenied, "...and two 403s outvote one 401");
+
+    // A tie is `kRevoked`: it says the server has stopped accepting the token,
+    // which is the true half of a run that is half of each.
+    auth::GateConfig even;
+    even.max_consecutive_rejections = 4;
+    auth::Gate split(even);
+    split.Observe(Answer::kRejected);
+    split.Observe(Answer::kForbidden);
+    split.Observe(Answer::kRejected);
+    split.Observe(Answer::kForbidden);
+    c.Expect(split.block() == Block::kRevoked, "and a tie reads as a revocation");
+  }
+
+  {
+    // A restored verdict keeps its sentence: the run behind it is not in the
+    // file, so nothing a later call says may flip it.
     auth::Gate gate;
+    gate.Restore(Block::kScopeDenied);
     gate.Observe(Answer::kRejected);
-    gate.Observe(Answer::kRejected);
-    gate.Observe(Answer::kForbidden);
-    c.Expect(gate.block() == Block::kScopeDenied, "the most recent kind of rejection wins");
+    c.Expect(gate.block() == Block::kScopeDenied,
+             "a 401 arriving at a blocked gate does not rewrite the stored verdict");
+    c.ExpectEq(gate.rejections(), gate.config().max_consecutive_rejections,
+               "and the count still says the budget is spent");
   }
 
   {

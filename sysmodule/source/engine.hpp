@@ -97,8 +97,14 @@ class SdEngine : public ipc::Engine {
   /// owns: an unauthenticated console is one whose `auth.json` says so, and
   /// nothing else lifts that -- `auth::Gate::Reset` is the only exit, by design,
   /// because a client that is not calling cannot be told its token works.
-  /// Running the device-code flow afterwards is `StartPairing`'s, and is still
-  /// `kUnavailable`.
+  ///
+  /// **`StartPairing` is still `kUnavailable`, so the other half is not here**,
+  /// and the asymmetry is worth knowing before something presses this: a console
+  /// that unpairs cannot yet pair again from the sysmodule. Nothing under
+  /// `overlay/` calls it today -- the settings screen's "Re-pair" button, which
+  /// sends `Unpair` then `StartPair`, is M4-4 (#26) -- so the order to build
+  /// them in is `StartPairing` first, or that button discards a pairing with
+  /// nothing to restart.
   ///
   /// The verdict goes **after** the token, deliberately: the other order leaves
   /// a moment where the card says the pairing is fine and the credentials are
