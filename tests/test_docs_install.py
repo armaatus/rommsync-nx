@@ -92,10 +92,13 @@ CLAUSE_BREAK = re.compile(r"[,;:]|\b(?:but|then|and|or|so|if|when|unless)\b")
 
 # Never acceptable, negated or otherwise: these are not sentences, they are the
 # thing itself, and a user copies one out of a code block without reading the
-# paragraph above it. Both are what M0-1 found the console's `ssl` service can
-# be talked into (docs/SECURITY.md#a-self-signed-certificate-on-a-home-server);
-# a curl flag is not, which is why none is listed.
-FORBIDDEN_LITERALS = ("SSL_VERIFY_NONE", "verify_peer = false")
+# paragraph above it. Each is a real switch on one side or the other of the
+# boundary docs/SECURITY.md#a-self-signed-certificate-on-a-home-server draws:
+# `verify_peer` is this client's own `ClientOptions` field, and the other two
+# are the Horizon `ssl` bypass M0-1 measured. A curl flag is neither, which is
+# why none is listed.
+FORBIDDEN_LITERALS = ("verify_peer = false", "SslOptionType_SkipDefaultVerify",
+                      "SetVerifyOption(0)")
 
 
 def fail(msg: str) -> int:
