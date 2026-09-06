@@ -3,6 +3,7 @@
 #include <ctime>
 #include <string>
 
+#include "card_probe.hpp"
 #include "ipc_client.hpp"
 #include "rommsync/core.hpp"
 #include "rommsync/ipc.hpp"
@@ -26,6 +27,14 @@ constexpr s32 kBarHeight = 12;
 constexpr s32 kValueColumn = 160;
 /// How far short of the drawer's right edge the progress track stops.
 constexpr s32 kBarInset = 8;
+
+/// Polls between two looks at the card, while the sysmodule is not answering.
+///
+/// `update()` runs once a frame, and three `stat`s a frame on an SD card is a
+/// cost for a screen that is not going to change until the user leaves the
+/// overlay and turns the sysmodule on. Sixty polls is about a second, which is
+/// faster than they can do that.
+constexpr int kPollsBetweenProbes = 60;
 
 }  // namespace
 
@@ -64,7 +73,7 @@ void StatusScreen::Poll() {
   // none of which is this screen's own (`screen_frame.hpp`).
   const Link link = frame_.Ready();
   if (link != Link::kOk) {
-    view_ = RenderUnreachable(link, frame_.sysmodule_interface());
+    view_ = RenderUnreachable(link, CardThisPoll(link), frame_.sysmodule_interface());
     return;
   }
 
@@ -81,7 +90,28 @@ void StatusScreen::Poll() {
   // `GetStatus` is documented never to fail, so a failure is the transport or a
   // payload this build cannot read -- and which of the two is `Diagnose`'s to
   // say, not this screen's.
-  view_ = RenderUnreachable(frame_.Diagnose(rc), frame_.sysmodule_interface());
+  const Link diagnosed = frame_.Diagnose(rc);
+  view_ = RenderUnreachable(diagnosed, CardThisPoll(diagnosed), frame_.sysmodule_interface());
+}
+
+const CardState& StatusScreen::CardThisPoll(Link link) {
+  if (link != Link::kNotRunning) {
+    // Three `stat`s a second for a value the renderer throws away. The other two
+    // link states are answered by the session rather than by the card
+    // (`card_probe.hpp`), so this hands back whatever was last read and looks at
+    // nothing.
+    return card_;
+  }
+  // Re-read on the first look and then only every `kPollsBetweenProbes` polls: the card
+  // is the one thing here a *user* changes while this screen is up -- they leave
+  // for ovl-sysmodules, turn the toggle on, and come back -- so it cannot be
+  // read once and kept, and it must not be read every frame either.
+  if (probe_countdown_ <= 0) {
+    card_ = ProbeCard();
+    probe_countdown_ = kPollsBetweenProbes;
+  }
+  --probe_countdown_;
+  return card_;
 }
 
 void StatusScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,

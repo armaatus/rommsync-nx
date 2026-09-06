@@ -1306,6 +1306,30 @@ void ScanForbidden(Checks& checks, const std::filesystem::path& path,
   }
 }
 
+/// The paths only `card_probe` may name, and why the ban is on two lists.
+///
+/// The rule was never "do not mention the boot flag"; it is **"do not write
+/// it"**, and M6-2 (#33) gave one file a reason to read it.
+/// `overlay/source/card_probe.hpp/.cpp` looks for `exefs.nsp` and
+/// `flags/boot2.flag` under the title id so the status screen can tell *not
+/// installed* from *installed, not set to boot* -- two states one sentence
+/// apart, with entirely different things to do about them, and only the card
+/// can say which. It opens nothing: `kForbiddenWrites` is scanned in that file
+/// exactly as in every other, and the exemption below is only for the three
+/// path tokens.
+constexpr const char* kCardProbeStem = "card_probe";
+
+/// Scanned everywhere under `overlay/`, with no exemption.
+constexpr const char* kForbiddenWrites[] = {
+    "ofstream", "fopen", "fwrite", "WriteAtomically", "atomic_file", "ApplyEdit",
+    "SetSyncEnabled",
+};
+
+/// Scanned everywhere but `card_probe`. A screen that built one of these paths
+/// itself would be a second place reasoning about ovl-sysmodules' files, which
+/// is how two overlays come to disagree about what is on.
+constexpr const char* kForbiddenPaths[] = {"boot2", "flags/", "atmosphere/contents"};
+
 /// Nothing under `overlay/` writes `config.ini`, and nothing there names a boot
 /// flag.
 ///
@@ -1314,12 +1338,8 @@ void ScanForbidden(Checks& checks, const std::filesystem::path& path,
 /// only as good as the suites that scan it, and a screen added while one suite
 /// is red would be checked by nothing. Both run on every `ctest`.
 void CheckLibraryScreenWritesNothing(Checks& checks) {
-  static constexpr const char* kForbidden[] = {
-      "ofstream",    "fopen",  "fwrite", "WriteAtomically",     "atomic_file",
-      "ApplyEdit",   "boot2",  "flags/", "atmosphere/contents", "SetSyncEnabled",
-  };
-
   bool found_the_screen = false;
+  bool found_the_probe = false;
   for (const std::filesystem::directory_entry& entry :
        std::filesystem::directory_iterator(ROMMSYNC_OVERLAY_SOURCE_DIR)) {
     const std::filesystem::path path = entry.path();
@@ -1330,9 +1350,20 @@ void CheckLibraryScreenWritesNothing(Checks& checks) {
     if (path.filename().string() == "library_screen.cpp") {
       found_the_screen = true;
     }
-    ScanForbidden(checks, path, kForbidden, "the sysmodule owns every write");
+    ScanForbidden(checks, path, kForbiddenWrites, "the sysmodule owns every write");
+    if (path.stem().string() == kCardProbeStem) {
+      found_the_probe = true;
+      continue;
+    }
+    ScanForbidden(checks, path, kForbiddenPaths,
+                  "the boot flag and the install tree are ovl-sysmodules', and only "
+                  "card_probe reads them (#33)");
   }
   checks.Expect(found_the_screen, "the library screen is in overlay/source/ and was scanned");
+  // Without this the exemption outlives the file it was written for: rename
+  // card_probe.cpp and every screen silently gains the right to name boot2.flag.
+  checks.Expect(found_the_probe,
+                "card_probe is in overlay/source/ -- the path exemption has a file to be about");
 }
 
 /// The library screen calls no engine.

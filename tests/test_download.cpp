@@ -1634,6 +1634,94 @@ void Disabled(checks::Checks& c, http::HttpClient& client, const std::string& ba
            "and the rom arrives, byte for byte");
 }
 
+/// M6-2 (#33): the kill ovl-sysmodules performs, in the middle of a transfer.
+///
+/// `truncate` already proves a short body is kept as a `.part` and finished by
+/// the next drain. What a relaunch adds is that **nothing in memory survives**:
+/// ovl-sysmodules stops a dynamic sysmodule with `pmshellTerminateProgram` and
+/// starts it again with no gap, so the second drain is a different process. It
+/// gets its queue from `queue.json`, its `.part` from the card, and nothing
+/// else -- and the resume has to be a **206**, because a 200 is the whole rom
+/// again and the interrupted bytes thrown away.
+void Relaunched(checks::Checks& c, http::HttpClient& client, const std::string& base,
+                const harness::Fixture& fixture) {
+  Rig rig(c, "download-relaunched", base, fixture);
+  harness::Rom rom;
+  const std::int64_t rom_id = Queued(c, client, base, fixture, &rig.queue, "240pee.nes", &rom);
+  if (rom_id == 0) {
+    return;
+  }
+  constexpr std::int64_t kCutAt = 1024;
+
+  {
+    rig.options.max_attempts = 1;
+    harness::Fault fault(c, client, base,
+                         "{\"mode\":\"truncate\",\"bytes\":" + std::to_string(kCutAt) +
+                             ",\"count\":9,\"path\":\"/api/roms/" + std::to_string(rom_id) +
+                             "/content\"}");
+    const download::DrainResult killed = rig.Drain(client);
+    c.Expect(killed.outcome == download::DrainOutcome::kRetryable,
+             std::string("the transfer is cut off mid-rom -- got ") +
+                 download::ToString(killed.outcome) + " (" + killed.message + ")");
+  }
+  c.Expect(!rig.sandbox.Exists("/tico/roms/nes/240pee.nes"),
+           "the truncated body was never promoted to the destination");
+  c.ExpectEq(rig.sandbox.SizeOf("/tico/roms/nes/240pee.nes.tmp.part"),
+             static_cast<std::uintmax_t>(kCutAt),
+             "and the prefix that did arrive is on the card, not in a buffer that died with it");
+
+  // The process goes. Everything the drain was holding -- the queue, the worker
+  // options, the resolved filesystem -- is dropped, and what is left is the
+  // sandbox: a card, exactly as a relaunched sysmodule finds one.
+  const std::string queue_path = rig.options.queue_path;
+  const download::LoadedQueue reloaded = download::LoadQueue(queue_path);
+  c.Expect(reloaded.trusted, "the queue.json the kill left behind reads back");
+  c.ExpectEq(reloaded.entries.size(), std::size_t{1}, "with the entry still in it");
+
+  // Everything a relaunched process builds for itself: a filesystem over the
+  // same card, a queue read off it, and worker options from the configuration.
+  // Nothing here is carried over from `rig`, which is the point.
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(rig.sandbox.root().string());
+  const config::Config settings = Settings();
+  download::WorkerOptions options;
+  options.base_url = base;
+  options.bearer_token = fixture.token;
+  options.queue_path = queue_path;
+  options.wait = [](std::chrono::milliseconds) {};
+  download::Queue queue;
+  queue.Reset(std::vector<QueueEntry>(reloaded.entries));
+  c.ExpectEq(queue.pending(), std::size_t{1},
+             "and the second process starts without refusing -- no lock, no pidfile");
+
+  Watched watched(client);
+  const download::DrainResult finished =
+      download::Drain(watched, *card, settings, queue, options);
+  c.Expect(finished.outcome == download::DrainOutcome::kCompleted,
+           std::string("the relaunched process finishes the download -- got ") +
+               download::ToString(finished.outcome) + " (" + finished.message + ")");
+  c.ExpectEq(watched.statuses.size(), std::size_t{1}, "in exactly one transfer");
+  if (watched.statuses.size() == 1) {
+    c.ExpectEq(watched.statuses.front(), 206,
+               "which the server answered 206 -- a 200 would mean the bytes the killed process "
+               "had already fetched were thrown away");
+  }
+  c.Expect(rig.sandbox.Read("/tico/roms/nes/240pee.nes") == FixtureRom("roms/nes/240pee.nes"),
+           "and the rom is byte-identical to the fixture across the two processes");
+  c.Expect(!rig.sandbox.Exists("/tico/roms/nes/240pee.nes.tmp.part"),
+           "with the .part consumed rather than left beside it");
+
+  // Neither the queue on the card nor the one in memory was corrupted by two
+  // processes writing it, and the entry is done exactly once.
+  const download::LoadedQueue after = download::LoadQueue(queue_path);
+  c.Expect(after.trusted, "the queue.json both processes wrote still reads");
+  c.ExpectEq(after.entries.size(), std::size_t{1}, "holding one entry, not two");
+  if (after.entries.size() == 1) {
+    c.Expect(after.entries.front().state == QueueState::kDone,
+             "and it is done");
+  }
+}
+
 void Multifile(checks::Checks& c, http::HttpClient& client, const std::string& base,
                const harness::Fixture& fixture) {
   Rig rig(c, "download-multifile", base, fixture);
@@ -2218,6 +2306,8 @@ int main(int argc, char** argv) {
     Missing(checks, *client, base, fixture);
   } else if (scenario == "progress") {
     Progress(checks, *client, base, fixture);
+  } else if (scenario == "relaunched") {
+    Relaunched(checks, *client, base, fixture);
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;

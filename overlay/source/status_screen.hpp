@@ -54,6 +54,23 @@ class StatusScreen : public tsl::Gui {
   /// Ask, and turn whatever came back -- including nothing -- into `view_`.
   void Poll();
 
+  /// What the card says about the two switches, re-reading it if this poll is
+  /// the one due to.
+  ///
+  /// Not an accessor: it is the poll's own step, and it stats three files on the
+  /// polls where the countdown has run out. Named for that -- `card()` beside
+  /// `card_` would read as free.
+  ///
+  /// `link` is what decides whether to look at all. Only `Link::kNotRunning`
+  /// uses the answer: `RenderUnreachable` discards the card for `kUnreadable`
+  /// and `kIncompatible`, where a session that opened has already proved the
+  /// module installed and running.
+  ///
+  /// Only ever consulted when the sysmodule did not answer: a session that
+  /// opened proves the module is installed and running, and reading it off the
+  /// card as well would be two sources for one fact (`card_probe.hpp`).
+  const CardState& CardThisPoll(Link link);
+
   /// Draw `view_` into the bounds `CustomDrawer` hands us.
   void Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width, s32 height) const;
 
@@ -67,6 +84,11 @@ class StatusScreen : public tsl::Gui {
   /// empty screen: the first frame is drawn before the first poll returns, and
   /// a blank one there is indistinguishable from a broken overlay.
   StatusView view_ = RenderUnreachable(Link::kNotRunning);
+
+  /// The last look at the card, and how many polls until the next one. Zero so
+  /// the first poll that needs it reads it rather than drawing a default.
+  CardState card_;
+  int probe_countdown_ = 0;
 };
 
 }  // namespace rommsync::overlay

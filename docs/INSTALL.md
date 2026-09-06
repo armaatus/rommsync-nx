@@ -50,12 +50,13 @@ Unzip the release onto the **root** of your SD card, keeping the folder
 structure. There is no wrapper directory: the archive merges into the
 `atmosphere/` and `switch/` folders your card already has.
 
-Five files land, and nothing else changes:
+Six files land, and nothing else changes:
 
 ```
 README.txt
 LICENSE
 atmosphere/contents/4200000000524D53/exefs.nsp
+atmosphere/contents/4200000000524D53/toolbox.json
 config/rommsync/config.ini.example
 switch/.overlays/ovl-rommsync.ovl
 ```
@@ -64,6 +65,13 @@ switch/.overlays/ovl-rommsync.ovl
   `4200000000524D53` is its title id, and `exefs.nsp` is the only name
   Atmosphère loads — a file named anything else in that folder installs
   cleanly, boots, and does nothing at all.
+- `atmosphere/contents/4200000000524D53/toolbox.json` is what **ovl-sysmodules**
+  reads. Atmosphère ignores it entirely; that overlay builds its list from it,
+  and a title id folder without one is a sysmodule that is simply not in the
+  list — with nothing on the console saying why. If step 2 cannot find
+  `sys-rommsync`, this is the file to check — and ovl-rommsync's own status
+  screen says so when it sees exactly that:
+  **"Unpack the release zip again: toolbox.json is missing beside exefs.nsp"**.
 - `switch/.overlays/ovl-rommsync.ovl` is the overlay. It only appears in the
   menu from that folder.
 - `config/rommsync/config.ini.example` is a starting configuration. It is an
@@ -74,7 +82,9 @@ switch/.overlays/ovl-rommsync.ovl
 
 There is **no `flags/` directory** in the archive at all — not an empty one, not
 one holding a disabled flag. `atmosphere/contents/4200000000524D53/` arrives
-holding `exefs.nsp` and nothing else.
+holding those two files and nothing else. ovl-sysmodules creates `flags/` itself
+the first time you turn the boot toggle on, so there is nothing for the zip to
+carry.
 
 That is deliberate. `flags/boot2.flag` is what makes Atmosphère launch the
 sysmodule at boot, so shipping it would mean the next boot after you unpacked
@@ -104,17 +114,26 @@ is the single most common way this goes wrong.
 They are not two spellings of the same thing. `boot2.flag` is ovl-sysmodules'
 to write: do not create it by hand, and rommsync-nx never writes it itself —
 two overlays writing the same flag is how they end up disagreeing about what is
-on. (Whether ovl-sysmodules also *creates* the `flags/` directory, which the
-archive deliberately does not ship, is still being confirmed —
-[#33](https://github.com/armaatus/rommsync-nx/issues/33). If your toggle appears
-to do nothing, that is the first thing to report.)
+on. It creates the `flags/` directory too, which is why the archive does not
+ship one.
+
+ovl-sysmodules also lists `sys-rommsync` in its **Dynamic** section, which means
+its `A` button starts and stops the process there and then, without a reboot —
+that is what `"requires_reboot": false` in `toolbox.json` asks for. Stopping it
+is a hard kill: the process is terminated where it stands, with no chance to
+finish what it was doing. That is safe by design here — every record the
+sysmodule keeps is written atomically as it goes, an interrupted download leaves
+a `.part` the next run resumes, and a save is never overwritten before its
+backup is on the card — and it is what `ctest -R toggle` checks on every build.
+The `Y` button is the separate boot toggle: it only writes or removes
+`boot2.flag`, deciding what happens at the *next* boot.
 
 ### The four states
 
 | What you have | Boot toggle | Enable switch | What is happening |
 |---|---|---|---|
-| **Not installed** | — | — | The files are not on the card. The overlay is not in the menu. |
-| **Installed, not set to boot** | off | (unread) | There is no process. Nothing syncs and nothing answers the overlay, which says **"sys-rommsync is not running"** rather than mislabelling it *disabled* — a switch that does nothing is worse than a missing one. |
+| **Not installed** | — | — | The files are not on the card. The overlay is not in the menu, and if you install only *it*, its status screen says **"sys-rommsync is not installed"** — it looks for `exefs.nsp` under the title id before it blames anything else. |
+| **Installed, not set to boot** | off | (read, not obeyed) | There is no process. Nothing syncs and nothing answers the overlay, which says **"sys-rommsync is not running"** and points you at ovl-sysmodules, rather than mislabelling it *disabled* — a switch that does nothing is worse than a missing one. It reads `config.ini` from the card so it can still show you which way the enable switch is set, labelled as the file rather than as the state. |
 | **Running, sync disabled** | on | off | The process is resident and answers the overlay, and nothing syncs. Automatic syncs stop, and the engine refuses an on-demand one with **"Sync is off"** rather than starting it — you are told which switch to flip instead of being shown a spinner that never moves. (The **Sync now** button that asks for one arrives with [#24](https://github.com/armaatus/rommsync-nx/issues/24); see step 5.) |
 | **Running, sync enabled** | on | on | The normal state: syncs on boot and on the timer — and on demand too, once [#24](https://github.com/armaatus/rommsync-nx/issues/24) lands **Sync now**. |
 

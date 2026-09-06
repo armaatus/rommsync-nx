@@ -474,12 +474,23 @@ void CheckOverlayWritesNothing(Checks& checks) {
   // exactly the arrangement this test defends. `SetSyncEnabled` is the engine
   // method behind one of them, and a screen reaching for it would be skipping
   // the boundary entirely.
-  static constexpr const char* kForbidden[] = {
-      "ofstream",    "fopen",  "fwrite", "WriteAtomically",     "atomic_file",
-      "ApplyEdit",   "boot2",  "flags/", "atmosphere/contents", "SetSyncEnabled",
+  static constexpr const char* kForbiddenWrites[] = {
+      "ofstream", "fopen", "fwrite", "WriteAtomically", "atomic_file", "ApplyEdit",
+      "SetSyncEnabled",
   };
 
+  // ...and the install paths, which are a different rule. "The boot flag is
+  // #33's" is what this list used to say, and #33 has landed: the flag is still
+  // ovl-sysmodules' to *write*, and `overlay/source/card_probe.cpp` now reads it
+  // -- with `exefs.nsp` beside it -- so the status screen can tell "not
+  // installed" from "installed, not set to boot". That one file is exempt from
+  // these three tokens and from nothing else; the writes above are scanned in it
+  // as everywhere.
+  static constexpr const char* kForbiddenPaths[] = {"boot2", "flags/", "atmosphere/contents"};
+  static constexpr const char* kCardProbeStem = "card_probe";
+
   int scanned = 0;
+  bool found_the_probe = false;
   for (const std::filesystem::directory_entry& entry :
        std::filesystem::directory_iterator(ROMMSYNC_OVERLAY_SOURCE_DIR)) {
     const std::filesystem::path path = entry.path();
@@ -488,6 +499,8 @@ void CheckOverlayWritesNothing(Checks& checks) {
       continue;
     }
     ++scanned;
+    const bool card_probe = path.stem().string() == kCardProbeStem;
+    found_the_probe = found_the_probe || card_probe;
     std::ifstream file(path);
     checks.Expect(file.good(), "the overlay source is readable: " + path.string());
     std::string line;
@@ -498,16 +511,27 @@ void CheckOverlayWritesNothing(Checks& checks) {
       if (first != std::string::npos && line.compare(first, 2, "//") == 0) {
         continue;
       }
-      for (const char* token : kForbidden) {
+      for (const char* token : kForbiddenWrites) {
         checks.Expect(!Contains(line, token),
                       path.filename().string() + ":" + std::to_string(number) + " names " +
                           token +
-                          "; the sysmodule owns every write (reading config.ini is fine) and "
-                          "the boot flag is #33's");
+                          "; the sysmodule owns every write (reading config.ini is fine)");
+      }
+      if (card_probe) {
+        continue;
+      }
+      for (const char* token : kForbiddenPaths) {
+        checks.Expect(!Contains(line, token),
+                      path.filename().string() + ":" + std::to_string(number) + " names " +
+                          token + "; the install tree is ovl-sysmodules', and only card_probe "
+                                  "reads it (#33)");
       }
     }
   }
   checks.Expect(scanned >= 6, "the scan found the overlay's sources");
+  // The exemption must not outlive the file it was written for.
+  checks.Expect(found_the_probe,
+                "card_probe is in overlay/source/ -- the path exemption has a file to be about");
 }
 
 }  // namespace

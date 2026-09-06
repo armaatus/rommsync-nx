@@ -39,6 +39,17 @@ namespace rommsync::config {
 /// The file the configuration lives in, relative to `sdmc:/config/rommsync/`.
 inline constexpr const char* kConfigFileName = "config.ini";
 
+/// The same file as an SD-root path, for the callers that have no directory to
+/// join it to.
+///
+/// `sync::kStateSdPath` and `sync::kBackupDir` are the same idea and the same
+/// reason: docs/ARCHITECTURE.md puts the client's own records under
+/// `/config/rommsync`, and a path spelled again in each caller is a path two of
+/// them disagree about. `sysmodule::kConfigDir` is the console's `sdmc:`-prefixed
+/// form of the directory; the overlay reads this file too (`card_probe.cpp`) and
+/// has no engine to ask for the path.
+inline constexpr const char* kConfigSdPath = "/config/rommsync/config.ini";
+
 /// The largest `config.ini` that will be read.
 ///
 /// A bound rather than "read the file" because this runs at boot on a sysmodule

@@ -1,0 +1,6 @@
+{
+	"name": "@NAME@",
+	"tid": "@TITLE_ID@",
+	"version": "@VERSION@",
+	"requires_reboot": false
+}

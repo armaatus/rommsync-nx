@@ -36,8 +36,14 @@ boot by Atmosphère. No UI. Responsibilities:
   status, config, toggle, queue, and "sync now".
 
 Runs paused/idle when disabled (toggled via ovl-sysmodules boot flag, or the
-overlay's enable switch). Must be a good background citizen: low idle CPU, back
-off when offline, never block boot.
+overlay's enable switch). Those are **two** switches, not two spellings of one:
+the boot flag decides whether the process exists at all, and `[sync] enabled`
+decides whether a resident one syncs. The table, and the four states the overlay
+draws off them, are
+[DEVELOPMENT.md#the-two-switches](DEVELOPMENT.md#the-two-switches).
+
+Must be a good background citizen: low idle CPU, back off when offline, never
+block boot.
 
 ### 2. `ovl-rommsync` — Ultrahand / Tesla overlay
 

@@ -175,6 +175,33 @@ enum class TickOutcome {
   /// stopped at a boundary and what it had done stands.
   kCanceled,
 
+  /// `[sync] enabled` is false. **Nothing happened at all**: no sweep, no
+  /// request, nothing written.
+  ///
+  /// The scheduler that owns the interval parks itself when the switch is off
+  /// (M7-2, #37), so reaching this is not the ordinary path. It is here because
+  /// "a disabled sysmodule makes no network call" is the promise M6-2 (#33) has
+  /// to keep against `pmshellTerminateProgram` and a relaunch, and a promise
+  /// that lives only in a scheduler is one that cannot be tested before that
+  /// scheduler exists -- nor kept by a second caller that forgets to ask.
+  /// **The sweep does not run either, and that is visible.** A crash between
+  /// `io::CommitStaged`'s two renames leaves a save parked as `<name>.old` with
+  /// the base missing, and `RecoverStaging` is what renames it back -- so a
+  /// console switched off in that state shows the player a missing save until it
+  /// is switched on again. Nothing is lost: the `.old` is the save and the
+  /// `.backup/` copy is beside it, and the first tick after the switch restores
+  /// it. Sweeping anyway would be a disabled sysmodule opening and renaming
+  /// files on the card, which is the one thing the switch promises it will not
+  /// do; #33's Scope asks for the ordering in those words.
+  ///
+  /// `download::DrainOutcome::kDisabled` is the same shape on the *other*
+  /// switch: `[downloads] enabled`, which is an independent key
+  /// (docs/CONFIG.md) and not this one's other half. A console with
+  /// `[sync] enabled = false` and `[downloads]` untouched still drains its
+  /// download queue, deliberately -- a user who switched save sync off did not
+  /// ask for the rom they queued to stop arriving.
+  kDisabled,
+
   /// The sweep put a save back that the scan could not have seen, so this tick's
   /// `reported` is already out of date. **Nothing was negotiated.**
   ///
@@ -202,6 +229,17 @@ const char* ToString(TickOutcome outcome);
 /// `CompleteOptions` are `CallPolicy`, which already times out, retries and
 /// backs off, and widening `ShouldRetry` is explicitly not this module's to do.
 struct TickOptions {
+  /// `config::SyncConfig::enabled`, and the whole of what a false one costs:
+  /// the tick returns `TickOutcome::kDisabled` before it sweeps, before it
+  /// reads and before it sends -- the treatment `download::Drain` gives its own
+  /// switch, `[downloads] enabled`.
+  ///
+  /// It defaults to *true* because a caller that has no configuration to
+  /// consult -- every unit test of one stage -- is not a console with the
+  /// switch off. The caller that does have one passes `config.sync.enabled`,
+  /// and the scheduler (M7-2, #37) additionally never gets this far.
+  bool enabled = true;
+
   /// Swept by `RecoverStaging` before anything else happens. Empty means no
   /// sweep.
   ///

@@ -129,6 +129,74 @@ StatusView Render(const ipc::Status& status, std::int64_t now_unix);
 /// only for `kIncompatible`, where the two numbers are the whole diagnosis.
 StatusView RenderUnreachable(Link link, std::uint32_t sysmodule_interface = 0);
 
+/// What the SD card says about the two switches, for a console whose sysmodule
+/// did not answer (M6-2, #33).
+///
+/// There are **two** switches and they mean different things: ovl-sysmodules'
+/// boot toggle -- `atmosphere/contents/<TID>/flags/boot2.flag` -- decides
+/// whether the process exists at all, and `[sync] enabled` in `config.ini`
+/// decides whether a resident process syncs. An overlay that collapses them
+/// hands the user a switch that does nothing, so the four states are drawn
+/// apart: not installed, installed but not set to boot, running with sync off,
+/// running with sync on. The first two are the ones only the card can tell
+/// apart, and this is what carries them.
+///
+/// **Every field is the card's, read by the overlay, and none of it is live.**
+/// The overlay owns no writes to either switch (`overlay/AGENTS.md`, and
+/// `boot2.flag` is ovl-sysmodules' file): it reads them to explain a silence.
+/// `core/` names no path here for hard rule 4's reason -- the SD prefix and the
+/// title id belong to the side that has them -- so the peeks are the caller's
+/// and this is the decision made about their answers.
+struct CardState {
+  /// `atmosphere/contents/<TID>/exefs.nsp` is on the card. False is the "not
+  /// installed" state, and it is the one worth saying out loud: nothing else on
+  /// this screen would tell a user that the zip never landed.
+  bool installed = false;
+
+  /// `atmosphere/contents/<TID>/toolbox.json` is on the card, so ovl-sysmodules
+  /// has a row to draw for this sysmodule.
+  ///
+  /// A separate question from `installed`, and the one that catches a half
+  /// landed unzip and an upgrade from a release before that file shipped:
+  /// Atmosphère loads `exefs.nsp` and ignores this, ovl-sysmodules reads this
+  /// and ignores `exefs.nsp`. Installed without it, the boot toggle the hint
+  /// would send a user to is on a screen the module is not on.
+  ///
+  /// Not checked for *validity* -- a `toolbox.json` that is there and will not
+  /// parse is skipped by that overlay just as a missing one is, and an overlay
+  /// that parsed it to say so would be reimplementing the thing it is
+  /// describing. Presence is what turns the common failure into a sentence.
+  bool listable = false;
+
+  /// `atmosphere/contents/<TID>/flags/boot2.flag` is on the card, so
+  /// Atmosphère launches the sysmodule at boot. Written by ovl-sysmodules and
+  /// by nothing here.
+  bool set_to_boot = false;
+
+  /// `config.ini` was read. False means there is no configuration to report --
+  /// a card with no `config/rommsync/config.ini` yet, or one that would not
+  /// parse -- and `sync_enabled` says nothing in that case.
+  bool config_read = false;
+
+  /// `[sync] enabled`, as the file holds it. Only meaningful with
+  /// `config_read`, and never drawn as the live state: the process this would
+  /// describe is not running.
+  bool sync_enabled = false;
+};
+
+/// The screen for a sysmodule that did not answer, with what the card adds.
+///
+/// `link` must not be `kOk`. For everything but `Link::kNotRunning` the card
+/// says nothing the link does not already -- a sysmodule that answered
+/// something unreadable is installed and running by definition -- so those
+/// three are exactly `RenderUnreachable(link, sysmodule_interface)`.
+///
+/// For `kNotRunning` it is the difference between "the files are not on the
+/// card" and "they are, and the boot toggle is off", which are one sentence
+/// apart and a different thing to do about each.
+StatusView RenderUnreachable(Link link, const CardState& card,
+                             std::uint32_t sysmodule_interface = 0);
+
 /// "4 minutes ago", "3 days ago", "Never" for `then_unix == 0`.
 ///
 /// Published because it is what the screen is made of and because it is the

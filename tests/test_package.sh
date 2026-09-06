@@ -4,10 +4,14 @@
 # produce the same bytes, and that unzipping over an existing install does not
 # take a user's settings with it.
 #
-#   test_package.sh layout         the unpacked tree is exactly the five paths
-#                                  #32 specifies, with the title id directory
-#                                  taken from sys-rommsync.json rather than
-#                                  typed here, and nothing else in it.
+#   test_package.sh layout         the unpacked tree is exactly the six paths
+#                                  #32 and #33 specify, with the title id
+#                                  directory taken from sys-rommsync.json rather
+#                                  than typed here, and nothing else in it. The
+#                                  sixth is toolbox.json, which ovl-sysmodules
+#                                  parses -- so it is asserted as JSON with the
+#                                  three fields that overlay requires, not just
+#                                  as a name in the list.
 #   test_package.sh refuses        a .nsp that is not PFS0 and an .ovl with no
 #                                  ULTR signature are refused, and no archive is
 #                                  left behind. Both build, zip and install
@@ -17,9 +21,10 @@
 #                                  a statement about the build rather than about
 #                                  one upload.
 #   test_package.sh upgrade        unzipping over an existing install replaces
-#                                  the two artifacts and leaves config.ini,
-#                                  token.dat, device.dat, state.db and
-#                                  queue.json alone.
+#                                  the artifacts and leaves config.ini,
+#                                  token.dat, device.dat, state.db, queue.json
+#                                  and the flags/boot2.flag that says the
+#                                  sysmodule is enabled alone.
 #   test_package.sh builds         ...and it packages a real devkitPro build,
 #                                  run inside the same container, so the script
 #                                  is exercised where #34's release job will run
@@ -116,6 +121,7 @@ phase_layout() {
     "README.txt" \
     "LICENSE" \
     "atmosphere/contents/$tid/exefs.nsp" \
+    "atmosphere/contents/$tid/toolbox.json" \
     "config/rommsync/config.ini.example" \
     "switch/.overlays/ovl-rommsync.ovl")"
   [ "$entries" = "$expected" ] || {
@@ -146,6 +152,19 @@ phase_layout() {
     fail "no switch/.overlays/ovl-rommsync.ovl"
   [ -f "$tree/config/rommsync/config.ini.example" ] ||
     fail "no config/rommsync/config.ini.example"
+  [ -f "$tree/atmosphere/contents/$tid/toolbox.json" ] ||
+    fail "no atmosphere/contents/$tid/toolbox.json"
+
+  # ovl-sysmodules PARSES this one, and drops the module from its list without a
+  # word if it cannot: `tid`, `name` and a boolean `requires_reboot` are the
+  # three fields it requires, `tid` goes through strtoul base 16 so an
+  # unsubstituted @TITLE_ID@ reads as program id 0, and `requires_reboot: true`
+  # would put sys-rommsync in the Static section, where the toggle needs a
+  # reboot the two-switch table promises it does not. Asserted field by field
+  # rather than by comparing the file to a copy of itself.
+  python3 "$REPO_ROOT/tests/toolbox_check.py" \
+      "$tree/atmosphere/contents/$tid/toolbox.json" "$tid" "$VERSION" ||
+    fail "the packaged toolbox.json is not one ovl-sysmodules would list"
 
   # `exefs.nsp`, not `sys-rommsync.nsp`. The wrong name installs cleanly, boots,
   # and does nothing at all -- so it is asserted from both directions.
@@ -156,9 +175,9 @@ phase_layout() {
 
   # boot2.flag is what makes Atmosphere launch the sysmodule at boot. Shipping
   # it contradicts "installed disabled first" (M8-2), and creating it is
-  # ovl-sysmodules' job (#33). Asserted on the name rather than on the flags/
-  # directory: whether that directory ships empty is #33's call, and this is not
-  # the place to make it for them.
+  # ovl-sysmodules' job. Asserted on the name rather than on the flags/
+  # directory, and #33 settled why there is no such directory to assert on:
+  # ovl-sysmodules `mkdir`s it itself before writing the flag into it.
   [ ! -e "$tree/atmosphere/contents/$tid/flags/boot2.flag" ] ||
     fail "the archive ships boot2.flag; the sysmodule must arrive disabled"
   grep -q 'boot2' <<<"$entries" &&
@@ -183,6 +202,20 @@ phase_layout() {
          "$tree/config/rommsync/config.ini.example" ||
     fail "the packaged config.ini.example is not packaging/config.ini.example"
   cmp -s "$REPO_ROOT/LICENSE" "$tree/LICENSE" || fail "the packaged LICENSE differs"
+
+  # The overlay names the same title id, because it looks for `exefs.nsp` and
+  # `flags/boot2.flag` under it to tell "not installed" from "not set to boot"
+  # (#33). It is a C++ constant rather than an archive entry, so nothing above
+  # would catch it drifting -- and a stale copy is an overlay reporting a
+  # correctly installed sysmodule as missing.
+  local overlay_tid
+  overlay_tid="$(sed -n 's/.*kProgramIdHex = "\([0-9A-Fa-f]*\)".*/\1/p' \
+                 "$REPO_ROOT/overlay/source/card_probe.hpp" | head -n 1 |
+                 tr '[:lower:]' '[:upper:]')"
+  [ -n "$overlay_tid" ] ||
+    fail "no kProgramIdHex in overlay/source/card_probe.hpp"
+  [ "$overlay_tid" = "$tid" ] ||
+    fail "overlay/source/card_probe.hpp says $overlay_tid; the archive installs under $tid"
 
   echo "ok: the archive is exactly the install layout, under $tid"
 }
@@ -278,6 +311,12 @@ phase_upgrade() {
   echo "[server]"                  > "$sd/config/rommsync/config.ini"
   echo "url = https://romm.lan"   >> "$sd/config/rommsync/config.ini"
   : > "$sd/atmosphere/contents/$tid/flags/boot2.flag"
+  # A previous release's toolbox.json, naming a version this build is not. It
+  # sits beside the flag and must be replaced -- ovl-sysmodules renders the
+  # `version` field into its list row, so a stale one has the overlay reporting
+  # the build the user upgraded *away* from.
+  printf '{"name":"sys-rommsync","tid":"%s","version":"0.0.1","requires_reboot":false}\n' \
+    "$tid" > "$sd/atmosphere/contents/$tid/toolbox.json"
   local user_state
   for user_state in token.dat device.dat state.db queue.json; do
     echo "the user's $user_state" > "$sd/config/rommsync/$user_state"
@@ -313,8 +352,8 @@ phase_upgrade() {
     # one and could slip past the exemptions below.
     path="${line#* * }"
     case "$path" in
-      *"/atmosphere/contents/$tid/exefs.nsp"|*"/switch/.overlays/ovl-rommsync.ovl"| \
-      ./README.txt|./LICENSE)
+      *"/atmosphere/contents/$tid/exefs.nsp"|*"/atmosphere/contents/$tid/toolbox.json"| \
+      *"/switch/.overlays/ovl-rommsync.ovl"|./README.txt|./LICENSE)
         continue ;;  # the archive's own files, replaced on purpose
     esac
     grep -qxF "$line" <<<"$after" || fail "unpacking changed or removed $path"
@@ -329,8 +368,11 @@ phase_upgrade() {
     fail "the upgrade did not replace README.txt at the SD root"
   cmp -s "$REPO_ROOT/LICENSE" "$sd/LICENSE" ||
     fail "the upgrade did not replace LICENSE at the SD root"
+  python3 "$REPO_ROOT/tests/toolbox_check.py" \
+      "$sd/atmosphere/contents/$tid/toolbox.json" "$tid" "$VERSION" ||
+    fail "the upgrade did not replace the previous release's toolbox.json"
 
-  echo "ok: unzipping twice over an install leaves config.ini and the rest alone"
+  echo "ok: unzipping twice over an install leaves config.ini, boot2.flag and the rest alone"
 }
 
 # --- the real thing ------------------------------------------------------------

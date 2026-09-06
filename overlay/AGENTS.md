@@ -9,12 +9,14 @@ Ultrahand overlay list.
   owns no sync, download, or auth logic — that lives in `core/` behind the
   sysmodule.
 - It *compiles* `core/` (`ROMMSYNC_USE_CORE` in the Makefile) and links almost
-  none of it. Two things it does link: the IPC codecs — `rommsync/ipc.hpp`,
+  none of it. Three things it does link: the IPC codecs — `rommsync/ipc.hpp`,
   shared with the sysmodule so one copy of the field names serves both halves —
-  and the screens' view models — `rommsync/overlay_status_view.hpp`,
+  the screens' view models — `rommsync/overlay_status_view.hpp`,
   `rommsync/overlay_pairing_view.hpp`, `rommsync/overlay_sync_actions.hpp`,
-  `rommsync/overlay_library_model.hpp` and `rommsync/overlay_settings_view.hpp`.
-  `--gc-sections` drops the engine no screen
+  `rommsync/overlay_library_model.hpp` and `rommsync/overlay_settings_view.hpp`
+  — and, since M6-2 (#33), `config::LoadConfig` in exactly one file,
+  `source/card_probe.cpp`, which reads `config.ini` off the card when the
+  sysmodule is not there to be asked. `--gc-sections` drops the engine no screen
   references. The rule above is about ownership, not about the link map.
 - **A screen is two halves, and only one of them is in this directory.** What
   the screen *says* — which sentence a never-paired console gets, what a
@@ -67,14 +69,25 @@ Ultrahand overlay list.
   than sending them whole. See `docs/DEVELOPMENT.md#ipc`.
 - The sysmodule owns writes to `config.ini`; the overlay asks it to change
   settings and never writes the file itself. `ctest -R overlay.sync_actions`
-  greps this directory for the write path and for the boot flag rather than
-  leaving it reviewed. Reading `config.ini` is allowed — both components read it
-  (docs/ARCHITECTURE.md); writing it is the sysmodule's alone.
+  greps this directory for the write path rather than leaving it reviewed, and
+  `overlay.library` and `overlay.settings` run the same grep. Reading
+  `config.ini` is allowed — both components read it (docs/ARCHITECTURE.md);
+  writing it is the sysmodule's alone.
 - **The enable switch is a runtime pause, not the ovl-sysmodules boot flag.**
   That flag lives under `/atmosphere/contents/<TID>/flags/` and means the
   process does not exist; `[sync] enabled` means it is resident, idle and still
   answering IPC. Rendering both as "disabled" hides a sysmodule that failed to
-  start. Nothing here reads or writes the flag — that is M6-2 (#33).
+  start.
+- **One file may name the install tree, and it may only read it.** M6-2 (#33)
+  gave the status screen four states to draw rather than two — not installed,
+  installed but not set to boot, running with sync off, running with sync on —
+  and the first two are apart only on the card. `source/card_probe.cpp` is the
+  one file allowed to name `exefs.nsp`, `flags/boot2.flag` or
+  `atmosphere/contents`; the three greps above scan every other file in this
+  directory for those tokens, and scan *every* file including that one for the
+  write path. `boot2.flag` is ovl-sysmodules' to create — two overlays writing
+  one flag is how they come to disagree about what is on. See
+  `docs/DEVELOPMENT.md#the-two-switches`.
 - libultrahand is upstream's code, not ours: `switch.mk` compiles it with
   `-isystem` headers and without `-Wextra -Wpedantic -Werror`. Do not relax
   those for anything in `source/`, and do not patch the submodule in place —

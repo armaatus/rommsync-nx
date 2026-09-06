@@ -16,6 +16,19 @@
 #   switch/.overlays/ovl-rommsync.ovl     ...this one keeps its name, but only
 #                                         Ultrahand's directory finds it.
 #
+# Beside the .nsp goes `toolbox.json`, which is not Atmosphere's file at all:
+# it is what ovl-sysmodules reads. That overlay lists a sysmodule only if
+# `/atmosphere/contents/<TID>/toolbox.json` parses and carries `tid`, `name` and
+# a boolean `requires_reboot` -- everything else in the directory it ignores. An
+# install without it is a sysmodule that is simply absent from the one list the
+# install guide sends a user to, with nothing on the console saying why (#33).
+#
+# `requires_reboot` is **false**: sys-rommsync is a dynamic module, started and
+# stopped with `pmshellLaunchProgram`/`pmshellTerminateProgram` while the console
+# is running. That is a claim about this process -- it is killed outright, at any
+# instant, with no shutdown hook -- and it is what `toggle.*` proves
+# (docs/DEVELOPMENT.md#the-two-switches).
+#
 # <TID> comes out of sysmodule/sys-rommsync.json rather than being typed here:
 # the id is still unconfirmed against the installed homebrew set
 # (sysmodule/README.md), so it will move, and a second copy of it is how a move
@@ -25,7 +38,11 @@
 #
 #   flags/boot2.flag   its presence is what makes Atmosphere launch the
 #                      sysmodule at boot, and the sysmodule ships DISABLED
-#                      (#33, and the first step of the install guide).
+#                      (#33, and the first step of the install guide). Nor the
+#                      `flags/` directory around it: ovl-sysmodules creates that
+#                      itself before it writes the flag (`mkdir` in its
+#                      gui_main.cpp), so a zip -- which cannot hold an empty
+#                      directory anyway -- has nothing to contribute.
 #   config.ini         only config.ini.example. An upgrade is this same zip
 #                      unpacked over the top, and replacing a user's settings
 #                      is not something a release may do.
@@ -99,6 +116,18 @@ CONFIG_JSON="$REPO_ROOT/sysmodule/sys-rommsync.json"
 TITLE_ID="$(sed -n 's/.*"title_id"[[:space:]]*:[[:space:]]*"0[xX]\([0-9A-Fa-f]*\)".*/\1/p' \
             "$CONFIG_JSON" | head -n 1 | tr '[:lower:]' '[:upper:]')"
 [ -n "$TITLE_ID" ] || die "no \"title_id\" in $CONFIG_JSON"
+# The name ovl-sysmodules draws in its list, read from the same file rather than
+# typed here for the same reason the title id is: one place to change it.
+MODULE_NAME="$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+               "$CONFIG_JSON" | head -n 1)"
+[ -n "$MODULE_NAME" ] || die "no \"name\" in $CONFIG_JSON"
+# It goes through `sed` as a replacement and into JSON as a string value, so a
+# `/`, a `&`, a backslash or a quote in it would produce either a broken sed
+# expression or a toolbox.json that does not parse -- and an unparseable one is
+# a module ovl-sysmodules drops from its list without a word. Refuse instead.
+case "$MODULE_NAME" in
+  *[!A-Za-z0-9\ ._-]*) die "module name '$MODULE_NAME' has a character this cannot substitute" ;;
+esac
 # A program id is 64 bits. Anything else is a typo that would install into a
 # directory Atmosphere never looks in, which is silent on the console.
 case "$TITLE_ID" in
@@ -110,9 +139,10 @@ esac
 # The archive's contents, in the order they are written. Explicit rather than
 # sorted: the order must not change when the title id does.
 NSP_ENTRY="atmosphere/contents/$TITLE_ID/exefs.nsp"
+TOOLBOX_ENTRY="atmosphere/contents/$TITLE_ID/toolbox.json"
 OVL_ENTRY="switch/.overlays/ovl-rommsync.ovl"
 CONFIG_ENTRY="config/rommsync/config.ini.example"
-ENTRIES=("README.txt" "LICENSE" "$NSP_ENTRY" "$CONFIG_ENTRY" "$OVL_ENTRY")
+ENTRIES=("README.txt" "LICENSE" "$NSP_ENTRY" "$TOOLBOX_ENTRY" "$CONFIG_ENTRY" "$OVL_ENTRY")
 
 if [ "$LIST_ONLY" -eq 1 ]; then
   printf '%s\n' "${ENTRIES[@]}"
@@ -152,9 +182,10 @@ rm -f "$ZIP"
   die "$OVL has no ULTR signature; Ultrahand would not list it"
 
 TEMPLATE="$REPO_ROOT/packaging/README.txt.in"
+TOOLBOX_TEMPLATE="$REPO_ROOT/packaging/toolbox.json.in"
 CONFIG_EXAMPLE="$REPO_ROOT/packaging/config.ini.example"
 LICENSE="$REPO_ROOT/LICENSE"
-for f in "$TEMPLATE" "$CONFIG_EXAMPLE" "$LICENSE"; do
+for f in "$TEMPLATE" "$TOOLBOX_TEMPLATE" "$CONFIG_EXAMPLE" "$LICENSE"; do
   [ -f "$f" ] || die "missing $f"
 done
 
@@ -178,6 +209,15 @@ cp "$LICENSE" "$STAGE/LICENSE"
 sed -e "s/@VERSION@/$VERSION/g" -e "s/@TITLE_ID@/$TITLE_ID/g" \
   "$TEMPLATE" > "$STAGE/README.txt"
 
+# ovl-sysmodules parses this one, so a substitution that did not happen is not a
+# cosmetic bug: `@TITLE_ID@` is not hex, `strtoul` reads it as 0, and the module
+# is silently dropped from the list. Substituted the same way and then checked.
+sed -e "s/@VERSION@/$VERSION/g" -e "s/@TITLE_ID@/$TITLE_ID/g" \
+    -e "s/@NAME@/$MODULE_NAME/g" \
+  "$TOOLBOX_TEMPLATE" > "$STAGE/$TOOLBOX_ENTRY"
+! grep -q '@[A-Z_]*@' "$STAGE/$TOOLBOX_ENTRY" ||
+  die "toolbox.json still holds an unsubstituted placeholder"
+
 # Determinism, part two: the mode and the mtime are recorded in the archive, and
 # both would otherwise come from whatever the build left behind. Applied to
 # every entry, including the ones copied out of the worktree.
@@ -185,7 +225,7 @@ sed -e "s/@VERSION@/$VERSION/g" -e "s/@TITLE_ID@/$TITLE_ID/g" \
 
 # -X drops the extra fields (unix uid/gid, the high-resolution timestamp) that
 # would otherwise differ between two runs; -D writes no directory entries, so
-# there is nothing in the archive but the five files named above; and the file
+# there is nothing in the archive but the six files named above; and the file
 # list is given explicitly, so the order is the one above rather than whatever
 # the filesystem hands back.
 ( cd "$STAGE" && zip -X -D -q "$ZIP" "${ENTRIES[@]}" )

@@ -143,6 +143,8 @@ const char* ToString(TickOutcome outcome) {
       return "unauthorized";
     case TickOutcome::kCanceled:
       return "canceled";
+    case TickOutcome::kDisabled:
+      return "disabled";
     case TickOutcome::kRescanNeeded:
       return "rescan_needed";
   }
@@ -155,6 +157,15 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
                    const std::vector<SaveTarget>& targets, state::Baseline previous,
                    const TickOptions& options) {
   TickResult result;
+  if (!options.enabled) {
+    // Before the cancel check and before the sweep: a console whose owner has
+    // switched sync off has not asked for litter to be tidied either, and the
+    // criterion this serves is that a disabled engine costs nothing at all --
+    // no file opened, no request sent (#33). `download::Drain` refuses in the
+    // same place for the same reason.
+    result.outcome = TickOutcome::kDisabled;
+    return result;
+  }
   if (Canceled(options.cancel)) {
     result.outcome = TickOutcome::kCanceled;
     return result;
