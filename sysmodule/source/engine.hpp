@@ -100,11 +100,13 @@ struct PairingBackend {
 /// from one thread of its own. Three things change after `Load()`: the queue,
 /// the configuration (M5-3, #30), and the pairing state.
 ///
-/// **`mutex_` guards exactly what the pairing thread can touch**: the attempt
-/// itself, `auth_`, `gate_`, and the writes to `token.dat` and `auth.json`.
-/// Every command that reads or changes one of those takes it, which is what
-/// makes a grant landing on the card and an `Unpair` discarding one two things
-/// that cannot interleave.
+/// **Two locks, and which one a method needs is decided by whether it touches
+/// the card.** `card_mutex_` serialises the writes to `token.dat` and
+/// `auth.json`, so a grant landing and an `Unpair` discarding cannot interleave;
+/// `mutex_` guards the in-memory state the two threads share -- the attempt,
+/// `auth_`, `gate_` -- and is never held across I/O, so the commands the
+/// overlay polls every frame never wait on an SD card. Order is `card_mutex_`
+/// then `mutex_`, never the reverse.
 ///
 /// `config_` and `queue_` are deliberately *not* under it, and that is still a
 /// fact about today rather than a decision to keep: `ServiceServer::Run` is a
@@ -346,6 +348,12 @@ class SdEngine : public ipc::Engine {
 
   /// Persist an approved grant, and leave the console reporting itself paired.
   ///
+  /// Takes `card_mutex_` for the two writes and `mutex_` only for the checks and
+  /// the assignments around them, so nothing polled every frame waits on the
+  /// card. Re-checks that the attempt is still the engine's *inside*
+  /// `card_mutex_` and before writing, which is what makes it atomic against
+  /// `ApplyConfigEdit` discarding the token for a `server.url` change.
+  ///
   /// The verdict goes after the token for the reason `Unpair` gives in reverse:
   /// the credentials are what matter, and a stale `auth.json` beside a fresh
   /// `token.dat` would have a worker refuse to call on a console that has just
@@ -444,7 +452,25 @@ class SdEngine : public ipc::Engine {
   /// console, which is what makes `StartPairing` answer `kUnavailable` there.
   PairingBackend pairing_backend_;
 
-  /// Guards everything below it, and the auth state above it. Mutable because
+  /// Serialises the *card* writes the two threads both make -- `token.dat` and
+  /// `auth.json` -- and nothing else.
+  ///
+  /// **It exists so that `mutex_` is never held across an SD write.** A commit
+  /// and an `Unpair` still cannot interleave, which is what that ordering was
+  /// for; what changes is that the commands polled every frame no longer wait
+  /// behind one. `GetStatus` and `GetPairState` take `mutex_` and never this,
+  /// so a slow card cannot stall the status or pairing screen -- the promise
+  /// `main.cpp` already makes about `GetStatus` never going near the card.
+  ///
+  /// **Lock order is this one, then `mutex_`, never the reverse**, and `mutex_`
+  /// is never held while acquiring this. Three methods take it, all of them on
+  /// a path that writes one of those two files: `CommitGrant`, `Unpair`, and
+  /// `ApplyConfigEdit` -- which discards the token when `server.url` moves, and
+  /// therefore has to be atomic against a commit landing at the same moment.
+  mutable std::mutex card_mutex_;
+
+  /// Guards the in-memory state the two threads share: the attempt, `auth_`,
+  /// and `gate_`. Held for assignments and never across I/O. Mutable because
   /// `Snapshot()` and `pairing_status()` are const and both read state the
   /// pairing thread writes.
   mutable std::mutex mutex_;

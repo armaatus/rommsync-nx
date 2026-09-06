@@ -49,10 +49,12 @@ void SdEngine::UseCard(fs::FileSystem* filesystem) { lists_.UseCard(filesystem);
 bool SdEngine::PumpLists() { return lists_.Pump(); }
 
 void SdEngine::Load(const std::string& config_dir) {
-  // The pairing thread reads `auth_` and `gate_`, and this writes both. It
-  // cannot be running yet -- it is started by the first `StartPairing`, and
-  // nothing has answered a command -- but taking the lock here costs one
-  // uncontended acquire at boot and means no future caller has to know that.
+  // This reads `token.dat` and `auth.json` and writes `auth_` and `gate_`, so it
+  // takes both locks in the documented order. The pairing thread cannot be
+  // running yet -- it is started by `UsePairingBackend`, and nothing has
+  // answered a command -- but two uncontended acquires at boot cost nothing and
+  // mean no future caller has to know that.
+  std::lock_guard<std::mutex> card(card_mutex_);
   std::lock_guard<std::mutex> lock(mutex_);
   config_dir_ = config_dir;
 
@@ -264,9 +266,11 @@ bool SdEngine::ReadConfigText(std::string* text,
 
 ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
                                      std::vector<config::Diagnostic>* diagnostics) {
-  // For `auth_`, `gate_` and the token below, which the pairing thread also
-  // writes. `config_` is this thread's alone (`engine.hpp`).
-  std::lock_guard<std::mutex> lock(mutex_);
+  // The card lock, because a `server.url` change discards `token.dat`, and that
+  // has to be atomic against the pairing thread committing a grant. `mutex_` is
+  // taken below in slices, for `auth_`, `gate_` and the attempt; `config_` is
+  // this thread's alone and needs neither (`engine.hpp`).
+  std::lock_guard<std::mutex> card(card_mutex_);
   std::string current;
   if (!ReadConfigText(&current, diagnostics)) {
     return ipc::Error::kWriteFailed;
@@ -315,7 +319,10 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
     // server that has just been replaced. Its grant would be a token issued by
     // one RomM committed under a `config.ini` naming another -- the same
     // confusion the discard above exists to prevent, arriving a minute later.
-    AbandonPairingLocked();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      AbandonPairingLocked();
+    }
     // The verdict was about the token that has just gone, and about the server
     // that issued it. Left behind, it would put a console that has never paired
     // with the *new* server on a "pair again" screen (M1-4, #8). Not a refusal
@@ -323,7 +330,10 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
     // rather than a bearer token pointed at a stranger, and the pairing is
     // already gone by this point.
     auth::ClearBlock(PathTo(auth::kAuthStateFileName));
-    gate_.Reset();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      gate_.Reset();
+    }
   }
 
   const io::WriteResult wrote = io::WriteAtomically(PathTo(config::kConfigFileName), written);
@@ -338,13 +348,17 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
       diagnostics->push_back({config::Severity::kWarning, 0, "server", "url",
                               "this console's pairing was discarded before the write was "
                               "attempted, so it has to be paired again"});
+      std::lock_guard<std::mutex> lock(mutex_);
       auth_ = ipc::AuthState::kNeverPaired;
     }
     return ipc::Error::kWriteFailed;
   }
 
   if (server_changed) {
-    auth_ = ipc::AuthState::kNeverPaired;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auth_ = ipc::AuthState::kNeverPaired;
+    }
     diagnostics->push_back({config::Severity::kNotice, 0, "server", "url",
                             "the server changed, so this console's pairing was discarded -- "
                             "pair again from the overlay"});
@@ -506,14 +520,26 @@ void SdEngine::DrivePairing() {
 
 void SdEngine::CommitGrant(const std::shared_ptr<PairingAttempt>& attempt,
                            const auth::DeviceTokenResponse& granted) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (stopping_ || attempt_ != attempt) {
-    // A newer attempt is running, or the engine is going away. The grant is
-    // real and its code is spent, so this does cost the user one approval --
-    // but writing it would put a token on the card that the attempt the overlay
-    // is drawing knows nothing about, and the attempt that replaced this one
-    // will commit its own.
-    return;
+  // The card lock for the whole commit, so an `Unpair` or a `server.url` change
+  // cannot land between the two writes below. `mutex_` is taken inside it, in
+  // slices, and never across a write -- `GetStatus` and `GetPairState` are
+  // polled every frame and may not wait on an SD card (`engine.hpp`).
+  std::lock_guard<std::mutex> card(card_mutex_);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stopping_ || attempt_ != attempt) {
+      // A newer attempt is running, or the engine is going away. The grant is
+      // real and its code is spent, so this does cost the user one approval --
+      // but writing it would put a token on the card that the attempt the
+      // overlay is drawing knows nothing about, and the attempt that replaced
+      // this one will commit its own.
+      //
+      // Checked under `card_mutex_`, which is what makes it a decision and not
+      // a guess: `ApplyConfigEdit` clears `attempt_` and discards the token
+      // while holding that lock, so it cannot happen between this check and the
+      // write below.
+      return;
+    }
   }
 
   // M1-5 (#9)'s write, unchanged: the record goes to `token.dat.tmp` and is
@@ -522,6 +548,7 @@ void SdEngine::CommitGrant(const std::shared_ptr<PairingAttempt>& attempt,
   // survive a re-pair or RomM registers the console twice.
   const auth::StoredToken record = auth::StoredTokenFrom(attempt->server_url, granted);
   const auth::StoreResult saved = auth::SaveToken(PathTo(auth::kTokenFileName), record);
+  std::lock_guard<std::mutex> lock(mutex_);
   if (!saved.ok()) {
     // Said out loud on the pairing screen rather than left to be discovered at
     // the next sync tick: the approval is spent, so the remedy is to pair again,
@@ -543,13 +570,14 @@ void SdEngine::CommitGrant(const std::shared_ptr<PairingAttempt>& attempt,
 }
 
 ipc::Error SdEngine::Unpair() {
-  // The pairing thread commits a grant under this same lock, so a discard and a
-  // commit cannot interleave: one of them happens whole. **It does not abandon a
-  // live attempt**, and that is the settings screen's whole design -- "Re-pair"
-  // sends `StartPair` first and `Unpair` only once an attempt is under way, so
-  // the console never passes through "unpaired with nothing to restart"
-  // (docs/AUTH.md, M4-4 #26).
-  std::lock_guard<std::mutex> lock(mutex_);
+  // The pairing thread commits a grant under this same card lock, so a discard
+  // and a commit cannot interleave: one of them happens whole. `mutex_` is taken
+  // afterwards, for the two assignments only, so nothing polled every frame
+  // waits on these writes. **It does not abandon a live attempt**, and that is
+  // the settings screen's whole design -- "Re-pair" sends `StartPair` first and
+  // `Unpair` only once an attempt is under way, so the console never passes
+  // through "unpaired with nothing to restart" (docs/AUTH.md, M4-4 #26).
+  std::lock_guard<std::mutex> card(card_mutex_);
   // The credentials first: see the header note on the order.
   if (!auth::DiscardToken(PathTo(auth::kTokenFileName))) {
     return ipc::Error::kWriteFailed;
@@ -566,8 +594,11 @@ ipc::Error SdEngine::Unpair() {
   // reading the file back and reporting `kUnauthenticated` over a pairing that
   // is gone -- which `Load` already refuses to do, because there is no token for
   // the verdict to be about.
-  gate_.Reset();
-  auth_ = ipc::AuthState::kNeverPaired;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    gate_.Reset();
+    auth_ = ipc::AuthState::kNeverPaired;
+  }
   return cleared ? ipc::Error::kOk : ipc::Error::kWriteFailed;
 }
 
