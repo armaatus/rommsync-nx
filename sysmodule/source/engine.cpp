@@ -19,9 +19,6 @@
 #include "rommsync/token_store.hpp"
 
 namespace rommsync::sysmodule {
-namespace {
-
-}  // namespace
 
 /// One of this client's files, as a path the SD card understands. `core/` owns
 /// the file names and may not know an SD path (hard rule 4), so joining them is
@@ -401,8 +398,17 @@ ipc::Error SdEngine::StartPairing() {
   if (!identity.ok()) {
     // `kUnreadable` is the important one: `device.dat` is there and would not
     // open, and minting over it is unrecoverable, so this refuses rather than
-    // duplicating the console. `kWriteFailed` is the right sentence for both --
-    // the card is what stopped this, and nothing was written.
+    // duplicating the console. `kWriteFailed` for that and for `kPersistFailed`
+    // -- the card is what stopped this, and nothing was written.
+    //
+    // **`kNoSeed` is the one that is not about the card**, which is why it
+    // answers differently. It means the platform layer handed over a seed with
+    // no usable stable value and too little entropy, and `device_identity.hpp`
+    // requires that layer to *fail rather than substitute* -- so reaching here
+    // is a defect in this build, not a state a user is in. `kWriteFailed` would
+    // send them to look at an SD card that is fine. `kInternal` is `ipc.hpp`'s
+    // "failed in a way it could not name", and while this one has a name, the
+    // name is not one the overlay can turn into an action.
     return identity.error == auth::IdentityError::kNoSeed ? ipc::Error::kInternal
                                                           : ipc::Error::kWriteFailed;
   }
