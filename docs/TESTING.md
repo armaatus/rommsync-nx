@@ -421,6 +421,21 @@ ctest --test-dir build --output-on-failure
   cannot fix a typo in a URL — a 403, which is a scope the user did not approve
   rather than a revoked token, sync switched off for the device, another 400,
   and the 503/429 that mean "not now".
+- The `sched.*` scenarios (M7-2) are about *when* a tick runs, and nine of the
+  eleven need no server and never may. Every one drives `sync::Scheduler` with an
+  **injected steady clock and an injected wall clock**, because the cases that
+  matter cannot be produced any other way: `suspend` advances the wall clock past
+  several intervals and asserts exactly **one** catch-up tick, `skew` corrects
+  the wall clock by a year in each direction and asserts neither a storm nor a
+  stall, and `idle` runs three simulated days of a switched-off console and
+  asserts it never once had a deadline to wake for -- a claim about requests that
+  were never made, which no running RomM can witness. `backoff` pins the one
+  retry curve the client has (`retry::Backoff`, shared with
+  `auth::PairingSession`): doubling, capped, jittered, never under the floor. The
+  two that *do* need the rig are `sched.stall` and `sched.drop`, and they live in
+  `test_sync_tick` because "reschedules with backoff rather than spinning" means
+  nothing unless a tick really failed on the stall timeout or a connection really
+  was reset.
 - The `tick.*` scenarios (M2-7) are the only ones that run a **whole** tick,
   `sync::RunTick`, and every one of them asks the same question afterwards: is
   the card holding the saves it started with, or a strictly completed subset of
