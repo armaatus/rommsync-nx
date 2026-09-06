@@ -548,11 +548,11 @@ void SdEngine::CommitGrant(const std::shared_ptr<PairingAttempt>& attempt,
   // survive a re-pair or RomM registers the console twice.
   const auth::StoredToken record = auth::StoredTokenFrom(attempt->server_url, granted);
   const auth::StoreResult saved = auth::SaveToken(PathTo(auth::kTokenFileName), record);
-  std::lock_guard<std::mutex> lock(mutex_);
   if (!saved.ok()) {
     // Said out loud on the pairing screen rather than left to be discovered at
     // the next sync tick: the approval is spent, so the remedy is to pair again,
     // and a screen still reading `kApproved` would tell the user the opposite.
+    std::lock_guard<std::mutex> lock(mutex_);
     attempt_commit_failure_ =
         std::string("the pairing was approved and the token could not be saved (") +
         auth::ToString(saved.error) + ") -- pair again";
@@ -565,8 +565,11 @@ void SdEngine::CommitGrant(const std::shared_ptr<PairingAttempt>& attempt,
   // gives: what a failed clear costs is the next boot reading it back, and
   // `Load` already declines to honour a verdict over a token it is not about.
   auth::ClearBlock(PathTo(auth::kAuthStateFileName));
-  gate_.Reset();
-  auth_ = ipc::AuthState::kPaired;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    gate_.Reset();
+    auth_ = ipc::AuthState::kPaired;
+  }
 }
 
 ipc::Error SdEngine::Unpair() {
