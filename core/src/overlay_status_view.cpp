@@ -40,34 +40,6 @@ void AddCounts(std::vector<Line>* lines, const ipc::Status& status) {
       status.failed > 0 ? Tone::kBad : Tone::kNeutral);
 }
 
-std::string ResultText(ipc::SyncResult result) {
-  switch (result) {
-    case ipc::SyncResult::kNever:
-      return "Not yet";
-    case ipc::SyncResult::kOk:
-      return "Finished";
-    case ipc::SyncResult::kPartial:
-      return "Partly finished";
-    case ipc::SyncResult::kFailed:
-      return "Failed";
-  }
-  return "Unknown";
-}
-
-Tone ResultTone(ipc::SyncResult result) {
-  switch (result) {
-    case ipc::SyncResult::kNever:
-      return Tone::kNeutral;
-    case ipc::SyncResult::kOk:
-      return Tone::kGood;
-    case ipc::SyncResult::kPartial:
-      return Tone::kWarn;
-    case ipc::SyncResult::kFailed:
-      return Tone::kBad;
-  }
-  return Tone::kNeutral;
-}
-
 /// The download rows and the bar. Split out because `kIdle` is the common case
 /// and it is the one that must add a line rather than nothing -- a screen that
 /// simply omits "Download" when nothing is downloading looks like a screen that
@@ -238,6 +210,34 @@ const char* ToString(Tone tone) {
   return "unknown";
 }
 
+std::string SyncResultText(ipc::SyncResult result) {
+  switch (result) {
+    case ipc::SyncResult::kNever:
+      return "Not yet";
+    case ipc::SyncResult::kOk:
+      return "Finished";
+    case ipc::SyncResult::kPartial:
+      return "Partly finished";
+    case ipc::SyncResult::kFailed:
+      return "Failed";
+  }
+  return "Unknown";
+}
+
+Tone SyncResultTone(ipc::SyncResult result) {
+  switch (result) {
+    case ipc::SyncResult::kNever:
+      return Tone::kNeutral;
+    case ipc::SyncResult::kOk:
+      return Tone::kGood;
+    case ipc::SyncResult::kPartial:
+      return Tone::kWarn;
+    case ipc::SyncResult::kFailed:
+      return Tone::kBad;
+  }
+  return Tone::kNeutral;
+}
+
 std::string FormatBytes(std::int64_t bytes) {
   if (bytes < 0) {
     // Not a size any caller should produce, and not worth a crash on a console
@@ -325,8 +325,9 @@ StatusView Render(const ipc::Status& status, std::int64_t now_unix) {
       status.enabled ? Tone::kGood : Tone::kNeutral);
   Add(&view.lines, "Last sync", FormatRelativeTime(status.last_sync_at, now_unix));
   Add(&view.lines, "Result",
-      status.sync_in_progress ? std::string("Running now") : ResultText(status.last_sync_result),
-      status.sync_in_progress ? Tone::kNeutral : ResultTone(status.last_sync_result));
+      status.sync_in_progress ? std::string("Running now")
+                              : SyncResultText(status.last_sync_result),
+      status.sync_in_progress ? Tone::kNeutral : SyncResultTone(status.last_sync_result));
   AddCounts(&view.lines, status);
   Add(&view.lines, "Queue",
       status.queue_depth == 0 ? std::string("Empty")

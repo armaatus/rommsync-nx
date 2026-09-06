@@ -136,6 +136,17 @@ StatusView RenderUnreachable(Link link, std::uint32_t sysmodule_interface = 0);
 /// one rather than each rounding differently.
 std::string FormatRelativeTime(std::int64_t then_unix, std::int64_t now_unix);
 
+/// "Finished", "Partly finished", "Failed", "Not yet" for a console that has
+/// never synced.
+///
+/// Published for `FormatRelativeTime`'s reason: the sync screen (M4-2, #24)
+/// names the last sync's outcome too, and a second copy of this switch is a
+/// second place for the two screens to disagree about the same result.
+/// `kPartial` is its own sentence there as it is here -- a tick that uploaded
+/// four saves and failed the fifth is not a failed sync (`ipc::SyncResult`).
+std::string SyncResultText(ipc::SyncResult result);
+Tone SyncResultTone(ipc::SyncResult result);
+
 /// "12.1 MiB". Binary units, one decimal above the byte, so a bar's caption and
 /// a size in a list never disagree about the same number.
 std::string FormatBytes(std::int64_t bytes);

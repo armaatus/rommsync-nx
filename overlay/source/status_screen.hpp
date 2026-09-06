@@ -19,6 +19,7 @@
 
 #include "ipc_client.hpp"
 #include "rommsync/overlay_status_view.hpp"
+#include "screen_frame.hpp"
 
 namespace rommsync::overlay {
 
@@ -42,26 +43,19 @@ class StatusScreen : public tsl::Gui {
   /// Ask, and turn whatever came back -- including nothing -- into `view_`.
   void Poll();
 
-  /// Drop the session, try the port again, and answer with whichever of the two
-  /// unreachable states that establishes. Every transport failure goes through
-  /// here so that "not running" is only ever said about a port that is actually
-  /// gone.
-  StatusView Reopen();
-
   /// Draw `view_` into the bounds `CustomDrawer` hands us.
   void Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width, s32 height) const;
 
   IpcClient& client_;
 
+  /// The session handshake, and which of the two unreachable sentences a failed
+  /// call means. Shared with every other screen (`screen_frame.hpp`).
+  ScreenFrame frame_{client_};
+
   /// What the last poll produced. Starts as "not running" rather than as an
   /// empty screen: the first frame is drawn before the first poll returns, and
   /// a blank one there is indistinguishable from a broken overlay.
   StatusView view_ = RenderUnreachable(Link::kNotRunning);
-
-  /// Whether the contract check has passed on the current session. Reset with
-  /// every session, because a session that came back is a sysmodule that may
-  /// have been replaced since the last one.
-  bool version_checked_ = false;
 };
 
 }  // namespace rommsync::overlay

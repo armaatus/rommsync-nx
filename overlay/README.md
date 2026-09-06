@@ -34,7 +34,9 @@ client, and that rule is about ownership rather than about the link map.
 - **Status** — connection, last sync, counts, current download + queue depth
   ✅ M4-1
 - **Library / queue** — browse platforms → roms, enqueue downloads, progress
-- **Sync** — Sync now, enable/disable, per-emulator toggles
+- **Sync** — Sync now, enable/disable auto-sync ✅ M4-2. The per-emulator toggles
+  are config values and belong to **Settings** and the write path (#30); there is
+  no second config writer here.
 - **Settings** — server URL, re-pair, folder-map overrides, interval, states on/off
 
 ## Structure
@@ -45,8 +47,10 @@ lib/libultrahand/     # submodule: libtesla + libultra, compiled from source
 source/
   main.cpp            # the tsl::Overlay, and the one IPC session every screen shares
   ipc_client.*        # the only place this directory talks to sys-rommsync
+  screen_frame.*      # the palette, the version handshake, and not-running vs unreachable
   status_screen.*     # the status screen's drawing; its decisions are in core/
   pairing_screen.*    # the pairing screen's drawing; likewise
+  sync_screen.*       # the switch and "Sync now"; likewise
 ```
 
 Screen files are flat here, and their basenames may not collide with anything in
@@ -56,13 +60,15 @@ on a duplicate, so a `source/screens/pairing.cpp` would clash with the
 `pairing_screen.*` rather than `screens/pairing.*`.
 
 The half of a screen that is a *decision* rather than a draw call lives in
-`core/include/rommsync/overlay_status_view.hpp` and
-`core/include/rommsync/overlay_pairing_view.hpp` — which sentence an unpaired
+`core/include/rommsync/overlay_status_view.hpp`,
+`core/include/rommsync/overlay_pairing_view.hpp` and
+`core/include/rommsync/overlay_sync_actions.hpp` — which sentence an unpaired
 console gets, what a download with no declared length shows instead of a
 percentage, what goes where a timestamp would go on a console that has never
-synced, and which of four sentences a dead pairing gets. That is deliberate: it
-is the half a host test can reach, and `ctest -R overlay.status` and
-`ctest -R overlay.pairing` are what hold it. Model toggling + IPC on
+synced, which of four sentences a dead pairing gets, and which of the two
+controls on the sync screen may be pressed. That is deliberate: it is the half a
+host test can reach, and `ctest -R overlay.status`, `ctest -R overlay.pairing`
+and `ctest -R overlay.sync_actions` are what hold it. Model toggling + IPC on
 [ovl-sysmodules](https://github.com/ppkantorski/ovl-sysmodules).
 
 ## Manual verification (M8-2)
@@ -99,23 +105,55 @@ production RomM or a real library.
    copy by hand. Approve it in the browser and expect *"Paired"*; let one
    expire and expect *"The code expired"*, not *"Pairing failed"*.
 
+8. **The sync screen's two controls.** On the sync screen with the sysmodule
+   running, configured and paired:
+   - **X** with auto-sync on. Expect the `Auto-sync` row to read *Off* and the
+     prompt to become *Turn auto-sync on* — the switch is drawn from what the
+     sysmodule read back, so a row that does not move is a write that did not
+     take and must have said so. Press **X** again and expect the screen to be
+     exactly as it was before the first press.
+   - **A** with auto-sync off. Expect *Auto-sync is off* under a greyed
+     *Sync now* — and expect it to have been there **before** the press, not to
+     appear because of it. That is the point: the refusal is permanent while it
+     is true, so the button never looks pressable and then does nothing. What
+     the press must not produce is a spinner, a second copy of the sentence, or
+     silence.
+   - **A** with auto-sync on. **Check which sysmodule you are running first.**
+     Until M7-2 (#37) lands, `SdEngine::RequestSync()` returns `false`
+     unconditionally — it is a `bool` with nowhere to put "not built yet" — so
+     `SyncNow` answers `already_running` on an idle console and this step draws
+     *A sync is already running*. That is the sysmodule, not the screen. With
+     M7-2 in, expect *Sync started* and the headline moving to *Syncing* within
+     a poll or two; press **A** again while it runs and expect *A sync is
+     already running* with **no second `SyncNow`** reaching the sysmodule — the
+     screen refuses that press itself, so the two cases are told apart by what
+     the sysmodule saw, not by what the panel says.
+   - **Runtime pause is not the boot flag.** Turn auto-sync off here, then leave
+     the overlay and confirm `sys-rommsync` is still resident and the status
+     screen still answers. A screen that reads *sys-rommsync is not running*
+     after this switch is the failure #24 was written around.
+
 Record what each step actually drew in #44, including the layout constants that
-had to move — `status_screen.cpp` and `pairing_screen.cpp` each keep them in one
-block for exactly that.
+had to move — `status_screen.cpp`, `pairing_screen.cpp` and `sync_screen.cpp`
+each keep them in one block for exactly that.
 
 ## Where the work is
 
-**M4-2..M4-4** — the library/queue, sync and settings screens, built on the
-frame M4-1 landed. The pairing screen (M4-5) is built and **nothing pushes it
-yet**: *Re-pair* on the settings screen (M4-4, #26) is the one place it is
-reached from, so until that lands it compiles and `--gc-sections` drops it from
-the image. See milestone M4 in [`../ISSUES.md`](../ISSUES.md).
+**M4-3 and M4-4** — the library/queue and settings screens, built on the frame
+M4-1 landed and the `screen_frame.*` M4-2 lifted out of it. See milestone M4 in
+[`../ISSUES.md`](../ISSUES.md).
 
 The palette (`ColorFor`), the `GetInterfaceVersion` handshake and the
-drop-and-reopen that decides *not running* from *unreachable* are now written
-out in both `status_screen.cpp` and `pairing_screen.cpp`. The third screen is
-the one that should lift them into a shared `overlay/source/screen_frame.*`
-rather than typing them a third time; doing it now, while three M4 screens are
-in flight in parallel worktrees, would be a merge conflict bought for nothing.
+drop-and-reopen that decides *not running* from *unreachable* now live in
+`source/screen_frame.*`, lifted there by M4-2 (#24) — the third screen, as #27
+asked. A new screen takes a `ScreenFrame` member and calls `Ready()` and
+`Diagnose()`; it does not open the port itself and does not name a colour.
+
+**Nothing pushes `SyncScreen` or `PairingScreen` yet.** This overlay opens on
+the status screen and has no root menu, so both compile and `--gc-sections`
+drops them from the image. The settings screen (M4-4, #26) is where both are
+reached from and is where the menu belongs; writing one in a worktree while #25
+and #26 are both startable is the merge conflict CLAUDE.md says to serialise
+around.
 
 [libultrahand]: https://github.com/ppkantorski/libultrahand

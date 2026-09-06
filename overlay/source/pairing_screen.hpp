@@ -21,6 +21,7 @@
 
 #include "ipc_client.hpp"
 #include "rommsync/overlay_pairing_view.hpp"
+#include "screen_frame.hpp"
 
 namespace rommsync::overlay {
 
@@ -64,15 +65,9 @@ class PairingScreen : public tsl::Gui {
   /// refusals.
   void Start();
 
-  /// Drop the session, try the port again, and answer with whichever of the two
-  /// unreachable states that establishes. Every transport failure goes through
-  /// here so that "not running" is only ever said about a port that is actually
-  /// gone.
-  PairingView Reopen();
-
-  /// The version handshake, which every command on a fresh session waits for.
-  /// Answers false when it could not be completed, having already put the
-  /// reason in `view_`.
+  /// The port and the version handshake, which every command on a fresh session
+  /// waits for. Answers false when they could not be completed, having already
+  /// put the reason in `view_`.
   bool Ready();
 
   /// Draw `view_` into the bounds `CustomDrawer` hands us.
@@ -80,15 +75,14 @@ class PairingScreen : public tsl::Gui {
 
   IpcClient& client_;
 
+  /// The session handshake, and which of the two unreachable sentences a failed
+  /// call means. Shared with every other screen (`screen_frame.hpp`).
+  ScreenFrame frame_{client_};
+
   /// What the last poll produced. Starts as "not running" rather than as an
   /// empty screen: the first frame is drawn before the first poll returns, and
   /// a blank one there is indistinguishable from a broken overlay.
   PairingView view_ = RenderPairingUnreachable(Link::kNotRunning);
-
-  /// Whether the contract check has passed on the current session. Reset with
-  /// every session, because a session that came back is a sysmodule that may
-  /// have been replaced since the last one.
-  bool version_checked_ = false;
 
   /// Set by a `StartPair` the sysmodule refused, and cleared only by the next
   /// press or by a transport failure.

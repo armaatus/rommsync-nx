@@ -7,6 +7,7 @@
 #include "rommsync/core.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/overlay_status_view.hpp"
+#include "screen_frame.hpp"
 
 namespace rommsync::overlay {
 namespace {
@@ -24,28 +25,6 @@ constexpr s32 kBarHeight = 12;
 constexpr s32 kValueColumn = 160;
 /// How far short of the drawer's right edge the progress track stops.
 constexpr s32 kBarInset = 8;
-
-/// The renderer's palette for a `Tone`. `core/` names no colour (hard rule 4),
-/// so this is the only place the two vocabularies meet -- and it uses
-/// libultrahand's theme variables rather than literals so a user's theme still
-/// applies.
-///
-/// Through `Renderer::a`, which folds in the overlay's fade animation alpha.
-/// Without it the frame's chrome fades on open and close while everything this
-/// file draws stays fully opaque and pops (libtesla's own convention).
-tsl::Color ColorFor(Tone tone) {
-  switch (tone) {
-    case Tone::kGood:
-      return tsl::gfx::Renderer::a(tsl::healthyRamTextColor);
-    case Tone::kWarn:
-      return tsl::gfx::Renderer::a(tsl::warningTextColor);
-    case Tone::kBad:
-      return tsl::gfx::Renderer::a(tsl::badRamTextColor);
-    case Tone::kNeutral:
-      break;
-  }
-  return tsl::gfx::Renderer::a(tsl::defaultTextColor);
-}
 
 }  // namespace
 
@@ -67,39 +46,12 @@ tsl::elm::Element* StatusScreen::createUI() {
 void StatusScreen::update() { Poll(); }
 
 void StatusScreen::Poll() {
-  if (!client_.open()) {
-    if (R_FAILED(client_.Open())) {
-      // No `rommsync` port. Not installed, not enabled, or it aborted at boot --
-      // and it is the state a user who forgot to switch it on is in, so it is
-      // drawn as a screen rather than reported as an error.
-      view_ = RenderUnreachable(Link::kNotRunning);
-      return;
-    }
-    version_checked_ = false;
-  }
-
-  if (!version_checked_) {
-    // Command 0 first, always: its encoding is frozen, so it is the only call
-    // that is safe to make before knowing whether this build can decode the
-    // others (`ipc::Command`). A mismatch is "update the sysmodule", not a
-    // decode failure, and telling those apart is the whole reason it exists.
-    std::uint32_t sysmodule_interface = 0;
-    const Result version_rc = client_.GetInterfaceVersion(&sysmodule_interface);
-    if (R_FAILED(version_rc)) {
-      // Not "not running": the port answered, so something is there. Which of
-      // the two sentences is true is decided the same way a failed `GetStatus`
-      // decides it, below -- by whether the port is still openable.
-      view_ = Reopen();
-      return;
-    }
-    if (sysmodule_interface != ipc::kVersion) {
-      // Left unchecked, so this is re-derived on every frame rather than
-      // latched: a user who exits the overlay, updates the sysmodule and comes
-      // back gets a working screen without rebooting.
-      view_ = RenderUnreachable(Link::kIncompatible, sysmodule_interface);
-      return;
-    }
-    version_checked_ = true;
+  // The port and the version handshake, both of which every screen needs and
+  // none of which is this screen's own (`screen_frame.hpp`).
+  const Link link = frame_.Ready();
+  if (link != Link::kOk) {
+    view_ = RenderUnreachable(link, frame_.sysmodule_interface());
+    return;
   }
 
   ipc::Status status;
@@ -112,29 +64,10 @@ void StatusScreen::Poll() {
     return;
   }
 
-  if (rc == MalformedResponse()) {
-    // It answered, and this build could not read the answer. Distinct from a
-    // sysmodule that is gone, and distinct from a half-parsed `Status`: the
-    // screen says so instead of drawing defaulted fields as though they were
-    // numbers (`overlay_status_view.hpp`).
-    view_ = RenderUnreachable(Link::kUnreadable);
-    return;
-  }
-
-  // Anything else is the transport, not the command -- `GetStatus` is
-  // documented never to fail.
-  view_ = Reopen();
-}
-
-StatusView StatusScreen::Reopen() {
-  // The session is not trusted after a transport failure, so it is dropped and
-  // re-opened here rather than on the next frame: whether the port is still
-  // there is exactly what decides which of the two sentences the user gets, and
-  // deferring it would draw one of them for a frame on no evidence.
-  client_.Close();
-  version_checked_ = false;
-  return R_SUCCEEDED(client_.Open()) ? RenderUnreachable(Link::kUnreadable)
-                                     : RenderUnreachable(Link::kNotRunning);
+  // `GetStatus` is documented never to fail, so a failure is the transport or a
+  // payload this build cannot read -- and which of the two is `Diagnose`'s to
+  // say, not this screen's.
+  view_ = RenderUnreachable(frame_.Diagnose(rc), frame_.sysmodule_interface());
 }
 
 void StatusScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
@@ -145,7 +78,7 @@ void StatusScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
   // the kind of thing that reads as a corrupted overlay rather than as a
   // too-long list.
   const s32 bottom = y + height;
-  const tsl::Color muted = tsl::gfx::Renderer::a(tsl::infoTextColor);
+  const tsl::Color muted = MutedColor();
   // Nothing runs off the right edge either. `drawString`'s `maxWidth` defaults
   // to "no limit", and a value is not ours to bound: `fs_name` comes off a RomM
   // library and `ipc::kMaxNameBytes` is 256, so a routine
