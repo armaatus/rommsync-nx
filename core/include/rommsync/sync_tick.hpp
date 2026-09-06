@@ -175,6 +175,19 @@ enum class TickOutcome {
   /// stopped at a boundary and what it had done stands.
   kCanceled,
 
+  /// `[sync] enabled` is false. **Nothing happened at all**: no sweep, no
+  /// request, nothing written.
+  ///
+  /// The scheduler that owns the interval parks itself when the switch is off
+  /// (M7-2, #37), so reaching this is not the ordinary path. It is here because
+  /// "a disabled sysmodule makes no network call" is the promise M6-2 (#33) has
+  /// to keep against `pmshellTerminateProgram` and a relaunch, and a promise
+  /// that lives only in a scheduler is one that cannot be tested before that
+  /// scheduler exists -- nor kept by a second caller that forgets to ask.
+  /// `download::DrainOutcome::kDisabled` is the same gate on the same switch's
+  /// other half, and it reads the configuration the same way.
+  kDisabled,
+
   /// The sweep put a save back that the scan could not have seen, so this tick's
   /// `reported` is already out of date. **Nothing was negotiated.**
   ///
@@ -202,6 +215,17 @@ const char* ToString(TickOutcome outcome);
 /// `CompleteOptions` are `CallPolicy`, which already times out, retries and
 /// backs off, and widening `ShouldRetry` is explicitly not this module's to do.
 struct TickOptions {
+  /// `config::SyncConfig::enabled`, and the whole of what a false one costs:
+  /// the tick returns `TickOutcome::kDisabled` before it sweeps, before it
+  /// reads and before it sends -- `download::Drain`'s treatment of
+  /// `[downloads] enabled`, on the switch's other half.
+  ///
+  /// It defaults to *true* because a caller that has no configuration to
+  /// consult -- every unit test of one stage -- is not a console with the
+  /// switch off. The caller that does have one passes `config.sync.enabled`,
+  /// and the scheduler (M7-2, #37) additionally never gets this far.
+  bool enabled = true;
+
   /// Swept by `RecoverStaging` before anything else happens. Empty means no
   /// sweep.
   ///
