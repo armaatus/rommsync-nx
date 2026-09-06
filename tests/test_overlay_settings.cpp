@@ -651,6 +651,65 @@ void CheckEveryRefusalIsRead(Checks& checks) {
   }
 }
 
+/// The headline never states a count the payload cannot support.
+///
+/// `GetConfig` sends at most `ipc::kMaxDiagnosticsInPayload` complaints and a
+/// `kNotice` saying how many did not fit, so a headline counting the list it was
+/// handed reads "config.ini has 7 warnings" over a file with twenty-three. This
+/// is the one screen whose job is telling a user what the parser found, and it
+/// is also the one place that number can be checked against nothing.
+void CheckTheHeadlineDoesNotCountATrimmedList(Checks& checks) {
+  std::string text = "[server]\nurl = https://romm.example.com\n[sync]\n";
+  for (int line = 0; line < 12; ++line) {
+    text += "states = maybe\n";
+  }
+  const config::LoadResult parsed = config::ParseConfig(text);
+  checks.Expect(parsed.diagnostics.size() > ipc::kMaxDiagnosticsInPayload,
+                "the file really does produce more complaints than one payload carries");
+
+  const ipc::ConfigView sent = ViewFor(checks, text);
+  checks.Expect(sent.diagnostics.size() <= ipc::kMaxDiagnosticsInPayload,
+                "and the wire really did trim them");
+
+  const overlay::SettingsView view = overlay::RenderSettings(sent);
+  // Whatever the wording, it may not be a number: every number this screen could
+  // produce here is the trimmed one, and the untrimmed count is not in the
+  // payload. `Status::config_error_count` is computed from the *untrimmed* list
+  // (`ipc_service.cpp`), so a count here would also disagree with the status
+  // screen about the same file.
+  for (char digit = '0'; digit <= '9'; ++digit) {
+    checks.Expect(view.headline.find(digit) == std::string::npos,
+                  std::string("the headline states no count over a trimmed list: ") +
+                      view.headline);
+  }
+  checks.Expect(Contains(view.headline, "config.ini"), "it still names the file");
+  checks.Expect(view.tone == overlay::Tone::kWarn, "and still reads as a warning");
+  checks.Expect(!view.complaints.empty(), "and the complaints are still under it");
+}
+
+/// A half-pressed "Re-pair" does not survive the button going blocked.
+///
+/// The state with no exit: `configured()` going false between the two presses
+/// left the confirmation warning drawn under a button that refuses every press,
+/// and nothing on the screen cleared it.
+void CheckAConfirmationNeverSitsUnderABlockedButton(Checks& checks) {
+  overlay::RepairState confirming;
+  confirming.confirming = true;
+
+  const overlay::SettingsView blocked =
+      overlay::RenderSettings(ViewFor(checks, "[sync]\nenabled = true\n"), confirming);
+  checks.Expect(blocked.repair.state == overlay::ControlState::kBlocked,
+                "a console with no server blocks the button");
+  checks.Expect(!Contains(blocked.notice, "discards"),
+                "and draws no warning about a discard no press can reach");
+  checks.Expect(!blocked.repair.refusal.empty(), "the refusal under it is what says why");
+
+  // ...and the live console is unchanged: this is a guard on one arm, not a
+  // confirmation that stopped confirming.
+  const overlay::SettingsView live = overlay::RenderSettings(ViewFor(checks, kMinimal), confirming);
+  checks.Expect(Contains(live.notice, "discards"), "a live button still asks first");
+}
+
 /// The no-server headline comes first, and Re-pair is still there under it.
 void CheckNoServerLeadsAndStillOffersRepair(Checks& checks) {
   // A file with a warning *and* no usable server: the warning is real and is
@@ -865,6 +924,8 @@ int main() {
   CheckEditableRowsAreMarked(checks);
   CheckRepairConfirmsBeforeItAsks(checks);
   CheckEveryRepairOutcomeIsDrawn(checks);
+  CheckTheHeadlineDoesNotCountATrimmedList(checks);
+  CheckAConfirmationNeverSitsUnderABlockedButton(checks);
   CheckAWithheldUrlSaysWhy(checks);
   CheckEveryRefusalIsRead(checks);
   CheckNoServerLeadsAndStillOffersRepair(checks);
