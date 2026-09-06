@@ -688,7 +688,8 @@ void Resume(rig::Checks& checks, http::HttpClient& client, const std::string& ba
                          R"({"mode":"drop","bytes":)" + std::to_string(kCutAt) + R"(,"path":")" +
                              rom.ContentPath() + R"("})");
     const http::Result interrupted =
-        client.Download(request, {destination, false, static_cast<std::uint64_t>(rom.size)});
+        client.Download(request, rig::DownloadTo(destination, false,
+                                                 static_cast<std::uint64_t>(rom.size)));
     checks.ExpectError(interrupted, http::Error::kTruncated, "a reset mid-body is an error");
   }
 
@@ -697,7 +698,8 @@ void Resume(rig::Checks& checks, http::HttpClient& client, const std::string& ba
   checks.Expect(partial > 0 && partial <= kCutAt, "the bytes that did arrive are kept to resume");
 
   const http::Result resumed =
-      client.Download(request, {destination, true, static_cast<std::uint64_t>(rom.size)});
+      client.Download(request, rig::DownloadTo(destination, true,
+                                               static_cast<std::uint64_t>(rom.size)));
   checks.ExpectOk(resumed, "the resumed attempt");
   checks.ExpectEq(resumed.response.status, 206, "the resume was a Range request RomM honoured");
   checks.ExpectEq(resumed.response.bytes_received,
@@ -755,8 +757,8 @@ void Truncate(rig::Checks& checks, http::HttpClient& client, const std::string& 
     http::Request request =
         harness::Authed(http::Method::kGet, base + server.ContentPath(), fixture);
     const http::Result cut = client.Download(
-        request, {sandbox.Host(SavePath(name)), false,
-                  static_cast<std::uint64_t>(server.file_size_bytes)});
+        request, rig::DownloadTo(sandbox.Host(SavePath(name)), false,
+                                 static_cast<std::uint64_t>(server.file_size_bytes)));
     checks.ExpectError(cut, http::Error::kTruncated,
                        "a clean short body is caught by the caller's own expected size");
   }
@@ -781,7 +783,7 @@ void Truncate(rig::Checks& checks, http::HttpClient& client, const std::string& 
     const std::string blind = sandbox.Host("/config/rommsync/blind.srm");
     http::Request request =
         harness::Authed(http::Method::kGet, base + server.ContentPath(), fixture);
-    const http::Result unchecked = client.Download(request, {blind, false, 0});
+    const http::Result unchecked = client.Download(request, rig::DownloadTo(blind));
     checks.ExpectOk(unchecked, "without an expected size the same body looks complete");
     checks.ExpectEq(rig::ReadFile(blind).size(), std::size_t{5},
                     "...and five bytes are accepted as the whole save");
@@ -1181,8 +1183,8 @@ void Backup(rig::Checks& checks, http::HttpClient& client, const std::string& ba
 
   http::Request request = harness::Authed(http::Method::kGet, base + server.ContentPath(), fixture);
   const http::Result downloaded = client.Download(
-      request, {sandbox.Host(SavePath(name)), false,
-                static_cast<std::uint64_t>(server.file_size_bytes)});
+      request, rig::DownloadTo(sandbox.Host(SavePath(name)), false,
+                               static_cast<std::uint64_t>(server.file_size_bytes)));
   checks.ExpectOk(downloaded, "the server's copy is written over the local one");
   checks.ExpectEq(sandbox.Read(SavePath(name)), server_bytes, "the save now holds the server's copy");
   checks.ExpectEq(sandbox.Read(backup), previous, "and the backup holds the bytes it replaced");
@@ -1209,8 +1211,8 @@ void Backup(rig::Checks& checks, http::HttpClient& client, const std::string& ba
     harness::Fault fault(checks, client, base,
                          R"({"mode":"drop","bytes":4,"path":")" + server.ContentPath() + R"("})");
     const http::Result interrupted = client.Download(
-        request, {sandbox.Host(SavePath(second)), false,
-                  static_cast<std::uint64_t>(server.file_size_bytes)});
+        request, rig::DownloadTo(sandbox.Host(SavePath(second)), false,
+                                 static_cast<std::uint64_t>(server.file_size_bytes)));
     checks.Expect(!interrupted.ok(), "the overwrite was interrupted");
   }
 

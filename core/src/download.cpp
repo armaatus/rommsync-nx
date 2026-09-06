@@ -459,12 +459,22 @@ ipc::Error Queue::Remove(std::int64_t rom_id) {
     return ipc::Error::kNotQueued;
   }
   entries_.erase(found);
+  if (rom_id == last_finished_rom_id_) {
+    last_finished_rom_id_ = 0;
+  }
+  if (rom_id == live_rom_id_) {
+    live_rom_id_ = 0;
+    live_bytes_per_second_ = 0;
+  }
   return ipc::Error::kOk;
 }
 
 void Queue::Clear() {
   std::lock_guard<std::mutex> held(mutex_);
   entries_.clear();
+  last_finished_rom_id_ = 0;
+  live_rom_id_ = 0;
+  live_bytes_per_second_ = 0;
 }
 
 std::vector<QueueEntry> Queue::Snapshot() const {
@@ -488,6 +498,11 @@ void Queue::Reset(std::vector<QueueEntry> entries) {
   }
   std::lock_guard<std::mutex> held(mutex_);
   entries_ = std::move(entries);
+  // These entries are not the ones the rate was measured over, nor the ones
+  // anything finished -- this is a load, or the rollback of a write that failed.
+  last_finished_rom_id_ = 0;
+  live_rom_id_ = 0;
+  live_bytes_per_second_ = 0;
 }
 
 std::size_t Queue::pending() const {
@@ -504,40 +519,122 @@ std::size_t Queue::size() const {
   return entries_.size();
 }
 
-ipc::DownloadSnapshot Queue::CurrentDownload() const {
-  const auto draw = [](const QueueEntry& entry, ipc::DownloadState state) {
-    ipc::DownloadSnapshot snapshot;
-    snapshot.state = state;
-    snapshot.rom_id = entry.rom_id;
-    snapshot.fs_name = entry.fs_name;
-    snapshot.bytes_done = entry.bytes_done;
-    snapshot.bytes_total = entry.size_bytes;
-    return snapshot;
+DownloadStatus Queue::Status() const {
+  const auto describe = [](DownloadStatus* status, const QueueEntry& entry,
+                           ipc::DownloadState state) {
+    status->state = state;
+    status->rom_id = entry.rom_id;
+    status->fs_name = entry.fs_name;
+    status->platform_fs_slug = entry.platform_fs_slug;
+    status->bytes_done = entry.bytes_done;
+    status->bytes_total = entry.size_bytes;
+    status->attempts = entry.attempts;
+    status->message = entry.message;
   };
 
+  DownloadStatus status;
   std::lock_guard<std::mutex> held(mutex_);
+  status.queue_message = queue_message_;
+
+  const QueueEntry* current = nullptr;
+  const QueueEntry* waiting = nullptr;
+  const QueueEntry* last_finished = nullptr;
   for (const QueueEntry& entry : entries_) {
-    if (entry.state == QueueState::kActive) {
-      return draw(entry, ipc::DownloadState::kDownloading);
+    if (Terminal(entry.state)) {
+      // Which row is the *last* one to have finished is not a question queue
+      // order answers. A retryable failure leaves its entry where it is and
+      // `Drain` carries on to the next rom, so a rom that was set aside and then
+      // failed for good sits in front of one that finished cleanly before it.
+      // `last_finished_rom_id_` is recorded as the transition happens instead.
+      if (entry.rom_id == last_finished_rom_id_) {
+        last_finished = &entry;
+      }
+      continue;
     }
-    if (entry.state == QueueState::kVerifying) {
-      return draw(entry, ipc::DownloadState::kVerifying);
+    ++status.queue_depth;
+    // What this entry still has to move. An unresolved one has `size_bytes ==
+    // 0` and contributes nothing -- nothing has said how big it is yet -- and a
+    // `bytes_done` past the size a server under-declared contributes nothing
+    // either, rather than a negative that would eat another entry's bytes.
+    if (entry.size_bytes > entry.bytes_done) {
+      status.queue_bytes_remaining += entry.size_bytes - entry.bytes_done;
+    }
+    if (current == nullptr &&
+        (entry.state == QueueState::kActive || entry.state == QueueState::kVerifying)) {
+      current = &entry;
+    }
+    if (waiting == nullptr && entry.state == QueueState::kQueued) {
+      waiting = &entry;
     }
   }
-  // A queue with something waiting and nothing moving is `kQueued`, not
-  // `kIdle`: the status screen has to tell "nothing to do" from "about to
-  // start", and `kIdle` on a queue three deep reads as a worker that stopped.
-  //
-  // `ipc::DownloadState::kFailed` is deliberately not produced here. It is the
-  // *current* entry's state, and a failed entry is not current -- what the
-  // status screen does with a queue whose last entry failed is #22's, and it
-  // has the whole snapshot to decide from.
-  for (const QueueEntry& entry : entries_) {
-    if (entry.state == QueueState::kQueued) {
-      return draw(entry, ipc::DownloadState::kQueued);
+
+  if (current != nullptr) {
+    describe(&status, *current,
+             current->state == QueueState::kActive ? ipc::DownloadState::kDownloading
+                                                   : ipc::DownloadState::kVerifying);
+    // Only over bytes that are moving. A rate left standing on a `kVerifying`
+    // entry would be a figure for a transfer that stopped, and one keyed on
+    // another rom is a number drawn against the wrong bar.
+    if (status.state == ipc::DownloadState::kDownloading && live_rom_id_ == current->rom_id) {
+      status.bytes_per_second = live_bytes_per_second_;
     }
+    return status;
   }
-  return {};
+  if (waiting != nullptr) {
+    // A queue with something waiting and nothing moving is `kQueued`, not
+    // `kIdle`: the status screen has to tell "nothing to do" from "about to
+    // start", and `kIdle` on a queue three deep reads as a worker that stopped.
+    describe(&status, *waiting, ipc::DownloadState::kQueued);
+    return status;
+  }
+  // Nothing left to do. `kFailed` is #22's call and this is where it is made:
+  // the last entry to finish is what the screen is still about, and a queue
+  // whose last act was a failure must not read "None" -- that is a user left
+  // with a rom that never arrived and a screen saying nothing happened. A
+  // `kDone` or `kSkipped` tail is `kIdle`: the work is over and it went as
+  // asked, which is the sentence "None" already carries.
+  if (last_finished != nullptr && last_finished->state == QueueState::kFailed) {
+    describe(&status, *last_finished, ipc::DownloadState::kFailed);
+  }
+  // A boot that has finished nothing reports `kIdle` even over a `failed` row
+  // the card kept, and that is the honest answer: this screen is about what the
+  // engine is doing, and nothing has happened yet. The row itself is not lost --
+  // it stays in `queue.json` for the queue screen (#31), which is where a user
+  // reads why a rom never arrived.
+
+  return status;
+}
+
+ipc::DownloadSnapshot Queue::CurrentDownload() const {
+  const DownloadStatus status = Status();
+  ipc::DownloadSnapshot snapshot;
+  snapshot.state = status.state;
+  snapshot.rom_id = status.rom_id;
+  snapshot.fs_name = status.fs_name;
+  snapshot.bytes_done = status.bytes_done;
+  snapshot.bytes_total = status.bytes_total;
+  return snapshot;
+}
+
+void Queue::ReportProgress(std::int64_t rom_id, std::int64_t bytes_done,
+                           std::int64_t bytes_per_second) {
+  std::lock_guard<std::mutex> held(mutex_);
+  const auto found = FindLocked(rom_id);
+  // Not `kActive` means the transfer this callback belongs to is over -- or the
+  // user dequeued the rom under it. Neither is an error and neither may write:
+  // progress onto an entry that has moved on to `kVerifying` would take the bar
+  // back off 100%, and onto a row that is gone would resurrect it.
+  if (found == entries_.end() || found->state != QueueState::kActive) {
+    return;
+  }
+  found->bytes_done = bytes_done;
+  live_rom_id_ = rom_id;
+  live_bytes_per_second_ = bytes_per_second;
+}
+
+void Queue::set_queue_message(std::string message) {
+  std::lock_guard<std::mutex> held(mutex_);
+  queue_message_ = std::move(message);
 }
 
 QueueEntry Queue::NextPending(const std::vector<std::int64_t>& skip) const {
@@ -560,6 +657,20 @@ bool Queue::Update(const QueueEntry& entry) {
     return false;
   }
   *found = entry;
+  if (Terminal(entry.state)) {
+    // The moment a row finishes, which is the only reliable order there is --
+    // see `Status`.
+    last_finished_rom_id_ = entry.rom_id;
+  }
+  // A row is written back at state transitions, and every one of those ends the
+  // window the rate was measured over -- the entry stops, or starts again from a
+  // `.part` this transfer has not touched yet. Leaving the figure standing would
+  // quote the *previous* attempt's rate over a second one that has not moved a
+  // byte, which is the one thing `bytes_per_second` promises not to do.
+  if (entry.rom_id == live_rom_id_) {
+    live_rom_id_ = 0;
+    live_bytes_per_second_ = 0;
+  }
   return true;
 }
 
@@ -1057,6 +1168,69 @@ http::Request Authed(const WorkerOptions& options, std::string url) {
   return request;
 }
 
+/// Turns the backend's progress callbacks into a bounded stream of queue
+/// updates, and measures a rate on the way.
+///
+/// One per transfer, on the worker's stack, borrowed by
+/// `http::DownloadTarget::progress` for exactly that scope. Every method here
+/// runs on the **transfer thread** (http.hpp), so it does the least a shared
+/// mutex allows and allocates nothing.
+///
+/// It is not the place `bytes_done` becomes durable: `queue.json` is written at
+/// state transitions only, because SD writes are not free.
+///
+/// It does no arithmetic on what the backend reports, either.
+/// `http::ProgressCallback`'s `staged` is already the whole in-flight file, the
+/// bytes an earlier attempt left in it included -- adding a starting point here
+/// would be this side guessing about a file the backend is the one rewriting,
+/// and it would be wrong in exactly the case the backend handles: a `resume` the
+/// server answers 200 to, where the prefix is discarded and `staged` drops to
+/// zero with it.
+class Publisher {
+ public:
+  using Clock = std::chrono::steady_clock;
+
+  Publisher(Queue& queue, std::int64_t rom_id, std::int64_t started_at,
+            std::chrono::milliseconds interval)
+      : queue_(queue),
+        rom_id_(rom_id),
+        interval_(interval),
+        published_(started_at),
+        since_(Clock::now()) {}
+
+  void Report(std::uint64_t staged) {
+    const Clock::time_point now = Clock::now();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - since_);
+    if (elapsed < interval_) {
+      return;
+    }
+    const std::int64_t done = static_cast<std::int64_t>(staged);
+    // Instantaneous, over the window that just closed. Smoothing is a decision
+    // for whoever draws it: this is a label on a live transfer, and a constant
+    // chosen here would be one every screen inherited. Nothing is quoted for a
+    // window the file did not grow over, which is also what a discarded prefix
+    // produces.
+    std::int64_t rate = 0;
+    if (elapsed.count() > 0 && done > published_) {
+      rate = (done - published_) * 1000 / elapsed.count();
+    }
+    published_ = done;
+    since_ = now;
+    queue_.ReportProgress(rom_id_, done, rate);
+  }
+
+ private:
+  Queue& queue_;
+  const std::int64_t rom_id_;
+  const std::chrono::milliseconds interval_;
+
+  /// The last figure published, and when. Seeded with what the entry started
+  /// this transfer holding, so the first window measures the bytes the transfer
+  /// moved and not the `.part` it inherited.
+  std::int64_t published_;
+  Clock::time_point since_;
+};
+
 /// What a write of the queue did.
 enum class Written {
   kOk,
@@ -1534,7 +1708,19 @@ class Drainer {
         return step;
       }
 
+      // What makes a 120 MiB rom a status screen rather than a frozen one
+      // (#22). The sink lives exactly as long as the call it is passed to, which
+      // is what `http::DownloadTarget::progress` requires of it, and it counts
+      // from the bytes already on the card rather than from zero.
+      Publisher publisher(queue_, entry.rom_id, entry.bytes_done, options_.progress_interval);
+      target.progress = [&publisher](std::uint64_t staged, std::uint64_t) {
+        publisher.Report(staged);
+      };
+
       const http::Result result = client_.Download(request, target);
+      // Nothing may hold this sink past the call: `publisher` is about to go out
+      // of scope on the next pass round the loop, and `target` outlives it.
+      target.progress = nullptr;
       ++requests_;
       const bool more = Spend();
       Reason why;

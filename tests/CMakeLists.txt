@@ -340,6 +340,7 @@ set(HTTP_SCENARIOS
   post_form         # form-urlencoded, and the login every other scenario needs
   multipart         # a file part streamed from disk
   download          # stream a whole resource to disk
+  progress          # ...reporting how far it has got while it is still going
   range             # fetch a slice and prove it is the right slice
   drop              # a TCP reset mid-body: an error, and no file at the destination
   resume            # pick that interrupted download back up
@@ -1129,14 +1130,18 @@ foreach(scenario IN LISTS DOWNLOAD_RIG_SCENARIOS)
   set_tests_properties(download.${scenario} PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
 endforeach()
 
-# `resume` moves the 120 MiB fixture twice -- 4 MiB, a dropped connection, then
-# the rest over Range -- through the Python fault proxy, so it gets its own
-# budget rather than the 180 seconds the others need.
-add_test(NAME download.resume COMMAND test_download resume)
-if(NOT ROMMSYNC_REQUIRE_RIG)
-  set_tests_properties(download.resume PROPERTIES SKIP_RETURN_CODE 77)
-endif()
-set_tests_properties(download.resume PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
+# `resume` and `progress` both move the 120 MiB fixture twice -- 4 MiB, a dropped
+# connection, then the rest over Range -- through the Python fault proxy, so they
+# get their own budget rather than the 180 seconds the others need. `progress`
+# (M3-5) is the one that watches the second transfer from another thread while it
+# is still going, which is the whole of what it adds.
+foreach(scenario resume progress)
+  add_test(NAME download.${scenario} COMMAND test_download ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(download.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  set_tests_properties(download.${scenario} PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
+endforeach()
 
 # --- the sysmodule's ipc::Engine, on the host --------------------------------
 # `sysmodule/source/engine.cpp` names no libnx type, so the only thing that tied
