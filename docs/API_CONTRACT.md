@@ -599,12 +599,15 @@ file**, and it is an ordinary download — the skip must not fire on it. Pinned 
 - the rom-level `sha1_hash` **is** that file's digest, so the download verifies
   the way any other rom's does.
 
-One consequence worth knowing before it surprises someone: `fs_name` is the
-**directory's** name, so the rom lands on the card without the inner file's
-extension — `Synthetic Nested Game`, not `Synthetic Nested Game.bin`. v1 writes
-what RomM names the rom; renaming would have to be the same rename everywhere
-that later looks for the file, so it is pinned by `download.nested` rather than
-quietly changed.
+One consequence, and it is a real one: `fs_name` is the **directory's** name and
+`fs_extension` is `""`, so the rom lands on the card *without* the inner file's
+extension — `Synthetic Nested Game`, not `Synthetic Nested Game.bin`. The bytes
+are right and the digest verifies them, so the entry settles `kDone` while
+RetroArch and hbmenu, which pick a core by extension, will not load it. M3-4
+pinned this with `download.nested` rather than changing it — the name is also
+what `AlreadyOnTheCard` looks for and what the overlay renders — and **#92**
+carries the decision. The name a fix would use is `files[0].file_name` from
+`GET /api/roms/{id}`.
 
 ### Platform → folder mapping
 

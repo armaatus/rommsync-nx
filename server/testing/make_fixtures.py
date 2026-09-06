@@ -12,8 +12,8 @@ Two cases in the backlog cannot be covered by a downloaded ROM:
   normal download, and it is what proves the skip does not over-trigger on every
   rom that happens to be a directory.
 
-Both are generated from a fixed seed, so every machine and every run produces
-byte-identical files and therefore stable SHA1/SHA256 hashes.
+All of them are generated from a fixed seed, so every machine and every run
+produces byte-identical files and therefore stable SHA1/SHA256 hashes.
 """
 
 from __future__ import annotations

@@ -668,8 +668,12 @@ std::int64_t Queued(checks::Checks& c, http::HttpClient& client, const std::stri
                     const harness::Fixture& fixture, download::Queue* queue, const char* fs_name,
                     harness::Rom* rom) {
   if (!harness::FindRom(client, base, fixture, fs_name, rom)) {
+    // seed.sh only stages files into the library; RomM does not import them
+    // until provision.py drives the scan, so naming only the first leaves an
+    // operator following an instruction that cannot fix it.
     c.Expect(false, std::string("the seeded library holds ") + fs_name +
-                        " -- re-seed it with ./server/testing/seed.sh");
+                        " -- re-seed and rescan: ./server/testing/seed.sh && "
+                        "./.venv/bin/python server/testing/provision.py");
     return 0;
   }
   std::int32_t position = 0;
@@ -1568,9 +1572,11 @@ void Nested(checks::Checks& c, http::HttpClient& client, const std::string& base
   c.ExpectEq(result.skipped, 0, "and nothing was skipped");
 
   // `fs_name` is the *directory's* name, so that is what the rom is called on
-  // the card -- the inner file's `.bin` is not part of it. Pinned rather than
-  // corrected: v1 writes what RomM names the rom, and a rename would have to be
-  // the same rename on every code path that later looks for the file.
+  // the card -- the inner file's `.bin` is not part of it, and an emulator that
+  // picks a core by extension will not load it. Pinned rather than corrected:
+  // the name is also what `AlreadyOnTheCard` looks for and what the overlay
+  // renders, so changing it is #92's decision and not M3-4's. This assertion is
+  // the one #92 has to update on purpose.
   const std::string destination = "/tico/roms/psx/Synthetic Nested Game";
   const std::string expected =
       FixtureRom("roms/psx/Synthetic Nested Game/Synthetic Nested Game.bin");

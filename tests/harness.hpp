@@ -379,6 +379,14 @@ inline std::int64_t Number(const json::Value& object, const char* key) {
   return value != nullptr && value->is_integer() ? value->integer() : 0;
 }
 
+/// False for a key that is absent, null, or not a boolean. Every flag read
+/// through this is one RomM sets on every rom, so absent means the body is not
+/// the schema -- which the scenario asserting on the flag is what catches.
+inline bool Boolean(const json::Value& object, const char* key) {
+  const json::Value* value = object.Find(key);
+  return value != nullptr && value->boolean();
+}
+
 /// A slot nobody else is using. RomM pairs saves on `(rom_id, slot)`, so a
 /// constant would make one run's leftovers another run's sync history -- and a
 /// run that failed before its cleanup does leave one behind. A timestamp alone
@@ -479,15 +487,17 @@ inline bool FindRom(http::HttpClient& client, const std::string& base, const Fix
     if (Field(item, "fs_name") != fs_name) {
       continue;
     }
+    // Cleared rather than filled in place: `files` is appended to below, so a
+    // caller reusing one `Rom` across two lookups would otherwise get both
+    // roms' files in one vector -- and every `files.size() == 2` assertion
+    // downstream would still pass.
+    *out = Rom{};
     out->id = Number(item, "id");
-    out->fs_name = fs_name;
+    out->fs_name = std::string(fs_name);
     out->size = Number(item, "fs_size_bytes");
-    const json::Value* multi = item.Find("has_multiple_files");
-    out->has_multiple_files = multi != nullptr && multi->boolean();
-    const json::Value* simple = item.Find("has_simple_single_file");
-    out->has_simple_single_file = simple != nullptr && simple->boolean();
-    const json::Value* nested = item.Find("has_nested_single_file");
-    out->has_nested_single_file = nested != nullptr && nested->boolean();
+    out->has_multiple_files = Boolean(item, "has_multiple_files");
+    out->has_simple_single_file = Boolean(item, "has_simple_single_file");
+    out->has_nested_single_file = Boolean(item, "has_nested_single_file");
     out->sha1_hash = Field(item, "sha1_hash");
     out->md5_hash = Field(item, "md5_hash");
     if (out->id == 0) {
