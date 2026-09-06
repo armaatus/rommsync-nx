@@ -352,6 +352,7 @@ def sync_scenarios(s, base, cap, rom_id):
     v1 = b"rommsync probe save v1\n"
     created = []
     devices = []
+    states = []
 
     # Negotiate reports every server save this device has no history for, so a
     # fixture that already holds saves adds operations these scenarios did not
@@ -545,9 +546,75 @@ def sync_scenarios(s, base, cap, rom_id):
         expect_action(tie, "conflict", slot)
         cap.record("sync-negotiate-conflict-same-timestamp", tie)
         print(json.dumps(tie, indent=2)[:600])
+        # --- save states ---------------------------------------------------
+        #
+        # M2-8. `/api/states` is NOT "the same flow with a different field", and
+        # these two calls are what says so: `StateSchema` carries no `slot`, no
+        # `content_hash`, no `origin_device_id` and no `device_syncs`, and there
+        # is no `/api/states/{id}/downloaded` to record that a device has one.
+        # Whatever a client does about a state, it does on its own.
+        hr("upload a save state (POST /api/states)")
+        state_name = f"probe-{run}.state"
+        posted = s.post(f"{base}/api/states",
+                        params={"rom_id": rom_id, "emulator": "probe-emulator"},
+                        files={"stateFile": (state_name, v1, "application/octet-stream")},
+                        timeout=60)
+        posted.raise_for_status()
+        state = cap.record("states-post", posted.json())
+        states.append(state["id"])
+        # RomM renames a *save* on ingest and does not rename a state. The whole
+        # of M2-8's pairing rests on that, so it is checked rather than assumed.
+        if state["file_name"] != state_name:
+            print(f"!! POST /api/states stored {state['file_name']!r} for a state sent as "
+                  f"{state_name!r}. M2-8 pairs a local state to a server row on "
+                  f"(rom_id, file_name) precisely because RomM does NOT rename one; "
+                  f"docs/API_CONTRACT.md is describing a server that changed.",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        hr("...and post the same name again: it REPLACES the row, in place")
+        again = s.post(f"{base}/api/states",
+                       params={"rom_id": rom_id, "emulator": "probe-other-emulator"},
+                       files={"stateFile": (state_name, v1 + b"and more\n",
+                                            "application/octet-stream")},
+                       timeout=60)
+        again.raise_for_status()
+        replaced = again.json()
+        if replaced["id"] != state["id"]:
+            print(f"!! a second POST /api/states under the same name created row "
+                  f"{replaced['id']} beside {state['id']} instead of replacing it. That is the "
+                  f"opposite of what M2-8 is built on -- the client refuses to POST over a name "
+                  f"it does not own precisely because the POST destroys what is there.",
+                  file=sys.stderr)
+            sys.exit(1)
+        # The emulator move is ASSERTED, not merely printed. API_CONTRACT.md says
+        # of this endpoint that "the probe fails loudly if it ever stops being
+        # true", and that sentence covers the emulator clause too -- it was the
+        # one part only reported, so a RomM that stopped moving the emulator
+        # would have scrolled past in the output. Found in review of #99.
+        if replaced.get("emulator") != "probe-other-emulator":
+            print(f"!! a second POST /api/states did not move the row's emulator: "
+                  f"sent 'probe-other-emulator', the row still reads "
+                  f"{replaced.get('emulator')!r}. API_CONTRACT.md states the "
+                  f"emulator is not part of the upsert key, and M2-8's naming "
+                  f"rules are built on that.",
+                  file=sys.stderr)
+            sys.exit(1)
+        print(f"  same id ({replaced['id']}), {state['file_size_bytes']} -> "
+              f"{replaced['file_size_bytes']} bytes, emulator "
+              f"{state['emulator']!r} -> {replaced['emulator']!r}")
+
+        hr("list them (GET /api/states?rom_id=)")
+        listed = s.get(f"{base}/api/states", params={"rom_id": rom_id}, timeout=30)
+        listed.raise_for_status()
+        cap.record("states-list", listed.json())
+        show_shape(listed.json(), "GET /api/states")
     finally:
+        if states:
+            s.post(f"{base}/api/states/delete", json={"states": states}, timeout=60)
+            states.clear()
         cleanup(devices_too=True)
-        print("\n  scenario saves and devices deleted; the fixture is as it was found.")
+        print("\n  scenario saves, states and devices deleted; the fixture is as it was found.")
 
 
 def main():

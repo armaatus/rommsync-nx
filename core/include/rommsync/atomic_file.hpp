@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <string_view>
 
 namespace rommsync::io {
@@ -200,6 +201,33 @@ WriteResult WriteAtomically(const std::string& path, std::string_view contents);
 /// `kOpenFailed` when there is nothing at `staged`; every other outcome is a
 /// commit that did not happen, named the way `WriteAtomically` names it.
 WriteResult CommitStaged(const std::string& staged, const std::string& path);
+
+/// A staged file that is removed unless something takes it.
+///
+/// Every download that lands somewhere other than its destination has the same
+/// several ways out between staging bytes and committing them -- unverified,
+/// unplaceable, refused, cancelled -- and each one has to remove those bytes: an
+/// incomplete download is not a save, and a `<file>.tmp` left beside one is
+/// supposed to mean "verified bytes that never landed" (issue #16). One branch
+/// forgetting is a file the next tick has to reason about, so the removal is a
+/// destructor rather than a line each branch remembers.
+///
+/// `Release` is for the caller that handed the path to `CommitStaged`, which
+/// consumes the file whether it succeeds or fails.
+class StagedFile {
+ public:
+  explicit StagedFile(std::string path) : path_(std::move(path)) {}
+  ~StagedFile();
+
+  StagedFile(const StagedFile&) = delete;
+  StagedFile& operator=(const StagedFile&) = delete;
+
+  const std::string& path() const { return path_; }
+  void Release() { path_.clear(); }
+
+ private:
+  std::string path_;
+};
 
 /// Why a copy did not complete.
 ///

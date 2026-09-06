@@ -387,4 +387,10 @@ bool Shred(const std::string& path) {
   return gone;
 }
 
+StagedFile::~StagedFile() {
+  if (!path_.empty()) {
+    std::remove(path_.c_str());
+  }
+}
+
 }  // namespace rommsync::io

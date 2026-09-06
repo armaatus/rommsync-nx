@@ -70,6 +70,17 @@ const std::string* FindHeader(const Headers& headers, std::string_view name);
 /// literal plus ids this client holds.
 std::string JoinUrl(std::string_view server_url, std::string_view path);
 
+/// Percent-encode one query-string *value*, RFC 3986 unreserved set only.
+///
+/// Every value this client puts in a query string comes off the card or off
+/// another client -- a save's `slot`, an emulator folder's name, a state's file
+/// name -- so none of them may be pasted in raw: a space makes a request line no
+/// server parses, and an `&` moves the rest of the value into a parameter of its
+/// own, which on `/api/saves` would mean uploading under someone else's
+/// `rom_id`. One spelling, here, because two would eventually differ on which
+/// byte is safe.
+std::string EncodeQueryValue(std::string_view value);
+
 /// One part of a `multipart/form-data` body.
 ///
 /// A part with a `file_path` is streamed from disk rather than read into memory:

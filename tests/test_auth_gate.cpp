@@ -23,6 +23,7 @@
 #include "rommsync/device_registration.hpp"
 #include "rommsync/download.hpp"
 #include "rommsync/sync.hpp"
+#include "rommsync/state_sync.hpp"
 #include "rommsync/sync_execute.hpp"
 
 namespace {
@@ -126,6 +127,33 @@ void Answers(checks::Checks& c) {
            "execute: an operation that did what the plan asked used the token");
   c.Expect(sync::AnswerOf(sync::OperationError::kUnverified) == Answer::kSilent,
            "execute: bytes that were not the save judged nothing about the token");
+
+  // States, held to exactly what every sibling above is held to. Untested until
+  // review caught it: nothing calls this yet -- there is no tick orchestrator --
+  // so a miswiring here, kNoPlacement or kCommitFailed answering something other
+  // than kSilent, would have gone unseen until the first caller trusted it.
+  c.Expect(sync::AnswerOf(sync::StateError::kUnauthorized) == Answer::kRejected,
+           "states: a 401 is a rejection");
+  c.Expect(sync::AnswerOf(sync::StateError::kForbidden) == Answer::kForbidden,
+           "states: a 403 is not");
+  c.Expect(sync::AnswerOf(sync::StateError::kNone) == Answer::kAccepted,
+           "states: an operation that did what it set out to used the token");
+  c.Expect(sync::AnswerOf(sync::StateError::kUnreadableCard) == Answer::kSilent,
+           "states: a card that could not be read judged nothing");
+  c.Expect(sync::AnswerOf(sync::StateError::kBackupFailed) == Answer::kSilent,
+           "states: a backup that could not be written judged nothing");
+  c.Expect(sync::AnswerOf(sync::StateError::kTransferFailed) == Answer::kSilent,
+           "states: a transfer that never completed judged nothing");
+  c.Expect(sync::AnswerOf(sync::StateError::kRefused) == Answer::kSilent,
+           "states: a refusal that was not 401 or 403 judged nothing");
+  c.Expect(sync::AnswerOf(sync::StateError::kUnverified) == Answer::kSilent,
+           "states: bytes that were not the state judged nothing");
+  c.Expect(sync::AnswerOf(sync::StateError::kCommitFailed) == Answer::kSilent,
+           "states: a commit that did not land judged nothing");
+  c.Expect(sync::AnswerOf(sync::StateError::kNoPlacement) == Answer::kSilent,
+           "states: a state with nowhere to go judged nothing");
+  c.Expect(sync::AnswerOf(sync::StateError::kCanceled) == Answer::kSilent,
+           "states: an operation the caller stopped judged nothing");
 
   c.Expect(download::AnswerOf(download::DrainOutcome::kUnauthorized) == Answer::kRejected,
            "download: a 401 is a rejection");

@@ -41,131 +41,6 @@ std::string Name(std::int64_t rom_id, const std::optional<std::string>& slot) {
   return "rom " + std::to_string(rom_id) + ", slot " + (slot.has_value() ? *slot : "<none>");
 }
 
-/// The directory part of an SD path, and the leaf under it.
-///
-/// `/retroarch/saves/Game.srm` -> `/retroarch/saves` + `Game.srm`. A path with
-/// no separator has no directory to list and is refused by the caller.
-bool SplitPath(const std::string& sd_path, std::string* directory, std::string* leaf) {
-  const std::size_t slash = sd_path.rfind('/');
-  if (slash == std::string::npos || slash + 1 >= sd_path.size()) {
-    return false;
-  }
-  *directory = slash == 0 ? "/" : sd_path.substr(0, slash);
-  *leaf = sd_path.substr(slash + 1);
-  return true;
-}
-
-/// The most recent directory listing, and nothing older.
-///
-/// `core/` has no single-file stat -- `fs::FileSystem` reads directories and
-/// resolves paths, and nothing else -- so the mtime and the size of a save this
-/// tick just rewrote come out of a listing of its folder.
-///
-/// **One entry, not a map.** A `fs::Listing` may hold up to
-/// `fs::kMaxDirectoryEntries` names, each of them a heap `std::string`, and the
-/// sysmodule's inner heap is 512 KiB (core/AGENTS.md). Keeping one listing per
-/// directory for the length of a tick is unbounded in exactly the dimension
-/// that is scarce, and it would be unbounded on the tick that is already the
-/// most expensive -- the one that downloaded a lot of saves. Keeping the last
-/// one costs a single listing and still collapses the case that matters, which
-/// is several saves in the same folder: a plan is executed in the server's
-/// order, and the server groups a rom's saves together.
-class Directories {
- public:
-  explicit Directories(fs::FileSystem& files) : files_(&files) {}
-
-  /// The entry for `sd_path`, or nullptr with the reason in `why`.
-  ///
-  /// The pointer is into this object and is invalidated by the next call for a
-  /// different directory, which is why the one caller reads it immediately.
-  const fs::Entry* Find(const std::string& sd_path, std::string* why) {
-    std::string directory;
-    std::string leaf;
-    if (!SplitPath(sd_path, &directory, &leaf)) {
-      *why = "\"" + sd_path + "\" is not a path with a directory in it";
-      return nullptr;
-    }
-    if (directory != directory_) {
-      // Assigned rather than kept alongside the old one: the previous listing's
-      // strings are freed before the next one is read.
-      listing_ = files_->List(directory);
-      directory_ = directory;
-    }
-    // Searched before `error` is consulted, on the scanner's stance
-    // (`scan::ScanSaves`): a `kTooManyEntries` listing still holds the first
-    // entries by name, so the save may well be in it, and dropping the row for a
-    // folder that is merely large re-hashes that save on every tick from then
-    // on. Only a listing that does not hold the file is a failure.
-    for (const fs::Entry& entry : listing_.entries) {
-      if (!entry.is_directory && entry.name == leaf) {
-        return &entry;
-      }
-    }
-    if (!listing_.ok()) {
-      *why = "its directory could not be read: " + listing_.message;
-      return nullptr;
-    }
-    *why = "it is no longer at " + sd_path;
-    return nullptr;
-  }
-
- private:
-  fs::FileSystem* files_;
-
-  /// Empty until the first listing. `SplitPath` never produces an empty
-  /// directory -- the shortest it answers is `/` -- so this cannot collide with
-  /// a real one.
-  std::string directory_;
-  fs::Listing listing_;
-};
-
-/// What a save looks like on the card right now.
-struct LocalFacts {
-  std::string content_hash;
-  Timestamp mtime{};
-  std::int64_t file_size_bytes = 0;
-};
-
-/// Re-stat and re-hash a save whose bytes this tick replaced.
-///
-/// Everything the tick reported about this file describes the bytes that are no
-/// longer there, so all three fields come from the card. A row built from the
-/// reported ones would claim a digest for bytes nothing ever hashed -- and
-/// worse, would claim it against an mtime and a size that no longer match, which
-/// is a row that lies and then never gets used.
-bool ReadBack(fs::FileSystem& files, Directories& directories, const std::string& sd_path,
-              LocalFacts* out, std::string* why) {
-  if (sd_path.empty()) {
-    *why = "the operation named no local file";
-    return false;
-  }
-  const fs::Entry* entry = directories.Find(sd_path, why);
-  if (entry == nullptr) {
-    return false;
-  }
-  if (entry->modified_unix < kMinTimestampSeconds || entry->modified_unix > kMaxTimestampSeconds) {
-    // The same window `Validate` holds a save's mtime to. `SaveBaseline` would
-    // skip the row anyway; refusing it here is what names the save.
-    *why = "its mtime of " + std::to_string(entry->modified_unix) +
-           " is not one a save can claim";
-    return false;
-  }
-  const std::string resolved = files.Resolve(sd_path);
-  if (resolved.empty()) {
-    *why = sd_path + " is not a path on this card";
-    return false;
-  }
-  const state::HashOutcome hashed = state::HashFile(resolved);
-  if (!hashed.ok()) {
-    *why = hashed.message;
-    return false;
-  }
-  out->content_hash = hashed.content_hash;
-  out->mtime = Timestamp{} + std::chrono::seconds{entry->modified_unix};
-  out->file_size_bytes = entry->size_bytes;
-  return true;
-}
-
 /// Drop rows nothing mentioned this tick, but only as far as the bound.
 ///
 /// The failure this exists for is the one #11 named, arriving from the other
@@ -358,7 +233,7 @@ BaselineUpdate AdvanceBaseline(state::Baseline previous, const SyncPlan& plan,
     local[Key{save.rom_id, save.slot}] = &save;
   }
 
-  Directories directories(files);
+  fs::Directories directories(files);
 
   for (std::size_t index = 0; index < report.operations.size(); ++index) {
     const OperationResult& done = report.operations[index];
@@ -399,9 +274,9 @@ BaselineUpdate AdvanceBaseline(state::Baseline previous, const SyncPlan& plan,
     ApplyServerHalf(operation, done, local, &record, &update.warnings);
 
     if (Rewrites(done.outcome)) {
-      LocalFacts facts;
+      state::FileFacts facts;
       std::string why;
-      if (!ReadBack(files, directories, done.sd_path, &facts, &why)) {
+      if (!state::ReadBackFile(files, directories, done.sd_path, &facts, &why)) {
         // **Erased, not merely skipped.** This operation replaced the bytes on
         // the card, so whatever row was there describes bytes that are gone --
         // its digest, its mtime and its size all belong to the copy this tick
@@ -432,12 +307,12 @@ BaselineUpdate AdvanceBaseline(state::Baseline previous, const SyncPlan& plan,
     }
 
     // No digest, no new row -- and here the previous one is **kept**, which is
-    // the opposite of the `ReadBack` failure above and for the opposite reason.
-    // Nothing on the card changed: an upload and a no-op both leave the file
-    // alone, so a row the last tick stored still describes it, and erasing it
-    // would cost this save a re-hash it has not earned. What cannot be written
-    // is a row carrying this tick's *missing* digest -- `SaveBaseline` refuses
-    // an empty one, and the scanner could never reuse it.
+    // the opposite of the `state::ReadBackFile` failure above and for the
+    // opposite reason. Nothing on the card changed: an upload and a no-op both
+    // leave the file alone, so a row the last tick stored still describes it,
+    // and erasing it would cost this save a re-hash it has not earned. What
+    // cannot be written is a row carrying this tick's *missing* digest --
+    // `SaveBaseline` refuses an empty one, and the scanner could never reuse it.
     if (!IsContentHash(record.content_hash)) {
       AddWarning(&update.warnings,
                  Name(done.rom_id, done.slot) +

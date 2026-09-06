@@ -27,9 +27,10 @@
 // `rommsync/` headers (core/AGENTS.md) so SQLite cannot be linked into the
 // portable engine at all, and because a sysmodule heap has no room for one.
 //
-//     rommsync-state 1
+//     rommsync-state 2
 //     {"rom_id":12,"slot":"autosave","content_hash":"...","mtime":1757000000,...}
 //     {"rom_id":12,"slot":null,...}
+//     {"kind":"state","rom_id":12,"file_name":"Game (USA).state",...}
 //
 // A version line, then one JSON object per row. JSON per line rather than a
 // separator-delimited record because a save's `slot` and `file_name` are user
@@ -39,6 +40,22 @@
 // `json::Reader`, the same strict reader every server response goes through, so
 // a field of the wrong type is a named diagnostic rather than a default value
 // that silently means "unchanged".
+//
+// ## Two kinds of row, and why the version moved
+//
+// Version 1 held saves only, keyed `(rom_id, slot)`. M2-8 added save states,
+// which RomM keys `(rom_id, file_name)` and gives no slot at all, so a state
+// cannot be a `SaveRecord`: synthesising a slot for one would collide with a
+// real save whose slot happened to match, and the collision would be a state
+// overwriting a save through the baseline. So a row is now **discriminated**.
+// `"kind":"state"` is a state; an absent `kind` is a save, which keeps a save
+// row byte-identical to the v1 row it replaced and keeps the per-row cost the
+// heap arithmetic below was sized against.
+//
+// A version 1 file is not migrated. `ParseBaseline` discards a file whose
+// version line it does not recognise, which is a re-hash and never a refusal --
+// one extra tick of hashing, once, on the boot after the upgrade. That is the
+// designed cost of the version line, not a migration anybody has to write.
 //
 // Timestamps are whole Unix seconds, not RFC 3339. The comparison the server
 // makes is at second granularity anyway, and a number cannot be spelled two
@@ -61,6 +78,7 @@
 #include <utility>
 #include <vector>
 
+#include "rommsync/file_system.hpp"
 #include "rommsync/sync.hpp"
 
 namespace rommsync::state {
@@ -70,7 +88,7 @@ inline constexpr const char* kStateFileName = "state.db";
 
 /// The first line of a well-formed file, `<magic> <version>`.
 inline constexpr const char* kFormatMagic = "rommsync-state";
-inline constexpr int kFormatVersion = 1;
+inline constexpr int kFormatVersion = 2;
 
 /// The largest `state.db` that will be read, and the most rows it may hold.
 ///
@@ -95,6 +113,28 @@ inline constexpr int kFormatVersion = 1;
 /// less than the byte bound, or the writer would produce a file the reader
 /// discards. And it is the *writer* that enforces both, so exceeding them is a
 /// named refusal once rather than a silent re-hash on every boot.
+///
+/// **`kMaxRecords` is the budget for saves *and* states together**, because it
+/// bounds the file rather than either kind. `scan::kMaxStates` is the share the
+/// state scan may take of it and is a quarter, on the grounds that states are
+/// opt-in and a console holds far fewer of them; the states half of a tick trims
+/// its own rows before a save's rather than letting the two compete
+/// (`sync::SyncStates`). A save is what hard rule 2 protects, so a save row is
+/// never dropped to make room for a state.
+///
+/// A state row is the longer of the two -- it carries a file name and an
+/// emulator where a save carries a slot -- so the byte bound is the tighter of
+/// the pair for a mixed file, and `core.state_db` asserts the worst mix the scan
+/// bounds can produce rather than only a file of saves.
+///
+/// **A card whose saves alone reach `kMaxRecords` records no states at all.**
+/// `scan::kMaxSaves` is the whole of this bound, so there is no room left beside
+/// them; `sync::SyncStates` drops every state row rather than write a file
+/// `ParseBaseline` would discard whole, and each state is then kept on both
+/// sides forever instead of syncing. It settles rather than churning -- the next
+/// tick finds no row and answers keep-both, which sends nothing -- and the run
+/// says so in a sentence naming the remedy. This is the card #11 describes:
+/// `kInnerHeapSize`, `scan::kMaxSaves` and `kMaxRecords` move together.
 ///
 /// A card with more saves than this needs the sysmodule heap raised first.
 /// These two constants and `kInnerHeapSize` move together.
@@ -148,32 +188,106 @@ struct SaveRecord {
   std::optional<std::string> server_content_hash;
 };
 
-/// The rows, keyed the way the server pairs saves.
+/// What one save **state** looked like at the end of the last sync.
 ///
-/// The key is `(rom_id, slot)` and `std::optional`'s ordering puts the null-slot
-/// row first, which only matters in that the file comes out in a stable order:
-/// a baseline rewritten with nothing changed produces byte-identical contents.
+/// A separate struct rather than a `SaveRecord` with two of its fields left
+/// empty, because the two are keyed on different things and mixing them is the
+/// mistake the version bump exists to prevent: a state has no slot, and the
+/// pairing key RomM actually enforces for one is `(rom_id, file_name)` --
+/// verified against a live 5.2.0, docs/API_CONTRACT.md#save-states.
+///
+/// **A state row is only ever written after a transfer that landed**, so every
+/// server field is known and none of them is optional. There is no "the server
+/// has never told us about this state" row: with nothing on the server there is
+/// nothing to pair against, and the arbitration wants that to be the absence of
+/// a row rather than a row with holes in it.
+struct StateRecord {
+  /// The rom this state belongs to. Positive, like `SaveRecord::rom_id`.
+  std::int64_t rom_id = 0;
+
+  /// The pairing key with `rom_id`: the file's own name, `Game (USA).state`.
+  ///
+  /// The *server's* name and the client's are the same string, which is the one
+  /// way states are simpler than saves: RomM renames a save on ingest and does
+  /// **not** rename a state (docs/API_CONTRACT.md#save-states). Never a path --
+  /// `sync::IsSingleFileName` is the bar.
+  std::string file_name;
+
+  /// `retroarch` or `tico`, when the directory said so; empty when it did not.
+  ///
+  /// Metadata, not part of the key, because RomM's own upsert ignores it: a
+  /// second upload of the same `(rom_id, file_name)` under another emulator
+  /// **moves** the existing row rather than making a second one. Stored so a
+  /// download can be placed back in the directory it came from.
+  std::string emulator;
+
+  /// The MD5 the client last computed for the local file: 32 lowercase hex
+  /// digits. Local only -- RomM computes no digest for a state, which is why a
+  /// downloaded one can be checked against its length and nothing more.
+  std::string content_hash;
+
+  /// The local file's mtime when that digest was taken, whole seconds.
+  sync::Timestamp mtime{};
+
+  /// Its size then, in bytes. Checked *with* the mtime, for `SaveRecord`'s
+  /// reasons.
+  std::int64_t file_size_bytes = 0;
+
+  /// The `id` of the server row this local file is paired with. Positive.
+  std::int64_t server_state_id = 0;
+
+  /// The server row's `updated_at` at the last sync. This is the whole of the
+  /// client's conflict detection for states: with no server arbitration and no
+  /// digest, "has the server's copy moved since we agreed?" is this field
+  /// compared against the row `GET /api/states` hands back today.
+  sync::Timestamp server_updated_at{};
+
+  /// ...and its `file_size_bytes` then, checked alongside for the reason the
+  /// local pair is checked together: a same-second rewrite moves one and not the
+  /// other.
+  std::int64_t server_file_size_bytes = 0;
+};
+
+/// The rows, keyed the way the server pairs each kind.
+///
+/// Saves are keyed `(rom_id, slot)` and `std::optional`'s ordering puts the
+/// null-slot row first; states are keyed `(rom_id, file_name)`. Two maps rather
+/// than one of a variant, because the two keys are different types and a single
+/// map would have to flatten them into a string -- which is the collision the
+/// version bump exists to prevent. Both come out in a stable order, so a
+/// baseline rewritten with nothing changed produces byte-identical contents.
 class Baseline {
  public:
   using Key = std::pair<std::int64_t, std::optional<std::string>>;
+  using StateKey = std::pair<std::int64_t, std::string>;
 
   /// The row for this save, or nullptr when there is none -- which is the
   /// signal to hash the file, not a reason to guess.
   const SaveRecord* Find(std::int64_t rom_id, const std::optional<std::string>& slot) const;
 
+  /// The same for a state, keyed as RomM keys one.
+  const StateRecord* FindState(std::int64_t rom_id, std::string_view file_name) const;
+
   /// Insert or replace the row for `record`'s key.
   void Set(SaveRecord record);
+  void SetState(StateRecord record);
 
   /// Drop the row for a save that is no longer on the card. Returns whether
   /// there was one.
   bool Erase(std::int64_t rom_id, const std::optional<std::string>& slot);
+  bool EraseState(std::int64_t rom_id, std::string_view file_name);
 
   const std::map<Key, SaveRecord>& rows() const { return rows_; }
-  std::size_t size() const { return rows_.size(); }
-  bool empty() const { return rows_.empty(); }
+  const std::map<StateKey, StateRecord>& state_rows() const { return states_; }
+
+  /// Every row of either kind -- what `kMaxRecords` bounds, because it bounds
+  /// the file.
+  std::size_t size() const { return rows_.size() + states_.size(); }
+  bool empty() const { return rows_.empty() && states_.empty(); }
 
  private:
   std::map<Key, SaveRecord> rows_;
+  std::map<StateKey, StateRecord> states_;
 };
 
 /// A baseline and everything wrong with the file it came from.
@@ -324,5 +438,40 @@ HashOutcome HashFile(const std::string& path);
 HashOutcome ContentHashFor(const Baseline& baseline, std::int64_t rom_id,
                            const std::optional<std::string>& slot, const std::string& path,
                            sync::Timestamp mtime, std::int64_t file_size_bytes);
+
+/// The same for a save state, keyed `(rom_id, file_name)`.
+///
+/// A state is the file this reuse was written for: tens of megabytes, hashed
+/// 4 KiB at a time, and unchanged between most ticks. The rule is `ContentHashFor`'s
+/// unchanged -- both the mtime and the size have to still match the row.
+HashOutcome ContentHashForState(const Baseline& baseline, std::int64_t rom_id,
+                                std::string_view file_name, const std::string& path,
+                                sync::Timestamp mtime, std::int64_t file_size_bytes);
+
+/// What a file on the card looks like *right now*: the three fields a baseline
+/// row is built from.
+struct FileFacts {
+  std::string content_hash;
+  sync::Timestamp mtime{};
+  std::int64_t file_size_bytes = 0;
+};
+
+/// Re-stat and re-hash a file whose bytes the engine has just replaced.
+///
+/// Everything the tick reported about such a file describes bytes that are no
+/// longer there, so all three fields come from the card. A row built from the
+/// reported ones would claim a digest for bytes nothing ever hashed -- and
+/// worse, would claim it against an mtime and a size that no longer match, which
+/// is a row that lies and then never gets used.
+///
+/// False with the reason in `why` when the file is gone, its folder could not be
+/// read, its mtime is not one this client can claim, or its bytes would not
+/// hash. A caller's answer to that is to *erase* the row rather than keep one
+/// describing bytes that are gone.
+///
+/// `directories` is carried across calls so several files in one folder cost one
+/// listing (fs::Directories).
+bool ReadBackFile(fs::FileSystem& files, fs::Directories& directories, const std::string& sd_path,
+                  FileFacts* out, std::string* why);
 
 }  // namespace rommsync::state
