@@ -406,6 +406,10 @@ release_repo() {
   if [ "$gh_json" = "REFUSE" ]; then
     printf '#!/bin/sh\nexit 1\n' > "$root/bin/gh"
     chmod +x "$root/bin/gh"
+  elif [ "$gh_json" = "HANG" ]; then
+    # Never answers, and never exits on its own.
+    printf '#!/bin/sh\nsleep 600\n' > "$root/bin/gh"
+    chmod +x "$root/bin/gh"
   elif [ -n "$gh_json" ]; then
     cat > "$root/bin/gh" <<EOF
 #!/bin/sh
@@ -510,6 +514,24 @@ $out" ;;
     || fail "--dry did not hold the release row it declined to look up:
 $(echo "$out" | grep -A3 'release ')"
   echo "ok: --dry does not look a release up, and holds the row rather than judging it"
+
+  # A `gh` that never answers. CLAUDE.md requires a timeout on every network
+  # call, and this is the only one in the gate: unbounded, a hung `gh` hangs the
+  # thing a person runs by hand before touching a console. Two seconds here
+  # rather than the default fifteen, so the test costs what it measures.
+  release_repo "$dir/hangs" 1.0.0 v1.0.0 "HANG"
+  local began ended
+  began="$(date +%s)"
+  out="$(cd "$dir/hangs" && PATH="$dir/hangs/bin:$PATH" ROMMSYNC_GATE_GH_TIMEOUT=2 \
+         ROMMSYNC_GATE_TRANSCRIPT=/dev/null \
+         "$dir/hangs/scripts/v1-gate.sh" --build-dir "$build" 2>&1)"
+  ended="$(date +%s)"
+  [ $((ended - began)) -lt 30 ] \
+    || fail "a gh that never answers was not bounded: the gate took $((ended - began))s"
+  echo "$out" | grep -q "^\[HELD\] release " \
+    || fail "a timed-out lookup did not leave the release row held:
+$(echo "$out" | grep -A3 'release ')"
+  echo "ok: a gh that never answers is bounded, and leaves the row unknown"
 
   # ...but --dry still reports what it already KNOWS is wrong. The case above
   # cannot see this: its tag agrees with VERSION, so the local `ok` flag is 0

@@ -338,6 +338,44 @@ EOF
   return "$ok"
 }
 
+# The only network call in this file, and CLAUDE.md is explicit that every one of
+# them carries a timeout. A `gh` that hangs -- slow DNS, an auth prompt nobody is
+# there to answer, a stalled connection to api.github.com -- would otherwise hang
+# the gate, which a person runs by hand before touching a console.
+#
+# A killed call produces no output, and no output is already "could not ask" a
+# few lines down: unknown, which is HELD and not a pass. So the timeout needs no
+# special case, only a bound.
+#
+# `timeout(1)` is GNU and is not on a stock macOS, where it is `gtimeout` if
+# coreutils is installed and absent otherwise -- hence the third branch, which
+# does the same job with a watchdog. The watchdog's own output goes to /dev/null,
+# and the caller sends this function's stdout to a file rather than a pipe: see
+# the call site for why that second part is not tidiness.
+GH_TIMEOUT="${ROMMSYNC_GATE_GH_TIMEOUT:-15}"
+
+bounded() {
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" env "$@"
+    return $?
+  fi
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$secs" env "$@"
+    return $?
+  fi
+  local pid watch rc
+  env "$@" &
+  pid=$!
+  ( sleep "$secs"; kill -TERM "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  watch=$!
+  wait "$pid"
+  rc=$?
+  kill "$watch" 2>/dev/null
+  wait "$watch" 2>/dev/null
+  return "$rc"
+}
+
 # A tagged, released v1 build. Two halves, because either alone is a release
 # nobody can install: a tag whose major version is at least 1, reachable from
 # `main`, and a published release carrying both assets. The second half needs
@@ -380,9 +418,18 @@ repo_release() {
     [ "$ok" -eq 0 ] && return 2
     return 1
   fi
-  local view=""
+  local view="" answer
   if command -v gh >/dev/null 2>&1; then
-    view="$(GH_PAGER=cat gh release view "$tag" --json isDraft,assets 2>/dev/null)"
+    # Into a FILE, not a pipe. A `gh` that spawns something of its own leaves
+    # that child holding whatever stdout it inherited: killing `gh` on the
+    # timeout would then still leave this function blocked on a pipe nobody is
+    # writing to, which is the hang the timeout exists to prevent, wearing a
+    # different hat. A file cannot be held open against us.
+    answer="$(mktemp "${TMPDIR:-/tmp}/v1gate-gh.XXXXXX")"
+    bounded "$GH_TIMEOUT" GH_PAGER=cat gh release view "$tag" --json isDraft,assets \
+      >"$answer" 2>/dev/null
+    view="$(cat "$answer" 2>/dev/null)"
+    rm -f "$answer"
   fi
   if [ -z "$view" ]; then
     echo "    no published release for $tag is visible from here -- gh is absent"
@@ -501,7 +548,7 @@ RAN_SKIPPED=""
 RAN_SEEN=""
 RAN_STATUS=0
 
-# $ROMMSYNC_GATE_TRANSCRIPT is a seam, and the only one: a file holding what a
+# $ROMMSYNC_GATE_TRANSCRIPT is a seam: a file holding what a
 # `ctest` run printed, used instead of running it. It exists so tests/test_v1_gate.sh
 # can drive the classification below -- and in particular the rule that a SKIP is
 # not a pass -- without a rig, a docker RomM and four minutes. Nothing else sets it.
