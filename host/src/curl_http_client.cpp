@@ -106,6 +106,11 @@ struct Transfer {
   bool restart_needed = false;
   bool write_failed = false;
 
+  /// The caller's progress sink, or null. Borrowed from the `DownloadTarget`,
+  /// which must outlive the call, and set only by `Download` -- so a `Send`
+  /// cannot fire one no matter what a caller left on a reused target.
+  const http::ProgressCallback* progress = nullptr;
+
   std::uint64_t received = 0;
 };
 
@@ -183,10 +188,35 @@ std::size_t OnBodyToFile(char* data, std::size_t size, std::size_t nmemb, void* 
   return length;
 }
 
-int OnProgress(void* context, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+int OnProgress(void* context, curl_off_t dltotal, curl_off_t, curl_off_t, curl_off_t) {
   const auto* transfer = static_cast<const Transfer*>(context);
   if (transfer->request->cancel != nullptr && transfer->request->cancel->canceled()) {
     return 1;  // aborts with CURLE_ABORTED_BY_CALLBACK
+  }
+  // Only a body-bearing response is progress. An error body is a message about
+  // why there is no content -- `OnBodyToFile` counts its bytes but never writes
+  // them -- and reporting them would push the caller's figure past what the file
+  // holds.
+  const bool content = transfer->status == 200 || transfer->status == 206;
+  // ...and only once this response has said whether the bytes already on disk
+  // are still part of it. Until the first body byte arrives, `resume_from` is a
+  // prefix a 200 is about to throw away, so a figure built on it would claim a
+  // file larger than the one that ends up there and then fall back. There is
+  // nothing to lose by waiting: it is the first buffer of the transfer.
+  if (transfer->progress != nullptr && content && !transfer->restart_needed) {
+    // `resume_from + received`, not libcurl's `dlnow`: what the *file* holds,
+    // which is what `ProgressCallback` promises and what a resumed download's
+    // bar is drawn from. `resume_from` is this backend's own bookkeeping and is
+    // zeroed the moment a 200 makes it start the file over, so the figure
+    // follows the bytes rather than outliving them.
+    //
+    // `dltotal` is this response's body, so the whole file is `resume_from`
+    // plus it: the resource on a resume, the slice on a caller's `range_start`.
+    // Zero means the server declared nothing; negative never happens, but is
+    // floored rather than cast, because a `curl_off_t` is signed.
+    const std::uint64_t declared = dltotal > 0 ? static_cast<std::uint64_t>(dltotal) : 0;
+    (*transfer->progress)(transfer->resume_from + transfer->received,
+                          declared == 0 ? 0 : transfer->resume_from + declared);
   }
   return 0;
 }
@@ -337,6 +367,7 @@ class CurlHttpClient final : public http::HttpClient {
     transfer.request = &effective;
     transfer.resume_from = already_have;
     transfer.restart_needed = resuming;
+    transfer.progress = target.progress ? &target.progress : nullptr;
     transfer.file = OpenPartial(partial_path, resuming);
     if (transfer.file == nullptr) {
       result.error = Error::kWriteFailed;

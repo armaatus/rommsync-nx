@@ -38,6 +38,20 @@ inline constexpr const char* kUser = "rommsync";
 inline constexpr const char* kPassword = "rommsync-test-only";
 inline constexpr const char* kEmail = "rommsync@example.invalid";
 
+/// A `DownloadTarget` by name rather than by position.
+///
+/// Named because the struct grew an optional progress sink (#22): a positional
+/// brace list is a `-Wmissing-field-initializers` error the moment a field is
+/// added, in every scenario that never asked for one.
+inline http::DownloadTarget DownloadTo(const std::string& path, bool resume = false,
+                                       std::uint64_t expected_size = 0) {
+  http::DownloadTarget target;
+  target.path = path;
+  target.resume = resume;
+  target.expected_size = expected_size;
+  return target;
+}
+
 inline std::string BaseUrl() {
   if (const char* override_url = std::getenv("PROXY_BASE_URL")) {
     return override_url;

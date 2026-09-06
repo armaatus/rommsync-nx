@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -174,6 +175,38 @@ struct Result {
   }
 };
 
+/// How far a transfer has got, while it is still going.
+///
+/// `Response::bytes_received` answers this after the fact and `CancelToken` is
+/// polled during, and between them there was nothing: a 120 MiB rom is minutes
+/// of a status screen that must not look frozen (#22).
+///
+/// **`staged` is the whole in-flight file, not this call's bytes.** It counts
+/// what `<path>.part` now holds, the bytes an earlier attempt left in it
+/// included -- so a resumed download carries on rather than restarting the bar
+/// at zero, which is the single most visible way to get this wrong. It is
+/// therefore *not* `Response::bytes_received`, which counts only this call: the
+/// two coincide exactly when nothing was resumed.
+///
+/// It is non-decreasing within a call with one exception, and the exception is
+/// the truth rather than a wobble: a `resume` the server answers **200** to has
+/// ignored the range and is sending the whole resource, so the backend discards
+/// the bytes it was building on and `staged` drops to zero with them. A caller
+/// that smoothed that over would be claiming progress the card does not have.
+///
+/// `total` is what the finished file must weigh -- the whole resource on a
+/// resume, not the slice this response carries -- and `0` from a server that
+/// declared no length, which is a real answer and never a licence to synthesise
+/// a percentage. For a *slice* the caller asked for with `Request::range_start`
+/// it is the slice, because that is what the file will hold.
+///
+/// **Called on the transfer thread**, between reads of the socket, so it holds
+/// up the transfer for as long as it runs. Whatever it touches is shared with
+/// another thread by construction. It must not block and must not allocate: the
+/// sysmodule heap is measured in hundreds of kilobytes (docs/DEVELOPMENT.md) and
+/// this runs thousands of times per rom.
+using ProgressCallback = std::function<void(std::uint64_t staged, std::uint64_t total)>;
+
 /// Where a streamed download lands.
 ///
 /// Bytes are written to `<path>.part` and renamed onto `path` only once the
@@ -194,6 +227,16 @@ struct DownloadTarget {
   /// no way to check the seam between two halves without a total, so a resumed
   /// download against a server that declares nothing fails rather than guesses.
   std::uint64_t expected_size = 0;
+
+  /// Optional. An unset sink is never called, and a backend that cannot report
+  /// progress simply never calls it -- neither is an error, and neither changes
+  /// what lands at `path`. It is invoked rather than copied per call, so the
+  /// only allocation it can cost is the one whoever built it already paid.
+  ///
+  /// Bounding the *rate* is the caller's job, not the backend's: a fast LAN
+  /// transfer would otherwise spend its time in here
+  /// (`download::kProgressInterval`).
+  ProgressCallback progress;
 };
 
 /// Where a `Download` stages the bytes before it commits them: `<path>.part`.

@@ -83,10 +83,24 @@ void SdEngine::Load(const std::string& config_dir) {
   // own on the wire is #22's to add.
   queue_diagnostics_.clear();
   queue_diagnostics_.reserve(queued.diagnostics.size());
-  for (std::string& complaint : queued.diagnostics) {
-    queue_diagnostics_.push_back(
-        {config::Severity::kWarning, 0, "downloads", "", std::move(complaint)});
+  for (const std::string& complaint : queued.diagnostics) {
+    queue_diagnostics_.push_back({config::Severity::kWarning, 0, "downloads", "", complaint});
   }
+  // M3-5 (#22) built the home the comment above was waiting for:
+  // `download::DownloadStatus::queue_message` is a queue-level message on the
+  // queue's own model rather than a `[downloads]` section on `config.ini`'s.
+  // Both are filled from the same load, because the placeholder is still the
+  // only one of the two that reaches a user -- `ipc::Status` carries the
+  // projection and not the whole status, and the queue screen (#31) is what
+  // should render this and retire the config diagnostic.
+  //
+  // `DescribeDiagnostics` renders one line per complaint for a log; the trailing
+  // newline goes, because this one is a sentence on a screen.
+  std::string queue_message = queued.DescribeDiagnostics();
+  while (!queue_message.empty() && queue_message.back() == '\n') {
+    queue_message.pop_back();
+  }
+  queue_.set_queue_message(std::move(queue_message));
 
   AdoptConfig(config::LoadConfig(PathTo(config::kConfigFileName)));
 }

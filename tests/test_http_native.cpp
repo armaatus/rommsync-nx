@@ -18,6 +18,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <vector>
 
 #include "rig.hpp"
 
@@ -39,6 +40,8 @@ void Clear(const std::string& path) {
 }
 
 bool Exists(const std::string& path) { return std::filesystem::exists(path); }
+
+using rig::DownloadTo;
 
 std::uint64_t SizeOf(const std::string& path) {
   std::error_code error;
@@ -197,7 +200,7 @@ int Download(http::HttpClient& client, const std::string& base, const std::strin
   http::Request request;
   request.url = base + asset;
   request.timeout = std::chrono::milliseconds{0};  // bounded by stall_timeout
-  const http::Result result = client.Download(request, {path, false, 0});
+  const http::Result result = client.Download(request, DownloadTo(path));
 
   checks.ExpectOk(result, "download");
   checks.ExpectEq(result.response.status, 200, "status");
@@ -205,6 +208,76 @@ int Download(http::HttpClient& client, const std::string& base, const std::strin
   checks.ExpectEq(SizeOf(path), reference.response.body.size(), "file size");
   checks.ExpectEq(rig::ReadFile(path), reference.response.body, "file contents");
   checks.Expect(!Exists(path + ".part"), "the partial file was renamed away");
+  return checks.failures();
+}
+
+// The progress sink: how far a transfer has got, while it is still going.
+//
+// `Response::bytes_received` answers this afterwards and `CancelToken` is polled
+// during; between them there was nothing, and a 120 MiB rom is minutes of a
+// status screen that must not look frozen (#22).
+int Progress(http::HttpClient& client, const std::string& base, const std::string& asset) {
+  rig::Checks checks;
+
+  const std::string path = Scratch("progress.bin");
+  Clear(path);
+
+  struct Sample {
+    std::uint64_t received;
+    std::uint64_t total;
+  };
+  std::vector<Sample> samples;
+
+  http::Request request;
+  request.url = base + asset;
+  request.timeout = std::chrono::milliseconds{0};  // bounded by stall_timeout
+
+  http::DownloadTarget target = DownloadTo(path);
+  target.progress = [&samples](std::uint64_t received, std::uint64_t total) {
+    samples.push_back({received, total});
+  };
+  const http::Result result = client.Download(request, target);
+
+  checks.ExpectOk(result, "download with a progress sink");
+  checks.ExpectEq(result.response.status, 200, "status");
+  const std::uint64_t size = SizeOf(path);
+  checks.Expect(size > 0, "the body reached the file");
+
+  checks.Expect(samples.size() > 1,
+                "the sink fired more than once -- one call at the end is what "
+                "`bytes_received` already was");
+
+  bool monotonic = true;
+  bool declared = false;
+  for (std::size_t at = 1; at < samples.size(); ++at) {
+    monotonic = monotonic && samples[at].received >= samples[at - 1].received;
+  }
+  for (const Sample& sample : samples) {
+    // Zero is a real answer from a server that declared no length, and this one
+    // does declare one -- but a sink that reported a *different* total would be
+    // a bar drawn against the wrong denominator, which is worse than none.
+    checks.Expect(sample.total == 0 || sample.total == size,
+                  "every total the sink reported is the size the body turned out to be");
+    declared = declared || sample.total == size;
+  }
+  checks.Expect(monotonic, "the counts never went backwards");
+  checks.Expect(declared, "and the declared total was reported at least once");
+  checks.ExpectEq(samples.empty() ? 0 : samples.back().received, size,
+                  "the last call counted every byte that reached the file");
+  checks.ExpectEq(samples.empty() ? 0 : samples.back().received, result.response.bytes_received,
+                  "which for a download that resumed nothing is also what `bytes_received` "
+                  "reports afterwards -- the two part company only on a resume");
+
+  // An unset sink is never called. Asserted against the *same* recorder rather
+  // than a new one: what would break is a backend holding on to a sink from an
+  // earlier call, and a fresh counter could not see that happen.
+  const std::size_t before = samples.size();
+  const std::string second = Scratch("progress-none.bin");
+  Clear(second);
+  const http::Result unwatched = client.Download(request, DownloadTo(second));
+  checks.ExpectOk(unwatched, "the same download with no sink");
+  checks.ExpectEq(samples.size(), before, "left the recorder untouched");
+  checks.ExpectEq(SizeOf(second), size, "and moved the same bytes");
   return checks.failures();
 }
 
@@ -228,7 +301,7 @@ int Range(http::HttpClient& client, const std::string& base, const std::string& 
   http::Request request;
   request.url = base + asset;
   request.range_start = kOffset;
-  const http::Result result = client.Download(request, {path, false, 0});
+  const http::Result result = client.Download(request, DownloadTo(path));
 
   checks.ExpectOk(result, "ranged download");
   checks.ExpectEq(result.response.status, 206, "the server honoured Range");
@@ -258,7 +331,7 @@ int Drop(http::HttpClient& client, const std::string& base, const std::string& a
   http::Request request;
   request.url = base + asset;
   request.timeout = std::chrono::milliseconds{0};
-  const http::Result result = client.Download(request, {path, false, 0});
+  const http::Result result = client.Download(request, DownloadTo(path));
 
   checks.ExpectError(result, http::Error::kTruncated, "a reset mid-body is an error");
   checks.Expect(!Exists(path), "no truncated file at the destination");
@@ -293,7 +366,7 @@ int Resume(http::HttpClient& client, const std::string& base, const std::string&
   http::Request request;
   request.url = base + asset;
   request.timeout = std::chrono::milliseconds{0};
-  const http::Result interrupted = client.Download(request, {path, false, 0});
+  const http::Result interrupted = client.Download(request, DownloadTo(path));
   checks.ExpectError(interrupted, http::Error::kTruncated, "the first attempt was cut short");
 
   // A reset does not deliver a predictable number of bytes, so the resume is
@@ -301,7 +374,7 @@ int Resume(http::HttpClient& client, const std::string& base, const std::string&
   const std::uint64_t got_first = SizeOf(path + ".part");
   checks.Expect(got_first > 0 && got_first <= kCutAt, "the first attempt left a partial file");
 
-  const http::Result resumed = client.Download(request, {path, true, 0});
+  const http::Result resumed = client.Download(request, DownloadTo(path, true));
   checks.ExpectOk(resumed, "the resumed attempt");
   checks.ExpectEq(resumed.response.status, 206, "the resume was a Range request");
   checks.ExpectEq(resumed.response.bytes_received, reference.response.body.size() - got_first,
@@ -332,12 +405,36 @@ int ResumeWithoutRangeSupport(http::HttpClient& client, const std::string& base)
 
   http::Request request;
   request.url = base + "/api/heartbeat";
-  const http::Result result = client.Download(request, {path, true, 0});
+  http::DownloadTarget target = DownloadTo(path, true);
+  // The progress sink through the one case that can make it lie (#22). `staged`
+  // is what the in-flight file holds, and here the backend throws the planted
+  // 64 bytes away mid-response -- so a sink that had been handed a starting
+  // point to add to would report 64 more than exist and then jump backwards at
+  // the end. It must follow the bytes down instead.
+  std::vector<std::uint64_t> staged;
+  target.progress = [&staged](std::uint64_t bytes, std::uint64_t) { staged.push_back(bytes); };
+  const http::Result result = client.Download(request, target);
 
   checks.ExpectOk(result, "download");
   checks.ExpectEq(result.response.status, 200, "the server ignored Range");
   checks.ExpectEq(rig::ReadFile(path), reference.response.body,
                   "the stale partial bytes were discarded, not prepended");
+
+  const std::uint64_t whole = reference.response.body.size();
+  bool sane = !staged.empty();
+  std::uint64_t previous = 0;
+  for (const std::uint64_t bytes : staged) {
+    // Every figure is a size this file genuinely held at that moment, counting
+    // up from the empty file the restart made -- never the discarded prefix, and
+    // never the prefix plus the body that replaced it.
+    sane = sane && bytes <= whole && bytes >= previous;
+    previous = bytes;
+  }
+  checks.Expect(sane,
+                "every progress figure is a size the file actually held, counting up from "
+                "the restart rather than from the prefix that was thrown away");
+  checks.ExpectEq(staged.empty() ? 0 : staged.back(), whole,
+                  "and the last one is the file that was actually written");
   return checks.failures();
 }
 
@@ -359,7 +456,7 @@ int ResumeEmptyBody(http::HttpClient& client, const std::string& base,
 
   http::Request request;
   request.url = base + asset;
-  const http::Result result = client.Download(request, {path, true, 0});
+  const http::Result result = client.Download(request, DownloadTo(path, true));
 
   checks.ExpectEq(result.response.status, 200, "the server answered 2xx");
   checks.ExpectError(result, http::Error::kTruncated,
@@ -390,7 +487,7 @@ int ResumeStaleRange(http::HttpClient& client, const std::string& base,
 
   http::Request request;
   request.url = base + asset;
-  const http::Result result = client.Download(request, {path, true, 0});
+  const http::Result result = client.Download(request, DownloadTo(path, true));
 
   checks.ExpectEq(result.response.status, 416, "the server rejected the range");
   checks.ExpectError(result, http::Error::kTruncated, "which is an error, not a success");
@@ -427,7 +524,7 @@ int RangeExpectedSize(http::HttpClient& client, const std::string& base,
   request.url = base + asset;
   request.range_start = kOffset;
   request.timeout = std::chrono::milliseconds{0};
-  const http::Result result = client.Download(request, {path, false, slice});
+  const http::Result result = client.Download(request, DownloadTo(path, false, slice));
 
   checks.ExpectError(result, http::Error::kTruncated, "a short slice is caught");
   checks.Expect(!Exists(path), "and nothing lands at the destination");
@@ -446,7 +543,7 @@ int DownloadNotFound(http::HttpClient& client, const std::string& base) {
 
   http::Request request;
   request.url = base + "/api/no-such-endpoint";
-  const http::Result result = client.Download(request, {path, false, 0});
+  const http::Result result = client.Download(request, DownloadTo(path));
 
   checks.ExpectOk(result, "a 404 is a response, not a transport failure");
   checks.ExpectEq(result.response.status, 404, "status");
@@ -481,7 +578,7 @@ int Truncate(http::HttpClient& client, const std::string& base, const std::strin
   http::Request request;
   request.url = base + asset;
   request.timeout = std::chrono::milliseconds{0};
-  const http::Result unchecked = client.Download(request, {blind, false, 0});
+  const http::Result unchecked = client.Download(request, DownloadTo(blind));
   checks.ExpectOk(unchecked, "a clean short close completes at the transport level");
   checks.ExpectEq(unchecked.response.declared_size, std::uint64_t{0},
                   "and the server declared no length to compare against");
@@ -492,7 +589,7 @@ int Truncate(http::HttpClient& client, const std::string& base, const std::strin
   rig::ArmFault(client, base,
                 R"({"mode":"truncate","bytes":)" + std::to_string(kCutAt) + R"(,"path":")" + asset +
                     R"("})");
-  const http::Result checked = client.Download(request, {guarded, false, full_size});
+  const http::Result checked = client.Download(request, DownloadTo(guarded, false, full_size));
   checks.ExpectError(checked, http::Error::kTruncated,
                      "an expected_size turns the same body into an error");
   checks.Expect(!Exists(guarded), "and nothing lands at the destination");
@@ -556,7 +653,7 @@ int Cancel(http::HttpClient& client, const std::string& base, const std::string&
 
   const Clock::time_point started = Clock::now();
   http::Result result;
-  std::thread worker([&] { result = client.Download(request, {path, false, 0}); });
+  std::thread worker([&] { result = client.Download(request, DownloadTo(path)); });
   std::this_thread::sleep_for(std::chrono::milliseconds{500});
   token.Cancel();
   worker.join();
@@ -600,7 +697,7 @@ int main(int argc, char** argv) {
   if (scenario == "download" || scenario == "range" || scenario == "drop" ||
       scenario == "resume" || scenario == "truncate" || scenario == "cancel" ||
       scenario == "resume_empty_body" || scenario == "resume_stale_range" ||
-      scenario == "range_expected_size") {
+      scenario == "range_expected_size" || scenario == "progress") {
     asset = rig::DiscoverLargeAsset(*client, base);
     if (asset.empty()) {
       std::cerr << "could not find a large asset to stream from " << base << "\n";
@@ -621,6 +718,8 @@ int main(int argc, char** argv) {
     failures = Multipart(*client, base);
   } else if (scenario == "download") {
     failures = Download(*client, base, asset);
+  } else if (scenario == "progress") {
+    failures = Progress(*client, base, asset);
   } else if (scenario == "range") {
     failures = Range(*client, base, asset);
   } else if (scenario == "drop") {

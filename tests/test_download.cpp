@@ -31,6 +31,9 @@
 //   multifile  -- a disc set is refused with a reason and no archive reaches the card
 //   nested     -- ...and the directory-shaped rom beside it is downloaded, not refused
 //   missing    -- a rom the server's library no longer holds fails with a sentence
+//   progress   -- how far a transfer has got, read from a second thread while it moves
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -39,6 +42,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "harness.hpp"
@@ -267,6 +271,167 @@ void QueueApi(checks::Checks& c) {
   c.ExpectEq(snapshot.fs_name, std::string("240pee.nes"), "by name and never by path");
   c.ExpectEq(snapshot.bytes_done, std::int64_t{4096}, "with the bytes already on the card");
   c.ExpectEq(snapshot.bytes_total, std::int64_t{65552}, "and the total to expect");
+
+  // The richer half of the same read (#22), which the projection above is taken
+  // from rather than decided a second time.
+  {
+    const download::DownloadStatus status = watched.Status();
+    c.Expect(status.state == snapshot.state, "the projection agrees with the status it came from");
+    c.ExpectEq(status.rom_id, snapshot.rom_id, "about the same rom");
+    c.ExpectEq(status.bytes_done, snapshot.bytes_done, "and the same bytes");
+    c.ExpectEq(status.queue_depth, std::int64_t{1}, "with one entry still to do");
+    c.ExpectEq(status.queue_bytes_remaining, std::int64_t{65552 - 4096},
+               "and what that entry has left to move");
+    c.ExpectEq(status.bytes_per_second, std::int64_t{0},
+               "no rate until a transfer has published one");
+
+    // Published from the transfer thread, without writing the card. Only onto a
+    // `kActive` row: a callback that lands after its transfer ended must not
+    // take the bar back off 100%, and one for a rom nothing is downloading must
+    // not invent a row.
+    watched.ReportProgress(4, 40'000, 1'000'000);
+    const download::DownloadStatus moved = watched.Status();
+    c.ExpectEq(moved.bytes_done, std::int64_t{40'000}, "progress lands on the active entry");
+    c.ExpectEq(moved.bytes_per_second, std::int64_t{1'000'000}, "with the rate it was measured at");
+    c.ExpectEq(moved.queue_bytes_remaining, std::int64_t{65552 - 40'000},
+               "and the queue has that much less left to move");
+
+    watched.ReportProgress(999, 1, 1);
+    c.ExpectEq(watched.Status().bytes_done, std::int64_t{40'000},
+               "a report for a rom that is not queued changes nothing");
+    c.ExpectEq(watched.size(), std::size_t{1}, "and invents no row for it");
+
+    QueueEntry checking = watched.Find(4);
+    checking.state = QueueState::kVerifying;
+    watched.Update(checking);
+    watched.ReportProgress(4, 7, 7);
+    const download::DownloadStatus hashing = watched.Status();
+    c.Expect(hashing.state == ipc::DownloadState::kVerifying,
+             "a hash in progress is its own state, not a bar stuck at 100%");
+    c.ExpectEq(hashing.bytes_done, std::int64_t{40'000},
+               "and a late callback does not take the bar backwards");
+    c.ExpectEq(hashing.bytes_per_second, std::int64_t{0},
+               "nor quote a rate for bytes that have stopped");
+
+    QueueEntry moving_again = watched.Find(4);
+    moving_again.state = QueueState::kActive;
+    watched.Update(moving_again);
+  }
+
+  // What the screen says when the queue has nothing left to do. `kDone` and
+  // `kSkipped` are `kIdle` -- the work is over and it went as asked -- and only
+  // a failure at the tail is `kFailed`, because "None" over a rom that never
+  // arrived is a user with nothing to go on (#22).
+  //
+  // Driven through `Update`, not `Reset`, and that is the point: "the last entry
+  // to finish" is a chronological question, and queue *order* does not answer
+  // it. `Drain` sets a retryable entry aside where it stands and carries on, so
+  // a rom that failed for good can sit in front of one that finished before it.
+  {
+    download::Queue finished;
+    std::int32_t at = 0;
+    finished.Enqueue(7, &at);   // the one that fails, and is first in the queue
+    finished.Enqueue(8, &at);   // the one that finishes cleanly, after it
+
+    c.Expect(finished.Status().state == ipc::DownloadState::kQueued,
+             "two entries waiting is not idle");
+
+    // 8 finishes first, while 7 is still set aside.
+    QueueEntry done = finished.Find(8);
+    done.state = QueueState::kDone;
+    c.Expect(finished.Update(done), "the second rom finishes first");
+    const download::DownloadStatus mid = finished.Status();
+    c.Expect(mid.state == ipc::DownloadState::kQueued,
+             "the queue still has the entry that was set aside, and reports it");
+    c.ExpectEq(mid.rom_id, std::int64_t{7}, "which is the one still to do");
+
+    // ...and only now does 7 fail for good. It is *earlier* in the queue than
+    // the row that finished, which is what a positional answer gets wrong.
+    QueueEntry failed = finished.Find(7);
+    failed.state = QueueState::kFailed;
+    failed.fs_name = "nova.nes";
+    failed.message = "the downloaded bytes are not the SHA-1 the server recorded";
+    failed.attempts = 2;
+    c.Expect(finished.Update(failed), "the entry that was set aside then fails for good");
+
+    const download::DownloadStatus after = finished.Status();
+    c.Expect(after.state == ipc::DownloadState::kFailed,
+             "a queue whose last entry to finish failed says so rather than 'None'");
+    c.ExpectEq(after.rom_id, std::int64_t{7}, "naming the rom");
+    c.ExpectEq(after.fs_name, std::string("nova.nes"), "by name and never by path");
+    c.ExpectEq(after.message, failed.message, "with the sentence that says why");
+    c.ExpectEq(after.attempts, 2, "and what it cost");
+    c.ExpectEq(after.queue_depth, std::int64_t{0}, "and nothing left to do");
+
+    // A clean finish after it puts the screen back to "None".
+    std::int32_t place = 0;
+    finished.Enqueue(9, &place);
+    QueueEntry cleared = finished.Find(9);
+    cleared.state = QueueState::kDone;
+    cleared.size_bytes = 500;
+    c.Expect(finished.Update(cleared), "another rom comes down afterwards");
+    c.Expect(finished.Status().state == ipc::DownloadState::kIdle,
+             "and the screen is about that rather than about the older failure");
+
+    // ...but only when there is nothing left to do. A queue with work in it
+    // reports the work: a bar that stopped on last week's failure while a rom is
+    // coming down is a screen about the wrong thing.
+    std::int32_t next = 0;
+    finished.Enqueue(10, &next);
+    QueueEntry waiting = finished.Find(10);
+    waiting.size_bytes = 500;
+    c.Expect(finished.Update(waiting), "and one more is queued behind them");
+    QueueEntry failed_again = finished.Find(7);
+    c.ExpectEq(failed_again.rom_id, std::int64_t{7}, "the failed row is still on file");
+    const download::DownloadStatus busy = finished.Status();
+    c.Expect(busy.state == ipc::DownloadState::kQueued,
+             "a queue with something still to do reports the work, not the last failure");
+    c.ExpectEq(busy.rom_id, std::int64_t{10}, "about the entry that is waiting");
+    c.ExpectEq(busy.queue_depth, std::int64_t{1}, "one entry to do");
+    c.ExpectEq(busy.queue_bytes_remaining, std::int64_t{500},
+               "and the terminal rows count for nothing in what is left to move");
+
+    // A skip is terminal too, and is the one an overlay would get wrong: a disc
+    // set or an unmapped platform is a row the user still sees, and counting it
+    // as work would leave the queue permanently one deep with nothing running.
+    std::int32_t last = 0;
+    finished.Enqueue(11, &last);
+    QueueEntry skipped = finished.Find(11);
+    skipped.size_bytes = 9'000;
+    skipped.state = QueueState::kSkipped;
+    c.Expect(finished.Update(skipped), "a disc set is skipped rather than downloaded");
+    const download::DownloadStatus around = finished.Status();
+    c.ExpectEq(around.queue_depth, std::int64_t{1},
+               "a skipped entry is not work the worker still has to do");
+    c.ExpectEq(around.queue_bytes_remaining, std::int64_t{500},
+               "and its bytes are not bytes the queue still has to move");
+    c.Expect(around.state == ipc::DownloadState::kQueued,
+             "and a skip at the tail is not what the screen is about while work is left");
+
+    c.Expect(finished.Remove(10) == ipc::Error::kOk, "the last thing to do is taken out");
+    c.Expect(finished.Status().state == ipc::DownloadState::kIdle,
+             "with nothing left to do, a skip as the last thing to finish is idle rather "
+             "than failed -- it went as the rules said, and the row is on the queue screen "
+             "to say why");
+
+    // A load is not a chronology. `Reset` adopts rows off the card, and a boot
+    // that has finished nothing has no last thing to report -- the `failed` row
+    // is still in the file for the queue screen (#31).
+    download::Queue booted;
+    booted.Reset(finished.Snapshot());
+    c.Expect(booted.Status().state == ipc::DownloadState::kIdle,
+             "a queue loaded off the card reports nothing as having just happened");
+
+    // The queue-level message: what is wrong with the *file*, rather than with
+    // any entry. `sysmodule::SdEngine::Load` still puts the same complaint on
+    // `config_diagnostics()` under a `[downloads]` section, because that is what
+    // reaches a user today; this is the home it belongs in (#22, #31).
+    c.Expect(booted.Status().queue_message.empty(), "a queue with a good file says nothing");
+    booted.set_queue_message("queue.json was discarded: it is not JSON");
+    c.ExpectEq(booted.Status().queue_message,
+               std::string("queue.json was discarded: it is not JSON"),
+               "and one that was thrown away says so");
+  }
 
   // `Update` on an entry that is gone is not an error: `Remove` is callable
   // while the worker is mid-transfer, and a transfer finishing must not put the
@@ -1701,6 +1866,287 @@ void Missing(checks::Checks& c, http::HttpClient& client, const std::string& bas
   c.Expect(rig.Persisted(healthy_id).state == QueueState::kDone, "all the way to done");
 }
 
+/// One reading of `download::Queue::Status()`, and when it was taken.
+struct Sample {
+  std::chrono::steady_clock::time_point at;
+  download::DownloadStatus status;
+};
+
+/// Poll `queue.Status()` from a second thread for as long as `running` says to.
+///
+/// The whole point of the issue is that this is safe and answers something
+/// useful *while* a transfer is in flight: a copy under the queue's own mutex,
+/// never a reference into live worker state (`PairingSession::status()`). Two
+/// millisecond because the whole 120 MiB transfer is under a tenth of a second
+/// against a RomM on loopback -- what takes minutes on a console's Wi-Fi -- so a
+/// slower poll would see a handful of samples and call a state unreachable when
+/// it was merely brief.
+class Watcher {
+ public:
+  Watcher(const download::Queue& queue, std::atomic<bool>& running)
+      : running_(running), thread_([this, &queue, &running] {
+          while (running.load(std::memory_order_relaxed)) {
+            samples_.push_back({std::chrono::steady_clock::now(), queue.Status()});
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+          }
+        }) {}
+
+  /// A drain that throws between the constructor and `Collect` would otherwise
+  /// destroy a joinable thread and `std::terminate` -- a test that aborts where
+  /// it could have reported a failure, with a poller still running.
+  ~Watcher() {
+    running_.store(false, std::memory_order_relaxed);
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+  }
+
+  Watcher(const Watcher&) = delete;
+  Watcher& operator=(const Watcher&) = delete;
+
+  /// Stop and hand back what was seen. The caller clears `running` first.
+  std::vector<Sample> Collect() {
+    thread_.join();
+    return std::move(samples_);
+  }
+
+ private:
+  std::atomic<bool>& running_;
+  std::vector<Sample> samples_;
+  std::thread thread_;
+};
+
+/// Byte-level progress, read from a second thread while the bytes are moving.
+///
+/// The 120 MiB fixture, in the shape `resume` uses it: a `drop` 4 MiB in and one
+/// attempt, then a second drain that finishes it. What is new is the second
+/// thread -- everything `resume` asserts is read off the card *after* the drain,
+/// and a worker that published nothing until the transfer ended would pass every
+/// one of those assertions while leaving the overlay a frozen screen for
+/// minutes, which is the failure this issue exists to prevent.
+void Progress(checks::Checks& c, http::HttpClient& client, const std::string& base,
+              const harness::Fixture& fixture) {
+  Rig rig(c, "download-progress", base, fixture);
+  harness::Rom rom;
+  const std::int64_t rom_id =
+      Queued(c, client, base, fixture, &rig.queue, "synthetic-large.gba", &rom);
+  if (rom_id == 0) {
+    return;
+  }
+  constexpr std::int64_t kDropAt = 4 * 1024 * 1024;
+
+  // Nothing has resolved the rom yet, so nothing knows how big it is. Zero is
+  // the honest answer for both, and neither may be guessed at.
+  {
+    const download::DownloadStatus queued = rig.queue.Status();
+    c.Expect(queued.state == ipc::DownloadState::kQueued,
+             "a queue with something waiting is about to start, not idle");
+    c.ExpectEq(queued.queue_depth, std::int64_t{1}, "one entry is still to do");
+    c.ExpectEq(queued.bytes_total, std::int64_t{0},
+               "with no size claimed for a rom nothing has looked up");
+    c.ExpectEq(queued.queue_bytes_remaining, std::int64_t{0},
+               "and no bytes claimed remaining for it either");
+  }
+
+  // 1. Four megabytes and a dropped connection, so there is a `.part` for the
+  // second drain to carry on from.
+  {
+    rig.options.max_attempts = 1;
+    harness::Fault fault(c, client, base,
+                         "{\"mode\":\"drop\",\"bytes\":" + std::to_string(kDropAt) +
+                             ",\"path\":\"/api/roms/" + std::to_string(rom_id) + "/content\"}");
+    const download::DrainResult result = rig.Drain(client);
+    c.Expect(result.outcome == download::DrainOutcome::kRetryable,
+             std::string("a dropped connection is retryable -- got ") +
+                 download::ToString(result.outcome) + " (" + result.message + ")");
+  }
+
+  const std::uintmax_t partial =
+      rig.sandbox.SizeOf("/tico/roms/gba/synthetic-large.gba.tmp.part");
+  c.Expect(partial > 0 && partial < static_cast<std::uintmax_t>(rom.size),
+           "the bytes that did arrive are in the .part under the staging name");
+
+  // The acceptance criterion, read off the published status rather than off the
+  // entry: after a drop and before the resume, the bar is where the card is.
+  {
+    const download::DownloadStatus stopped = rig.queue.Status();
+    c.Expect(stopped.state == ipc::DownloadState::kQueued, "the entry is waiting again");
+    c.ExpectEq(stopped.rom_id, rom_id, "and the status is about it");
+    c.ExpectEq(stopped.bytes_done, static_cast<std::int64_t>(partial),
+               "with bytes_done continuing from the .part rather than restarting at 0");
+    c.ExpectEq(stopped.bytes_total, rom.size, "against the size the server declared");
+    c.ExpectEq(stopped.fs_name, std::string("synthetic-large.gba"), "named, and never by path");
+    c.ExpectEq(stopped.platform_fs_slug, std::string("gba"), "keyed on the fs slug");
+    c.ExpectEq(stopped.attempts, 1, "one failed attempt is recorded");
+    c.ExpectEq(stopped.queue_depth, std::int64_t{1}, "one entry is still to do");
+    c.ExpectEq(stopped.queue_bytes_remaining, rom.size - static_cast<std::int64_t>(partial),
+               "and the queue has exactly the rest of it left to move");
+    c.ExpectEq(stopped.bytes_per_second, std::int64_t{0},
+               "with no rate quoted for a transfer that is not running");
+  }
+
+  // 2. The drain that finishes it, watched while it runs.
+  //
+  // The publish interval is turned down from `kProgressInterval`, and that is
+  // the point rather than a convenience: against a RomM on loopback the whole
+  // 120 MiB moves in well under the 250 ms a console would publish on, so the
+  // default would correctly publish nothing at all and this test would be
+  // asserting about a transfer that was over before it started. Turned down, the
+  // same run proves both halves -- that progress is published *during* a
+  // transfer, and that it is still bounded by the interval rather than by the
+  // backend's callback rate, which is thousands of times higher.
+  rig.options.max_attempts = 3;
+  rig.options.progress_interval = std::chrono::milliseconds{10};
+  std::atomic<bool> running{true};
+  Watcher watcher(rig.queue, running);
+  const download::DrainResult finished = rig.Drain(client);
+  running.store(false, std::memory_order_relaxed);
+  const std::vector<Sample> seen = watcher.Collect();
+
+  c.Expect(finished.outcome == download::DrainOutcome::kCompleted,
+           std::string("the second drain finishes it -- got ") +
+               download::ToString(finished.outcome) + " (" + finished.message + ")");
+  c.Expect(rig.sandbox.Read("/tico/roms/gba/synthetic-large.gba") ==
+               FixtureRom("roms/gba/synthetic-large.gba"),
+           "with the whole rom byte-identical to the fixture");
+
+  bool monotonic = true;
+  bool verifying = false;
+  bool rate = false;
+  std::int64_t highest = 0;
+  std::int64_t last_done = 0;
+  std::int64_t moving = 0;   // samples taken with bytes actually in flight
+  std::int64_t changes = 0;  // distinct figures published during the transfer
+  std::int64_t remaining_high = 0;
+  // The transfer's own window, as this thread saw it. The drain around it is
+  // seconds of rom detail and SHA-1 over 120 MiB, and a rate bound measured
+  // against *that* would be a ceiling nothing could hit.
+  std::chrono::steady_clock::time_point first_moving{};
+  std::chrono::steady_clock::time_point last_moving{};
+  for (const Sample& sample : seen) {
+    const download::DownloadStatus& status = sample.status;
+    if (status.rom_id != rom_id) {
+      continue;
+    }
+    if (status.state == ipc::DownloadState::kVerifying) {
+      verifying = true;
+    }
+    if (status.state != ipc::DownloadState::kDownloading &&
+        status.state != ipc::DownloadState::kVerifying) {
+      continue;
+    }
+    monotonic = monotonic && status.bytes_done >= last_done;
+    if (status.state == ipc::DownloadState::kDownloading) {
+      if (moving == 0) {
+        first_moving = sample.at;
+      }
+      last_moving = sample.at;
+      ++moving;
+      changes += status.bytes_done != last_done ? 1 : 0;
+      rate = rate || status.bytes_per_second > 0;
+      remaining_high = std::max(remaining_high, status.queue_bytes_remaining);
+    }
+    last_done = status.bytes_done;
+    highest = std::max(highest, status.bytes_done);
+  }
+
+  c.Expect(moving > 0, "the transfer was observed from another thread while it was moving");
+  c.Expect(monotonic, "and bytes_done never went backwards");
+  c.ExpectEq(highest, rom.size, "reaching fs_size_bytes exactly");
+  c.Expect(changes > 1,
+           "with the figure published repeatedly during the transfer -- one write at the end "
+           "is a frozen screen for the whole of a 120 MiB rom");
+  // The bar carried on rather than restarting: every figure published for a
+  // *resumed* transfer is at least the `.part` it built on. A publisher that
+  // reported this request's bytes alone would start again at zero, which is the
+  // single most visible way to get this wrong (#22).
+  bool carried_on = true;
+  for (const Sample& sample : seen) {
+    if (sample.status.rom_id == rom_id &&
+        sample.status.state == ipc::DownloadState::kDownloading) {
+      carried_on = carried_on && sample.status.bytes_done >= static_cast<std::int64_t>(partial);
+    }
+  }
+  c.Expect(carried_on, "and never dropped below the bytes the .part already held");
+  c.Expect(rate, "a rate was quoted while bytes were moving");
+  c.Expect(remaining_high <= rom.size - static_cast<std::int64_t>(partial),
+           "and the queue never claimed more left to move than there was");
+
+  // `kVerifying` between the last byte and `kDone`. Its own state because a
+  // SHA-1 over 120 MiB is seconds with no bytes moving, and a bar stuck at 100%
+  // with no label reads as a hang.
+  c.Expect(verifying, "kVerifying was observed between the last byte and kDone");
+
+  // The rate is bounded, and this is what says so: the transfer's own window
+  // divided by the interval, with a few spare for the state transitions, which
+  // are written whatever the interval says. The backend calls the sink on every
+  // buffer -- thousands of times over a 120 MiB rom -- so a publisher that did
+  // not hold itself back would produce a new figure on every poll this thread
+  // makes, an order of magnitude past this.
+  const auto window =
+      std::chrono::duration_cast<std::chrono::milliseconds>(last_moving - first_moving);
+  const std::int64_t ceiling = window.count() / rig.options.progress_interval.count() + 4;
+  c.Expect(changes <= ceiling,
+           "the publish rate is bounded -- " + std::to_string(changes) + " figures over a " +
+               std::to_string(window.count()) + " ms transfer, against a ceiling of " +
+               std::to_string(ceiling));
+
+  // 3. What is left when it is over.
+  {
+    const download::DownloadStatus idle = rig.queue.Status();
+    c.Expect(idle.state == ipc::DownloadState::kIdle,
+             "a queue whose last entry finished cleanly is idle");
+    c.ExpectEq(idle.queue_depth, std::int64_t{0}, "with nothing left to do");
+    c.ExpectEq(idle.queue_bytes_remaining, std::int64_t{0}, "and no bytes left to move");
+    c.ExpectEq(idle.bytes_per_second, std::int64_t{0}, "and no rate for a transfer that is over");
+  }
+
+  // 4. A failure a human can act on -- and every published string checked for a
+  // secret. `nova.nes` with a digest the server never recorded: the bytes arrive,
+  // the hash refuses them, and because they were fetched whole that is terminal
+  // (`Drain`).
+  {
+    harness::Rom nova;
+    const std::int64_t nova_id = Queued(c, client, base, fixture, &rig.queue, "nova.nes", &nova);
+    if (nova_id == 0) {
+      return;
+    }
+    harness::Fault fault(c, client, base,
+                         DetailFault(nova_id, DetailBody(nova, "nes", std::string(40, 'a'), "")));
+    const download::DrainResult failed = rig.Drain(client);
+    c.Expect(failed.outcome == download::DrainOutcome::kCompleted,
+             std::string("a rom whose digest does not match is finished with, not retried -- got ") +
+                 download::ToString(failed.outcome));
+    c.ExpectEq(failed.failed, 1, "and counted as a failure");
+
+    const download::DownloadStatus after = rig.queue.Status();
+    c.Expect(after.state == ipc::DownloadState::kFailed,
+             "a queue with nothing left to do whose last entry failed says so, rather than 'None'");
+    c.ExpectEq(after.rom_id, nova_id, "naming the rom it was about");
+    c.ExpectEq(after.fs_name, std::string("nova.nes"), "by name and never by path");
+    c.Expect(!after.message.empty(), "with a sentence a human can act on");
+    c.Expect(after.message.find("SHA-1") != std::string::npos ||
+                 after.message.find("hash") != std::string::npos ||
+                 after.message.find("digest") != std::string::npos,
+             std::string("that says what went wrong -- got \"") + after.message + "\"");
+    c.ExpectEq(after.queue_depth, std::int64_t{0}, "and nothing left to do");
+
+    // Nothing published carries a credential or a URL (docs/SECURITY.md).
+    // `ipc.secrets` covers the payloads; this covers the model they are taken
+    // from, which is where a `message` built from an `http::Result` could put
+    // one.
+    for (const std::string& published :
+         {after.fs_name, after.platform_fs_slug, after.message, after.queue_message}) {
+      c.Expect(published.find(fixture.token) == std::string::npos,
+               "no published field carries the token");
+      c.Expect(published.find("://") == std::string::npos,
+               std::string("nor a URL -- got \"") + published + "\"");
+      c.Expect(published.find('?') == std::string::npos,
+               std::string("nor a query string -- got \"") + published + "\"");
+    }
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1770,6 +2216,8 @@ int main(int argc, char** argv) {
     Nested(checks, *client, base, fixture);
   } else if (scenario == "missing") {
     Missing(checks, *client, base, fixture);
+  } else if (scenario == "progress") {
+    Progress(checks, *client, base, fixture);
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;

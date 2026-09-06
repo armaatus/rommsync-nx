@@ -43,10 +43,23 @@
 //     is the two-rename dance that exists for exactly this (atomic_file.hpp),
 //     and moving the commit here is what lets it be used.
 //
+// ## How far it has got, while it is still going
+//
+// M3-5 (#22) added the other half of the same picture. `DownloadStatus` is the
+// whole of what the overlay draws -- the entry in flight, how deep the queue is,
+// and why an entry stopped -- taken as a copy under this queue's own mutex, and
+// `Queue::Status()` is safe to ask for from another thread while the worker
+// runs. `ipc::Status` carries the projection of it (`Queue::CurrentDownload`).
+//
+// Between the transitions the file is written at, the figure comes off the
+// transfer itself: the worker hands `http::DownloadTarget::progress` a sink that
+// publishes at most once per `kProgressInterval`. Nothing about that writes the
+// card -- a 120 MiB rom is thousands of buffers, and `queue.json` is still
+// written at state transitions only.
+//
 // ## What is not here
 //
-// Byte-level progress over IPC is M3-5 (#22), which reads `bytes_done` from
-// here. What to do with a disc set beyond refusing it is M3-4 (#21).
+// What to do with a disc set beyond refusing it is M3-4 (#21).
 #pragma once
 
 #include <chrono>
@@ -205,6 +218,104 @@ struct QueueEntry {
   std::int64_t queued_at = 0;
 };
 
+/// How often the worker publishes byte-level progress while a transfer is in
+/// flight.
+///
+/// A few times a second, and not once per chunk. A 120 MiB rom off a LAN is
+/// thousands of buffers, and a publisher that ran on each of them would spend
+/// the transfer taking a lock the overlay is polling -- for a bar nobody can
+/// see move more finely than this anyway. Nothing here writes `queue.json`: the
+/// file is written at state transitions only, because SD writes are not free.
+inline constexpr std::chrono::milliseconds kProgressInterval{250};
+
+/// Everything the overlay draws while a rom comes down, in one value.
+///
+/// The **in-process** model, and the richer half of the split M5-2 (#29) made:
+/// `ipc::DownloadSnapshot` is the projection that rides on `ipc::Status`, capped
+/// at one poll per frame, and this is what the projection is taken from.
+/// `bytes_per_second`, `attempts`, `message`, `platform_fs_slug` and the two
+/// queue-level counts stay on this side of the wire; anything else the overlay
+/// needs per entry rides on the queue list (#31), not on `Status`.
+///
+/// A value, taken as a copy under the queue's own mutex -- `PairingSession::
+/// status()`'s contract, for its reason: the overlay asks while the worker is
+/// mid-transfer. It carries no secret and no URL (docs/SECURITY.md): a rom is
+/// named by `fs_name` and never by path, and `message` is the same sentence
+/// `QueueEntry::message` holds, which never quotes a name and never a URL.
+struct DownloadStatus {
+  /// What the worker is doing with the entry it is on.
+  ///
+  /// `kIdle` when there is nothing to do. `kQueued` when something is waiting
+  /// and nothing is moving -- `kIdle` on a queue three deep reads as a worker
+  /// that stopped. `kFailed` in one case only: **the queue has nothing left to
+  /// do and the last entry to finish failed.** A queue with work still in it
+  /// reports the work, but a queue whose last act was a failure must not read
+  /// "None" -- that is a user left with a rom that never arrived and a screen
+  /// saying nothing happened.
+  ipc::DownloadState state = ipc::DownloadState::kIdle;
+
+  /// The entry `state` is about. Zero, empty and zero when `state` is `kIdle`.
+  std::int64_t rom_id = 0;
+  std::string fs_name;
+  std::string platform_fs_slug;
+
+  /// Bytes already on the card for this entry, the `.part` included -- what
+  /// `QueueEntry::bytes_done` means, and never the bytes one request fetched.
+  /// A resumed download reporting only the latter shows the bar restarting at
+  /// zero, which is the single most visible way to get this wrong.
+  ///
+  /// Non-decreasing **within one transfer**. It does go back to zero when a
+  /// transfer restarts from the beginning -- a resumed prefix the digest
+  /// rejected is discarded and fetched clean (`Drain`) -- because that is what
+  /// actually happened to the bytes, and a bar that hid it would be claiming
+  /// progress the card does not have.
+  std::int64_t bytes_done = 0;
+
+  /// `fs_size_bytes`. **Zero is a real answer** from a server that declared no
+  /// length: the overlay needs an indeterminate bar there and must never
+  /// synthesise a percentage from it. Zero also before the worker has resolved
+  /// the rom, for the same reason -- nothing has said how big it is.
+  std::int64_t bytes_total = 0;
+
+  /// Over the last publish window, or zero when nothing has moved long enough
+  /// to measure. Instantaneous rather than smoothed, and only ever non-zero
+  /// while `state` is `kDownloading`: it is a label on a live transfer, and a
+  /// figure left standing over a `kVerifying` entry would be a rate for bytes
+  /// that stopped.
+  std::int64_t bytes_per_second = 0;
+
+  /// Failed requests spent on this entry, across drains as well as within one.
+  int attempts = 0;
+
+  /// Why the entry is in the state it is in, in a sentence
+  /// (`QueueEntry::message`). Empty while a transfer is simply going.
+  std::string message;
+
+  /// Entries the worker still has to do -- `Queue::pending()`. Deliberately not
+  /// a count of every row: the finished ones kept for the queue screen are not
+  /// work.
+  std::int64_t queue_depth = 0;
+
+  /// Bytes the whole queue still has to move: the sum over the entries that are
+  /// not terminal of what each one has left.
+  ///
+  /// An entry the worker has not resolved yet contributes **nothing**, because
+  /// its `size_bytes` is zero and nothing has said how big it is -- the same
+  /// honest zero `bytes_total` is. This number therefore grows as ids resolve,
+  /// and an overlay drawing a whole-queue bar from it has to say so.
+  std::int64_t queue_bytes_remaining = 0;
+
+  /// What is wrong with the queue **itself**, rather than with any entry -- a
+  /// `queue.json` that would not parse, and the entries that went with it.
+  ///
+  /// Here because there was nowhere for it: `sysmodule::SdEngine::Load`
+  /// currently puts it on `config_diagnostics()` under a `[downloads]` section,
+  /// and `ipc::ConfigView` is documented as being about `config.ini`. This is
+  /// the home; the queue screen (#31) is what should render it and retire the
+  /// placeholder.
+  std::string queue_message;
+};
+
 /// The queue, in memory and on the card.
 ///
 /// Every method takes the lock: the IPC thread enqueues while the worker
@@ -285,9 +396,38 @@ class Queue {
   /// Every entry, terminal ones included.
   std::size_t size() const;
 
-  /// The entry the worker is on, as the status screen draws it (ipc.hpp).
-  /// `kIdle` when nothing is `kActive` or `kVerifying`.
+  /// Everything the overlay draws while a rom comes down, in one consistent
+  /// read. See `DownloadStatus`.
+  DownloadStatus Status() const;
+
+  /// The projection of `Status()` that `ipc::Status` carries (ipc.hpp).
+  ///
+  /// Derived rather than decided a second time: two functions choosing which
+  /// entry is "current" is two answers the moment one of them is edited.
   ipc::DownloadSnapshot CurrentDownload() const;
+
+  /// Publish how far the entry the worker is on has got, without writing the
+  /// card.
+  ///
+  /// Called from the **transfer thread** (`http::ProgressCallback`), so it does
+  /// as little as a shared mutex allows: two integers onto the row, no
+  /// allocation, no `queue.json`. `bytes_per_second` is not a `QueueEntry`
+  /// field and never reaches the file -- a rate is not durable state, and the
+  /// file is written at state transitions only.
+  ///
+  /// Ignored unless there is a row for `rom_id` and it is `kActive`. A callback
+  /// that lands after its transfer ended must not write progress onto an entry
+  /// that has moved on to `kVerifying`, and must not resurrect one the user
+  /// dequeued mid-transfer.
+  void ReportProgress(std::int64_t rom_id, std::int64_t bytes_done,
+                      std::int64_t bytes_per_second);
+
+  /// Record what was wrong with the file these entries came out of, for
+  /// `DownloadStatus::queue_message`. Empty clears it.
+  ///
+  /// Set by whoever loaded the queue, beside `Reset`: `LoadQueue` answers with
+  /// the diagnostics and the queue is what outlives them.
+  void set_queue_message(std::string message);
 
   /// The first entry the worker still has to do whose `rom_id` is not in
   /// `skip`, or a default-constructed one with `rom_id == 0` when there is
@@ -314,6 +454,25 @@ class Queue {
 
   mutable std::mutex mutex_;
   std::vector<QueueEntry> entries_;
+
+  /// The last rate `ReportProgress` measured, and the rom it was measured for.
+  /// Beside the entries rather than on one, because it must not reach the file
+  /// -- and keyed on the rom so a stale figure cannot be drawn against another
+  /// one's bar.
+  std::int64_t live_rom_id_ = 0;
+  std::int64_t live_bytes_per_second_ = 0;
+
+  /// The rom that reached a terminal state most recently, or `0`. Recorded as
+  /// the transition happens because queue order does not answer the question:
+  /// `Drain` sets a retryable entry aside *in place* and carries on, so a rom
+  /// that failed for good can sit in front of one that finished before it.
+  ///
+  /// Not persisted, and deliberately: it is "the last thing this engine did",
+  /// and a boot that has done nothing has no answer. `Status` is documented
+  /// there.
+  std::int64_t last_finished_rom_id_ = 0;
+
+  std::string queue_message_;
 };
 
 /// `ipc::Engine::Enqueue`, whole: the two refusals only the library can answer,
@@ -523,6 +682,12 @@ struct WorkerOptions {
   /// "do not wait"** -- `sync::NegotiateOptions::wait`'s contract, so a caller
   /// that wants one attempt says so with `max_attempts`.
   std::function<void(std::chrono::milliseconds)> wait;
+
+  /// The floor on how often a transfer in flight publishes its progress. See
+  /// `kProgressInterval`, which is what this defaults to; zero publishes on
+  /// every callback the backend makes, which is a test's business and not a
+  /// console's.
+  std::chrono::milliseconds progress_interval = kProgressInterval;
 
   /// Optional, not owned; must outlive the drain. Cancelling stops the transfer
   /// in flight and ends the drain, leaving the entry `kQueued` with its `.part`.
