@@ -953,13 +953,18 @@ auth::PairingStatus BeginAndShow(Console& console, checks::Checks& c) {
       return {};
     }
     // The contract `ipc::Engine::StartPairing` documents: the command hands the
-    // work to the engine thread, so the status one instant later is the attempt
-    // starting and never `kIdle`, which the overlay would draw as "nothing
-    // happened when you pressed Pair".
-    c.Expect(started.state == auth::PairingState::kStarting,
-             std::string("the attempt is reported as starting, not as idle (") +
+    // work to the engine thread, so the status one instant later is *not*
+    // `kIdle`, which the overlay would draw as "nothing happened when you
+    // pressed Pair".
+    //
+    // Asserted as "not idle" rather than as `kStarting` on purpose. `StartPair`
+    // notifies the thread before it returns, so how far that thread has got by
+    // the time this line runs is the scheduler's business: pinning `kStarting`
+    // would be pinning a race, and a test that fails on a preemption teaches the
+    // next reader to re-run it rather than to believe it.
+    c.Expect(started.state != auth::PairingState::kIdle,
+             std::string("the attempt is reported as started, not as idle (") +
                  auth::ToString(started.state) + ")");
-    c.Expect(started.user_code.empty(), "and there is nothing to show yet");
 
     const auth::PairingStatus status =
         Settled(console, c, [](const auth::PairingStatus& seen) {
@@ -1182,7 +1187,11 @@ void Unreachable(checks::Checks& c) {
   c.Expect(console.StartPair(&started) == ipc::Error::kOk,
            "StartPair still starts an attempt: whether the server answers is not something "
            "this command can know without waiting, which it may not do");
-  c.Expect(started.state == auth::PairingState::kStarting, "and reports it starting");
+  // Not `kStarting` exactly: the connect to a closed port is refused in
+  // microseconds, so the thread can reach `kFailed` before this line runs. What
+  // the command promises is that it did not answer `kIdle`.
+  c.Expect(started.state != auth::PairingState::kIdle,
+           std::string("and reports it started (") + auth::ToString(started.state) + ")");
 
   const auth::PairingStatus settled = Terminal(console, c);
   c.Expect(settled.state == auth::PairingState::kFailed,

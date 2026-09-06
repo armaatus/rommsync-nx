@@ -324,34 +324,26 @@ int main(int, char**) {
   // swaps the live `Config`, which is what makes a setting changed from the
   // overlay take effect without a reboot.
   rommsync::sysmodule::SdEngine engine;
-  // **No `UsePairingBackend` call, and that is the one thing this console still
-  // cannot do.** M1-6 (#123) built `SdEngine::StartPairing`, and it needs an
-  // `http::HttpClient` to run an attempt on; the only implementation of that
-  // interface is libcurl's, which is the host harness's and is never built for
-  // Switch. The Horizon one goes through the `ssl` system service and is the
-  // M8-1 gate item (#43) -- until it exists, `StartPair` answers `kUnavailable`
-  // here, which is the sentence the pairing screen already draws. The identity
-  // seed belongs in the same call, from `setsysGetSerialNumber`: an engine given
-  // one and no transport would mint a `device.dat` for a pairing it can never
-  // start.
   engine.Load();
 
-  // **This is where the client goes, and M1-7 (#126) could not put it here.**
+  // The transport M1-7 (#126) built, installed through the seam this issue
+  // (M1-6, #123) added. #126 wrote this call out commented, because the seam was
+  // not on `main` when it landed; this is that line, uncommented.
   //
-  //     engine.UsePairingBackend({g_http.get(), seed});
-  //
-  // `SdEngine::UsePairingBackend` is M1-6 (#123)'s and #123 is not on `main`
-  // yet, so the transport this issue built has no seam to be installed through
-  // and `StartPair` still answers `kUnavailable` here. #126's PR body says so,
-  // and #123 is where that line lands.
-  //
-  // The other seam, `UseServer`, is deliberately **not** used instead, and the
-  // reason is worth reading before anyone tries it: `lists::Service` answers a
-  // page that needs a request with `kOk` and `ListPage::pending`, and makes the
-  // request in `Pump()` -- on a thread this build does not have
-  // (`list_service.hpp`). Handing it a client without also starting that worker
-  // would turn "offline", which the browser draws, into "pending" forever,
-  // which it cannot. Starting the worker is M7-2 (#37), and it is written there.
+  // After it, `StartPair` is answered on a console rather than refused: the
+  // engine drives a real device-code attempt on a thread of its own, and the
+  // overlay's pairing screen has a code to draw.
+  engine.UsePairingBackend({g_http.get(), seed});
+
+  // The other seam, `UseServer`, is deliberately **not** used, and the reason is
+  // worth reading before anyone tries it: `lists::Service` answers a page that
+  // needs a request with `kOk` and `ListPage::pending`, and makes the request in
+  // `Pump()` -- on a thread this build does not have (`list_service.hpp`).
+  // Handing it a client without also starting that worker would turn "offline",
+  // which the browser draws, into "pending" forever, which it cannot. Starting
+  // the worker is M7-2 (#37), and it is written there. That is also why the two
+  // setters are still two: this one is safe to call the moment a client exists,
+  // and that one is not.
 
   rommsync::ipc::ServiceCore core(engine);
   rommsync::sysmodule::ServiceServer server(core, g_service_port);

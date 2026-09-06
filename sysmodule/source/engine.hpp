@@ -159,12 +159,16 @@ class SdEngine : public ipc::Engine {
   /// leave a pairing screen that never moves. A backend with no transport starts
   /// nothing, which is every console today.
   ///
-  /// Separate from `UseServer` below, and that is a seam to reconcile rather
-  /// than a decision: both hand this class an `http::HttpClient*`, because M5-4
-  /// (#31) and M1-6 (#123) landed in parallel and each needed one. **Whichever
-  /// issue gives the console a real transport (#126) should make it one call**
-  /// -- a console has one client, and two setters is two chances to install
-  /// only half of it.
+  /// Separate from `UseServer` below, and it stays that way. Both hand this
+  /// class an `http::HttpClient*`, and while that started as an accident -- M5-4
+  /// (#31) and M1-6 (#123) landed in parallel and each needed one -- M1-7 (#126)
+  /// gave the console a real transport and the two did not collapse into one
+  /// call, because they are not the same promise. This one is safe the moment a
+  /// client exists: the pairing thread is this class's own. `UseServer` is not,
+  /// and `main.cpp` says why at length -- `lists::Service` needs a `PumpLists()`
+  /// worker in the same breath or every page that needs a request is `pending`
+  /// forever, and that worker is M7-2 (#37). One setter would make it impossible
+  /// to install the half that is ready.
   void UsePairingBackend(PairingBackend backend);
 
   /// The network the library is read over, and the token to read it with.
@@ -463,18 +467,21 @@ class SdEngine : public ipc::Engine {
   /// `main.cpp` already makes about `GetStatus` never going near the card.
   ///
   /// **Lock order is this one, then `mutex_`, never the reverse**, and `mutex_`
-  /// is never held while acquiring this. Three methods take it, all of them on
-  /// a path that writes one of those two files: `CommitGrant`, `Unpair`, and
-  /// `ApplyConfigEdit` -- which discards the token when `server.url` moves, and
-  /// therefore has to be atomic against a commit landing at the same moment.
+  /// is never held while acquiring this. Four methods take it: `CommitGrant`,
+  /// `Unpair` and `ApplyConfigEdit` -- which discards the token when
+  /// `server.url` moves, and therefore has to be atomic against a commit landing
+  /// at the same moment -- and `Load`, which reads the same two files at boot.
   mutable std::mutex card_mutex_;
 
   /// Guards the in-memory state the two threads share: the attempt, `auth_`,
-  /// and `gate_`. Held for assignments and never across I/O, with one exception
-  /// that is safe because it predates the contention: `Load` holds it over the
-  /// four files it reads at boot, before `UsePairingBackend` has made a second
-  /// thread to stall. Mutable because `Snapshot()` and `pairing_status()` are
-  /// const and both read state the pairing thread writes.
+  /// and `gate_`. Held for assignments and never across I/O, with one exception:
+  /// `Load` holds it over the four files it reads at boot. The pairing thread
+  /// usually *does* exist by then -- `UsePairingBackend` is called before `Load`
+  /// -- so what makes that safe is not the absence of a second thread but the
+  /// absence of a reader: it is parked with no attempt to drive, and no
+  /// `ServiceCore` exists yet to answer the frame-polled commands this rule is
+  /// really about. Mutable because `Snapshot()` and `pairing_status()` are const
+  /// and both read state the pairing thread writes.
   mutable std::mutex mutex_;
 
   /// How the pairing thread is told there is something to do, and how it is

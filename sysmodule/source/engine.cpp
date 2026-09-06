@@ -50,10 +50,16 @@ bool SdEngine::PumpLists() { return lists_.Pump(); }
 
 void SdEngine::Load(const std::string& config_dir) {
   // This reads `token.dat` and `auth.json` and writes `auth_` and `gate_`, so it
-  // takes both locks in the documented order. The pairing thread cannot be
-  // running yet -- it is started by `UsePairingBackend`, and nothing has
-  // answered a command -- but two uncontended acquires at boot cost nothing and
-  // mean no future caller has to know that.
+  // takes both locks in the documented order.
+  //
+  // It is the one place `mutex_` is held across I/O, and the header says so.
+  // The pairing thread may well exist by now -- `UsePairingBackend` starts it
+  // and both `main()` and the tests call that first -- but it is parked in
+  // `AwaitNextPoll` with no attempt to drive, so all it ever does with `mutex_`
+  // here is take it for the length of a condition-variable predicate. Nothing
+  // that a frame-polled command reaches can block on these reads, because
+  // nothing is answering commands yet: `Boot` builds the `ServiceCore` after
+  // this returns.
   std::lock_guard<std::mutex> card(card_mutex_);
   std::lock_guard<std::mutex> lock(mutex_);
   config_dir_ = config_dir;
@@ -323,6 +329,12 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
       std::lock_guard<std::mutex> lock(mutex_);
       AbandonPairingLocked();
     }
+    // Every other write to `attempt_` notifies, and this one has the longest
+    // wait to cut short: the thread is parked in `AwaitNextPoll` until the
+    // session's next deadline, which after a `slow_down` is `max_poll_backoff`
+    // away. Without this it holds the retired attempt alive for that long before
+    // noticing nobody wants it.
+    wake_.notify_all();
     // The verdict was about the token that has just gone, and about the server
     // that issued it. Left behind, it would put a console that has never paired
     // with the *new* server on a "pair again" screen (M1-4, #8). Not a refusal
@@ -534,10 +546,19 @@ void SdEngine::CommitGrant(const std::shared_ptr<PairingAttempt>& attempt,
       // overlay is drawing knows nothing about, and the attempt that replaced
       // this one will commit its own.
       //
-      // Checked under `card_mutex_`, which is what makes it a decision and not
-      // a guess: `ApplyConfigEdit` clears `attempt_` and discards the token
-      // while holding that lock, so it cannot happen between this check and the
-      // write below.
+      // Checked under `card_mutex_`, which is what settles it against the one
+      // racer that would be dangerous: `ApplyConfigEdit` clears `attempt_` and
+      // discards the token while holding that lock, so a `server.url` change
+      // cannot slip between this check and the write below and leave the new
+      // server's console holding the old server's token.
+      //
+      // It is *not* atomic against `StartPairing`, which replaces `attempt_`
+      // under `mutex_` alone -- deliberately, because a command may not wait on
+      // an SD write (`ipc.hpp`). So a user who presses "start over" in the
+      // moment between this check and the write gets A1's token committed under
+      // A2's screen. That end state is honest rather than wrong: A1 really was
+      // approved, the token really does work, and A2 overwrites it if the user
+      // finishes it. What the lock buys is that the *card* is never spliced.
       return;
     }
   }
