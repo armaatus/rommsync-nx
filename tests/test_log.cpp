@@ -35,7 +35,10 @@
 #include "checks.hpp"
 #include "rommsync/log.hpp"
 
-namespace log = rommsync::log;
+// Aliased `rlog` and not `log`: at global scope that name is already taken by
+// `::log`, the C library's logarithm, and GCC refuses a namespace alias that
+// redeclares it (clang accepts it, which is how this reached CI once).
+namespace rlog = rommsync::log;
 
 namespace {
 
@@ -97,14 +100,14 @@ std::size_t CountLines(const std::string& text) {
 
 /// Everything written, in order. What a test asserts on when it cares about the
 /// line rather than about the file.
-class Recorder : public log::Sink {
+class Recorder : public rlog::Sink {
  public:
-  void Write(log::Level level, std::string_view line) override {
+  void Write(rlog::Level level, std::string_view line) override {
     levels.push_back(level);
     lines.emplace_back(line);
   }
 
-  std::vector<log::Level> levels;
+  std::vector<rlog::Level> levels;
   std::vector<std::string> lines;
 };
 
@@ -113,17 +116,17 @@ class Recorder : public log::Sink {
 /// one's lines.
 class Installed {
  public:
-  explicit Installed(log::Sink* sink) : previous_(log::GetSink()) {
-    log::Reset();
-    log::SetSink(sink);
+  explicit Installed(rlog::Sink* sink) : previous_(rlog::GetSink()) {
+    rlog::Reset();
+    rlog::SetSink(sink);
   }
-  ~Installed() { log::SetSink(previous_); }
+  ~Installed() { rlog::SetSink(previous_); }
 
   Installed(const Installed&) = delete;
   Installed& operator=(const Installed&) = delete;
 
  private:
-  log::Sink* previous_;
+  rlog::Sink* previous_;
 };
 
 // --- the line ----------------------------------------------------------------
@@ -132,9 +135,9 @@ void Renders(checks::Checks& c) {
   Recorder recorder;
   Installed installed(&recorder);
 
-  log::Info(log::Event::kBoot, "rommsync-nx/0.1.0");
-  log::Warn(log::Event::kNetOffline, "negotiate: connection failed");
-  log::Error(log::Event::kSaveFailed, "");
+  rlog::Info(rlog::Event::kBoot, "rommsync-nx/0.1.0");
+  rlog::Warn(rlog::Event::kNetOffline, "negotiate: connection failed");
+  rlog::Error(rlog::Event::kSaveFailed, "");
 
   c.ExpectEq(recorder.lines.size(), std::size_t{3}, "every line reached the sink");
   c.ExpectEq(recorder.lines[0], std::string("1 info boot rommsync-nx/0.1.0"),
@@ -143,18 +146,18 @@ void Renders(checks::Checks& c) {
              "and the ordinal counts up across levels and events");
   c.ExpectEq(recorder.lines[2], std::string("3 error save.failed"),
              "an empty detail is three fields, not a trailing space");
-  c.Expect(recorder.levels[0] == log::Level::kInfo && recorder.levels[2] == log::Level::kError,
+  c.Expect(recorder.levels[0] == rlog::Level::kInfo && recorder.levels[2] == rlog::Level::kError,
            "the level reaches the sink as a value as well as as text");
 
   // One record is one line. A caller with several -- every `Describe*` in this
   // codebase renders one line per complaint -- uses `WriteEach`, and a caller
   // that does not gets its newlines flattened rather than a record `wc -l`
   // cannot count.
-  log::Warn(log::Event::kConfigDiagnostic, "line 9 [sync] states: expected true or false\nand more");
+  rlog::Warn(rlog::Event::kConfigDiagnostic, "line 9 [sync] states: expected true or false\nand more");
   c.Expect(recorder.lines.back().find('\n') == std::string::npos,
            "a detail with a newline in it is still one line: " + recorder.lines.back());
 
-  log::WriteEach(log::Level::kWarn, log::Event::kConfigDiagnostic,
+  rlog::WriteEach(rlog::Level::kWarn, rlog::Event::kConfigDiagnostic,
                  "line 9 [sync] states: expected true or false\n"
                  "line 12 [server] url: not a URL\n"
                  "\n");
@@ -166,7 +169,7 @@ void Renders(checks::Checks& c) {
   // The other spelling, for the reports that hand up a vector rather than a
   // block. Same rule about empties, so neither caller has to convert into the
   // other's shape.
-  log::WriteEach(log::Level::kError, log::Event::kSaveFailed,
+  rlog::WriteEach(rlog::Level::kError, rlog::Event::kSaveFailed,
                  std::vector<std::string>{"upload Game.srm: refused", "", "the baseline"});
   c.ExpectEq(recorder.lines.size(), std::size_t{8}, "a vector writes one line each too");
   c.Expect(recorder.lines[6].find("upload Game.srm") != std::string::npos &&
@@ -175,13 +178,13 @@ void Renders(checks::Checks& c) {
 
   // The bound is on the whole line, marker included: a line that announced its
   // own truncation by exceeding the limit would defeat the limit.
-  const std::string enormous(4 * log::kMaxLineBytes, 'x');
-  log::Info(log::Event::kScanSkipped, enormous);
+  const std::string enormous(4 * rlog::kMaxLineBytes, 'x');
+  rlog::Info(rlog::Event::kScanSkipped, enormous);
   const std::string& cut = recorder.lines.back();
-  c.ExpectEq(cut.size(), log::kMaxLineBytes, "a long line is cut to exactly the bound");
-  c.Expect(cut.size() > std::strlen(log::kTruncationMarker) &&
-               cut.compare(cut.size() - std::strlen(log::kTruncationMarker), std::string::npos,
-                           log::kTruncationMarker) == 0,
+  c.ExpectEq(cut.size(), rlog::kMaxLineBytes, "a long line is cut to exactly the bound");
+  c.Expect(cut.size() > std::strlen(rlog::kTruncationMarker) &&
+               cut.compare(cut.size() - std::strlen(rlog::kTruncationMarker), std::string::npos,
+                           rlog::kTruncationMarker) == 0,
            "and says so, rather than ending mid-word: " + cut.substr(cut.size() - 24));
   c.Expect(cut.find("scan.skipped") != std::string::npos,
            "with the tag still in it -- the part that identifies the failure survives");
@@ -193,18 +196,18 @@ void Renders(checks::Checks& c) {
   // continuation byte at the end of the text.
   for (std::size_t pad = 0; pad < 4; ++pad) {
     std::string wide(pad, 'a');
-    while (wide.size() < 2 * log::kMaxLineBytes) {
+    while (wide.size() < 2 * rlog::kMaxLineBytes) {
       wide += "\xe6\x97\xa5";  // U+65E5, three bytes
     }
-    log::Info(log::Event::kScanSkipped, wide);
+    rlog::Info(rlog::Event::kScanSkipped, wide);
     const std::string& line = recorder.lines.back();
-    const std::string body = line.substr(0, line.size() - std::strlen(log::kTruncationMarker));
+    const std::string body = line.substr(0, line.size() - std::strlen(rlog::kTruncationMarker));
     c.Expect(EndsOnACharacter(body),
              "a truncated line never ends inside a UTF-8 character (pad " +
                  std::to_string(pad) + ")");
-    c.Expect(line.size() <= log::kMaxLineBytes,
+    c.Expect(line.size() <= rlog::kMaxLineBytes,
              "and backing off to the boundary never pushes it over the bound");
-    c.Expect(line.size() + 3 > log::kMaxLineBytes,
+    c.Expect(line.size() + 3 > rlog::kMaxLineBytes,
              "nor costs more than the one character it had to drop: " +
                  std::to_string(line.size()));
   }
@@ -226,15 +229,15 @@ void Redacts(checks::Checks& c) {
   // Written through a real `FileSink`, because the promise is about the file on
   // the card and not about the value a helper returned.
   {
-    log::FileSink sink(path);
+    rlog::FileSink sink(path);
     Installed installed(&sink);
-    log::Error(log::Event::kAuthRejected, "request headers: Authorization: Bearer " + kToken);
-    log::Info(log::Event::kBoot, "{\"access_token\":\"" + kToken + "\",\"token_type\":\"bearer\"}");
-    log::Info(log::Event::kBoot, "device_code=" + kDeviceCode + "&grant_type=device_code");
-    log::Info(log::Event::kBoot, "{ \"device_code\" : \"" + kDeviceCode + "\" }");
-    log::Error(log::Event::kNoServer,
+    rlog::Error(rlog::Event::kAuthRejected, "request headers: Authorization: Bearer " + kToken);
+    rlog::Info(rlog::Event::kBoot, "{\"access_token\":\"" + kToken + "\",\"token_type\":\"bearer\"}");
+    rlog::Info(rlog::Event::kBoot, "device_code=" + kDeviceCode + "&grant_type=device_code");
+    rlog::Info(rlog::Event::kBoot, "{ \"device_code\" : \"" + kDeviceCode + "\" }");
+    rlog::Error(rlog::Event::kNoServer,
                "https://romm:" + kPassword + "@romm.example.lan/api/sync/negotiate");
-    log::Error(log::Event::kNetTls, "password=" + kPassword + " secret=" + kPassword);
+    rlog::Error(rlog::Event::kNetTls, "password=" + kPassword + " secret=" + kPassword);
   }
 
   const std::string written = ReadWhole(path);
@@ -249,7 +252,7 @@ void Redacts(checks::Checks& c) {
 
   // Redaction replaces rather than removes: a line that silently lost a field
   // reads as a line that never had one.
-  c.Expect(written.find(log::kRedacted) != std::string::npos,
+  c.Expect(written.find(rlog::kRedacted) != std::string::npos,
            "the redactions are visible in the file");
   c.Expect(written.find("romm.example.lan") != std::string::npos,
            "the host survives -- what goes is the userinfo, not the URL");
@@ -258,25 +261,25 @@ void Redacts(checks::Checks& c) {
 
   // The same rule, reachable on its own, because a caller that renders a line
   // some other way has to be able to ask rather than write a second copy.
-  c.ExpectEq(log::Redact("https://me:hunter2@host/api"),
+  c.ExpectEq(rlog::Redact("https://me:hunter2@host/api"),
              std::string("https://<redacted>@host/api"), "Redact on a URL");
-  c.ExpectEq(log::Redact("https://host/roms/me@home.zip"),
+  c.ExpectEq(rlog::Redact("https://host/roms/me@home.zip"),
              std::string("https://host/roms/me@home.zip"),
              "an `@` in the path is not userinfo -- the host is not eaten");
-  c.ExpectEq(log::Redact("Authorization: Bearer abc123"),
+  c.ExpectEq(rlog::Redact("Authorization: Bearer abc123"),
              std::string("Authorization: <redacted> <redacted>"), "Redact on a header");
-  c.ExpectEq(log::Redact("Bearer abc123"), std::string("Bearer <redacted>"),
+  c.ExpectEq(rlog::Redact("Bearer abc123"), std::string("Bearer <redacted>"),
              "and on a header value that starts the line");
   // `config::Diagnostic` writes this sentence for a plain-`http://` server, and
   // it is a warning the user has to be able to read: `bearer` after a word is
   // English, not a header value.
-  c.ExpectEq(log::Redact("plain http: the bearer token and every save cross the network"),
+  c.ExpectEq(rlog::Redact("plain http: the bearer token and every save cross the network"),
              std::string("plain http: the bearer token and every save cross the network"),
              "the English word `bearer` in a diagnostic is not a credential");
-  c.ExpectEq(log::Redact("Bearer"), std::string("Bearer"), "a bare `Bearer` is left alone");
-  c.ExpectEq(log::Redact("token_expires=2026-01-01"), std::string("token_expires=2026-01-01"),
+  c.ExpectEq(rlog::Redact("Bearer"), std::string("Bearer"), "a bare `Bearer` is left alone");
+  c.ExpectEq(rlog::Redact("token_expires=2026-01-01"), std::string("token_expires=2026-01-01"),
              "the key match is on a whole word, so `token_expires` is not `token`");
-  c.ExpectEq(log::Redact("nothing to hide here"), std::string("nothing to hide here"),
+  c.ExpectEq(rlog::Redact("nothing to hide here"), std::string("nothing to hide here"),
              "and a line with no secret in it is untouched");
 }
 
@@ -285,17 +288,17 @@ void Redacts(checks::Checks& c) {
 void Rotates(checks::Checks& c) {
   const std::string directory = FreshDir("rotates");
   const std::string path = directory + "/rommsync.log";
-  const std::string previous = log::PreviousLogPathFor(path);
+  const std::string previous = rlog::PreviousLogPathFor(path);
   c.ExpectEq(previous, path + ".old", "the rotated file is `<path>.old`");
 
   // A cap far below the real one, so the scenario is a few hundred lines rather
   // than thousands -- the arithmetic is the same and the test is a moment.
   constexpr std::size_t kCap = 2 * 1024;
   {
-    log::FileSink sink(path, kCap);
+    rlog::FileSink sink(path, kCap);
     Installed installed(&sink);
     for (int line = 0; line < 400; ++line) {
-      log::Info(log::Event::kSyncTick, "outcome=completed uploaded=0 downloaded=0 failed=0");
+      rlog::Info(rlog::Event::kSyncTick, "outcome=completed uploaded=0 downloaded=0 failed=0");
     }
   }
 
@@ -323,9 +326,9 @@ void Rotates(checks::Checks& c) {
   // line it had.
   const std::size_t before = SizeOf(path);
   {
-    log::FileSink restarted(path, kCap);
+    rlog::FileSink restarted(path, kCap);
     Installed installed(&restarted);
-    log::Info(log::Event::kBoot, "rommsync-nx/0.1.0");
+    rlog::Info(rlog::Event::kBoot, "rommsync-nx/0.1.0");
   }
   c.Expect(SizeOf(path) > before || SizeOf(previous) > 0,
            "a second sink continues the file rather than truncating it");
@@ -336,11 +339,11 @@ void Rotates(checks::Checks& c) {
   // A missing directory is a dropped line and not a crash: a card that will not
   // take the log must never be a client that stops syncing.
   {
-    log::FileSink nowhere(directory + "/does/not/exist/rommsync.log");
+    rlog::FileSink nowhere(directory + "/does/not/exist/rommsync.log");
     Installed installed(&nowhere);
-    log::Error(log::Event::kSaveFailed, "a line with nowhere to go");
-    std::vector<log::Line> tail;
-    log::Tail(4, &tail);
+    rlog::Error(rlog::Event::kSaveFailed, "a line with nowhere to go");
+    std::vector<rlog::Line> tail;
+    rlog::Tail(4, &tail);
     c.ExpectEq(tail.size(), std::size_t{1},
                "a sink that cannot open its file drops the line and keeps the tail");
   }
@@ -352,76 +355,76 @@ void TailRing(checks::Checks& c) {
   Recorder recorder;
   Installed installed(&recorder);
 
-  std::vector<log::Line> tail;
-  c.ExpectEq(log::Tail(8, &tail), std::uint64_t{0}, "a fresh log has written nothing");
+  std::vector<rlog::Line> tail;
+  c.ExpectEq(rlog::Tail(8, &tail), std::uint64_t{0}, "a fresh log has written nothing");
   c.Expect(tail.empty(), "and has no tail");
 
-  for (std::size_t line = 0; line < log::kTailLines + 10; ++line) {
-    log::Info(log::Event::kSyncTick, "tick " + std::to_string(line));
+  for (std::size_t line = 0; line < rlog::kTailLines + 10; ++line) {
+    rlog::Info(rlog::Event::kSyncTick, "tick " + std::to_string(line));
   }
 
-  const std::uint64_t total = log::Tail(log::kTailLines * 4, &tail);
-  c.ExpectEq(total, static_cast<std::uint64_t>(log::kTailLines + 10),
+  const std::uint64_t total = rlog::Tail(rlog::kTailLines * 4, &tail);
+  c.ExpectEq(total, static_cast<std::uint64_t>(rlog::kTailLines + 10),
              "the total counts every line ever written, not the ones kept");
-  c.ExpectEq(tail.size(), log::kTailLines, "the ring is bounded at kTailLines");
+  c.ExpectEq(tail.size(), rlog::kTailLines, "the ring is bounded at kTailLines");
   c.Expect(tail.front().ordinal < tail.back().ordinal, "oldest first");
   c.ExpectEq(tail.back().ordinal, total, "and the last line is the newest");
   c.Expect(tail.front().text.find("tick 10") != std::string::npos,
            "what fell off the front is the oldest: " + tail.front().text);
 
-  log::Tail(3, &tail);
+  rlog::Tail(3, &tail);
   c.ExpectEq(tail.size(), std::size_t{3}, "a smaller request is a smaller answer");
   c.ExpectEq(tail.back().ordinal, total, "still ending at the newest line");
 
   // The whole reason the ring is the log's own memory rather than a sink's: the
   // overlay has to be able to show why a sync did not happen on a console whose
   // SD card would not take the log file (`ipc.hpp`).
-  log::SetSink(nullptr);
-  log::Info(log::Event::kNoServer, "no server set");
-  log::Tail(1, &tail);
+  rlog::SetSink(nullptr);
+  rlog::Info(rlog::Event::kNoServer, "no server set");
+  rlog::Tail(1, &tail);
   c.ExpectEq(tail.size(), std::size_t{1}, "the tail is answered with no sink installed at all");
   c.Expect(tail.back().text.find("config.no_server") != std::string::npos,
            "and holds the line: " + tail.back().text);
 }
 
 void SinkInstall(checks::Checks& c) {
-  log::Reset();
-  log::SetSink(nullptr);
-  c.Expect(log::GetSink() == nullptr, "the default sink is null");
-  log::Info(log::Event::kBoot, "nothing is listening");  // must not crash
+  rlog::Reset();
+  rlog::SetSink(nullptr);
+  c.Expect(rlog::GetSink() == nullptr, "the default sink is null");
+  rlog::Info(rlog::Event::kBoot, "nothing is listening");  // must not crash
 
   Recorder recorder;
   {
     Installed installed(&recorder);
-    c.Expect(log::GetSink() == &recorder, "an installed sink is the one that is asked");
-    log::Info(log::Event::kBoot, "listening");
+    c.Expect(rlog::GetSink() == &recorder, "an installed sink is the one that is asked");
+    rlog::Info(rlog::Event::kBoot, "listening");
   }
-  c.Expect(log::GetSink() == nullptr, "and taking it out again puts back what was there");
-  log::Info(log::Event::kBoot, "nobody is listening again");
+  c.Expect(rlog::GetSink() == nullptr, "and taking it out again puts back what was there");
+  rlog::Info(rlog::Event::kBoot, "nobody is listening again");
   c.ExpectEq(recorder.lines.size(), std::size_t{1},
              "a sink sees exactly the lines written while it was installed");
 }
 
 void Events(checks::Checks& c) {
-  c.Expect(log::kAllEvents.size() >= 12,
+  c.Expect(rlog::kAllEvents.size() >= 12,
            "every failure mode docs/TROUBLESHOOTING.md documents has a tag");
 
   // Two events with the same tag would make the guide's sections ambiguous and
   // `IsEvent` answer the wrong one.
-  for (std::size_t at = 0; at < log::kAllEvents.size(); ++at) {
-    const std::string tag = log::ToString(log::kAllEvents[at]);
+  for (std::size_t at = 0; at < rlog::kAllEvents.size(); ++at) {
+    const std::string tag = rlog::ToString(rlog::kAllEvents[at]);
     c.Expect(!tag.empty() && tag != "unknown", "every event has a tag: " + tag);
     c.Expect(tag.find(' ') == std::string::npos,
              "and no spaces in it -- the tag is the third field of a line: " + tag);
-    for (std::size_t other = at + 1; other < log::kAllEvents.size(); ++other) {
-      c.Expect(tag != log::ToString(log::kAllEvents[other]), "and it is unique: " + tag);
+    for (std::size_t other = at + 1; other < rlog::kAllEvents.size(); ++other) {
+      c.Expect(tag != rlog::ToString(rlog::kAllEvents[other]), "and it is unique: " + tag);
     }
-    log::Event round_tripped = log::Event::kBoot;
-    c.Expect(log::IsEvent(tag, &round_tripped) && round_tripped == log::kAllEvents[at],
+    rlog::Event round_tripped = rlog::Event::kBoot;
+    c.Expect(rlog::IsEvent(tag, &round_tripped) && round_tripped == rlog::kAllEvents[at],
              "IsEvent round-trips it: " + tag);
   }
-  c.Expect(!log::IsEvent("net.nonsense"), "and refuses a tag this build does not write");
-  c.Expect(!log::IsEvent(""), "and an empty one");
+  c.Expect(!rlog::IsEvent("net.nonsense"), "and refuses a tag this build does not write");
+  c.Expect(!rlog::IsEvent(""), "and an empty one");
 }
 
 }  // namespace

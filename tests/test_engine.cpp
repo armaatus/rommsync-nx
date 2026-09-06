@@ -73,7 +73,10 @@ namespace download = rommsync::download;
 namespace fs = rommsync::fs;
 namespace http = rommsync::http;
 namespace ipc = rommsync::ipc;
-namespace log = rommsync::log;
+// Aliased `rlog` and not `log`: at global scope that name is already taken by
+// `::log`, the C library's logarithm, and GCC refuses a namespace alias that
+// redeclares it (clang accepts it, which is how this reached CI once).
+namespace rlog = rommsync::log;
 namespace sysmodule = rommsync::sysmodule;
 
 namespace {

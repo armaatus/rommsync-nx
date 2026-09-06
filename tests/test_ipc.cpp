@@ -45,7 +45,10 @@ namespace config = rommsync::config;
 namespace http = rommsync::http;
 namespace conflicts = rommsync::conflicts;
 namespace ipc = rommsync::ipc;
-namespace log = rommsync::log;
+// Aliased `rlog` and not `log`: at global scope that name is already taken by
+// `::log`, the C library's logarithm, and GCC refuses a namespace alias that
+// redeclares it (clang accepts it, which is how this reached CI once).
+namespace rlog = rommsync::log;
 namespace json = rommsync::json;
 namespace sync = rommsync::sync;
 
@@ -648,8 +651,8 @@ int RoundTrip() {
     {
       FakeEngine quiet;
       ipc::ServiceCore core(quiet);
-      log::Reset();
-      log::Info(log::Event::kBoot, "something happened");
+      rlog::Reset();
+      rlog::Info(rlog::Event::kBoot, "something happened");
       const ipc::LogTail none = core.GetLog(0);
       checks.Expect(none.lines.empty(), "a request for no lines answers no lines");
       checks.ExpectEq(none.total, std::int64_t{1}, "and still says how many there are");
@@ -665,7 +668,7 @@ int RoundTrip() {
     // The bound the decoder enforces is the log's own: a line longer than
     // `log::kMaxLineBytes` did not come from this client's log.
     ipc::LogTail overlong;
-    overlong.lines = {std::string(log::kMaxLineBytes + 1, 'x')};
+    overlong.lines = {std::string(rlog::kMaxLineBytes + 1, 'x')};
     checks.Expect(!ipc::DecodeLogTail(ipc::EncodeLogTail(overlong)).ok(),
                   "a line longer than the log ever writes is refused");
 
@@ -681,7 +684,7 @@ int RoundTrip() {
     // hostilely is a shorter tail rather than a `kTooLarge`.
     ipc::LogTail plain;
     std::size_t ordinary = 0;
-    while (ipc::AppendIfItFits(&plain, std::string(log::kMaxLineBytes, 'y'))) {
+    while (ipc::AppendIfItFits(&plain, std::string(rlog::kMaxLineBytes, 'y'))) {
       ++ordinary;
     }
     checks.ExpectEq(ordinary, static_cast<std::size_t>(ipc::kMaxLogLines),
@@ -690,7 +693,7 @@ int RoundTrip() {
 
     ipc::LogTail hostile;
     std::size_t escaped = 0;
-    while (ipc::AppendIfItFits(&hostile, std::string(log::kMaxLineBytes, '"'))) {
+    while (ipc::AppendIfItFits(&hostile, std::string(rlog::kMaxLineBytes, '"'))) {
       ++escaped;
     }
     checks.Expect(escaped > 0, "at least one line of escapes fits");
@@ -986,16 +989,16 @@ int Secrets() {
   // payload. `log::Write` redacts before any sink or tail sees a byte, and this
   // is that guarantee asserted at the boundary rather than only in `log.redacts`
   // -- so the loop below is checking a tail that really was handed both secrets.
-  log::Reset();
-  log::Error(log::Event::kAuthRejected, "Authorization: Bearer " + token);
-  log::Info(log::Event::kBoot, "device_code=" + device_code);
+  rlog::Reset();
+  rlog::Error(rlog::Event::kAuthRejected, "Authorization: Bearer " + token);
+  rlog::Info(rlog::Event::kBoot, "device_code=" + device_code);
   // And the one thing the log *is* allowed to carry, put there deliberately so
   // the sweep below has to make the exception rather than pass by accident. It
   // is `auth::DescribeStoredToken`'s own shape: #38's scope asks for exactly
   // this line in a bug report -- which server, which device, which scopes, never
   // the token -- and a configured origin carries no credential because
   // `NormalizeServerUrl` refuses `user:password@` outright.
-  log::Info(log::Event::kStoredToken, "server=" + url + " device=abc scopes=[roms.read]");
+  rlog::Info(rlog::Event::kStoredToken, "server=" + url + " device=abc scopes=[roms.read]");
   checks.ExpectEq(core.GetLog(ipc::kMaxLogLines).lines.size(), std::size_t{3},
                   "the tail the secrets sweep is about to read holds all three lines");
   checks.ExpectEq(calls.size(), std::size(ipc::kAllCommands),
