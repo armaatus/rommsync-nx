@@ -137,6 +137,24 @@ jobs:
             not seen the conversation which produced the diff. Do not repeat what
             is already listed there unless you think the fix was wrong.
 
+            SUBMITTING IS THE JOB. A review that reads the diff, forms a
+            verdict and then ends without running `gh pr review` has done
+            nothing at all: the verdict lives only in this log, `merge-gate`
+            still sees no review on the head, and the worktree on the other side
+            waits for something that is never coming. That has happened, at 35
+            turns and real money per run, and it is the single worst outcome
+            here -- worse than a thin review, worse than a missed finding.
+
+            So: budget for it. Decide your verdict while you still have turns
+            left, submit it, and only then keep looking if you want to. If you
+            are running low on turns, submit what you have.
+
+            If an inline comment will not post -- a permission, a line the API
+            rejects -- do NOT let that stop the review. Put the finding in the
+            review body instead, say there that it was meant to be inline, and
+            submit. A finding in the body is worth less than a thread; a finding
+            in a log that nobody reads is worth nothing.
+
             Submit a REVIEW, not a comment, because the verdict has to live in
             the PR's own state where the worktree can read it back:
 
@@ -182,6 +200,55 @@ jobs:
             what it does is tell the worktree that produced this PR that there is
             work to do, and it clears when the author pushes fixes and
             re-requests review.
+
+      # Silence is the failure mode here, and it is invisible: the action can
+      # burn 35 turns and real money, decide a verdict, and end without ever
+      # running `gh pr review` -- `is_error: false`, job green, nothing on the
+      # PR. `merge-gate` then blocks on a review that never arrives, and the
+      # watcher on the other side re-fires the event forever.
+      #
+      # This does not fail the job (a broken review must not hold up a PR) and
+      # it deliberately does NOT submit a review of its own: an auto-generated
+      # "no verdict" review would satisfy merge-gate's requirement for an
+      # independent review while carrying no judgement at all, which is worse
+      # than the silence. It leaves a plain comment -- visible to a person, and
+      # not something the gate will ever mistake for a review.
+      - name: say so if no verdict was submitted
+        # `!cancelled()` rather than a bare condition: a step `if` with no status
+        # function gets an implicit `success()`, so this would be SKIPPED exactly
+        # when the review action FAILED -- the case where the silence is loudest
+        # and least visible. Found in review of this PR.
+        if: ${{ !cancelled() && steps.token.outputs.have_token == 'true' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number || inputs.pr }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -uo pipefail
+          [ -n "${PR:-}" ] || exit 0
+          sha="${HEAD_SHA:-$(gh pr view "$PR" --json headRefOid --jq .headRefOid)}"
+          n="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" \
+                 --jq "[.[] | select(.commit_id == \"$sha\")] | length" 2>/dev/null || echo 0)"
+          if [ "${n:-0}" -gt 0 ]; then
+            echo "review(s) on ${sha:0:8}: $n"
+            exit 0
+          fi
+          echo "::warning title=No verdict::The reviewer ran but submitted no review on ${sha:0:8}."
+          marker="<!-- review-produced-no-verdict ${sha} -->"
+          if gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --jq '.[].body' 2>/dev/null \
+               | grep -qF "$marker"; then
+            exit 0
+          fi
+          body="$(mktemp)"
+          {
+            printf '%s\n\n' "$marker"
+            printf "The review job ran to completion on \`%s\` and submitted **no review**, so there is no verdict for \`merge-gate\` to read and nothing for the author to resolve. The job is green because a broken review must never hold up a PR -- this comment is the visible half of that silence.\n\n" "${sha:0:8}"
+            printf 'This is a comment and not a review on purpose: an auto-generated verdict would satisfy the gate requirement for an independent review while carrying no judgement, which is worse than saying nothing.\n\n'
+            printf "Push a change, or re-run \`claude review\` for this PR, to ask for another one.\n"
+          } >"$body"
+          gh pr comment "$PR" --body-file "$body" >/dev/null 2>&1 || true
+          rm -f "$body"
 
   mention:
     name: respond to @claude
