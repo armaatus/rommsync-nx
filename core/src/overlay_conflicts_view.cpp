@@ -374,13 +374,25 @@ void ConflictsModel::MoveSelection(int delta) {
   const int last = static_cast<int>(rows_.size()) - 1;
   const int before = selected_;
   selected_ = std::clamp(selected_ + delta, 0, last);
-  if (selected_ != before) {
-    // **Scrolling is the retry.** A page that failed part way down a list left
-    // `page_error_` set, and `Next()` gates every later fetch on it, so without
-    // this the rest of the history is unreachable for the life of the screen.
-    // A on a loaded list opens the row under it, so it cannot also be the retry;
-    // moving toward the missing rows is the gesture that already means "I want
-    // more of these".
+
+  // **Scrolling is the retry.** A page that failed part way down a list left
+  // `page_error_` set, and `Next()` gates every later fetch on it, so without
+  // this the rest of the history is unreachable for the life of the screen. A on
+  // a loaded list opens the row under it, so it cannot also be the retry; moving
+  // toward the missing rows is the gesture that already means "I want more of
+  // these".
+  //
+  // **A press toward the end counts even when the selection does not move**, and
+  // that is the whole of it: the fetch that can fail is only ever issued within
+  // `kConflictPrefetchRows` of the last loaded row, so by the time the failure
+  // lands the user is usually already at the bottom, where `std::clamp` pins the
+  // index. Retrying only on a *changed* index would leave every further Down
+  // press inert at exactly the position the hint tells them to press it, and
+  // recovery would need an undocumented Up-then-Down.
+  //
+  // It is one retry per press and not one per frame: `MoveSelection` is called
+  // from `handleInput` on a key event, never from `update()`.
+  if (selected_ != before || delta > 0) {
     page_error_ = ipc::Error::kOk;
   }
 }

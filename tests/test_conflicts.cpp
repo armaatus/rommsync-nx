@@ -1087,9 +1087,29 @@ void Overlay(checks::Checks& c) {
     c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
              "nothing is asked for while the failure stands");
 
+    // **At the bottom, where the failure actually lands.** The fetch that can
+    // fail is only issued within `kConflictPrefetchRows` of the last loaded row,
+    // so the selection is pinned by `clamp` when the refusal arrives. A retry
+    // that needed the index to *change* would leave every further Down press
+    // inert exactly where the hint says to press it.
+    c.ExpectEq(model.Render().selected, ipc::kMaxConflictPage - 1,
+               "the selection is at the last loaded row, where clamp pins it");
+    model.MoveSelection(1);
+    c.ExpectEq(model.Render().selected, ipc::kMaxConflictPage - 1, "...and does not move");
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kListConflicts,
+             "but the press is still the retry: a pinned selection is the common case, "
+             "not the exception");
+
+    // ...and one retry per press rather than one per frame: nothing asks again
+    // until the user presses again.
+    model.OnRefused(ipc::Error::kInternal);
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
+             "a second refusal stops the asking until the next press");
+
     model.MoveSelection(-1);
     c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kListConflicts,
-             "and scrolling is the retry: the rest of the history is reachable again");
+             "and scrolling the other way is a retry too: the rest of the history is "
+             "reachable again");
   }
 
   // A restore of an entry **below the first page** keeps the detail and its
