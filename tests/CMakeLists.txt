@@ -1465,6 +1465,68 @@ add_test(NAME release.history
          COMMAND "${BASH_PROGRAM}" "${RELEASE_TEST}" history)
 set_tests_properties(release.history PROPERTIES TIMEOUT 120)
 
+# --- M8-1: the v1 gate itself -------------------------------------------------
+# scripts/v1-gate.sh owns the eight rows of the gate that stands between this
+# repository and a console (#43). These entries check its MACHINERY -- that
+# every row still points at a CTest group somebody registers, that the
+# save-overwrite census still matches core/, that a skipped test still holds its
+# row instead of passing it, and that docs/TESTING.md publishes the same eight
+# rows the script evaluates.
+#
+# They deliberately do NOT report the verdict. `ctest` going green must never be
+# readable as "the v1 gate passed", because it has not: two of its rows have
+# never been executed anywhere and one of them cannot be, here. The verdict is
+# what `scripts/v1-gate.sh` exits with, and today that is 3.
+#
+# None of these needs Docker, a network or a console. `audit`, `rows`,
+# `evidence` and `release` read the registered test names out of this build
+# directory, so they are handed it rather than guessing at one.
+set(GATE_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_v1_gate.sh")
+
+# The entry that goes red the day a CTest group is renamed out from under a gate
+# row -- which is how a gate rots: not by being wrong, by being about nothing.
+add_test(NAME gate.audit
+         COMMAND "${BASH_PROGRAM}" "${GATE_TEST}" audit "${CMAKE_BINARY_DIR}")
+set_tests_properties(gate.audit PROPERTIES TIMEOUT 60)
+
+# ...and that the audit can fail: a row naming a group nobody registers, a suite
+# row naming nothing, a fourth kind invented to slip past the checks, a console
+# row that does not say what would settle it.
+add_test(NAME gate.rows
+         COMMAND "${BASH_PROGRAM}" "${GATE_TEST}" rows "${CMAKE_BINARY_DIR}")
+set_tests_properties(gate.rows PROPERTIES TIMEOUT 120)
+
+# The save-overwrite census, which is the word "every" in hard rule 2's gate row.
+# The tests prove that each save path backs up first; this proves the set of them
+# is still the set somebody classified -- against copies of the tree with a
+# commit site added, one hidden behind a slash, one hidden in a block comment,
+# and a real BackUpFirst call deleted from each of the three paths that land on a
+# save. It deliberately names no count: the count moved the day M7-1 (#131)
+# landed a third, and a comment carrying one goes stale without failing.
+add_test(NAME gate.sites
+         COMMAND "${BASH_PROGRAM}" "${GATE_TEST}" sites "${CMAKE_BINARY_DIR}")
+set_tests_properties(gate.sites PROPERTIES TIMEOUT 120)
+
+# What counts as evidence, driven by recorded ctest output rather than by a run:
+# all-green passes, a failure fails its row, and -- the one this is for -- a
+# SKIPPED test does not pass one. rig.smoke skips whenever RomM is down and most
+# of this gate is written against RomM.
+add_test(NAME gate.evidence
+         COMMAND "${BASH_PROGRAM}" "${GATE_TEST}" evidence "${CMAKE_BINARY_DIR}")
+set_tests_properties(gate.evidence PROPERTIES TIMEOUT 120)
+
+# The release row, against throwaway repositories with real tags and a stubbed
+# `gh`. This repository has no tags, so every branch except "no tag at all" is
+# unreachable from the checkout -- including the one that actually ships.
+add_test(NAME gate.release
+         COMMAND "${BASH_PROGRAM}" "${GATE_TEST}" release "${CMAKE_BINARY_DIR}")
+set_tests_properties(gate.release PROPERTIES TIMEOUT 120)
+
+# Two copies of eight rows drift. docs/TESTING.md publishes the table; the script
+# owns it; this is what stops them disagreeing.
+add_test(NAME gate.doc COMMAND "${BASH_PROGRAM}" "${GATE_TEST}" doc)
+set_tests_properties(gate.doc PROPERTIES TIMEOUT 60)
+
 # --- the TLS terminator the M0-1 probe aims at -------------------------------
 # The rig is plain HTTP because the host suite reaches it over loopback; the
 # probe needs a real handshake to complete, so server/testing/docker-compose.yml

@@ -171,12 +171,21 @@ M0-5's wording that belong to the milestone writing that engine.
 ## M8 — Hardware bring-up (after proven v1)
 
 First contact with a real modded Switch. **Gated:** nothing here starts until the
-v1 gate passes. Everything below the thin Horizon glue has already been proven on
-host + docker RomM + Ryujinx.
+v1 gate passes — `./scripts/v1-gate.sh` is that gate, and it exits non-zero.
+Everything below the thin Horizon glue has already been proven on host + docker
+RomM. **Not on Ryujinx:** that rung turned out not to be available here at all
+(it needs `prod.keys` and a firmware dump, which hard rule 1 forbids), and it
+could not have settled the certificate half anyway
+([DEVELOPMENT.md](docs/DEVELOPMENT.md#m0-1-the-measurement-and-the-decision)).
 
-- **M8-1** `risk` **v1 gate — do not touch hardware until this passes.** Checklist:
-  sync/downloads/auth/config+IPC all green on host + docker; `ssl` backend proven
-  in Ryujinx NRO; backups verified by tests; tagged v1 build; NAND/SD backup ready.
+- **M8-1** `risk` **v1 gate — do not touch hardware until this passes.** Eight
+  rows: sync/downloads/auth/config+IPC all green on host + docker; `ssl` backend
+  proven on an NRO; every save-overwrite path backing up first; a tagged v1
+  build; a NAND/SD backup ready. They live in
+  [`scripts/v1-gate.sh`](scripts/v1-gate.sh), which evaluates the six a laptop
+  can decide and says precisely what the other two are waiting for — the gate is
+  a command with an exit code, not a checklist somebody reads. Published as a
+  table in [TESTING.md](docs/TESTING.md#rung-3--the-v1-gate-and-real-hardware-m8).
 - **M8-2** `sysmodule` `risk` **First real-console smoke test** on a backup
   SD/emuMMC: manually-launched NRO first, then sysmodule installed **disabled**,
   first sync against a **disposable** collection with `.backup/` populated. Never
