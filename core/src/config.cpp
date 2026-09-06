@@ -2,7 +2,7 @@
 
 #include "rommsync/atomic_file.hpp"
 
-#include "config_text.hpp"
+#include "rommsync/config_text.hpp"
 
 #include <cstddef>
 #include <iterator>

@@ -175,8 +175,13 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
   // The token goes **before** the write, deliberately. The other order leaves a
   // moment where the card names the new server and still holds the old
   // credential, and a discard that failed there would leave it there for good.
-  const bool server_changed = config::ParseConfig(written).value.server.url !=
-                              config::ParseConfig(current).value.server.url;
+  //
+  // Parsed once and kept: this is also the configuration adopted at the end, so
+  // the alternative is parsing the same few hundred bytes twice on a command a
+  // user pressed by hand.
+  config::LoadResult parsed = config::ParseConfig(written);
+  const bool server_changed =
+      parsed.value.server.url != config::ParseConfig(current).value.server.url;
   if (server_changed && !auth::DiscardToken(PathTo(auth::kTokenFileName))) {
     diagnostics->push_back({config::Severity::kError, 0, "server", "url",
                             "the pairing for the previous server could not be discarded, so the "
@@ -208,10 +213,9 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
                             "pair again from the overlay"});
   }
 
-  // Parsed rather than kept, so the configuration in force is one `ParseConfig`
-  // produced and nothing in this process is a `Config` assembled by hand -- and
-  // parsed from `written` rather than re-read off the card, which is the
-  // difference that matters. `WriteAtomically` has just succeeded, so `written`
+  // The parse above rather than a re-read off the card, and that is the
+  // difference that matters: the configuration in force is one `ParseConfig`
+  // produced, so nothing in this process is a `Config` assembled by hand. `WriteAtomically` has just succeeded, so `written`
   // *is* what the card holds; a re-read that failed for a moment would hand back
   // `LoadConfig`'s built-in defaults, and adopting those would throw away a
   // configuration this process knows to be correct in favour of a worse one. At
@@ -219,7 +223,7 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
   //
   // This is what makes the change take effect with no reboot: `GetStatus` and
   // `GetConfig` read `config_`, and it is now the new one.
-  AdoptConfig(config::ParseConfig(written));
+  AdoptConfig(std::move(parsed));
   return ipc::Error::kOk;
 }
 

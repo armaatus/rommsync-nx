@@ -22,7 +22,7 @@
 #include <utility>
 #include <vector>
 
-#include "config_text.hpp"
+#include "rommsync/config_text.hpp"
 
 namespace rommsync::config {
 namespace {

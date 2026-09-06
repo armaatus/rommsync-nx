@@ -6,8 +6,12 @@
 // read back under another is a `config.ini` that silently means something else
 // -- a folder called `disc#2` surviving one and not the other, say.
 //
-// Private to `core/src`: nothing outside the config module needs them, and
-// `config.hpp` is the module's public face.
+// Internal to the config module: nothing outside it needs these, and
+// `config.hpp` is what the module is used through. It lives here rather than
+// beside the two `.cpp` files that include it because `core/` includes only
+// standard headers and `rommsync/` ones -- the rule `core/AGENTS.md` states and
+// the `static` CI job greps for -- so a private header under `core/src` is not
+// a shape this project has.
 #pragma once
 
 #include <cstddef>
