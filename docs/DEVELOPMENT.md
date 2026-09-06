@@ -353,6 +353,7 @@ progress rides on the `queue` list kind (M5-4).
 | `sysmodule/source/engine.*` | the `ipc::Engine` `ServiceCore` reads the console out of, as far as it is built. Names no libnx type, so the host build compiles it too and `engine.*` drives it against a directory (`tests/test_engine.cpp`) |
 | `overlay/source/ipc_client.*` | `smGetService("rommsync")` and the *same* codecs |
 | `core/include/rommsync/overlay_status_view.hpp` | what the status screen *says*, decided off the framebuffer (`overlay.status`) |
+| `core/include/rommsync/overlay_pairing_view.hpp` | the same for the pairing screen: the code, the address, the countdown, and which of four sentences a dead pairing gets (`overlay.pairing`) |
 
 `core/` may not name a libnx type (hard rule 4), so the errors are a portable
 `ipc::Error` and the sysmodule maps them to a Horizon `Result` at the boundary.

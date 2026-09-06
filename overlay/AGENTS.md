@@ -24,6 +24,11 @@ Ultrahand overlay list.
 - Flat files in `core/src/` only. CMake globs recursively; `switch.mk` uses a
   non-recursive wildcard, so a `core/src/overlay/` would build on the host and
   silently vanish from the Switch build.
+- Flat files in `source/` too, and no basename this target already compiles.
+  Objects are named after the source basename, so a `source/screens/pairing.cpp`
+  would collide with the `core/src/pairing.cpp` linked in beside it —
+  `switch.mk` stops the build rather than letting VPATH pick a winner. Screens
+  are `<thing>_screen.*`, which keeps them clear of `core/src/`.
 - All IPC goes through `source/ipc_client.*`. A screen never builds a payload
   itself; if a screen needs something the client cannot answer, the command
   belongs in `docs/DEVELOPMENT.md#ipc` and in `rommsync/ipc.hpp` first.

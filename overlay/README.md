@@ -46,14 +46,23 @@ source/
   main.cpp            # the tsl::Overlay, and the one IPC session every screen shares
   ipc_client.*        # the only place this directory talks to sys-rommsync
   status_screen.*     # the status screen's drawing; its decisions are in core/
+  pairing_screen.*    # the pairing screen's drawing; likewise
 ```
 
+Screen files are flat here, and their basenames may not collide with anything in
+`core/src/` — `switch.mk` names objects after the source basename and errors out
+on a duplicate, so a `source/screens/pairing.cpp` would clash with the
+`core/src/pairing.cpp` this target already compiles. That is why the screen is
+`pairing_screen.*` rather than `screens/pairing.*`.
+
 The half of a screen that is a *decision* rather than a draw call lives in
-`core/include/rommsync/overlay_status_view.hpp` — which sentence an unpaired
+`core/include/rommsync/overlay_status_view.hpp` and
+`core/include/rommsync/overlay_pairing_view.hpp` — which sentence an unpaired
 console gets, what a download with no declared length shows instead of a
 percentage, what goes where a timestamp would go on a console that has never
-synced. That is deliberate: it is the half a host test can reach, and
-`ctest -R overlay.status` is what holds it. Model toggling + IPC on
+synced, and which of four sentences a dead pairing gets. That is deliberate: it
+is the half a host test can reach, and `ctest -R overlay.status` and
+`ctest -R overlay.pairing` are what hold it. Model toggling + IPC on
 [ovl-sysmodules](https://github.com/ppkantorski/ovl-sysmodules).
 
 ## Manual verification (M8-2)
@@ -83,12 +92,30 @@ production RomM or a real library.
 6. **Legibility.** Read the panel at arm's length in handheld and docked. Every
    row's value is on screen and none is clipped by the value column.
 
+7. **Pairing.** From the settings screen, choose *Re-pair*. Expect
+   *"Contacting the server"* first — never *"Not paired"* — then the eight
+   characters and the address, with a countdown that moves. Read the code back
+   at arm's length: it is the one string on any of these screens a person has to
+   copy by hand. Approve it in the browser and expect *"Paired"*; let one
+   expire and expect *"The code expired"*, not *"Pairing failed"*.
+
 Record what each step actually drew in #44, including the layout constants that
-had to move — `status_screen.cpp` keeps them in one block for exactly that.
+had to move — `status_screen.cpp` and `pairing_screen.cpp` each keep them in one
+block for exactly that.
 
 ## Where the work is
 
-**M4-2..M4-5** — the library/queue, sync and settings screens, built on the
-frame M4-1 landed. See milestone M4 in [`../ISSUES.md`](../ISSUES.md).
+**M4-2..M4-4** — the library/queue, sync and settings screens, built on the
+frame M4-1 landed. The pairing screen (M4-5) is built and **nothing pushes it
+yet**: *Re-pair* on the settings screen (M4-4, #26) is the one place it is
+reached from, so until that lands it compiles and `--gc-sections` drops it from
+the image. See milestone M4 in [`../ISSUES.md`](../ISSUES.md).
+
+The palette (`ColorFor`), the `GetInterfaceVersion` handshake and the
+drop-and-reopen that decides *not running* from *unreachable* are now written
+out in both `status_screen.cpp` and `pairing_screen.cpp`. The third screen is
+the one that should lift them into a shared `overlay/source/screen_frame.*`
+rather than typing them a third time; doing it now, while three M4 screens are
+in flight in parallel worktrees, would be a merge conflict bought for nothing.
 
 [libultrahand]: https://github.com/ppkantorski/libultrahand
