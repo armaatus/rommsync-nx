@@ -288,6 +288,18 @@ if [ -f "$review_wf" ]; then
   ok "the no-verdict notice is a comment, never a review"
 fi
 
+# A cancelled run is not a green run. `cancel-in-progress` is right on a branch,
+# where only the newest push matters, and wrong on main, where every commit is
+# one somebody has to be able to trust: two merges close together cancelled the
+# earlier commit's build outright, and nothing re-ran it. #105 and #102 merged
+# seconds apart and #105's main build died mid-flight.
+if [ -f .github/workflows/ci.yml ]; then
+  if grep -qE "^[[:space:]]*cancel-in-progress:[[:space:]]*true[[:space:]]*$" .github/workflows/ci.yml; then
+    fail "ci.yml cancels in progress unconditionally, so a merge can cancel main's own build and that commit is never verified"
+  fi
+  ok "main's builds are never cancelled by the next merge"
+fi
+
 echo "== the merge gate"
 # The one required check `gh pr merge --auto` waits on. Its decision lives in a
 # script rather than in the YAML precisely so it can be tested without a pull
