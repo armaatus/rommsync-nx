@@ -93,12 +93,21 @@ Client-token pairing (alternative / management) also exists:
 ```
 me.read roms.read roms.user.read roms.user.write
 assets.read assets.write devices.read devices.write collections.read
+platforms.read
 me.write            # only if recording play sessions
 ```
 
 This block is not prose: the `auth.scopes` test parses it and compares it to
 `MinimumScopes()`, so editing one without the other goes red. Anything qualified
 with a `#` comment is documented and *not* requested.
+
+`platforms.read` is the one that is not obvious, and it was found by being
+refused. `GET /api/platforms` declares it in 5.2.0's OpenAPI and answers
+`403 {"detail":"Forbidden"}` to a token granted every other scope on this list —
+so the overlay's library browser (M4-3, #25) could not have listed a single
+platform without it. Nothing else on this API can stand in: `GET /api/roms`
+carries a `filter_values.platforms`, and it holds bare ids with no slug, no name
+and no rom count.
 
 All authed requests send `Authorization: Bearer <token>`.
 
@@ -633,10 +642,22 @@ than as a revocation.
 | GET | `/api/roms/{id}/files/content/{file_name}` | download one file — `{id}` is the **RomFile** id, not the rom's |
 | GET | `/api/collections` | user collections (curate a "Switch" collection to mirror) |
 | HEAD | `/api/roms/{id}/content/{file_name}` | size / resume checks |
+| GET | `/api/platforms` | **unpaged bare array** of `PlatformSchema`; needs `platforms.read` |
 
 `GET /api/roms` returns an envelope, not a bare array
 (`captures/roms-list.json`): `{items, total, limit, offset, char_index,
 rom_id_index, filter_values}`.
+
+`GET /api/platforms` is the opposite shape and the one exception on this API:
+**no envelope, no `limit`, no `offset`** — 5.2.0 answers the whole list as a bare
+array of `PlatformSchema` (`captures/platforms-list.json`). A client that wants
+platforms a page at a time therefore has to page them on its own side, which is
+what `lists::Service` does (M5-4, #31). Key platform fields for the client:
+`id, slug, fs_slug, name, display_name, custom_name, rom_count, fs_size_bytes,
+missing_from_fs`. `display_name` is `custom_name` when the user set one and
+`name` otherwise, so it is the string to draw; `fs_slug` is what
+`config::Config::platforms` is keyed by, and `id` is what `GET /api/roms`'s
+`platform_ids` takes.
 
 Key rom fields for the client: `id, platform_fs_slug, platform_slug,
 platform_display_name, fs_name, fs_name_no_ext, fs_name_no_tags, fs_extension,

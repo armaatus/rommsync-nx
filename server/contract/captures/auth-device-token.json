@@ -1,6 +1,6 @@
 {
   "access_token": "<access_token>",
-  "device_id": "9fdce844-779b-4216-a6e2-597a2f3e7027",
+  "device_id": "b4ee319c-aea5-43ff-a0b3-a0ae994aa8a7",
   "scopes": [
     "assets.read",
     "assets.write",
@@ -8,6 +8,7 @@
     "devices.read",
     "devices.write",
     "me.read",
+    "platforms.read",
     "roms.read",
     "roms.user.read",
     "roms.user.write"

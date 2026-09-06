@@ -1,15 +1,15 @@
 {
-  "session_id": 140,
+  "session_id": 4,
   "operations": [
     {
       "action": "download",
       "rom_id": 4,
-      "save_id": 57,
-      "file_name": "probe [2026-09-04_11-36-26].srm",
-      "slot": "probe-4bb29c6c-a",
+      "save_id": 1,
+      "file_name": "probe [2026-09-06_15-10-39].srm",
+      "slot": "probe-873af96c-a",
       "emulator": "probe-emulator",
       "reason": "Save exists on server but not on client",
-      "server_updated_at": "2026-09-04T11:36:26+00:00",
+      "server_updated_at": "2026-09-06T15:10:40+00:00",
       "server_content_hash": "abd8fff93894e8112c7dd17386e54a5f"
     }
   ],

@@ -76,7 +76,12 @@ auth::Parsed<sync::SyncPlan> ParseCapture(checks::Checks& c, const char* name) {
 void UploadCapture(checks::Checks& c) {
   const auth::Parsed<sync::SyncPlan> parsed = ParseCapture(c, "sync-negotiate-upload.json");
   const sync::SyncPlan& plan = parsed.value;
-  c.ExpectEq(plan.session_id, std::int64_t{138}, "session_id");
+  // A positive id rather than the one this capture happens to hold: RomM
+  // numbers sessions per server, so every re-capture of these files -- the
+  // command for which is in tests/test_contract_captures.py -- moves it, and a
+  // test pinned to the number goes red over a contract that did not change.
+  // What is a contract is that a plan always opens a session.
+  c.Expect(plan.session_id > 0, "session_id");
   c.ExpectEq(plan.total_upload, std::int64_t{1}, "total_upload");
   c.ExpectEq(plan.total_download, std::int64_t{0}, "total_download");
   c.ExpectEq(plan.total_conflict, std::int64_t{0}, "total_conflict");
@@ -93,7 +98,9 @@ void UploadCapture(checks::Checks& c) {
   c.Expect(!operation->save_id.has_value(),
            "save_id is empty for a save the server does not have -- not a zero");
   c.ExpectEq(operation->file_name, std::string("probe.srm"), "file_name");
-  c.Expect(operation->slot.has_value() && *operation->slot == "probe-4bb29c6c-a", "slot");
+  // The slot the probe sent, whose suffix is a fresh uuid per run -- so the
+  // claim is that it came back at all and came back unchanged in shape.
+  c.Expect(operation->slot.has_value() && operation->slot->rfind("probe-", 0) == 0, "slot");
   c.Expect(operation->emulator.has_value() && *operation->emulator == "probe-emulator",
            "emulator");
   c.Expect(operation->reason == sync::Reason::kClientOnly, "reason classifies");
@@ -107,7 +114,7 @@ void UploadCapture(checks::Checks& c) {
 void DownloadCapture(checks::Checks& c) {
   const auth::Parsed<sync::SyncPlan> parsed = ParseCapture(c, "sync-negotiate-download.json");
   const sync::SyncPlan& plan = parsed.value;
-  c.ExpectEq(plan.session_id, std::int64_t{140}, "session_id");
+  c.Expect(plan.session_id > 0, "session_id");
   c.ExpectEq(plan.total_download, std::int64_t{1}, "total_download");
 
   const sync::SyncOperation* operation = OnlyOperation(c, plan, "the download capture");
@@ -115,13 +122,17 @@ void DownloadCapture(checks::Checks& c) {
     return;
   }
   c.Expect(operation->action == sync::Action::kDownload, "action is download");
-  c.Expect(operation->save_id.has_value() && *operation->save_id == 57, "save_id");
-  // The server's name, datetime tag and all -- not the name the client sent.
-  c.ExpectEq(operation->file_name, std::string("probe [2026-09-04_11-36-26].srm"),
-             "file_name is the SERVER's");
+  c.Expect(operation->save_id.has_value() && *operation->save_id > 0, "save_id");
+  // The server's name, datetime tag and all -- not the name the client sent,
+  // which was `probe.srm` (the upload capture above). The tag is a per-run
+  // timestamp, so what is asserted is the difference rather than the string.
+  c.Expect(operation->file_name != "probe.srm" &&
+               operation->file_name.rfind("probe [", 0) == 0 &&
+               operation->file_name.size() > std::string("probe [].srm").size(),
+           "file_name is the SERVER's, datetime tag and all: " + operation->file_name);
   c.Expect(operation->reason == sync::Reason::kServerOnly, "reason classifies");
   c.Expect(operation->server_updated_at.has_value() &&
-               *operation->server_updated_at == "2026-09-04T11:36:26+00:00",
+               operation->server_updated_at->find("+00:00") != std::string::npos,
            "the server's timestamp comes through as text");
   // Carried, not parsed: RomM spells the offset `+00:00` where this client
   // writes `Z`, and nothing here compares the two.
@@ -177,7 +188,7 @@ void NoOpCapture(checks::Checks& c) {
 /// An empty plan is a fully-synced device, not an error.
 void EmptyCapture(checks::Checks& c) {
   const auth::Parsed<sync::SyncPlan> parsed = ParseCapture(c, "sync-negotiate-empty.json");
-  c.ExpectEq(parsed.value.session_id, std::int64_t{137}, "a session was still opened");
+  c.Expect(parsed.value.session_id > 0, "a session was still opened");
   c.Expect(parsed.value.operations.empty(), "no operations is a plan, not a failure");
   c.ExpectEq(parsed.value.total_upload + parsed.value.total_download +
                  parsed.value.total_conflict + parsed.value.total_no_op,

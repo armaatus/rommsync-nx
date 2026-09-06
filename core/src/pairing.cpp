@@ -40,7 +40,8 @@ std::vector<std::string> MinimumScopes() {
   // against the other reads straight down. `auth.scopes` checks that it is the
   // same set.
   return {"me.read",      "roms.read",    "roms.user.read",  "roms.user.write", "assets.read",
-          "assets.write", "devices.read", "devices.write",   "collections.read"};
+          "assets.write", "devices.read", "devices.write",   "collections.read",
+          "platforms.read"};
 }
 
 namespace {

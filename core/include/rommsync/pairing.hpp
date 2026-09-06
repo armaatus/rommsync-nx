@@ -44,7 +44,10 @@ inline constexpr const char* kClientPlatform = "switch";
 /// `auth.scopes` so the code and the document cannot drift. Every `.write` here
 /// is one the client actually performs: `roms.user.write` and `assets.write`
 /// are how a save gets uploaded, `devices.write` is how the console registers
-/// itself (M1-3). `me.write` is in the document and deliberately *not* here --
+/// itself (M1-3). `platforms.read` is a read this client makes for the overlay's
+/// library browser (M4-3, #25): `GET /api/platforms` declares it and answers
+/// `403` without it, so a console granted every other scope here lists no
+/// platforms at all. `me.write` is in the document and deliberately *not* here --
 /// it exists only for recording play sessions, which this client does not do,
 /// and a scope that is granted and never used is blast radius bought for
 /// nothing (docs/SECURITY.md).

@@ -377,9 +377,23 @@ A removed command leaves a hole.
 | 8 | `Unpair` | - -> - | `kWriteFailed` |
 | 9 | `Enqueue` | `rom_id` -> position | `kUnknownRom`, `kQueueFull`, `kDuplicate`, `kMultiFile` |
 | 10 | `Dequeue` | `rom_id` -> - | `kNotQueued` |
-| 11 | `ListBegin` | `ListRequest` -> cursor | `kBadCursor`, `kOffline` |
-| 12 | `ListNext` | cursor -> `ListPage` | `kBadCursor`, `kOffline` |
+| 11 | `ListBegin` | `ListRequest` -> cursor | never fails |
+| 12 | `ListNext` | cursor -> `ListPage` | `kBadCursor`, `kNotConfigured`, `kOffline`, `kInternal` |
 | 13 | `ListEnd` | cursor -> - | `kBadCursor` |
+
+`ListBegin` never fails, and that is a decision rather than an omission.
+It does not run out of cursors -- the cap is enforced by reclaiming the least
+recently touched one, because #25's browser treats a `kBadCursor` on a
+`ListNext` as "re-open and reload" while a refused `ListBegin` would leave a
+screen with nowhere to go. It also does not refuse a console with no
+`server.url` or no network: **opening a list is not reading one**, so those are
+answered by the first `ListNext` as `kNotConfigured` or `kOffline`, where the
+browser already draws a failed page with a row to press. A `ListNext` that
+could not fetch its page is `kOffline` for a request that did not complete or a
+server that refused it, and `kInternal` for a `200` whose body this client cannot
+read -- a truncated one among them. **Neither is ever a short page**, which would
+read as the end of the library. The cursor keeps its offset either way and the
+same `ListNext` can be asked again.
 
 Rows 3 and 4 answer a `WriteOutcome` inside a successful reply rather than a
 failing `Result`, and that is forced rather than chosen: a `cmif` reply's data
@@ -412,8 +426,20 @@ still being built. A command whose engine does not exist yet answers
 refusal that would send a user looking for a full queue or a failing SD card.
 Each of M3-2, M5-3, M5-4 and M7-2 removes its own use of it, and the last one to
 go is what says the engine is finished (`sysmodule/source/engine.hpp`). M3-2
-took the queue commands off that list and M5-3 took `SetConfig` and `SetEnabled`;
-what is left is `Unpair`, `StartPairing` and the three list commands.
+took the queue commands off that list, M5-3 took `SetConfig` and `SetEnabled`,
+and M5-4 took the three list commands; what is left is `StartPairing`.
+
+The list commands came off it in a way worth knowing about, because `kOffline`
+does some of the work `kUnavailable` used to. The paging engine is `core/`'s
+(`lists::Service`) and the sysmodule holds one, but **this build has no
+`http::HttpClient` for Horizon** -- M0-1 measured what TLS would cost and nothing
+implements the interface there yet. So on a console the `queue` kind, which is
+served off `queue.json` and never touches the network, works in full, while
+`platforms` and `roms` answer `kOffline`: the same sentence a console with its
+Wi-Fi off gets, which is what a build with no network amounts to.
+`SdEngine::UseServer` is the seam M7-2 fills, and the host suite passes it a
+libcurl client and the fixture token, which is what proves the paging
+(`lists.*`).
 
 `SyncNow` is the one command that cannot say it, and the reason is the seam
 rather than a choice: `ipc::Engine::RequestSync()` is a `bool`, so an engine

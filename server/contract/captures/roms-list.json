@@ -75,17 +75,17 @@
       "has_nested_single_file": false,
       "has_multiple_files": false,
       "full_path": "roms/nes/240pee.nes",
-      "created_at": "2026-09-04T10:39:15+00:00",
-      "updated_at": "2026-09-04T10:39:15+00:00",
+      "created_at": "2026-09-06T14:59:06+00:00",
+      "updated_at": "2026-09-06T14:59:06+00:00",
       "missing_from_fs": false,
       "has_notes": false,
       "rom_user": {
-        "id": 1,
-        "user_id": 1,
-        "rom_id": 4,
-        "created_at": "2026-09-04T11:05:40+00:00",
-        "updated_at": "2026-09-04T11:36:05+00:00",
-        "last_played": "2026-09-04T11:36:05+00:00",
+        "id": -1,
+        "user_id": -1,
+        "rom_id": -1,
+        "created_at": "2026-09-06T15:10:39.896969+00:00",
+        "updated_at": "2026-09-06T15:10:39.896969+00:00",
+        "last_played": null,
         "is_main_sibling": false,
         "backlogged": false,
         "now_playing": false,
@@ -102,7 +102,7 @@
       "screenshot_path": null
     }
   ],
-  "total": 6,
+  "total": 7,
   "limit": 1,
   "offset": 0,
   "char_index": {
@@ -117,6 +117,7 @@
     1,
     5,
     6,
+    7,
     3
   ],
   "filter_values": {

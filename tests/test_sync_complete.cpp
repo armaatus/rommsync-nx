@@ -303,7 +303,10 @@ void Parse(rig::Checks& checks) {
     return;
   }
   const sync::SyncSession& session = parsed.value.session;
-  checks.ExpectEq(session.id, static_cast<std::int64_t>(139), "the session id");
+  // Positive rather than the number this capture happens to hold: RomM numbers
+  // sessions per server, so a re-capture moves it and a test pinned to it goes
+  // red over a contract that did not change.
+  checks.Expect(session.id > 0, "the session id");
   checks.ExpectEq(session.status, std::string("COMPLETED"),
                   "the status is upper-case, as the server spells it");
   checks.ExpectEq(session.operations_planned, static_cast<std::int64_t>(0),

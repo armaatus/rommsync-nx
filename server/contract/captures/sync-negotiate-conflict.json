@@ -1,15 +1,15 @@
 {
-  "session_id": 141,
+  "session_id": 5,
   "operations": [
     {
       "action": "conflict",
       "rom_id": 4,
-      "save_id": 58,
-      "file_name": "probe [2026-09-04_11-36-26].srm",
-      "slot": "probe-4bb29c6c-b",
+      "save_id": 2,
+      "file_name": "probe [2026-09-06_15-10-40].srm",
+      "slot": "probe-873af96c-b",
       "emulator": "probe-emulator",
       "reason": "Both sides changed since last sync",
-      "server_updated_at": "2026-09-04T11:36:27+00:00",
+      "server_updated_at": "2026-09-06T15:10:41+00:00",
       "server_content_hash": "de4145ae0f69d760f9b57981a5e82a64"
     }
   ],

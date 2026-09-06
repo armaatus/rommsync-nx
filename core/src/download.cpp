@@ -734,6 +734,13 @@ std::string SerializeQueue(const std::vector<QueueEntry>& entries) {
 }
 
 LoadedQueue ParseQueue(std::string_view text) {
+  // Every complaint this function can produce is about contents it refused to
+  // use, so `discarded` and "there are diagnostics" are the same answer here --
+  // unlike in `LoadQueue`, where a file that was never written also has
+  // something to say. Written on each path rather than once at the end: a
+  // scope-exit helper would be setting a field on a local the return may have
+  // already been move-constructed from, since NRVO is a compiler's choice and
+  // not the standard's.
   LoadedQueue loaded;
 
   const json::ParseResult document = json::Parse(text);
@@ -742,6 +749,7 @@ LoadedQueue ParseQueue(std::string_view text) {
     // anything a corrupt card region holds.
     Add(&loaded.diagnostics, std::string(kQueueFileName) + " is not readable JSON (" +
                                  document.error.Describe() + "); the queue is discarded");
+    loaded.discarded = true;
     return loaded;
   }
 
@@ -753,12 +761,14 @@ LoadedQueue ParseQueue(std::string_view text) {
   if (!reader.ok()) {
     Add(&loaded.diagnostics, std::string(kQueueFileName) + ": " + reader.error().Describe() +
                                  "; the queue is discarded");
+    loaded.discarded = true;
     return loaded;
   }
   if (format != kFormatMagic || version != kFormatVersion) {
     Add(&loaded.diagnostics, std::string(kQueueFileName) + " is not a \"" + kFormatMagic +
                                  "\" version " + std::to_string(kFormatVersion) +
                                  " file; the queue is discarded");
+    loaded.discarded = true;
     return loaded;
   }
 
@@ -766,12 +776,14 @@ LoadedQueue ParseQueue(std::string_view text) {
   if (entries == nullptr || !entries->is_array()) {
     Add(&loaded.diagnostics,
         std::string(kQueueFileName) + ": field entries: expected an array; the queue is discarded");
+    loaded.discarded = true;
     return loaded;
   }
   if (entries->elements().size() > kMaxQueueEntries) {
     Add(&loaded.diagnostics, std::string(kQueueFileName) + " holds more than the " +
                                  std::to_string(kMaxQueueEntries) +
                                  " entries a queue may have; it is discarded");
+    loaded.discarded = true;
     return loaded;
   }
 
@@ -806,6 +818,7 @@ LoadedQueue ParseQueue(std::string_view text) {
     // needs to be told the *whole* queue went.
     loaded.diagnostics.push_back(std::string(kQueueFileName) +
                                  " is not intact; the whole queue is discarded");
+    loaded.discarded = true;
     return loaded;
   }
 
@@ -848,6 +861,9 @@ LoadedQueue LoadQueue(const std::string& path) {
         Add(&diagnostics, std::move(diagnostic));
       }
       recovered.diagnostics = std::move(diagnostics);
+      // A commit was interrupted. Whatever came back, the primary file is not
+      // there, and that is worth a user seeing rather than a silent recovery.
+      recovered.discarded = true;
       return recovered;
     }
   }
@@ -861,13 +877,17 @@ LoadedQueue LoadQueue(const std::string& path) {
       break;
     case io::BoundedRead::kUnreadable:
       // The one outcome that is not a discard: the queue on the card is
-      // probably intact and this boot simply cannot see it. See `trusted`.
+      // probably intact and this boot simply cannot see it. See `trusted`. It
+      // is still a queue the user has lost for this boot, so it is still
+      // something to say out loud on the queue screen.
       loaded.trusted = false;
+      loaded.discarded = true;
       Add(&loaded.diagnostics,
           Describe(path, "could not be read; the queue is empty for this boot, and must not be "
                          "written over until it can be read again"));
       break;
     case io::BoundedRead::kTooLarge:
+      loaded.discarded = true;
       Add(&loaded.diagnostics,
           Describe(path, "is larger than the " + std::to_string(kMaxQueueBytes) +
                              " bytes a queue may take; it is discarded"));

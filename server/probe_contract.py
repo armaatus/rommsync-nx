@@ -61,7 +61,7 @@ POLL_LIMIT_SECONDS = 120
 REQUESTED_SCOPES = [
     "me.read", "roms.read", "roms.user.read", "roms.user.write",
     "assets.read", "assets.write", "devices.read", "devices.write",
-    "collections.read",
+    "collections.read", "platforms.read",
 ]
 
 
@@ -667,6 +667,7 @@ def main():
         ("GET", "/api/roms"),
         ("GET", "/api/roms/{id}/content/{file_name}"),
         ("GET", "/api/collections"),
+        ("GET", "/api/platforms"),
     ]
     ok = True
     for m, p in need:
@@ -735,6 +736,29 @@ def main():
         if items:
             show_shape(items[0], "rom")
             rom_id = items[0]["id"]
+
+        hr("platforms (the one bare array on this API)")
+        # Bare array, not an envelope: the client pages this on its own side
+        # (M5-4, #31), so the capture is what pins that there is nothing to page
+        # with. Checked before recording for roms-list's reason -- and this one
+        # 403s without `platforms.read`, which is a scope a token can be granted
+        # every other one of and still not have (docs/API_CONTRACT.md#scopes-to-request).
+        platforms_r = s.get(f"{base}/api/platforms", timeout=30)
+        platforms_r.raise_for_status()
+        platforms = platforms_r.json()
+        if not isinstance(platforms, list):
+            print(f"\n!! /api/platforms answered {type(platforms).__name__}, not an array -- "
+                  f"the capture would be mislabelled, so it is not written.", file=sys.stderr)
+            return 1
+        # One element, because the capture is a *shape*: the fixture's four
+        # platforms are four copies of it, and a capture that grew with the
+        # library would go red every time a rom fixture was added.
+        if not platforms:
+            print("\n!! /api/platforms answered an empty array -- an empty capture is a "
+                  "wildcard that matches anything, so it is not written.", file=sys.stderr)
+            return 1
+        cap.record("platforms-list", platforms[:1])
+        show_shape(platforms[0], "platform")
 
         if args.negotiate or args.sync_scenarios:
             hr("no-op negotiate (empty saves -> all noop, /complete NOT called)")
