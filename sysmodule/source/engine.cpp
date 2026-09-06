@@ -677,6 +677,18 @@ void SdEngine::RunOneTick() {
     // person at a pairing screen. `auth::Gate` is the only thing that lifts it,
     // and `kUnauthorized` is what tells the scheduler not to invent a backoff
     // over a decision that is not its (scheduler.hpp).
+    //
+    // **`gate_.backoff()` is deliberately not consulted, and this is the place
+    // to say why.** It paces a console whose credentials are merely *suspect* --
+    // tens of seconds after the first rejection. The schedule already waits
+    // longer than that: `Scheduler::Finished(kUnauthorized)` restamps the
+    // interval, so the next ordinary tick is `interval_min` away, which is never
+    // shorter than `auth::GateConfig::backoff`. Asking the gate could therefore
+    // only ever make this client *more* eager, which is the opposite of what the
+    // number is for. The one path that skips the interval is a user pressing
+    // "Sync now", and there the gate's real guarantee is the one that holds:
+    // three rejections and it is blocked, so a user leaning on the button costs
+    // three requests and then this branch.
     std::lock_guard<std::mutex> lock(mutex_);
     scheduler_.Finished(sync::TickOutcome::kUnauthorized);
     return;
