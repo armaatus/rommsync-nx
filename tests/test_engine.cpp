@@ -25,6 +25,8 @@
 //   rollback  -- a write that cannot happen changes neither the file nor memory
 //   corrupt   -- a queue.json a yanked card left behind never blocks the boot
 //   config    -- M5-3: an edit lands on the card and on the running engine
+//   unpairs   -- M5-3: the pairing goes before the write, even when it fails
+//   stale     -- M5-3: an unreadable boot does not make the next edit un-pair
 //   server    -- M5-3: changing the server discards the token it does not own
 //   commands  -- what is still `kUnavailable`, so the list shrinks deliberately
 #include <cstddef>
@@ -381,6 +383,89 @@ void ConfigWrites(checks::Checks& c) {
   std::filesystem::remove(console.sandbox.Host("/config/rommsync/config.ini"), error);
 }
 
+void UrlWriteFails(checks::Checks& c) {
+  Console console(c, "engine-url-fails");
+  const std::string settings = "[server]\nurl = https://romm.example.com\n";
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini", settings),
+           "a configured console");
+
+  auth::StoredToken token;
+  token.server_url = "https://romm.example.com";
+  token.access_token = "not-a-real-token";
+  token.device_id = "console-1";
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(), "and a pairing");
+  console.Boot();
+  c.Expect(console.Status().auth == ipc::AuthState::kPaired, "which it reports");
+
+  // The token is discarded *before* the write, so that the card never names one
+  // server while holding another's credential. The cost of that order is this
+  // case, and it is the branch a user actually meets: the write fails, the
+  // server did not change, and the pairing is gone anyway. It has to be said
+  // out loud rather than left to be discovered at the pairing screen.
+  //
+  // A directory where `io::WriteAtomically` wants to stage its temp file makes
+  // the write fail with the config directory still readable and writable, so
+  // the discard succeeds and the write does not -- which is exactly the order
+  // under test.
+  console.sandbox.MakeDirs("/config/rommsync/config.ini.tmp");
+  const ipc::ConfigResult failed =
+      console.Set(Edit("server", "url", "https://elsewhere.example.com"));
+  c.Expect(failed.outcome == ipc::WriteOutcome::kWriteFailed, "the write did not happen");
+  c.ExpectEq(console.sandbox.Read("/config/rommsync/config.ini"), settings,
+             "and config.ini is byte-identical");
+  c.ExpectEq(console.Configured().config.server.url, std::string("https://romm.example.com"),
+             "so the console is still pointed at the server it was");
+  c.Expect(!console.sandbox.Exists("/config/rommsync/token.dat"),
+           "the pairing is gone, because it was discarded first on purpose");
+  c.Expect(console.Status().auth == ipc::AuthState::kNeverPaired, "and the overlay is told");
+  bool warned = false;
+  for (const config::Diagnostic& diagnostic : failed.diagnostics) {
+    warned = warned || diagnostic.message.find("paired again") != std::string::npos;
+  }
+  c.Expect(warned, "with a sentence saying the pairing went even though the server did not");
+
+  std::error_code error;
+  std::filesystem::remove(console.sandbox.Host("/config/rommsync/config.ini.tmp"), error);
+}
+
+void StaleConfig(checks::Checks& c) {
+  Console console(c, "engine-stale");
+
+  // A `config.ini` that is *there* and will not read. `LoadConfig` may never
+  // refuse (nothing blocks boot), so the engine comes up on the built-in
+  // defaults -- which have no `server.url` -- while the card names a perfectly
+  // good server.
+  console.sandbox.MakeDirs("/config/rommsync/config.ini");
+  auth::StoredToken token;
+  token.server_url = "https://romm.example.com";
+  token.access_token = "not-a-real-token";
+  token.device_id = "console-1";
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(), "a pairing");
+  console.Boot();
+  c.Expect(!console.Configured().config.configured(),
+           "the engine boots unconfigured over a config.ini it could not read");
+  c.Expect(console.Status().auth == ipc::AuthState::kPaired, "and still knows it is paired");
+
+  std::error_code error;
+  std::filesystem::remove(console.sandbox.Host("/config/rommsync/config.ini"), error);
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = https://romm.example.com\n[sync]\n"
+                                 "enabled = true\n"),
+           "the card comes back with the settings it always had");
+
+  // Whether the server changed is a question about the *card*, not about what
+  // this process managed to load at boot. Asking `config_` would make this
+  // toggle -- which names no server at all -- look like a server change and
+  // shred a working pairing over one bad moment from an SD card.
+  const ipc::EnabledResult off = console.SetEnabled(false);
+  c.Expect(off.outcome == ipc::WriteOutcome::kApplied, "an unrelated edit is applied");
+  c.Expect(console.sandbox.Exists("/config/rommsync/token.dat"),
+           "and the pairing is left where it is");
+  c.Expect(console.Status().auth == ipc::AuthState::kPaired, "the console is still paired");
+  c.ExpectEq(console.Configured().config.server.url, std::string("https://romm.example.com"),
+             "and the engine has picked the real settings up");
+}
+
 void InterruptedCommit(checks::Checks& c) {
   Console console(c, "engine-commit");
   const std::string settings =
@@ -561,6 +646,10 @@ int main(int argc, char** argv) {
     ConfigWrites(checks);
   } else if (scenario == "commit") {
     InterruptedCommit(checks);
+  } else if (scenario == "unpairs") {
+    UrlWriteFails(checks);
+  } else if (scenario == "stale") {
+    StaleConfig(checks);
   } else if (scenario == "commands") {
     Commands(checks);
   } else if (scenario == "server") {

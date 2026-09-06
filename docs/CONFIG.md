@@ -263,13 +263,22 @@ An edit is applied as a unit. A settings screen that sends four values and gets
 one of them wrong leaves the card exactly as it was, rather than three-quarters
 changed.
 
-**Changing `url` un-pairs the console.** The token in `token.dat` was issued by
-the RomM you were pointed at and is meaningless to any other — so pointing the
+**Changing `url` un-pairs the console**, and does so before the file is written
+(see below). The token in `token.dat` was issued by the RomM you were pointed at
+and is meaningless to any other — so pointing the
 client at a different server discards it rather than sending your bearer token
 to a host that never issued it. Pair again from the overlay. Editing anything
 else leaves the pairing alone.
 
 If the write itself cannot happen — no card, a full one — the answer says so and
-nothing changed: the file is committed with the same two-rename write the token
-and device records use, so an interrupted one leaves your previous settings
-under `config.ini.old` and the next boot reads them from there.
+your settings are unchanged: the file is committed with the same two-rename
+write the token and device records use, so an interrupted one leaves your
+previous settings under `config.ini.old` and the next boot reads them from
+there.
+
+The one thing that is *not* put back is the pairing, and only on an edit that
+changed `url`. The token is discarded **before** the file is written, because
+the other order would leave a moment where the card names a new server and still
+holds the old server's credential. So a `url` edit whose write then failed
+leaves you pointed at the server you were already using and needing to pair
+again; the answer says that too.

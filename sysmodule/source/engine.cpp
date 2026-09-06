@@ -164,11 +164,19 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
   // one, so it is decided by what the file will actually parse to and not by
   // which assignments the overlay happened to send.
   //
+  // Compared against the **card**, not against `config_`. Those two part company
+  // exactly when `config.ini` was there and unreadable at boot: `LoadConfig`
+  // answers with the built-in defaults then (it may never refuse), so
+  // `config_.server.url` is empty while the file names a perfectly good server.
+  // Comparing against that would make the next edit of any kind -- a plain
+  // `SetEnabled` toggle included -- look like a server change and shred a
+  // working pairing over an SD card that had one bad moment.
+  //
   // The token goes **before** the write, deliberately. The other order leaves a
   // moment where the card names the new server and still holds the old
   // credential, and a discard that failed there would leave it there for good.
-  const bool server_changed =
-      config::ParseConfig(written).value.server.url != config_.server.url;
+  const bool server_changed = config::ParseConfig(written).value.server.url !=
+                              config::ParseConfig(current).value.server.url;
   if (server_changed && !auth::DiscardToken(PathTo(auth::kTokenFileName))) {
     diagnostics->push_back({config::Severity::kError, 0, "server", "url",
                             "the pairing for the previous server could not be discarded, so the "
@@ -200,13 +208,18 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
                             "pair again from the overlay"});
   }
 
-  // Read back rather than kept: the file on the card is the source of truth for
-  // what the engine is configured with, and an in-memory `Config` built from the
-  // edit would be the one thing in this process that never went through
-  // `ParseConfig`. This is also what makes the change take effect with no
-  // reboot -- `GetStatus` and `GetConfig` read `config_`, and it is now the new
-  // one.
-  AdoptConfig(config::LoadConfig(PathTo(config::kConfigFileName)));
+  // Parsed rather than kept, so the configuration in force is one `ParseConfig`
+  // produced and nothing in this process is a `Config` assembled by hand -- and
+  // parsed from `written` rather than re-read off the card, which is the
+  // difference that matters. `WriteAtomically` has just succeeded, so `written`
+  // *is* what the card holds; a re-read that failed for a moment would hand back
+  // `LoadConfig`'s built-in defaults, and adopting those would throw away a
+  // configuration this process knows to be correct in favour of a worse one. At
+  // boot that fallback is right, because there is nothing better to have.
+  //
+  // This is what makes the change take effect with no reboot: `GetStatus` and
+  // `GetConfig` read `config_`, and it is now the new one.
+  AdoptConfig(config::ParseConfig(written));
   return ipc::Error::kOk;
 }
 

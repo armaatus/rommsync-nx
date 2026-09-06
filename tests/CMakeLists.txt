@@ -1035,6 +1035,8 @@ set(ENGINE_SCENARIOS
   corrupt   # a queue.json a yanked card left behind never blocks the boot
   config    # M5-3: an edit lands on the card and on the running engine
   commit    # M5-3: a commit interrupted between the two renames loses nothing
+  unpairs   # M5-3: a server change discards the pairing before it writes
+  stale     # M5-3: "did the server change" is a question about the card
   commands  # what is still `kUnavailable`, so the list shrinks deliberately
 )
 foreach(scenario IN LISTS ENGINE_SCENARIOS)

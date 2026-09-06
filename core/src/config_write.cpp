@@ -165,9 +165,12 @@ std::string KeyOf(const std::string& line) {
   return LowerAscii(Trim(content.substr(0, equals)));
 }
 
-/// Every line in `section` that assigns `key`, in file order.
-std::vector<std::size_t> Assignments(const Document& doc, const std::string& section,
-                                     const std::string& key) {
+/// The **line indices** of every line in `section` that assigns `key`, in file
+/// order. Named for what it returns rather than for what it finds, because
+/// `Assignment` and `Edit::assignments` mean the edit's own records in this
+/// file and confusing the two is an off-by-a-whole-concept.
+std::vector<std::size_t> AssignmentLines(const Document& doc, const std::string& section,
+                                         const std::string& key) {
   std::vector<std::size_t> hits;
   std::string current;
   for (std::size_t i = 0; i < doc.lines.size(); ++i) {
@@ -230,6 +233,9 @@ void Erase(Document* doc, std::size_t at) {
 }
 
 /// `line` with its value replaced, and everything else about it kept.
+///
+/// Only ever called on a line `KeyOf` accepted, so the `=` it splits on is
+/// there; there is no `npos` case to handle.
 ///
 /// The indentation, the spacing around the `=` and any trailing `; comment` are
 /// the user's, and an edit that reformatted them would make a one-setting change
@@ -305,39 +311,33 @@ void AppendSection(Document* doc, const std::string& section,
 
 enum class ValueKind { kUnknown, kBool, kMinutes, kUrl, kPathList };
 
+const bool* BoolField(const Config& config, const std::string& section, const std::string& key);
+
 ValueKind KindOf(const std::string& section, const std::string& key) {
   if (section == "server") {
     return key == "url" ? ValueKind::kUrl : ValueKind::kUnknown;
   }
-  if (section == "sync") {
-    if (key == "interval_min") {
-      return ValueKind::kMinutes;
-    }
-    if (key == "enabled" || key == "on_boot" || key == "saves" || key == "states" ||
-        key == "conflict_show") {
-      return ValueKind::kBool;
-    }
-    return ValueKind::kUnknown;
-  }
-  if (section == "downloads") {
-    if (key == "enabled" || key == "verify_hash" || key == "resume") {
-      return ValueKind::kBool;
-    }
-    return ValueKind::kUnknown;
+  if (section == "sync" && key == "interval_min") {
+    return ValueKind::kMinutes;
   }
   if (section.rfind("platform.", 0) == 0) {
-    if (key == "roms" || key == "saves" || key == "states") {
-      return ValueKind::kPathList;
-    }
+    return key == "roms" || key == "saves" || key == "states" ? ValueKind::kPathList
+                                                              : ValueKind::kUnknown;
   }
-  return ValueKind::kUnknown;
+  // Asked of the accessor rather than of a list repeated here: see `BoolField`.
+  // The `Config` is a throwaway -- the question is which field the key names,
+  // not what is in it.
+  const Config unused;
+  return BoolField(unused, section, key) != nullptr ? ValueKind::kBool : ValueKind::kUnknown;
 }
 
 /// The `[sync]`/`[downloads]` flag `key` names, or nullptr.
 ///
-/// One table read two ways: `KindOf` says a key is a boolean and this says which
-/// one, so the read-back check below cannot be looking at a different field from
-/// the one the write set.
+/// **This is the only list of which keys are booleans.** `KindOf` asks it the
+/// same question against a throwaway `Config` rather than keeping a second copy
+/// of the names, so a flag added to one and not the other is not expressible --
+/// which is the mistake worth designing out, since the two copies would be a
+/// key the write path accepts and the read-back check cannot find.
 const bool* BoolField(const Config& config, const std::string& section,
                       const std::string& key) {
   if (section == "sync") {
@@ -356,17 +356,32 @@ const bool* BoolField(const Config& config, const std::string& section,
   return nullptr;
 }
 
-const std::vector<std::string>* PathField(const Config& config, const std::string& section,
+const std::vector<std::string>* PathList(const PlatformFolders& folders,
+                                        const std::string& key) {
+  if (key == "roms") return &folders.roms;
+  if (key == "saves") return &folders.saves;
+  if (key == "states") return &folders.states;
+  return nullptr;
+}
+
+/// The folder list `section`/`key` names in `config`, or an empty one.
+///
+/// **An absent platform is an empty list, not a missing answer.** `ParseConfig`
+/// drops a platform whose section maps nothing at all -- an entry that maps
+/// nothing is the same thing as no entry -- so emptying the last folder of a
+/// platform makes `Config::Platform` return nullptr, and reading that as a
+/// failure would refuse `roms =`, which is the documented way to say "nowhere"
+/// (docs/CONFIG.md).
+const std::vector<std::string>& PathField(const Config& config, const std::string& section,
                                           const std::string& key) {
+  static const std::vector<std::string> kNone;
   const PlatformFolders* folders =
       config.Platform(std::string_view(section).substr(std::string_view("platform.").size()));
   if (folders == nullptr) {
-    return nullptr;
+    return kNone;
   }
-  if (key == "roms") return &folders->roms;
-  if (key == "saves") return &folders->saves;
-  if (key == "states") return &folders->states;
-  return nullptr;
+  const std::vector<std::string>* list = PathList(*folders, key);
+  return list == nullptr ? kNone : *list;
 }
 
 /// One assignment, canonically keyed and with its value already normalised.
@@ -511,13 +526,8 @@ bool ReadsBackAs(const Config& config, const Resolved& target) {
       const bool* field = BoolField(config, target.section, target.key);
       return field != nullptr && *field == (target.value == "true");
     }
-    case ValueKind::kPathList: {
-      const std::vector<std::string>* field = PathField(config, target.section, target.key);
-      if (field == nullptr) {
-        return false;
-      }
-      return Join(*field) == target.value;
-    }
+    case ValueKind::kPathList:
+      return Join(PathField(config, target.section, target.key)) == target.value;
     case ValueKind::kUnknown:
       break;
   }
@@ -538,8 +548,8 @@ bool ReadsBackAs(const Config& config, const Resolved& target) {
 /// Emptying a key on purpose is still `roms =`, the documented way to map a
 /// platform nowhere; that is an assignment with an empty value and reaches here
 /// as one.
-std::vector<std::pair<std::string, std::string>> NewSectionBody(const Resolved& target,
-                                                                bool* carried) {
+std::vector<std::pair<std::string, std::string>> NewSectionBody(
+    const Resolved& target, const std::vector<Resolved>& edit, bool* carried) {
   std::vector<std::pair<std::string, std::string>> body;
   const auto found = target.kind == ValueKind::kPathList
                          ? DefaultPlatforms().find(
@@ -553,8 +563,24 @@ std::vector<std::pair<std::string, std::string>> NewSectionBody(const Resolved& 
   const std::pair<const char*, const std::vector<std::string>*> keys[] = {
       {"roms", &folders.roms}, {"saves", &folders.saves}, {"states", &folders.states}};
   for (const auto& [name, paths] : keys) {
-    if (target.key == name) {
-      body.push_back({target.key, target.value});
+    // **The whole edit, not just the assignment that got here first.** The
+    // section is created once, by whichever assignment reaches it first, and
+    // carrying a default over a key the *same edit* also sets or removes would
+    // make the result depend on the order the overlay listed its fields in --
+    // which is the property the "set twice in one edit" refusal exists to
+    // protect. An edit is a unit; this is what that costs.
+    const Resolved* asked = nullptr;
+    for (const Resolved& other : edit) {
+      if (other.section == target.section && other.key == name) {
+        asked = &other;
+      }
+    }
+    if (asked != nullptr) {
+      if (!asked->remove) {
+        body.push_back({asked->key, asked->value});
+      }
+      // A `remove` leaves the key out, which is what removing it means: the
+      // section is what this platform maps, so an absent key maps nothing.
     } else if (!paths->empty()) {
       body.push_back({name, Join(*paths)});
       *carried = true;
@@ -600,6 +626,19 @@ bool ApplyEdit(std::string_view current_text, const Edit& edit, std::string* out
                "names no section and key to set");
       return false;
     }
+    // The section is *written into the file* when it is not there yet, and a
+    // `platform.` slug is whatever the caller sent -- `DecodeConfigEdit` only
+    // checks it is non-empty, and JSON carries a newline or a `]` happily. So it
+    // gets the guard a value gets, plus the two brackets a header is made of.
+    // Neither the section nor the message quotes it back: what arrived is not
+    // something a user typed, and a diagnostic carrying a synthetic `[sync]`
+    // header into an overlay row helps nobody.
+    if (!SurvivesReadBack(target.section) ||
+        target.section.find_first_of("[]") != std::string::npos) {
+      Complain(diagnostics, Severity::kError, "", "",
+               "names a section that cannot be written to config.ini");
+      return false;
+    }
     target.kind = KindOf(target.section, target.key);
     if (target.kind == ValueKind::kUnknown) {
       Complain(diagnostics, Severity::kError, target.section, target.key,
@@ -630,7 +669,7 @@ bool ApplyEdit(std::string_view current_text, const Edit& edit, std::string* out
   // --- apply ---
   Document doc = Split(current_text);
   for (const Resolved& target : resolved) {
-    const std::vector<std::size_t> hits = Assignments(doc, target.section, target.key);
+    const std::vector<std::size_t> hits = AssignmentLines(doc, target.section, target.key);
     if (target.remove) {
       // Every occurrence, not the last: leaving an earlier one in place would
       // hand the value straight back on the next boot.
@@ -653,7 +692,7 @@ bool ApplyEdit(std::string_view current_text, const Edit& edit, std::string* out
     }
     bool carried = false;
     const std::vector<std::pair<std::string, std::string>> body =
-        NewSectionBody(target, &carried);
+        NewSectionBody(target, resolved, &carried);
     AppendSection(&doc, target.section, body);
     if (carried) {
       Complain(diagnostics, Severity::kNotice, target.section, target.key,
@@ -677,17 +716,31 @@ bool ApplyEdit(std::string_view current_text, const Edit& edit, std::string* out
   // back. Every rule above is a reason this cannot fail; this is what makes that
   // a fact rather than a claim, and it costs one parse of a few hundred bytes on
   // a command a user presses by hand.
-  const Config reparsed = ParseConfig(written).value;
+  const LoadResult reparsed = ParseConfig(written);
   const Document check = Split(written);
   for (const Resolved& target : resolved) {
-    const bool held = target.remove ? Assignments(check, target.section, target.key).empty()
-                                    : ReadsBackAs(reparsed, target);
-    if (!held) {
-      Complain(diagnostics, Severity::kError, target.section, target.key,
-               "could not be written to config.ini in a form that reads back the same; "
-               "nothing was changed");
-      return false;
+    const bool held = target.remove
+                          ? AssignmentLines(check, target.section, target.key).empty()
+                          : ReadsBackAs(reparsed.value, target);
+    if (held) {
+      continue;
     }
+    // The reason this path refuses at all is that there is a person watching who
+    // can be told which limit they met, so the parser's own complaint about the
+    // section goes back with the refusal when it has one -- "is past the 256
+    // platforms a configuration may map" is an answer; "it did not read back" is
+    // not. There is not always one, and then the generic sentence is the honest
+    // report of a writing bug this check exists to catch.
+    for (const Diagnostic& complaint : reparsed.diagnostics) {
+      if (complaint.section == target.section && complaint.severity != Severity::kNotice) {
+        diagnostics->push_back(complaint);
+        break;
+      }
+    }
+    Complain(diagnostics, Severity::kError, target.section, target.key,
+             "could not be written to config.ini in a form that reads back the same; "
+             "nothing was changed");
+    return false;
   }
 
   *out_text = std::move(written);

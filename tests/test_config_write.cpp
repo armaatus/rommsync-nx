@@ -82,6 +82,13 @@ void ExpectSame(checks::Checks& c, const std::string& actual, const std::string&
   c.Expect(false, what);
 }
 
+/// The `Config` `text` parses to, **by value**.
+///
+/// Named because the shape that is not written here is
+/// `ParseConfig(text).value.Platform(slug)`: the `Config` is a temporary, so the
+/// pointer that comes back outlives the map it points into.
+config::Config Parsed(const std::string& text) { return config::ParseConfig(text).value; }
+
 bool Mentions(const std::vector<config::Diagnostic>& diagnostics, const std::string& fragment) {
   for (const config::Diagnostic& entry : diagnostics) {
     if (entry.Describe().find(fragment) != std::string::npos) {
@@ -196,6 +203,14 @@ void Rejects(checks::Checks& c) {
   cases.push_back({"an empty entry in a folder list",
                    One("platform.snes", "roms", "/a, , /b")});
   cases.push_back({"an edit that changes nothing", config::Edit{}});
+  // A section is written into the file when it is not there yet, and a
+  // `platform.` slug is whatever arrived over IPC -- `DecodeConfigEdit` only
+  // checks it is not empty. A slug carrying a newline and a `[` would otherwise
+  // be a section header of somebody else's writing.
+  cases.push_back({"a slug that would forge a section header",
+                   One("platform.snes]\n[sync]\nenabled = false\n;", "roms", "/roms/snes")});
+  cases.push_back({"a slug with a comment marker in it",
+                   One("platform.snes ; and the rest", "roms", "/roms/snes")});
 
   config::Edit twice;
   twice.assignments.push_back({"sync", "interval_min", "10", false});
@@ -278,7 +293,7 @@ void Absent(checks::Checks& c) {
   std::vector<config::Diagnostic> notes;
   c.Expect(config::ApplyEdit(before, One("platform.gba", "roms", "/roms/gba"), &platform, &notes),
            "a folder for a platform with no section of its own");
-  const config::Config parsed = config::ParseConfig(platform).value;
+  const config::Config parsed = Parsed(platform);
   const config::PlatformFolders* gba = parsed.Platform("gba");
   c.Expect(gba != nullptr, "the new platform section is there");
   if (gba != nullptr) {
@@ -290,6 +305,24 @@ void Absent(checks::Checks& c) {
   }
   c.Expect(!notes.empty(), "and the user is told the default mapping was written out");
 
+  // ...and which of the same edit's assignments got to the section first must
+  // not decide the outcome. A `remove` and a `set` on one absent platform is the
+  // case: whichever runs first creates the section, and carrying a default over
+  // the *other* one would make the overlay's field order the deciding factor.
+  config::Edit forwards;
+  forwards.assignments.push_back({"platform.gba", "roms", "", true});
+  forwards.assignments.push_back({"platform.gba", "saves", "/saves/gba", false});
+  config::Edit backwards;
+  backwards.assignments.push_back({"platform.gba", "saves", "/saves/gba", false});
+  backwards.assignments.push_back({"platform.gba", "roms", "", true});
+  const std::string one = Applied(c, before, forwards, "remove then set");
+  const std::string other = Applied(c, before, backwards, "set then remove");
+  ExpectSame(c, one, other, "an edit is a unit: its assignments' order changes nothing");
+  const config::Config after_edit = Parsed(one);
+  const config::PlatformFolders* gba_edit = after_edit.Platform("gba");
+  c.Expect(gba_edit != nullptr && gba_edit->roms.empty(), "the removed folder is gone");
+  c.Expect(gba_edit != nullptr && gba_edit->saves.size() == 1, "and the set one is there");
+
   // A platform this build ships no default for has nothing to carry across, so
   // the section is exactly what was asked for.
   std::string unknown;
@@ -297,7 +330,8 @@ void Absent(checks::Checks& c) {
   c.Expect(config::ApplyEdit(before, One("platform.jaguar", "roms", "/roms/jaguar"), &unknown,
                              &notes),
            "a platform this build does not map by default");
-  const config::PlatformFolders* jaguar = config::ParseConfig(unknown).value.Platform("jaguar");
+  const config::Config mapped_unknown = Parsed(unknown);
+  const config::PlatformFolders* jaguar = mapped_unknown.Platform("jaguar");
   c.Expect(jaguar != nullptr && jaguar->saves.empty() && jaguar->states.empty(),
            "gets the one key it was given and nothing invented around it");
 
@@ -357,6 +391,25 @@ void Removes(checks::Checks& c) {
            "removing the URL leaves the console unconfigured");
   c.Expect(unset.find("[server]\r\n\r\n[sync]") != std::string::npos,
            "and the empty section is left where it was");
+
+  // Emptying a folder key is the documented way to map a platform nowhere, and
+  // it has to be *possible*: `ParseConfig` drops a platform whose section maps
+  // nothing at all, so the read-back check has to read an absent platform as an
+  // empty list rather than as a value it could not find.
+  const std::string nowhere =
+      Applied(c, "[platform.snes]\nroms = /roms/snes\n", One("platform.snes", "roms", ""),
+              "emptying the last folder of a platform");
+  ExpectSame(c, nowhere, "[platform.snes]\nroms =\n", "the key is left with no value");
+  c.Expect(config::ParseConfig(nowhere).value.Platform("snes") == nullptr,
+           "and the platform maps nothing, which is what was asked for");
+
+  config::Edit both;
+  both.assignments.push_back({"platform.snes", "roms", "", false});
+  both.assignments.push_back({"platform.snes", "saves", "", false});
+  const std::string emptied =
+      Applied(c, "[platform.snes]\nroms = /a\nsaves = /b\n", both, "emptying two keys at once");
+  c.Expect(config::ParseConfig(emptied).value.Platform("snes") == nullptr,
+           "a whole platform can be switched off in one edit");
 
   // A key that is not in the file is already at its default: nothing to do, and
   // not a failure.

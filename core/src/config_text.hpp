@@ -96,11 +96,12 @@ inline std::string Redact(std::string_view text) {
   }
 }
 
-/// A whole decimal integer, or nothing.
+/// `text` as an `int`, refusing anything that is not exactly one integer.
 ///
-/// Not `std::stoi`: that one accepts a trailing tail, throws, and is a locale
-/// away from surprising -- and this parser has to be able to say "that is not a
-/// number" about `30 minutes` rather than quietly reading 30 out of it.
+/// Hand-rolled rather than `strtol`, because `strtol` reads `30 minutes` as 30
+/// and saturates an out-of-range value onto `LONG_MAX` -- both of which turn a
+/// typo into a plausible number instead of a message. Overflow is detected
+/// against the bound rather than by wrapping.
 inline bool ParseInt(std::string_view text, int* out) {
   if (text.empty()) {
     return false;
