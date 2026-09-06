@@ -712,11 +712,12 @@ endforeach()
 # teardown -- which is the whole reason the fault proxy exists, because the
 # guarantee only ever matters on the failure path.
 #
-# `recovery`, `durable`, `backupdir`, `offline` and `canceled` are deliberately
-# NOT in the skippable list: the sweep a crash makes necessary, the platform
-# fsync hard rule 2 depends on, the directory `core/` could not create, the tick
-# that must write nothing at all, and the shutdown that must cost no request all
-# need no server, so they must stay checked with docker stopped.
+# `recovery`, `durable`, `backupdir`, `offline`, `rescan` and `canceled` are
+# deliberately NOT in the skippable list: the sweep a crash makes necessary, the
+# platform fsync hard rule 2 depends on, the directory `core/` could not create,
+# the tick that must write nothing at all, the restored save that must not be
+# negotiated without, and the shutdown that must cost no request all need no
+# server, so they must stay checked with docker stopped.
 add_executable(test_sync_tick test_sync_tick.cpp)
 target_link_libraries(test_sync_tick PRIVATE rommsync::host)
 target_include_directories(test_sync_tick PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -730,6 +731,7 @@ set(TICK_UNIT_SCENARIOS
   durable    # the backup's bytes are on the card before the rename publishes them
   backupdir  # .backup/ made on a first boot, which core/ could not do until now
   offline    # an unreachable server: the card is byte-for-byte what it was
+  rescan     # a restored save stops the tick rather than negotiating without it
   canceled   # a token already fired ends the tick without a single request
 )
 foreach(scenario IN LISTS TICK_UNIT_SCENARIOS)
@@ -745,12 +747,12 @@ set(TICK_RIG_SCENARIOS
   upload_5xx       # refused before RomM saw it: no row, no save touched
   upload_truncate  # a short 200 is a *completed* upload whose save_id is unknown
   upload_drop      # the row exists and the client cannot know -- and must not re-post
-  upload_stall     # a stall never reaches RomM; the tick pays and nothing else does
+  upload_stall     # a stall never reaches RomM, and the next tick runs normally
   download_5xx     # a refusal never replaces a save
-  download_stall   # ...and neither does a transfer that stopped moving
+  download_stall   # ...and neither does a transfer that stopped moving; next tick recovers
   download_401     # M1-4's stop, met at a download rather than at an upload
   complete_drop    # the accounting is lost and the baseline is not
-  complete_stall   # the same, on the timeout rather than the reset
+  complete_stall   # the same on the timeout, and the next tick finds no work to redo
   resumes          # a reset mid-download, then a second tick: one save, one row
 )
 foreach(scenario IN LISTS TICK_RIG_SCENARIOS)

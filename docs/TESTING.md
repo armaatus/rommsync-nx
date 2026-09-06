@@ -417,13 +417,18 @@ ctest --test-dir build --output-on-failure
   `.old` with the save missing -- and checks the sweep discards the first two,
   puts the third back, leaves `.backup/` alone and leaves a rom download's
   resumable `.part` alone. `durable` is the platform `fsync` hard rule 2 depends
-  on: the backup's bytes go to the card *before* the rename publishes them, a
-  hook that refuses fails the copy rather than leaving a backup that holds
-  nothing, and the same seam serves `WriteAtomically`. `backupdir` is the
+  on, and it pins the sequence: the backup's bytes go to the card *before* the
+  rename publishes them and the destination's **directory** goes after it, since
+  on POSIX a name is not durable until the directory holding it is. A hook that
+  refuses fails the copy rather than leaving a backup that holds nothing, and the
+  same seam serves `WriteAtomically`. `backupdir` is the
   directory `core/` could not create until this issue. `offline` points a tick at
-  a closed loopback port and compares the whole sandbox byte for byte before and
-  after -- no backup, no partial, no `state.db` rewrite. `canceled` fires the
-  token first and counts the requests: zero.
+  a closed loopback port and compares the whole sandbox -- directories included,
+  so "no `.backup/` was created either" is part of it -- byte for byte before and
+  after. `rescan` is the one case the sweep cannot simply carry on past: a save
+  it put back is a save the scan never saw, so the tick stops before the network
+  rather than reporting that save as absent and having RomM plan a download over
+  it. `canceled` fires the token first and counts the requests: zero.
 - The rig half is one CTest entry per (stage, fault mode), so a red run names the
   stage and the way it broke rather than "the tick": `negotiate_5xx`,
   `negotiate_drop`, `upload_5xx`, `upload_truncate`, `upload_drop`,

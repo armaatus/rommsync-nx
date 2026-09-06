@@ -397,14 +397,14 @@ no third legal outcome.
 ### On entry: what a crash left behind
 
 A *handled* failure clears its own staging. This is the sweep for the case where
-no cleanup got to run — `sync::RecoverStaging`, over the save folders,
-`/config/rommsync` and its `.backup/`:
+no cleanup got to run — `sync::RecoverStaging`, over the save folders and
+`.backup/`:
 
 | left behind | by | what happens to it |
 |---|---|---|
 | `<save>.tmp.part` | a download the process died during | removed. `DownloadTarget::resume` is false for a save, so nothing in it is worth keeping and the next tick refetches |
 | `<save>.tmp` | a download whose body ended and whose commit did not | **removed, not committed.** See below |
-| `<save>.old` | an interrupted `io::CommitStaged` | renamed back when `<save>` is missing — it is then the only copy of the save — and removed when `<save>` is there, because the commit finished and the previous bytes are already under `.backup/` |
+| `<save>.old` | an interrupted `io::CommitStaged` | renamed back when `<save>` is missing — it is then the only copy of the save. When `<save>` *is* there the commit finished, and the file is counted and **left alone**: a `Game.srm.old` a human made by hand has exactly that shape, and this sweep does not delete files it did not write |
 | `.backup/<rom_id>-<slot>-<ts>.<ext>` | any overwrite | never touched. A backup is never garbage: it is the copy M7-1 restores from, including one written for an overwrite that then failed |
 
 **A `<save>.tmp` is discarded rather than finished, and an earlier revision of
@@ -423,18 +423,46 @@ place it matters. Discarding costs one refetch.
 beside a rom is a M3-3 range-resume in progress, and a sweep that took it would
 throw away a gigabyte of a transfer that was going to finish.
 
+**Not `/config/rommsync` itself.** The records there — `token.dat`, `device.dat`,
+`config.ini`, `state.db` — already recover from their own `.old` when they are
+read, so a sweep adds nothing; and the overlay writes `config.ini` from another
+thread (M5-3), where removing a `.tmp` between that write and its rename would
+cost a setting the user had just changed. `RecoverStaging` takes the list of
+directories rather than deciding for itself precisely so a caller can keep to the
+ones nothing else writes.
+
 The sweep runs *before* the network, and it is right to run it on a tick that
 turns out to be offline: it only removes litter and puts back a save an
-interrupted commit parked. It writes no backup, no save and no `state.db`.
+interrupted commit parked. It writes no backup, no save and no `state.db` — which
+is the reading "with RomM unreachable, a tick writes nothing at all" gets here,
+and `tick.offline` checks both halves of it: a card with nothing to recover is
+byte-for-byte identical afterwards, and a card with leftovers has them dealt with
+and still gains no backup and no rewritten baseline.
 
-### On entry: the directory `core/` cannot create
+### A save the sweep put back is a save the scan never saw
+
+Restoring a `<save>.old` is the one thing the sweep does that the rest of the
+tick cannot simply carry on past. Step 0 ran before `RunTick` — the scan's output
+*is* its argument — so the restored save is missing from `reported`, and RomM
+answers a save it is not told about by planning a download of its own copy over
+it. The local bytes would be backed up and replaced without the conflict
+arbitration they were owed, which is the client deciding a conflict by omission.
+
+So the tick stops, before the network, with `TickOutcome::kRescanNeeded`, and the
+caller scans again and runs another. That costs a tick, which is harmless, and it
+only happens after a crash mid-commit. A caller that sweeps *before* it scans
+never sees it.
+
+### After the negotiation: the directory `core/` cannot create
 
 `sdmc:/config/rommsync/.backup/` missing is an `OperationError::kBackupFailed`
 *before* the save is touched — no backup, no overwrite — so on a first boot every
 download failed until something made the folder.
 `fs::FileSystem::CreateDirectory` is that platform facility, behind the interface
-that already owns the card, and `RunTick` calls it on entry. A directory that is
-already there is success.
+that already owns the card. `RunTick` calls it once the negotiation has answered
+and not before: nothing needs the directory until an operation does, and a tick
+that never reached the server must not have written anything at all. A directory
+that is already there is success.
 
 ### Cancellation
 
@@ -458,14 +486,21 @@ the card, so the answer is the next tick's own negotiation.
 ### What the tick says it did
 
 `TickOutcome` is split on what the scheduler would *do*: `kCompleted`,
-`kPartial` (some operations did not happen; the next negotiation plans them
-again), `kUnreported` (the transfers landed and the accounting did not),
-`kOffline` (nothing was written — back off), `kRefused` (an answer that does not
-change on a second attempt), `kUnauthorized` and `kCanceled`.
+`kPartial` (something did not happen — an operation, or the baseline reaching the
+card; the next negotiation plans it again), `kUnreported` (the transfers landed,
+the accounting did not, and the baseline *is* on the card — the two are asked
+about in that order, because a bad minute loses both and only one of them is
+expensive), `kOffline` (nothing was written — back off), `kRefused` (an answer
+that does not change on a second attempt), `kUnauthorized`, `kRescanNeeded` and
+`kCanceled`.
 `TickResult::answer` is separate and is what `auth::Gate::Observe` takes: it is
 the **last** word on the credentials rather than the worst one, because one 401
 is not a verdict and a completion the same token was accepted for is proof it
-still works (M1-4).
+still works (M1-4). It falls back through the completion, the last operation and
+finally the negotiation, which on any tick that got a plan is itself proof the
+server read the token — leave that last step out and a tick that negotiated fine
+and then lost the link twice reports silence, and `auth::Gate`'s consecutive
+count survives a 200 that should have cleared it.
 
 ## Failure & safety rules
 

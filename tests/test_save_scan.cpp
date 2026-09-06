@@ -147,7 +147,7 @@ class FakeFileSystem final : public fs::FileSystem {
     fs::MakeDirResult result;
     const std::string path = Resolve(sd_path);
     if (path.empty()) {
-      result.error = fs::MakeDirError::kMissing;
+      result.error = fs::MakeDirError::kNotOnThisCard;
       result.message = std::string(sd_path) + ": not a path on this card";
       return result;
     }

@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "harness.hpp"
+#include "rommsync/host/file_sync.hpp"
 #include "rommsync/host/native_file_system.hpp"
 #include "rommsync/md5.hpp"
 #include "rommsync/state_db.hpp"
@@ -1389,6 +1390,11 @@ void Truncated(rig::Checks& checks, http::HttpClient& client, const std::string&
 }  // namespace
 
 int main(int argc, char** argv) {
+  // The durability hook the sysmodule installs from its own `main` (M2-7). A
+  // suite that left it null would be proving the weaker of the two promises
+  // `io::CopyAtomically` can make, on the very path a backup depends on.
+  rommsync::host::InstallPosixFileSync();
+
   const std::string scenario = argc > 1 ? argv[1] : "counts";
   const std::string base = rig::BaseUrl();
 

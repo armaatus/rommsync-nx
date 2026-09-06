@@ -91,7 +91,16 @@ struct Listing {
 /// Why a directory could not be created.
 enum class MakeDirError {
   kNone,
-  kMissing,        ///< `sd_path` is not a path on this card, so nothing was tried
+
+  /// `sd_path` is not a path on this card, so nothing was tried.
+  ///
+  /// Deliberately **not** spelled `kMissing`, which is what its neighbour
+  /// `ListError` calls "there is no such path". Here there is no such *card*
+  /// path to have, which is a refusal rather than something a caller answers by
+  /// creating one -- the same line `fs::FileSystem::Resolve` draws when it
+  /// returns empty.
+  kNotOnThisCard,
+
   kNotADirectory,  ///< something is already there and it is a file
   kUnwritable,     ///< the card refused it -- full, read-only, or a bad moment
 };

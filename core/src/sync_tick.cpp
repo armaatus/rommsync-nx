@@ -71,16 +71,18 @@ TickOutcome OutcomeAfter(const ExecutionReport& executed, const TickCompletion& 
       finished.reported.error == CompleteError::kForbidden) {
     return TickOutcome::kUnauthorized;
   }
-  if (!finished.reported.ok() && !SessionGone(finished.reported.error)) {
-    // The transfers landed and the accounting did not. `FinishTick` wrote the
-    // baseline first, so this costs a row in a history a user reads.
-    return TickOutcome::kUnreported;
-  }
   if (!finished.stored.ok()) {
-    // The baseline did not reach the card. Nothing is wrong with the saves --
-    // every one of them is either untouched or completed -- but the next tick
-    // re-hashes the library, and calling that "completed" would hide it.
+    // Asked **before** the accounting, because the two fail together -- a card
+    // having a bad minute drops the link as readily as it refuses a write -- and
+    // `kUnreported` promises the baseline is safe. Nothing is wrong with the
+    // saves here; the next tick re-hashes the library, and calling that
+    // "completed" or "reported" would hide it.
     return TickOutcome::kPartial;
+  }
+  if (!finished.reported.ok() && !SessionGone(finished.reported.error)) {
+    // The transfers landed and the accounting did not, and the baseline is on
+    // the card, so this costs a row in a history a user reads.
+    return TickOutcome::kUnreported;
   }
   const bool all_done = executed.failed == 0 && executed.not_understood == 0;
   return all_done ? TickOutcome::kCompleted : TickOutcome::kPartial;
@@ -101,7 +103,8 @@ TickOutcome OutcomeAfter(const ExecutionReport& executed, const TickCompletion& 
 /// evidence either way, so the operation that did meet a 401 is what the gate
 /// hears. And an invented `kAccepted` would clear a count that should have
 /// stood, which is why nothing here manufactures one (auth_gate.hpp).
-auth::Answer AnswerAfter(const ExecutionReport& executed, const TickCompletion& finished) {
+auth::Answer AnswerAfter(NegotiateError negotiated, const ExecutionReport& executed,
+                         const TickCompletion& finished) {
   const auth::Answer reported = AnswerOf(finished.reported.error);
   if (reported != auth::Answer::kSilent) {
     return reported;
@@ -112,7 +115,14 @@ auth::Answer AnswerAfter(const ExecutionReport& executed, const TickCompletion& 
       return last;
     }
   }
-  return auth::Answer::kSilent;
+  // The negotiation, last, and it is never nothing: reaching here means it
+  // produced a plan, which is `kAccepted` -- the server had to read the token to
+  // answer one. Leaving it out was a real hole: a tick that negotiated fine and
+  // then lost the link at a download *and* at `complete` would report `kSilent`,
+  // so `auth::Gate`'s consecutive-rejection count would survive a 200 that
+  // should have cleared it, and three such ticks around three transient 401s
+  // would drop a pairing the server never revoked.
+  return AnswerOf(negotiated);
 }
 
 }  // namespace
@@ -133,6 +143,8 @@ const char* ToString(TickOutcome outcome) {
       return "unauthorized";
     case TickOutcome::kCanceled:
       return "canceled";
+    case TickOutcome::kRescanNeeded:
+      return "rescan_needed";
   }
   return "unknown";
 }
@@ -154,16 +166,14 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
   // save and no `state.db`.
   result.recovered = RecoverStaging(files, options.recover_dirs);
 
-  if (options.create_backup_dir) {
-    const fs::MakeDirResult made = files.CreateDirectory(options.execute.backup_dir);
-    if (!made.ok()) {
-      // Not fatal here. Every operation that would overwrite a save fails with
-      // `kBackupFailed` further down -- no backup, no overwrite -- and an upload
-      // or a no-op does not need the directory at all, so a tick that can still
-      // do half its work does it.
-      result.recovered.warnings.push_back("the backup directory " + options.execute.backup_dir +
-                                          " could not be created: " + made.message);
-    }
+  if (result.recovered.saves_restored > 0) {
+    // A save the scan could not have seen is back on the card, so `reported` is
+    // already out of date -- and negotiating with it would report that save as
+    // absent, which RomM answers by planning a download over it. See
+    // `TickOutcome::kRescanNeeded`. Nothing has been written but the restore
+    // itself, and the caller scans again.
+    result.outcome = TickOutcome::kRescanNeeded;
+    return result;
   }
 
   if (Canceled(options.cancel)) {
@@ -183,6 +193,21 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
     return result;
   }
 
+  // Only now: nothing needs `.backup/` until an operation does, and a tick that
+  // never reached the server must not have written anything to the card.
+  if (options.create_backup_dir) {
+    const fs::MakeDirResult made = files.CreateDirectory(options.execute.backup_dir);
+    if (!made.ok() && result.recovered.warnings.size() < kMaxRecoveryWarnings) {
+      // Not fatal. Every operation that would overwrite a save fails with
+      // `kBackupFailed` further down -- no backup, no overwrite -- and an upload
+      // or a no-op does not need the directory at all, so a tick that can still
+      // do half its work does it. Bounded by the same cap the sweep's own lines
+      // are, because the list is the same list.
+      result.recovered.warnings.push_back("the backup directory " + options.execute.backup_dir +
+                                          " could not be created: " + made.message);
+    }
+  }
+
   ExecuteOptions execute = options.execute;
   execute.cancel = options.cancel;
   result.executed =
@@ -199,7 +224,7 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
 
   result.session_gone = SessionGone(result.finished.reported.error);
   result.outcome = OutcomeAfter(result.executed, result.finished);
-  result.answer = AnswerAfter(result.executed, result.finished);
+  result.answer = AnswerAfter(result.negotiated.error, result.executed, result.finished);
   return result;
 }
 

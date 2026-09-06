@@ -27,6 +27,23 @@ bool Synced(const std::string& path) {
   return hook == nullptr || hook(path);
 }
 
+/// The directory `path` is in, or empty when the path names no directory.
+///
+/// For the second half of durability: `rename` publishes a *name*, and on POSIX
+/// a name is not durable until the directory holding it is synced. Syncing the
+/// file's bytes alone leaves the window `CopyAtomically` exists to close -- a
+/// backup whose data landed and whose directory entry did not, followed by a
+/// save overwrite in a *different* directory that did.
+std::string DirectoryOf(const std::string& path) {
+  const std::string::size_type slash = path.find_last_of('/');
+  if (slash == std::string::npos) {
+    return {};
+  }
+  // A path directly under the root keeps the slash: `/` is the directory, `` is
+  // not a path at all.
+  return slash == 0 ? std::string("/") : path.substr(0, slash);
+}
+
 constexpr const char* kTempSuffix = ".tmp";
 constexpr const char* kPreviousSuffix = ".old";
 
@@ -144,6 +161,17 @@ WriteResult CommitStaged(const std::string& staged, const std::string& path) {
     return {WriteError::kCommitFailed, Describe(path, detail)};
   }
   std::remove(previous.c_str());
+
+  // Best effort, and after the fact on purpose: the rename has happened, so
+  // reporting a failure here would describe a commit that did not occur. What it
+  // buys is the *name* being as durable as the bytes already are -- see
+  // `DirectoryOf`. A platform whose hook commits the whole device (Horizon's
+  // does) has already done this and pays for it twice, which is cheaper than the
+  // alternative of a second hook nobody would remember to call.
+  const std::string directory = DirectoryOf(path);
+  if (!directory.empty()) {
+    Synced(directory);
+  }
   return {};
 }
 
@@ -159,8 +187,9 @@ WriteResult WriteAtomically(const std::string& path, std::string_view contents) 
   const std::size_t written = std::fwrite(contents.data(), 1, contents.size(), file);
   // The flush has to happen while the handle is still open: fclose reports a
   // failed flush too, but by then there is nothing left to distinguish "the
-  // bytes never left the buffer" from "the close itself failed". The sync has
-  // to happen there for a harder reason -- it needs the handle.
+  // bytes never left the buffer" from "the close itself failed". The sync comes
+  // after the close, by path, because that is the contract both platforms can
+  // hold (`FileSync`).
   const bool flushed = written == contents.size() && std::fflush(file) == 0;
   const bool closed = std::fclose(file) == 0;
   // After the close and before the commit below, which is the only ordering
@@ -250,7 +279,7 @@ CopyResult CopyAtomically(const std::string& from, const std::string& to) {
   // the card before the save they came from is overwritten. Syncing a temp file
   // that is about to be deleted would just be a slow way to fail.
   const bool synced = !short_write && flushed && closed && Synced(temp);
-  if (short_write || !flushed || !synced || !closed) {
+  if (short_write || !flushed || !closed || !synced) {
     std::remove(temp.c_str());
     result.error = CopyError::kWriteFailed;
     result.message = Describe(temp, "could not be written completely");

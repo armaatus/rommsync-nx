@@ -22,8 +22,8 @@ const char* ToString(MakeDirError error) {
   switch (error) {
     case MakeDirError::kNone:
       return "none";
-    case MakeDirError::kMissing:
-      return "missing";
+    case MakeDirError::kNotOnThisCard:
+      return "not on this card";
     case MakeDirError::kNotADirectory:
       return "not a directory";
     case MakeDirError::kUnwritable:

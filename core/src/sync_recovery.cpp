@@ -21,14 +21,6 @@
 namespace rommsync::sync {
 namespace {
 
-/// How many lines one sweep may hand up.
-///
-/// The same bound `state::kMaxDiagnostics` draws and for the same reason: a card
-/// that will not delete anything must cost a bounded amount of memory on a
-/// 512 KiB heap, not one string per file (core/AGENTS.md). The counts in
-/// `RecoveryReport` stay honest past it.
-constexpr std::size_t kMaxWarnings = 16;
-
 /// `.tmp`, `.old` and `.part`, taken from the functions that write them.
 ///
 /// `TempPathFor("")` is `".tmp"`. Deriving them is not cleverness for its own
@@ -56,7 +48,7 @@ bool EndsWith(std::string_view text, std::string_view suffix) {
 }
 
 void Warn(RecoveryReport* report, std::string line) {
-  if (report->warnings.size() < kMaxWarnings) {
+  if (report->warnings.size() < kMaxRecoveryWarnings) {
     report->warnings.push_back(std::move(line));
   }
 }
@@ -129,7 +121,14 @@ RecoveryReport RecoverStaging(fs::FileSystem& files,
       if (io::Exists(base)) {
         // The commit finished and only the tidy-up did not, so these are the
         // previous bytes -- which for a save are already under `.backup/`.
-        Discard(path, sd_path, &report.previous_removed, &report);
+        //
+        // **And they are still left alone.** This shape is indistinguishable
+        // from a `Game.srm.old` a human made by hand beside their `Game.srm`,
+        // and deleting that would be this code destroying a file it did not
+        // write. `io::CommitStaged` removes its own on success, so reaching here
+        // means even that failed -- one stale file, rarely, against the chance
+        // of taking someone's manual backup.
+        ++report.previous_left;
         continue;
       }
       // The destination does not exist, which is the one thing Horizon's rename

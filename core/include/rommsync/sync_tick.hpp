@@ -58,6 +58,14 @@
 
 namespace rommsync::sync {
 
+/// How many lines one sweep -- or one tick's preparation -- may hand up.
+///
+/// The same bound `state::kMaxDiagnostics` draws and for the same reason: a card
+/// that will not delete anything must cost a bounded amount of memory on a
+/// 512 KiB heap, not one string per file (core/AGENTS.md). The counts stay honest
+/// past it.
+inline constexpr std::size_t kMaxRecoveryWarnings = 16;
+
 /// What a sweep found, and what it did about it.
 ///
 /// Counts rather than paths: a card that comes back from a bad week can hold a
@@ -76,17 +84,27 @@ struct RecoveryReport {
   std::size_t saves_restored = 0;
 
   /// `<save>.old` beside a `<save>` that is there: a commit that finished and
-  /// did not tidy up. Removed.
-  std::size_t previous_removed = 0;
+  /// whose tidy-up did not.
+  ///
+  /// **Left alone, not removed**, which is the one place this sweep deliberately
+  /// does less than it could. It cannot tell that file from one a human named --
+  /// a `Game.srm.old` a user made by hand beside their `Game.srm` has exactly
+  /// the same shape -- and deleting it would be this code destroying something
+  /// it did not write. The cost of keeping it is one stale file, and a rare one:
+  /// `io::CommitStaged` removes its own on success, so reaching here means even
+  /// that failed.
+  std::size_t previous_left = 0;
 
   /// Leftovers the card would not let go of, and directories that would not
-  /// list. Never fatal -- a tick runs anyway, and the worst a survivor costs is
-  /// the space it takes and one more attempt next time.
+  /// list -- plus, when this is a tick's report rather than a bare sweep's,
+  /// anything else the tick's preparation could not do. Never fatal: a tick runs
+  /// anyway, and the worst a survivor costs is the space it takes and one more
+  /// attempt next time.
   std::vector<std::string> warnings;
 
-  std::size_t total() const {
-    return partials_removed + staged_removed + saves_restored + previous_removed;
-  }
+  /// Leftovers this sweep acted on. `previous_left` is not in it: nothing
+  /// happened to those.
+  std::size_t total() const { return partials_removed + staged_removed + saves_restored; }
 };
 
 /// Sweep `directories` for what an interrupted tick leaves beside a save.
@@ -101,9 +119,17 @@ struct RecoveryReport {
 /// a rom is a M3-3 range-resume in progress and deleting it would throw away a
 /// gigabyte of a transfer that was going to finish.
 ///
-/// `directories` are SD-root paths and are listed, not walked: the save folders
-/// from the config's map, plus `/config/rommsync` and its `.backup/`. Nothing
-/// recurses, for the reason `fs::FileSystem` gives.
+/// `directories` are SD-root paths and are listed, not walked. Nothing recurses,
+/// for the reason `fs::FileSystem` gives.
+///
+/// **What to pass is the save folders and `.backup/`, and not `/config/rommsync`
+/// itself.** The records there -- `token.dat`, `device.dat`, `config.ini`,
+/// `state.db` -- already recover from their own `.old` when they are read, so
+/// there is nothing here to add; and the overlay writes `config.ini` from
+/// another thread (M5-3), where a sweep that removed a `.tmp` between the write
+/// and its rename would cost a setting the user had just changed. Sweeping only
+/// directories nothing else writes to is the whole reason this takes a list
+/// rather than deciding for itself.
 RecoveryReport RecoverStaging(fs::FileSystem& files,
                               const std::vector<std::string>& directories);
 
@@ -116,15 +142,19 @@ enum class TickOutcome {
   /// for.
   kCompleted,
 
-  /// It ran, and some operations did not do what the plan asked. The saves
-  /// involved were left alone and the next negotiation plans them again. Not a
-  /// reason to retry sooner: there is no retry inside a tick, deliberately
-  /// (sync_execute.hpp).
+  /// It ran, and something in it did not happen: an operation that did not do
+  /// what the plan asked, or the baseline failing to reach the card. The saves
+  /// involved were left alone and the next negotiation plans them again -- and a
+  /// lost baseline costs the next tick a re-hash of the library, which is time
+  /// rather than correctness. Not a reason to retry sooner: there is no retry
+  /// inside a tick, deliberately (sync_execute.hpp).
   kPartial,
 
-  /// The transfers landed and the accounting did not. The baseline is on the
-  /// card -- `FinishTick` writes it first, on purpose -- so this costs a row in
-  /// a history a user reads and nothing else.
+  /// The transfers landed and the accounting did not, **and the baseline did
+  /// reach the card** -- `FinishTick` writes it first, on purpose, and this
+  /// outcome is only chosen once that is known to have worked. So it costs a row
+  /// in a history a user reads and nothing else. A tick that lost both halves is
+  /// `kPartial`, because the baseline is the expensive one.
   kUnreported,
 
   /// The negotiation never completed: offline, stalled, reset, or a 5xx.
@@ -144,6 +174,23 @@ enum class TickOutcome {
   /// The caller's `http::CancelToken` fired. Not a failure of anything: the tick
   /// stopped at a boundary and what it had done stands.
   kCanceled,
+
+  /// The sweep put a save back that the scan could not have seen, so this tick's
+  /// `reported` is already out of date. **Nothing was negotiated.**
+  ///
+  /// A `<save>.old` with no `<save>` beside it is restored on entry (see
+  /// `RecoverStaging`), and step 0 ran before that -- the scan is the caller's
+  /// and its output is this call's argument. Negotiating anyway would report the
+  /// restored save as *absent*, and RomM answers "absent" with a plan to
+  /// download its own copy over it: the local bytes would be backed up and
+  /// replaced without the conflict arbitration they were owed. The client would
+  /// have decided a conflict by omission, which is the one thing it may never do
+  /// (docs/SYNC_PROTOCOL.md#principle-the-server-is-the-source-of-truth).
+  ///
+  /// So the tick stops and the caller scans again and runs another. That costs a
+  /// tick, which is harmless, and it only ever happens after a crash mid-commit.
+  /// A caller that sweeps *before* it scans never sees this.
+  kRescanNeeded,
 };
 
 /// Stable, log-friendly name. Never null.
@@ -156,7 +203,14 @@ const char* ToString(TickOutcome outcome);
 /// backs off, and widening `ShouldRetry` is explicitly not this module's to do.
 struct TickOptions {
   /// Swept by `RecoverStaging` before anything else happens. Empty means no
-  /// sweep, which is only right for a caller that has just done one.
+  /// sweep.
+  ///
+  /// **The better order is to sweep before step 0 and leave this empty**, and a
+  /// caller that can scan cheaply should: the sweep can put back a save the scan
+  /// would then find, where a sweep *after* the scan leaves this call holding a
+  /// `reported` that predates it. `RunTick` handles that rather than pretending
+  /// otherwise -- it stops with `TickOutcome::kRescanNeeded` -- but stopping
+  /// costs a tick that scanning in the right order does not.
   std::vector<std::string> recover_dirs;
 
   /// Create `execute.backup_dir` on entry if it is not there.
@@ -165,6 +219,11 @@ struct TickOptions {
   /// `OperationError::kBackupFailed` -- correctly, because no backup means no
   /// overwrite. `fs::FileSystem::CreateDirectory` is the platform facility that
   /// closes that, and running it every tick costs one stat.
+  ///
+  /// It runs **after** the negotiation, not before it. Nothing needs the
+  /// directory until an operation does, and an offline tick that created one
+  /// would be a tick that wrote something on a card it never got to sync --
+  /// which is the one thing the offline case promises not to do.
   ///
   /// A failure is a line in `TickResult::recovered.warnings` rather than the end
   /// of the tick: an upload and a no-op do not need the directory at all, and

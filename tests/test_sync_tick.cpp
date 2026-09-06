@@ -129,7 +129,7 @@ bool LocalSaveOnCard(rig::Checks& checks, fs::FileSystem& files, const Sandbox& 
 /// has nothing to reason about.
 void NoLeftovers(rig::Checks& checks, const Sandbox& sandbox, const std::string& sd_path,
                  const std::string& what) {
-  checks.Expect(!sandbox.Exists(io::TempPathFor(sd_path) + ".part"),
+  checks.Expect(!sandbox.Exists(http::PartialPathFor(io::TempPathFor(sd_path))),
                 what + ": no partial body beside " + sd_path);
   checks.Expect(!sandbox.Exists(io::TempPathFor(sd_path)),
                 what + ": no staged copy beside " + sd_path);
@@ -164,20 +164,26 @@ int SaveRowsFor(http::HttpClient& client, const std::string& base, const Fixture
   return rows;
 }
 
-/// Every file under the sandbox, path -> bytes. What "wrote nothing at all" is
-/// checked against.
+/// Everything under the sandbox: path -> bytes for a file, and a marker for a
+/// directory. What "wrote nothing at all" is checked against.
+///
+/// Directories are in it because one of the things an offline tick must not do
+/// is *create* one -- `RunTick` makes `.backup/` on entry, and a snapshot of
+/// files alone could not tell that apart from nothing having happened.
 std::map<std::string, std::string> Snapshot(const Sandbox& sandbox) {
-  std::map<std::string, std::string> files;
+  std::map<std::string, std::string> tree;
   std::error_code error;
   for (const std::filesystem::directory_entry& entry :
        std::filesystem::recursive_directory_iterator(sandbox.root(), error)) {
-    if (!entry.is_regular_file(error)) {
-      continue;
+    const std::string name =
+        std::filesystem::relative(entry.path(), sandbox.root(), error).string();
+    if (entry.is_directory(error)) {
+      tree[name] = "<directory>";
+    } else if (entry.is_regular_file(error)) {
+      tree[name] = rig::ReadFile(entry.path().string());
     }
-    files[std::filesystem::relative(entry.path(), sandbox.root(), error).string()] =
-        rig::ReadFile(entry.path().string());
   }
-  return files;
+  return tree;
 }
 
 // --- recovery -----------------------------------------------------------------
@@ -198,7 +204,7 @@ void Recovery(rig::Checks& checks) {
   const std::string kept = "the save the card already had\n";
   sandbox.SeedSave(SavePath("kept.srm"), kept);
   sandbox.Write(io::TempPathFor(SavePath("kept.srm")), "an unverified body\n");
-  sandbox.Write(io::TempPathFor(SavePath("kept.srm")) + ".part", "half an unverified body");
+  sandbox.Write(http::PartialPathFor(io::TempPathFor(SavePath("kept.srm"))), "half an unverified body");
 
   // A save whose commit was interrupted between its two renames: the file is
   // *missing* and `.old` is the only copy of it. This is the one leftover that
@@ -210,7 +216,9 @@ void Recovery(rig::Checks& checks) {
 
   // A commit that finished and did not tidy up: the new bytes are in place, the
   // previous ones are under `.backup/` where the overwrite put them, and the
-  // `.old` beside the save is the copy that is now redundant.
+  // `.old` beside the save is the copy that is now redundant -- and is *still*
+  // left alone, because a `Game.srm.old` a human made by hand has exactly this
+  // shape and this code does not delete files it did not write.
   const std::string before = "what this save used to hold\n";
   const std::string after = "what the server sent\n";
   sandbox.SeedSave(SavePath("moved.srm"), before);
@@ -237,8 +245,9 @@ void Recovery(rig::Checks& checks) {
                   "and so was the staged copy nothing had verified");
   checks.ExpectEq(report.saves_restored, static_cast<std::size_t>(1),
                   "the parked save was put back, because it was the only copy");
-  checks.ExpectEq(report.previous_removed, static_cast<std::size_t>(1),
-                  "and the redundant one beside a finished commit was dropped");
+  checks.ExpectEq(report.previous_left, static_cast<std::size_t>(1),
+                  "and the redundant one beside a finished commit was counted and left: it is "
+                  "indistinguishable from a backup a user made by hand");
 
   checks.ExpectEq(sandbox.Read(SavePath("kept.srm")), kept,
                   "the save the staging sat beside is untouched");
@@ -251,8 +260,8 @@ void Recovery(rig::Checks& checks) {
 
   checks.ExpectEq(sandbox.Read(SavePath("moved.srm")), after,
                   "the finished commit's own bytes stand");
-  checks.Expect(!sandbox.Exists(io::PreviousPathFor(SavePath("moved.srm"))),
-                "and its redundant previous copy is gone");
+  checks.ExpectEq(sandbox.Read(io::PreviousPathFor(SavePath("moved.srm"))), before,
+                  "and the file beside it is untouched, bytes and all");
 
   // The rule the sweep must never break: a backup is the copy M7-1 restores
   // from, including one written for an overwrite that then failed.
@@ -265,7 +274,9 @@ void Recovery(rig::Checks& checks) {
   // from a bad week runs it twice in a minute.
   const sync::RecoveryReport again = sync::RecoverStaging(*files, {harness::kSavesDir});
   checks.ExpectEq(again.total(), static_cast<std::size_t>(0),
-                  "a second sweep finds nothing, having left nothing");
+                  "a second sweep acts on nothing, having left nothing to act on");
+  checks.ExpectEq(again.previous_left, static_cast<std::size_t>(1),
+                  "...and reports the one file it will never act on, every time");
 }
 
 // --- durable ------------------------------------------------------------------
@@ -275,21 +286,20 @@ void Recovery(rig::Checks& checks) {
 // published them could be durable while the bytes themselves were not -- a
 // backup that reads as present and holds nothing.
 
-/// A `FileSync` that counts, and records what was already on the card when it
-/// ran. `published` is what proves the ordering: the sync has to happen *before*
-/// the rename, so the destination must not exist yet.
-int g_syncs = 0;
-bool g_published_before_sync = false;
+/// A `FileSync` that records the sequence: which path, and whether the file the
+/// commit is about to publish already existed at that moment.
+///
+/// The second half is what proves the ordering, and it is the whole point of the
+/// hook: the bytes have to be synced *before* the rename publishes them, so on
+/// the first call the destination must not be there yet.
+std::vector<std::string> g_synced;
+std::vector<bool> g_published;
 std::string g_watched;
-std::string g_last_synced;
 bool g_refuse = false;
 
 bool CountingFileSync(const std::string& path) {
-  ++g_syncs;
-  g_last_synced = path;
-  if (!g_watched.empty() && io::Exists(g_watched)) {
-    g_published_before_sync = true;
-  }
+  g_synced.push_back(path);
+  g_published.push_back(!g_watched.empty() && io::Exists(g_watched));
   // The real `fsync` is `InstallPosixFileSync`'s and is put back below; what
   // this stands in for is the *answer*, which is the only thing the writers
   // act on.
@@ -304,20 +314,27 @@ void Durable(rig::Checks& checks) {
   sandbox.Write(SavePath("durable.srm"), bytes);
 
   const io::FileSync installed = io::GetFileSync();
-  g_syncs = 0;
-  g_published_before_sync = false;
+  g_synced.clear();
+  g_published.clear();
   g_watched = backup;
   g_refuse = false;
   io::SetFileSync(&CountingFileSync);
 
   const io::CopyResult copied = io::CopyAtomically(save, backup);
   checks.Expect(copied.ok(), "the backup was written: " + copied.message);
-  checks.ExpectEq(g_syncs, 1, "and its bytes were put on the card exactly once");
-  checks.ExpectEq(g_last_synced, io::TempPathFor(backup),
-                  "the staged copy is what was synced, which is the file the rename publishes");
-  checks.Expect(!g_published_before_sync,
-                "before the rename that publishes them, which is the whole ordering: a backup "
-                "whose name landed and whose data did not is the state hard rule 2 rules out");
+  checks.ExpectEq(g_synced.size(), static_cast<std::size_t>(2),
+                  "durability is two calls, not one: the bytes, and then the name");
+  if (g_synced.size() == 2) {
+    checks.ExpectEq(g_synced[0], io::TempPathFor(backup),
+                    "the staged copy is synced first, which is the file the rename publishes");
+    checks.Expect(!g_published[0],
+                  "before that rename, which is the whole ordering: a backup whose name landed "
+                  "and whose data did not is the state hard rule 2 rules out");
+    checks.ExpectEq(g_synced[1], std::string(sandbox.Host(harness::kBackupDir)),
+                    "and the directory second, because on POSIX a rename is not durable until "
+                    "the directory holding the new name is");
+    checks.Expect(g_published[1], "which can only be after it -- there is a name to make durable");
+  }
   checks.ExpectEq(rig::ReadFile(backup), bytes, "and the backup holds the save's bytes");
 
   // A hook that refuses is a card that would not take the bytes, and a backup
@@ -334,11 +351,13 @@ void Durable(rig::Checks& checks) {
   // The same seam for the small records `WriteAtomically` owns -- `state.db` and
   // `token.dat` -- rather than a second one beside it.
   g_refuse = false;
-  g_syncs = 0;
+  g_synced.clear();
+  g_published.clear();
   const io::WriteResult written =
       io::WriteAtomically(sandbox.Host("/config/rommsync/durable.txt"), "a small record\n");
   checks.Expect(written.ok(), "a small record is written: " + written.message);
-  checks.ExpectEq(g_syncs, 1, "through the same hook, not a second copy of it");
+  checks.ExpectEq(g_synced.size(), static_cast<std::size_t>(2),
+                  "through the same hook and the same two calls, not a second copy of either");
 
   io::SetFileSync(installed);
   checks.Expect(io::GetFileSync() != nullptr,
@@ -389,7 +408,7 @@ void BackupDir(rig::Checks& checks) {
 
   // A path off this card is a refusal, not a directory made somewhere else.
   const fs::MakeDirResult escaped = files->CreateDirectory("/config/../../elsewhere");
-  checks.Expect(escaped.error == fs::MakeDirError::kMissing,
+  checks.Expect(escaped.error == fs::MakeDirError::kNotOnThisCard,
                 std::string("a path that escapes the card is refused: ") +
                     fs::ToString(escaped.error));
 }
@@ -399,6 +418,24 @@ void BackupDir(rig::Checks& checks) {
 // The acceptance this issue is sharpest about: with RomM unreachable a tick
 // writes **nothing at all** -- no backup, no `.part`, no `state.db` rewrite --
 // and the missed tick costs nothing. A blocked boot would.
+
+/// An `HttpClient` that answers nothing and counts what it was asked.
+class CountingClient final : public http::HttpClient {
+ public:
+  http::Result Send(const http::Request&) override {
+    ++requests;
+    http::Result result;
+    result.error = http::Error::kConnectFailed;
+    result.message = "there is no server in this scenario";
+    return result;
+  }
+
+  http::Result Download(const http::Request& request, const http::DownloadTarget&) override {
+    return Send(request);
+  }
+
+  int requests = 0;
+};
 
 /// A port on loopback with nothing behind it. Not a name that could resolve to
 /// something real: `policy.loopback_only` exists because a test that reaches a
@@ -426,6 +463,12 @@ void Offline(rig::Checks& checks) {
   const state::StoreResult seeded =
       state::SaveBaseline(files->Resolve(sync::kStateSdPath), baseline);
   checks.Expect(seeded.ok(), "the baseline was seeded: " + seeded.message);
+
+  // The sandbox makes `.backup/` for every other scenario. Taking it away is what
+  // makes "no directory was created either" a claim rather than a coincidence:
+  // `RunTick` creates that folder, and it does so only *after* a negotiation.
+  std::error_code error;
+  std::filesystem::remove_all(sandbox.Host(harness::kBackupDir), error);
 
   const std::map<std::string, std::string> before = Snapshot(sandbox);
 
@@ -461,13 +504,96 @@ void Offline(rig::Checks& checks) {
   checks.ExpectEq(tick.finished.reported.attempts, 0,
                   "and the accounting call was never made: there was no session to close");
 
-  // The claim, made against the card rather than against the report.
+  // The claim, made against the card rather than against the report. Directories
+  // are in the snapshot too, so "`.backup/` was not created" is part of it.
   const std::map<std::string, std::string> after = Snapshot(sandbox);
   checks.Expect(before == after,
                 "the tick left the card byte-for-byte as it found it: no backup, no partial, no "
                 "state.db rewrite");
   NoLeftovers(checks, sandbox, SavePath("offline.srm"), "after an offline tick");
   checks.ExpectEq(sandbox.Read(SavePath("offline.srm")), bytes, "and the save is what it was");
+  checks.Expect(!sandbox.Exists(harness::kBackupDir),
+                "not even the backup directory: nothing needs one until an operation does, and "
+                "this tick never reached the server");
+
+  // The other half of the same reading, and the one the acceptance does not
+  // spell out: an offline tick still *sweeps*. It runs before the network and
+  // only removes litter, so it is right to do on a tick that turns out to have
+  // nowhere to go -- and it still writes no backup and does not rewrite the
+  // baseline.
+  sandbox.Write(http::PartialPathFor(io::TempPathFor(SavePath("offline.srm"))), "half a body");
+  const std::string baseline_before = sandbox.Read(sync::kStateSdPath);
+
+  const sync::TickResult sweeping =
+      sync::RunTick(*rommsync::host::MakeCurlHttpClient(), *files, token, {local}, targets,
+                    baseline, options);
+  checks.Expect(sweeping.outcome == sync::TickOutcome::kOffline,
+                std::string("the second offline tick is offline too: ") +
+                    sync::ToString(sweeping.outcome));
+  checks.ExpectEq(sweeping.recovered.partials_removed, static_cast<std::size_t>(1),
+                  "and it swept the interrupted body on its way in");
+  checks.Expect(!sandbox.HasBackupOf(bytes),
+                "with no backup written, because nothing was overwritten");
+  checks.ExpectEq(sandbox.Read(sync::kStateSdPath), baseline_before,
+                  "and the baseline is byte-for-byte what it was");
+}
+
+// --- rescan -------------------------------------------------------------------
+//
+// The one thing the sweep does that the *rest* of the tick cannot survive: it
+// puts back a save the scan could not have seen. Step 0 ran before this call --
+// its output is the argument -- so negotiating with it would report the restored
+// save as absent, and RomM answers "absent" by planning a download of its own
+// copy over it. The client would have decided a conflict by leaving a save out
+// of the report, which is the one thing it may never do.
+
+void Rescan(rig::Checks& checks) {
+  Sandbox sandbox(checks, "tick-rescan");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+
+  const std::string parked = "the only copy, moved aside mid-commit\n";
+  sandbox.SeedSave(SavePath("parked.srm"), parked);
+  std::error_code moved;
+  std::filesystem::rename(sandbox.Host(SavePath("parked.srm")),
+                          sandbox.Host(io::PreviousPathFor(SavePath("parked.srm"))), moved);
+
+  auth::StoredToken token;
+  token.server_url = kNowhere;
+  token.access_token = "not-a-token";
+  token.device_id = "fixture-rescan";
+
+  sync::TickOptions options = OptionsAt(1'757'000'150);
+  Impatient(&options);
+
+  // A client that would answer every request, so "no request was made" is the
+  // tick's decision rather than the network's.
+  CountingClient client;
+  const sync::TickResult tick =
+      sync::RunTick(client, *files, token, {}, {}, /*previous=*/{}, options);
+
+  checks.Expect(tick.outcome == sync::TickOutcome::kRescanNeeded,
+                std::string("a restored save stops the tick rather than negotiating without it: ") +
+                    sync::ToString(tick.outcome));
+  checks.ExpectEq(client.requests, 0,
+                  "before any request, so nothing was planned against a stale report");
+  checks.ExpectEq(tick.recovered.saves_restored, static_cast<std::size_t>(1),
+                  "and the save is the thing that was put back");
+  checks.ExpectEq(sandbox.Read(SavePath("parked.srm")), parked, "it is on the card again");
+  checks.Expect(!sandbox.Exists(io::PreviousPathFor(SavePath("parked.srm"))),
+                "and nothing is left under the previous name");
+  checks.Expect(!sandbox.HasBackupOf(parked),
+                "with no backup, because nothing was overwritten to need one");
+
+  // The next tick, with the scan redone -- here, simply a sweep that finds
+  // nothing left to restore. It gets past the sweep and fails on the network,
+  // which is the point: the stop is about the report being stale, not about
+  // there being something wrong with the card.
+  const sync::TickResult next =
+      sync::RunTick(client, *files, token, {}, {}, /*previous=*/{}, options);
+  checks.Expect(next.outcome == sync::TickOutcome::kOffline,
+                std::string("a rescanned tick runs: ") + sync::ToString(next.outcome));
+  checks.Expect(client.requests > 0, "and reaches the network this time");
 }
 
 // --- canceled -----------------------------------------------------------------
@@ -478,24 +604,6 @@ void Offline(rig::Checks& checks) {
 // no request at all -- on the link whose loss is usually why the shutdown
 // happened.
 
-/// An `HttpClient` that answers nothing and counts what it was asked.
-class CountingClient final : public http::HttpClient {
- public:
-  http::Result Send(const http::Request&) override {
-    ++requests;
-    http::Result result;
-    result.error = http::Error::kConnectFailed;
-    result.message = "there is no server in this scenario";
-    return result;
-  }
-
-  http::Result Download(const http::Request& request, const http::DownloadTarget&) override {
-    return Send(request);
-  }
-
-  int requests = 0;
-};
-
 void Canceled(rig::Checks& checks) {
   Sandbox sandbox(checks, "tick-canceled");
   const std::unique_ptr<fs::FileSystem> files =
@@ -505,7 +613,7 @@ void Canceled(rig::Checks& checks) {
 
   // A leftover, so "recovery did not run either" is checkable. A cancelled tick
   // stops before the sweep: the caller asked for nothing to happen.
-  sandbox.Write(io::TempPathFor(SavePath("canceled.srm")) + ".part", "half a body");
+  sandbox.Write(http::PartialPathFor(io::TempPathFor(SavePath("canceled.srm"))), "half a body");
 
   auth::StoredToken token;
   token.server_url = kNowhere;
@@ -529,7 +637,7 @@ void Canceled(rig::Checks& checks) {
                   "and costs no request -- three timeouts plus two backoffs is what this saves");
   checks.ExpectEq(stopped.recovered.total(), static_cast<std::size_t>(0),
                   "nothing was swept either: the caller asked for nothing to happen");
-  checks.Expect(sandbox.Exists(io::TempPathFor(SavePath("canceled.srm")) + ".part"),
+  checks.Expect(sandbox.Exists(http::PartialPathFor(io::TempPathFor(SavePath("canceled.srm")))),
                 "so the leftover is still there for the next tick to deal with");
 
   // The same tick with the token unfired reaches the network, which is what
@@ -684,10 +792,14 @@ void NegotiateFault(rig::Checks& checks, http::HttpClient& client, const std::st
 // computes at ingest (issue #85). There is no retry inside a tick precisely so
 // that a lost response costs a tick rather than a second row.
 
+/// `rows_expected` is the row count on the server when the scenario is over --
+/// after the second tick, when `then_normally` asks for one. That second tick is
+/// the acceptance's "and the next tick runs normally", which a scenario that
+/// stopped at the failure would not have checked.
 void UploadFault(rig::Checks& checks, http::HttpClient& client, const std::string& base,
                  const Fixture& fixture, const harness::Rom& rom, const std::string& spec,
                  sync::OperationOutcome outcome, sync::OperationError error, int rows_expected,
-                 const std::string& what) {
+                 bool then_normally, const std::string& what) {
   Sandbox sandbox(checks, "tick-upload");
   const std::unique_ptr<fs::FileSystem> files =
       rommsync::host::MakeNativeFileSystem(sandbox.root().string());
@@ -724,6 +836,22 @@ void UploadFault(rig::Checks& checks, http::HttpClient& client, const std::strin
 
   SaveSurvived(checks, sandbox, arranged.name, arranged.bytes, what);
 
+  if (then_normally) {
+    // The fault has disarmed itself with the scope above, so this is the next
+    // schedule with nothing wrong: a tick that wedged rather than timed out
+    // would not get here at all.
+    const sync::TickResult next =
+        sync::RunTick(client, *files, TokenFor(base, fixture), {arranged.local},
+                      arranged.targets, /*previous=*/{}, OptionsAt(1'757'000'401));
+    checks.Expect(next.outcome == sync::TickOutcome::kCompleted,
+                  what + ": and the next tick runs normally: " + sync::ToString(next.outcome) +
+                      (next.executed.warnings.empty() ? std::string()
+                                                      : " -- " + next.executed.warnings[0]));
+    checks.ExpectEq(next.executed.completed, 1, what + ": doing the work the damaged one did not");
+    SaveSurvived(checks, sandbox, arranged.name, arranged.bytes,
+                 what + ", after the next tick");
+  }
+
   // The row count is the point. One means the upload landed and the client was
   // right not to send it again; zero means it never left.
   std::vector<std::int64_t> ids;
@@ -744,7 +872,7 @@ void UploadFault(rig::Checks& checks, http::HttpClient& client, const std::strin
 
 void DownloadFault(rig::Checks& checks, http::HttpClient& client, const std::string& base,
                    const Fixture& fixture, const harness::Rom& rom, const std::string& mode,
-                   sync::OperationError error, const std::string& what) {
+                   sync::OperationError error, bool then_normally, const std::string& what) {
   Sandbox sandbox(checks, "tick-download");
   const std::unique_ptr<fs::FileSystem> files =
       rommsync::host::MakeNativeFileSystem(sandbox.root().string());
@@ -793,6 +921,22 @@ void DownloadFault(rig::Checks& checks, http::HttpClient& client, const std::str
   }
 
   SaveSurvived(checks, sandbox, arranged.name, arranged.previous, what);
+
+  if (then_normally) {
+    const sync::TickResult next =
+        sync::RunTick(client, *files, TokenFor(base, fixture), {arranged.local},
+                      arranged.targets, /*previous=*/{}, OptionsAt(1'757'000'501));
+    checks.Expect(next.outcome == sync::TickOutcome::kCompleted,
+                  what + ": and the next tick runs normally: " + sync::ToString(next.outcome) +
+                      (next.executed.warnings.empty() ? std::string()
+                                                      : " -- " + next.executed.warnings[0]));
+    checks.ExpectEq(sandbox.Read(SavePath(arranged.name)), arranged.server_bytes,
+                    what + ": with the server's bytes on the card");
+    checks.Expect(sandbox.HasBackupOf(arranged.previous),
+                  what + ": and the bytes it replaced under .backup/");
+    NoLeftovers(checks, sandbox, SavePath(arranged.name), what + ", after the next tick");
+  }
+
   harness::DeleteSave(client, base, fixture, arranged.server.id);
 }
 
@@ -857,7 +1001,7 @@ void DownloadRevoked(rig::Checks& checks, http::HttpClient& client, const std::s
 
 void CompleteFault(rig::Checks& checks, http::HttpClient& client, const std::string& base,
                    const Fixture& fixture, const harness::Rom& rom, const std::string& spec,
-                   const std::string& what) {
+                   bool then_normally, const std::string& what) {
   Sandbox sandbox(checks, "tick-complete");
   const std::unique_ptr<fs::FileSystem> files =
       rommsync::host::MakeNativeFileSystem(sandbox.root().string());
@@ -892,6 +1036,23 @@ void CompleteFault(rig::Checks& checks, http::HttpClient& client, const std::str
   }
 
   SaveSurvived(checks, sandbox, arranged.name, arranged.bytes, what);
+
+  if (then_normally) {
+    // The save is already on the server *with* this device's sync row -- the
+    // upload carried `device_id` -- so the next negotiation plans nothing for
+    // it. "Runs normally" is exactly that: a tick that completes, having found
+    // there is no work, rather than one that re-uploads what the lost accounting
+    // makes look unsent.
+    const sync::TickResult next =
+        sync::RunTick(client, *files, TokenFor(base, fixture), {arranged.local},
+                      arranged.targets, /*previous=*/{}, OptionsAt(1'757'000'701));
+    checks.Expect(next.outcome == sync::TickOutcome::kCompleted,
+                  what + ": and the next tick runs normally: " + sync::ToString(next.outcome) +
+                      (next.executed.warnings.empty() ? std::string()
+                                                      : " -- " + next.executed.warnings[0]));
+    checks.ExpectEq(next.executed.failed, 0, what + ": with nothing failed on the way");
+  }
+
   std::vector<std::int64_t> ids;
   SaveRowsFor(client, base, fixture, rom.id, arranged.slot, &ids);
   for (const std::int64_t id : ids) {
@@ -990,7 +1151,7 @@ int main(int argc, char** argv) {
 
   // The five that need no server, so they stay checked with docker stopped.
   if (scenario == "recovery" || scenario == "durable" || scenario == "backupdir" ||
-      scenario == "offline" || scenario == "canceled") {
+      scenario == "offline" || scenario == "rescan" || scenario == "canceled") {
     if (scenario == "recovery") {
       Recovery(checks);
     } else if (scenario == "durable") {
@@ -999,6 +1160,8 @@ int main(int argc, char** argv) {
       BackupDir(checks);
     } else if (scenario == "offline") {
       Offline(checks);
+    } else if (scenario == "rescan") {
+      Rescan(checks);
     } else {
       Canceled(checks);
     }
@@ -1050,7 +1213,7 @@ int main(int argc, char** argv) {
     UploadFault(checks, *client, base, fixture, rom,
                 R"({"mode":"status","status":500,"path":"/api/saves","count":4})",
                 sync::OperationOutcome::kFailed, sync::OperationError::kRefused, 0,
-                "a 500 at an upload");
+                /*then_normally=*/false, "a 500 at an upload");
   } else if (scenario == "upload_truncate") {
     // A clean short 200. The save *is* on the server -- the proxy cuts the
     // response, not the request -- so the operation is deliberately a success
@@ -1059,7 +1222,7 @@ int main(int argc, char** argv) {
     UploadFault(checks, *client, base, fixture, rom,
                 R"({"mode":"truncate","bytes":8,"path":"/api/saves"})",
                 sync::OperationOutcome::kUploaded, sync::OperationError::kNone, 1,
-                "a truncated upload response");
+                /*then_normally=*/false, "a truncated upload response");
   } else if (scenario == "upload_drop") {
     // The other half of the same story, and the reason there is no retry inside
     // a tick: the row exists and the client cannot know it. It counts the
@@ -1068,30 +1231,32 @@ int main(int argc, char** argv) {
     UploadFault(checks, *client, base, fixture, rom,
                 R"({"mode":"drop","bytes":4,"path":"/api/saves"})",
                 sync::OperationOutcome::kFailed, sync::OperationError::kTransferFailed, 1,
+                /*then_normally=*/false,
                 "a reset while the upload response was arriving");
   } else if (scenario == "upload_stall") {
     // The proxy sleeps before forwarding, so this upload never reaches RomM at
     // all -- a stalled request costs the tick and nothing else.
     UploadFault(checks, *client, base, fixture, rom,
                 R"({"mode":"stall","seconds":3,"path":"/api/saves"})",
-                sync::OperationOutcome::kFailed, sync::OperationError::kTransferFailed, 0,
-                "a stall at an upload");
+                sync::OperationOutcome::kFailed, sync::OperationError::kTransferFailed,
+                /*rows_expected=*/1, /*then_normally=*/true, "a stall at an upload");
   } else if (scenario == "download_5xx") {
     DownloadFault(checks, *client, base, fixture, rom, "status", sync::OperationError::kRefused,
-                  "a 500 at a download");
+                  /*then_normally=*/false, "a 500 at a download");
   } else if (scenario == "download_stall") {
     DownloadFault(checks, *client, base, fixture, rom, "stall",
-                  sync::OperationError::kTransferFailed, "a stall at a download");
+                  sync::OperationError::kTransferFailed, /*then_normally=*/true,
+                  "a stall at a download");
   } else if (scenario == "download_401") {
     DownloadRevoked(checks, *client, base, fixture, rom);
   } else if (scenario == "complete_drop") {
     CompleteFault(checks, *client, base, fixture, rom,
                   R"({"mode":"drop","bytes":4,"path":"/api/sync/sessions","count":9})",
-                  "a reset at complete");
+                  /*then_normally=*/false, "a reset at complete");
   } else if (scenario == "complete_stall") {
     CompleteFault(checks, *client, base, fixture, rom,
                   R"({"mode":"stall","seconds":3,"path":"/api/sync/sessions","count":9})",
-                  "a stall at complete");
+                  /*then_normally=*/true, "a stall at complete");
   } else if (scenario == "resumes") {
     Resumes(checks, *client, base, fixture, rom);
   } else {

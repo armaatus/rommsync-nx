@@ -153,7 +153,7 @@ class NativeFileSystem final : public fs::FileSystem {
     fs::MakeDirResult result;
     std::filesystem::path resolved;
     if (!ResolveUnderRoot(root_, sd_path, &resolved)) {
-      result.error = fs::MakeDirError::kMissing;
+      result.error = fs::MakeDirError::kNotOnThisCard;
       result.message = std::string(sd_path) + ": not a path on this card";
       return result;
     }
