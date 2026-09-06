@@ -263,8 +263,8 @@ ctest --test-dir build --output-on-failure
   a rate-limited init out rather than failing on it. The wait is bounded, so an
   init broken for any other reason still goes red.
 - The `device.*` tests cover registering the console (M1-3): `shapes`,
-  `registered`, `repair`, `recovers`, `deleted`, `revoked`, `sync_disabled`,
-  `offline`, `impostor`, `never_post`. All but `shapes` need the rig, and they
+  `registered`, `repair`, `recovers`, `deleted`, `revoked`, `forbidden`,
+  `sync_disabled`, `offline`, `impostor`, `never_post`. All but `shapes` need the rig, and they
   need it for a reason no client-side test can substitute for: "pairing twice
   leaves one device, not two" is a claim about what RomM does with a
   `client_device_identifier`, so they list `GET /api/devices` **as the fixture
@@ -291,6 +291,25 @@ ctest --test-dir build --output-on-failure
   token or device code appears in any message this code can produce, by running
   every failure path with a distinctive needle in the record and searching the
   output for it.
+- The `auth.gate_*` tests cover M1-4: what a rejected call means once you count
+  them — `answers`, `counts`, `backoff`, `persists`. They need no server, and
+  that is deliberate rather than a convenience: RomM issues no refresh token, so
+  there is nothing to refresh and what is left is arithmetic over answers. The
+  decision they hold is the one standing between a proxy hiccup and a console
+  sent to the pairing screen, so it stays checked with Docker stopped. The
+  live-server half of the same claim is `harness.expired`, which shows a real
+  5.2.0 answering one `401` mid-flow and then accepting the very same token —
+  which is *why* `auth::Gate` counts rather than acting on the first one.
+  `answers` is the one that keeps the rest honest: it asserts every classified
+  error enum (`sync::NegotiateError`, `sync::CompleteError`,
+  `sync::OperationError`, `auth::RegistrationError`, `download::DrainOutcome`)
+  maps to the same `auth::Answer` a raw status would, so a `403` cannot arrive as
+  a revocation from one path and a missing scope from another. Three rig
+  scenarios carry the parts only a server can show: `device.forbidden` (a `403`
+  is a scope, not a revoked token), `execute.revoked` (a `401` on the first of
+  two uploads leaves the second unattempted and touches no save) and
+  `complete.revoked` (a `401` mid-tick leaves `state.db` byte-for-byte as it was,
+  with `operations_failed` = 1).
 - `core.device_identity` covers `device.dat` and the `client_device_identifier`
   under it: the SHA-256 against FIPS 180-4's published vectors and against the
   block-boundary lengths the padding gets wrong, and then the property that
@@ -374,7 +393,10 @@ ctest --test-dir build --output-on-failure
   shape — and gets the server-only save back as a `download`, which is the one
   operation where every nullable field is filled in. `revoked`, `truncated` and
   `stalled` force the three failures a healthy RomM will not produce: a 401 is a
-  revoked token rather than a parse failure and is never retried; a clean short
+  revoked token rather than a parse failure and is never retried, and — the
+  assertion M1-4 added — a refused negotiation is **not** an empty plan, because
+  an empty plan and a refused one are both a vector of size zero and only
+  `ok()` tells them apart; a clean short
   body is a named `json` error and no plan; a stall times out, is retried, and
   the backoff doubles. The wait is injected rather than slept, so `stalled`
   proves the backoff without spending it — and it asserts the retry as a
@@ -432,9 +454,9 @@ ctest --test-dir build --output-on-failure
   `MinimumScopes()`. Editing the document without editing the code, or the other
   way round, fails here — including adding a scope marked "only if…" to the set
   the client actually requests.
-- None of `auth.scopes`, `core.token_store`, `core.device_identity`,
-  `device.shapes`, `core.md5`, `core.state_db` or `sync.payload` touches the
-  network, so none of them ever skips.
+- None of `auth.scopes`, `auth.gate_*`, `core.token_store`,
+  `core.device_identity`, `device.shapes`, `core.md5`, `core.state_db` or
+  `sync.payload` touches the network, so none of them ever skips.
 - The `policy.*` tests re-ask row 8 of [the M0 exit gate](#the-m0-exit-gate) on
   every run: the suite is configured for loopback only, the scripts that write
   refuse anything else, and no registered test reaches off this machine. They
