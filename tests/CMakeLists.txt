@@ -887,6 +887,13 @@ set(TICK_UNIT_SCENARIOS
   rescan     # a restored save stops the tick rather than negotiating without it
   canceled   # a token already fired ends the tick without a single request
 )
+
+# M6-2 (#33). These are the same executables, registered under `toggle.` because
+# what they check is one issue's acceptance rather than one module's: the
+# sysmodule under ovl-sysmodules' two switches. `ctest -R toggle` is the whole of
+# it, and docs/DEVELOPMENT.md#the-two-switches says so.
+add_test(NAME toggle.disabled COMMAND test_sync_tick disabled)
+set_tests_properties(toggle.disabled PROPERTIES TIMEOUT 60)
 foreach(scenario IN LISTS TICK_UNIT_SCENARIOS)
   add_test(NAME tick.${scenario} COMMAND test_sync_tick ${scenario})
   set_tests_properties(tick.${scenario} PROPERTIES TIMEOUT 60)
@@ -908,6 +915,16 @@ set(TICK_RIG_SCENARIOS
   complete_stall   # the same on the timeout, and the next tick finds no work to redo
   resumes          # a reset mid-download, then a second tick: one save, one row
 )
+# M6-2 (#33), and a rig scenario for the same reason `resumes` is one: the kill
+# has to happen to a real transfer. `resumes` interrupts a tick; this interrupts
+# the *process*, throwing away the client, the filesystem and the baseline before
+# the second tick, which is what `pmshellTerminateProgram` does.
+add_test(NAME toggle.tick COMMAND test_sync_tick relaunched)
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(toggle.tick PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+set_tests_properties(toggle.tick PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+
 foreach(scenario IN LISTS TICK_RIG_SCENARIOS)
   add_test(NAME tick.${scenario} COMMAND test_sync_tick ${scenario})
   if(NOT ROMMSYNC_REQUIRE_RIG)
@@ -1364,6 +1381,16 @@ endforeach()
 # get their own budget rather than the 180 seconds the others need. `progress`
 # (M3-5) is the one that watches the second transfer from another thread while it
 # is still going, which is the whole of what it adds.
+# M6-2 (#33), grouped with the other `toggle.` tests: what survives the hard kill
+# ovl-sysmodules performs on a dynamic sysmodule. Cheap enough for the ordinary
+# budget -- it cuts a 64 KiB rom, not the 120 MiB one -- and what it adds over
+# `download.truncate` is that the second drain is a different process.
+add_test(NAME toggle.download COMMAND test_download relaunched)
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(toggle.download PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+set_tests_properties(toggle.download PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+
 foreach(scenario resume progress)
   add_test(NAME download.${scenario} COMMAND test_download ${scenario})
   if(NOT ROMMSYNC_REQUIRE_RIG)
@@ -1405,6 +1432,15 @@ foreach(scenario IN LISTS ENGINE_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
   set_tests_properties(engine.${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
+
+# M6-2 (#33), under `toggle.` with the rest of that issue's acceptance. Both are
+# about the two switches rather than about the queue this file otherwise pins:
+# `relaunch` is the terminate-then-launch ovl-sysmodules performs -- two engines
+# over one card, no lock file, neither refusing to start -- and `reenable` is the
+# enable switch turned off and back on inside one process.
+add_test(NAME toggle.relaunch COMMAND test_engine relaunch)
+add_test(NAME toggle.reenable COMMAND test_engine reenable)
+set_tests_properties(toggle.relaunch toggle.reenable PROPERTIES TIMEOUT 60)
 
 # M5-3's one scenario that needs the fixture RomM. Repointing `server.url` has to
 # discard the pairing, and a token no server ever accepted would prove nothing

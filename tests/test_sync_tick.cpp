@@ -6,12 +6,14 @@
 // started with or a strictly completed subset of them**, and that the next tick
 // picks the rest up (issue #16, docs/SYNC_PROTOCOL.md's failure & safety rules).
 //
-// Five scenarios need no server and must stay checked with docker stopped --
+// Seven scenarios need no server and must stay checked with docker stopped --
 // `recovery` is the sweep a crash makes necessary, `durable` is the platform
 // `fsync` hard rule 2 depends on, `backupdir` is the directory `core/` could not
 // create until this issue, `offline` is the tick that must write nothing at all,
-// and `canceled` is the shutdown that must not cost a request. The rest arm the
-// fault proxy at one stage of a real tick and look at what is left behind.
+// `canceled` is the shutdown that must not cost a request, and `disabled` is the
+// enable switch that must cost nothing at all (M6-2, #33). The rest arm the
+// fault proxy at one stage of a real tick and look at what is left behind --
+// `relaunched` among them, which is the kill ovl-sysmodules performs.
 //
 // **Every rig scenario runs `sync::RunTick` inside a `harness::Sandbox`**, so the
 // backup-before-overwrite audit judges it on teardown whether or not the
@@ -656,6 +658,74 @@ void Canceled(rig::Checks& checks) {
                   "and this one did sweep the leftover on its way in");
 }
 
+// --- disabled -----------------------------------------------------------------
+//
+// The enable switch, which is not the boot toggle (M6-2, #33,
+// docs/DEVELOPMENT.md#the-two-switches). With `[sync] enabled = false` the
+// process is resident and IPC answers; what must not happen is a request, a
+// file, or a sweep.
+//
+// The scheduler that owns the interval parks itself when the switch is off, and
+// that scheduler is M7-2's -- so the promise would be untestable until it exists
+// if it lived only there. `TickOptions::enabled` is the same gate one level
+// down, where `download::Drain` already has it, and this is what makes "a
+// disabled sysmodule is genuinely idle" a fact about the tick rather than about
+// a caller remembering to ask.
+
+void Disabled(rig::Checks& checks) {
+  Sandbox sandbox(checks, "tick-disabled");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const std::string bytes = "a save nothing may touch while sync is off\n";
+  sandbox.SeedSave(SavePath("disabled.srm"), bytes);
+
+  // A leftover, for the same reason `Canceled` plants one: "no sweep either" is
+  // only checkable if there was something to sweep. A tick that tidied the card
+  // while switched off would be a disabled sysmodule doing work.
+  const std::string partial = http::PartialPathFor(io::TempPathFor(SavePath("disabled.srm")));
+  sandbox.Write(partial, "half a body");
+
+  auth::StoredToken token;
+  token.server_url = kNowhere;
+  token.access_token = "not-a-token";
+  token.device_id = "fixture-disabled";
+
+  const std::map<std::string, std::string> before = Snapshot(sandbox);
+
+  sync::TickOptions options = OptionsAt(1'757'000'300);
+  options.enabled = false;
+
+  CountingClient client;
+  const sync::TickResult parked =
+      sync::RunTick(client, *files, token, {}, {}, /*previous=*/{}, options);
+
+  checks.Expect(parked.outcome == sync::TickOutcome::kDisabled,
+                std::string("[sync] enabled = false parks the tick: ") +
+                    sync::ToString(parked.outcome));
+  checks.ExpectEq(client.requests, 0,
+                  "and it costs zero HTTP requests -- the whole of what the switch promises");
+  checks.ExpectEq(parked.recovered.total(), static_cast<std::size_t>(0),
+                  "no sweep ran: a disabled sysmodule does no work at all");
+  checks.Expect(sandbox.Exists(partial), "so the leftover is exactly where it was");
+  checks.Expect(Snapshot(sandbox) == before,
+                "and nothing under the sandbox changed -- not a file, not a directory");
+
+  // Switching it back on runs the tick, with no restart of anything: the same
+  // objects, the same card, one field. That is the other half of the criterion
+  // -- a switch that cannot be switched back is not a switch.
+  sync::TickOptions running = OptionsAt(1'757'000'301);
+  CountingClient reachable;
+  const sync::TickResult resumed =
+      sync::RunTick(reachable, *files, token, {}, {}, /*previous=*/{}, running);
+  checks.Expect(reachable.requests > 0,
+                "with enabled back on the tick reaches the network again");
+  checks.Expect(resumed.outcome == sync::TickOutcome::kOffline,
+                std::string("and it is the missing server that stops it, not the switch: ") +
+                    sync::ToString(resumed.outcome));
+  checks.ExpectEq(resumed.recovered.partials_removed, static_cast<std::size_t>(1),
+                  "and this one did sweep the leftover the parked tick left alone");
+}
+
 // --- the rig scenarios --------------------------------------------------------
 //
 // One shape, four stages. Each arranges a plan of exactly one operation, arms
@@ -1130,6 +1200,104 @@ void Resumes(rig::Checks& checks, http::HttpClient& client, const std::string& b
   harness::DeleteSave(client, base, fixture, arranged.server.id);
 }
 
+// --- relaunched ---------------------------------------------------------------
+//
+// M6-2 (#33). ovl-sysmodules stops a dynamic sysmodule with
+// `pmshellTerminateProgram`: the process is killed where it stands, with no
+// shutdown hook, and its "restart" is a terminate followed immediately by a
+// launch. So the tick has to survive not only a dropped connection but the loss
+// of everything the process was holding.
+//
+// `Resumes` is the same interruption without the kill -- it keeps its client,
+// its filesystem and the baseline it read. This one throws all three away
+// between the two ticks, exactly as a relaunch does, and the second tick starts
+// from nothing but the card. What that adds is the three claims a relaunch
+// makes: the baseline is on the card and is accurate, the kill left no lock or
+// pidfile a fresh process would trip over, and the save is intact with its
+// backup beside it.
+
+void Relaunched(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                const Fixture& fixture, const harness::Rom& rom) {
+  Sandbox sandbox(checks, "tick-relaunched");
+  DownloadFixture arranged;
+  {
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    if (!ArrangeDownload(checks, client, base, fixture, sandbox, rom, "m6-2-relaunched",
+                         &arranged)) {
+      return;
+    }
+
+    sync::TickOptions options = OptionsAt(1'757'000'900);
+    Impatient(&options);
+    harness::Fault fault(checks, client, base,
+                         R"({"mode":"drop","bytes":4,"path":")" +
+                             arranged.server.ContentPath() + R"("})");
+    const sync::TickResult interrupted =
+        sync::RunTick(client, *files, TokenFor(base, fixture), {arranged.local}, arranged.targets,
+                      /*previous=*/{}, options);
+    checks.Expect(interrupted.outcome == sync::TickOutcome::kPartial,
+                  std::string("the reset costs the operation and not the tick: ") +
+                      sync::ToString(interrupted.outcome));
+    // ...and here the process dies. `files` goes out of scope with it; nothing
+    // below reuses anything the first tick held.
+  }
+  SaveSurvived(checks, sandbox, arranged.name, arranged.previous, "after the kill");
+
+  // What a relaunched process finds. It is a *fresh* filesystem over the same
+  // card, and the baseline is read off `state.db` rather than carried in memory
+  // -- which is the point: a tick killed mid-plan must leave the card able to
+  // answer that question on its own.
+  const std::unique_ptr<fs::FileSystem> relaunched =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+
+  // No lock file, no pidfile, nothing a second instance would read as "another
+  // one is running". ovl-sysmodules' restart is terminate-then-launch with no
+  // gap, so a process that wrote one would refuse to start after every toggle.
+  for (const auto& [path, contents] : Snapshot(sandbox)) {
+    (void)contents;
+    checks.Expect(path.find(".lock") == std::string::npos && path.find(".pid") == std::string::npos,
+                  "the killed tick left no lock or pidfile behind: " + path);
+  }
+
+  const state::LoadedBaseline read_back = StoredBaseline(*relaunched);
+  checks.Expect(read_back.value.Find(rom.id, arranged.slot) == nullptr,
+                "and no baseline row for a save that never landed -- the next tick plans it again");
+
+  sync::TickOptions second = OptionsAt(1'757'000'901);
+  Impatient(&second);
+  const sync::TickResult recovered =
+      sync::RunTick(client, *relaunched, TokenFor(base, fixture), {arranged.local},
+                    arranged.targets, state::Baseline(read_back.value), second);
+
+  checks.Expect(recovered.outcome == sync::TickOutcome::kCompleted,
+                std::string("the relaunched engine finishes the job: ") +
+                    sync::ToString(recovered.outcome));
+  checks.ExpectEq(sandbox.Read(SavePath(arranged.name)), arranged.server_bytes,
+                  "with the server's bytes on the card");
+  checks.Expect(sandbox.HasBackupOf(arranged.previous),
+                "and the bytes it replaced under .backup/, which is hard rule 2");
+  NoLeftovers(checks, sandbox, SavePath(arranged.name), "after the relaunched tick");
+
+  // The baseline the relaunch produced, read once more with a third filesystem:
+  // accurate, and about the bytes that are actually on the card.
+  const std::unique_ptr<fs::FileSystem> next_boot =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const state::LoadedBaseline stored = StoredBaseline(*next_boot);
+  const state::SaveRecord* row = stored.value.Find(rom.id, arranged.slot);
+  checks.Expect(row != nullptr, "the baseline advanced across the relaunch");
+  if (row != nullptr) {
+    checks.ExpectEq(row->content_hash, crypto::Md5Hex(arranged.server_bytes),
+                    "and holds the digest of the bytes the card now has");
+  }
+
+  // One row, not two: the killed tick sent nothing it could not account for.
+  checks.ExpectEq(SaveRowsFor(client, base, fixture, rom.id, arranged.slot, nullptr), 1,
+                  "and the server holds one row for the slot");
+
+  harness::DeleteSave(client, base, fixture, arranged.server.id);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1151,7 +1319,8 @@ int main(int argc, char** argv) {
 
   // The five that need no server, so they stay checked with docker stopped.
   if (scenario == "recovery" || scenario == "durable" || scenario == "backupdir" ||
-      scenario == "offline" || scenario == "rescan" || scenario == "canceled") {
+      scenario == "offline" || scenario == "rescan" || scenario == "canceled" ||
+      scenario == "disabled") {
     if (scenario == "recovery") {
       Recovery(checks);
     } else if (scenario == "durable") {
@@ -1162,6 +1331,8 @@ int main(int argc, char** argv) {
       Offline(checks);
     } else if (scenario == "rescan") {
       Rescan(checks);
+    } else if (scenario == "disabled") {
+      Disabled(checks);
     } else {
       Canceled(checks);
     }
@@ -1266,6 +1437,8 @@ int main(int argc, char** argv) {
                   /*then_normally=*/true, "a stall at complete");
   } else if (scenario == "resumes") {
     Resumes(checks, *client, base, fixture, rom);
+  } else if (scenario == "relaunched") {
+    Relaunched(checks, *client, base, fixture, rom);
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;

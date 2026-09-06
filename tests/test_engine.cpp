@@ -31,6 +31,8 @@
 //   unauthenticated -- M1-4: the verdict `auth.json` carries, and the re-pair
 //                      that lifts it
 //   commands  -- what is still `kUnavailable`, so the list shrinks deliberately
+//   relaunch  -- M6-2: two engines over one card at once, and no lock file
+//   reenable  -- M6-2: the enable switch off and back on, with nothing rebooted
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -109,6 +111,12 @@ class Console {
     std::string response;
     Call(ipc::Command::kSetEnabled, ipc::EncodeEnabled(enabled), &response);
     return ipc::DecodeEnabledResult(response).value;
+  }
+
+  ipc::SyncOutcome SyncNow() {
+    std::string response;
+    Call(ipc::Command::kSyncNow, ipc::EncodeEmpty(), &response);
+    return ipc::DecodeSyncOutcome(response).value;
   }
 
   ipc::ConfigView Configured() {
@@ -384,6 +392,138 @@ void ConfigWrites(checks::Checks& c) {
            "an unreadable config.ini is a write that did not happen");
   c.Expect(!unreadable.diagnostics.empty(), "and says which file");
   std::filesystem::remove(console.sandbox.Host("/config/rommsync/config.ini"), error);
+}
+
+// --- M6-2 (#33): the two switches, and the kill between them ------------------
+
+/// ovl-sysmodules' "restart" is `pmshellTerminateProgram` followed immediately
+/// by `pmshellLaunchProgram` -- terminate then launch, with no gap. So a second
+/// engine can be constructed over a card the first is still holding open, and
+/// neither may refuse to start.
+///
+/// The failure this rules out is the ordinary one: a lock file or a pidfile
+/// written at boot and removed at shutdown. There is no shutdown here, so the
+/// first one written would be the last toggle this sysmodule ever survives.
+void Relaunch(checks::Checks& c) {
+  Console first(c, "engine-relaunch");
+  const std::string original = "[server]\nurl = https://romm.example.com\n";
+  c.Expect(first.sandbox.Write("/config/rommsync/config.ini", original), "a configured card");
+  first.Boot();
+
+  std::int32_t position = 0;
+  c.Expect(first.Enqueue(4, &position) == ipc::Error::kOk, "with a download owed");
+  c.ExpectEq(first.OnCard().entries.size(), std::size_t{1}, "and it is on the card");
+
+  // The kill. `first` is not destroyed: a terminate-then-launch with no gap can
+  // have the second process reading the card while the first is still unloading,
+  // which is the case a lock file gets wrong and a sequential test never sees.
+  Console second(c, "engine-relaunch-2", first.directory);
+  second.Boot();
+  c.ExpectEq(second.Status().queue_depth, std::int64_t{1},
+             "the relaunched engine starts, and owes the same download");
+  c.ExpectEq(second.Configured().config.server.url, std::string("https://romm.example.com"),
+             "reading the same configuration");
+
+  // Nothing in the client's own directory looks like a lock, a pidfile, or the
+  // debris of an interrupted write. `.tmp` and `.old` are the two `io::WriteAtomically`
+  // stages, and both being absent is what says the writes committed rather than
+  // that nobody has looked.
+  std::error_code error;
+  for (const std::filesystem::directory_entry& entry :
+       std::filesystem::directory_iterator(first.sandbox.Host(harness::kConfigDir), error)) {
+    const std::string name = entry.path().filename().string();
+    c.Expect(name.find("lock") == std::string::npos && name.find("pid") == std::string::npos,
+             "no lock or pidfile in the client's directory: " + name);
+    c.Expect(name.size() < 4 || name.substr(name.size() - 4) != ".tmp",
+             "and no half-written record: " + name);
+  }
+
+  // Both are live, and the card does not end up holding half of each. The
+  // second process is the one that owns the console now, so its write is the
+  // one that has to land intact.
+  c.Expect(second.Enqueue(5, &position) == ipc::Error::kOk, "the relaunched engine writes");
+  const download::LoadedQueue after = second.OnCard();
+  c.Expect(after.trusted, "and queue.json still reads back");
+  c.Expect(after.diagnostics.empty(), "with no complaint about its contents");
+  c.ExpectEq(after.entries.size(), std::size_t{2}, "holding both entries");
+
+  // A third boot over the same card, after the two overlapping ones: the file is
+  // a queue and not a fragment of two.
+  Console third(c, "engine-relaunch-3", first.directory);
+  third.Boot();
+  c.ExpectEq(third.Status().queue_depth, std::int64_t{2},
+             "and a third relaunch reads exactly what the second wrote");
+}
+
+/// The enable switch, on the running process. `[sync] enabled` is not the boot
+/// toggle: with it off the process is resident and IPC answers, and what stops
+/// is syncing (docs/DEVELOPMENT.md#the-two-switches).
+///
+/// The acceptance is that turning it back on needs no reboot -- so every
+/// assertion here is against the *same* `Console`, and the card is checked after
+/// rather than reloaded to produce the answer.
+void Reenable(checks::Checks& c) {
+  Console console(c, "engine-reenable");
+  const std::string original =
+      "[server]\n"
+      "url = https://romm.example.com\n"
+      "\n"
+      "[sync]\n"
+      "enabled = true\n";
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini", original), "a configured card");
+
+  auth::StoredToken token;
+  token.server_url = "https://romm.example.com";
+  token.access_token = "not-a-real-token";
+  token.device_id = "console-reenable";
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+           "and a paired one, so the switch is the only thing left to refuse a sync");
+  console.Boot();
+  c.Expect(console.Status().enabled, "sync is on to begin with");
+  c.Expect(console.SyncNow() != ipc::SyncOutcome::kDisabled,
+           "so an on-demand sync is not refused for being switched off");
+
+  const ipc::EnabledResult off = console.SetEnabled(false);
+  c.Expect(off.outcome == ipc::WriteOutcome::kApplied, "the switch goes off");
+  c.Expect(!off.enabled, "and answers with the state that took");
+  c.Expect(!console.Configured().config.sync.enabled,
+           "the running engine is the one that changed, not just the file");
+  c.Expect(console.sandbox.Read("/config/rommsync/config.ini").find("enabled = false") !=
+               std::string::npos,
+           "and the card agrees");
+
+  // The refusal, which is the whole of what "disabled" costs a user who asks
+  // for a sync anyway: a sentence naming the switch, not a spinner that never
+  // moves (`ipc.hpp`, and #35 corrected this issue's own body to match).
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kDisabled,
+           "and SyncNow is refused for the one reason the user can fix");
+
+  // Back on, in the same process. Nothing was rebooted and nothing re-read the
+  // card to get here.
+  const ipc::EnabledResult on = console.SetEnabled(true);
+  c.Expect(on.outcome == ipc::WriteOutcome::kApplied, "the switch goes back on");
+  c.Expect(on.enabled, "answering with the state that took");
+  c.Expect(console.Status().enabled, "the status screen draws it immediately");
+  c.Expect(console.Configured().config.sync.enabled, "and the live configuration carries it");
+  c.Expect(console.sandbox.Read("/config/rommsync/config.ini").find("enabled = true") !=
+               std::string::npos,
+           "with the card written once more");
+
+  // `SyncNow` stops answering `kDisabled` the moment the switch is back on, with
+  // no restart in between -- which is this issue's criterion. It does not yet
+  // answer `kAccepted`: `SdEngine::RequestSync` returns false until there is a
+  // scheduler to start a tick, and `ServiceCore` reports that as
+  // `kAlreadyRunning` (M7-2, #37, "What M4-1 left here"). The switch is what
+  // this issue owns; the tick behind it is #37's.
+  c.Expect(console.SyncNow() != ipc::SyncOutcome::kDisabled,
+           "and a sync asked for now is refused by something other than the switch");
+
+  // The card and the engine still agree after a real reboot, so nothing above
+  // was true only in memory.
+  Console rebooted(c, "engine-reenable-2", console.directory);
+  rebooted.Boot();
+  c.Expect(rebooted.Configured().config.sync.enabled,
+           "a console that reboots comes back with the switch where the user left it");
 }
 
 void UrlWriteFails(checks::Checks& c) {
@@ -731,6 +871,10 @@ int main(int argc, char** argv) {
     StaleConfig(checks);
   } else if (scenario == "commands") {
     Commands(checks);
+  } else if (scenario == "relaunch") {
+    Relaunch(checks);
+  } else if (scenario == "reenable") {
+    Reenable(checks);
   } else if (scenario == "server") {
     // The one scenario here that needs the fixture RomM: what it pins is that a
     // *live* credential stops being on the card, and a token nothing ever
