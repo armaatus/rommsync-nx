@@ -39,6 +39,17 @@ class StatusScreen : public tsl::Gui {
   /// off a snapshot it already holds (`ipc::Engine::Snapshot`).
   void update() override;
 
+  /// Y opens the settings screen, which is this overlay's root menu.
+  ///
+  /// One binding rather than a screen of its own: until M4-4 (#26) nothing
+  /// pushed any gui at all, so `SyncScreen`, `LibraryScreen` and
+  /// `PairingScreen` compiled and `--gc-sections` dropped them from the image.
+  /// The status screen is where the overlay opens, so it is where the way in
+  /// has to be -- and the settings screen carries the rest of the menu, because
+  /// putting it here would make a second one (#26).
+  bool handleInput(u64 keys_down, u64 keys_held, const HidTouchState& touch,
+                   HidAnalogStickState left_stick, HidAnalogStickState right_stick) override;
+
  private:
   /// Ask, and turn whatever came back -- including nothing -- into `view_`.
   void Poll();

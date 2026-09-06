@@ -36,17 +36,6 @@ constexpr s32 kInset = 8;
 /// How far a row's label and note are indented from the selection marker.
 constexpr s32 kRowIndent = 18;
 
-/// The button glyphs libtesla draws from the Switch's own font, the same way
-/// `sync_screen.cpp` and `pairing_screen.cpp` name theirs.
-constexpr const char* kGlyphA = "\uE0E0";
-constexpr const char* kGlyphB = "\uE0E1";
-constexpr const char* kGlyphY = "\uE0E3";
-
-/// A control's prompt: the glyph, two spaces, and what pressing it does.
-std::string Prompt(const char* glyph, const char* label) {
-  return std::string(glyph) + "  " + label;
-}
-
 /// Whether the queue prompt is offered on this view.
 bool ShowsQueuePrompt(const LibraryView& view) {
   return view.link == Link::kOk && view.level != LibraryLevel::kQueue;

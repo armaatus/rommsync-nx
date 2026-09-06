@@ -193,9 +193,10 @@ void PairingScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
 
   // Last, and only when there is something the button does. A prompt for an
   // action the screen would decline is worse than no prompt at all.
-  const char* action =
-      view_.start ? "\uE0E0  Pair" : (view_.start_over ? "\uE0E0  Start over" : "");
-  if (action[0] != '\0' && fits(kRowHeight * 2)) {
+  const std::string action = view_.start ? Prompt(kGlyphA, "Pair")
+                             : view_.start_over ? Prompt(kGlyphA, "Start over")
+                                                : std::string();
+  if (!action.empty() && fits(kRowHeight * 2)) {
     row += kRowHeight / 2;
     renderer->drawString(action, false, x, row, kBodyFont,
                          tsl::gfx::Renderer::a(tsl::defaultTextColor), line_width);

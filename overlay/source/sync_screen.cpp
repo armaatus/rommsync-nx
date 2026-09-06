@@ -25,16 +25,6 @@ constexpr s32 kValueColumn = 160;
 /// How far short of the drawer's right edge a line stops.
 constexpr s32 kInset = 8;
 
-/// The button glyphs libtesla draws from the Switch's own font, the same way
-/// `pairing_screen.cpp` names its one.
-constexpr const char* kGlyphA = "\uE0E0";
-constexpr const char* kGlyphX = "\uE0E2";
-
-/// A control's prompt: the glyph, two spaces, and what pressing it does.
-std::string Prompt(const char* glyph, const std::string& label) {
-  return std::string(glyph) + "  " + label;
-}
-
 }  // namespace
 
 SyncScreen::SyncScreen(IpcClient& client) : client_(client) {}

@@ -23,6 +23,7 @@
 #include <tesla.hpp>
 
 #include <cstdint>
+#include <string>
 
 #include "ipc_client.hpp"
 #include "rommsync/overlay_status_view.hpp"
@@ -42,6 +43,25 @@ tsl::Color ColorFor(Tone tone);
 /// The colour a label, a hint or a caption is drawn in -- the quiet half of
 /// every row, and not a `Tone`: it is a role rather than a judgement.
 tsl::Color MutedColor();
+
+/// The button glyphs libtesla draws from the Switch's own font.
+///
+/// Here rather than in each screen for `ColorFor`'s reason: they were written
+/// out in `sync_screen.cpp`, `library_screen.cpp` and `pairing_screen.cpp`
+/// before this file existed, and a fourth copy in `settings_screen.cpp` (#26)
+/// is a private-use codepoint typed from memory in four places.
+inline constexpr const char* kGlyphA = "\uE0E0";
+inline constexpr const char* kGlyphB = "\uE0E1";
+inline constexpr const char* kGlyphX = "\uE0E2";
+inline constexpr const char* kGlyphY = "\uE0E3";
+
+/// A control's prompt: the glyph, two spaces, and what pressing it does.
+///
+/// The two spaces are the whole of it, and they are why this is a function
+/// rather than a convention: the glyph is a square in the console's font, and a
+/// prompt that spaced it differently from the screen next door reads as a
+/// different control.
+std::string Prompt(const char* glyph, const std::string& label);
 
 /// The session state a screen keeps between frames, and the two questions it
 /// asks of it.
