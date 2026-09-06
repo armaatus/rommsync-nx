@@ -175,9 +175,9 @@ phase_layout() {
 
   # boot2.flag is what makes Atmosphere launch the sysmodule at boot. Shipping
   # it contradicts "installed disabled first" (M8-2), and creating it is
-  # ovl-sysmodules' job (#33). Asserted on the name rather than on the flags/
-  # directory: whether that directory ships empty is #33's call, and this is not
-  # the place to make it for them.
+  # ovl-sysmodules' job. Asserted on the name rather than on the flags/
+  # directory, and #33 settled why there is no such directory to assert on:
+  # ovl-sysmodules `mkdir`s it itself before writing the flag into it.
   [ ! -e "$tree/atmosphere/contents/$tid/flags/boot2.flag" ] ||
     fail "the archive ships boot2.flag; the sysmodule must arrive disabled"
   grep -q 'boot2' <<<"$entries" &&

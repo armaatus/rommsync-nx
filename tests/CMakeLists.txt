@@ -1166,7 +1166,7 @@ set(PACKAGE_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_package.sh")
 # the script inspects -- so they need neither Docker nor a cross-compiler and
 # none of them ever skips.
 foreach(scenario
-        layout          # the unpacked tree is exactly #32's five paths
+        layout          # the unpacked tree is exactly the six paths #32 and #33 specify
         refuses         # a wrong .nsp, an unsigned .ovl, a missing input
         deterministic   # the same inputs, the same bytes
         upgrade)        # unzipping over an install keeps config.ini and the rest
