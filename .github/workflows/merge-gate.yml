@@ -31,16 +31,32 @@ on:
 permissions:
   contents: read
   pull-requests: read
-
-concurrency:
-  group: merge-gate-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  # To re-run an earlier failed gate on this same commit; see "Decide" below.
+  actions: write
 
 jobs:
   gate:
     name: merge-gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # On the JOB, not the workflow. The clearing job below re-queues an older
+    # run of this same workflow, and a re-queue goes through the same
+    # concurrency arbitration as a fresh trigger -- so with the group at
+    # workflow level it would cancel the very run trying to conclude success,
+    # leaving a CANCELLED check where the SUCCESS should be. Found in review of
+    # this PR; the same class of wedge as #84, self-inflicted and with less log
+    # to explain it.
+    concurrency:
+      group: merge-gate-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    # Explicitly read-only, overriding the workflow block. `clear-stale` needs
+    # `actions: write`; this job does not, and it is the one that reads a pull
+    # request's contents. Without this it inherits that write scope for no
+    # reason -- and it is precisely the job whose base-ref checkout exists to
+    # keep a PR from running anything with elevated capability.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       # The BASE branch's copy of the gate, never the PR's. On a pull_request
       # event actions/checkout defaults to the merge ref, which means the script
@@ -93,3 +109,111 @@ jobs:
           fi
           python3 .github/scripts/merge_gate.py \
             "${{ github.event.pull_request.head.sha }}" pr.json files.txt
+
+  # Deliberately a separate job, and deliberately NOT in the gate's concurrency
+  # group: it re-queues an older run of this workflow, which enters that group.
+  # By the time this runs, `gate` has already concluded, so the cancellation
+  # that re-queue triggers can only land on a gate that is still in flight --
+  # never on the one whose success this job exists to preserve.
+  clear-stale:
+    name: clear stale merge-gate failures
+    needs: gate
+    if: success()
+    runs-on: ubuntu-latest
+    # Has to cover N stale runs, not one. Most PRs arrive with two (`opened`
+    # fails with no review yet, then the body edit fails again), and the loop
+    # below waits for each to finish before starting the next. At 5 minutes
+    # total with a 5-minute per-item wait, the job could be killed by its own
+    # timeout before reaching the second -- leaving a check unclear and the PR
+    # back at the BLOCKED state this whole job exists to prevent.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      # A gate that has failed once on a commit stays failed.
+      #
+      # This check correctly fails the first time it runs on any PR -- at that
+      # moment no independent review exists yet. When the review lands the gate
+      # re-runs and passes, but GitHub creates a NEW check run rather than
+      # superseding the old one, and branch protection goes on counting the
+      # failure. The PR then sits BLOCKED while its own latest gate says every
+      # gate holds. That is issue #84, and it wedged #81 and #82.
+      #
+      # Re-running the earlier run updates that check run in place, which is the
+      # manual workaround that unwedged both in seconds.
+      - name: Re-run them so their checks clear
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NWO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SELF: ${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          # Errors are reported, not swallowed. A lookup that fails for a real
+          # reason -- an auth hiccup, an API shape change -- used to print the
+          # same "nothing to do" as the true no-op, removing the one trail that
+          # would explain why the fix silently did nothing.
+          if ! listing="$(gh run list --repo "$NWO" --workflow "merge gate" --limit 40 \
+                            --json databaseId,conclusion,headSha 2>&1)"; then
+            echo "::warning title=Could not look for stale gate failures::$listing"
+            exit 0
+          fi
+          # `cancelled` as well as `failure`. A cancelled run is just as
+          # non-passing to branch protection, and if the filter only matched
+          # failures then any run this job accidentally cancelled could never be
+          # picked up again -- permanently unclearable without a human, which is
+          # the thing this job exists to avoid.
+          stale="$(printf '%s' "$listing" | jq -r \
+            "[.[] | select(.headSha==\"$HEAD_SHA\" and (.conclusion==\"failure\" or .conclusion==\"cancelled\") and (.databaseId|tostring)!=\"$SELF\")] | .[].databaseId")"
+          if [ -z "$stale" ]; then
+            echo "no stale gate runs on $HEAD_SHA"
+            exit 0
+          fi
+
+          # ONE AT A TIME, waiting for each to finish before starting the next.
+          #
+          # `gh run rerun` returns as soon as the API accepts it, and every gate
+          # run for this PR shares one concurrency group with
+          # cancel-in-progress. Firing two back to back therefore cancels the
+          # first -- and this is the ordinary case, not an edge one: `opened`
+          # fails (no review yet), then editing the body with the local-review
+          # findings fails again, so most PRs reach here with two stale runs.
+          for run in $stale; do
+            # The GATE JOB only, never the whole run. `gh run rerun <run>` would
+            # re-execute this job too: `clear-stale` is `needs: gate` +
+            # `if: success()`, so it was SKIPPED on the failed run and a
+            # successful rerun would finally run it -- a second instance of this
+            # very loop, concurrent with the one you are reading, both racing to
+            # rerun the same targets. Two of them collide in `gate`'s
+            # `merge-gate-<PR>` group and cancel each other, which is the wedge
+            # this job exists to clear, reproduced one level down. Found in
+            # review of this PR.
+            job="$(gh api "repos/$NWO/actions/runs/$run/jobs" \
+                     --jq '[.jobs[] | select(.name == "merge-gate") | .id][0]' \
+                   2>/dev/null || echo "")"
+            if [ -z "$job" ] || [ "$job" = "null" ]; then
+              # Deliberately not falling back to a whole-run rerun: that is the
+              # bug above. A warning a person can act on beats a race.
+              echo "::warning title=Stale gate not cleared::could not find the gate job of run $run; clear it with: gh run rerun --job <gate job id>"
+              continue
+            fi
+            echo "re-running the gate job ($job) of stale run $run so its check clears"
+            if ! gh run rerun --job "$job" --repo "$NWO"; then
+              echo "::warning title=Stale gate not cleared::run $run; clear it with: gh run rerun --job $job"
+              continue
+            fi
+            # 150s per item against a 20-minute job budget: room for seven
+            # stale runs, where two is the common case and the gate itself
+            # takes seconds.
+            waited=0
+            while [ "$waited" -lt 150 ]; do
+              status="$(gh run view "$run" --repo "$NWO" --json status --jq .status 2>/dev/null || echo "")"
+              [ "$status" = "completed" ] && break
+              sleep 10
+              waited=$((waited + 10))
+            done
+            if [ "$waited" -ge 150 ]; then
+              echo "::warning title=Stale gate still running::run $run did not finish in 150s; the next re-run may cancel it"
+            fi
+          done
