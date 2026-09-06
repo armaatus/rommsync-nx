@@ -44,6 +44,14 @@ the Switch homebrew scene does:
    overlay), saves reconcile with RomM — **server is the source of truth**, so
    all your devices converge to the same save.
 
+## Installing it (users)
+
+[`docs/INSTALL.md`](docs/INSTALL.md) is the one page written for the person
+holding the console: unpacking the release zip onto the SD, enabling the
+sysmodule with ovl-sysmodules, pointing it at your RomM, and pairing without
+typing anything secret on the console. Nothing in it has been run on hardware
+yet — that is M8-2.
+
 ## Architecture at a glance
 
 ```
