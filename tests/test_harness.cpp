@@ -832,6 +832,11 @@ void Stall(rig::Checks& checks, http::HttpClient& client, const std::string& bas
   // fixture's. Left open, this one is cancelled by the NEXT negotiate --
   // and that cancel races with the session that negotiate creates. See
   // harness::CloseSession and issue #76.
+  //
+  // This is now the ONLY session this scenario opens. The stalled negotiate
+  // above is dropped by the proxy rather than replayed once the client has
+  // given up, so it reaches RomM never rather than eight seconds late, inside
+  // whichever test was running by then (issue #109).
   harness::CloseSession(client, base, fixture, next.response.body);
   checks.ExpectEq(next.response.status, 200, "and the next tick negotiates normally");
 }

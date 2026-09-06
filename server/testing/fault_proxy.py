@@ -12,6 +12,10 @@ to the real RomM untouched, and only when a scenario is armed does it damage one
 specific thing about a genuine response. It never synthesises a RomM response of
 its own, so it cannot drift from RomM the way a hand-written mock would.
 
+``stall`` is the one mode that does not forward at all, and deliberately: see
+``seconds`` below. The other three damage a real response; a stall models a
+server that never produced one.
+
 Control API (not forwarded upstream)::
 
     GET    /__fault          -> the armed scenario, or null
@@ -33,7 +37,9 @@ Scenario fields::
               ``drop`` still sends the real Content-Length and then resets, the
               way a genuinely dropped transfer looks; ``truncate`` sends no
               length at all, so only the caller's own expected size can catch it
-    seconds   delay before responding            (mode=stall, default 30)
+    seconds   hold the connection open this long and then drop it, WITHOUT
+              forwarding -- a stalled request never reaches RomM
+                                                (mode=stall, default 30)
 
 Example -- make the 3rd call to /api/sync/negotiate fail with 401, once::
 
@@ -212,7 +218,31 @@ class Handler(BaseHTTPRequestHandler):
         fault = FAULT.claim(self.path)
 
         if fault and fault["mode"] == "stall":
+            # Hold the connection, then drop it -- and never forward. This is
+            # the one mode whose request must not reach RomM, and the `return`
+            # is the whole fix for issue #109.
+            #
+            # Every caller of `stall` sets a client timeout well under the
+            # sleep, because what each of them asserts is that the CLIENT gives
+            # up first. So by the time this wakes, the request has been
+            # abandoned: nobody is waiting for the answer, and the test that
+            # armed it has usually exited. Forwarding it there replayed an
+            # abandoned POST into whatever test was running by then. Measured,
+            # by `harness.stall_dropped`: an `/api/saves` that wrote a save row
+            # and an `/api/sync/negotiate` that opened a session, each landing
+            # exactly `seconds` after a client that had already given up. None
+            # of that is a stalled server; it is a second client nothing in the
+            # suite can see.
+            #
+            # Which flakes that explains is a separate question and an open one
+            # -- see #109. This is a defect on its own terms either way.
+            #
+            # Nothing observes what happens after the sleep, so there is no
+            # fidelity to lose: dropping the connection is what a server that
+            # accepted a connection and then said nothing finally does.
             time.sleep(float(fault.get("seconds", 30)))
+            self.close_connection = True
+            return
         if fault and fault["mode"] == "status":
             payload = str(fault.get("body", "")).encode()
             self._respond(int(fault.get("status", 401)), payload,

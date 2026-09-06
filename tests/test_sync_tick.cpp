@@ -1234,8 +1234,15 @@ int main(int argc, char** argv) {
                 /*then_normally=*/false,
                 "a reset while the upload response was arriving");
   } else if (scenario == "upload_stall") {
-    // The proxy sleeps before forwarding, so this upload never reaches RomM at
-    // all -- a stalled request costs the tick and nothing else.
+    // The proxy holds a stalled request and then drops it without forwarding,
+    // so this upload never reaches RomM at all -- a stalled request costs the
+    // tick and nothing else. `rows_expected=1` IS that claim: the one row is
+    // the one the next tick writes, and a second row would mean the abandoned
+    // upload landed after the client had given up on it.
+    //
+    // Until issue #109 this comment described the intent rather than the
+    // behaviour. The proxy did forward, 1.5s late -- straight into the window
+    // this row count is measured in.
     UploadFault(checks, *client, base, fixture, rom,
                 R"({"mode":"stall","seconds":3,"path":"/api/saves"})",
                 sync::OperationOutcome::kFailed, sync::OperationError::kTransferFailed,
