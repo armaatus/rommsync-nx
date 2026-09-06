@@ -100,27 +100,40 @@ void SyncScreen::Poll() {
   }
 
   status_ = status;
-  // When a notice stops being true is `RenderSyncActions`'s to decide, not this
-  // screen's -- both expiry rules are in the view model, where a host test
-  // reaches them (`overlay_sync_actions.hpp`).
+  // The one thing a `Status` cannot say on its own, observed here because it is
+  // a transition rather than a state: a tick that has not started yet and one
+  // that has finished both report `sync_in_progress == false`, so "Sync
+  // started" would come back when the sync ended. What to *do* about it is
+  // still the view model's (`overlay_sync_actions.hpp`); this only records that
+  // it happened.
+  if (last_.kind == LastCommand::Kind::kSyncNow &&
+      last_.sync == ipc::SyncOutcome::kAccepted && status_.sync_in_progress) {
+    last_.sync_seen_running = true;
+  }
   Refresh();
 }
 
 void SyncScreen::PressSyncNow() {
   if (view_.sync_now.state == ControlState::kBlocked) {
-    // Refused here rather than sent to be refused there. The two say the same
-    // words -- `SyncOutcomeText` is what both go through -- and
-    // `overlay.sync_actions` holds the prediction against
-    // `ipc::ServiceCore::SyncNow` itself, so a screen that greys the button is
-    // a screen that would have been told exactly this.
-    last_ = LastCommand::SyncNow(PredictSyncNow(status_));
-    Refresh();
+    // Refused here rather than sent to be refused there: the screen already
+    // knows which refusal it would get, and `overlay.sync_actions` holds that
+    // prediction against `ipc::ServiceCore::SyncNow` itself.
+    //
+    // Nothing is written to `last_`, because the sentence is already on screen
+    // and was before the press -- `Draw` paints `sync_now.refusal` under the
+    // greyed prompt whenever the button is blocked. Recording it as a notice
+    // too would draw the same words twice. This is not the silent no-op #24
+    // forbids; the refusal is permanent rather than momentary.
     return;
   }
 
   ipc::SyncOutcome outcome = ipc::SyncOutcome::kAccepted;
   const Result rc = client_.SyncNow(&outcome);
   if (R_FAILED(rc)) {
+    // Dropped, not left: the previous press's answer would otherwise survive
+    // the failure and be put back by the next successful poll, describing a
+    // command two actions ago.
+    last_ = LastCommand{};
     view_ = RenderSyncActionsUnreachable(frame_.Diagnose(rc), frame_.sysmodule_interface());
     return;
   }
@@ -141,7 +154,9 @@ void SyncScreen::PressToggle() {
   if (R_FAILED(rc)) {
     // A failing `Result` means the call did not happen. A refused *write* is a
     // successful call carrying `kWriteFailed`, which is the whole reason the
-    // outcome rides in the payload (`ipc::WriteOutcome`).
+    // outcome rides in the payload (`ipc::WriteOutcome`). `last_` goes for the
+    // reason it goes in `PressSyncNow`.
+    last_ = LastCommand{};
     view_ = RenderSyncActionsUnreachable(frame_.Diagnose(rc), frame_.sysmodule_interface());
     return;
   }
@@ -168,9 +183,18 @@ void SyncScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
   const tsl::Color muted = MutedColor();
 
   s32 row = y;
-  const auto fits = [&](s32 needed) { return row + needed <= bottom; };
+  // Once one element has been dropped for want of room, nothing below it is
+  // drawn either. Testing each element on its own would let a short line take
+  // the place of a taller one that did not fit -- the hint without its
+  // headline, a remedy with no problem above it.
+  bool clipped = false;
+  const auto fits = [&](s32 needed) { return !clipped && row + needed <= bottom; };
   const auto line = [&](const std::string& text, s32 font, tsl::Color color, s32 advance) {
-    if (text.empty() || !fits(advance)) {
+    if (text.empty()) {
+      return;
+    }
+    if (!fits(advance)) {
+      clipped = true;
       return;
     }
     renderer->drawString(text, false, x, row, font, color, line_width);

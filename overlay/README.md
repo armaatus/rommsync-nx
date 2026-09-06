@@ -112,12 +112,22 @@ production RomM or a real library.
      sysmodule read back, so a row that does not move is a write that did not
      take and must have said so. Press **X** again and expect the screen to be
      exactly as it was before the first press.
-   - **A** with auto-sync off. Expect *Auto-sync is off* on screen — a sentence,
-     never a spinner and never nothing.
-   - **A** with auto-sync on. Expect *Sync started*, then the headline moving to
-     *Syncing* within a poll or two. Press **A** again while it runs and expect
-     *A sync is already running* — and, on the sysmodule's log, **no second
-     `SyncNow`**: the screen refuses that press itself.
+   - **A** with auto-sync off. Expect *Auto-sync is off* under a greyed
+     *Sync now* — and expect it to have been there **before** the press, not to
+     appear because of it. That is the point: the refusal is permanent while it
+     is true, so the button never looks pressable and then does nothing. What
+     the press must not produce is a spinner, a second copy of the sentence, or
+     silence.
+   - **A** with auto-sync on. **Check which sysmodule you are running first.**
+     Until M7-2 (#37) lands, `SdEngine::RequestSync()` returns `false`
+     unconditionally — it is a `bool` with nowhere to put "not built yet" — so
+     `SyncNow` answers `already_running` on an idle console and this step draws
+     *A sync is already running*. That is the sysmodule, not the screen. With
+     M7-2 in, expect *Sync started* and the headline moving to *Syncing* within
+     a poll or two; press **A** again while it runs and expect *A sync is
+     already running* with **no second `SyncNow`** reaching the sysmodule — the
+     screen refuses that press itself, so the two cases are told apart by what
+     the sysmodule saw, not by what the panel says.
    - **Runtime pause is not the boot flag.** Turn auto-sync off here, then leave
      the overlay and confirm `sys-rommsync` is still resident and the status
      screen still answers. A screen that reads *sys-rommsync is not running*

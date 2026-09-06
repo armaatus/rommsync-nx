@@ -61,7 +61,10 @@ void SetHeadline(SyncActionsView* view, const ipc::Status& status, ipc::SyncOutc
       // distinction #24 exists to keep. `RenderSyncActionsUnreachable` is the
       // other one, and it never says this.
       view->headline = "Sync is off";
-      view->hint = "Turn auto-sync on, or sync once now";
+      // Not "...or sync once now": `SyncNow` answers `kDisabled` for exactly
+      // this console, so the button beside this hint is greyed. A hint that
+      // offers what the control next to it refuses is worse than no hint.
+      view->hint = "Turn auto-sync on to sync";
       view->tone = Tone::kWarn;
       return;
     case ipc::SyncOutcome::kAlreadyRunning:
@@ -131,9 +134,12 @@ void SetNotice(SyncActionsView* view, const ipc::Status& status, const LastComma
       // `kAccepted` is drawn because `SyncNow` returns as soon as the tick is
       // queued: the very next `Status` may not have `sync_in_progress` set yet,
       // and a press with nothing on screen for two frames is a press a user
-      // repeats. It is dropped again the moment the headline takes over, so
-      // "Sync started" cannot stand over a tick that finished long ago.
-      if (last.sync == ipc::SyncOutcome::kAccepted && status.sync_in_progress) {
+      // repeats. It is dropped the moment the headline takes over, and stays
+      // dropped afterwards -- `sync_seen_running` is what makes the second half
+      // of that true, since a tick that has finished reports the same
+      // `sync_in_progress` as one that has not started.
+      if (last.sync == ipc::SyncOutcome::kAccepted &&
+          (status.sync_in_progress || last.sync_seen_running)) {
         return;
       }
       view->notice = SyncOutcomeText(last.sync);

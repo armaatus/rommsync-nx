@@ -123,6 +123,17 @@ struct LastCommand {
   /// "Sync started" does not stand over a tick that finished ten minutes ago.
   ipc::SyncOutcome sync = ipc::SyncOutcome::kAccepted;
 
+  /// `kSyncNow`/`kAccepted` only: the screen has already seen the tick running.
+  ///
+  /// The one thing `Status` cannot express on its own. A tick that has not
+  /// started yet and a tick that has finished are both
+  /// `sync_in_progress == false`, so suppressing "Sync started" only while the
+  /// flag is set puts the sentence *back* when the sync ends -- describing a
+  /// press from ten minutes ago. The transition is therefore observed once, by
+  /// the screen, and remembered here; what to do about it stays a decision this
+  /// header owns and `overlay.sync_actions` holds.
+  bool sync_seen_running = false;
+
   /// `SyncNow` answered `outcome`.
   static LastCommand SyncNow(ipc::SyncOutcome outcome);
 

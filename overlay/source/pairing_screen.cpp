@@ -153,9 +153,18 @@ void PairingScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
   const tsl::Color muted = MutedColor();
 
   s32 row = y;
-  const auto fits = [&](s32 needed) { return row + needed <= bottom; };
+  // Once one element has been dropped for want of room, nothing below it is
+  // drawn either. Testing each element on its own would let a short line take
+  // the place of a taller one that did not fit -- the countdown without the
+  // code it counts down, which is worse than neither.
+  bool clipped = false;
+  const auto fits = [&](s32 needed) { return !clipped && row + needed <= bottom; };
   const auto line = [&](const std::string& text, s32 font, tsl::Color color, s32 advance) {
-    if (text.empty() || !fits(advance)) {
+    if (text.empty()) {
+      return;
+    }
+    if (!fits(advance)) {
+      clipped = true;
       return;
     }
     renderer->drawString(text, false, x, row, font, color, line_width);

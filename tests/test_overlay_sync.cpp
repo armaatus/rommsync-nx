@@ -192,6 +192,13 @@ void CheckPredictionMatchesTheSysmodule(Checks& checks) {
 
           const overlay::SyncActionsView view = overlay::RenderSyncActions(status);
           ExpectWellFormed(checks, view, what);
+          // A hint may not offer what the control beside it refuses. The
+          // disabled console is where this went wrong: "Turn auto-sync on, or
+          // sync once now" over a greyed "Sync now" that answers `kDisabled`.
+          if (view.sync_now.state == overlay::ControlState::kBlocked) {
+            checks.Expect(!Contains(view.hint, "sync once") && !Contains(view.hint, "Sync now"),
+                          what + ": the hint does not offer the press the screen refuses");
+          }
           checks.ExpectEq(view.sync_now.state == overlay::ControlState::kLive,
                           actual == ipc::SyncOutcome::kAccepted,
                           what + ": Sync now is live exactly when the command is accepted");
@@ -403,6 +410,15 @@ void CheckEveryOutcomeIsDrawn(Checks& checks) {
   checks.Expect(!ViewOf(syncing, overlay::LastCommand::SyncNow(ipc::SyncOutcome::kAlreadyRunning))
                      .notice.empty(),
                 "...and a refusal mid-tick is still a sentence");
+
+  // ...and it does not come back when the tick ends. A finished tick and one
+  // that has not started report the same `sync_in_progress`, so suppressing on
+  // that flag alone would put "Sync started" back on screen the moment the sync
+  // the user asked for completed.
+  overlay::LastCommand ran = overlay::LastCommand::SyncNow(ipc::SyncOutcome::kAccepted);
+  ran.sync_seen_running = true;
+  checks.Expect(ViewOf(Working(), ran).notice.empty(),
+                "and it does not come back once that tick has finished");
 }
 
 /// A sysmodule that could not be reached is a screen of its own: both controls
