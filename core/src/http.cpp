@@ -61,4 +61,24 @@ const std::string* FindHeader(const Headers& headers, std::string_view name) {
 
 std::string PartialPathFor(std::string_view path) { return std::string(path) + ".part"; }
 
+std::string EncodeQueryValue(std::string_view value) {
+  static constexpr char kHex[] = "0123456789ABCDEF";
+  std::string out;
+  out.reserve(value.size());
+  for (const char character : value) {
+    const unsigned char byte = static_cast<unsigned char>(character);
+    const bool unreserved = (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+                            (byte >= '0' && byte <= '9') || byte == '-' || byte == '_' ||
+                            byte == '.' || byte == '~';
+    if (unreserved) {
+      out.push_back(character);
+    } else {
+      out.push_back('%');
+      out.push_back(kHex[byte >> 4]);
+      out.push_back(kHex[byte & 0x0F]);
+    }
+  }
+  return out;
+}
+
 }  // namespace rommsync::http

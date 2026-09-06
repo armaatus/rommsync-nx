@@ -684,6 +684,10 @@ set(STATES_UNIT_SCENARIOS
   naming    # a state has no slot, so its backup name is built from its own name
   scanning  # an ambiguous state is skipped, and two of one name are one state
   decides   # the decision table, keep-both branches included
+  trims     # saves and states share one baseline, and states are what gives
+  placing   # a state this console lacks is created, never written over
+  listing   # a listing this client cannot work from stops the run
+  recording # an upload's row comes from the scan, and the next tick is a no-op
 )
 foreach(scenario IN LISTS STATES_UNIT_SCENARIOS)
   add_test(NAME states.${scenario} COMMAND test_state_sync ${scenario})

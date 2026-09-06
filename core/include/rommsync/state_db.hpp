@@ -127,6 +127,15 @@ inline constexpr int kFormatVersion = 2;
 /// the pair for a mixed file, and `core.state_db` asserts the worst mix the scan
 /// bounds can produce rather than only a file of saves.
 ///
+/// **A card whose saves alone reach `kMaxRecords` records no states at all.**
+/// `scan::kMaxSaves` is the whole of this bound, so there is no room left beside
+/// them; `sync::SyncStates` drops every state row rather than write a file
+/// `ParseBaseline` would discard whole, and each state is then kept on both
+/// sides forever instead of syncing. It settles rather than churning -- the next
+/// tick finds no row and answers keep-both, which sends nothing -- and the run
+/// says so in a sentence naming the remedy. This is the card #11 describes:
+/// `kInnerHeapSize`, `scan::kMaxSaves` and `kMaxRecords` move together.
+///
 /// A card with more saves than this needs the sysmodule heap raised first.
 /// These two constants and `kInnerHeapSize` move together.
 inline constexpr std::size_t kMaxRecords = 512;

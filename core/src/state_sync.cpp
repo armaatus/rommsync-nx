@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <map>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -60,32 +61,15 @@ constexpr const char* kStatesPath = "/api/states";
 /// the end reads as "the server has no row with this name", and the answer to
 /// that is an upload -- which, `POST /api/states` being an upsert, would replace
 /// the row that was there. So the listing is all of it or none of it.
-constexpr std::size_t kMaxStateListBytes = 128 * 1024;
-
-/// Percent-encode one query-string value.
 ///
-/// A state's `file_name` is user data off a FAT32 card and its `emulator` is a
-/// folder name a human chose, so neither may be pasted into a URL: an `&` in one
-/// would move the rest of the value into a parameter of its own.
-std::string EncodeQuery(std::string_view value) {
-  static constexpr char kHex[] = "0123456789ABCDEF";
-  std::string out;
-  out.reserve(value.size());
-  for (const char character : value) {
-    const unsigned char byte = static_cast<unsigned char>(character);
-    const bool unreserved = (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
-                            (byte >= '0' && byte <= '9') || byte == '-' || byte == '_' ||
-                            byte == '.' || byte == '~';
-    if (unreserved) {
-      out.push_back(character);
-    } else {
-      out.push_back('%');
-      out.push_back(kHex[byte >> 4]);
-      out.push_back(kHex[byte & 0x0F]);
-    }
-  }
-  return out;
-}
+/// **It bounds the parse, not the allocation.** `http::HttpClient::Send` reads a
+/// successful body whole, so a four-megabyte listing is already resident by the
+/// time this is checked; what the bound stops is turning it into that many more
+/// `ServerState`s, each of them several heap strings. Bounding the *transfer*
+/// needs a ceiling on `http::Request`, which every list call in this engine
+/// would want and none has -- `GET /api/roms` pages instead, and `/api/states`
+/// offers no `limit` to page with.
+constexpr std::size_t kMaxStateListBytes = 128 * 1024;
 
 /// How one state is named in a log line: the rom and the file. Never a token,
 /// and never the file's contents.
@@ -133,27 +117,6 @@ std::optional<std::pair<StateError, std::string>> Refused(const http::Result& re
   }
   return std::nullopt;
 }
-
-/// The staged download, removed unless something takes it. `sync_execute.cpp`'s
-/// guard, for its reason: an unverified download is not a state.
-class StagedFile {
- public:
-  explicit StagedFile(std::string path) : path_(std::move(path)) {}
-  ~StagedFile() {
-    if (!path_.empty()) {
-      std::remove(path_.c_str());
-    }
-  }
-
-  StagedFile(const StagedFile&) = delete;
-  StagedFile& operator=(const StagedFile&) = delete;
-
-  const std::string& path() const { return path_; }
-  void Release() { path_.clear(); }
-
- private:
-  std::string path_;
-};
 
 StateOperationResult Fail(std::int64_t rom_id, std::string file_name, StateAction action,
                           StateError error, std::string message) {
@@ -283,10 +246,14 @@ bool ReadStateRow(const json::Value& element, ServerState* out, json::Error* err
     *error = json::Error{0, "state row", "id and rom_id must be positive"};
     return false;
   }
-  if (!IsSingleFileName(state.file_name)) {
+  if (state.file_name.empty() || !IsSingleFileName(state.file_name)) {
     // The name is a pairing key that gets joined into a backup path and a
     // placement. A row whose name is a path is a row this client refuses to act
-    // on rather than one it sanitises into something else.
+    // on rather than one it sanitises into something else -- and emptiness is
+    // checked alongside because `IsSingleFileName` accepts it, exactly as
+    // `state::Usable(StateRecord)` says. An empty name matches no local file, so
+    // it would fall to the placement branch and then produce a baseline row the
+    // writer refuses, once per tick, forever.
     *error = json::Error{0, "state row", "file_name is not a single file name"};
     return false;
   }
@@ -459,7 +426,7 @@ StateOperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
   std::string url = http::JoinUrl(token.server_url, kStatesPath) +
                     "?rom_id=" + std::to_string(file.rom_id);
   if (!file.emulator.empty()) {
-    url += "&emulator=" + EncodeQuery(file.emulator);
+    url += "&emulator=" + http::EncodeQueryValue(file.emulator);
   }
 
   http::Request request = Authed(http::Method::kPost, std::move(url), token, options);
@@ -531,7 +498,7 @@ StateOperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   // its `.part` onto the destination the instant the body ends, which is before
   // anything has checked it. A stale one from an interrupted run goes first --
   // the bytes in it are a download that never completed and belong to nothing.
-  StagedFile staged(io::TempPathFor(destination));
+  io::StagedFile staged(io::TempPathFor(destination));
   std::remove(staged.path().c_str());
 
   http::Request request =
@@ -562,7 +529,16 @@ StateOperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
     // The backend leaves its partial behind for a resume that is never coming,
     // so it is litter beside a state rather than progress towards one.
     std::remove(http::PartialPathFor(staged.path()).c_str());
-    return Fail(server.rom_id, server.file_name, action, refused->first, refused->second);
+    // **A body that ended early is `kUnverified`, not `kTransferFailed`.** The
+    // length check is enforced by the transport (`DownloadTarget::expected_size`)
+    // and comes back as `http::Error::kTruncated`, so leaving it in the
+    // transport bucket would make the one check a state download gets
+    // indistinguishable from an offline server -- and `kUnverified`'s whole
+    // reason for existing is to name bytes that were fetched and rejected.
+    const StateError error = fetched.error == http::Error::kTruncated
+                                 ? StateError::kUnverified
+                                 : refused->first;
+    return Fail(server.rom_id, server.file_name, action, error, refused->second);
   }
   StateOperationResult result;
   result.action = action;
@@ -641,15 +617,60 @@ StateOperationResult KeepBoth(std::int64_t rom_id, const std::string& file_name,
   return result;
 }
 
-/// Record what an operation did, or drop the row it invalidated.
+/// The row an operation earned, from the facts and the server row it names.
+state::StateRecord RowFor(const ServerState& server, const std::string& emulator,
+                          const state::FileFacts& facts) {
+  state::StateRecord row;
+  row.rom_id = server.rom_id;
+  row.file_name = server.file_name;
+  row.emulator = emulator;
+  row.content_hash = facts.content_hash;
+  row.mtime = facts.mtime;
+  row.file_size_bytes = facts.file_size_bytes;
+  row.server_state_id = server.id;
+  row.server_updated_at = server.updated_at;
+  row.server_file_size_bytes = server.file_size_bytes;
+  return row;
+}
+
+/// Record an **upload**, from what the scan already knows.
 ///
-/// The row is built from the card rather than from what the tick reported, for
-/// `state::ReadBackFile`'s reason -- and here it applies to an *upload* as well
-/// as to a download, because the row also has to carry the server's new
-/// `updated_at`, which only the response knows.
-void Advance(fs::FileSystem& files, const scan::StateFile* local, const ServerState& server,
-             const std::string& sd_path, state::Baseline* baseline,
-             std::vector<std::string>* warnings) {
+/// An upload does not touch the local file, so the scan's mtime, size and digest
+/// still describe it exactly -- which is `sync_finish`'s rule for a save, and it
+/// matters more here: re-reading would re-hash a file that is tens of megabytes
+/// for no new information, once per upload.
+///
+/// The only thing that can stop a row being written is the scan having failed to
+/// hash the file, and then the state is **left with no row at all**, which the
+/// next tick reads as "never synced" and answers with a keep-both. That is
+/// permanent until the digest can be taken, so it is said plainly rather than as
+/// "compared from scratch next tick".
+void AdvanceUploaded(const scan::StateFile& local, const ServerState& server,
+                     state::Baseline* baseline, std::vector<std::string>* warnings) {
+  if (local.content_hash.empty()) {
+    baseline->EraseState(server.rom_id, server.file_name);
+    warnings->push_back(Describe(server.rom_id, server.file_name) +
+                        ": it uploaded, but its bytes could not be hashed, so no row pairs it with "
+                        "the server copy -- until they can be, this state is kept on both sides "
+                        "and not synced");
+    return;
+  }
+  state::FileFacts facts;
+  facts.content_hash = local.content_hash;
+  facts.mtime = Timestamp{} + std::chrono::seconds{local.modified_unix};
+  facts.file_size_bytes = local.size_bytes;
+  baseline->SetState(RowFor(server, local.emulator, facts));
+}
+
+/// Record a **download or a placement**, from the card.
+///
+/// Everything this run knew about the file describes bytes that are no longer
+/// there, so all three fields are re-read. A row built from the reported ones
+/// would claim a digest against an mtime and a size that no longer match, which
+/// is a row that lies and then never gets used.
+void AdvanceWritten(fs::FileSystem& files, const scan::StateFile* local,
+                    const ServerState& server, const std::string& sd_path,
+                    state::Baseline* baseline, std::vector<std::string>* warnings) {
   // **A listing per call, not one carried across the run.** `fs::Directories`
   // re-lists only when the directory changes, and here the writes and the
   // read-backs interleave: two states downloaded into one folder would have the
@@ -670,47 +691,43 @@ void Advance(fs::FileSystem& files, const scan::StateFile* local, const ServerSt
                         "), so this state is compared from scratch next tick");
     return;
   }
-  state::StateRecord row;
-  row.rom_id = server.rom_id;
-  row.file_name = server.file_name;
-  row.emulator = local != nullptr ? local->emulator : server.emulator;
-  row.content_hash = facts.content_hash;
-  row.mtime = facts.mtime;
-  row.file_size_bytes = facts.file_size_bytes;
-  row.server_state_id = server.id;
-  row.server_updated_at = server.updated_at;
-  row.server_file_size_bytes = server.file_size_bytes;
-  baseline->SetState(std::move(row));
+  baseline->SetState(
+      RowFor(server, local != nullptr ? local->emulator : server.emulator, facts));
 }
 
 /// Drop state rows until the baseline fits, and never a save row.
 ///
 /// The ones this run knows nothing about go first -- almost always states that
 /// are no longer on the card and no longer on the server -- and only then the
-/// ones it does, newest key last. Saves are untouched at every step: a save is
-/// what hard rule 2 protects, and a state that loses its row costs a re-hash and
-/// a keep-both, never a file.
+/// ones it does, in key order. Saves are untouched at every step: a save is what
+/// hard rule 2 protects, and a state that loses its row costs a keep-both, never
+/// a file.
+///
+/// **A card whose saves alone fill the baseline cannot record a state at all.**
+/// `scan::kMaxSaves` is the whole of `state::kMaxRecords`, so 512 saves leave no
+/// room, both passes run, and every state row goes -- including the ones this
+/// run just wrote. The next tick then finds no row for any state and answers
+/// keep-both, which is safe and settles rather than churning, but it does mean
+/// states never sync on such a card. That is a *condition*, not a transient, so
+/// it gets a sentence of its own naming the remedy rather than being left to be
+/// inferred from a row count.
 std::size_t TrimStates(const std::vector<StateOperationResult>& operations,
-                       state::Baseline* baseline) {
+                       state::Baseline* baseline, std::vector<std::string>* warnings) {
   if (baseline->size() <= state::kMaxRecords) {
     return 0;
   }
-  std::vector<std::pair<std::int64_t, std::string>> touched;
-  touched.reserve(operations.size());
+  std::set<state::Baseline::StateKey> touched;
   for (const StateOperationResult& operation : operations) {
-    touched.emplace_back(operation.rom_id, operation.file_name);
+    touched.emplace(operation.rom_id, operation.file_name);
   }
-  const auto known = [&touched](std::int64_t rom_id, const std::string& file_name) {
-    return std::find(touched.begin(), touched.end(), std::make_pair(rom_id, file_name)) !=
-           touched.end();
-  };
 
+  const bool saves_alone_fill_it = baseline->rows().size() >= state::kMaxRecords;
   std::size_t dropped = 0;
   for (int pass = 0; pass < 2 && baseline->size() > state::kMaxRecords; ++pass) {
-    std::vector<std::pair<std::int64_t, std::string>> droppable;
+    std::vector<state::Baseline::StateKey> droppable;
     for (const auto& [key, row] : baseline->state_rows()) {
       (void)row;
-      if (pass == 0 && known(key.first, key.second)) {
+      if (pass == 0 && touched.count(key) != 0) {
         continue;
       }
       droppable.push_back(key);
@@ -723,6 +740,14 @@ std::size_t TrimStates(const std::vector<StateOperationResult>& operations,
         ++dropped;
       }
     }
+  }
+  if (saves_alone_fill_it) {
+    warnings->push_back(
+        "this card holds " + std::to_string(baseline->rows().size()) +
+        " saves, which is the whole of the " + std::to_string(state::kMaxRecords) +
+        " rows a state.db can be read back with, so no state can be recorded beside them and "
+        "every state stays kept-on-both-sides; turn sync.states off, or raise the client's "
+        "bounds (state_db.hpp)");
   }
   return dropped;
 }
@@ -743,23 +768,42 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
   report.ran = true;
 
   report.scan = scan::ScanStates(config, index, files, *baseline);
+  // Lifted, not left on `report.scan`. "An ambiguous state is skipped and
+  // logged" is the acceptance, and a caller that logs `warnings` and nothing
+  // else -- which is what every other step of a tick hands up -- would otherwise
+  // never see one. Bounded already: the scan caps what it spells out.
+  for (const scan::Skip& skip : report.scan.skipped) {
+    report.warnings.push_back(skip.Describe());
+  }
+  for (const scan::Skip& unhashed : report.scan.unhashed) {
+    report.warnings.push_back(unhashed.Describe());
+  }
 
   std::vector<ServerState> server_states;
   StateError error = StateError::kNone;
   std::string message;
   if (!ListServerStates(client, token, options, &server_states, &error, &message)) {
-    report.failed = 1;
+    // Built here rather than through `Fail`, which prefixes the rom and the
+    // state: this failure is about the listing and names neither. Without it
+    // there is nothing to compare against, and comparing against nothing would
+    // read as "the server holds no states" -- which for every local state is an
+    // upload, and an upload is an overwrite.
+    StateOperationResult failed;
+    failed.outcome =
+        error == StateError::kCanceled ? StateOutcome::kCanceled : StateOutcome::kFailed;
+    failed.error = error;
+    failed.message = message;
+    // A cancelled listing is counted nowhere, for `OperationOutcome::kCanceled`'s
+    // reason: the caller stopped it, so reporting it as failed would describe
+    // work that went wrong rather than work that was not attempted.
+    report.failed = failed.outcome == StateOutcome::kFailed ? 1 : 0;
+    report.canceled = failed.outcome == StateOutcome::kCanceled;
     report.unauthorized =
         error == StateError::kUnauthorized || error == StateError::kForbidden;
-    report.canceled = error == StateError::kCanceled;
-    report.operations.push_back(Fail(0, std::string(), StateAction::kNoOp, error, message));
-    // `Fail` prefixes the rom and the state, and there is neither: this failure
-    // is about the listing.
-    report.operations.back().message = message;
+    report.operations.push_back(std::move(failed));
     report.warnings.push_back(message);
     return report;
   }
-
 
   // The server rows a local state claimed. What is left over is what this
   // console does not have yet.
@@ -835,7 +879,7 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
       case StateAction::kUpload: {
         StateOperationResult result = Upload(client, files, token, file, action, options);
         if (result.outcome == StateOutcome::kUploaded) {
-          Advance(files, &file, result.server, file.sd_path, baseline, &report.warnings);
+          AdvanceUploaded(file, result.server, baseline, &report.warnings);
         }
         if (!record(std::move(result))) {
           stopped = true;
@@ -846,7 +890,7 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
         StateOperationResult result =
             Fetch(client, files, token, *server, file.sd_path, action, options, &report.warnings);
         if (result.outcome == StateOutcome::kDownloaded) {
-          Advance(files, &file, *server, file.sd_path, baseline, &report.warnings);
+          AdvanceWritten(files, &file, *server, file.sd_path, baseline, &report.warnings);
         }
         if (!record(std::move(result))) {
           stopped = true;
@@ -884,18 +928,35 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
       }
       continue;
     }
+    // **A placement may only create.** "No local file claimed this row" is not
+    // the same as "there is no file at that path": a state the scan *skipped* --
+    // ambiguous, or the loser of a duplicate name -- never claimed its row, and
+    // `place` is free to answer with the path it sits at. Writing there would be
+    // an overwrite on the strength of a row this console has no history for,
+    // which is exactly the case the policy keeps both copies for. The backup
+    // inside `Fetch` would keep it recoverable; that is not the promise.
+    const std::string resolved = files.Resolve(sd_path);
+    if (!resolved.empty() && io::Exists(resolved)) {
+      if (!record(KeepBoth(server.rom_id, server.file_name, sd_path,
+                           "the server holds a state this console has no history for, and " +
+                               sd_path +
+                               " is already taken; both copies are kept and neither was touched"))) {
+        break;
+      }
+      continue;
+    }
     StateOperationResult result =
         Fetch(client, files, token, server, sd_path, StateAction::kPlace, options,
               &report.warnings);
     if (result.outcome == StateOutcome::kDownloaded) {
-      Advance(files, nullptr, server, sd_path, baseline, &report.warnings);
+      AdvanceWritten(files, nullptr, server, sd_path, baseline, &report.warnings);
     }
     if (!record(std::move(result))) {
       break;
     }
   }
 
-  report.rows_dropped = TrimStates(report.operations, baseline);
+  report.rows_dropped = TrimStates(report.operations, baseline, &report.warnings);
   if (report.rows_dropped > 0) {
     report.warnings.push_back(
         std::to_string(report.rows_dropped) +

@@ -69,7 +69,13 @@
 
 namespace rommsync::sync {
 
-/// One row of `GET /api/states?rom_id=`, reduced to what arbitration uses.
+/// One row of `GET /api/states`, reduced to what arbitration uses.
+///
+/// The listing is taken **unfiltered, once per run**. The endpoint takes an
+/// optional `rom_id`, but it offers no way to ask about several roms at once, so
+/// filtering would cost a round trip per rom on every tick to learn that nothing
+/// changed -- and the placement branch needs the rows for roms no local state
+/// mentioned anyway.
 ///
 /// `StateSchema` has seventeen fields; these five are the ones a decision is
 /// made on. Everything else -- `file_path`, `download_path`, `screenshot` -- is

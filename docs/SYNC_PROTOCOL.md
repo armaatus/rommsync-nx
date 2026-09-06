@@ -440,10 +440,15 @@ For one local state, keyed `(rom_id, file_name)`:
 | id X    | id X, moved     | unchanged | download |
 | id X    | id X, moved     | changed   | **keep both** |
 
-A server state no local file claimed is *placed* — a new local file, so it
-overwrites nothing. Where it goes is the caller's
-(`sync::StateSyncOptions::place`), because the folder depends on the rom's
-platform and on which emulator the state belongs to.
+A server state no local file claimed is *placed* — and a placement may only
+**create**. Where it goes is the caller's (`sync::StateSyncOptions::place`),
+because the folder depends on the rom's platform and on which emulator the state
+belongs to; nothing said is a named failure rather than a guessed path. If there
+is already a file at the path it names, that is keep-both too: "no local state
+claimed this row" is not "there is nothing at that path" — a state the scan
+skipped, as an ambiguity or as the loser of a duplicate name, claims nothing and
+still sits on the card, and writing over it on the strength of a row this console
+has no history for is exactly what the policy refuses.
 
 "Keep both" means exactly that: nothing is transferred, the local file is not
 touched, the server row is not written, and the run says so in a warning. It is
@@ -607,6 +612,15 @@ finally the negotiation, which on any tick that got a plan is itself proof the
 server read the token — leave that last step out and a tick that negotiated fine
 and then lost the link twice reports silence, and `auth::Gate`'s consecutive
 count survives a 200 that should have cleared it.
+
+The two kinds share one budget, because `state::kMaxRecords` bounds the *file*.
+`scan::kMaxStates` is a quarter of it, and a run trims its own state rows before
+a save ever loses one — a save is what hard rule 2 protects. **A card whose saves
+alone reach the bound therefore records no states**: there is no room beside
+them, so every state is kept on both sides rather than synced. That settles
+instead of churning (the next tick finds no row and sends nothing) and the run
+says so, naming the remedy — turn `sync.states` off, or raise the client's
+bounds.
 
 ## Failure & safety rules
 

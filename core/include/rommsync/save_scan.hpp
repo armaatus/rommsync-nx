@@ -326,6 +326,6 @@ std::string SlotFor(std::string_view emulator, std::string_view file_name);
 /// string, which is what makes its files match across the whole library and
 /// makes a two-platform name an ambiguity rather than a coin toss.
 std::map<std::string, std::string, std::less<>> PlatformHints(
-    const config::Config& config, Folders folders = Folders::kSaves);
+    const config::Config& config, Folders which = Folders::kSaves);
 
 }  // namespace rommsync::scan

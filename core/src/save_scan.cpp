@@ -215,9 +215,9 @@ std::string SlotFor(std::string_view emulator, std::string_view file_name) {
 std::map<std::string, std::string, std::less<>> PlatformHints(const config::Config& config,
                                                               Folders which) {
   std::map<std::string, std::string, std::less<>> hints;
-  for (const auto& [slug, folders] : config.platforms) {
+  for (const auto& [slug, mapped] : config.platforms) {
     const std::vector<std::string>& directories =
-        which == Folders::kStates ? folders.states : folders.saves;
+        which == Folders::kStates ? mapped.states : mapped.saves;
     for (const std::string& directory : directories) {
       const auto found = hints.find(directory);
       if (found == hints.end()) {
@@ -459,7 +459,11 @@ ScanResult ScanStates(const config::Config& config, const roms::RomIndex& index,
   // row however different their directories are. Claiming the pair here is what
   // stops the RetroArch copy and the Tico copy taking turns destroying each
   // other through RomM (`SkipReason::kDuplicateName`).
-  std::set<std::pair<std::int64_t, std::string>> claimed;
+  //
+  // `state::Baseline::StateKey` rather than a second spelling of the pair: the
+  // baseline is keyed on exactly this, and two spellings of a key are two places
+  // to disagree about what pairs with what.
+  std::set<state::Baseline::StateKey> claimed;
 
   Walk(config.StateScanDirs(), PlatformHints(config, Folders::kStates), index, files, kMaxStates,
        SkipReason::kTooManyStates,

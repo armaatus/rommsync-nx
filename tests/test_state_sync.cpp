@@ -379,6 +379,7 @@ void Scanning(rig::Checks& checks) {
   state::Baseline baseline;
   const scan::ScanResult result = scan::ScanStates(configured, index, *files, baseline);
 
+
   checks.ExpectEq(result.states.size(), std::size_t{1},
                   "one state is reported: " + result.DescribeSkipped());
   if (result.states.size() == 1) {
@@ -399,6 +400,27 @@ void Scanning(rig::Checks& checks) {
   checks.Expect(duplicate,
                 "and the second file of one (rom_id, file_name) is skipped as a duplicate name -- " +
                     result.DescribeSkipped());
+
+  // "Skipped **and logged**" is the acceptance, and a caller that logs
+  // `warnings` -- which is what every other step of a tick hands up -- has to
+  // see them there rather than having to know to look at `report.scan`.
+  auth::StoredToken token;
+  token.server_url = "http://127.0.0.1:1";
+  token.access_token = "not-used";
+  token.device_id = "not-used";
+  ScriptedClient client;
+  client.upload_response =
+      StateRowJson(9, 1, "Game.state", "retroarch", 18, "2026-09-06T03:00:00+00:00");
+  const sync::StateSyncReport report =
+      sync::SyncStates(client, *files, token, configured, index, &baseline, OptionsAt(kStamp));
+  bool warned_ambiguous = false;
+  bool warned_duplicate = false;
+  for (const std::string& warning : report.warnings) {
+    warned_ambiguous = warned_ambiguous || warning.find("ambiguous") != std::string::npos;
+    warned_duplicate = warned_duplicate || warning.find("duplicate name") != std::string::npos;
+  }
+  checks.Expect(warned_ambiguous, "the ambiguous state reaches the run's warnings");
+  checks.Expect(warned_duplicate, "and so does the duplicate name");
 }
 
 // --- decides ------------------------------------------------------------------
@@ -516,6 +538,323 @@ void Decides(rig::Checks& checks) {
 
   // Both moved, and RomM arbitrates neither.
   run("both moved", "[" + kServerRow + "]", true, false, false, sync::StateOutcome::kKeptBoth);
+}
+
+// --- recording ----------------------------------------------------------------
+
+/// What an upload records, and what it must not need to record it.
+///
+/// An upload does not touch the local file, so the row comes from the facts the
+/// scan already has. Reading the card back for one would re-hash a file that is
+/// tens of megabytes for no new information -- and, worse, a card that would not
+/// answer in that moment would erase the pairing and drop the state to keep-both
+/// permanently, because there is no "compared from scratch" for a state whose
+/// server copy is already there.
+void Recording(rig::Checks& checks) {
+  Sandbox sandbox(checks, "states-recording");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const std::string bytes = "a snapshot of a core's memory";
+  sandbox.Write(StatePath("Game.state"), bytes);
+
+  const roms::RomIndex index = IndexOf(1, "Game", "nes");
+  auth::StoredToken token;
+  token.server_url = "http://127.0.0.1:1";
+  token.access_token = "not-used";
+  token.device_id = "not-used";
+
+  ScriptedClient client;
+  client.upload_response = StateRowJson(9, 1, "Game.state", "retroarch",
+                                        static_cast<std::int64_t>(bytes.size()),
+                                        "2026-09-06T03:00:00+00:00");
+  state::Baseline baseline;
+  const sync::StateSyncReport report =
+      sync::SyncStates(client, *files, token, StatesOn(true), index, &baseline, OptionsAt(kStamp));
+  checks.ExpectEq(report.completed, 1, "the state uploaded");
+
+  const state::StateRecord* row = baseline.FindState(1, "Game.state");
+  checks.Expect(row != nullptr, "and it has a row");
+  if (row == nullptr) {
+    return;
+  }
+  checks.ExpectEq(row->content_hash, crypto::Md5Hex(bytes),
+                  "carrying the digest of the bytes that went up");
+  checks.ExpectEq(row->file_size_bytes, static_cast<std::int64_t>(bytes.size()),
+                  "and their size");
+  checks.ExpectEq(row->server_state_id, std::int64_t{9}, "paired with the server row");
+  checks.ExpectEq(sync::UnixSeconds(row->server_updated_at), std::int64_t{1788663600},
+                  "at the instant the server stamped it");
+
+  // The row has to be one `state::SaveBaseline` will actually write -- a row it
+  // skips is a state that reads as never-synced on the next tick, which is a
+  // keep-both that never resolves.
+  const state::StoreResult stored =
+      state::SaveBaseline(sandbox.Host("/config/rommsync/state.db"), baseline);
+  checks.Expect(stored.ok(), "and the baseline writes: " + stored.message);
+  checks.Expect(stored.skipped.empty(), "with the row intact, not skipped");
+
+  // The second tick: nothing moved on either side, so nothing is done and no
+  // request but the listing goes out.
+  ScriptedClient again;
+  again.listing = "[" + client.upload_response + "]";
+  const sync::StateSyncReport unchanged = sync::SyncStates(again, *files, token, StatesOn(true),
+                                                           index, &baseline, OptionsAt(kStamp));
+  checks.ExpectEq(unchanged.completed, 1, "the next tick considers it");
+  if (unchanged.operations.size() == 1) {
+    checks.Expect(unchanged.operations.front().outcome == sync::StateOutcome::kNoOp,
+                  std::string("and finds nothing to do: ") +
+                      sync::ToString(unchanged.operations.front().outcome));
+  }
+  checks.ExpectEq(again.Count("POST"), 0, "so it uploads nothing a second time");
+}
+
+// --- placing ------------------------------------------------------------------
+
+/// The branch for a server state this console does not have, and its two ways
+/// of refusing to guess.
+///
+/// A placement is the one branch that needs no arbitration, *because it creates*
+/// -- so the two things it must not do are invent a path and write over one.
+/// "No local state claimed this row" is not "there is nothing at that path": a
+/// state the scan skipped, as an ambiguity or as the loser of a duplicate name,
+/// claims nothing and still sits on the card.
+void Placing(rig::Checks& checks) {
+  const roms::RomIndex index = IndexOf(1, "Game", "nes");
+  auth::StoredToken token;
+  token.server_url = "http://127.0.0.1:1";
+  token.access_token = "not-used";
+  token.device_id = "not-used";
+  const std::string kServerRow =
+      StateRowJson(9, 1, "Game.state", "retroarch", 40, "2026-09-06T03:00:00+00:00");
+
+  // Nothing said where it should go.
+  {
+    Sandbox sandbox(checks, "states-placing-nowhere");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    ScriptedClient client;
+    client.listing = "[" + kServerRow + "]";
+    client.content = std::string(40, 'z');
+
+    state::Baseline baseline;
+    const sync::StateSyncReport report =
+        sync::SyncStates(client, *files, token, StatesOn(true), index, &baseline, OptionsAt(kStamp));
+    checks.ExpectEq(report.failed, 1, "a state with nowhere to go is a failure, not a guess");
+    if (report.operations.size() == 1) {
+      checks.Expect(report.operations.front().error == sync::StateError::kNoPlacement,
+                    std::string("named as one: ") +
+                        sync::ToString(report.operations.front().error));
+    }
+    checks.Expect(!sandbox.Exists(StatePath("Game.state")), "and nothing was written");
+    checks.Expect(baseline.state_rows().empty(), "and no row was recorded");
+  }
+
+  // The path it would go to is already taken by a state the scan skipped.
+  {
+    Sandbox sandbox(checks, "states-placing-occupied");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    const std::string sitting = "a state the scan skipped and never claimed";
+    sandbox.SeedState(StatePath("Game.state"), sitting);
+
+    ScriptedClient client;
+    client.listing = "[" + kServerRow + "]";
+    client.content = std::string(40, 'z');
+
+    sync::StateSyncOptions options = OptionsAt(kStamp);
+    options.place = [](const sync::ServerState& server) { return StatePath(server.file_name); };
+
+    // An index the local file does NOT match, so the scan claims nothing and the
+    // server row reaches the placement branch with a file already at its path.
+    const roms::RomIndex elsewhere = IndexOf(1, "Something Else", "nes");
+    state::Baseline baseline;
+    const sync::StateSyncReport report = sync::SyncStates(client, *files, token, StatesOn(true),
+                                                          elsewhere, &baseline, options);
+    checks.ExpectEq(report.kept_both, 1, "a placement onto an occupied path keeps both");
+    checks.ExpectEq(report.completed, 0, "and transfers nothing");
+    checks.ExpectEq(sandbox.Read(StatePath("Game.state")), sitting,
+                    "the file that was there is exactly as it was");
+    checks.Expect(baseline.state_rows().empty(),
+                  "and nothing was recorded as paired that is not");
+  }
+}
+
+// --- listing ------------------------------------------------------------------
+
+/// A listing this client cannot work from stops the run, and touches nothing.
+///
+/// **A partial listing is worse than none.** A local state whose server row fell
+/// off the end reads as "the server has no row with this name", and the answer
+/// to that is an upload -- which, `POST /api/states` being an upsert, replaces
+/// the row that was there. So both ways the listing can be unusable, over the
+/// bound and unparseable, are refusals rather than a shorter list.
+void Listing(rig::Checks& checks) {
+  const roms::RomIndex index = IndexOf(1, "Game", "nes");
+  auth::StoredToken token;
+  token.server_url = "http://127.0.0.1:1";
+  token.access_token = "not-used";
+  token.device_id = "not-used";
+
+  struct Case {
+    const char* what;
+    std::string listing;
+  };
+  // One row per 5 KiB of padding, so the body is comfortably over the bound the
+  // module refuses at without this test needing to know its value.
+  std::string huge = "[";
+  for (int at = 0; at < 4096; ++at) {
+    if (at > 0) {
+      huge += ",";
+    }
+    huge += StateRowJson(at + 1, 1, "Padding " + std::to_string(at) + ".state", "retroarch", 1,
+                         "2026-09-06T03:00:00+00:00");
+  }
+  huge += "]";
+
+  const Case kCases[] = {
+      {"a listing over the bound", huge},
+      {"a listing that is not an array", "{\"id\":1}"},
+      {"a listing whose row is missing a field", "[{\"id\":1,\"rom_id\":1}]"},
+      {"a body that is not JSON at all", "not json"},
+  };
+
+  for (const Case& one : kCases) {
+    Sandbox sandbox(checks, "states-listing");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    const std::string bytes = "a snapshot of a core's memory";
+    sandbox.SeedState(StatePath("Game.state"), bytes);
+
+    ScriptedClient client;
+    client.listing = one.listing;
+    client.upload_response =
+        StateRowJson(9, 1, "Game.state", "retroarch", 29, "2026-09-06T03:00:00+00:00");
+
+    state::Baseline baseline;
+    const sync::StateSyncReport report =
+        sync::SyncStates(client, *files, token, StatesOn(true), index, &baseline, OptionsAt(kStamp));
+
+    checks.ExpectEq(report.failed, 1, std::string(one.what) + " fails the run");
+    checks.ExpectEq(report.completed, 0, std::string(one.what) + ": nothing was done");
+    checks.ExpectEq(client.Count("POST"), 0,
+                    std::string(one.what) + ": and no upload went out on the strength of it");
+    checks.ExpectEq(sandbox.Read(StatePath("Game.state")), bytes,
+                    std::string(one.what) + ": the local state is untouched");
+    checks.Expect(baseline.state_rows().empty(), std::string(one.what) + ": and so is the baseline");
+  }
+}
+
+// --- trims --------------------------------------------------------------------
+
+/// The baseline is one file and `state::kMaxRecords` bounds it, so saves and
+/// states share a budget. When the two together would overflow it, **states are
+/// what gives**.
+///
+/// The failure this is written against is the one #11 named, arriving through a
+/// feature that is off by default: a baseline over the bound is one
+/// `state::SaveBaseline` refuses *whole*, so nothing is written, and the whole
+/// library is re-hashed on that tick and every tick after it -- silently. A save
+/// is what hard rule 2 protects, so a save row is never the one dropped.
+void Trims(rig::Checks& checks) {
+  Sandbox sandbox(checks, "states-trims");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  sandbox.Write(StatePath("Game.state"), "a snapshot of a core's memory");
+
+  const roms::RomIndex index = IndexOf(1, "Game", "nes");
+  auth::StoredToken token;
+  token.server_url = "http://127.0.0.1:1";
+  token.access_token = "not-used";
+  token.device_id = "not-used";
+
+  ScriptedClient client;
+  client.upload_response =
+      StateRowJson(9, 1, "Game.state", "retroarch", 29, "2026-09-06T03:00:00+00:00");
+
+  // A full baseline of saves, and then some state rows on top -- rows for states
+  // that are no longer on this card and no longer on the server, which is what
+  // accretes.
+  constexpr std::size_t kSaves = state::kMaxRecords / 2;
+  constexpr std::size_t kStaleStates = state::kMaxRecords;
+  state::Baseline baseline;
+  for (std::size_t at = 0; at < kSaves; ++at) {
+    state::SaveRecord save;
+    save.rom_id = static_cast<std::int64_t>(at) + 1000;
+    save.slot = "retroarch-srm";
+    save.content_hash = crypto::Md5Hex("save " + std::to_string(at));
+    save.mtime = sync::Timestamp{} + std::chrono::seconds{kStamp};
+    save.file_size_bytes = 32768;
+    baseline.Set(std::move(save));
+  }
+  for (std::size_t at = 0; at < kStaleStates; ++at) {
+    state::StateRecord stale;
+    stale.rom_id = static_cast<std::int64_t>(at) + 5000;
+    stale.file_name = "Stale " + std::to_string(at) + ".state";
+    stale.emulator = "retroarch";
+    stale.content_hash = crypto::Md5Hex("state " + std::to_string(at));
+    stale.mtime = sync::Timestamp{} + std::chrono::seconds{kStamp};
+    stale.file_size_bytes = 4096;
+    stale.server_state_id = static_cast<std::int64_t>(at) + 1;
+    stale.server_updated_at = sync::Timestamp{} + std::chrono::seconds{kStamp};
+    stale.server_file_size_bytes = 4096;
+    baseline.SetState(std::move(stale));
+  }
+  checks.Expect(baseline.size() > state::kMaxRecords, "the baseline starts over the bound");
+
+  const sync::StateSyncReport report =
+      sync::SyncStates(client, *files, token, StatesOn(true), index, &baseline, OptionsAt(kStamp));
+
+  checks.ExpectEq(report.completed, 1, "the one local state was still uploaded");
+  checks.Expect(baseline.size() <= state::kMaxRecords,
+                "and the baseline now fits -- " + std::to_string(baseline.size()) + " rows");
+  checks.Expect(report.rows_dropped > 0, "the trim says how many rows it dropped");
+  checks.ExpectEq(baseline.rows().size(), kSaves, "no save row was dropped to make room");
+  checks.Expect(baseline.FindState(1, "Game.state") != nullptr,
+                "and the state this run just synced kept its row");
+
+  // The refusal this exists to prevent: a baseline over the bound is one the
+  // writer will not write at all.
+  const state::StoreResult stored =
+      state::SaveBaseline(sandbox.Host("/config/rommsync/state.db"), baseline);
+  checks.Expect(stored.ok(), "so the baseline can actually be written: " + stored.message);
+
+  // ...and the case where there is no room at all, because the saves alone are
+  // the whole budget. It settles rather than churning -- the next tick finds no
+  // row and answers keep-both -- but "states never sync on this card" is a
+  // condition a user can act on, so it has to be said rather than inferred.
+  state::Baseline crowded;
+  for (std::size_t at = 0; at < state::kMaxRecords; ++at) {
+    state::SaveRecord save;
+    save.rom_id = static_cast<std::int64_t>(at) + 1000;
+    save.slot = "retroarch-srm";
+    save.content_hash = crypto::Md5Hex("save " + std::to_string(at));
+    save.mtime = sync::Timestamp{} + std::chrono::seconds{kStamp};
+    save.file_size_bytes = 32768;
+    crowded.Set(std::move(save));
+  }
+  ScriptedClient second;
+  second.upload_response =
+      StateRowJson(9, 1, "Game.state", "retroarch", 29, "2026-09-06T03:00:00+00:00");
+  const sync::StateSyncReport full = sync::SyncStates(second, *files, token, StatesOn(true), index,
+                                                      &crowded, OptionsAt(kStamp));
+  checks.ExpectEq(crowded.rows().size(), state::kMaxRecords, "every save row survives");
+  checks.Expect(crowded.state_rows().empty(), "and no state row could be kept beside them");
+  checks.Expect(crowded.size() <= state::kMaxRecords, "the baseline is still writable");
+  bool named = false;
+  for (const std::string& warning : full.warnings) {
+    named = named || warning.find("no state can be recorded beside them") != std::string::npos;
+  }
+  checks.Expect(named, "and the run says so in a sentence naming the remedy");
+
+  // The settling half: with no row and a server copy under that name, the next
+  // tick keeps both rather than uploading again.
+  ScriptedClient third;
+  third.listing = "[" + StateRowJson(9, 1, "Game.state", "retroarch", 29,
+                                     "2026-09-06T03:00:00+00:00") + "]";
+  const sync::StateSyncReport next = sync::SyncStates(third, *files, token, StatesOn(true), index,
+                                                      &crowded, OptionsAt(kStamp));
+  checks.ExpectEq(next.kept_both, 1, "the tick after settles on keep-both");
+  checks.ExpectEq(third.Count("POST"), 0, "and uploads nothing a second time");
 }
 
 // --- the rig scenarios --------------------------------------------------------
@@ -727,6 +1066,15 @@ void Truncate(rig::Checks& checks, http::HttpClient& client, const std::string& 
         sync::SyncStates(client, *files, token, StatesOn(true), index, &baseline, OptionsAt(kStamp));
     checks.ExpectEq(report.completed, 0, "a truncated download completes nothing");
     checks.ExpectEq(report.failed, 1, "and is counted as a failure");
+    if (report.operations.size() == 1) {
+      // Named `unverified` rather than `transfer_failed`: the length is the one
+      // check a state download gets, so "the bytes were fetched and rejected"
+      // has to be tellable from "the server was not there".
+      checks.ExpectEq(std::string(sync::ToString(report.operations.front().error)),
+                      std::string("unverified"),
+                      "and named as bytes that failed their only check -- " +
+                          report.operations.front().message);
+    }
   }
 
   checks.ExpectEq(sandbox.Read(StatePath(name)), mine, "the local state is exactly as it was");
@@ -804,13 +1152,22 @@ int main(int argc, char** argv) {
   rig::Checks checks;
 
   if (scenario == "silent" || scenario == "naming" || scenario == "scanning" ||
-      scenario == "decides") {
+      scenario == "decides" || scenario == "trims" || scenario == "placing" ||
+      scenario == "listing" || scenario == "recording") {
     if (scenario == "silent") {
       Silent(checks);
     } else if (scenario == "naming") {
       Naming(checks);
     } else if (scenario == "scanning") {
       Scanning(checks);
+    } else if (scenario == "trims") {
+      Trims(checks);
+    } else if (scenario == "placing") {
+      Placing(checks);
+    } else if (scenario == "listing") {
+      Listing(checks);
+    } else if (scenario == "recording") {
+      Recording(checks);
     } else {
       Decides(checks);
     }

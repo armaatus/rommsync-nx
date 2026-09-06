@@ -66,34 +66,6 @@ std::string Sanitize(std::string_view value) {
   return out;
 }
 
-/// Percent-encode one query-string value.
-///
-/// A `slot` is derived (`retroarch-srm`) but an `emulator` is a folder name a
-/// human chose and a slot on an operation is whatever another client sent, so
-/// neither may be pasted into a URL: a space makes a request line no server
-/// parses, and an `&` moves the rest of the value into a parameter of its own --
-/// which on this endpoint would mean uploading a save under someone else's
-/// `rom_id`. Only RFC 3986's unreserved set survives.
-std::string EncodeQuery(std::string_view value) {
-  static constexpr char kHex[] = "0123456789ABCDEF";
-  std::string out;
-  out.reserve(value.size());
-  for (const char character : value) {
-    const unsigned char byte = static_cast<unsigned char>(character);
-    const bool unreserved = (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
-                            (byte >= '0' && byte <= '9') || byte == '-' || byte == '_' ||
-                            byte == '.' || byte == '~';
-    if (unreserved) {
-      out.push_back(character);
-    } else {
-      out.push_back('%');
-      out.push_back(kHex[byte >> 4]);
-      out.push_back(kHex[byte & 0x0F]);
-    }
-  }
-  return out;
-}
-
 /// How this operation is named in a log line: the rom and the slot, which are
 /// the pair a user can go and look at. Never the save's own name, which is a
 /// game title, and never a token.
@@ -466,13 +438,13 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
   std::string url = http::JoinUrl(token.server_url, kSavesPath) +
                     "?rom_id=" + std::to_string(operation.rom_id);
   if (operation.emulator.has_value()) {
-    url += "&emulator=" + EncodeQuery(*operation.emulator);
+    url += "&emulator=" + http::EncodeQueryValue(*operation.emulator);
   }
   if (operation.slot.has_value()) {
-    url += "&slot=" + EncodeQuery(*operation.slot);
+    url += "&slot=" + http::EncodeQueryValue(*operation.slot);
   }
   url += "&session_id=" + std::to_string(plan.session_id);
-  url += "&device_id=" + EncodeQuery(token.device_id);
+  url += "&device_id=" + http::EncodeQueryValue(token.device_id);
   url += "&overwrite=true";
 
   http::Request request =
@@ -615,7 +587,7 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   // A stale one from an interrupted run is a destination the Horizon rename
   // refuses -- it is not a replace -- so it goes first. The bytes in it are a
   // download that never completed and belong to nothing.
-  StagedFile staged(io::TempPathFor(destination));
+  io::StagedFile staged(io::TempPathFor(destination));
   std::remove(staged.path().c_str());
 
   http::Request request = Authed(http::Method::kGet,
