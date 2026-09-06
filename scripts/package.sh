@@ -121,6 +121,13 @@ TITLE_ID="$(sed -n 's/.*"title_id"[[:space:]]*:[[:space:]]*"0[xX]\([0-9A-Fa-f]*\
 MODULE_NAME="$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
                "$CONFIG_JSON" | head -n 1)"
 [ -n "$MODULE_NAME" ] || die "no \"name\" in $CONFIG_JSON"
+# It goes through `sed` as a replacement and into JSON as a string value, so a
+# `/`, a `&`, a backslash or a quote in it would produce either a broken sed
+# expression or a toolbox.json that does not parse -- and an unparseable one is
+# a module ovl-sysmodules drops from its list without a word. Refuse instead.
+case "$MODULE_NAME" in
+  *[!A-Za-z0-9\ ._-]*) die "module name '$MODULE_NAME' has a character this cannot substitute" ;;
+esac
 # A program id is 64 bits. Anything else is a typo that would install into a
 # directory Atmosphere never looks in, which is silent on the console.
 case "$TITLE_ID" in
