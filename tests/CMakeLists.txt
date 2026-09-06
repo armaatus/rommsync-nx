@@ -886,6 +886,30 @@ add_test(NAME package.builds
          COMMAND "${BASH_PROGRAM}" "${PACKAGE_TEST}" builds)
 set_tests_properties(package.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 
+# --- the install guide: docs/INSTALL.md --------------------------------------
+# The one page in this repo nobody may verify by following it -- hard rule 1
+# puts a console on the far side of M8-1 -- so what it can be held to is that it
+# never names a path the release zip does not ship. `scripts/package.sh --list`
+# prints the archive's entries and builds nothing, which is what makes a docs
+# test able to ask that without a cross-compiler; a renamed artifact and a moved
+# title id are both entries in that list, so both are red here rather than a
+# wrong instruction on someone's SD card.
+#
+# Reads files and runs one bash script, so none of these ever skips.
+set(DOCS_INSTALL_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_docs_install.py")
+
+foreach(scenario
+        paths       # every SD path the guide names is one the archive ships
+        links       # every relative link and anchor resolves
+        safety      # no account secret on the console, no weakened TLS
+        pairing     # the state table is exactly what PairingState exposes
+        structure)  # #35's ten sections, the hardware note, the README link
+  add_test(NAME docs.install_${scenario}
+           COMMAND ${Python3_EXECUTABLE} "${DOCS_INSTALL_TEST}" ${scenario}
+                   --repo "${CMAKE_SOURCE_DIR}")
+  set_tests_properties(docs.install_${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
 # --- the TLS terminator the M0-1 probe aims at -------------------------------
 # The rig is plain HTTP because the host suite reaches it over loopback; the
 # probe needs a real handshake to complete, so server/testing/docker-compose.yml
