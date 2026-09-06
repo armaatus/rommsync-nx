@@ -36,6 +36,7 @@
 #include "rommsync/host/native_file_system.hpp"
 #include "rommsync/md5.hpp"
 #include "rommsync/state_db.hpp"
+#include "rommsync/scheduler.hpp"
 #include "rommsync/sync_tick.hpp"
 
 namespace {
@@ -854,6 +855,119 @@ void NegotiateFault(rig::Checks& checks, http::HttpClient& client, const std::st
   checks.ExpectEq(rows, 0, what + ": and the server holds no row for a save never sent");
 }
 
+// --- M7-2: the schedule around a failed tick ---------------------------------
+//
+// Everything above is about one tick. These two are about what happens *next*,
+// which is the scheduler's (`core/include/rommsync/scheduler.hpp`) -- and they
+// are here rather than in `test_scheduler.cpp` because they are the two
+// acceptance cases that cannot be produced with an injected outcome. A tick
+// really has to fail on the stall timeout, and a connection really has to be
+// reset mid-plan, before "reschedules with backoff rather than spinning" and
+// "nothing was written" mean anything.
+//
+// The clocks are still injected: the point is the *decision*, and a test that
+// waited out thirty seconds of backoff to see one would be the test nobody runs.
+
+/// A steady clock the scenario advances by hand, and a wall clock beside it.
+struct ScheduleClocks {
+  std::chrono::milliseconds steady{std::chrono::hours{5}};
+  std::chrono::milliseconds wall{std::chrono::seconds{1'757'000'000}};
+
+  void Advance(std::chrono::milliseconds by) {
+    steady += by;
+    wall += by;
+  }
+};
+
+/// A tick that fails against a real fault reschedules on the backoff, and the
+/// next one that works puts the delay back to the floor.
+///
+/// `spec` arms the proxy for the first tick only; the second runs clean, which
+/// is the "the next success resets the delay" half of the acceptance and the
+/// only way to see that a failed tick did not poison the schedule.
+void Scheduled(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+               const Fixture& fixture, const harness::Rom& rom, const std::string& spec,
+               const std::string& what) {
+  Sandbox sandbox(checks, "tick-scheduled");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  UploadFixture arranged;
+  if (!ArrangeUpload(checks, *files, sandbox, rom, "m7-2-schedule", &arranged)) {
+    return;
+  }
+  const std::map<std::string, std::string> before = Snapshot(sandbox);
+
+  ScheduleClocks clocks;
+  sync::SchedulerConfig config;
+  config.interval = std::chrono::minutes{30};
+  config.backoff.floor = std::chrono::seconds{30};
+  config.backoff.cap = std::chrono::minutes{10};
+  // Off, so the delay this scenario asserts on is a number rather than a range.
+  // The jitter itself is `sched.backoff`'s.
+  config.backoff.jitter = 0.0;
+  sync::Scheduler scheduler(
+      config,
+      [&clocks] { return std::chrono::steady_clock::time_point{} + clocks.steady; },
+      [&clocks] { return std::chrono::system_clock::time_point{} + clocks.wall; });
+
+  sync::TickOptions options = OptionsAt(1'757'000'500);
+  Impatient(&options);
+
+  const sync::Decision first = scheduler.Poll();
+  checks.Expect(first.trigger == sync::Trigger::kBoot, what + ": the first tick is the boot one");
+  {
+    harness::Fault fault(checks, client, base, spec);
+    const sync::TickResult tick =
+        sync::RunTick(client, *files, TokenFor(base, fixture), {arranged.local}, arranged.targets,
+                      /*previous=*/{}, options);
+    checks.Expect(tick.outcome == sync::TickOutcome::kOffline,
+                  what + ": the tick is offline, got " + sync::ToString(tick.outcome) + " -- " +
+                      tick.negotiated.message);
+    scheduler.Finished(tick);
+  }
+
+  // Nothing was written. That is the half of the acceptance the scheduler cannot
+  // check for itself, and the reason this scenario runs a real tick.
+  checks.Expect(Snapshot(sandbox) == before,
+                what + ": the card is byte-for-byte what it was before the failed tick");
+
+  checks.ExpectEq(scheduler.failures(), 1, what + ": the failed tick is counted");
+  checks.Expect(scheduler.backoff() == std::chrono::seconds{30},
+                what + ": and the next attempt waits the floor");
+  const sync::Decision waiting = scheduler.Poll();
+  checks.Expect(!waiting.run(), what + ": nothing runs inside the backoff window");
+  checks.Expect(!waiting.parked && waiting.sleep_for == std::chrono::seconds{30},
+                what + ": it sleeps on the backoff rather than spinning");
+
+  // A worker that polled in a loop would have run a second tick by now. Ten
+  // polls, no clock movement, no tick.
+  for (int poll = 0; poll < 10; ++poll) {
+    checks.Expect(!scheduler.Poll().run(), what + ": and it stays that way however often it is asked");
+  }
+
+  clocks.Advance(std::chrono::seconds{31});
+  const sync::Decision retry = scheduler.Poll();
+  checks.Expect(retry.trigger == sync::Trigger::kInterval,
+                what + ": the retry fires when the backoff is up");
+  const sync::TickResult second =
+      sync::RunTick(client, *files, TokenFor(base, fixture), {arranged.local}, arranged.targets,
+                    /*previous=*/{}, options);
+  checks.Expect(second.outcome == sync::TickOutcome::kCompleted,
+                what + ": and the tick that follows the fault completes, got " +
+                    sync::ToString(second.outcome));
+  scheduler.Finished(second);
+  checks.ExpectEq(scheduler.failures(), 0, what + ": one success clears the run of failures");
+  checks.Expect(scheduler.backoff() == std::chrono::milliseconds{0},
+                what + ": and the delay is back to nothing");
+  checks.Expect(!scheduler.Poll().run(),
+                what + ": leaving the ordinary interval, not another retry");
+
+  // The save the fault interrupted did reach the server on that second tick,
+  // which is what makes the backoff a delay rather than a loss.
+  const int rows = SaveRowsFor(client, base, fixture, rom.id, arranged.slot, nullptr);
+  checks.ExpectEq(rows, 1, what + ": and the save is on the server exactly once");
+}
+
 // --- upload -------------------------------------------------------------------
 //
 // An upload never touches the local save, so what is at stake here is the
@@ -1435,6 +1549,18 @@ int main(int argc, char** argv) {
     CompleteFault(checks, *client, base, fixture, rom,
                   R"({"mode":"stall","seconds":3,"path":"/api/sync/sessions","count":9})",
                   /*then_normally=*/true, "a stall at complete");
+  } else if (scenario == "sched_stall") {
+    // A negotiate that stops moving: the tick fails on the stall timeout rather
+    // than hanging, and the schedule backs off rather than retrying at once.
+    Scheduled(checks, *client, base, fixture, rom,
+              R"({"mode":"stall","seconds":4,"path":"/api/sync/negotiate","count":9})",
+              "a stalled negotiation");
+  } else if (scenario == "sched_drop") {
+    // A real TCP reset mid-plan. Transient: back off, write nothing, and let the
+    // next tick recover.
+    Scheduled(checks, *client, base, fixture, rom,
+              R"({"mode":"drop","bytes":16,"path":"/api/sync/negotiate","count":9})",
+              "a reset mid-negotiation");
   } else if (scenario == "resumes") {
     Resumes(checks, *client, base, fixture, rom);
   } else if (scenario == "relaunched") {

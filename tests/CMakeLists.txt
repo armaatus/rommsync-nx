@@ -1098,6 +1098,24 @@ set(TICK_RIG_SCENARIOS
   complete_stall   # the same on the timeout, and the next tick finds no work to redo
   resumes          # a reset mid-download, then a second tick: one save, one row
 )
+
+# M7-2 (#37), registered under `sched.` because what they check is the schedule
+# around a tick rather than the tick. They live in this executable because the
+# two acceptance cases they cover cannot be produced with an injected outcome: a
+# tick has to really fail on the stall timeout, and a connection has to really be
+# reset, before "reschedules with backoff rather than spinning" means anything.
+set(SCHEDULER_RIG_SCENARIOS
+  sched_stall  # a stalled negotiation: backoff, no spin, and the next tick recovers
+  sched_drop   # a reset mid-plan: transient, nothing written, one row afterwards
+)
+foreach(scenario IN LISTS SCHEDULER_RIG_SCENARIOS)
+  string(REPLACE "sched_" "" name "${scenario}")
+  add_test(NAME sched.${name} COMMAND test_sync_tick ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(sched.${name} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  set_tests_properties(sched.${name} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+endforeach()
 # M6-2 (#33), and a rig scenario for the same reason `resumes` is one: the kill
 # has to happen to a real transfer. `resumes` interrupts a tick; this interrupts
 # the *process*, throwing away the client, the filesystem and the baseline before
