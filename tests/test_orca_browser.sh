@@ -811,6 +811,71 @@ GHSTUB
     echo "PASS: no run-list calls while the review check is healthy"
     ;;
 
+  await_stops_paying_once_the_review_recovers)
+    # The other half of the throttle: not "never dead" but dead and then ALIVE
+    # again. A review job that failed can be re-run, and when it comes back the
+    # `gh run list` behind it has to stop -- otherwise a single dead check early
+    # in the wait buys an unthrottled call on every poll for the remaining 45
+    # minutes, which is the cost the throttle exists to remove.
+    #
+    # This is the transition the other four await tests do not cross: they cover
+    # dead-from-the-first-check, never-dead, and the red-build path. In each of
+    # those the value carried between checks happens to equal the correct one,
+    # so a `review_dead` that never cleared would pass all of them.
+    #
+    # The stub answers FAILURE on the first rollup and SUCCESS on every one
+    # after it, and stamps each `gh run list` with the number of rollups that
+    # preceded it. Any call stamped 2 or higher is one made after the rollup
+    # said the review had recovered.
+    make_fixture
+    cp "$REPO_ROOT"/scripts/orca/{await-review.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    stub="$TMPDIR_FIXTURE/stub-bin"
+    mkdir -p "$stub"
+    cat >"$stub/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"pr list"*)
+    printf '[{"number":80}]\n' ;;
+  *"run list"*)
+    # Stamped with how many rollups have been served, so the assertion can tell
+    # a call made while the check was dead from one made after it recovered.
+    printf '%s\n' "$(cat "$ROLLUP_COUNT")" >>"$RUNLIST_LOG"
+    printf '\n' ;;
+  *statusCheckRollup*)
+    n=$(( $(cat "$ROLLUP_COUNT") + 1 )); printf '%s' "$n" >"$ROLLUP_COUNT"
+    if [ "$n" = 1 ]; then
+      # The review job died. Nothing else is failing, so the red-build path
+      # (which needs the same non-review check twice running) never fires and
+      # cannot end the wait early.
+      printf '{"statusCheckRollup":[{"name":"review against REVIEW.md","conclusion":"FAILURE"}]}\n'
+    else
+      printf '{"statusCheckRollup":[{"name":"review against REVIEW.md","conclusion":"SUCCESS"}]}\n'
+    fi ;;
+  *"pr view"*)
+    printf '{"reviews":[]}\n' ;;
+  *)
+    printf '\n' ;;
+esac
+GHSTUB
+    chmod +x "$stub/gh"
+    ( cd "$TMPDIR_FIXTURE" && git init -q . && git commit -q --allow-empty -m fixture ) 2>/dev/null
+    runlog="$TMPDIR_FIXTURE/runlist.log"; : >"$runlog"
+    counter="$TMPDIR_FIXTURE/rollups"; printf '0' >"$counter"
+    # Long enough to cross at least two throttle checks (they fire on polls
+    # 1, 5, 9 ...), so the recovery at check 2 is actually reached.
+    ( cd "$TMPDIR_FIXTURE" &&
+      PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$TMPDIR_FIXTURE/fleet" \
+      RUNLIST_LOG="$runlog" ROLLUP_COUNT="$counter" \
+      AWAIT_REVIEW_DEADLINE=9 AWAIT_REVIEW_POLL=1 \
+      bash "$TMPDIR_FIXTURE/scripts/orca/await-review.sh" 80 >/dev/null 2>&1 )
+    [ "$(cat "$counter")" -ge 2 ] \
+      || fail "the wait never reached a second throttle check ($(cat "$counter")) -- the fixture proves nothing"
+    late="$(awk '$1 >= 2' "$runlog" | wc -l | tr -d ' ')"
+    [ "${late:-0}" = 0 ] \
+      || fail "spent $late run-list call(s) after the rollup said the review check had recovered; review_dead never cleared"
+    echo "PASS: the run-list stops once the review check recovers"
+    ;;
+
   reap_judges_removal_by_the_directory)
     # #27's worktree removal exited non-zero and the fleet logged "could not
     # remove it" -- while the same command by hand removed it, warning only that
@@ -903,6 +968,7 @@ PYCHECK
     echo "       review_status_shows_the_open_thread|brief_never_lists_threads_over_rest" >&2
     echo "       brief_queues_the_merge_at_step_four" >&2
     echo "       await_costs_nothing_while_the_review_is_healthy" >&2
+    echo "       await_stops_paying_once_the_review_recovers" >&2
     echo "       reap_judges_removal_by_the_directory" >&2
     echo "       brief_warns_about_human_merge_paths" >&2
     exit 2

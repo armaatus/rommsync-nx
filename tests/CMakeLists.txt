@@ -880,6 +880,7 @@ foreach(phase opens reuses foreign no_romm submits no_draft unstable
               review_status_shows_the_open_thread brief_never_lists_threads_over_rest
               brief_queues_the_merge_at_step_four
               await_costs_nothing_while_the_review_is_healthy
+              await_stops_paying_once_the_review_recovers
               reap_judges_removal_by_the_directory
               brief_warns_about_human_merge_paths)
   add_test(NAME orca.browser_${phase}

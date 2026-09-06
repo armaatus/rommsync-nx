@@ -135,6 +135,20 @@ print('REVIEW_FAILED' if review_dead else '')
     # saying the review check itself is among the dead. Read from `rollup` rather
     # than from `broken` -- reusing one name as both the here-string source and
     # the first read target works, but reads like a bug.
+    #
+    # Cleared first, and that is deliberate. `$(...)` strips ALL trailing
+    # newlines, so a healthy answer -- whose second line is empty -- comes back
+    # as ONE line, and the second `read` then hits EOF. bash assigns the empty
+    # line it did not get and returns non-zero, so `review_dead` does end up
+    # empty (verified on 3.2.57 and 5.3.15, the oldest and newest bash this repo
+    # can meet). But the recovery path depends entirely on that: if `read` left
+    # the variable untouched on EOF, a `REVIEW_FAILED` set on one throttle check
+    # would survive every later one, and the `gh run list` below would run on
+    # every poll for the rest of the 45-minute wait -- reintroducing exactly the
+    # cost the throttle above exists to remove. One assignment makes the
+    # recovery explicit instead of a consequence of how `read` handles EOF.
+    # `await_stops_paying_once_the_review_recovers` pins it.
+    review_dead=""
     { IFS= read -r broken; IFS= read -r review_dead; } <<<"$rollup" || true
     if [ -n "$broken" ] && [ "$broken" = "$broken_before" ]; then
       cat <<RED
