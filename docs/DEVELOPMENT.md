@@ -204,6 +204,13 @@ a user who switched save sync off did not ask for the rom they queued to stop
 arriving. So "the sysmodule sends nothing" is true of a console with *both* off,
 and what the overlay's enable switch alone promises is that no sync tick runs.
 
+One consequence is worth knowing rather than discovering: a disabled tick does
+not sweep either, so a save an interrupted commit parked as `<name>.old` stays
+parked until the switch goes back on. Nothing is lost — the `.old` *is* the save
+and its `.backup/` copy is beside it — but the file the console looks for is
+absent in the meantime. Sweeping anyway would be a disabled sysmodule renaming
+files on the card, which is what the switch promises it will not do.
+
 Nothing in the shipped build calls `RunTick` yet — the scheduler is M7-2 (#37) —
 so today that gate is proven at the seam rather than end to end. #37 sets it
 from `config.sync.enabled` and parks the timer as well; a scheduler that woke up

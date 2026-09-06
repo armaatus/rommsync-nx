@@ -184,6 +184,16 @@ enum class TickOutcome {
   /// to keep against `pmshellTerminateProgram` and a relaunch, and a promise
   /// that lives only in a scheduler is one that cannot be tested before that
   /// scheduler exists -- nor kept by a second caller that forgets to ask.
+  /// **The sweep does not run either, and that is visible.** A crash between
+  /// `io::CommitStaged`'s two renames leaves a save parked as `<name>.old` with
+  /// the base missing, and `RecoverStaging` is what renames it back -- so a
+  /// console switched off in that state shows the player a missing save until it
+  /// is switched on again. Nothing is lost: the `.old` is the save and the
+  /// `.backup/` copy is beside it, and the first tick after the switch restores
+  /// it. Sweeping anyway would be a disabled sysmodule opening and renaming
+  /// files on the card, which is the one thing the switch promises it will not
+  /// do; #33's Scope asks for the ordering in those words.
+  ///
   /// `download::DrainOutcome::kDisabled` is the same shape on the *other*
   /// switch: `[downloads] enabled`, which is an independent key
   /// (docs/CONFIG.md) and not this one's other half. A console with
