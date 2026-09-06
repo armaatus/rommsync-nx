@@ -13,7 +13,16 @@ on:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel supersedes on a BRANCH, never on main. On a branch the newest push is
+  # the only one anyone cares about, and cancelling the older run saves minutes.
+  # On main every commit is a commit somebody has to be able to trust: two merges
+  # close together cancelled the earlier one's build, so that sha's verification
+  # simply never happened and nothing re-ran it. A cancelled run is not a green
+  # run, and "main is green" has to mean every commit on it was actually checked.
+  #
+  # It happened the morning this was written: #105 and #102 merged seconds apart
+  # and #105's main build was cancelled mid-flight.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   # Cheap, fast checks on the scripts that stand up everyone's environment. If
