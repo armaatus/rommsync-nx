@@ -180,9 +180,27 @@ jobs:
           # fails (no review yet), then editing the body with the local-review
           # findings fails again, so most PRs reach here with two stale runs.
           for run in $stale; do
-            echo "re-running stale merge-gate run $run so its check clears"
-            if ! gh run rerun "$run" --repo "$NWO"; then
-              echo "::warning title=Stale gate not cleared::run $run; clear it with: gh run rerun $run"
+            # The GATE JOB only, never the whole run. `gh run rerun <run>` would
+            # re-execute this job too: `clear-stale` is `needs: gate` +
+            # `if: success()`, so it was SKIPPED on the failed run and a
+            # successful rerun would finally run it -- a second instance of this
+            # very loop, concurrent with the one you are reading, both racing to
+            # rerun the same targets. Two of them collide in `gate`'s
+            # `merge-gate-<PR>` group and cancel each other, which is the wedge
+            # this job exists to clear, reproduced one level down. Found in
+            # review of this PR.
+            job="$(gh api "repos/$NWO/actions/runs/$run/jobs" \
+                     --jq '[.jobs[] | select(.name == "merge-gate") | .id][0]' \
+                   2>/dev/null || echo "")"
+            if [ -z "$job" ] || [ "$job" = "null" ]; then
+              # Deliberately not falling back to a whole-run rerun: that is the
+              # bug above. A warning a person can act on beats a race.
+              echo "::warning title=Stale gate not cleared::could not find the gate job of run $run; clear it with: gh run rerun --job <gate job id>"
+              continue
+            fi
+            echo "re-running the gate job ($job) of stale run $run so its check clears"
+            if ! gh run rerun --job "$job" --repo "$NWO"; then
+              echo "::warning title=Stale gate not cleared::run $run; clear it with: gh run rerun --job $job"
               continue
             fi
             # 150s per item against a 20-minute job budget: room for seven
