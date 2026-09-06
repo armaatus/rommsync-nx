@@ -283,9 +283,10 @@ target_compile_definitions(test_lists PRIVATE
   ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
 
 set(LIST_UNIT_SCENARIOS
-  caps     # nothing on this wire grows with a rom's name, at any page size
-  cursors  # the cap, the TTL, and what a reclaimed cursor answers
-  queue    # served off the card, and never over the network
+  caps       # nothing on this wire grows with a rom's name, at any page size
+  platforms  # an empty list, one shorter than a page, and a rom with no name
+  cursors    # the cap, the TTL, and what a reclaimed cursor answers
+  queue      # served off the card, and never over the network
 )
 foreach(scenario IN LISTS LIST_UNIT_SCENARIOS)
   add_test(NAME lists.${scenario} COMMAND test_lists ${scenario})

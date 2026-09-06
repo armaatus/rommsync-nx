@@ -18,20 +18,28 @@ json::Error Fail(std::string field, std::string message) {
   return error;
 }
 
-/// A string field that must be present and free of embedded NULs, and **may be
-/// empty**.
+/// A string field a **row draws**, which may be absent, `null` or empty.
 ///
-/// `json::Reader::Required` refuses an empty string, which is right for an
-/// identifier and wrong for every one of these: RomM leaves `name` empty on an
-/// unidentified rom and `custom_name` empty on every platform nobody renamed,
-/// and refusing those would fail the whole page over a row that draws fine as a
-/// file name. An embedded NUL is still refused, for `rom_index.cpp`'s reason:
-/// every C API downstream stops at one, so the value that got used would not be
-/// the value that was checked.
-json::Error ReadText(const json::Value& object, const char* key, std::string* out) {
+/// The one reader here that is not `json::Reader::Required`, and for its
+/// documented reason inverted: `Required` refuses an empty string because every
+/// string it was written for is an identifier. These are not. RomM types a
+/// rom's `name` as `string | null` and leaves it null on an unidentified rom, so
+/// a strict read would fail the whole page over one file the server has no
+/// metadata for -- which is a library that stops listing rather than a row that
+/// draws its file name instead. `rom_index.cpp` makes the same exception for the
+/// same shape.
+///
+/// An embedded NUL is still refused: every C API downstream stops at one, so the
+/// value that got used would not be the value that was checked.
+json::Error ReadDrawnText(const json::Value& object, const char* key, std::string* out,
+                          bool required = true) {
   const json::Value* value = object.Find(key);
-  if (value == nullptr) {
-    return Fail(key, "missing");
+  if (value == nullptr || value->is_null()) {
+    if (required && value == nullptr) {
+      return Fail(key, "missing");
+    }
+    out->clear();
+    return {};
   }
   if (!value->is_string()) {
     return Fail(key, "expected a string");
@@ -40,30 +48,6 @@ json::Error ReadText(const json::Value& object, const char* key, std::string* ou
     return Fail(key, "contains a NUL");
   }
   *out = value->string();
-  return {};
-}
-
-json::Error ReadInteger(const json::Value& object, const char* key, std::int64_t* out) {
-  const json::Value* value = object.Find(key);
-  if (value == nullptr) {
-    return Fail(key, "missing");
-  }
-  if (!value->is_integer()) {
-    return Fail(key, "expected a whole number");
-  }
-  *out = value->integer();
-  return {};
-}
-
-json::Error ReadFlag(const json::Value& object, const char* key, bool* out) {
-  const json::Value* value = object.Find(key);
-  if (value == nullptr) {
-    return Fail(key, "missing");
-  }
-  if (!value->is_bool()) {
-    return Fail(key, "expected true or false");
-  }
-  *out = value->boolean();
   return {};
 }
 
@@ -83,6 +67,29 @@ void PutInteger(ipc::ListItem* item, std::string_view key, std::int64_t value) {
 
 void PutFlag(ipc::ListItem* item, std::string_view key, bool value) {
   item->fields.push_back({std::string(key), ipc::ListValue::Flag(value)});
+}
+
+/// Fill `page` with rows `[from, count)`, stopping on whichever bound comes first.
+///
+/// The one loop the three kinds share, because the only thing that differs
+/// between them is what a row *is*: `make_row(index)` builds it. Returns the
+/// index one past the last row that fitted, so the caller advances its offset by
+/// what actually went out rather than by what it asked for.
+///
+/// `page->items.empty()` on return with rows left is the one thing that would be
+/// a page that never advances -- see `PageOf` -- and it is the caller's to
+/// report.
+template <typename MakeRow>
+std::int64_t FillPage(ipc::ListPage* page, std::int64_t from, std::int64_t count,
+                      std::int32_t page_size, MakeRow make_row) {
+  std::int64_t index = from;
+  while (index < count && static_cast<std::int32_t>(page->items.size()) < page_size) {
+    if (!ipc::AppendIfItFits(page, make_row(index))) {
+      break;
+    }
+    ++index;
+  }
+  return index;
 }
 
 /// The size of the file at `path`, or zero when there is none.
@@ -132,8 +139,10 @@ json::Error ParseRomPage(std::string_view body, RomPage* out) {
   // really does answer -- fails here rather than producing an empty page, and
   // an empty page is what a truncated response must never be able to look like.
   RomPage page;
-  if (json::Error error = ReadInteger(document.value, "total", &page.total); !error.ok()) {
-    return error;
+  json::Reader envelope(document.value, "rom list");
+  envelope.Required("total", &page.total);
+  if (!envelope.ok()) {
+    return envelope.error();
   }
   const json::Value* items = document.value.Find("items");
   if (items == nullptr || !items->is_array()) {
@@ -144,25 +153,18 @@ json::Error ParseRomPage(std::string_view body, RomPage* out) {
   std::size_t index = 0;
   for (const json::Value& item : items->elements()) {
     const std::string where = "items[" + std::to_string(index++) + "].";
+    json::Reader reader(item, "rom");
     RomRow rom;
-    if (json::Error error = ReadInteger(item, "id", &rom.id); !error.ok()) {
-      return At(where, error);
+    reader.Required("id", &rom.id);
+    reader.Required("fs_name", &rom.fs_name);
+    reader.Required("platform_fs_slug", &rom.platform_fs_slug);
+    reader.Required("fs_size_bytes", &rom.size_bytes);
+    reader.Required("has_multiple_files", &rom.has_multiple_files);
+    if (!reader.ok()) {
+      return At(where, reader.error());
     }
-    if (json::Error error = ReadText(item, "name", &rom.name); !error.ok()) {
-      return At(where, error);
-    }
-    if (json::Error error = ReadText(item, "fs_name", &rom.fs_name); !error.ok()) {
-      return At(where, error);
-    }
-    if (json::Error error = ReadText(item, "platform_fs_slug", &rom.platform_fs_slug);
-        !error.ok()) {
-      return At(where, error);
-    }
-    if (json::Error error = ReadInteger(item, "fs_size_bytes", &rom.size_bytes); !error.ok()) {
-      return At(where, error);
-    }
-    if (json::Error error = ReadFlag(item, "has_multiple_files", &rom.has_multiple_files);
-        !error.ok()) {
+    // `name` alone is read leniently: see `ReadDrawnText`.
+    if (json::Error error = ReadDrawnText(item, "name", &rom.name); !error.ok()) {
       return At(where, error);
     }
     if (rom.id <= 0) {
@@ -195,26 +197,22 @@ json::Error ParsePlatforms(std::string_view body, std::vector<PlatformRow>* out,
       break;
     }
     const std::string where = "[" + std::to_string(index++) + "].";
+    json::Reader reader(item, "platform");
     PlatformRow platform;
-    if (json::Error error = ReadInteger(item, "id", &platform.id); !error.ok()) {
-      return At(where, error);
-    }
-    if (json::Error error = ReadText(item, "fs_slug", &platform.fs_slug); !error.ok()) {
-      return At(where, error);
-    }
-    if (json::Error error = ReadText(item, "name", &platform.name); !error.ok()) {
-      return At(where, error);
-    }
-    if (json::Error error = ReadInteger(item, "rom_count", &platform.rom_count); !error.ok()) {
-      return At(where, error);
+    reader.Required("id", &platform.id);
+    reader.Required("fs_slug", &platform.fs_slug);
+    reader.Required("name", &platform.name);
+    reader.Required("rom_count", &platform.rom_count);
+    if (!reader.ok()) {
+      return At(where, reader.error());
     }
     // What RomM's own UI draws: `custom_name` when the user renamed the
-    // platform and `name` otherwise. Read leniently, because it is absent on
-    // nothing this client has seen and a platform is still a platform without
-    // it -- unlike the four above, none of which the browser can draw a row or
-    // descend into a list without.
+    // platform and `name` otherwise. Optional, because a platform is still a
+    // platform without it -- unlike the four above, none of which the browser
+    // can draw a row or descend into a list without.
     std::string display_name;
-    if (ReadText(item, "display_name", &display_name).ok() && !display_name.empty()) {
+    if (ReadDrawnText(item, "display_name", &display_name, false).ok() &&
+        !display_name.empty()) {
       platform.name = std::move(display_name);
     }
     if (platform.id <= 0) {
@@ -252,13 +250,9 @@ std::size_t Service::open_cursors() const {
   return cursors_.size();
 }
 
-Service::Entry* Service::Find(ipc::Cursor cursor) {
-  for (Entry& entry : cursors_) {
-    if (entry.id == cursor) {
-      return &entry;
-    }
-  }
-  return nullptr;
+std::vector<Service::Entry>::iterator Service::Find(ipc::Cursor cursor) {
+  return std::find_if(cursors_.begin(), cursors_.end(),
+                      [cursor](const Entry& entry) { return entry.id == cursor; });
 }
 
 void Service::ReapLocked(TimePoint now) {
@@ -299,11 +293,14 @@ ipc::Error Service::ListBegin(const ipc::ListRequest& request, ipc::Cursor* curs
 
   Entry entry;
   entry.id = next_id_++;
-  entry.kind = request.kind;
-  entry.page_size = std::clamp(request.page_size, 1, ipc::kMaxPageSize);
-  if (entry.kind == ipc::ListKind::kRoms) {
-    entry.platform_id = request.platform_id;
-    entry.search = request.search;
+  entry.request = request;
+  entry.request.page_size = std::clamp(request.page_size, 1, ipc::kMaxPageSize);
+  if (entry.request.kind != ipc::ListKind::kRoms) {
+    // A filter that means nothing for the kind is dropped rather than carried,
+    // exactly as `ipc::ServiceCore::ListBegin` drops it -- this class is also
+    // called directly by the suite, so it holds itself to the same rule.
+    entry.request.platform_id = 0;
+    entry.request.search.clear();
   }
   entry.touched = now;
   *cursor = entry.id;
@@ -315,11 +312,11 @@ ipc::Error Service::ListEnd(ipc::Cursor cursor) {
   const TimePoint now = Now();
   const std::lock_guard<std::mutex> held(mutex_);
   ReapLocked(now);
-  Entry* entry = Find(cursor);
-  if (entry == nullptr) {
+  const auto found = Find(cursor);
+  if (found == cursors_.end()) {
     return ipc::Error::kBadCursor;
   }
-  cursors_.erase(cursors_.begin() + (entry - cursors_.data()));
+  cursors_.erase(found);
   return ipc::Error::kOk;
 }
 
@@ -341,87 +338,84 @@ ipc::Error Service::FillFromQueueLocked(Entry& entry, ipc::ListPage* page) {
   const bool complaint = !status.queue_message.empty();
   const std::int64_t count = static_cast<std::int64_t>(rows.size()) + (complaint ? 1 : 0);
 
-  std::int64_t index = entry.offset;
-  while (index < count && static_cast<std::int32_t>(page->items.size()) < entry.page_size) {
-    ipc::ListItem item;
-    if (complaint && index == 0) {
-      PutInteger(&item, keys::kQueueRomId, 0);
-      // Named after the file rather than left blank: the model falls back to
-      // "Rom 0" for a row with no `fs_name`, and this row is about the file.
-      PutText(&item, keys::kQueueFsName, download::kQueueFileName);
-      PutText(&item, keys::kQueuePlatformFsSlug, "");
-      PutText(&item, keys::kQueueState, download::ToString(download::QueueState::kFailed));
-      PutInteger(&item, keys::kQueueBytesDone, 0);
-      PutInteger(&item, keys::kQueueSizeBytes, 0);
-      PutInteger(&item, keys::kQueueBytesPerSecond, 0);
-      PutInteger(&item, keys::kQueueAttempts, 0);
-      PutText(&item, keys::kQueueMessage, status.queue_message);
-    } else {
-      const download::QueueEntry& row = rows[static_cast<std::size_t>(index - (complaint ? 1 : 0))];
-      PutInteger(&item, keys::kQueueRomId, row.rom_id);
-      PutText(&item, keys::kQueueFsName, row.fs_name);
-      PutText(&item, keys::kQueuePlatformFsSlug, row.platform_fs_slug);
-      PutText(&item, keys::kQueueState, download::ToString(row.state));
-      PutInteger(&item, keys::kQueueBytesDone, row.bytes_done);
-      PutInteger(&item, keys::kQueueSizeBytes, row.size_bytes);
-      // A rate is not a `QueueEntry` field and never reaches `queue.json`
-      // (`download.hpp`), so it comes off the live status and only for the row
-      // it was measured on -- a figure drawn against another rom's bar is a
-      // number that is simply wrong.
-      PutInteger(&item, keys::kQueueBytesPerSecond,
-                 status.rom_id == row.rom_id ? status.bytes_per_second : 0);
-      PutInteger(&item, keys::kQueueAttempts, row.attempts);
-      PutText(&item, keys::kQueueMessage, row.message);
-    }
-    if (!ipc::AppendIfItFits(page, std::move(item))) {
-      break;
-    }
-    ++index;
-  }
+  const std::int64_t served =
+      FillPage(page, entry.offset, count, entry.request.page_size, [&](std::int64_t index) {
+        ipc::ListItem item;
+        if (complaint && index == 0) {
+          PutInteger(&item, keys::kQueueRomId, 0);
+          // Named after the file rather than left blank: the model falls back to
+          // "Rom 0" for a row with no `fs_name`, and this row is about the file.
+          PutText(&item, keys::kQueueFsName, download::kQueueFileName);
+          PutText(&item, keys::kQueuePlatformFsSlug, "");
+          PutText(&item, keys::kQueueState, download::ToString(download::QueueState::kFailed));
+          PutInteger(&item, keys::kQueueBytesDone, 0);
+          PutInteger(&item, keys::kQueueSizeBytes, 0);
+          PutInteger(&item, keys::kQueueBytesPerSecond, 0);
+          PutInteger(&item, keys::kQueueAttempts, 0);
+          PutText(&item, keys::kQueueMessage, status.queue_message);
+          return item;
+        }
+        const download::QueueEntry& row =
+            rows[static_cast<std::size_t>(index - (complaint ? 1 : 0))];
+        PutInteger(&item, keys::kQueueRomId, row.rom_id);
+        PutText(&item, keys::kQueueFsName, row.fs_name);
+        PutText(&item, keys::kQueuePlatformFsSlug, row.platform_fs_slug);
+        PutText(&item, keys::kQueueState, download::ToString(row.state));
+        PutInteger(&item, keys::kQueueBytesDone, row.bytes_done);
+        PutInteger(&item, keys::kQueueSizeBytes, row.size_bytes);
+        // A rate is not a `QueueEntry` field and never reaches `queue.json`
+        // (`download.hpp`), so it comes off the live status and only for the row
+        // it was measured on -- a figure drawn against another rom's bar is a
+        // number that is simply wrong.
+        PutInteger(&item, keys::kQueueBytesPerSecond,
+                   status.rom_id == row.rom_id ? status.bytes_per_second : 0);
+        PutInteger(&item, keys::kQueueAttempts, row.attempts);
+        PutText(&item, keys::kQueueMessage, row.message);
+        return item;
+      });
 
-  if (page->items.empty() && index < count) {
-    // One row does not fit a payload on its own. Unreachable while every string
-    // is cut at `kMaxRowTextBytes` -- a queue row is a few hundred bytes against
-    // an 8 KiB cap -- and named rather than left as a `break`, because the shape
-    // it would otherwise take is a page that never advances and a browser that
-    // asks for it once a frame forever. `kTooLarge` is what a bug on *this* side
-    // is called (`ipc.hpp`).
-    return ipc::Error::kTooLarge;
-  }
-  entry.offset = index;
-  page->has_more = index < count;
-  return ipc::Error::kOk;
+  return PageOf(entry, page, served, count);
 }
 
 ipc::Error Service::FillFromPlatformsLocked(Entry& entry, ipc::ListPage* page) {
   const std::int64_t count = static_cast<std::int64_t>(entry.platforms.size());
-  std::int64_t index = entry.offset;
-  while (index < count && static_cast<std::int32_t>(page->items.size()) < entry.page_size) {
-    const PlatformRow& platform = entry.platforms[static_cast<std::size_t>(index)];
-    ipc::ListItem item;
-    PutInteger(&item, keys::kPlatformId, platform.id);
-    PutText(&item, keys::kPlatformFsSlug, platform.fs_slug);
-    PutText(&item, keys::kPlatformName, platform.name);
-    PutInteger(&item, keys::kPlatformRomCount, platform.rom_count);
-    // Read off the configuration in force *here*, which is the point of the
-    // field: the overlay never opens `config.ini` to decide whether a platform
-    // has a folder (#25).
-    PutFlag(&item, keys::kPlatformMapped, config_.Platform(platform.fs_slug) != nullptr);
-    if (!ipc::AppendIfItFits(page, std::move(item))) {
-      break;
-    }
-    ++index;
-  }
+  const std::int64_t served =
+      FillPage(page, entry.offset, count, entry.request.page_size, [&](std::int64_t index) {
+        const PlatformRow& platform = entry.platforms[static_cast<std::size_t>(index)];
+        ipc::ListItem item;
+        PutInteger(&item, keys::kPlatformId, platform.id);
+        PutText(&item, keys::kPlatformFsSlug, platform.fs_slug);
+        PutText(&item, keys::kPlatformName, platform.name);
+        PutInteger(&item, keys::kPlatformRomCount, platform.rom_count);
+        // Read off the configuration in force *here*, which is the point of the
+        // field: the overlay never opens `config.ini` to decide whether a
+        // platform has a folder (#25).
+        PutFlag(&item, keys::kPlatformMapped, config_.Platform(platform.fs_slug) != nullptr);
+        return item;
+      });
 
-  if (page->items.empty() && index < count) {
-    return ipc::Error::kTooLarge;  // see `FillFromQueueLocked`
+  // A snapshot cut at `kMaxPlatforms` *ends* at that row: `PageOf` sets
+  // `has_more` from the rows left and nothing else, so the browser is never told
+  // there is a page after the last one. See `kMaxPlatforms`.
+  return PageOf(entry, page, served, count);
+}
+
+/// Finish a page filled out of memory: advance the offset, set `has_more`.
+///
+/// `kTooLarge` for the one thing that would otherwise be a page that never
+/// advances: a single row that does not fit a payload on its own. Unreachable
+/// while every string is cut at `kMaxRowTextBytes` -- a row is a few hundred
+/// bytes against an 8 KiB cap -- and named rather than left silent, because the
+/// shape it would otherwise take is a browser asking for the same page once a
+/// frame forever. `kTooLarge` is what a bug on *this* side is called
+/// (`ipc.hpp`).
+ipc::Error Service::PageOf(Entry& entry, ipc::ListPage* page, std::int64_t served,
+                           std::int64_t count) {
+  if (page->items.empty() && served < count) {
+    return ipc::Error::kTooLarge;
   }
-  entry.offset = index;
-  // Strictly the rows left. A snapshot cut at `kMaxPlatforms` *ends* at that
-  // row: keeping `has_more` true past the last one would have the browser ask
-  // for a page that comes back empty and says there is more, forever. See
-  // `kMaxPlatforms` for why the cut is not reachable against a RomM 5.2.0.
-  page->has_more = index < count;
+  entry.offset = served;
+  page->has_more = served < count;
   return ipc::Error::kOk;
 }
 
@@ -491,6 +485,14 @@ ipc::ListPage Service::BuildRomPage(const RomPage& fetched, std::int64_t offset,
   // `FillFromQueueLocked` says what is done about it if it ever does.
   page.has_more = appended < fetched.roms.size() ||
                   offset + static_cast<std::int64_t>(appended) < fetched.total;
+  if (fetched.roms.empty()) {
+    // The server counted more than it served: a rom deleted between two of these
+    // requests leaves `offset` past the new end (`rom_index.cpp` meets the same
+    // shape while paging a whole library). For a *list* the answer is that it
+    // ended here -- `has_more` over an empty page is a browser asking for the
+    // same offset again, forever, because nothing advanced.
+    page.has_more = false;
+  }
   return page;
 }
 
@@ -498,23 +500,30 @@ ipc::Error Service::ListNext(ipc::Cursor cursor, ipc::ListPage* page) {
   const TimePoint now = Now();
   const std::lock_guard<std::mutex> held(mutex_);
   ReapLocked(now);
-  Entry* entry = Find(cursor);
-  if (entry == nullptr) {
+  const auto found = Find(cursor);
+  if (found == cursors_.end()) {
     return ipc::Error::kBadCursor;
   }
+  Entry* entry = &*found;
   entry->touched = now;
+  // Cleared here rather than in three places, so every kind answers the same
+  // way: a `ListNext` *replaces* the page it is handed. `Dispatch` passes a
+  // fresh one, but a caller reusing a `ListPage` across calls -- which the suite
+  // does -- would otherwise accumulate rows on the two kinds served out of
+  // memory and carry a stale `pending` from an earlier fetch into them.
+  *page = ipc::ListPage{};
 
-  if (entry->kind == ipc::ListKind::kQueue) {
+  if (entry->request.kind == ipc::ListKind::kQueue) {
     return FillFromQueueLocked(*entry, page);
   }
-  if (entry->kind == ipc::ListKind::kPlatforms && entry->platforms_loaded) {
+  if (entry->request.kind == ipc::ListKind::kPlatforms && entry->platforms_loaded) {
     return FillFromPlatformsLocked(*entry, page);
   }
 
   switch (entry->fetch) {
     case Fetch::kReady: {
       entry->fetch = Fetch::kIdle;
-      if (entry->kind == ipc::ListKind::kPlatforms) {
+      if (entry->request.kind == ipc::ListKind::kPlatforms) {
         // What landed was the snapshot, not a page: every `platforms` page --
         // the first one included -- is served out of it by one function, so the
         // two paths cannot disagree about what page one holds.
@@ -568,10 +577,7 @@ bool Service::Pump() {
   // made without holding it. Nothing in this file may block the IPC thread, and
   // a mutex held across a fifteen-second timeout would do exactly that.
   ipc::Cursor id = 0;
-  ipc::ListKind kind = ipc::ListKind::kPlatforms;
-  std::int64_t platform_id = 0;
-  std::string search;
-  std::int32_t page_size = 0;
+  ipc::ListRequest asked;
   std::int64_t offset = 0;
   std::string url;
   std::string token;
@@ -582,6 +588,10 @@ bool Service::Pump() {
   fs::FileSystem* card = nullptr;
   {
     const std::lock_guard<std::mutex> held(mutex_);
+    // A cursor abandoned with a built page on it holds that heap until something
+    // reclaims it, and on a console with a worker this loop may be the only
+    // thing running -- the overlay is closed, so no command is coming.
+    ReapLocked(Now());
     Entry* found = nullptr;
     for (Entry& entry : cursors_) {
       if (entry.fetch == Fetch::kRunning) {
@@ -595,17 +605,14 @@ bool Service::Pump() {
     client = client_;
     card = filesystem_;
     id = found->id;
-    kind = found->kind;
-    platform_id = found->platform_id;
-    search = found->search;
-    page_size = found->page_size;
+    asked = found->request;
     offset = found->offset;
     token = bearer_token_;
     url = config_.server.url;
   }
 
   http::Request request;
-  if (kind == ipc::ListKind::kPlatforms) {
+  if (asked.kind == ipc::ListKind::kPlatforms) {
     request.url = url + "/api/platforms";
   } else {
     // `order_by=id&order_dir=asc` is a **total** order, which is what makes
@@ -618,15 +625,15 @@ bool Service::Pump() {
     // otherwise haul the whole library's `rom_id_index` and a freshly
     // aggregated `filter_values` through a JSON parser on a sysmodule heap, all
     // of it discarded here. Turning them off is most of what this request costs.
-    request.url = url + "/api/roms?limit=" + std::to_string(page_size) +
+    request.url = url + "/api/roms?limit=" + std::to_string(asked.page_size) +
                   "&offset=" + std::to_string(offset) +
                   "&order_by=id&order_dir=asc"
                   "&with_char_index=false&with_filter_values=false&with_rom_id_index=false";
-    if (platform_id > 0) {
-      request.url += "&platform_ids=" + std::to_string(platform_id);
+    if (asked.platform_id > 0) {
+      request.url += "&platform_ids=" + std::to_string(asked.platform_id);
     }
-    if (!search.empty()) {
-      request.url += "&search_term=" + http::EncodeQueryValue(search);
+    if (!asked.search.empty()) {
+      request.url += "&search_term=" + http::EncodeQueryValue(asked.search);
     }
   }
   if (!token.empty()) {
@@ -648,7 +655,7 @@ bool Service::Pump() {
   ipc::Error failure = ipc::Error::kOk;
   if (!sent.ok() || !sent.successful()) {
     failure = ipc::Error::kOffline;
-  } else if (kind == ipc::ListKind::kPlatforms) {
+  } else if (asked.kind == ipc::ListKind::kPlatforms) {
     // The cut is not reported: there is no field on `ListPage` for "this list
     // was cut", and `kMaxPlatforms` is a backstop against a server that is not
     // a RomM rather than a bound a console meets.
@@ -662,18 +669,19 @@ bool Service::Pump() {
     } else {
       // Built outside the lock: it reads the card for `on_disk` and the queue
       // for `queued`, and both take locks of their own.
-      built = BuildRomPage(fetched, offset, page_size, card);
+      built = BuildRomPage(fetched, offset, asked.page_size, card);
     }
   }
 
   const std::lock_guard<std::mutex> held(mutex_);
-  Entry* entry = Find(id);
-  if (entry == nullptr || entry->fetch != Fetch::kRunning) {
+  const auto found_again = Find(id);
+  if (found_again == cursors_.end() || found_again->fetch != Fetch::kRunning) {
     // The cursor was reclaimed, evicted or ended while the request was in
     // flight. The answer is dropped rather than resurrecting it -- a page
     // belonging to a list nobody is reading is heap on a sysmodule.
     return true;
   }
+  Entry* entry = &*found_again;
   if (failure != ipc::Error::kOk) {
     entry->fetch = Fetch::kFailed;
     entry->failure = failure;
@@ -687,7 +695,7 @@ bool Service::Pump() {
 
   entry->consecutive_failures = 0;
   entry->failure = ipc::Error::kOk;
-  if (kind == ipc::ListKind::kPlatforms) {
+  if (asked.kind == ipc::ListKind::kPlatforms) {
     entry->platforms = std::move(platforms);
   }
   entry->ready = std::move(built);

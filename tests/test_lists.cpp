@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cctype>
 #include <cstdlib>
 #include <iostream>
 #include <map>
@@ -215,9 +216,22 @@ class FakeClient : public http::HttpClient {
   explicit FakeClient(std::vector<std::pair<std::string, std::string>> library)
       : library_(std::move(library)) {}
 
+  /// What `GET /api/platforms` answers. A bare array, as 5.2.0 sends one.
+  void SetPlatforms(std::string body) { platforms_ = std::move(body); }
+
+  /// Report this many roms in `total` however few are served -- what a library
+  /// that lost a rom between two requests looks like from here.
+  void OverCount(std::size_t total) { over_count_ = total; }
+
   http::Result Send(const http::Request& request) override {
     ++requests;
     last_url = request.url;
+    if (request.url.find("/api/platforms") != std::string::npos) {
+      http::Result answer;
+      answer.response.status = 200;
+      answer.response.body = platforms_;
+      return answer;
+    }
     const std::size_t limit = static_cast<std::size_t>(Query(request.url, "limit", 10));
     const std::size_t offset = static_cast<std::size_t>(Query(request.url, "offset", 0));
 
@@ -231,8 +245,8 @@ class FakeClient : public http::HttpClient {
     }
     http::Result result;
     result.response.status = 200;
-    result.response.body = "{\"items\":[" + items +
-                           "],\"total\":" + std::to_string(library_.size()) +
+    result.response.body = "{\"items\":[" + items + "],\"total\":" +
+                           std::to_string(over_count_ != 0 ? over_count_ : library_.size()) +
                            ",\"limit\":" + std::to_string(limit) +
                            ",\"offset\":" + std::to_string(offset) + "}";
     return result;
@@ -258,6 +272,8 @@ class FakeClient : public http::HttpClient {
   }
 
   std::vector<std::pair<std::string, std::string>> library_;
+  std::string platforms_ = "[]";
+  std::size_t over_count_ = 0;
 };
 
 /// A client that answers nothing and records that it was asked.
@@ -419,6 +435,93 @@ void Caps(checks::Checks& c) {
   lists::RomPage refused;
   c.Expect(!lists::ParseRomPage("[]", &refused).ok(),
            "and a rom list that lost its envelope is refused rather than read as empty");
+
+  // A server that counts more than it serves. A rom deleted between two of these
+  // requests leaves the offset past the new end, and an empty page that still
+  // said "there is more" would be a browser asking for the same offset forever
+  // -- nothing advanced.
+  Console short_(c, "lists-caps-overcount");
+  c.Expect(short_.sandbox.Write("/config/rommsync/config.ini",
+                                ConfigWith("http://127.0.0.1:1")),
+           "a config with a server on it");
+  short_.Boot();
+  FakeClient counting({{"one", "one.gba"}, {"two", "two.gba"}});
+  counting.OverCount(500);
+  short_.engine.UseServer(&counting, "fixture-token");
+  ipc::ListRequest asked;
+  asked.kind = ipc::ListKind::kRoms;
+  asked.page_size = 8;
+  const Walk cut = WalkList(short_, asked);
+  c.ExpectEq(static_cast<int>(cut.error), static_cast<int>(ipc::Error::kOk),
+             "a library that lost a rom still pages");
+  c.ExpectEq(cut.items.size(), std::size_t{2}, "and serves what the server actually had");
+  c.Expect(cut.pages <= 2, "ending rather than asking for the same offset forever -- " +
+                               std::to_string(cut.pages) + " pages");
+}
+
+/// The two `platforms` lists a live RomM will not produce on demand: an empty
+/// library, and one whose whole list fits inside a page.
+///
+/// The acceptance item asks for both, and a fixture with four platforms can only
+/// show one of them -- emptying the fixture's library to prove the other would
+/// leave every rig scenario in the suite with nothing to page.
+void Platforms(checks::Checks& c) {
+  struct Case {
+    const char* what;
+    const char* body;
+    std::size_t rows;
+  };
+  const Case cases[] = {
+      {"an empty platform list", "[]", 0},
+      {"a platform list shorter than one page",
+       R"([{"id":1,"fs_slug":"gba","name":"Game Boy Advance","rom_count":2}])", 1},
+  };
+  for (const Case& scenario : cases) {
+    Console console(c, std::string("lists-platforms-") + std::to_string(scenario.rows));
+    c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                   ConfigWith("http://127.0.0.1:1")),
+             "a config with a server on it");
+    console.Boot();
+    FakeClient client({});
+    client.SetPlatforms(scenario.body);
+    console.engine.UseServer(&client, "fixture-token");
+
+    ipc::ListRequest request;
+    request.kind = ipc::ListKind::kPlatforms;
+    request.page_size = ipc::kMaxPageSize;
+    const Walk walk = WalkList(console, request);
+    c.ExpectEq(static_cast<int>(walk.error), static_cast<int>(ipc::Error::kOk),
+               std::string(scenario.what) + " is a list, not an error");
+    c.ExpectEq(walk.items.size(), scenario.rows, std::string("rows on ") + scenario.what);
+    c.ExpectEq(walk.pages, std::size_t{1}, std::string("answered in one page: ") + scenario.what);
+    c.ExpectEq(client.requests, 1,
+               std::string("and fetched once, not once a page: ") + scenario.what);
+  }
+
+  // A rom RomM has no metadata for. `name` is `string | null` on the list schema
+  // (docs/API_CONTRACT.md), and a strict read of it would fail the whole page
+  // over one unidentified file -- a library that stops listing rather than a row
+  // that draws its file name instead.
+  lists::RomPage page;
+  c.Expect(lists::ParseRomPage(
+               R"({"total":1,"items":[{"id":9,"name":null,"fs_name":"x.gba",)"
+               R"("platform_fs_slug":"gba","fs_size_bytes":1,"has_multiple_files":false}]})",
+               &page)
+               .ok(),
+           "a rom with no name is read rather than refused");
+  c.ExpectEq(page.roms.size(), std::size_t{1}, "and it is on the page");
+  if (!page.roms.empty()) {
+    c.Expect(page.roms[0].name.empty(), "with an empty name rather than a guessed one");
+    c.ExpectEq(page.roms[0].fs_name, std::string("x.gba"), "and its file name intact");
+  }
+  // The four that are not optional: a row the browser cannot draw or descend
+  // into is a page of blanks on a console, so the page fails instead.
+  c.Expect(!lists::ParseRomPage(
+                R"({"total":1,"items":[{"id":9,"name":"x","fs_name":"x.gba",)"
+                R"("fs_size_bytes":1,"has_multiple_files":false}]})",
+                &page)
+                .ok(),
+           "a rom with no platform_fs_slug fails the page");
 }
 
 /// Cursors: the cap, the TTL, and what a reclaimed one answers.
@@ -438,8 +541,16 @@ void Cursors(checks::Checks& c) {
     opened.push_back(cursor);
   }
   ipc::ListPage page;
+  // Deliberately not fresh: `ListNext` replaces the page it is handed, whatever
+  // the kind, and a caller reusing one across calls must not accumulate rows or
+  // inherit a `pending` from an earlier fetch.
+  page.items.push_back(ipc::ListItem{});
+  page.pending = true;
+  page.has_more = true;
   c.ExpectEq(static_cast<int>(console.Next(opened.back(), &page)),
              static_cast<int>(ipc::Error::kOk), "the newest cursor still pages");
+  c.ExpectEq(page.items.size(), std::size_t{0}, "over an empty queue, into a reused page");
+  c.Expect(!page.pending && !page.has_more, "which carries nothing from the last call");
   c.ExpectEq(static_cast<int>(console.Next(opened.front(), &page)),
              static_cast<int>(ipc::Error::kBadCursor),
              "and the oldest was reclaimed to make room for it");
@@ -763,6 +874,50 @@ int Library(checks::Checks& c) {
   c.Expect(rom_count_total >= total,
            "the platforms' rom counts cover the library -- " + std::to_string(rom_count_total) +
                " over " + std::to_string(total));
+
+  // --- has_multiple_files, by value. It is on the *list* schema so #25 can grey
+  // a disc set out without a second call per rom, and a projection that carried
+  // the field and always said `false` would look exactly like this one.
+  ipc::ListRequest every;
+  every.kind = ipc::ListKind::kRoms;
+  every.page_size = ipc::kMaxPageSize;
+  const Walk library = WalkList(rig_.console, every);
+  int multi = 0;
+  for (const ipc::ListItem& item : library.items) {
+    const int flag = Flag(item, keys::kRomHasMultipleFiles);
+    c.Expect(flag >= 0, "every rom row carries has_multiple_files");
+    multi += flag == 1 ? 1 : 0;
+  }
+  const std::int64_t multi_on_server =
+      LibraryTotal(*rig_.client, rig_.fixture, "&search_term=Two%20Disc");
+  c.Expect(multi_on_server > 0, "the fixture holds a disc set to grey out");
+  c.ExpectEq(multi, static_cast<int>(multi_on_server),
+             "and the list reports it as one rather than always answering false");
+
+  // --- search_term, the other half of the `roms` filter.
+  ipc::ListRequest searched;
+  searched.kind = ipc::ListKind::kRoms;
+  searched.search = "Synthetic";
+  searched.page_size = 1;
+  const Walk found_rows = WalkList(rig_.console, searched);
+  const std::int64_t searched_total =
+      LibraryTotal(*rig_.client, rig_.fixture, "&search_term=Synthetic");
+  c.ExpectEq(static_cast<int>(found_rows.error), static_cast<int>(ipc::Error::kOk),
+             "a searched rom list pages");
+  c.Expect(searched_total > 0 && searched_total < total,
+           "the search matches some of the library and not all of it");
+  c.ExpectEq(static_cast<std::int64_t>(found_rows.items.size()), searched_total,
+             "and the pages hold exactly what the server matched");
+  for (const ipc::ListItem& item : found_rows.items) {
+    // RomM matches case-insensitively and the fixture holds both
+    // `Synthetic Nested Game` and `synthetic-large`, so the row is lowered
+    // before it is compared rather than the term being chosen to avoid one.
+    std::string name = Text(item, keys::kRomName);
+    std::transform(name.begin(), name.end(), name.begin(),
+                   [](unsigned char letter) { return static_cast<char>(std::tolower(letter)); });
+    c.Expect(name.find("synthetic") != std::string::npos,
+             "every row matches the term: " + Text(item, keys::kRomName));
+  }
   return 0;
 }
 
@@ -865,6 +1020,8 @@ int main(int argc, char** argv) {
   int code = 0;
   if (scenario == "caps") {
     Caps(checks);
+  } else if (scenario == "platforms") {
+    Platforms(checks);
   } else if (scenario == "cursors") {
     Cursors(checks);
   } else if (scenario == "queue") {

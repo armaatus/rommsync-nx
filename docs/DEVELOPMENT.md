@@ -377,14 +377,18 @@ A removed command leaves a hole.
 | 8 | `Unpair` | - -> - | `kWriteFailed` |
 | 9 | `Enqueue` | `rom_id` -> position | `kUnknownRom`, `kQueueFull`, `kDuplicate`, `kMultiFile` |
 | 10 | `Dequeue` | `rom_id` -> - | `kNotQueued` |
-| 11 | `ListBegin` | `ListRequest` -> cursor | `kNotConfigured`, `kOffline` |
+| 11 | `ListBegin` | `ListRequest` -> cursor | never fails |
 | 12 | `ListNext` | cursor -> `ListPage` | `kBadCursor`, `kNotConfigured`, `kOffline`, `kInternal` |
 | 13 | `ListEnd` | cursor -> - | `kBadCursor` |
 
-`ListBegin` does not answer `kBadCursor` and does not run out of cursors: the
-cap is enforced by reclaiming the least recently touched one, because #25's
-browser treats a `kBadCursor` on a `ListNext` as "re-open and reload" while a
-refused `ListBegin` would leave a screen with nowhere to go. A `ListNext` that
+`ListBegin` never fails, and that is a decision rather than an omission.
+It does not run out of cursors -- the cap is enforced by reclaiming the least
+recently touched one, because #25's browser treats a `kBadCursor` on a
+`ListNext` as "re-open and reload" while a refused `ListBegin` would leave a
+screen with nowhere to go. It also does not refuse a console with no
+`server.url` or no network: **opening a list is not reading one**, so those are
+answered by the first `ListNext` as `kNotConfigured` or `kOffline`, where the
+browser already draws a failed page with a row to press. A `ListNext` that
 could not fetch its page is `kOffline` for a request that did not complete or a
 server that refused it, and `kInternal` for a `200` whose body this client cannot
 read -- a truncated one among them. **Neither is ever a short page**, which would

@@ -112,6 +112,12 @@ inline constexpr std::chrono::seconds kCursorTtl{90};
 /// past the last row would have the browser ask for a page that comes back empty
 /// and says there is more, forever, which is a worse failure than a cut nobody
 /// can reach.
+///
+/// The snapshot is **per cursor**, so the worst case this service holds is
+/// `kMaxCursors * kMaxPlatforms` trimmed rows rather than one snapshot's worth.
+/// Four times a number nothing reaches is still nothing, and sharing one
+/// snapshot between cursors would mean deciding when it goes stale -- a cache,
+/// which is the thing the header note says this never holds.
 inline constexpr std::size_t kMaxPlatforms = 256;
 
 /// How long one string on a list row may be.
@@ -279,10 +285,12 @@ class Service {
 
   struct Entry {
     ipc::Cursor id = 0;
-    ipc::ListKind kind = ipc::ListKind::kPlatforms;
-    std::int64_t platform_id = 0;
-    std::string search;
-    std::int32_t page_size = ipc::kMaxPageSize;
+
+    /// What the list was opened for: kind, filter and page size, already
+    /// clamped. The whole of it rather than four fields beside each other,
+    /// because it is the same clump `ipc::ListRequest` already is and `Pump`
+    /// copies it out whole.
+    ipc::ListRequest request;
 
     /// Rows handed over so far -- the offset the next page starts at.
     std::int64_t offset = 0;
@@ -309,20 +317,19 @@ class Service {
 
   TimePoint Now() const;
 
-  /// The caller holds `mutex_`.
-  Entry* Find(ipc::Cursor cursor);
+  /// The cursor named, or `cursors_.end()`. The caller holds `mutex_`.
+  std::vector<Entry>::iterator Find(ipc::Cursor cursor);
   void ReapLocked(TimePoint now);
   void EvictOldestLocked();
 
   /// Build a page out of what is already in memory. The caller holds `mutex_`.
-  ///
-  /// `kTooLarge` for the one thing that would otherwise be a page that never
-  /// advances: a single row that does not fit a payload on its own. See the
-  /// definition -- it is unreachable while `kMaxRowTextBytes` holds, and named
-  /// rather than silent so that if it ever is reachable it reads as the bug on
-  /// this side that it is.
   ipc::Error FillFromQueueLocked(Entry& entry, ipc::ListPage* page);
   ipc::Error FillFromPlatformsLocked(Entry& entry, ipc::ListPage* page);
+
+  /// Advance `entry`'s offset by what fitted and set `has_more`. See the
+  /// definition for the one case it refuses.
+  static ipc::Error PageOf(Entry& entry, ipc::ListPage* page, std::int64_t served,
+                           std::int64_t count);
 
   /// Turn fetched rows into a page. Runs **outside** `mutex_`, because it reads
   /// the card for `on_disk` and the queue for `queued`. `card` is the
