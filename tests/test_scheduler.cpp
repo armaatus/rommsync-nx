@@ -268,6 +268,15 @@ void Disabled(checks::Checks& c) {
              "and fires nothing over a day at a five-minute interval");
   c.Expect(!scheduler.RequestNow(), "a Sync now against the switch is refused, not queued");
   c.Expect(scheduler.Poll().parked, "so nothing is waiting when it is switched back on");
+  // ...and neither is one that was already waiting when the switch went off,
+  // which is the case `Poll` and not `Reconfigure` has to catch.
+  config.enabled = true;
+  scheduler.Reconfigure(config);
+  c.Expect(scheduler.RequestNow(), "a request taken while the switch is on");
+  config.enabled = false;
+  scheduler.Reconfigure(config);
+  c.Expect(scheduler.Poll().parked, "the switch goes off under it");
+  c.Expect(!scheduler.requested(), "and the request is dropped rather than queued");
 
   // Switched on: the interval starts now rather than reaching back over the day
   // the console spent disabled.

@@ -1221,9 +1221,14 @@ void SyncNowStarts(checks::Checks& c) {
                                  "\n"
                                  "[sync]\n"
                                  "enabled = true\n"
-                                 // Boot and on demand only, so the one tick this
-                                 // scenario counts is the one it asked for.
-                                 "interval_min = 0\n"),
+                                 // No timer and no boot tick, so the scheduler
+                                 // parks with **no deadline at all** and the
+                                 // only thing that can ever run one is the
+                                 // press. That is the shape a lost wake-up
+                                 // would strand forever rather than merely
+                                 // delay.
+                                 "interval_min = 0\n"
+                                 "on_boot = false\n"),
            "a configured card");
   auth::StoredToken token;
   token.server_url = "https://romm.example.com";
@@ -1234,14 +1239,20 @@ void SyncNowStarts(checks::Checks& c) {
   console.Boot();
 
   c.Expect(!console.Status().sync_in_progress, "an idle console is not drawn as syncing");
+
+  // The worker, which this build has for the first time. With no boot tick and
+  // no interval it parks immediately, so nothing has run and nothing is due.
+  console.engine.StartWorker();
+  std::this_thread::sleep_for(std::chrono::milliseconds{200});
+  c.Expect(console.Status().last_sync_result == ipc::SyncResult::kNever,
+           "a parked worker runs nothing on its own");
+
   c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted,
            "Sync now is accepted rather than answered with 'one is already running'");
 
-  // The worker, which this build has for the first time. It has no
-  // `http::HttpClient` -- nothing installed one -- so the tick it runs cannot
-  // negotiate and settles as a failure, which is the honest answer and the one
-  // the status screen draws.
-  console.engine.StartWorker();
+  // And the parked worker actually wakes for it. It has no `http::HttpClient`
+  // -- nothing installed one -- so the tick cannot negotiate and settles as a
+  // failure, which is the honest answer and the one the status screen draws.
   ipc::Status status = console.Status();
   for (int waited = 0; waited < 200 && status.last_sync_result == ipc::SyncResult::kNever;
        ++waited) {

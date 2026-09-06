@@ -101,6 +101,14 @@ Decision Scheduler::Poll() {
     // The switch is off, so nothing is scheduled and there is no deadline worth
     // waking for. `sync::TickOptions::enabled` refuses a tick one level down
     // (M6-2, #33); this is the half that costs no wakeups at all.
+    //
+    // Anything that was waiting to run is **dropped here, not queued**: a
+    // request or a rescan that survived the switch would fire the instant it
+    // went back on, which is the thing `SchedulerConfig::enabled` says must not
+    // happen. Dropping it in `Poll` rather than in `Reconfigure` catches the
+    // request that arrives while it is already off as well.
+    on_demand_ = false;
+    rerun_ = false;
     decision.parked = true;
     return decision;
   }

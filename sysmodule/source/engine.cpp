@@ -77,9 +77,17 @@ void SdEngine::UseServer(http::HttpClient* client, std::string bearer_token) {
   lists_.UseAuthObserver([this](auth::Answer answer) { ObserveAnswer(answer); });
 }
 
-void SdEngine::UseNetworkWait(NetworkWait wait) {
+void SdEngine::UseNetworkProbe(NetworkProbe probe) {
   std::lock_guard<std::mutex> lock(mutex_);
-  network_wait_ = std::move(wait);
+  network_probe_ = std::move(probe);
+}
+
+void SdEngine::Wake() {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++wakes_;
+  }
+  wake_.notify_all();
 }
 
 void SdEngine::UseCard(fs::FileSystem* filesystem) {
@@ -224,6 +232,7 @@ void SdEngine::AdoptConfigLocked(config::LoadResult loaded) {
   {
     // The innermost lock, held for the swap alone. See `config_mutex_`.
     std::lock_guard<std::mutex> configuration(config_mutex_);
+    previous_config_ = config_;
     config_ = std::make_shared<const config::Config>(std::move(loaded.value));
   }
   // In the same breath, so a changed interval takes effect with no reboot and a
@@ -493,7 +502,7 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
   // The scheduler may now have something due -- a shortened interval, a switch
   // turned back on, or a park lifted -- and the worker is asleep on a deadline
   // that was computed from the configuration before this one.
-  wake_.notify_all();
+  Wake();
   return ipc::Error::kOk;
 }
 
@@ -508,10 +517,17 @@ bool SdEngine::RequestSync() {
       // to answer false here would put the two out of step (`ipc.hpp`).
       return false;
     }
-    taken = scheduler_.RequestNow();
+    // **A switched-off console answers true here and runs nothing**, and the
+    // scheduler drops the request rather than queueing it (`SchedulerConfig::enabled`).
+    // The switch is `ServiceCore::SyncNow`'s to report, in front of this, and it
+    // answers `kDisabled`; returning `false` would report "a sync is already
+    // running" for a console that is merely switched off, which is the exact
+    // sentence this issue exists to remove.
+    scheduler_.RequestNow();
+    taken = true;
   }
   // Outside the lock: the worker takes `mutex_` the moment it wakes.
-  wake_.notify_all();
+  Wake();
   return taken;
 }
 
@@ -575,27 +591,47 @@ void SdEngine::ObserveAnswer(auth::Answer answer) {
   auth::SaveBlock(PathTo(auth::kAuthStateFileName), block);
 }
 
-void SdEngine::RunWorker() {
+void SdEngine::AwaitNetwork() {
+  // The wait for the network happens **here**, on this thread, and never in
+  // `main`: a console that comes up with no Wi-Fi must not hold boot
+  // (CLAUDE.md, docs/ARCHITECTURE.md §1). A null probe is "the network is up",
+  // which is what every host build is.
+  NetworkProbe probe;
   {
-    // The wait for the network happens **here**, on this thread, and never in
-    // `main`: a console that comes up with no Wi-Fi must not hold boot
-    // (CLAUDE.md, docs/ARCHITECTURE.md §1). A null waiter is "the network is
-    // up", which is what every host build is.
-    NetworkWait wait;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (stopping_) {
-        return;
-      }
-      wait = network_wait_;
-    }
-    if (wait) {
-      wait();
-    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    probe = network_probe_;
   }
+  if (!probe) {
+    return;
+  }
+
+  const std::chrono::steady_clock::time_point deadline =
+      std::chrono::steady_clock::now() + kNetworkWaitBudget;
+  std::unique_lock<std::mutex> lock(mutex_);
+  while (!stopping_ && std::chrono::steady_clock::now() < deadline) {
+    lock.unlock();
+    // Outside the lock: `nifm` is a service call and `mutex_` guards state the
+    // frame-polled commands read.
+    const bool up = probe();
+    lock.lock();
+    if (up) {
+      return;
+    }
+    // `wait_for` rather than a sleep, so a shutdown cuts this short instead of
+    // costing the destructor the rest of the poll interval.
+    wake_.wait_for(lock, kNetworkPollInterval, [this] { return stopping_; });
+  }
+}
+
+void SdEngine::RunWorker() {
+  AwaitNetwork();
 
   std::unique_lock<std::mutex> lock(mutex_);
   while (!stopping_) {
+    // Read **before** the decision and compared after the pump: everything that
+    // gives this thread work bumps it under `mutex_`, so a notification that
+    // lands while the lock is released below cannot be missed. See `wakes_`.
+    const std::uint64_t decided_at = wakes_;
     const sync::Decision decision = scheduler_.Poll();
     if (decision.run()) {
       sync_in_progress_ = true;
@@ -617,16 +653,17 @@ void SdEngine::RunWorker() {
       continue;
     }
 
-    if (stopping_) {
-      break;
+    const auto woken = [this, decided_at] { return stopping_ || wakes_ != decided_at; };
+    if (woken()) {
+      continue;
     }
     if (decision.parked) {
       // No deadline at all. This is the idle cost the whole scheduler exists to
       // avoid: a switched-off or boot-only console waits to be woken by a
       // command and costs nothing in between (scheduler.hpp).
-      wake_.wait(lock);
+      wake_.wait(lock, woken);
     } else {
-      wake_.wait_for(lock, decision.sleep_for);
+      wake_.wait_for(lock, decision.sleep_for, woken);
     }
   }
 }
@@ -657,6 +694,14 @@ std::string PlaceUnder(const std::vector<std::string>& folders, std::string_view
 }
 
 }  // namespace
+
+void SdEngine::RecordFailedTickLocked() {
+  last_sync_result_ = ipc::SyncResult::kFailed;
+  uploaded_ = 0;
+  downloaded_ = 0;
+  conflicts_ = 0;
+  failed_ = 0;
+}
 
 void SdEngine::RunOneTick() {
   const std::shared_ptr<const config::Config> config = ConfigSnapshot();
@@ -691,6 +736,7 @@ void SdEngine::RunOneTick() {
     // three requests and then this branch.
     std::lock_guard<std::mutex> lock(mutex_);
     scheduler_.Finished(sync::TickOutcome::kUnauthorized);
+    RecordFailedTickLocked();
     return;
   }
   if (client == nullptr || files == nullptr || token.access_token.empty() ||
@@ -703,7 +749,7 @@ void SdEngine::RunOneTick() {
     // does not need to know.
     std::lock_guard<std::mutex> lock(mutex_);
     scheduler_.Finished(sync::TickOutcome::kOffline);
-    last_sync_result_ = ipc::SyncResult::kFailed;
+    RecordFailedTickLocked();
     return;
   }
 
@@ -730,7 +776,7 @@ void SdEngine::RunOneTick() {
                             ? sync::TickOutcome::kUnauthorized
                             : sync::TickOutcome::kOffline,
                         library.transport);
-    last_sync_result_ = ipc::SyncResult::kFailed;
+    RecordFailedTickLocked();
     return;
   }
 
@@ -1094,7 +1140,7 @@ void SdEngine::CommitGrant(const std::shared_ptr<PairingAttempt>& attempt,
   }
   // A paired console usually has a tick due: `[sync] on_boot` fired long before
   // there were credentials to fire it with.
-  wake_.notify_all();
+  Wake();
 }
 
 ipc::Error SdEngine::Unpair() {
@@ -1158,7 +1204,7 @@ ipc::Error SdEngine::ListNext(ipc::Cursor cursor, ipc::ListPage* page) {
     // sleep on whatever the *scheduler* said -- which for a boot-only or
     // switched-off console is no deadline at all, and the page would stay
     // pending until a sync woke the thread. The overlay is asking now.
-    wake_.notify_all();
+    Wake();
   }
   return answered;
 }
@@ -1217,6 +1263,31 @@ ipc::Error SdEngine::RestoreBackup(std::int64_t entry_id, conflicts::RestoreRepo
   // appending an entry underneath a restore reading one would be a race on the
   // same vector.
   std::lock_guard<std::mutex> history(history_mutex_);
+
+  // **Refused while a tick is running**, because both write saves.
+  //
+  // Until M7-2 (#37) this was the only thing in the sysmodule that wrote a save,
+  // so there was nothing to be atomic against. Now the worker runs
+  // `sync::Execute` and `sync::SyncStates` over the same `sd_path` a restore
+  // targets. Each write is individually atomic, so the collision is a lost
+  // update rather than a corrupt file -- the restored bytes replaced moments
+  // later by an in-flight download, and the tick's `.backup/` copy taken of a
+  // half-restored state -- and neither is something to hand a player.
+  //
+  // Refused rather than serialised: waiting would park the **IPC thread** behind
+  // a whole tick, which `ipc.hpp` forbids in as many words. `kBackupFailed` is
+  // the outcome whose promise is exactly what holds here -- nothing was written
+  // -- and the sentence beside it is what the screen draws, so the user is told
+  // to try again rather than told their backup is gone.
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (sync_in_progress_) {
+      report->outcome = conflicts::RestoreOutcome::kBackupFailed;
+      report->message = "a sync is running; try the restore again when it finishes";
+      return ipc::Error::kOk;
+    }
+  }
+
   if (card_ == nullptr) {
     // Nothing implements `fs::FileSystem` for Horizon yet (`engine.hpp`).
     // `kBackupFailed` rather than a transport failure: its promise is that

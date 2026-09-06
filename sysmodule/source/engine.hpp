@@ -47,6 +47,7 @@
 // before the M8-1 gate, never on hardware (sysmodule/AGENTS.md).
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
@@ -86,6 +87,12 @@ inline constexpr const char* kConfigDir = "sdmc:/config/rommsync/";
 /// plus the directory `core/` names, and is kept as its own constant because it
 /// is what `Load` is *given* rather than something it derives.
 inline constexpr const char* kSdRoot = "sdmc:";
+
+/// How long the worker waits for the network before its first tick, and how
+/// often it asks (M7-2, #37). See `SdEngine::AwaitNetwork` for why it is bounded
+/// at all.
+inline constexpr std::chrono::seconds kNetworkWaitBudget{120};
+inline constexpr std::chrono::seconds kNetworkPollInterval{2};
 
 /// What a pairing attempt needs that neither `core/` nor this file can supply.
 ///
@@ -225,18 +232,23 @@ class SdEngine : public ipc::Engine {
   /// (`-fno-exceptions`, `switch.mk`).
   void StartWorker();
 
-  /// What the worker waits for before its first tick.
+  /// Whether the console has an internet connection right now.
   ///
   /// **Injected, because `nifm` is libnx and this file names no libnx type.**
-  /// `main.cpp` passes a function that asks `nifmGetInternetConnectionStatus`;
-  /// the host suite passes one that answers immediately, and a build that passes
-  /// nothing gets "the network is up", which is what a laptop is.
+  /// `main.cpp` passes one line asking `nifmGetInternetConnectionStatus`; a
+  /// build that passes nothing is treated as connected, which is what a laptop
+  /// is.
   ///
-  /// It is called on the **worker thread** and may block. That is the whole
-  /// point: a console that comes up with no Wi-Fi must not hold `main`, and
-  /// `sys-rommsync` registered its port before this class existed.
-  using NetworkWait = std::function<void()>;
-  void UseNetworkWait(NetworkWait wait);
+  /// A *probe* rather than a wait, so the waiting -- the budget, the poll
+  /// interval, and noticing that the process is going away -- happens on this
+  /// side of the seam, where `stopping_` is visible. A wait that slept inside
+  /// libnx would make a shutdown during boot take the whole budget.
+  ///
+  /// Called on the **worker thread**, never on the IPC one, and never while
+  /// `mutex_` is held. Boot is not held either way: `main` starts this thread
+  /// and returns.
+  using NetworkProbe = std::function<bool()>;
+  void UseNetworkProbe(NetworkProbe probe);
 
   /// The network the library is read over, and the token to read it with.
   ///
@@ -500,6 +512,26 @@ class SdEngine : public ipc::Engine {
   /// it and the destructor stops it.
   void RunWorker();
 
+  /// Wait for `network_probe_` to say yes, or for the budget to run out.
+  ///
+  /// Bounded rather than indefinite: a console that lives on a coffee table with
+  /// no Wi-Fi would otherwise park this thread until it is next carried into
+  /// range. Giving up costs one tick, which fails `TickOutcome::kOffline` and is
+  /// rescheduled on the same backoff every other offline console is on. It also
+  /// gives up at once when the process is going away.
+  void AwaitNetwork();
+
+  /// Tell the worker there is something to do. Safe from any thread; takes
+  /// `mutex_` for the counter and notifies outside it.
+  void Wake();
+
+  /// Record a tick that did not transfer anything. The caller holds `mutex_`.
+  ///
+  /// The counts go to zero with it: `ipc::Status` carries *the last sync's*
+  /// counts, so leaving the previous run's numbers beside a `kFailed` would draw
+  /// a failed sync that uploaded four saves.
+  void RecordFailedTickLocked();
+
   /// One scheduled tick, start to finish: scan, `sync::RunTick`, record.
   ///
   /// **Not a second tick loop.** `sync::RunTick` is the loop (sync_tick.hpp) and
@@ -587,6 +619,17 @@ class SdEngine : public ipc::Engine {
   /// the order is `mutex_` -> `lists_`'s -> this, and this one is a leaf: nothing
   /// is called while it is held.
   mutable std::mutex config_mutex_;
+
+  /// The `Config` the last swap replaced, kept alive and never read.
+  ///
+  /// `config()` hands out a reference into `config_`, and `AdoptConfigLocked`
+  /// *replaces* the pointer -- so a caller on the IPC thread holding that
+  /// reference across a `SetConfig` would have been reading freed memory rather
+  /// than merely stale fields. Nothing in `ipc::ServiceCore` holds one that
+  /// long, and this makes the mistake cost a stale read again instead of a
+  /// crash. One generation is enough: a caller that survives two swaps is a bug
+  /// no amount of keeping would fix.
+  std::shared_ptr<const config::Config> previous_config_;
 
   /// What was wrong with `config.ini`, and -- see `AdoptConfig` -- with
   /// `auth.json`. Rebuilt every time the configuration is re-read.
@@ -683,8 +726,21 @@ class SdEngine : public ipc::Engine {
   http::HttpClient* server_ = nullptr;
   std::string list_token_;
 
-  /// What the worker waits for before its first tick. Null means "up".
-  NetworkWait network_wait_;
+  /// Whether the console is on a network. Null means "up".
+  NetworkProbe network_probe_;
+
+  /// Bumped by every command that gives the worker something to do, under
+  /// `mutex_`, and read by the worker as part of its wait predicate.
+  ///
+  /// **A counter and not a flag**, because the window it closes is a lost
+  /// wake-up: the worker releases `mutex_` to run `PumpLists()` and re-takes it
+  /// before waiting, and a `notify_all` landing inside that gap wakes nobody.
+  /// With a parked decision -- `interval_min = 0`, or the switch off -- the wait
+  /// has no deadline to save it, so a "Sync now" would be lost until some
+  /// unrelated command happened along. Comparing the count the worker last
+  /// *decided* on against the count now makes the notification impossible to
+  /// miss.
+  std::uint64_t wakes_ = 0;
 
   std::thread worker_thread_;
 

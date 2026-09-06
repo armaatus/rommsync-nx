@@ -157,40 +157,24 @@ std::unique_ptr<rommsync::http::HttpClient> g_http;
 /// ever one.
 std::unique_ptr<rommsync::fs::FileSystem> g_card;
 
-/// How long the worker waits for `nifm` to report a connection before its first
-/// tick, and how often it asks.
+/// Whether this console has an internet connection, right now.
 ///
-/// It gives up rather than waiting forever, and that is the point: a console
-/// that comes up on a coffee table with no Wi-Fi would otherwise hold a thread
-/// on a condition that may not be met for a week. Giving up costs one tick,
-/// which fails with `TickOutcome::kOffline` and is rescheduled on the backoff --
-/// which is the same battery-friendly curve every other offline console is on
-/// (`sync::Scheduler`). Waiting at all is what stops the *first* tick from being
-/// a guaranteed failure on every boot, because Horizon brings the link up a few
-/// seconds after a sysmodule starts.
-constexpr u64 kNetworkWaitNanoseconds = 120ull * 1000 * 1000 * 1000;
-constexpr u64 kNetworkPollNanoseconds = 2ull * 1000 * 1000 * 1000;
-
-/// Block until the console has an internet connection, or until the budget above
-/// runs out.
+/// The whole of the libnx half of "boot, after the network is up"
+/// (docs/ARCHITECTURE.md §1). The waiting -- the budget, the poll interval, and
+/// noticing that the process is going away -- is `SdEngine::AwaitNetwork`'s,
+/// where `stopping_` is visible and where a host test can drive it; a wait that
+/// slept in here would make a shutdown during boot take the whole budget.
 ///
-/// **Runs on the worker thread, never on the main one.** `main` registers the
+/// **Called on the worker thread, never on the main one.** `main` registers the
 /// service and enters its loop with no network call in front of it, which is
 /// CLAUDE.md's "never block boot" -- a console with no Wi-Fi still has an
 /// overlay that opens, settings that read and a queue that draws.
-void WaitForNetwork() {
-  const u64 started = armGetSystemTick();
-  const u64 budget = armNsToTicks(kNetworkWaitNanoseconds);
-  while (armGetSystemTick() - started < budget) {
-    NifmInternetConnectionType type = static_cast<NifmInternetConnectionType>(0);
-    u32 strength = 0;
-    NifmInternetConnectionStatus status = static_cast<NifmInternetConnectionStatus>(0);
-    if (R_SUCCEEDED(nifmGetInternetConnectionStatus(&type, &strength, &status)) &&
-        status == NifmInternetConnectionStatus_Connected) {
-      return;
-    }
-    svcSleepThread(kNetworkPollNanoseconds);
-  }
+bool NetworkUp() {
+  NifmInternetConnectionType type = static_cast<NifmInternetConnectionType>(0);
+  u32 strength = 0;
+  NifmInternetConnectionStatus status = static_cast<NifmInternetConnectionStatus>(0);
+  return R_SUCCEEDED(nifmGetInternetConnectionStatus(&type, &strength, &status)) &&
+         status == NifmInternetConnectionStatus_Connected;
 }
 
 /// The Horizon half of `io::FileSync` (#16): make what was just written
@@ -413,7 +397,7 @@ int main(int, char**) {
   g_card = rommsync::sysmodule::MakeSdCard();
   engine.UseServer(g_http.get(), "");
   engine.UseCard(g_card.get());
-  engine.UseNetworkWait(&WaitForNetwork);
+  engine.UseNetworkProbe(&NetworkUp);
   engine.StartWorker();
 
   rommsync::ipc::ServiceCore core(engine);
