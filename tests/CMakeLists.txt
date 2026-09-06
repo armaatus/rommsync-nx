@@ -877,6 +877,7 @@ foreach(phase opens reuses foreign no_romm submits no_draft unstable
               watch_bare_url watch_full_draft_untouched cli_broken
               await_reports_failed_review await_reports_a_red_build
               await_finds_the_failed_run_under_newer_skipped_ones
+              await_throttles_the_lookup_when_the_run_is_never_found
               fleet_notices_a_stalled_agent
               review_status_shows_the_open_thread brief_never_lists_threads_over_rest
               brief_queues_the_merge_at_step_four

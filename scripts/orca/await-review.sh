@@ -194,8 +194,18 @@ RED
   # reintroduced through the list window instead of through a rate limit.
   # The `--jq` already selects on this head AND conclusion == failure, so the
   # only job of the limit is to make sure the matching run is inside the window.
+  #
+  # Throttled on the SAME poll as the rollup that set `review_dead`, not merely
+  # on `review_dead` being true. The usual path exits 6 on the first try and the
+  # distinction never shows; it shows when the lookup comes back empty and
+  # `review_dead` stays true -- a transient error swallowed by `2>/dev/null`, or
+  # a failure sitting further back than the window. Gated on the flag alone this
+  # would then re-ask on every poll until the next throttled recheck, and for as
+  # long as the run stays unfound, which is the per-poll cost the throttle exists
+  # to prevent -- moved one call downstream of the fix rather than removed.
+  # A slow-to-appear run now costs one extra call per throttle cycle.
   failed_run=""
-  if [ -n "$review_dead" ]; then
+  if [ -n "$review_dead" ] && [ "$((checks_due % 4))" = "1" ]; then
     failed_run="$(GH_PAGER=cat gh run list --branch "$branch" --workflow "claude review" \
                     --limit 25 --json conclusion,databaseId,headSha \
                     --jq "[.[] | select(.headSha==\"$head\" and .conclusion==\"failure\")][0].databaseId" \

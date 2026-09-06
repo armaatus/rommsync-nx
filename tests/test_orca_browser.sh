@@ -654,6 +654,58 @@ GHSTUB
     echo "PASS: the failed run is found even under newer skipped runs"
     ;;
 
+  await_throttles_the_lookup_when_the_run_is_never_found)
+    # The third way this same call has now been made expensive, and the subtlest.
+    # The review check is dead, so `review_dead` is correctly true -- but the run
+    # behind it is never found: a transient error swallowed by `2>/dev/null`, or
+    # a failure further back than the window. The loop therefore does NOT exit 6,
+    # and `review_dead` stays true until the next throttled recheck.
+    #
+    # Gated on `review_dead` alone, the lookup then re-fires on every poll for as
+    # long as that lasts -- the per-poll cost the throttle exists to prevent,
+    # moved one call downstream of the fix rather than removed. Gated on the
+    # throttle too, an unfound run costs one call per cycle.
+    #
+    # The other two await phases cannot see this: one exits 6 on the first try
+    # so the loop never repeats, and the recovery phase only counts calls made
+    # AFTER the rollup reports recovery, not the ones made while review_dead is
+    # correctly still true.
+    make_fixture
+    cp "$REPO_ROOT"/scripts/orca/{await-review.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    stub="$TMPDIR_FIXTURE/stub-bin"
+    mkdir -p "$stub"
+    cat >"$stub/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"pr list"*)  printf '[{"number":80}]\n' ;;
+  # The review check stays dead all the way through, so review_dead is true on
+  # every poll after the first throttled check.
+  *statusCheckRollup*)
+    printf '{"statusCheckRollup":[{"name":"review against REVIEW.md","conclusion":"FAILURE"},{"name":"host-tests","conclusion":"SUCCESS"}]}\n' ;;
+  # ...and the run behind it is never found, so the loop never exits 6.
+  *"run list"*) echo x >>"$RUNLIST_LOG"; printf '\n' ;;
+  *"pr view"*)  printf '{"reviews":[]}\n' ;;
+  *)            printf '\n' ;;
+esac
+GHSTUB
+    chmod +x "$stub/gh"
+    ( cd "$TMPDIR_FIXTURE" && git init -q . && git commit -q --allow-empty -m fixture ) 2>/dev/null
+    runlog="$TMPDIR_FIXTURE/runlist.log"; : >"$runlog"
+    # 12 polls at one second: three throttled checks (polls 1, 5, 9), so a
+    # correctly throttled lookup spends three calls and a per-poll one spends
+    # about twelve.
+    ( cd "$TMPDIR_FIXTURE" &&
+      PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$TMPDIR_FIXTURE/fleet" RUNLIST_LOG="$runlog" \
+      AWAIT_REVIEW_DEADLINE=12 AWAIT_REVIEW_POLL=1 \
+      bash "$TMPDIR_FIXTURE/scripts/orca/await-review.sh" 80 >/dev/null 2>&1 )
+    calls="$(wc -l <"$runlog" | tr -d ' ')"
+    [ "${calls:-0}" -ge 1 ] \
+      || fail "never looked for the failed run at all; the fixture proves nothing"
+    [ "${calls:-0}" -le 4 ] \
+      || fail "spent $calls run-list call(s) over 12 polls while the run stayed unfound; the lookup is running per poll, not per throttle cycle"
+    echo "PASS: an unfound run costs one lookup per throttle cycle, not one per poll"
+    ;;
+
   await_reports_a_red_build)
     # #88 sat in await-review.sh while host-tests failed on its own new test.
     # A review cannot fix a red build, and waiting for one costs 45 minutes and
@@ -1049,6 +1101,7 @@ PYCHECK
     echo "       watch_bare_url|watch_full_draft_untouched|cli_broken" >&2
     echo "       await_reports_failed_review|await_reports_a_red_build" >&2
     echo "       await_finds_the_failed_run_under_newer_skipped_ones" >&2
+    echo "       await_throttles_the_lookup_when_the_run_is_never_found" >&2
     echo "       fleet_notices_a_stalled_agent" >&2
     echo "       review_status_shows_the_open_thread|brief_never_lists_threads_over_rest" >&2
     echo "       brief_queues_the_merge_at_step_four" >&2
