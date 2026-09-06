@@ -29,8 +29,9 @@
 # the script inspects -- so it needs no Docker and never skips. `builds` needs
 # the devkitpro/devkita64 image, exactly like `switch.builds`, and skips rather
 # than pulling 2.7GB unasked -- which means that on a machine without it,
-# nothing exercises the packaging in the container at all. No CI job does either
-# yet; see the note on `package.builds` in tests/CMakeLists.txt.
+# nothing here exercises the packaging in the container. CI does: `switch-build`
+# runs scripts/package.sh on every push and the `release` job runs it on a tag
+# (#34), both in this image.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
