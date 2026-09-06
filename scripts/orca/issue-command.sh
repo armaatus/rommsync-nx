@@ -160,9 +160,12 @@ That does NOT merge. It asks GitHub to merge once the required checks pass, and
 directly; the hook will not let you, and that is the one review control this
 project has. Say the PR is queued and stop.
 
-A PR that touches `.claude/` or `.github/workflows/` never auto-merges: those are
-the paths that can disable the checks gating their own PR, and a person merges
-them. `merge-gate` will say so.
+A PR that touches `.claude/`, `.github/workflows/` or `.github/scripts/` never
+auto-merges: those are the paths that can disable or rewrite the checks gating
+their own PR, and a person merges them. All three, and the same three named
+above -- `merge_gate.py` refuses exactly this list, and a brief that named fewer
+would send an agent to spend its review rounds turning green a gate that never
+will. `merge-gate` will say so.
 
 At any point, if `~/.rommsync-fleet/STOP` exists, put the work down: say where you
 got to and do nothing further. Nothing can go out while it exists.

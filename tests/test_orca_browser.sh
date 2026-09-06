@@ -945,18 +945,45 @@ STUB
     # a different set than the gate enforces is worse than no warning.
     gate="$REPO_ROOT/.github/scripts/merge_gate.py"
     if [ -f "$gate" ]; then
-      python3 - "$gate" "$brief" <<'PYCHECK' || fail "the brief and merge_gate.py disagree about the human-merge paths"
+      # EVERY place that makes the claim, not just one of them. The brief says
+      # it twice -- once in step 4 and once in the closing notes -- and CLAUDE.md
+      # says it a third time. Checking only that each path appears SOMEWHERE
+      # passes while a second, narrower list sits a few lines further down
+      # contradicting the first, which is exactly what was found here: the
+      # closing note named two of the three paths, so an agent whose PR touched
+      # only .github/scripts/ read the correct warning and then the one that
+      # said it was fine, with nothing to say which governs.
+      python3 - "$gate" "$brief" "$REPO_ROOT/CLAUDE.md" <<'PYCHECK' || fail "a human-merge-path claim names fewer paths than merge_gate.py refuses"
 import re, sys
-gate, brief = open(sys.argv[1]).read(), open(sys.argv[2]).read()
+gate = open(sys.argv[1]).read()
 block = re.search(r"HUMAN_ONLY_PREFIXES\s*=\s*\((.*?)\)", gate, re.S)
 paths = re.findall(r'"([^"]+)"', block.group(1)) if block else []
-missing = [p for p in paths if p not in brief]
-if missing:
-    print("not warned about in the brief:", missing, file=sys.stderr)
+if not paths:
+    print("could not read HUMAN_ONLY_PREFIXES from the gate", file=sys.stderr)
     raise SystemExit(1)
+
+# A paragraph that both names one of the refused paths and asserts something
+# about merging is making the claim, and has to make it in full.
+claim = re.compile(r"auto-merge|merges? itself|never merges", re.I)
+bad = False
+for doc in sys.argv[2:]:
+    text = open(doc).read()
+    for para in re.split(r"\n\s*\n", text):
+        if not claim.search(para):
+            continue
+        named = [p for p in paths if p in para]
+        if not named:
+            continue
+        missing = [p for p in paths if p not in para]
+        if missing:
+            print(f"{doc}: a paragraph claiming {named} never auto-merges "
+                  f"omits {missing}:\n    " + "\n    ".join(para.strip().splitlines()),
+                  file=sys.stderr)
+            bad = True
+raise SystemExit(1 if bad else 0)
 PYCHECK
     fi
-    echo "PASS: the brief names every path merge-gate refuses, and what done means for them"
+    echo "PASS: every human-merge-path claim names the full set merge-gate refuses"
     ;;
 
   *)
