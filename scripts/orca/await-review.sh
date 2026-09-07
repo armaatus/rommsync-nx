@@ -19,6 +19,7 @@
 #   5  the third round is over; stop and say what is unresolved
 #   6  the review job failed on this commit; the reason is printed
 #   7  the PR's build is red; a review cannot fix that
+#   8  the PR conflicts with its base; a review cannot fix that either
 #
 # The round cap is counted HERE rather than left to the agent to remember. Three
 # rounds is more than almost any PR needs, and a fourth is not what a
@@ -36,6 +37,12 @@ POLL_SECONDS="${AWAIT_REVIEW_POLL:-30}"
 DEADLINE_SECONDS="${AWAIT_REVIEW_DEADLINE:-2700}"
 MAX_ROUNDS="${AWAIT_REVIEW_MAX_ROUNDS:-3}"
 ROUNDS_FILE="$REPO_ROOT/.orca/review-rounds"
+# Exit 8 is the one failure path with no natural bound: it fires on poll 1, so
+# the deadline never applies, and a conflict is not a round of disagreement so
+# the round cap must not count it. What CAN be bounded is the case where nothing
+# changed -- keyed on the local head, because a real rebase moves it and a
+# forgotten force-push does not.
+CONFLICT_FILE="$REPO_ROOT/.orca/conflict-head"
 
 pr="${1:-}"
 branch="$(git rev-parse --abbrev-ref HEAD)"
@@ -89,6 +96,8 @@ broken_before=""
 # Set from the rollup inside the throttled block below; declared here so a poll
 # that skips the block still has a value under `set -u`.
 review_dead=""
+merge_state=""
+base_ref=""
 while [ "$waited" -lt "$DEADLINE_SECONDS" ]; do
   if orca_fleet_stopped; then
     echo
@@ -115,11 +124,19 @@ while [ "$waited" -lt "$DEADLINE_SECONDS" ]; do
   # same failure twice.
   checks_due=$((checks_due + 1))
   if [ "$((checks_due % 4))" = "1" ]; then
-    rollup="$(GH_PAGER=cat gh pr view "$pr" --json statusCheckRollup 2>/dev/null \
+    # `mergeStateStatus` and `baseRefName` ride along on the rollup call rather
+    # than costing a second one -- the same reasoning as everything else in this
+    # block, and #83's finding was an unthrottled check exactly here. The base
+    # comes from the PR because the rebase command below is printed for an agent
+    # to run: `origin/main` is right for every PR the fleet opens today and wrong
+    # the first time one is stacked on another, and a wrong command is the class
+    # of failure this whole exit exists to stop.
+    rollup="$(GH_PAGER=cat gh pr view "$pr" --json statusCheckRollup,mergeStateStatus,baseRefName 2>/dev/null \
               | python3 -c "
 import json, sys
 try:
-    checks = json.load(sys.stdin).get('statusCheckRollup') or []
+    doc = json.load(sys.stdin)
+    checks = doc.get('statusCheckRollup') or []
 except Exception:
     raise SystemExit
 skip = ('merge-gate', 'review against REVIEW.md')
@@ -130,26 +147,89 @@ review_dead = any(c.get('name') == 'review against REVIEW.md'
                   and (c.get('conclusion') or '') in dead for c in checks)
 print(', '.join(n for n in bad if n))
 print('REVIEW_FAILED' if review_dead else '')
+print((doc.get('mergeStateStatus') or '').upper())
+print(doc.get('baseRefName') or '')
 " 2>/dev/null)"
-    # Two lines out of one capture: the failing check names, then the marker
-    # saying the review check itself is among the dead. Read from `rollup` rather
-    # than from `broken` -- reusing one name as both the here-string source and
-    # the first read target works, but reads like a bug.
+    # Four lines out of one capture: the failing check names, the marker saying
+    # the review check itself is among the dead, what GitHub makes of the branch
+    # against its base, and the base it judged that against. Read from `rollup`
+    # rather than from `broken` -- reusing one name as both the here-string
+    # source and the first read target works, but reads like a bug.
     #
     # Cleared first, and that is deliberate. `$(...)` strips ALL trailing
-    # newlines, so a healthy answer -- whose second line is empty -- comes back
-    # as ONE line, and the second `read` then hits EOF. bash assigns the empty
-    # line it did not get and returns non-zero, so `review_dead` does end up
-    # empty (verified on 3.2.57 and 5.3.15, the oldest and newest bash this repo
-    # can meet). But the recovery path depends entirely on that: if `read` left
-    # the variable untouched on EOF, a `REVIEW_FAILED` set on one throttle check
-    # would survive every later one, and the `gh run list` below would run on
-    # every poll for the rest of the 45-minute wait -- reintroducing exactly the
-    # cost the throttle above exists to remove. One assignment makes the
-    # recovery explicit instead of a consequence of how `read` handles EOF.
+    # newlines, so an answer whose tail lines are empty comes back short and the
+    # later `read`s hit EOF. bash assigns the empty line it did not get and
+    # returns non-zero, so those variables do end up empty (verified on 3.2.57
+    # and 5.3.15, the oldest and newest bash this repo can meet). But the
+    # recovery path depends entirely on that: if `read` left the variable
+    # untouched on EOF, a `REVIEW_FAILED` set on one throttle check would survive
+    # every later one, and the `gh run list` below would run on every poll for
+    # the rest of the 45-minute wait -- reintroducing exactly the cost the
+    # throttle above exists to remove. One assignment makes the recovery explicit
+    # instead of a consequence of how `read` handles EOF.
     # `await_stops_paying_once_the_review_recovers` pins it.
     review_dead=""
-    { IFS= read -r broken; IFS= read -r review_dead; } <<<"$rollup" || true
+    merge_state=""
+    base_ref=""
+    { IFS= read -r broken; IFS= read -r review_dead
+      IFS= read -r merge_state; IFS= read -r base_ref; } <<<"$rollup" || true
+
+    # One capture now feeds THREE detections -- the red build, the dead review
+    # job and the conflict -- so a rollup that comes back empty turns all three
+    # off at once and the wait runs its full deadline saying nothing arrived:
+    # #80, #88 and #99 simultaneously, and silently, because `2>/dev/null`
+    # swallowed whatever gh said. Nothing here can tell a rejected --json field
+    # from a rate limit from a network blip, and none of them is worth aborting
+    # a 45-minute wait over. Saying it once is: it turns an invisible failure
+    # into one line an agent can act on.
+    if [ -z "$rollup" ] && [ -z "${rollup_warned:-}" ]; then
+      rollup_warned=1
+      echo "  note: the check rollup for PR #$pr came back empty -- the red-build," >&2
+      echo "  failed-review and conflict checks are blind while that lasts. If this" >&2
+      echo "  persists, run it by hand to see the error this loop discards:" >&2
+      echo "    gh pr view $pr --json statusCheckRollup,mergeStateStatus,baseRefName" >&2
+    fi
+
+    # A conflict with the base is not something a review can answer, and it
+    # blocks every merge -- a person's included. #99 sat here for the full 45
+    # minutes, got its review, resolved its threads and still could not merge,
+    # because this was the blocker the whole time.
+    #
+    # Acted on from ONE sighting, unlike the red build below: `DIRTY` is not a
+    # flake, and a branch that conflicts has to be rebased whatever else is true.
+    # Anything else -- `UNKNOWN` while GitHub is still computing mergeability,
+    # `BLOCKED`, `BEHIND` -- is left to review-status.sh, which sees the whole
+    # picture; only the state that makes waiting pointless exits here.
+    if [ "$merge_state" = "DIRTY" ]; then
+      seen_head=""
+      [ -r "$CONFLICT_FILE" ] && read -r seen_head <"$CONFLICT_FILE" 2>/dev/null
+      printf '%s\n' "$head" >"$CONFLICT_FILE"
+      cat <<CONFLICT
+
+GitHub says DIRTY: this PR conflicts with its base.
+
+No review will fix a merge conflict, and a conflicted branch cannot merge at
+all. Rebase it:
+  git fetch origin && git rebase origin/${base_ref:-main}
+resolve the conflicts, re-run the build and the tests, then run
+./scripts/orca/record-review.sh for the new head -- the marker is per-commit and
+a rebase changes every sha, so the guard refuses the push without a fresh one.
+Then push the rewritten branch:
+  git push --force-with-lease
+and come back here.
+CONFLICT
+      if [ "$seen_head" = "$head" ]; then
+        cat <<AGAIN
+
+This is the SECOND time on commit $head. Nothing about the branch changed
+between them, so the rebase either did not happen or was never pushed -- this
+script reads GitHub's view of the PR, not your working tree. Check that
+\`git status\` is clean and that \`git push --force-with-lease\` actually ran
+before coming back; another lap on the same commit gets the same answer.
+AGAIN
+      fi
+      exit 8
+    fi
     if [ -n "$broken" ] && [ "$broken" = "$broken_before" ]; then
       cat <<RED
 

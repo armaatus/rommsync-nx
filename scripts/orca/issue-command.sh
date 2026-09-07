@@ -114,11 +114,17 @@ while it waits:
 
     ./scripts/orca/await-review.sh
 
-It returns when the review lands. **A clean verdict is not the same as no
-findings.** A review can come back COMMENTED and still carry inline comments,
-each of which is a THREAD, and `merge-gate` refuses to merge while any thread is
-unresolved. #88 and #89 both sat blocked on exactly one unresolved thread with
-every check green.
+It returns when the review lands -- or early, without one, when nothing a review
+could say would help: exit 7 for a red build, and exit 8 when GitHub says `DIRTY`
+because something merged underneath your branch. Exit 8 wants a rebase, a fresh
+`./scripts/orca/record-review.sh` for the new head, and `git push
+--force-with-lease`; it prints all three. Do not come back here until it is
+rebased.
+
+**A clean verdict is not the same as no findings.** A review can come back
+COMMENTED and still carry inline comments, each of which is a THREAD, and
+`merge-gate` refuses to merge while any thread is unresolved. #88 and #89 both
+sat blocked on exactly one unresolved thread with every check green.
 
 So after every review, whatever its verdict:
 
@@ -149,7 +155,9 @@ Three of those reasons are NOT waiting for a review, and it says so in the outpu
   still counting a stale run whose newer run passed. Run the `gh run rerun --job`
   it prints, then run `review-status.sh` again. Waiting for another review here
   costs 45 minutes and changes nothing.
-- **`GitHub says DIRTY`** is a conflict with the base. Rebase and push.
+- **`GitHub says DIRTY`** is a conflict with the base. Rebase, re-run
+  `record-review.sh` for the new head, and `git push --force-with-lease` -- the
+  same three things `await-review.sh` exit 8 prints, for the same reason.
 - **`GitHub says BEHIND`** means the base moved and the branch has to catch up.
   Rebase and push.
 

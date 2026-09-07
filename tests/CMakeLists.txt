@@ -1291,6 +1291,7 @@ foreach(phase opens reuses foreign no_romm submits no_draft unstable
               watch_needs_issue watch_late_draft watch_grace watch_submits watch_single
               watch_bare_url watch_full_draft_untouched cli_broken
               await_reports_failed_review await_reports_a_red_build
+              await_reports_a_conflicted_pr
               await_finds_the_failed_run_under_newer_skipped_ones
               await_throttles_the_lookup_when_the_run_is_never_found
               fleet_notices_a_stalled_agent

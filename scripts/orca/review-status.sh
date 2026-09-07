@@ -231,7 +231,10 @@ if problems:
 if merge_state in ("DIRTY", "BEHIND"):
     print(f"PR #{pr} is not ready, and GitHub says {merge_state}:")
     if merge_state == "DIRTY":
-        print("  the branch conflicts with its base. Rebase, push, and come back.")
+        print("  the branch conflicts with its base. Rebase, re-run "
+              "record-review.sh for the")
+        print("  new head -- the marker is per-commit -- and push with "
+              "--force-with-lease.")
     else:
         print("  the branch is behind its base and the base requires being up to "
               "date. Update it.")

@@ -244,6 +244,13 @@ whether the review has arrived* burns tokens the whole time. An agent that waits
 inside one tool call burns nothing — the session is suspended until the script
 returns. No webhook, no ingress, no daemon; `gh` on a 30-second poll.
 
+It also returns early on the two things a review cannot answer, rather than
+spending the deadline on them: exit 7 when the PR's build is red, and exit 8 when
+GitHub says `DIRTY` because something merged underneath the branch. Both print
+what to do instead — for the conflict that is a rebase, a fresh
+`record-review.sh` (the marker is per-commit, and a rebase changes every sha),
+and `git push --force-with-lease`.
+
 Then it fixes what is real, replies with a reason where it disagrees, resolves
 every thread, pushes, re-requests review, and checks:
 
@@ -462,6 +469,7 @@ does. Sweep anything left behind with `./scripts/orca/reap.sh --yes`.
 | Every hook says "this worktree has no linked issue" | the `orca` CLI on `PATH` cannot find `Orca.app` | nothing — the hooks probe it and fall back. If it persists: `sudo chmod -h 755 /usr/local/bin/orca` |
 | `git push` refused, "nothing leaves one of those unreviewed" | the local review is not recorded for this commit | run both passes, then `./scripts/orca/record-review.sh` |
 | `await-review.sh` times out | the review job never ran | `gh run list`; check `CLAUDE_CODE_OAUTH_TOKEN` is a repo secret |
+| `await-review.sh` exits 8, "GitHub says DIRTY" | something merged underneath the branch | rebase, re-run `record-review.sh`, `git push --force-with-lease` |
 | `merge-gate` red on a PR that looks fine | usually the body is missing a review section, or the review predates the last push | read the check's output; it says which of the five |
 | A PR sits queued and never merges | a required check never reported | `gh pr checks <n>` |
 | `ctest` reports `rig.smoke` **Skipped** | RomM is not running for this worktree | `./scripts/orca/compose.sh up -d` |
