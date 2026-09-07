@@ -165,8 +165,7 @@ make_review_status_fixture() {
   make_fixture
   mkdir -p "$TMPDIR_FIXTURE/.github/scripts" "$TMPDIR_FIXTURE/stub-bin"
   cp "$REPO_ROOT"/scripts/orca/{review-status.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
-  cp "$REPO_ROOT"/.github/scripts/{merge_gate.py,issue_refs.py} \
-     "$TMPDIR_FIXTURE/.github/scripts/"
+  cp "$REPO_ROOT"/.github/scripts/*.py "$TMPDIR_FIXTURE/.github/scripts/"
   cat >"$TMPDIR_FIXTURE/stub-bin/gh" <<'GHSTUB'
 #!/usr/bin/env bash
 case "$*" in
@@ -229,7 +228,7 @@ make_await_fixture() {
   make_fixture
   mkdir -p "$TMPDIR_FIXTURE/.github/scripts" "$TMPDIR_FIXTURE/stub-bin"
   cp "$REPO_ROOT"/scripts/orca/{await-review.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
-  cp "$REPO_ROOT/.github/scripts/merge_gate.py" "$TMPDIR_FIXTURE/.github/scripts/"
+  cp "$REPO_ROOT"/.github/scripts/*.py "$TMPDIR_FIXTURE/.github/scripts/"
   cat >"$TMPDIR_FIXTURE/stub-bin/gh" <<'GHSTUB'
 #!/usr/bin/env bash
 case "$*" in
@@ -749,7 +748,7 @@ JSON
     # review, and a worktree without it is one where nothing can, which is its
     # own exit. A fixture missing it would test that instead of the branch named.
     mkdir -p "$TMPDIR_FIXTURE/.github/scripts"
-    cp "$REPO_ROOT/.github/scripts/merge_gate.py" "$TMPDIR_FIXTURE/.github/scripts/"
+    cp "$REPO_ROOT"/.github/scripts/*.py "$TMPDIR_FIXTURE/.github/scripts/"
     stub="$TMPDIR_FIXTURE/stub-bin"
     mkdir -p "$stub"
     cat >"$stub/gh" <<'GHSTUB'
@@ -804,7 +803,7 @@ GHSTUB
     # review, and a worktree without it is one where nothing can, which is its
     # own exit. A fixture missing it would test that instead of the branch named.
     mkdir -p "$TMPDIR_FIXTURE/.github/scripts"
-    cp "$REPO_ROOT/.github/scripts/merge_gate.py" "$TMPDIR_FIXTURE/.github/scripts/"
+    cp "$REPO_ROOT"/.github/scripts/*.py "$TMPDIR_FIXTURE/.github/scripts/"
     stub="$TMPDIR_FIXTURE/stub-bin"
     mkdir -p "$stub"
     cat >"$stub/gh" <<'GHSTUB'
@@ -867,7 +866,7 @@ GHSTUB
     # review, and a worktree without it is one where nothing can, which is its
     # own exit. A fixture missing it would test that instead of the branch named.
     mkdir -p "$TMPDIR_FIXTURE/.github/scripts"
-    cp "$REPO_ROOT/.github/scripts/merge_gate.py" "$TMPDIR_FIXTURE/.github/scripts/"
+    cp "$REPO_ROOT"/.github/scripts/*.py "$TMPDIR_FIXTURE/.github/scripts/"
     stub="$TMPDIR_FIXTURE/stub-bin"
     mkdir -p "$stub"
     cat >"$stub/gh" <<'GHSTUB'
@@ -913,7 +912,7 @@ GHSTUB
     # review, and a worktree without it is one where nothing can, which is its
     # own exit. A fixture missing it would test that instead of the branch named.
     mkdir -p "$TMPDIR_FIXTURE/.github/scripts"
-    cp "$REPO_ROOT/.github/scripts/merge_gate.py" "$TMPDIR_FIXTURE/.github/scripts/"
+    cp "$REPO_ROOT"/.github/scripts/*.py "$TMPDIR_FIXTURE/.github/scripts/"
     stub="$TMPDIR_FIXTURE/stub-bin"; mkdir -p "$stub"
     cat >"$stub/gh" <<'GHSTUB'
 #!/usr/bin/env bash
@@ -961,7 +960,7 @@ GHSTUB
     # review, and a worktree without it is one where nothing can, which is its
     # own exit. A fixture missing it would test that instead of the branch named.
     mkdir -p "$TMPDIR_FIXTURE/.github/scripts"
-    cp "$REPO_ROOT/.github/scripts/merge_gate.py" "$TMPDIR_FIXTURE/.github/scripts/"
+    cp "$REPO_ROOT"/.github/scripts/*.py "$TMPDIR_FIXTURE/.github/scripts/"
     stub="$TMPDIR_FIXTURE/stub-bin"; mkdir -p "$stub"
     cat >"$stub/gh" <<'GHSTUB'
 #!/usr/bin/env bash
@@ -1354,7 +1353,7 @@ $step4"
     # review, and a worktree without it is one where nothing can, which is its
     # own exit. A fixture missing it would test that instead of the branch named.
     mkdir -p "$TMPDIR_FIXTURE/.github/scripts"
-    cp "$REPO_ROOT/.github/scripts/merge_gate.py" "$TMPDIR_FIXTURE/.github/scripts/"
+    cp "$REPO_ROOT"/.github/scripts/*.py "$TMPDIR_FIXTURE/.github/scripts/"
     stub="$TMPDIR_FIXTURE/stub-bin"
     mkdir -p "$stub"
     cat >"$stub/gh" <<'GHSTUB'
@@ -1410,7 +1409,7 @@ GHSTUB
     # review, and a worktree without it is one where nothing can, which is its
     # own exit. A fixture missing it would test that instead of the branch named.
     mkdir -p "$TMPDIR_FIXTURE/.github/scripts"
-    cp "$REPO_ROOT/.github/scripts/merge_gate.py" "$TMPDIR_FIXTURE/.github/scripts/"
+    cp "$REPO_ROOT"/.github/scripts/*.py "$TMPDIR_FIXTURE/.github/scripts/"
     stub="$TMPDIR_FIXTURE/stub-bin"
     mkdir -p "$stub"
     cat >"$stub/gh" <<'GHSTUB'
