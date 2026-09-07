@@ -135,6 +135,11 @@
 #                                           the first occurrence must not be
 #                                           inherited by the second -- that is a
 #                                           worktree removed with no notice at all.
+#   test_orca_fleet.sh abandon_lookup_blind a lookup that FAILED is not "no
+#                                           reason". Folded into one, it wipes a
+#                                           warning still owed to a reason nobody
+#                                           could read, and the notice starts over
+#                                           every time GitHub hiccups -- silently.
 #
 # The Orca CLI and gh are stubbed on PATH; the fleet state dir is a temp dir.
 # Nothing here touches a real worktree, docker, or GitHub.
@@ -892,7 +897,37 @@ JSON
     [ -d "$WORK/wt" ] && fail "the second warning never turned into a release: $out"
     echo "ok: a reason that comes back buys a fresh pass of notice"
     ;;
+  abandon_lookup_blind)
+    make_fixture ok
+    make_worktree
+    add_origin
+    quiet_issue
+    agent_state working
+    # 1. Blocked, and warned.
+    issue_labels "blocked"
+    release_pass >/dev/null 2>&1
+    [ -e "$ROMMSYNC_FLEET_DIR/warned-42" ] \
+      || fail "could not arm warned-42, so the assertion that follows would be vacuous"
+    # 2. `gh` cannot answer. That is the third answer, not "it stopped being
+    #    blocked", and the difference is a warning that is still owed.
+    issue_labels FAIL
+    out="$(release_pass)"
+    [ -e "$ROMMSYNC_FLEET_DIR/warned-42" ] \
+      || fail "a failed lookup wiped a warning still owed to a reason nobody could read: $out"
+    grep -q "could not read" <<<"$out" || fail "it discarded the pass in silence: $out"
+    [ -d "$WORK/wt" ] || fail "it removed the worktree on a lookup that never answered: $out"
+    # 3. The outage lasts. Once per outage, not once per poll.
+    again="$(release_pass)"
+    grep -q "could not read" <<<"$again" && fail "it says so every poll: $again"
+    # 4. It ends, still blocked. The warning was never lost, so this pass
+    #    releases rather than starting the notice over.
+    issue_labels "blocked"
+    out="$(release_pass)"
+    [ -d "$WORK/wt" ] \
+      && fail "the outage restarted the notice; under a flaky gh the release never happens: $out"
+    echo "ok: a lookup that failed leaves the markers, and the notice, where they were"
+    ;;
   *)
-    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers" >&2
+    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind" >&2
     exit 2 ;;
 esac
