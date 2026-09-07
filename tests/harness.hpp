@@ -738,18 +738,33 @@ inline void DeleteState(http::HttpClient& client, const std::string& base, const
 /// string RomM will compare against on every later negotiation, and only RomM
 /// can say what that is; `harness.content_hash` is where the two are compared.
 ///
+/// It takes `checks` for the reason `Partial` reads the session state before it
+/// completes one: this fails intermittently, and it used to say only "the MD5 of
+/// partial-2.srm". Two different things produce that -- an upload that never
+/// landed, and an upload that landed on a row RomM handed back with an empty
+/// `content_hash` -- and the message could not tell them apart, so #119 spent a
+/// 250-repetition run to learn which. It says so now: the row, and what came
+/// back in place of the digest.
 inline bool ServerMd5(::checks::Checks& checks, http::HttpClient& client, const std::string& base,
                       const Fixture& fixture, std::int64_t rom_id, const std::string& local_path,
                       std::string* out) {
-  (void)checks;
   Save scratch;
   if (!UploadSave(client, base, fixture, rom_id, UniqueSlot("harness-md5"), "harness-md5", local_path,
                   "harness-md5.srm", /*with_device=*/false, &scratch)) {
+    checks.Expect(false, "the harness could not upload the scratch save RomM computes the MD5 of");
     return false;
   }
   *out = scratch.content_hash;
   DeleteSave(client, base, fixture, scratch.id);
-  return out->size() == sync::kContentHashDigits;
+  if (out->size() != sync::kContentHashDigits) {
+    checks.Expect(false, "RomM returned save row " + std::to_string(scratch.id) + " (" +
+                             scratch.file_name + ", " +
+                             std::to_string(scratch.file_size_bytes) + " bytes) with content_hash " +
+                             "\"" + *out + "\" -- expected " +
+                             std::to_string(sync::kContentHashDigits) + " hex digits");
+    return false;
+  }
+  return true;
 }
 
 /// `2026-09-04T22:45:33.512340+00:00` -> a `sync::Timestamp`, whole seconds.
