@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "checks.hpp"
+#include "scratch.hpp"
 #include "rommsync/device_registration.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/token_store.hpp"
@@ -325,7 +326,7 @@ void States(checks::Checks& c) {
 }
 
 void Caching(checks::Checks& c) {
-  const std::string directory = std::string(ROMMSYNC_TEST_SCRATCH) + "/device-cache";
+  const std::string directory = scratch::Dir() + "/device-cache";
   std::error_code ignored;
   std::filesystem::remove_all(directory, ignored);
   std::filesystem::create_directories(directory, ignored);

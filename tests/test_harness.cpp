@@ -31,6 +31,8 @@
 // reasonable client would guess wrong, which are named at each scenario.
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -38,6 +40,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <unistd.h>  // getpid/getppid: the scratch scenario names both
 
 #include "harness.hpp"
 #include "rommsync/atomic_file.hpp"
@@ -129,6 +133,84 @@ class CapturedCerr {
 
 /// The name the scenarios that only want the silence have always used.
 using Quiet = CapturedCerr;
+
+// --- scratch ------------------------------------------------------------------
+//
+// The rule one level below the sandbox: the directory `rig::ScratchDir()` hands
+// out is this PROCESS's, so two `ctest` invocations against one build tree
+// cannot write each other's files (#151). Needs no server, for the same reason
+// `sandbox` does not -- it is a guarantee the suite rests on, and it has to stay
+// checked with docker stopped.
+//
+// The sweep is what makes that affordable: without it a leaf would survive every
+// test CTest killed on TIMEOUT. It deletes directories, so what it deletes is
+// pinned here, on a root of this scenario's own rather than the live one -- a
+// second `ctest` running this same scenario must not be able to see the debris
+// it plants.
+
+void ScratchScenario(rig::Checks& checks) {
+  const auto self = static_cast<long long>(::getpid());
+
+  checks.ExpectEq(std::filesystem::path(scratch::Dir()).filename().string(),
+                  scratch::LeafName(self), "the scratch leaf is named for this process");
+  checks.Expect(std::filesystem::is_directory(scratch::Dir()), "and it exists");
+
+  // 1. what the sweep removes ------------------------------------------------
+  const std::filesystem::path root = std::filesystem::path(scratch::Dir()) / "sweep";
+  const std::filesystem::path mine = root / scratch::LeafName(self);
+  // A pid above any a kernel hands out: `kill` answers ESRCH for it, which is
+  // the only answer that means the owner is gone.
+  const std::filesystem::path dead = root / scratch::LeafName(2147483646);
+  // Whatever started this process -- ctest, or a shell. Alive for the duration.
+  const std::filesystem::path live =
+      root / scratch::LeafName(static_cast<long long>(::getppid()));
+  const std::filesystem::path stranger = root / "captures";
+  const std::filesystem::path malformed = root / (std::string(scratch::kLeafPrefix) + "12x");
+
+  std::error_code ignored;
+  for (const std::filesystem::path& leaf : {mine, dead, live, stranger, malformed}) {
+    std::filesystem::create_directories(leaf, ignored);
+    checks.Expect(rig::WriteFile((leaf / "debris").string(), "left behind"),
+                  "planted " + leaf.filename().string());
+  }
+
+  scratch::Sweep(root, mine);
+
+  checks.Expect(!std::filesystem::exists(dead), "a leaf whose process is gone is swept");
+  checks.Expect(std::filesystem::exists(live), "one whose process is still running is not");
+  checks.Expect(std::filesystem::exists(mine), "nor is the caller's own");
+  checks.Expect(std::filesystem::exists(stranger), "nor is a directory that is not a leaf");
+  checks.Expect(std::filesystem::exists(malformed), "nor is a name that only looks like one");
+
+  // 2. and what keeps one from being removed at all ---------------------------
+  // `ROMMSYNC_KEEP_SANDBOX` keeps a tree that lives INSIDE the leaf, so it has
+  // to keep the leaf too or it keeps nothing. `scratch::Keep()` is what it asks
+  // with, and this is the destructor's decision made early against a stand-in.
+  const std::filesystem::path kept = root / "kept";
+  std::filesystem::create_directories(kept, ignored);
+  {
+    // Discard() announces a leaf it spares, and a green run should not.
+    Quiet quiet;
+    scratch::Keep();
+    scratch::detail::Discard(kept);
+  }
+  checks.Expect(std::filesystem::exists(kept), "Keep() spares a leaf on the way out");
+  checks.Expect(std::filesystem::exists(kept / scratch::detail::kKeepMarker),
+                "and marks it, so the NEXT process's sweep spares it too");
+
+  scratch::detail::Kept() = false;
+  // `ROMMSYNC_KEEP_SCRATCH` is the other half of `Keeping()`, and under it the
+  // rest of this cannot be asked -- the same reason `sandbox` stops asserting
+  // teardown under `ROMMSYNC_KEEP_SANDBOX`. A debugging switch may not turn a
+  // green suite red.
+  const char* keep_scratch = std::getenv("ROMMSYNC_KEEP_SCRATCH");
+  if (keep_scratch == nullptr || *keep_scratch == '\0') {
+    scratch::detail::Discard(kept);
+    checks.Expect(!std::filesystem::exists(kept), "and without it the leaf goes");
+  }
+
+  std::filesystem::remove_all(root, ignored);
+}
 
 // --- sandbox ------------------------------------------------------------------
 //
@@ -1612,13 +1694,18 @@ int main(int argc, char** argv) {
   // would print and the process would still exit 0. See `Sandbox`'s constructor.
   rig::Checks checks;
 
-  // The sandbox scenario is the harness's own guarantee and needs no server, so
-  // it runs with docker stopped -- which is when a broken sandbox is most likely
-  // to be introduced and least likely to be noticed.
-  if (scenario == "sandbox") {
-    SandboxScenario(checks);
+  // `sandbox` and `scratch` are the harness's own guarantees and need no server,
+  // so they run with docker stopped -- which is when a broken sandbox, or a
+  // scratch directory two processes share again, is most likely to be introduced
+  // and least likely to be noticed.
+  if (scenario == "sandbox" || scenario == "scratch") {
+    if (scenario == "sandbox") {
+      SandboxScenario(checks);
+    } else {
+      ScratchScenario(checks);
+    }
     if (checks.failures() == 0) {
-      std::cout << "harness.sandbox ok\n";
+      std::cout << "harness." << scenario << " ok\n";
     }
     return checks.failures() == 0 ? 0 : 1;
   }

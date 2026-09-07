@@ -46,8 +46,6 @@
 #include <thread>
 #include <vector>
 
-#include <unistd.h>  // getpid: one sandbox per process, and the suite is POSIX
-
 #include "rig.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/sync.hpp"
@@ -113,14 +111,13 @@ class Sandbox {
   /// count would copy the number out first and let this audit raise a failure
   /// into a value nobody reads -- printing FAIL and exiting 0.
   Sandbox(::checks::Checks& checks, std::string_view name) : checks_(&checks) {
-    // The build tree, not /tmp: three worktrees run this suite at once and a
-    // shared path would have them delete each other's sandboxes. The pid and a
-    // counter separate two sandboxes inside one process, which
-    // `ctest --repeat until-fail:N` produces.
+    // `rig::ScratchDir()` is already this process's own (tests/scratch.hpp), so
+    // what is left to separate is two sandboxes inside ONE process -- which a
+    // scenario that builds a second one, and `ctest --repeat until-fail:N`, both
+    // produce. That is the counter.
     static int serial = 0;
     root_ = std::filesystem::path(rig::ScratchDir()) / "sandbox" /
-            (std::string(name) + "-" + std::to_string(static_cast<long long>(::getpid())) + "-" +
-             std::to_string(serial++));
+            (std::string(name) + "-" + std::to_string(serial++));
     std::error_code error;
     std::filesystem::remove_all(root_, error);
     std::filesystem::create_directories(root_, error);
@@ -135,6 +132,9 @@ class Sandbox {
       Audit(*checks_);
     }
     if (const char* keep = std::getenv("ROMMSYNC_KEEP_SANDBOX"); keep != nullptr && *keep != '\0') {
+      // The scratch leaf this sits in is removed when the process exits
+      // (tests/scratch.hpp), which would take the kept tree with it.
+      scratch::Keep();
       std::cerr << "  sandbox kept at " << root_.string() << "\n";
       return;
     }

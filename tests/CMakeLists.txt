@@ -41,6 +41,11 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 # agent's `ctest` beside a review's `ctest` on the same worktree is two of them,
 # which is how #118 was found. Ownership is what makes that safe; serialising
 # could not have, and the comments here used to imply otherwise.
+#
+# The other half of that case was on disk rather than on the wire: one scratch
+# directory, fixed destination names, two processes (#151). It is fixed the same
+# way -- per process, in tests/scratch.hpp -- and held by `scratch.concurrent`,
+# which runs two `ctest`s at once because nothing inside one can see this.
 
 # --- unit tests: no external services ---------------------------------------
 add_executable(test_version test_version.cpp)
@@ -475,7 +480,9 @@ add_executable(test_rig_provisioned test_rig_provisioned.cpp)
 target_link_libraries(test_rig_provisioned PRIVATE rommsync::host)
 target_compile_definitions(test_rig_provisioned PRIVATE
   ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
-  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}"
+  # `scratch`, like every other target: this one never writes there, but the
+  # build tree itself is not a scratch directory and a sweep of it would be.
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
   ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
 
 add_test(NAME rig.provisioned COMMAND test_rig_provisioned)
@@ -487,9 +494,10 @@ set_tests_properties(rig.smoke PROPERTIES TIMEOUT 120)
 
 # --- the native HttpClient against the real rig ------------------------------
 # One CTest entry per scenario, selected by argv[1], so a red run names the
-# behaviour that broke. The scratch directory is per-build-tree, because three
+# behaviour that broke. The scratch directory is per build tree, because three
 # worktrees run these concurrently and a shared /tmp path would have them
-# overwrite each other's downloads.
+# overwrite each other's downloads -- and per process INSIDE that (#151, see
+# tests/scratch.hpp), because one build tree takes more than one `ctest`.
 add_executable(test_http_native test_http_native.cpp)
 target_link_libraries(test_http_native PRIVATE rommsync::host)
 target_compile_definitions(test_http_native PRIVATE
@@ -531,6 +539,37 @@ foreach(scenario IN LISTS HTTP_SCENARIOS)
   # to the client that armed it.
   set_tests_properties(http.${scenario} PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 endforeach()
+
+# --- and the same build tree under two `ctest`s at once ----------------------
+# M0-2 (#151). `http.download` is the shape that broke: a fixed destination name
+# in a directory every process shares, so the local loop's `ctest` and the
+# review's `ctest` removed and renamed each other's `download.bin.part`.
+# RUN_SERIAL cannot reach this -- it orders tests within ONE invocation (see the
+# top of this file) -- so the fix is in tests/scratch.hpp, and this is what holds
+# it. `harness.scratch` pins the same rule without a server.
+#
+# It runs `ctest` recursively, which is the case itself rather than a model of
+# it. The anchored regex is what keeps that from including this test.
+find_program(BASH_PROGRAM bash REQUIRED)
+set(SCRATCH_CONCURRENT_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_scratch_concurrent.sh")
+# Which scenarios, and why these: each writes a fixed name into the scratch
+# directory, which is the mechanism, and each is READ-ONLY against RomM -- a GET
+# plus, since #118, a fault only its own client can claim. That second condition
+# is the load-bearing one, because the two invocations run at the same time
+# against one fixture: adding `post_form` or `multipart` here would put two
+# writers on the one fixture device and two logins against the rate limit. Cost
+# is the third filter -- `stall` and `cancel` take seconds, `progress` moves
+# 120 MiB -- and it is the only one that is merely a preference.
+add_test(NAME scratch.concurrent
+         COMMAND "${BASH_PROGRAM}" "${SCRATCH_CONCURRENT_TEST}"
+                 "${CMAKE_CTEST_COMMAND}" "${CMAKE_BINARY_DIR}"
+                 "^http\\.(download|range|drop|resume|truncate|not_found)$")
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(scratch.concurrent PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+# RUN_SERIAL because the two invocations it starts are already two rig clients,
+# and nothing else may be a third.
+set_tests_properties(scratch.concurrent PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 
 # --- the console's HttpClient against the same rig ---------------------------
 # M1-7 (#126). The Horizon backend is split so that the half that can be got
@@ -928,6 +967,14 @@ target_compile_definitions(test_harness PRIVATE
 add_test(NAME harness.sandbox COMMAND test_harness sandbox)
 set_tests_properties(harness.sandbox PROPERTIES TIMEOUT 60)
 
+# `harness.scratch` is not skippable either, and for the same reason: the
+# per-process scratch directory (#151) is what keeps two `ctest` invocations off
+# each other's files, and the sweep that keeps it affordable deletes directories.
+# `scratch.concurrent` proves the rule over two real invocations and needs RomM;
+# this one pins which leaves the sweep removes, and needs nothing.
+add_test(NAME harness.scratch COMMAND test_harness scratch)
+set_tests_properties(harness.scratch PROPERTIES TIMEOUT 60)
+
 set(HARNESS_SCENARIOS
   disarms         # an armed fault cannot outlive the scope that armed it
   fault_owner     # ...and belongs to the client that armed it, not to the proxy (#118)
@@ -1314,8 +1361,8 @@ set_tests_properties(contract.captures PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 # --- worktree environment: the `romm` tab in orca.yaml -----------------------
 # Shell, not C++, because the thing under test is a shell script. Splitting the
 # two phases keeps the regression (`waits`) meaningful with Docker stopped --
-# only `follows` needs the rig, so only it can skip.
-find_program(BASH_PROGRAM bash REQUIRED)
+# only `follows` needs the rig, so only it can skip. BASH_PROGRAM is found above,
+# for scratch.concurrent.
 set(ROMM_TAB_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_romm_tab.sh")
 
 add_test(NAME orca.romm_tab_waits COMMAND "${BASH_PROGRAM}" "${ROMM_TAB_TEST}" wait)
@@ -1909,9 +1956,10 @@ foreach(scenario IN LISTS DOWNLOAD_RIG_SCENARIOS)
     set_tests_properties(download.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
   endif()
   # RUN_SERIAL for the reason every rig test has it (see the top of this file):
-  # these download the shared fixture's roms, and they download them into one
-  # scratch directory under fixed names, so two at once read each other's
-  # half-written files (#151).
+  # these download the shared fixture's roms, and a second one at once reads and
+  # deletes the saves and queue entries this one is asserting on. Not the scratch
+  # directory -- these drive `harness::Sandbox`, which was per process before
+  # #151 and is not what that issue was about.
   set_tests_properties(download.${scenario} PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
 endforeach()
 

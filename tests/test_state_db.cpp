@@ -20,6 +20,7 @@
 #include <system_error>
 
 #include "checks.hpp"
+#include "scratch.hpp"
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/md5.hpp"
 #include "rommsync/state_db.hpp"
@@ -38,7 +39,7 @@ namespace state = rommsync::state;
 namespace sync = rommsync::sync;
 
 std::filesystem::path ScratchDir() {
-  const std::filesystem::path dir = std::filesystem::path(ROMMSYNC_TEST_SCRATCH) / "state_db";
+  const std::filesystem::path dir = std::filesystem::path(scratch::Dir()) / "state_db";
   std::filesystem::create_directories(dir);
   return dir;
 }

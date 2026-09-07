@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "checks.hpp"
+#include "scratch.hpp"
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/log.hpp"
 #include "rommsync/pairing.hpp"
@@ -35,7 +36,7 @@ namespace io = rommsync::io;
 namespace {
 
 std::filesystem::path ScratchDir() {
-  const std::filesystem::path dir = std::filesystem::path(ROMMSYNC_TEST_SCRATCH) / "token_store";
+  const std::filesystem::path dir = std::filesystem::path(scratch::Dir()) / "token_store";
   std::filesystem::create_directories(dir);
   return dir;
 }
