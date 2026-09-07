@@ -605,8 +605,8 @@ phase_history() {
 phase_procedure() {
   local gate="$REPO_ROOT/.github/scripts/merge_gate.py"
   local guide="$REPO_ROOT/docs/DEVELOPMENT.md"
-  [ -f "$gate" ] || fail "no $gate -- the merge gate moved, and the guide below
-is written against where it used to be"
+  [ -f "$gate" ] || fail "no $gate -- the merge gate moved, and
+docs/DEVELOPMENT.md#releases is written against where it used to be"
   [ -f "$guide" ] || fail "no $guide"
 
   # The needle of each LOCAL_PASSES entry: the first quoted string on a line
@@ -621,6 +621,20 @@ is written against where it used to be"
 The constant moved or changed shape, and this phase would otherwise pass by
 asserting nothing at all."
 
+  # ...and ALL of them, not just the ones that happen to be shaped the way the
+  # sed above expects. A third entry whose needle sat on a continuation line --
+  # entry two already wraps its second element, so a formatter reaching the line
+  # width is all it would take -- yields no needle and no error, and this phase
+  # would go on passing while the guide stayed silent about a pass the gate had
+  # started demanding. An empty result is not the only way to assert nothing.
+  local declared extracted
+  declared="$(sed -n '/^LOCAL_PASSES = (/,/^)/p' "$gate" | grep -c '^    (')"
+  extracted="$(printf '%s\n' "$needles" | grep -c .)"
+  [ "$declared" = "$extracted" ] || fail "LOCAL_PASSES declares $declared \
+entries and only $extracted needle(s) could be read out of them. One of them is
+written in a shape this phase cannot see, so the guide is being checked against
+some of what the gate requires rather than all of it."
+
   # Scoped to the section that documents the procedure. `/code-review` somewhere
   # else in the guide -- and it is in CLAUDE.md and in the agent brief already --
   # says nothing about whether a maintainer cutting a release is told about it.
@@ -632,7 +646,6 @@ asserting nothing at all."
 
   local needle
   while IFS= read -r needle; do
-    [ -n "$needle" ] || continue
     printf '%s\n' "$section" | grep -qF -- "$needle" || fail \
 "docs/DEVELOPMENT.md#releases never tells a maintainer that the VERSION bump's
 pull request has to show '$needle' in its body. merge_gate.py requires it of
@@ -640,6 +653,26 @@ every pull request, with no exemption for a release or for whoever opened it, so
 the procedure as written walks into a red required check on the one pull request
 that is only ever opened while a release is being cut."
   done <<<"$needles"
+
+  # The other half of it. The bullet above can say everything correct about the
+  # gate while the code block three lines up still hands a maintainer the one
+  # command that defeats it -- and a maintainer follows the block, not the
+  # prose. Scoped to what is inside the fences, and with comments stripped:
+  # both the bullet and the block's own annotation name `--fill` deliberately,
+  # to say what it does and why it is not there. What may not come back is a
+  # command that runs it.
+  local commands
+  commands="$(printf '%s\n' "$section" \
+              | awk '/^```/ { in_b = !in_b; next } in_b' \
+              | sed 's/#.*//')"
+  [ -n "$commands" ] || fail "the '## Releases' section of $guide has no fenced
+command block any more. The assertion below reads it, so this phase would pass
+by looking at nothing."
+  printf '%s\n' "$commands" | grep -q -- '--fill' && fail \
+"the release procedure's command block still runs \`gh pr create --fill\`. That
+fills the pull request body from the commit message, so the body carries neither
+local review pass and \`merge-gate\` -- a required check on main, with no
+exemption for a release -- comes back red on it."
 
   echo "ok: the release procedure quotes what merge-gate will require of its PR"
 }

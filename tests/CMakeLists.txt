@@ -1584,12 +1584,16 @@ set_tests_properties(release.compatibility PROPERTIES TIMEOUT 60)
 # The half of the release path that is not a script: the procedure a person
 # follows. The `VERSION` bump is an ordinary pull request, so it meets the
 # ordinary required check -- `merge-gate` refuses a body that does not show both
-# local review passes, for a release exactly as for anything else -- and
-# `gh pr create --fill`, which the guide's own code block hands a maintainer,
-# produces a body carrying neither phrase. This holds docs/DEVELOPMENT.md's
-# "Releases" section against merge_gate.py's own LOCAL_PASSES, so a renamed pass
-# turns the guide red rather than leaving it asking for something the gate no
-# longer accepts.
+# local review passes, for a release exactly as for anything else -- and the
+# `--fill` the guide's own code block used to hand a maintainer produces a body
+# carrying neither phrase.
+#
+# Both halves are held: the "Releases" section of docs/DEVELOPMENT.md quotes
+# every needle in merge_gate.py's own LOCAL_PASSES, so a renamed pass turns the
+# guide red rather than leaving it asking for something the gate no longer
+# accepts; and the section's command block may not go back to filling the body
+# from the commit message, which a bullet saying the right thing three lines
+# above would not stop -- a maintainer follows the block.
 add_test(NAME release.procedure
          COMMAND "${BASH_PROGRAM}" "${RELEASE_TEST}" procedure)
 set_tests_properties(release.procedure PROPERTIES TIMEOUT 60)
