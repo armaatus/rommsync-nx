@@ -1308,6 +1308,7 @@ foreach(phase opens reuses foreign no_romm submits no_draft unstable
               await_reports_the_independent_review_on_this_head
               await_judges_the_head_github_has
               await_never_hands_back_the_same_review_twice
+              await_stops_when_the_gate_will_not_import
               review_status_says_a_human_merges_this_one
               review_status_names_the_wedge
               review_status_waits_for_the_run_in_flight

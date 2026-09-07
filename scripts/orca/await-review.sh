@@ -81,11 +81,16 @@ round=$((round + 1))
 # three CI timeouts in a row must not exhaust the cap without a single finding
 # having been seen.
 #
-# `$stamp` is written by the Python block: the head it judged and the newest
-# review it handed back, so the next round can tell a re-review from the one it
-# has already acted on.
+# `$stamp` is written by the Python block, one field per line: the head it judged
+# and the newest review it handed back, so the next round can tell a re-review
+# from the one it has already acted on. Read back as two lines and printed as two
+# fields rather than splicing the file in whole -- a null `submittedAt` would
+# otherwise collapse the line to three fields, `read` would leave `seen_stamp`
+# empty, and the dedupe would silently switch itself off.
 record_round() {
-  printf '%s %s %s\n' "$pr" "$round" "$(cat "$stamp" 2>/dev/null)" >"$ROUNDS_FILE"
+  local stamp_head="" stamp_at=""
+  { IFS= read -r stamp_head; IFS= read -r stamp_at; } <"$stamp" 2>/dev/null || true
+  printf '%s %s %s %s\n' "$pr" "$round" "$stamp_head" "$stamp_at" >"$ROUNDS_FILE"
 }
 
 if [ "$round" -gt "$MAX_ROUNDS" ]; then
@@ -118,16 +123,19 @@ owner="$orca_owner"; name="$orca_repo_name"
 echo "round $round of $MAX_ROUNDS -- waiting for a review on PR #$pr, on its current head"
 echo "  (polling every ${POLL_SECONDS}s; stop everything with ./scripts/orca/stop.sh)"
 
-payload="$(mktemp)"; reviews_out="$(mktemp)"; stamp="$(mktemp)"
-trap 'rm -f "$payload" "$reviews_out" "$stamp"' EXIT
+payload="$(mktemp)"; reviews_out="$(mktemp)"; stamp="$(mktemp)"; notes="$(mktemp)"
+trap 'rm -f "$payload" "$reviews_out" "$stamp" "$notes"' EXIT
 waited=0
 checks_due=0
 broken_before=""
-# Set when a poll saw review records on this head that none of the gate rules
-# count, and when the only ones that DO count were already handed back in an
-# earlier round. Only ever read by the timeout message below.
-discounted=""
-already_seen=""
+# What the last poll worked out and said. Every reason this wait continues rather
+# than ending is printed the poll it is discovered, not saved for the timeout
+# forty-five minutes later: the agent can act on "the review you already read is
+# the only one here" immediately, and cannot act on it at all once it has paid
+# the deadline. Kept so the same sentence is not repeated on all ninety polls,
+# and compared by CONTENT so a reason that changes -- the head moved under the
+# wait -- is said again.
+notes_shown=""
 # Set from the rollup inside the throttled block below; declared here so a poll
 # that skips the block still has a value under `set -u`.
 review_dead=""
@@ -356,6 +364,7 @@ query($owner:String!,$name:String!,$pr:Int!){
     }
   }
 }' >"$payload" 2>/dev/null; then
+    reviews_call_failed=""
     # Its output goes to a file rather than into `$(...)`, and that is not
     # style. bash 3.2 -- which macOS still ships, and which this repo therefore
     # has to parse under -- tracks single quotes while scanning for the closing
@@ -363,40 +372,54 @@ query($owner:String!,$name:String!,$pr:Int!){
     # in a comment inside the block below is enough to make the whole script a
     # syntax error, and the message it gives names neither the line nor the
     # quote. Outside `$(...)` the heredoc is just a heredoc.
-    python3 - "$payload" "$head" "$seen_head" "$seen_stamp" "$stamp" \
+    python3 - "$payload" "$head" "$seen_head" "$seen_stamp" "$stamp" "$notes" \
       >"$reviews_out" <<'PY'
 import json, sys
+
+path, local_head, seen_head, seen_stamp, stamp_path, notes_path = sys.argv[1:7]
+
+# Every reason this poll did not end the wait, for the caller to print once. A
+# reason discovered on poll 1 and said only at the deadline is a reason the agent
+# could not act on.
+notes = []
+
+
+def stop(code):
+    with open(notes_path, "w") as fh:
+        fh.write("".join(n + "\n" for n in notes))
+    raise SystemExit(code)
+
 
 sys.path.insert(0, ".github/scripts")
 try:
     from merge_gate import independent_reviews, is_substantive
 except Exception as exc:  # missing, half-edited, or broken at import time
-    # Not ImportError alone: merge_gate.py is a file agents in this repo edit,
-    # and a SyntaxError in it must not read as "no review yet" for the rest of a
-    # 45-minute wait. Said once per poll on stderr and then waited out, because
-    # there is nothing here that could answer instead.
-    print(f"  note: could not load .github/scripts/merge_gate.py ({exc}), which "
-          "decides what counts as a review. Nothing can end this wait until it "
-          "imports.", file=sys.stderr)
-    raise SystemExit(1)
-
-path, local_head, seen_head, seen_stamp, stamp_path = sys.argv[1:6]
+    # Not ImportError alone: merge_gate.py is a file agents in this repo edit --
+    # this very PR edits it -- and a SyntaxError in it must not read as "no
+    # review yet". Its own exit code, because nothing here can end the wait until
+    # it imports and waiting out the deadline would then blame the review job for
+    # a purely local cause. review-status.sh treats the same condition the same
+    # way, as "could not tell".
+    notes.append(f"could not load .github/scripts/merge_gate.py ({exc}), which "
+                 "decides what counts as a review. Nothing here can answer "
+                 "without it.")
+    stop(5)
 try:
     pull = json.load(open(path))["data"]["repository"]["pullRequest"] or {}
 except Exception:
-    raise SystemExit(1)
+    stop(1)
 
 head = pull.get("headRefOid") or ""
 if not head:
-    raise SystemExit(1)
+    stop(1)
 if head != local_head:
     # Not fatal: the head GitHub reports is still the one being reviewed and
     # the one merge-gate will judge. But an agent that forgot to push is
     # waiting for a review of code it did not send, and nothing else here
     # would ever say so.
-    print(f"  note: this worktree is on {local_head[:8]} and the PR's head is "
-          f"{head[:8]} -- there is something unpushed. The review being waited "
-          "for is of what GitHub has.", file=sys.stderr)
+    notes.append(f"this worktree is on {local_head[:8]} and the PR's head is "
+                 f"{head[:8]} -- there is something unpushed. The review being "
+                 "waited for is of what GitHub has.")
 
 # The rules the gate itself uses, imported rather than paraphrased: not by the
 # PR author, on this head, and carrying something to act on.
@@ -414,33 +437,59 @@ reviews = [r for r in on_head if is_substantive(r)]
 if reviews and seen_head == head and seen_stamp:
     unseen = [r for r in reviews if (r.get("submittedAt") or "") > seen_stamp]
     if not unseen:
-        raise SystemExit(4)
+        notes.append(
+            "the only review on this head is the one an earlier round already "
+            "handed back, so this is waiting for a NEW one rather than "
+            "reporting the same findings twice and spending a second round on "
+            "them. Nothing left to fix on it? Then the next step is "
+            "./scripts/orca/review-status.sh, not another wait. Something left? "
+            "Push the fix -- the push re-runs the reviewer.")
+        stop(1)
     reviews = unseen
 
-if reviews:
-    with open(stamp_path, "w") as fh:
-        fh.write("%s %s" % (head, reviews[-1].get("submittedAt") or ""))
 if not reviews:
-    # 3 rather than 1 when review RECORDS exist on this head and none of them
-    # counted. Nothing to act on either way, so the wait continues -- but a
-    # timeout after this has a real reason to give, and "nothing arrived" would
-    # be the wrong one. Counted from every record on the head, the PR's own
-    # author included, because the record an agent most often mistakes for a
-    # review is the one its own thread reply created.
+    # Counted from every record on the head, the PR's own author included,
+    # because the record an agent most often mistakes for a review is the one
+    # its own thread reply created. Said now rather than at the deadline: this
+    # is a real answer, and "nothing arrived" would be the wrong one.
     records = [r for r in ((pull.get("reviews") or {}).get("nodes") or [])
                if ((r.get("commit") or {}).get("oid") == head)]
-    raise SystemExit(3 if records else 1)
+    if records:
+        notes.append(
+            "review records were submitted against this head, and none of them "
+            "is a review merge-gate would count: a record by the PR's own "
+            "author (every reply to a review thread creates one), or one with "
+            "no body worth reading and no inline comment. Handing one back "
+            "would spend a round and leave merge-gate refusing the PR for the "
+            "reason this had just called satisfied.")
+    stop(1)
+
+with open(stamp_path, "w") as fh:
+    fh.write("%s\n%s\n" % (head, reviews[-1].get("submittedAt") or ""))
 for r in reviews:
     who = (r.get("author") or {}).get("login", "?")
     print(f"--- {r.get('state')} by {who} at {r.get('submittedAt')}")
     print(r.get("body") or "(no body; see the inline comments)")
     print()
+stop(0)
 PY
     verdict=$?
-    # 3 is "records on this head, none of them a review" -- remembered for the
-    # timeout message rather than repeated on all ninety polls.
-    [ "$verdict" = 3 ] && discounted=1
-    [ "$verdict" = 4 ] && already_seen=1
+
+    # Whatever this poll worked out, said the poll it was worked out, and only
+    # when it is not the sentence already on screen.
+    if [ -s "$notes" ] && [ "$(cat "$notes")" != "$notes_shown" ]; then
+      sed 's/^/  note: /' "$notes" >&2
+      notes_shown="$(cat "$notes")"
+    fi
+
+    # 5 is a merge_gate.py that will not import. Nothing here can end the wait
+    # until it does, so this is "could not tell" rather than 45 minutes of
+    # polling followed by a message blaming the review job.
+    if [ "$verdict" = 5 ]; then
+      echo "Fix that, then run this again." >&2
+      exit 2
+    fi
+
     if [ "$verdict" = 0 ]; then
       echo
       cat "$reviews_out"
@@ -453,8 +502,33 @@ PY
       echo "rather than ignoring it. Resolve every thread, push, and re-request review"
       echo "-- the push itself re-runs the reviewer. Then:"
       echo "  ./scripts/orca/review-status.sh $pr"
-      record_round
+      # The round cap counts rounds of DISAGREEMENT. A review of a head this
+      # worktree has already moved past is not one: the agent will push what it
+      # has, the reviewer will run again, and that answer is the round. Spending
+      # one here would leave two for the whole conversation.
+      pr_head="$(sed -n 1p "$stamp")"
+      if [ "$pr_head" = "$head" ]; then
+        record_round
+      else
+        echo
+        echo "Not counted as one of the $MAX_ROUNDS rounds: the PR is on ${pr_head:0:8} and"
+        echo "this worktree is on ${head:0:8}, so the review above answers code you have"
+        echo "already changed. Push, and the reviewer runs again on what you sent."
+      fi
       exit 0
+    fi
+  else
+    # The one call in this loop that can end it, and it was silent when it
+    # failed: a secondary rate limit or a token that lost `repo` scope mid-wait
+    # made every poll fail, the payload was never written, and the wait reported
+    # at 45 minutes that no review had arrived while one sat on the PR the whole
+    # time. Exactly what `rollup_warned` above exists to prevent, so it is said
+    # here the same way -- once.
+    if [ -z "${reviews_call_failed:-}" ]; then
+      reviews_call_failed=1
+      echo "  note: the reviews query for PR #$pr is failing -- nothing here can see a" >&2
+      echo "  review while that lasts. Run it by hand to see the error this loop discards:" >&2
+      echo "    gh api graphql -F owner=$owner -F name=$name -F pr=$pr -f query='{__typename}'" >&2
     fi
   fi
 
@@ -471,22 +545,11 @@ broken review looks like a green run with no comments. Check:
   gh run list --branch $(git rev-parse --abbrev-ref HEAD) --limit 5
 and whether CLAUDE_CODE_OAUTH_TOKEN is set as a repository secret.
 TIMEOUT
-if [ -n "$already_seen" ]; then
-  cat <<SEEN
-The only review on this head is the one an earlier round already handed back, so
-this waited for a NEW one rather than reporting the same findings twice and
-spending a second round on them. If there is nothing left to fix on it, the next
-step is ./scripts/orca/review-status.sh, not another wait; if there is, push the
-fix -- the push re-runs the reviewer.
-SEEN
-fi
-if [ -n "$discounted" ]; then
-  cat <<DISCOUNTED
-Review RECORDS were submitted against this head, and none of them is a review
-merge-gate would count: a record by the PR's own author (every reply to a review
-thread creates one), or one with no body worth reading and no inline comment.
-This waited rather than handing one back, because merge-gate would have refused
-the PR straight afterwards for the reason the wait had just called satisfied.
-DISCOUNTED
+if [ -n "$notes_shown" ]; then
+  cat <<NOTED
+
+...and this wait already said why, above:
+$(printf '%s\n' "$notes_shown" | sed 's/^/  /')
+NOTED
 fi
 exit 4

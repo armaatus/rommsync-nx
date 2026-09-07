@@ -219,10 +219,10 @@ run_review_status() {
 # it carries the gate as well as the script, because await-review.sh asks
 # merge_gate.py who counts as a reviewer rather than deciding it again.
 #
-# The gh stub answers BOTH shapes of the reviews question -- the GraphQL one
-# that can see `commit` and `author`, and the older `gh pr view --json reviews`
-# that cannot -- so a phase describes one pull request and the assertion holds
-# whichever call the script makes.
+# The reviews come back through GraphQL, which is the only shape that can report
+# the commit a review was submitted against and the PR's own author to compare a
+# reviewer with. The `gh pr view` the stub still answers is the check rollup, not
+# the reviews.
 AW_PR=114
 make_await_fixture() {
   make_fixture
@@ -238,7 +238,6 @@ case "$*" in
   *statusCheckRollup*) printf '{"statusCheckRollup":[{"name":"host-tests","conclusion":"SUCCESS"}],"mergeStateStatus":"CLEAN","baseRefName":"main"}\n' ;;
   *graphql*)           cat "$AW_FIXTURE/graphql.json" ;;
   *"run list"*)        printf '\n' ;;
-  *"pr view"*)         cat "$AW_FIXTURE/prview.json" ;;
   *"/comments"*)       printf '[]\n' ;;
   *)                   printf '\n' ;;
 esac
@@ -254,11 +253,6 @@ GHSTUB
 
 # The reviews on the fixture PR, in $1, as GraphQL review nodes. The PR's own
 # author is `armaatus`, as it is on every PR the fleet opens.
-#
-# Written twice: once in the GraphQL shape, and once flattened into the
-# `gh pr view --json reviews` shape, which reports neither `commit` nor the
-# review author -- it is what the script used to read, and what made every one
-# of these filters unenforceable.
 write_await_reviews() {
   cat >"$TMPDIR_FIXTURE/graphql.json" <<JSON
 {"data":{"repository":{"pullRequest":{
@@ -267,12 +261,6 @@ write_await_reviews() {
   "reviews":{"nodes":[$1]}
 }}}}
 JSON
-  python3 - "$TMPDIR_FIXTURE/graphql.json" "$TMPDIR_FIXTURE/prview.json" <<'FLATTEN'
-import json, sys
-pull = json.load(open(sys.argv[1]))["data"]["repository"]["pullRequest"]
-json.dump({"reviews": pull["reviews"]["nodes"], "reviewDecision": "COMMENTED"},
-          open(sys.argv[2], "w"))
-FLATTEN
 }
 
 run_await_review() {
@@ -694,6 +682,11 @@ JSON
     # branch under test, and the failure blames the feature rather than the
     # fixture. Found in review of this PR.
     cp "$REPO_ROOT"/scripts/orca/{await-review.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    # The gate comes too: await-review.sh imports it to decide what counts as a
+    # review, and a worktree without it is one where nothing can, which is its
+    # own exit. A fixture missing it would test that instead of the branch named.
+    mkdir -p "$TMPDIR_FIXTURE/.github/scripts"
+    cp "$REPO_ROOT/.github/scripts/merge_gate.py" "$TMPDIR_FIXTURE/.github/scripts/"
     stub="$TMPDIR_FIXTURE/stub-bin"
     mkdir -p "$stub"
     cat >"$stub/gh" <<'GHSTUB'
@@ -744,6 +737,11 @@ GHSTUB
     # exactly as gh would.
     make_fixture
     cp "$REPO_ROOT"/scripts/orca/{await-review.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    # The gate comes too: await-review.sh imports it to decide what counts as a
+    # review, and a worktree without it is one where nothing can, which is its
+    # own exit. A fixture missing it would test that instead of the branch named.
+    mkdir -p "$TMPDIR_FIXTURE/.github/scripts"
+    cp "$REPO_ROOT/.github/scripts/merge_gate.py" "$TMPDIR_FIXTURE/.github/scripts/"
     stub="$TMPDIR_FIXTURE/stub-bin"
     mkdir -p "$stub"
     cat >"$stub/gh" <<'GHSTUB'
@@ -802,6 +800,11 @@ GHSTUB
     # correctly still true.
     make_fixture
     cp "$REPO_ROOT"/scripts/orca/{await-review.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    # The gate comes too: await-review.sh imports it to decide what counts as a
+    # review, and a worktree without it is one where nothing can, which is its
+    # own exit. A fixture missing it would test that instead of the branch named.
+    mkdir -p "$TMPDIR_FIXTURE/.github/scripts"
+    cp "$REPO_ROOT/.github/scripts/merge_gate.py" "$TMPDIR_FIXTURE/.github/scripts/"
     stub="$TMPDIR_FIXTURE/stub-bin"
     mkdir -p "$stub"
     cat >"$stub/gh" <<'GHSTUB'
@@ -843,6 +846,11 @@ GHSTUB
     # then reports the wrong thing.
     make_fixture
     cp "$REPO_ROOT"/scripts/orca/{await-review.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    # The gate comes too: await-review.sh imports it to decide what counts as a
+    # review, and a worktree without it is one where nothing can, which is its
+    # own exit. A fixture missing it would test that instead of the branch named.
+    mkdir -p "$TMPDIR_FIXTURE/.github/scripts"
+    cp "$REPO_ROOT/.github/scripts/merge_gate.py" "$TMPDIR_FIXTURE/.github/scripts/"
     stub="$TMPDIR_FIXTURE/stub-bin"; mkdir -p "$stub"
     cat >"$stub/gh" <<'GHSTUB'
 #!/usr/bin/env bash
@@ -886,6 +894,11 @@ GHSTUB
     # made it exit.
     make_fixture
     cp "$REPO_ROOT"/scripts/orca/{await-review.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    # The gate comes too: await-review.sh imports it to decide what counts as a
+    # review, and a worktree without it is one where nothing can, which is its
+    # own exit. A fixture missing it would test that instead of the branch named.
+    mkdir -p "$TMPDIR_FIXTURE/.github/scripts"
+    cp "$REPO_ROOT/.github/scripts/merge_gate.py" "$TMPDIR_FIXTURE/.github/scripts/"
     stub="$TMPDIR_FIXTURE/stub-bin"; mkdir -p "$stub"
     cat >"$stub/gh" <<'GHSTUB'
 #!/usr/bin/env bash
@@ -1274,6 +1287,11 @@ $step4"
     # rollup says the review check is dead.
     make_fixture
     cp "$REPO_ROOT"/scripts/orca/{await-review.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    # The gate comes too: await-review.sh imports it to decide what counts as a
+    # review, and a worktree without it is one where nothing can, which is its
+    # own exit. A fixture missing it would test that instead of the branch named.
+    mkdir -p "$TMPDIR_FIXTURE/.github/scripts"
+    cp "$REPO_ROOT/.github/scripts/merge_gate.py" "$TMPDIR_FIXTURE/.github/scripts/"
     stub="$TMPDIR_FIXTURE/stub-bin"
     mkdir -p "$stub"
     cat >"$stub/gh" <<'GHSTUB'
@@ -1325,6 +1343,11 @@ GHSTUB
     # said the review had recovered.
     make_fixture
     cp "$REPO_ROOT"/scripts/orca/{await-review.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    # The gate comes too: await-review.sh imports it to decide what counts as a
+    # review, and a worktree without it is one where nothing can, which is its
+    # own exit. A fixture missing it would test that instead of the branch named.
+    mkdir -p "$TMPDIR_FIXTURE/.github/scripts"
+    cp "$REPO_ROOT/.github/scripts/merge_gate.py" "$TMPDIR_FIXTURE/.github/scripts/"
     stub="$TMPDIR_FIXTURE/stub-bin"
     mkdir -p "$stub"
     cat >"$stub/gh" <<'GHSTUB'
@@ -1413,11 +1436,11 @@ GHSTUB
     # that was never a review is a round the real disagreement does not get.
     [ ! -f "$TMPDIR_FIXTURE/.orca/review-rounds" ] \
       || fail "burned a review round on a review the gate does not count: $(cat "$TMPDIR_FIXTURE/.orca/review-rounds")"
-    # And the timeout gives the real reason. "No review arrived" is true and
-    # useless here -- three records did arrive, and an agent told only that
-    # goes looking at the review workflow instead of at what it discounted.
+    # And it says so, rather than reporting plain silence -- three records did
+    # arrive, and an agent told only "no review arrived" goes looking at the
+    # review workflow instead of at what was discounted.
     grep -q "none of them is a review" <<<"$out" \
-      || fail "timed out on records that did not count and reported plain silence: $out"
+      || fail "discounted three records and reported plain silence: $out"
     echo "PASS: await-review counts a review the way merge_gate.py does"
     ;;
 
@@ -1446,6 +1469,31 @@ GHSTUB
     grep -q "114 1" "$TMPDIR_FIXTURE/.orca/review-rounds" \
       || fail "read a review without counting the round; the cap of three stops bounding anything: $(cat "$TMPDIR_FIXTURE/.orca/review-rounds" 2>&1)"
     echo "PASS: a real independent review on this head still ends the wait"
+    ;;
+
+  await_stops_when_the_gate_will_not_import)
+    # Now that merge_gate.py decides what counts, a merge_gate.py that will not
+    # import decides that NOTHING counts -- and that is indistinguishable from
+    # "no review yet" unless it is said. merge_gate.py is a file agents in this
+    # repo edit; a half-finished edit or a rename of one of these two functions
+    # would otherwise cost the full 45-minute deadline and then blame the review
+    # job, which is a GitHub Actions problem the agent would go and look for.
+    #
+    # review-status.sh answers the same condition with exit 2, "could not tell".
+    # So does this, immediately.
+    make_await_fixture
+    write_await_reviews \
+      '{"state":"CHANGES_REQUESTED","submittedAt":"2099-01-01T03:00:00Z",
+        "commit":{"oid":"'"$AW_PR_HEAD"'"},"author":{"login":"claude"},
+        "body":"A real review that will never be seen while the gate is broken.",
+        "comments":{"totalCount":1}}'
+    printf 'def independent_reviews(\n' >"$TMPDIR_FIXTURE/.github/scripts/merge_gate.py"
+    out="$(run_await_review 12)"; rc=$?
+    [ "$rc" = 2 ] \
+      || fail "a merge_gate.py that will not import read as 'no review yet' (exit $rc); the wait would cost its whole deadline and then blame the review job: $out"
+    grep -q "merge_gate.py" <<<"$out" \
+      || fail "did not name the file that has to import before anything here can answer: $out"
+    echo "PASS: a gate that will not import is 'could not tell', not silence"
     ;;
 
   await_never_hands_back_the_same_review_twice)
@@ -1519,7 +1567,14 @@ GHSTUB
       || fail "judged the worktree head rather than the PR head, so a review merge-gate counts was invisible (exit $rc): $out"
     grep -q "something unpushed" <<<"$out" \
       || fail "the worktree is on a commit the PR does not have and nothing said so: $out"
-    echo "PASS: the head judged is the PR head, and a divergence is named"
+    # And it must not spend a round. The review answers code this worktree has
+    # already moved past; the round is the answer to what gets pushed next, and
+    # there are only three.
+    [ ! -f "$TMPDIR_FIXTURE/.orca/review-rounds" ] \
+      || fail "spent a review round on a review of a commit this worktree has already superseded: $(cat "$TMPDIR_FIXTURE/.orca/review-rounds")"
+    grep -q "Not counted as one of the" <<<"$out" \
+      || fail "did not say the round was not counted, so the agent cannot tell how many it has left: $out"
+    echo "PASS: the head judged is the PR head, a divergence is named, and no round is spent"
     ;;
 
   review_status_matches_the_gate_on_a_thread_reply)
