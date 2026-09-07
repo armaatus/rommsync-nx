@@ -21,6 +21,7 @@
 #include "rommsync/md5.hpp"
 #include "rommsync/rom_index.hpp"
 #include "rommsync/sha1.hpp"
+#include "rommsync/sync.hpp"
 
 namespace rommsync::download {
 namespace {
@@ -977,6 +978,18 @@ json::Error ParseRomDetail(std::string_view body, RomDetail* out) {
     return document.error;
   }
 
+  // The shape `json::Reader::Fail` produces, for the checks made by hand beside
+  // it. `message` carries no `field ...:` prefix of its own -- `Error::Describe`
+  // adds one, and this string reaches a user through `QueueEntry::message`, so a
+  // second copy of it reads as a stutter. Never quotes a value either: a body
+  // being refused here may still be carrying a token (json.hpp).
+  const auto refuse = [](std::string_view field, std::string_view what) {
+    json::Error error;
+    error.field = std::string(field);
+    error.message = std::string(what);
+    return error;
+  };
+
   RomDetail detail;
   json::Reader reader(document.value, "rom detail");
   reader.Required("id", &detail.id);
@@ -994,31 +1007,26 @@ json::Error ParseRomDetail(std::string_view body, RomDetail* out) {
     return reader.error();
   }
 
-  // `files[]` is the one field read only when the body carries it. It is present
-  // and always empty on the *list* schema and only filled by
+  // The one field read only when the body carries the *key*. `files[]` is
+  // present and always empty on the list schema and only filled by
   // `GET /api/roms/{id}` (docs/API_CONTRACT.md), and the only rom whose name
-  // depends on it is the nested single-file one -- which the worker refuses
-  // rather than guessing at when the list is not exactly one name. Requiring it
-  // of every body would add a way for an ordinary rom to fail and buy nothing.
+  // depends on it is the nested single-file one -- where the worker refuses an
+  // absent or ambiguous list rather than guessing. Requiring the key of every
+  // body would add a way for an ordinary rom to fail and buy nothing.
   //
-  // What it holds is still held to the shape: an element that is not an object,
-  // or one whose `file_name` is not a string, is a named refusal rather than a
-  // list with a hole in it. A caller reading `file_names.front()` must be
-  // reading a name the server actually sent.
+  // Its *shape*, once the key is there, is held to the bar every other field is,
+  // and that is not the same trade: a library serving one body of the wrong
+  // shape serves them all, and the next rom out of it is the nested one whose
+  // name this decides. A caller reading `file_names.front()` must be reading a
+  // name the server actually sent, not the survivor of a list with a hole in it.
   if (const json::Value* files = document.value.Find("files"); files != nullptr) {
     if (!files->is_array()) {
-      json::Error error;
-      error.field = "files";
-      error.message = "field files: expected an array";
-      return error;
+      return refuse("files", "expected an array");
     }
     for (const json::Value& file : files->elements()) {
       const json::Value* name = file.is_object() ? file.Find("file_name") : nullptr;
       if (name == nullptr || !name->is_string()) {
-        json::Error error;
-        error.field = "files";
-        error.message = "field files: expected every entry to carry a file_name string";
-        return error;
+        return refuse("files", "expected every entry to carry a file_name string");
       }
       detail.file_names.push_back(name->string());
     }
@@ -1048,16 +1056,10 @@ json::Error ParseRomDetail(std::string_view body, RomDetail* out) {
   }
 
   if (detail.id <= 0) {
-    json::Error error;
-    error.field = "id";
-    error.message = "field id: expected a positive rom id";
-    return error;
+    return refuse("id", "expected a positive rom id");
   }
   if (detail.size_bytes < 0) {
-    json::Error error;
-    error.field = "fs_size_bytes";
-    error.message = "field fs_size_bytes: expected a size that is not negative";
-    return error;
+    return refuse("fs_size_bytes", "expected a size that is not negative");
   }
 
   *out = std::move(detail);
@@ -1565,12 +1567,10 @@ class Drainer {
                     "the server's library no longer holds this rom's file");
     }
 
-    // 3. What is the file called? `fs_name` for every rom but one, and the
-    // exception is why this is a step rather than an argument: a nested
-    // single-file rom is a directory holding one file, so `fs_name` is that
-    // directory and `fs_extension` is `""`. Written under it the bytes verify,
-    // the entry settles `kDone`, and the user has a file no emulator picks a
-    // core for (#92).
+    // 3. What is the file called? `fs_name` for every rom but a nested
+    // single-file one, which needs the extension of the file inside it -- and
+    // that is why this is a step of its own rather than an argument to the next.
+    // See `NameOnTheCard` (#92).
     std::string leaf;
     if (const std::optional<Step> refused = NameOnTheCard(&entry, detail, &leaf);
         refused.has_value()) {
@@ -1623,17 +1623,43 @@ class Drainer {
 
   /// The leaf the rom is written under, or the refusal that stops it.
   ///
-  /// `fs_name` for every rom but a nested single-file one, where it is
-  /// `files[0].file_name` -- the name RomM's own `content-disposition` gives the
-  /// bytes it serves for that rom (docs/API_CONTRACT.md).
+  /// `fs_name` for every rom but a nested single-file one. There it is
+  /// **`fs_name` with the extension of `files[0].file_name` on the end** --
+  /// `Final Fantasy VII (USA)` + `.chd` -- and not `files[0].file_name` itself,
+  /// which was the obvious candidate and is the wrong one for two reasons the
+  /// issue did not know (#92):
   ///
-  /// That name comes off the server's filesystem exactly as `fs_name` does and
-  /// nothing else has looked at it, so `ValidRomFileName` is asked here rather
-  /// than left to `DestinationFor`: both would refuse, but only this one can say
-  /// it was the file *inside* the folder that was unusable, and a sentence
-  /// blaming the rom's own name when the rom's name is fine sends whoever reads
-  /// it to the wrong place. It never quotes the name, for
-  /// `config::RomDestination::reason`'s reason.
+  ///   - **It is not unique and `fs_name` is.** `fs_name` is a directory in the
+  ///     platform's folder on the server, so no two roms on a platform share
+  ///     one; the file inside is named by whoever built the library, and
+  ///     `Game A/rom.gba` and `Game B/rom.gba` are an ordinary pair. Both would
+  ///     resolve to one path here. `AlreadyOnTheCard` would reject the file it
+  ///     found there -- the digest is the *other* rom's -- so each drain would
+  ///     overwrite the other rom with `io::CommitStaged` and report `kDone` for
+  ///     both, forever.
+  ///   - **Saves are matched by the rom file's name.** An emulator names a save
+  ///     after the file it loaded, and `roms::RomIndex::Find` keys on
+  ///     `fs_name_no_ext`, which for these roms *is* `fs_name` (`fs_extension`
+  ///     is `""`). A rom on the card as `ff7.chd` produces `ff7.srm`, which
+  ///     matches no rom in the index, and the save never syncs.
+  ///
+  /// So the extension is what is taken, because the extension is the whole of
+  /// what `fs_name` was missing -- and it is taken only when `fs_name` is
+  /// missing it. A `file_name` with no extension leaves `fs_name` as it stands
+  /// (the file has none on the server either, so there is nothing to recover),
+  /// and a `fs_name` that already carries one is not missing anything, so
+  /// `Game.gba` is not written out as `Game.gba.gba`.
+  ///
+  /// `files[0].file_name` is still held to `config::ValidRomFileName` even
+  /// though only its extension is used. It comes off the server's filesystem
+  /// exactly as `fs_name` does and nothing else has looked at it, and a server
+  /// naming a path where a file name belongs is one to refuse outright rather
+  /// than take a substring of. The check is asked here rather than left to
+  /// `DestinationFor`, which would refuse the composed name: both refuse, but
+  /// only this one can say it was the file *inside* the folder that was
+  /// unusable, and a sentence blaming the rom's own name when the rom's name is
+  /// fine sends whoever reads it to the wrong place. It never quotes the name,
+  /// for `config::RomDestination::reason`'s reason.
   std::optional<Step> NameOnTheCard(QueueEntry* entry, const RomDetail& detail,
                                     std::string* leaf) {
     if (!detail.has_nested_single_file) {
@@ -1646,14 +1672,28 @@ class Drainer {
     // picking one of several files would be a guess at which rom the user gets.
     if (detail.file_names.size() != 1) {
       return Settle(std::move(*entry), QueueState::kSkipped,
-                    "this rom is a folder and the server did not say which single file is in it");
+                    "this rom is a folder and the server did not name exactly one file inside it");
     }
+    // Composed the way `DestinationFor` composes its own reason (config.cpp):
+    // `why` is a predicate with no subject, and the subject is what tells this
+    // apart from a rom whose own name was the problem.
     std::string why;
     if (!config::ValidRomFileName(detail.file_names.front(), &why)) {
       return Settle(std::move(*entry), QueueState::kSkipped,
-                    "the file inside this rom's folder cannot be written to the card -- " + why);
+                    "the one file inside this rom's folder " + why);
     }
-    *leaf = detail.file_names.front();
+    // `sync::ExtensionOf`, not a second split of a file name: a leading dot is a
+    // whole name rather than an extension, and the engine already has one answer
+    // to where that split is (sync.hpp).
+    //
+    // Appended only to a `fs_name` that has none. The whole complaint is that
+    // these roms reach the card with no extension for an emulator to pick a core
+    // from; a directory that already carries one is not missing anything, and
+    // appending regardless would write `Game.gba` out as `Game.gba.gba`.
+    *leaf = detail.fs_name;
+    if (sync::ExtensionOf(detail.fs_name).empty()) {
+      *leaf += std::string(sync::ExtensionOf(detail.file_names.front()));
+    }
     return std::nullopt;
   }
 

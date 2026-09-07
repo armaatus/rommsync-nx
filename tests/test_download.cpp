@@ -1262,22 +1262,28 @@ void Resume(checks::Checks& c, http::HttpClient& client, const std::string& base
 
 /// A `DetailedRomSchema` body for the fault proxy to answer a detail call with.
 ///
-/// Only the six fields `ParseRomDetail` reads, and the *real* parser is what
-/// reads them. This is how a library that is healthy on purpose is made to look
+/// Only the fields `ParseRomDetail` reads, and the *real* parser is what reads
+/// them. This is how a library that is healthy on purpose is made to look
 /// like one that recorded the wrong hash, or none at all, without touching the
 /// fixture every other scenario shares -- the same trick `missing` uses for
 /// `missing_from_fs`. An empty digest is written as JSON `null`, which is what
 /// an unscanned RomM sends.
+///
+/// `files` is the JSON array to send as `files[]`, and sending one is what makes
+/// the body a *nested* single-file rom's: the two travel together, because a
+/// body claiming the flag without naming its one file is a shape the worker
+/// refuses (#92) rather than a variation a caller would want by accident.
 std::string DetailBody(const harness::Rom& rom, const char* slug, const std::string& sha1,
-                       const std::string& md5) {
+                       const std::string& md5, const std::string& files = "") {
   const auto quoted = [](const std::string& value) {
     return value.empty() ? std::string("null") : json::Quote(value);
   };
   return "{\"id\":" + std::to_string(rom.id) + ",\"fs_name\":" + json::Quote(rom.fs_name) +
          ",\"platform_fs_slug\":\"" + slug + "\",\"fs_size_bytes\":" + std::to_string(rom.size) +
          ",\"sha1_hash\":" + quoted(sha1) + ",\"md5_hash\":" + quoted(md5) +
-         ",\"has_multiple_files\":false,\"has_nested_single_file\":false"
-         ",\"missing_from_fs\":false}";
+         ",\"has_multiple_files\":false,\"has_nested_single_file\":" +
+         (files.empty() ? "false" : "true") + ",\"missing_from_fs\":false" +
+         (files.empty() ? std::string() : ",\"files\":" + files) + "}";
 }
 
 /// Arm the proxy to answer this rom's *detail* call with `body`.
@@ -1962,11 +1968,7 @@ void NestedName(checks::Checks& c, http::HttpClient& client, const std::string& 
   }
 
   const auto nested_body = [&rom](const std::string& files) {
-    return "{\"id\":" + std::to_string(rom.id) + ",\"fs_name\":" + json::Quote(rom.fs_name) +
-           ",\"platform_fs_slug\":\"psx\",\"fs_size_bytes\":" + std::to_string(rom.size) +
-           ",\"sha1_hash\":null,\"md5_hash\":null,\"has_multiple_files\":false"
-           ",\"has_nested_single_file\":true,\"missing_from_fs\":false,\"files\":" +
-           files + "}";
+    return DetailBody(rom, "psx", "", "", files);
   };
 
   // A separator is the refusal that matters most. It is not a deeper folder
@@ -1991,8 +1993,11 @@ void NestedName(checks::Checks& c, http::HttpClient& client, const std::string& 
   c.Expect(!refused.message.empty(), "which says why");
   c.Expect(refused.message.find("atmosphere") == std::string::npos,
            "without quoting the name back into the queue file, which is the point of refusing it");
-  c.Expect(refused.message.find("folder") != std::string::npos,
-           "and says it was the file inside the rom's folder, not the rom: " + refused.message);
+  c.Expect(refused.message.find("file inside this rom's folder") != std::string::npos,
+           "and says it was the file inside the rom's folder, not the rom -- whose own name is "
+           "fine: " + refused.message);
+  c.Expect(refused.message.find("separator") != std::string::npos,
+           "carrying the reason `ValidRomFileName` gave: " + refused.message);
   c.Expect(refused.destination.empty(), "with no destination recorded");
   c.ExpectEq(refused.fs_name, std::string("Synthetic Nested Game"),
              "though the rom's own name -- which is fine -- is still on the entry");
@@ -2017,13 +2022,68 @@ void NestedName(checks::Checks& c, http::HttpClient& client, const std::string& 
   }
   const QueueEntry nameless = rig.Persisted(rom_id);
   c.Expect(nameless.state == QueueState::kSkipped, "with a skip on the card");
-  c.Expect(nameless.message.find("single file") != std::string::npos,
+  c.Expect(nameless.message.find("exactly one file") != std::string::npos,
            "saying the server did not name the file: " + nameless.message);
   c.Expect(!rig.sandbox.Exists("/tico/roms/psx/Synthetic Nested Game"),
            "and still nothing under the directory's name");
   c.Expect(!rig.sandbox.Exists("/tico/roms/psx/Synthetic Nested Game.bin"),
            "nor under the one a healthy body would have given it");
   c.ExpectEq(rig.queue.pending(), std::size_t{0}, "the worker has nothing left to do");
+
+  // The half of the decision the seeded fixture cannot show. Its inner file is
+  // named after its folder, so `fs_name` + the extension and `files[0].file_name`
+  // are the same string there; this is the case where they are not, and it is
+  // the one that says which of the two the worker actually uses.
+  //
+  // `fs_name` and not the file's own name, for two reasons `download.nested`
+  // cannot see. `fs_name` is a directory in the platform's folder on the server,
+  // so no two roms on a platform share one -- while `Game A/rom.gba` and
+  // `Game B/rom.gba` are an ordinary pair, and under the file's name both roms
+  // would land on one path and overwrite each other on every drain, `kDone`
+  // each time. And an emulator names a save after the file it loaded, while
+  // `roms::RomIndex::Find` keys on `fs_name_no_ext` -- which for these roms *is*
+  // `fs_name` -- so a rom on the card as `inner.chd` produces `inner.srm`,
+  // matches nothing in the index, and never syncs its save.
+  c.Expect(rig.queue.Enqueue(rom_id, &again) == ipc::Error::kOk, "the rom is queued a third time");
+  {
+    harness::Fault fault(c, client, base,
+                         DetailFault(rom_id, nested_body("[{\"file_name\":\"inner.chd\"}]")));
+    const download::DrainResult result = rig.Drain(client);
+    c.Expect(result.outcome == download::DrainOutcome::kCompleted,
+             std::string("a rom whose inner file is named differently still drains -- got ") +
+                 download::ToString(result.outcome) + " (" + result.message + ")");
+    c.ExpectEq(result.downloaded, 1, "and comes down");
+  }
+  const std::string composed = "/tico/roms/psx/Synthetic Nested Game.chd";
+  c.Expect(rig.sandbox.Exists(composed),
+           "it lands under the rom's own name with the inner file's extension on it");
+  c.Expect(!rig.sandbox.Exists("/tico/roms/psx/inner.chd"),
+           "and not under the inner file's name, which is neither unique across roms nor what an "
+           "emulator will name the save after");
+  c.Expect(rig.sandbox.Read(composed) ==
+               FixtureRom("roms/psx/Synthetic Nested Game/Synthetic Nested Game.bin"),
+           "with the bytes the whole-rom endpoint served, which are the inner file's");
+  c.ExpectEq(rig.Persisted(rom_id).destination, composed, "and the entry records that path");
+
+  // ...and the extension is added only where one is missing. A directory that
+  // already carries one is not what this issue is about, and appending anyway
+  // would write `Game.gba` out as `Game.gba.gba`.
+  harness::Rom suffixed = rom;
+  suffixed.fs_name = "Synthetic Nested Game.chd";
+  c.Expect(rig.queue.Enqueue(rom_id, &again) == ipc::Error::kOk, "the rom is queued once more");
+  {
+    harness::Fault fault(
+        c, client, base,
+        DetailFault(rom_id, DetailBody(suffixed, "psx", "", "",
+                                       "[{\"file_name\":\"inner.chd\"}]")));
+    const download::DrainResult result = rig.Drain(client);
+    c.Expect(result.outcome == download::DrainOutcome::kCompleted,
+             std::string("a folder whose own name has an extension still drains -- got ") +
+                 download::ToString(result.outcome) + " (" + result.message + ")");
+  }
+  c.Expect(rig.sandbox.Exists(composed), "it stays at the one name it already had");
+  c.Expect(!rig.sandbox.Exists("/tico/roms/psx/Synthetic Nested Game.chd.chd"),
+           "and the extension is not doubled onto it");
 
   // The queue is still writable and the next rom still drains: a refusal here is
   // one entry's, and must not cost the sixty-three behind it.
