@@ -873,6 +873,18 @@ inline void CloseSession(http::HttpClient& client, const std::string& base,
 /// clears them at the start of each one, which is the only place that cannot be
 /// forgotten by a scenario that negotiates and walks away.
 ///
+/// A session another run is still holding is left alone. Until #174 this closed
+/// every IN_PROGRESS session on the device, and a second `ctest` against the
+/// same worktree therefore ended this one's LIVE session merely by starting up
+/// -- cleanup that cannot fail its own scenario ruining somebody else's.
+/// `rig::sessions` is where the ownership is kept, and why it cannot be kept on
+/// the session row itself.
+///
+/// This process's OWN sessions are still closed, which is what the trailing
+/// calls in tests/test_sync_tick.cpp and tests/test_play_sessions.cpp are for:
+/// a scenario whose `complete` failed still holds its claim, and leaving it for
+/// the next process is the leftover #76 is about.
+///
 /// Best effort by design: this is cleanup, and a scenario must not fail because
 /// tidying up did not work.
 inline void CloseOpenSessions(http::HttpClient& client, const std::string& base,
@@ -895,6 +907,25 @@ inline void CloseOpenSessions(http::HttpClient& client, const std::string& base,
   if (sessions == nullptr || !sessions->is_array()) {
     return;
   }
+  // Read AFTER the listing, never before: RomM's row exists from the moment it
+  // creates one and its claim is written when the response naming it arrives, so
+  // a snapshot taken first can miss a claim taken in between -- and the session
+  // it then fails to attribute is a live one.
+  //
+  // A run inside that window defers this entirely, since nothing unattributed
+  // can be told apart from what it is about to own. Waited out rather than
+  // simply accepted: every rig `main()` calls this once and then negotiates, so
+  // a leftover left here is the cancel #76 races. What is being waited for is a
+  // round trip; a stalled negotiate holds the marker longer than this, and that
+  // one is left to the next process to start, which is what best effort costs.
+  rig::sessions::LiveClaims live = rig::sessions::Live();
+  for (int waited = 0; live.negotiating && waited < 10; ++waited) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    live = rig::sessions::Live();
+  }
+  if (live.negotiating) {
+    return;
+  }
   for (const json::Value& session : sessions->elements()) {
     if (Field(session, "status") != "IN_PROGRESS") {
       continue;
@@ -905,6 +936,9 @@ inline void CloseOpenSessions(http::HttpClient& client, const std::string& base,
     const std::int64_t id = Number(session, "id");
     if (id == 0) {
       continue;
+    }
+    if (live.Holds(id)) {
+      continue;  // another run, still going, opened it
     }
     PostJson(client, base + "/api/sync/sessions/" + std::to_string(id) + "/complete", fixture,
              R"({"operations_completed":0,"operations_failed":0,"play_sessions":[]})");

@@ -30,18 +30,49 @@ namespace scratch {
 /// The `pid-` in `<build>/tests/scratch/pid-4213`.
 inline constexpr const char* kLeafPrefix = "pid-";
 
-/// The name of the leaf a process of this pid owns: `pid-4213`.
-///
-/// Assembled here rather than at each site, because `LeafOwner` below has to
-/// take it apart again and test_harness.cpp has to recognise one.
-inline std::string LeafName(long long pid) { return kLeafPrefix + std::to_string(pid); }
+/// The directory the leaves sit in: one per build tree, and therefore one
+/// shared by every `ctest` invocation against that tree. That sharing is the
+/// hazard this file exists for (#151) and, read the other way, the only place
+/// two runs against one worktree can see each other at all -- which is what
+/// `rig::sessions` attributes a live sync session through (#174).
+inline std::filesystem::path Root() { return ROMMSYNC_TEST_SCRATCH; }
 
-namespace detail {
+/// The digits of `text` as a number no larger than `limit`, or 0 for anything
+/// that is not one.
+///
+/// Names carry the numbers here -- a leaf is `pid-4213`, a session claim is
+/// `session-815-pid-4213` -- so every reader has to take one apart, and a name
+/// this suite did not write must read as 0 rather than as something plausible.
+inline long long Digits(const std::string& text, long long limit) {
+  if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos) {
+    return 0;
+  }
+  errno = 0;
+  const long long value = std::strtoll(text.c_str(), nullptr, 10);
+  if (errno == ERANGE || value > limit) {
+    return 0;
+  }
+  return value;
+}
+
+/// The same, bounded to what a `pid_t` can hold.
+///
+/// A number no `pid_t` can hold is not one this suite wrote, whatever it looks
+/// like, and casting it would hand `kill` a truncated or saturated value -- 0 is
+/// this process's group and -1 is every process the user can signal, and both
+/// answer "running".
+inline long long Pid(const std::string& text) {
+  return Digits(text, static_cast<long long>(std::numeric_limits<pid_t>::max()));
+}
 
 /// Is `pid` a process that still exists?
 ///
 /// `ESRCH` is the only answer that means gone. `EPERM` is a live process this
-/// user does not own, which is still a reason to leave its leaf alone.
+/// user does not own, which is still a reason to leave what it owns alone.
+///
+/// `Sweep` retires a leaf by this, and `rig::sessions` retires a claim on a sync
+/// session by it: in both, what a run holds lapses when the run does, so nothing
+/// has to survive a crash in order to clean up after it.
 inline bool Running(long long pid) {
   if (pid <= 0) {
     return false;
@@ -50,26 +81,21 @@ inline bool Running(long long pid) {
   return ::kill(static_cast<pid_t>(pid), 0) == 0 || errno != ESRCH;
 }
 
+/// The name of the leaf a process of this pid owns: `pid-4213`.
+///
+/// Assembled here rather than at each site, because `LeafOwner` below has to
+/// take it apart again and test_harness.cpp has to recognise one.
+inline std::string LeafName(long long pid) { return kLeafPrefix + std::to_string(pid); }
+
+namespace detail {
+
 /// The pid a leaf is named for, or 0 for a name that is not one of ours.
 inline long long LeafOwner(const std::string& name) {
   const std::string prefix = kLeafPrefix;
   if (name.size() <= prefix.size() || name.compare(0, prefix.size(), prefix) != 0) {
     return 0;
   }
-  const std::string digits = name.substr(prefix.size());
-  if (digits.find_first_not_of("0123456789") != std::string::npos) {
-    return 0;
-  }
-  // A number no `pid_t` can hold is not one this suite wrote, whatever it looks
-  // like, and casting it would hand `kill` a truncated or saturated value --
-  // 0 is this process's group and -1 is every process the user can signal, and
-  // both answer "running".
-  errno = 0;
-  const long long owner = std::strtoll(digits.c_str(), nullptr, 10);
-  if (errno == ERANGE || owner > static_cast<long long>(std::numeric_limits<pid_t>::max())) {
-    return 0;
-  }
-  return owner;
+  return Pid(name.substr(prefix.size()));
 }
 
 /// Set by `scratch::Keep()`, and read once the process is on its way out.
@@ -158,7 +184,7 @@ inline void Sweep(const std::filesystem::path& root, const std::filesystem::path
       continue;
     }
     const long long owner = detail::LeafOwner(leaf.filename().string());
-    if (owner == 0 || detail::Running(owner)) {
+    if (owner == 0 || Running(owner)) {
       continue;
     }
     std::error_code ignored;
@@ -179,7 +205,7 @@ inline void Sweep(const std::filesystem::path& root, const std::filesystem::path
 /// run of *this* process.
 inline const std::string& Dir() {
   static const std::string dir = [] {
-    const std::filesystem::path root = ROMMSYNC_TEST_SCRATCH;
+    const std::filesystem::path root = Root();
     const std::filesystem::path mine = root / LeafName(static_cast<long long>(::getpid()));
 
     std::error_code error;

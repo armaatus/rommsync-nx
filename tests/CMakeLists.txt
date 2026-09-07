@@ -46,6 +46,18 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 # directory, fixed destination names, two processes (#151). It is fixed the same
 # way -- per process, in tests/scratch.hpp -- and held by `scratch.concurrent`,
 # which runs two `ctest`s at once because nothing inside one can see this.
+#
+# Ownership had to cover a third thing: the sync session a rig test opens. Every
+# rig `main()` clears the sessions left on the fixture device, and until #174
+# that meant another run's LIVE one -- the same "an earlier run's leftovers must
+# not damage this one" that #118 fixed for faults, and the same second `ctest`.
+# `rig::sessions` attributes them by process and `harness.session_owner` holds
+# it; RUN_SERIAL is again beside the point.
+#
+# It closes the STARTUP door and not the whole room. RomM cancels a device's
+# active session on every negotiate and every rig process shares the fixture
+# device, so a second `ctest` still ends this one's session once it negotiates.
+# A device per process is what would close that, and docs/TESTING.md says so.
 
 # --- unit tests: no external services ---------------------------------------
 add_executable(test_version test_version.cpp)
@@ -623,6 +635,10 @@ target_include_directories(test_http_wire PRIVATE
 target_compile_definitions(test_http_wire PRIVATE
   ROMMSYNC_TEST_WIRE_BACKEND
   ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  # A scratch root of its own, because `wire.*` and `http.*` are the same
+  # scenarios writing the same fixed names. It also puts this binary's
+  # `rig::sessions` claims somewhere nobody else reads -- harmless while it only
+  # GETs, and the reason to think twice before giving it a negotiate (#174).
   ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch-wire")
 
 foreach(scenario IN LISTS HTTP_SCENARIOS)
@@ -1013,6 +1029,7 @@ set_tests_properties(harness.scratch PROPERTIES TIMEOUT 60)
 set(HARNESS_SCENARIOS
   disarms         # an armed fault cannot outlive the scope that armed it
   fault_owner     # ...and belongs to the client that armed it, not to the proxy (#118)
+  session_owner   # ...and a live sync session belongs to the run that opened it (#174)
   expired         # 401 mid-flow: a response, not a transport error, and not a verdict
   conflict        # both sides moved past the last sync
   same_timestamp  # ...and the no-history conflict a switch on one reason drops

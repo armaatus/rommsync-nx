@@ -19,8 +19,9 @@
 // plus the harness's own two guarantees, which are the ones that keep the rest
 // honest: `sandbox` (the per-test SD card, and the backup rule it enforces
 // whether or not a test remembers to look) and `disarms` (a fault cannot
-// outlive the scope that armed it), and `fault_owner` (a fault belongs to the
-// client that armed it, so a second `ctest` cannot spend it -- #118).
+// outlive the scope that armed it), `fault_owner` (a fault belongs to the
+// client that armed it, so a second `ctest` cannot spend it -- #118) and
+// `session_owner` (nor end its live sync session by starting up -- #174).
 //
 // **What is deliberately not here.** The issue's wording asks for the client's
 // *behaviour* on a conflict and on a partial plan -- resolve by policy, count
@@ -31,6 +32,7 @@
 // reasonable client would guess wrong, which are named at each scenario.
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -41,7 +43,9 @@
 #include <thread>
 #include <vector>
 
-#include <unistd.h>  // getpid/getppid: the scratch scenario names both
+#include <signal.h>    // kill: session_owner's stranger has a deadline
+#include <sys/wait.h>  // waitpid/WEXITSTATUS: session_owner runs a second process
+#include <unistd.h>    // fork/execl, and getpid/getppid for the scratch scenario
 
 #include "harness.hpp"
 #include "rommsync/atomic_file.hpp"
@@ -1097,6 +1101,11 @@ void StallDropped(rig::Checks& checks, http::HttpClient& client, const std::stri
     if (sessions == nullptr || !sessions->is_array()) {
       return std::int64_t{-1};
     }
+    // Read after the listing, for `harness::CloseOpenSessions`'s reason. Every
+    // rig process shares this device, so without it a second `ctest`'s LIVE
+    // session is reported here as the replayed negotiate -- which reads as the
+    // proxy having forwarded something it did not (#174).
+    const rig::sessions::LiveClaims live = rig::sessions::Live();
     for (const json::Value& session : sessions->elements()) {
       if (harness::Field(session, "device_id") != fixture.device_id) {
         continue;
@@ -1104,7 +1113,11 @@ void StallDropped(rig::Checks& checks, http::HttpClient& client, const std::stri
       if (harness::Field(session, "status") != "IN_PROGRESS") {
         continue;
       }
-      return harness::Number(session, "id");
+      const std::int64_t id = harness::Number(session, "id");
+      if (live.Holds(id)) {
+        continue;
+      }
+      return id;
     }
     return std::int64_t{0};
   };
@@ -1719,6 +1732,169 @@ void FaultOwnerScenario(rig::Checks& checks, const std::string& base) {
 }
 
 
+// --- session_owner ------------------------------------------------------------
+//
+// The half of #156 that #118 did not fix, and the same shape as `fault_owner`
+// above. Every rig `main()` opens by clearing what an earlier run left behind,
+// and one of the two things it clears was still everybody's:
+// `harness::CloseOpenSessions` completes every IN_PROGRESS session belonging to
+// the fixture device, and every rig process negotiates as that one device. So a
+// second `ctest` against this worktree -- an agent's run beside a review's --
+// ended this one's LIVE session merely by starting up (#174).
+//
+// What that costs to attribute is why it is a bug rather than a line in the
+// docs: the owner's own `complete` is then answered "already completed", so the
+// scenario reads its accounting call as failed and fails on an outcome, in a
+// test that armed nothing and touched nothing.
+//
+// The stranger is a real second process, because nothing inside one can see
+// this -- RUN_SERIAL orders tests within one invocation and says nothing about a
+// second one. It is this same binary, running the startup every rig test shares
+// and then stopping there: the reproduction measured in the issue, run from
+// inside the suite. `kStrangerScenario` below is the name it does that under,
+// and says why it is a reserved one rather than the unrecognised one the issue
+// used.
+
+/// The scenario name `session_owner` spawns this binary under.
+///
+/// Reserved rather than unrecognised. The reproduction measured in #174 used a
+/// name no `main` knew, but that branch is reached only PAST the rom lookup, so
+/// on a library that was staged and never scanned the stranger SKIPS instead of
+/// running -- and a red `session_owner` would then be reporting an unprovisioned
+/// fixture as an ownership bug. This one sits with `disarms` and `fault_owner`,
+/// immediately after the startup, which is the whole of what a stranger does.
+constexpr const char* kStrangerScenario = "__stranger__";
+
+/// Run this binary the way a second `ctest` would, and return its exit code --
+/// or -1 if it could not be started or had to be killed.
+///
+/// `fork`/`exec` rather than `std::system`: there is no shell to quote a build
+/// path for, and the child can be given a deadline. Without one, a stranger that
+/// wedges against a sick RomM blocks this test until CTest's own TIMEOUT and
+/// then outlives it, still hammering the shared fixture -- which surfaces as
+/// unrelated rig tests failing with nothing pointing back here.
+int RunStranger(const std::string& self) {
+  const pid_t stranger = ::fork();
+  if (stranger < 0) {
+    return -1;
+  }
+  if (stranger == 0) {
+    // Its own fault-proxy identity, not this process's: `rig::FaultOwner`
+    // exports `ROMMSYNC_FAULT_OWNER` so that a child is part of its parent's
+    // scenario, and a stranger is the one thing that must not be. Empty rather
+    // than unset, because either makes `FaultOwner` mint a fresh one.
+    ::setenv("ROMMSYNC_FAULT_OWNER", "", 1);
+    // Its stdout is noise. Its stderr is kept, because it is the only thing that
+    // can say why it exited with anything other than 0, and CTest shows neither
+    // unless this test is red.
+    std::freopen("/dev/null", "w", stdout);
+    ::execl(self.c_str(), self.c_str(), kStrangerScenario, static_cast<char*>(nullptr));
+    ::_exit(127);
+  }
+
+  // Six of these at most -- one, plus the five the sweep half may retry -- and
+  // `harness.*` gets 300s from CTest, so the deadline has to leave room for all
+  // six inside it. A stranger that is working takes under two seconds.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+  int status = 0;
+  while (std::chrono::steady_clock::now() < deadline) {
+    const pid_t reaped = ::waitpid(stranger, &status, WNOHANG);
+    if (reaped == stranger) {
+      return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    if (reaped < 0) {
+      return -1;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  ::kill(stranger, SIGKILL);
+  ::waitpid(stranger, &status, 0);
+  return -1;
+}
+
+void SessionOwnerScenario(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                          const harness::Fixture& fixture, const std::string& self) {
+  // Asked of the session by id rather than off the listing: `GET
+  // /api/sync/sessions` is capped at 50 and ordered `initiated_at DESC` over the
+  // whole user, and this scenario has to be able to say what became of ONE row.
+  const auto status_of = [&](std::int64_t id) {
+    const http::Result got = client.Send(harness::Authed(
+        http::Method::kGet, base + "/api/sync/sessions/" + std::to_string(id), fixture));
+    if (!got.successful()) {
+      return std::string("unreadable");
+    }
+    const json::ParseResult parsed = json::Parse(got.response.body);
+    return parsed.ok() ? harness::Field(parsed.value, "status") : std::string("unreadable");
+  };
+
+  // Nothing local to report: "what am I missing?" is a legitimate negotiate --
+  // it is the shape the contract probe uses -- and it opens a session like any
+  // other.
+  sync::SyncNegotiatePayload payload;
+  payload.device_id = fixture.device_id;
+
+  const http::Result negotiated = harness::Negotiate(checks, client, base, fixture, payload);
+  const json::ParseResult opened = json::Parse(negotiated.response.body);
+  if (!negotiated.successful() || !opened.ok()) {
+    checks.Expect(false, "negotiate opened a session -- " +
+                             std::to_string(negotiated.response.status) + " " +
+                             negotiated.response.body);
+    return;
+  }
+  const std::int64_t session = harness::Number(opened.value, "session_id");
+  if (session == 0) {
+    checks.Expect(false, "the negotiate response names its session");
+    return;
+  }
+  checks.ExpectEq(status_of(session), std::string("IN_PROGRESS"), "the session is live");
+
+  checks.ExpectEq(RunStranger(self), 0,
+                  "the stranger ran the startup every rig test shares -- any other exit code "
+                  "means it never got that far, and the check below would pass having exercised "
+                  "nothing (its own stderr says which)");
+  checks.ExpectEq(status_of(session), std::string("IN_PROGRESS"),
+                  "a stranger's startup leaves a session it does not own alone");
+
+  // The half a fix that simply stopped cleaning up would fail: a session no run
+  // is holding is still collected, and by a stranger, because that is what this
+  // cleanup is for (#76). A claim lapses with the process that took it, and
+  // dropping it by hand is that without waiting for a process to exit.
+  rig::sessions::Release(session);
+  std::string swept;
+  for (int attempt = 0; attempt < 5 && swept != "COMPLETED"; ++attempt) {
+    // Retried because a run with a negotiate in flight defers the cleanup by
+    // design -- inside that window an unclaimed session cannot be told from one
+    // about to be claimed. That is a round trip, not a verdict, and this suite
+    // is built to be run twice at once, so a third party can genuinely be in it.
+    const int exited = RunStranger(self);
+    if (exited != 0) {
+      // Reported here rather than left to the assertion below, which would blame
+      // the ownership rules for a stranger that never ran.
+      checks.Expect(false, "the stranger ran again, exit " + std::to_string(exited));
+      return;
+    }
+    swept = status_of(session);
+  }
+  checks.ExpectEq(swept, std::string("COMPLETED"),
+                  "and a stranger still collects a leftover no run is holding");
+
+  // And a run may always close what it opened, claim or no claim: several
+  // scenarios END with this call, on a session whose own `complete` failed and
+  // whose claim is therefore still held. Leaving that for the next process is
+  // the leftover #76 is about, so ownership must not have quietly disabled it.
+  const http::Result reopened = harness::Negotiate(checks, client, base, fixture, payload);
+  const json::ParseResult second = json::Parse(reopened.response.body);
+  const std::int64_t own = second.ok() ? harness::Number(second.value, "session_id") : 0;
+  if (own == 0) {
+    checks.Expect(false, "a second negotiate opened a session to close");
+    return;
+  }
+  harness::CloseOpenSessions(client, base, fixture);
+  checks.ExpectEq(status_of(own), std::string("COMPLETED"),
+                  "and a run's own cleanup still closes the session it opened");
+}
+
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1729,6 +1905,10 @@ int main(int argc, char** argv) {
 
   const std::string scenario = argc > 1 ? argv[1] : "sandbox";
   const std::string base = rig::BaseUrl();
+  // `session_owner` runs this same binary again as a stranger would. Absolute,
+  // because the child inherits a working directory but not whatever PATH lookup
+  // found this one.
+  const std::string self = std::filesystem::absolute(argv[0]).string();
 
   std::error_code error;
   std::filesystem::create_directories(rig::ScratchDir(), error);
@@ -1779,6 +1959,12 @@ int main(int argc, char** argv) {
     Disarms(checks, *client, base);
   } else if (scenario == "fault_owner") {
     FaultOwnerScenario(checks, base);
+  } else if (scenario == "session_owner") {
+    SessionOwnerScenario(checks, *client, base, fixture, self);
+  } else if (scenario == kStrangerScenario) {
+    // Nothing at all. The startup above -- DisarmFault, LoadFixture and
+    // CloseOpenSessions -- is what `session_owner` spawns this to run, and it
+    // has already run. Not a CTest entry: it asserts nothing on its own.
   } else if (scenario == "expired") {
     Expired(checks, *client, base, fixture);
   } else if (scenario == "stall") {

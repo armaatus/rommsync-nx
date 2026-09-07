@@ -76,11 +76,55 @@ tick rather than as a stranger at the proxy. `harness.fault_owner` pins both
 halves, and it is the canonical account — the two comments at the scenes point
 here rather than repeating it.
 
-The fault is the half that was fixed. A rig test's *other* opening act,
-`harness::CloseOpenSessions`, is still global — it closes every `IN_PROGRESS`
-session belonging to the fixture device, and every rig process shares that
-device, so a second `ctest` starting up still ends this one's live session. That
-is #174, and it is the second half of what #156 turned out to be.
+A rig test's *other* opening act was global for longer, and it is the second
+half of what #156 turned out to be. `harness::CloseOpenSessions` completes every
+`IN_PROGRESS` session belonging to the fixture device, and every rig process
+negotiates as that one device — so a second `ctest` starting up ended this one's
+*live* session (#174). What that looks like from the far side is one FAIL about
+an outcome, in a test that arms nothing: the owner's own `complete` is answered
+*already completed*, which reads as a bug in the accounting.
+
+A session cannot carry its owner the way a fault does. `SyncSessionSchema` in
+the pinned snapshot is an id, a device, a user, a status, three counters and
+timestamps — there is no field a client may write, and the device is the
+fixture's for everybody. So the attribution is kept on this side of the wire, in
+the scratch root the build tree already shares between runs: `rig::sessions`
+writes a file named `session-815-pid-4213` when a negotiate comes back, and
+removes it when that session is completed. Both happen in `rig::OwnedHttpClient`
+— the same decorator that signs the owner tag — because that is the one place
+that sees every negotiate, the harness's own and the engine's alike.
+
+`CloseOpenSessions` reads those claims *after* it lists the sessions, never
+before: a row exists from the moment RomM creates it and its claim is written
+when the response naming it arrives, so a snapshot taken first can miss a claim
+taken in between. It then skips every session a running process claims. A claim
+lapses when its process does, by the same `kill(pid, 0)` the scratch sweep
+retires a leaf by, so a run CTest killed on `TIMEOUT` leaves leftovers that are
+still collectable and nothing that has to clean up after it.
+
+The window between the row and the claim is covered by a second marker,
+`negotiating-pid-4213`. While a running process is inside it, nothing
+unattributed can be told from what that process is about to own, so the cleanup
+defers entirely — waited out for a couple of seconds first, since every rig
+`main()` calls the cleanup once and then negotiates, and a leftover left here is
+the cancel #76 races. Beyond that it is best effort by design and the next
+process to start does it instead. `harness.session_owner` pins all three of the
+rules: a live session a stranger may not end, a leftover the cleanup still
+collects, and the session a run opened itself, which it may always close — the
+last one because several scenarios *end* with that call, and ownership must not
+have quietly turned it into a no-op. It runs a real second process to do it, for
+the reason `RUN_SERIAL` cannot help either: nothing inside one invocation can see
+the other.
+
+**What this does not fix**, because it cannot be fixed from this side: RomM keeps
+one active sync session per device and cancels the existing one on every
+negotiate (`/backend/endpoints/sync.py` in 5.2.0), and every rig process
+negotiates as the fixture's single device. A second `ctest` therefore still ends
+this run's session the moment it reaches its own first negotiate. What #174
+closed is the *startup* door — a second run clears sessions before it has done
+anything else, which is the window it spends most of its life in, and the one
+`#156` was measured through. Closing the rest would mean a registered device per
+process, not a claim file.
 
 Two `ctest`s at once broke a second thing, on disk rather than on the wire, and
 for the same reason (#151). `ROMMSYNC_TEST_SCRATCH` is per build tree, so it kept
