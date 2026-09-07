@@ -105,6 +105,27 @@
 #                                           without the record would do.
 #   test_orca_fleet.sh gaveup_retry         `fleet.sh retry 42` is how it comes
 #                                           back, and it is the only way.
+#   test_orca_fleet.sh abandon_warns_first  the first pass that finds a reason
+#                                           WARNS and removes nothing. An agent
+#                                           plans before it edits (CLAUDE.md), so
+#                                           a worktree forty minutes into real
+#                                           work is legitimately empty -- and
+#                                           `blocked` is re-derived by
+#                                           unblock.yml on every merge, so it
+#                                           lands under one that is mid-plan.
+#   test_orca_fleet.sh abandon_warned_saved ...and a minute is enough: something
+#                                           committed after the warning keeps the
+#                                           worktree.
+#   test_orca_fleet.sh abandon_two_keeps    the two keeps do not share one
+#                                           marker. A transient git failure must
+#                                           not silence the line that says what
+#                                           is actually in there.
+#   test_orca_fleet.sh gaveup_pruned        the record is dropped once the issue
+#                                           lands, or `fleet.sh status` lists
+#                                           finished work forever and the files
+#                                           never go away.
+#   test_orca_fleet.sh list_says_declined   a run that declined every issue it was
+#                                           given does not report that they landed.
 #
 # The Orca CLI and gh are stubbed on PATH; the fleet state dir is a temp dir.
 # Nothing here touches a real worktree, docker, or GitHub.
@@ -277,6 +298,13 @@ commit_ahead()    { git -C "$WORK/wt" -c user.email=t@t -c user.name=t \
 # No reason to release, and the reap must find none: an open issue, no merged PR
 # for the branch, and nothing the fleet has given up on.
 quiet_issue() { issue_state OPEN; issue_labels "ready"; : >"$GH_MERGED"; }
+
+# A release takes TWO passes on purpose: the first warns and interrupts, the
+# second re-asks what the worktree holds and only then removes it. Tests about
+# the removal drive both; tests about the warning, or about a worktree that is
+# kept, drive one.
+release_pass()      { in_fleet reap_abandoned 2>&1; }
+warn_then_release() { release_pass >/dev/null 2>&1; release_pass; }
 
 # An issue that is past its box with no PR open: the started marker is old, and
 # the PR listing is empty.
@@ -604,7 +632,7 @@ JSON
     add_origin
     quiet_issue
     issue_labels "blocked"
-    out="$(in_fleet reap_abandoned 2>&1)"
+    out="$(warn_then_release)"
     [ -d "$WORK/wt" ] && fail "a blocked issue's clean worktree still holds a slot: $out"
     [ -e "$ROMMSYNC_FLEET_DIR/worktrees/42" ] \
       && fail "the worktree is gone but the issue is still owned, so the cap still counts it"
@@ -617,7 +645,7 @@ JSON
     add_origin
     quiet_issue
     issue_state CLOSED
-    out="$(in_fleet reap_abandoned 2>&1)"
+    out="$(warn_then_release)"
     [ -d "$WORK/wt" ] && fail "a closed issue's clean worktree still holds a slot: $out"
     grep -q "closed" <<<"$out" || fail "it did not say why it released it: $out"
     echo "ok: a worktree whose issue closed with no merged PR is released"
@@ -631,7 +659,7 @@ JSON
     # worktree, so its agent correctly produced no PR, labelled the issue and
     # stopped. reap_merged waits for a merged PR that can never exist.
     issue_labels "ready,needs-human-step"
-    out="$(in_fleet reap_abandoned 2>&1)"
+    out="$(warn_then_release)"
     [ -d "$WORK/wt" ] && fail "an issue no agent may close still holds a slot: $out"
     grep -q "needs-human-step" <<<"$out" || fail "it did not say why it released it: $out"
     echo "ok: a worktree whose last step is yours is released once it holds nothing"
@@ -643,7 +671,7 @@ JSON
     quiet_issue
     issue_labels "blocked"
     dirty_worktree
-    out="$(in_fleet reap_abandoned 2>&1)"
+    out="$(release_pass)"
     [ -d "$WORK/wt" ] || fail "it deleted uncommitted work on the strength of a label: $out"
     [ -e "$ROMMSYNC_FLEET_DIR/worktrees/42" ] \
       || fail "it kept the directory but disowned the issue, so nothing looks at it again"
@@ -651,7 +679,7 @@ JSON
     grep -q "worktree rm" "$ORCA_CALLS" \
       && fail "it attempted the removal anyway, and --run-hooks archives the stack first"
     # Once per worktree, not once per poll.
-    again="$(in_fleet reap_abandoned 2>&1)"
+    again="$(release_pass)"
     grep -q "uncommitted" <<<"$again" && fail "it says so every poll: $again"
     echo "ok: a dirty worktree is kept, and it says what it holds"
     ;;
@@ -662,7 +690,7 @@ JSON
     quiet_issue
     issue_labels "blocked"
     commit_ahead
-    out="$(in_fleet reap_abandoned 2>&1)"
+    out="$(release_pass)"
     [ -d "$WORK/wt" ] || fail "it deleted the only copy of a commit: $out"
     grep -q "not in origin/main" <<<"$out" || fail "it did not say what is in there: $out"
     grep -q "worktree rm" "$ORCA_CALLS" && fail "it attempted the removal anyway: $out"
@@ -676,7 +704,7 @@ JSON
     # No origin at all, so there is nothing to compare against. That is the third
     # answer, and reading it as "holds nothing" is how a fix like this destroys
     # the work it was written to protect.
-    out="$(in_fleet reap_abandoned 2>&1)"
+    out="$(release_pass)"
     [ -d "$WORK/wt" ] || fail "it removed a worktree it could not read: $out"
     grep -q "could not be read" <<<"$out" || fail "it did not say it could not tell: $out"
     echo "ok: a git that cannot answer is not read as an empty worktree"
@@ -687,7 +715,7 @@ JSON
     add_origin
     quiet_issue
     agent_state working
-    out="$(in_fleet reap_abandoned 2>&1)"
+    out="$(release_pass)"
     [ -d "$WORK/wt" ] || fail "it removed the worktree of an agent that is still working: $out"
     [ -e "$ROMMSYNC_FLEET_DIR/worktrees/42" ] \
       || fail "it disowned an issue that is still being worked, so the cap stops counting it"
@@ -705,7 +733,7 @@ JSON
     in_fleet enforce_timebox >/dev/null 2>&1
     [ -e "$ROMMSYNC_FLEET_DIR/gaveup-42" ] \
       || fail "the box stopped the agent without recording it, so nothing else can act on it"
-    out="$(in_fleet reap_abandoned 2>&1)"
+    out="$(warn_then_release)"
     [ -d "$WORK/wt" ] && fail "#44's case again: three hours, nothing produced, slot held: $out"
     [ -e "$ROMMSYNC_FLEET_DIR/gaveup-42" ] \
       || fail "the record died with the worktree, so the queue hands the issue straight back"
@@ -750,7 +778,83 @@ JSON
     grep -q "startable again" <<<"$out" || fail "retry said nothing useful: $out"
     echo "ok: fleet.sh retry hands a gave-up issue back to the queue"
     ;;
+  abandon_warns_first)
+    make_fixture ok
+    make_worktree
+    add_origin
+    quiet_issue
+    issue_labels "blocked"
+    agent_state working
+    out="$(release_pass)"
+    [ -d "$WORK/wt" ] \
+      || fail "it removed the worktree on the pass that found the reason, with no notice: $out"
+    grep -q "next pass" <<<"$out" || fail "it did not say what happens next: $out"
+    grep -q -- "--interrupt" "$ORCA_CALLS" \
+      || fail "it warned the board and left the agent working against a rig that is going"
+    grep -q "worktree rm" "$ORCA_CALLS" && fail "it removed it anyway: $(cat "$ORCA_CALLS")"
+    echo "ok: the pass that finds a reason warns, and removes nothing"
+    ;;
+  abandon_warned_saved)
+    make_fixture ok
+    make_worktree
+    add_origin
+    quiet_issue
+    issue_labels "blocked"
+    release_pass >/dev/null 2>&1
+    # The minute of notice is only worth having if it is really re-asked.
+    commit_ahead
+    out="$(release_pass)"
+    [ -d "$WORK/wt" ] \
+      || fail "it removed a worktree that had work in it by the time it acted: $out"
+    grep -q "not in origin/main" <<<"$out" || fail "it did not say what saved it: $out"
+    echo "ok: work that lands during the warning keeps the worktree"
+    ;;
+  abandon_two_keeps)
+    make_fixture ok
+    make_worktree
+    quiet_issue
+    issue_labels "blocked"
+    # No origin yet: git cannot answer, and that is said once.
+    first="$(release_pass)"
+    grep -q "could not be read" <<<"$first" || fail "the unreadable case was not reported: $first"
+    # Now it can answer, and there is something in there. One shared marker would
+    # swallow this, and the board would go on claiming git was unreadable.
+    add_origin
+    dirty_worktree
+    out="$(release_pass)"
+    grep -q "uncommitted" <<<"$out" \
+      || fail "the second keep was silenced by the first one's marker: $out"
+    echo "ok: an unreadable git does not silence the line that says what is in there"
+    ;;
+  gaveup_pruned)
+    make_fixture ok
+    make_worktree
+    add_origin
+    make_overdue
+    quiet_issue
+    agent_state working
+    in_fleet enforce_timebox >/dev/null 2>&1
+    [ -e "$ROMMSYNC_FLEET_DIR/gaveup-42" ] \
+      || fail "could not arm gaveup-42, so the assertion that follows would be vacuous"
+    # A person picks it up by hand and its PR lands.
+    issue_state CLOSED
+    out="$(in_fleet prune_gaveup 2>&1)"
+    [ -e "$ROMMSYNC_FLEET_DIR/gaveup-42" ] \
+      && fail "the record outlived the work: status lists a finished issue forever, and the file never goes"
+    grep -q "dropping the record" <<<"$out" || fail "it dropped it silently: $out"
+    echo "ok: a give-up record is dropped once its issue lands"
+    ;;
+  list_says_declined)
+    make_fixture ok
+    issue_labels "ready,needs-human-step"
+    out="$(in_fleet cmd_run --max-prs 1 148 2>&1)"
+    grep -q "fleet down" <<<"$out" || fail "the run never terminated: $out"
+    grep -q "every issue it was given has landed$" <<<"$out" \
+      && fail "it reported an issue it declined as landed: $out"
+    grep -q "declined" <<<"$out" || fail "the last line does not say what really happened: $out"
+    echo "ok: a run that declined its issues does not report that they landed"
+    ;;
   *)
-    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry" >&2
+    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined" >&2
     exit 2 ;;
 esac

@@ -476,6 +476,19 @@ rather than removing them. `origin/main` is read as it stands and never fetched:
 a stale one only ever makes commits look absent that are in fact merged, so every
 error it can cause keeps a worktree rather than deleting one.
 
+That pair answers *is anything here worth keeping*. It does not answer *is anyone
+using this* — every by-hand check behind it was made on a worktree that was
+already finished — and this file is where the two come apart: **an agent plans
+before it edits**, so a worktree forty minutes into real work is legitimately
+empty. `blocked` is not a label a person types either —
+`unblock.yml` re-derives it on every merge, so it can arrive under an agent that
+is mid-plan, as `needs-human-step` can arrive from the agent's own hand. So the
+first pass that finds a reason **warns**: it interrupts the agent, says on the
+card that the worktree goes next pass, and leaves it. The pass after that asks
+the pair again — a minute is long enough to commit, or to write a plan down — and
+only then removes it. If the agent is working on a `blocked` issue, that is the
+point: the label says stop.
+
 A time-box release has one extra half. Releasing the slot would otherwise hand
 the issue straight back to the front of the queue and to the same three hours, so
 the dispatcher records that it gave up and declines the issue — in `--auto` and
