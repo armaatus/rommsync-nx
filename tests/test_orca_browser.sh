@@ -172,6 +172,7 @@ case "$*" in
   *"repo view"*) printf 'armaatus/rommsync-nx\n' ;;
   *graphql*)     cat "$RS_FIXTURE/graphql.json" ;;
   *"pr view"*)   cat "$RS_FIXTURE/prview.json" ;;
+  *"/files"*)    cat "$RS_FIXTURE/files.txt" ;;
   *)             printf '\n' ;;
 esac
 GHSTUB
@@ -193,17 +194,18 @@ JSON
 }
 
 # The checks/mergeability half. $1 is the statusCheckRollup array, $2 the
-# mergeStateStatus, $3 the changed-file paths as a JSON array of objects.
+# mergeStateStatus, $3 the changed files one per line -- the same shape
+# `gh api --paginate .../files --jq .[].filename` hands back in CI.
 write_pr_checks() {
   cat >"$TMPDIR_FIXTURE/prview.json" <<JSON
 {
   "headRefOid":"$RS_HEAD",
   "mergeStateStatus":"$2",
   "autoMergeRequest":{"enabledAt":"2026-09-07T00:00:00Z"},
-  "files":[$3],
   "statusCheckRollup":[$1]
 }
 JSON
+  printf '%s\n' "$3" >"$TMPDIR_FIXTURE/files.txt"
 }
 
 run_review_status() {
@@ -865,7 +867,7 @@ STUB
     write_pr_checks \
       '{"name":"host-tests","status":"COMPLETED","conclusion":"SUCCESS",
         "startedAt":"2026-09-06T09:00:00Z","completedAt":"2026-09-06T09:30:00Z"}' \
-      BLOCKED '{"path":"core/src/sync.cpp"}'
+      BLOCKED core/src/sync.cpp
     out="$(run_review_status)"; rc=$?
     [ "$rc" = 1 ] || fail "expected exit 1 (an unresolved thread is not ready), got $rc: $out"
     grep -q "THE ONE STILL OPEN" <<<"$out" \
@@ -880,6 +882,183 @@ STUB
     grep -q "outdated -- still open" <<<"$out" \
       || fail "an outdated-but-unresolved thread must be shown as still open: $out"
     echo "PASS: only unresolved threads are listed, with the ID needed to resolve them"
+    ;;
+
+  review_status_ignores_superseded_checks)
+    # #84: merge-gate runs several times on one head by design -- it re-evaluates
+    # when a review lands -- and every run before the review is an honest
+    # failure. GitHub resolves a required check from the NEWEST run of that name;
+    # `statusCheckRollup` hands back all of them un-deduplicated. Judging the raw
+    # list reports "check failed: merge-gate" on a PR GitHub calls CLEAN, and the
+    # fleet loop is told to keep going until this exits 0 -- so it loops forever
+    # against a green PR. Seen on #100 and #108.
+    make_review_status_fixture
+    write_pr_reviews \
+      '{"state":"COMMENTED","submittedAt":"2026-09-06T10:00:00Z",
+        "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
+        "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.",
+        "comments":{"totalCount":0}}' \
+      '' '"## Plan\n/code-review high\nmattpocock-skills:code-review\n"'
+    write_pr_checks \
+      '{"name":"merge-gate","status":"COMPLETED","conclusion":"FAILURE",
+        "startedAt":"2026-09-06T09:00:00Z","completedAt":"2026-09-06T09:00:10Z",
+        "detailsUrl":"https://github.com/armaatus/rommsync-nx/actions/runs/1/job/11"},
+       {"name":"merge-gate","status":"COMPLETED","conclusion":"SUCCESS",
+        "startedAt":"2026-09-06T11:00:00Z","completedAt":"2026-09-06T11:00:10Z",
+        "detailsUrl":"https://github.com/armaatus/rommsync-nx/actions/runs/2/job/22"},
+       {"name":"host-tests","status":"COMPLETED","conclusion":"SUCCESS",
+        "startedAt":"2026-09-06T09:00:00Z","completedAt":"2026-09-06T09:30:00Z"}' \
+      CLEAN core/src/sync.cpp
+    out="$(run_review_status)"; rc=$?
+    [ "$rc" = 0 ] || fail "a superseded merge-gate failure must not count -- GitHub reads the newest run of a name; got $rc: $out"
+    grep -q "check failed" <<<"$out" \
+      && fail "reported a check that its own newer run superseded: $out"
+    echo "PASS: only the newest run of each check name is judged"
+    ;;
+
+  review_status_mirrors_the_gate_on_who_reviewed)
+    # The local answer and the required check must not be able to disagree: a
+    # review-status that says "ready" on a PR merge-gate refuses is how a PR
+    # sits quietly BLOCKED, which is the failure mode #84 is about. The two
+    # rules the gate has and prose alone would drift on: a review by the PR's
+    # own author is not independent, and an empty review record is not a review
+    # (PR #95 merged on one whose whole body was the word "test").
+    make_review_status_fixture
+    write_pr_reviews \
+      '{"state":"COMMENTED","submittedAt":"2026-09-06T10:00:00Z",
+        "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"armaatus"},
+        "body":"The author reviewing itself, at length, which is not independence.",
+        "comments":{"totalCount":0}},
+       {"state":"COMMENTED","submittedAt":"2026-09-06T10:05:00Z",
+        "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
+        "body":"test","comments":{"totalCount":0}}' \
+      '' '"## Plan\n/code-review high\nmattpocock-skills:code-review\n"'
+    write_pr_checks \
+      '{"name":"host-tests","status":"COMPLETED","conclusion":"SUCCESS",
+        "startedAt":"2026-09-06T09:00:00Z","completedAt":"2026-09-06T09:30:00Z"}' \
+      BLOCKED core/src/sync.cpp
+    out="$(run_review_status)"; rc=$?
+    [ "$rc" = 1 ] || fail "a self-review plus an empty record is not a reviewed PR; got $rc: $out"
+    grep -qi "empty" <<<"$out" \
+      || fail "did not say the only independent review is empty, which is what merge-gate will say: $out"
+    echo "PASS: review-status answers who reviewed with merge_gate.py's own rule"
+    ;;
+
+  review_status_says_a_human_merges_this_one)
+    # merge-gate refuses the enforcement layer on purpose, so its FAILURE on such
+    # a PR is the gate working. Reported as a plain "check failed" it reads as
+    # something to fix, and the agent spends its three review rounds trying to
+    # turn green a gate that never will (#96). Distinct exit code, so the brief's
+    # loop can stop rather than lap.
+    make_review_status_fixture
+    write_pr_reviews \
+      '{"state":"COMMENTED","submittedAt":"2026-09-06T10:00:00Z",
+        "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
+        "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.",
+        "comments":{"totalCount":0}}' \
+      '' '"## Plan\n/code-review high\nmattpocock-skills:code-review\n"'
+    write_pr_checks \
+      '{"name":"merge-gate","status":"COMPLETED","conclusion":"FAILURE",
+        "startedAt":"2026-09-06T11:00:00Z","completedAt":"2026-09-06T11:00:10Z",
+        "detailsUrl":"https://github.com/armaatus/rommsync-nx/actions/runs/2/job/22"},
+       {"name":"host-tests","status":"COMPLETED","conclusion":"SUCCESS",
+        "startedAt":"2026-09-06T09:00:00Z","completedAt":"2026-09-06T09:30:00Z"}' \
+      BLOCKED '.github/workflows/merge-gate.yml
+core/src/sync.cpp'
+    out="$(run_review_status)"; rc=$?
+    [ "$rc" = 4 ] || fail "a PR touching the enforcement layer needs its own answer, not 'not ready'; got $rc: $out"
+    grep -qi "human" <<<"$out" \
+      || fail "did not say a person merges this one: $out"
+    grep -q ".github/workflows/merge-gate.yml" <<<"$out" \
+      || fail "did not name the path that makes it human-merge-only: $out"
+    echo "PASS: an enforcement-layer PR is reported as human-merge, not as a failure to fix"
+    ;;
+
+  review_status_names_the_wedge)
+    # The #84 wedge itself: every latest check green, every thread resolved, and
+    # GitHub still says BLOCKED, because branch protection is still counting a
+    # stale run. Whatever else happens, this must not be silent -- the script
+    # says which run is holding it and the command that clears it, rather than
+    # printing "ready" at an agent whose PR will never merge.
+    make_review_status_fixture
+    write_pr_reviews \
+      '{"state":"COMMENTED","submittedAt":"2026-09-06T10:00:00Z",
+        "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
+        "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.",
+        "comments":{"totalCount":0}}' \
+      '' '"## Plan\n/code-review high\nmattpocock-skills:code-review\n"'
+    write_pr_checks \
+      '{"name":"merge-gate","status":"COMPLETED","conclusion":"FAILURE",
+        "startedAt":"2026-09-06T09:00:00Z","completedAt":"2026-09-06T09:00:10Z",
+        "detailsUrl":"https://github.com/armaatus/rommsync-nx/actions/runs/34061892166/job/11"},
+       {"name":"merge-gate","status":"COMPLETED","conclusion":"SUCCESS",
+        "startedAt":"2026-09-06T11:00:00Z","completedAt":"2026-09-06T11:00:10Z",
+        "detailsUrl":"https://github.com/armaatus/rommsync-nx/actions/runs/2/job/22"}' \
+      BLOCKED core/src/sync.cpp
+    out="$(run_review_status)"; rc=$?
+    [ "$rc" = 1 ] || fail "GitHub says BLOCKED, so this PR is not ready however green it looks; got $rc: $out"
+    grep -q "BLOCKED" <<<"$out" \
+      || fail "did not report GitHub's own verdict on the PR: $out"
+    grep -q "34061892166" <<<"$out" \
+      || fail "did not name the stale run still being counted: $out"
+    grep -q "gh run rerun" <<<"$out" \
+      || fail "did not print the command that clears it: $out"
+    echo "PASS: a PR wedged on a stale check run says so, and says what clears it"
+    ;;
+
+  review_status_waits_for_the_run_in_flight)
+    # The gate job is `cancel-in-progress`, so the ordinary sequence is: a run
+    # starts, the review lands, a second run starts and CANCELS the first. The
+    # cancelled run therefore FINISHES a few seconds after the live one STARTED.
+    # Ordering by completion time then picks the cancelled run as the newest of
+    # its name and reports "check failed" while the real gate is still running --
+    # the misreport this whole change exists to remove, reintroduced through the
+    # clock. Newest is by start, and a run with no conclusion yet is in flight.
+    make_review_status_fixture
+    write_pr_reviews \
+      '{"state":"COMMENTED","submittedAt":"2026-09-06T10:00:00Z",
+        "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
+        "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.",
+        "comments":{"totalCount":0}}' \
+      '' '"## Plan\n/code-review high\nmattpocock-skills:code-review\n"'
+    write_pr_checks \
+      '{"name":"merge-gate","status":"COMPLETED","conclusion":"CANCELLED",
+        "startedAt":"2026-09-06T09:00:00Z","completedAt":"2026-09-06T09:10:05Z",
+        "detailsUrl":"https://github.com/armaatus/rommsync-nx/actions/runs/1/job/11"},
+       {"name":"merge-gate","status":"IN_PROGRESS","conclusion":null,
+        "startedAt":"2026-09-06T09:10:00Z","completedAt":null,
+        "detailsUrl":"https://github.com/armaatus/rommsync-nx/actions/runs/2/job/22"}' \
+      BLOCKED core/src/sync.cpp
+    out="$(run_review_status)"; rc=$?
+    [ "$rc" = 1 ] || fail "a gate still in flight is not ready yet; got $rc: $out"
+    grep -q "check still running: merge-gate" <<<"$out" \
+      || fail "did not report the run in flight as running: $out"
+    grep -q "check failed" <<<"$out" \
+      && fail "reported the run the live one cancelled as the current answer: $out"
+    echo "PASS: the newest run of a name is the one that started last, not the one that ended last"
+    ;;
+
+  review_status_reports_a_conflict_before_the_human_merge)
+    # Exit 4 tells the agent to stop, so it must not be reachable while something
+    # is still wrong. A conflict with the base blocks EVERY merge, a person's
+    # included -- announcing "nothing here is left to fix" on one leaves the PR
+    # parked with the one thing that had to be said unsaid.
+    make_review_status_fixture
+    write_pr_reviews \
+      '{"state":"COMMENTED","submittedAt":"2026-09-06T10:00:00Z",
+        "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
+        "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.",
+        "comments":{"totalCount":0}}' \
+      '' '"## Plan\n/code-review high\nmattpocock-skills:code-review\n"'
+    write_pr_checks \
+      '{"name":"host-tests","status":"COMPLETED","conclusion":"SUCCESS",
+        "startedAt":"2026-09-06T09:00:00Z","completedAt":"2026-09-06T09:30:00Z"}' \
+      DIRTY '.claude/hooks/guard.py'
+    out="$(run_review_status)"; rc=$?
+    [ "$rc" = 1 ] || fail "a conflicted PR is not finished, whoever merges it; got $rc: $out"
+    grep -qi "conflict" <<<"$out" \
+      || fail "did not say the branch conflicts with its base: $out"
+    echo "PASS: a conflict is reported even on a PR only a human can merge"
     ;;
 
   brief_never_lists_threads_over_rest)
@@ -1138,127 +1317,6 @@ PYCHECK
     echo "PASS: every human-merge-path claim names the full set merge-gate refuses"
     ;;
 
-  review_status_ignores_superseded_checks)
-    # #84: merge-gate runs several times on one head by design -- it re-evaluates
-    # when a review lands -- and every run before the review is an honest
-    # failure. GitHub resolves a required check from the NEWEST run of that name;
-    # `statusCheckRollup` hands back all of them un-deduplicated. Judging the raw
-    # list reports "check failed: merge-gate" on a PR GitHub calls CLEAN, and the
-    # fleet loop is told to keep going until this exits 0 -- so it loops forever
-    # against a green PR. Seen on #100 and #108.
-    make_review_status_fixture
-    write_pr_reviews \
-      '{"state":"COMMENTED","submittedAt":"2026-09-06T10:00:00Z",
-        "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
-        "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.",
-        "comments":{"totalCount":0}}' \
-      '' '"## Plan\n/code-review high\nmattpocock-skills:code-review\n"'
-    write_pr_checks \
-      '{"name":"merge-gate","status":"COMPLETED","conclusion":"FAILURE",
-        "startedAt":"2026-09-06T09:00:00Z","completedAt":"2026-09-06T09:00:10Z",
-        "detailsUrl":"https://github.com/armaatus/rommsync-nx/actions/runs/1/job/11"},
-       {"name":"merge-gate","status":"COMPLETED","conclusion":"SUCCESS",
-        "startedAt":"2026-09-06T11:00:00Z","completedAt":"2026-09-06T11:00:10Z",
-        "detailsUrl":"https://github.com/armaatus/rommsync-nx/actions/runs/2/job/22"},
-       {"name":"host-tests","status":"COMPLETED","conclusion":"SUCCESS",
-        "startedAt":"2026-09-06T09:00:00Z","completedAt":"2026-09-06T09:30:00Z"}' \
-      CLEAN '{"path":"core/src/sync.cpp"}'
-    out="$(run_review_status)"; rc=$?
-    [ "$rc" = 0 ] || fail "a superseded merge-gate failure must not count -- GitHub reads the newest run of a name; got $rc: $out"
-    grep -q "check failed" <<<"$out" \
-      && fail "reported a check that its own newer run superseded: $out"
-    echo "PASS: only the newest run of each check name is judged"
-    ;;
-
-  review_status_mirrors_the_gate_on_who_reviewed)
-    # The local answer and the required check must not be able to disagree: a
-    # review-status that says "ready" on a PR merge-gate refuses is how a PR
-    # sits quietly BLOCKED, which is the failure mode #84 is about. The two
-    # rules the gate has and prose alone would drift on: a review by the PR's
-    # own author is not independent, and an empty review record is not a review
-    # (PR #95 merged on one whose whole body was the word "test").
-    make_review_status_fixture
-    write_pr_reviews \
-      '{"state":"COMMENTED","submittedAt":"2026-09-06T10:00:00Z",
-        "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"armaatus"},
-        "body":"The author reviewing itself, at length, which is not independence.",
-        "comments":{"totalCount":0}},
-       {"state":"COMMENTED","submittedAt":"2026-09-06T10:05:00Z",
-        "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
-        "body":"test","comments":{"totalCount":0}}' \
-      '' '"## Plan\n/code-review high\nmattpocock-skills:code-review\n"'
-    write_pr_checks \
-      '{"name":"host-tests","status":"COMPLETED","conclusion":"SUCCESS",
-        "startedAt":"2026-09-06T09:00:00Z","completedAt":"2026-09-06T09:30:00Z"}' \
-      BLOCKED '{"path":"core/src/sync.cpp"}'
-    out="$(run_review_status)"; rc=$?
-    [ "$rc" = 1 ] || fail "a self-review plus an empty record is not a reviewed PR; got $rc: $out"
-    grep -qi "empty" <<<"$out" \
-      || fail "did not say the only independent review is empty, which is what merge-gate will say: $out"
-    echo "PASS: review-status answers who reviewed with merge_gate.py's own rule"
-    ;;
-
-  review_status_says_a_human_merges_this_one)
-    # merge-gate refuses the enforcement layer on purpose, so its FAILURE on such
-    # a PR is the gate working. Reported as a plain "check failed" it reads as
-    # something to fix, and the agent spends its three review rounds trying to
-    # turn green a gate that never will (#96). Distinct exit code, so the brief's
-    # loop can stop rather than lap.
-    make_review_status_fixture
-    write_pr_reviews \
-      '{"state":"COMMENTED","submittedAt":"2026-09-06T10:00:00Z",
-        "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
-        "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.",
-        "comments":{"totalCount":0}}' \
-      '' '"## Plan\n/code-review high\nmattpocock-skills:code-review\n"'
-    write_pr_checks \
-      '{"name":"merge-gate","status":"COMPLETED","conclusion":"FAILURE",
-        "startedAt":"2026-09-06T11:00:00Z","completedAt":"2026-09-06T11:00:10Z",
-        "detailsUrl":"https://github.com/armaatus/rommsync-nx/actions/runs/2/job/22"},
-       {"name":"host-tests","status":"COMPLETED","conclusion":"SUCCESS",
-        "startedAt":"2026-09-06T09:00:00Z","completedAt":"2026-09-06T09:30:00Z"}' \
-      BLOCKED '{"path":".github/workflows/merge-gate.yml"},{"path":"core/src/sync.cpp"}'
-    out="$(run_review_status)"; rc=$?
-    [ "$rc" = 4 ] || fail "a PR touching the enforcement layer needs its own answer, not 'not ready'; got $rc: $out"
-    grep -qi "human" <<<"$out" \
-      || fail "did not say a person merges this one: $out"
-    grep -q ".github/workflows/merge-gate.yml" <<<"$out" \
-      || fail "did not name the path that makes it human-merge-only: $out"
-    echo "PASS: an enforcement-layer PR is reported as human-merge, not as a failure to fix"
-    ;;
-
-  review_status_names_the_wedge)
-    # The #84 wedge itself: every latest check green, every thread resolved, and
-    # GitHub still says BLOCKED, because branch protection is still counting a
-    # stale run. Whatever else happens, this must not be silent -- the script
-    # says which run is holding it and the command that clears it, rather than
-    # printing "ready" at an agent whose PR will never merge.
-    make_review_status_fixture
-    write_pr_reviews \
-      '{"state":"COMMENTED","submittedAt":"2026-09-06T10:00:00Z",
-        "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
-        "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.",
-        "comments":{"totalCount":0}}' \
-      '' '"## Plan\n/code-review high\nmattpocock-skills:code-review\n"'
-    write_pr_checks \
-      '{"name":"merge-gate","status":"COMPLETED","conclusion":"FAILURE",
-        "startedAt":"2026-09-06T09:00:00Z","completedAt":"2026-09-06T09:00:10Z",
-        "detailsUrl":"https://github.com/armaatus/rommsync-nx/actions/runs/34061892166/job/11"},
-       {"name":"merge-gate","status":"COMPLETED","conclusion":"SUCCESS",
-        "startedAt":"2026-09-06T11:00:00Z","completedAt":"2026-09-06T11:00:10Z",
-        "detailsUrl":"https://github.com/armaatus/rommsync-nx/actions/runs/2/job/22"}' \
-      BLOCKED '{"path":"core/src/sync.cpp"}'
-    out="$(run_review_status)"; rc=$?
-    [ "$rc" = 1 ] || fail "GitHub says BLOCKED, so this PR is not ready however green it looks; got $rc: $out"
-    grep -q "BLOCKED" <<<"$out" \
-      || fail "did not report GitHub's own verdict on the PR: $out"
-    grep -q "34061892166" <<<"$out" \
-      || fail "did not name the stale run still being counted: $out"
-    grep -q "gh run rerun" <<<"$out" \
-      || fail "did not print the command that clears it: $out"
-    echo "PASS: a PR wedged on a stale check run says so, and says what clears it"
-    ;;
-
   *)
     echo "usage: $0 opens|reuses|foreign|no_romm|submits|no_draft|unstable" >&2
     echo "       watch_needs_issue|watch_late_draft|watch_grace|watch_submits|watch_single" >&2
@@ -1277,6 +1335,8 @@ PYCHECK
     echo "       review_status_mirrors_the_gate_on_who_reviewed" >&2
     echo "       review_status_says_a_human_merges_this_one" >&2
     echo "       review_status_names_the_wedge" >&2
+    echo "       review_status_waits_for_the_run_in_flight" >&2
+    echo "       review_status_reports_a_conflict_before_the_human_merge" >&2
     exit 2
     ;;
 esac

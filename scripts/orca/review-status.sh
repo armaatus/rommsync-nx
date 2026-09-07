@@ -16,13 +16,18 @@
 # whose lines moved is still open.
 #
 # WHO COUNTS AS A REVIEWER IS NOT DECIDED HERE. This imports
-# .github/scripts/merge_gate.py and asks it, because the local answer and the
-# required check must not be able to disagree: a review-status that says "ready"
-# on a PR merge-gate refuses is precisely how a PR sits quietly BLOCKED. The
-# rules that mattered when this was a paraphrase -- the latest review per author
-# rather than the sticky `reviewDecision`, a self-review not counting, an empty
-# review record not counting -- now have one implementation and one place to
-# change them.
+# .github/scripts/merge_gate.py and asks it, because a review-status that says
+# "ready" on a PR merge-gate refuses is precisely how a PR sits quietly BLOCKED.
+# The rules that mattered when this was a paraphrase -- the latest review per
+# author rather than the sticky `reviewDecision`, a self-review not counting, an
+# empty review record not counting -- now have one implementation and one place
+# to change them.
+#
+# With one gap that cannot be closed from here: CI runs the BASE branch's copy of
+# that script (merge-gate.yml checks out `base.sha`, so a PR cannot pass its own
+# gate by rewriting it), while this runs the copy in the worktree. On a PR
+# editing merge_gate.py the two therefore judge by different rules -- which is
+# also a PR only a person can merge, so the exit-4 answer below says so.
 #
 # Checks are judged as GitHub judges them: the NEWEST run of each check name.
 # `merge-gate` runs several times on one head by design, and every run before the
@@ -45,8 +50,8 @@ pr="${1:-}"
 owner_repo="$(GH_PAGER=cat gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null)" || exit 2
 owner="${owner_repo%%/*}"; name="${owner_repo##*/}"
 
-payload="$(mktemp)"; checks="$(mktemp)"
-trap 'rm -f "$payload" "$checks"' EXIT
+payload="$(mktemp)"; checks="$(mktemp)"; files="$(mktemp)"
+trap 'rm -f "$payload" "$checks" "$files"' EXIT
 
 # Written to files and read back, never spliced into a Python source string.
 # Review bodies are third-party text: one containing a quote sequence would
@@ -71,35 +76,46 @@ query($owner:String!,$name:String!,$pr:Int!){
   }
 }' >"$payload" 2>/dev/null || { echo "could not read the PR's reviews" >&2; exit 2; }
 
-# One call for everything GitHub itself knows about mergeability. `files` decides
-# whether this is a human-merge PR, and `mergeStateStatus` is the only thing that
-# can see a stale check run branch protection is still counting -- the wedge in
-# #84, which is invisible from the rollup alone because the newest run of every
-# name is green.
+# `mergeStateStatus` is the only thing that can see a stale check run branch
+# protection is still counting -- the wedge in #84, which is invisible from the
+# rollup alone because the newest run of every name is green.
 GH_PAGER=cat gh pr view "$pr" \
-  --json headRefOid,statusCheckRollup,mergeStateStatus,autoMergeRequest,files \
+  --json headRefOid,statusCheckRollup,mergeStateStatus,autoMergeRequest \
   >"$checks" 2>/dev/null || exit 2
 
-python3 - "$pr" "$payload" "$checks" <<'PY'
+# Paginated, because `gh pr view --json files` stops at 100 and the gate's own
+# Gather step paginates. A PR whose only enforcement-layer path sorts past the
+# 100th file would otherwise be told to fix a merge-gate failure that is the gate
+# working as designed.
+GH_PAGER=cat gh api --paginate "repos/$owner/$name/pulls/$pr/files" \
+  --jq '.[].filename' >"$files" 2>/dev/null || exit 2
+
+python3 - "$pr" "$payload" "$checks" "$files" <<'PY'
 import json, sys
 
 sys.path.insert(0, ".github/scripts")
 try:
     from merge_gate import HUMAN_ONLY_PREFIXES, evaluate
-except ImportError:
-    print("could not import .github/scripts/merge_gate.py, which is the rule this "
-          "PR will actually be judged by. Nothing here can answer without it.",
-          file=sys.stderr)
+except Exception as exc:  # missing, half-edited, or broken at import time
+    # Deliberately not ImportError alone. merge_gate.py is a file agents in this
+    # repo edit, and a SyntaxError in it would otherwise reach the caller as an
+    # exit 1 with a traceback -- "not ready", which sends an agent back to
+    # await-review.sh for feedback that cannot exist. This is exit 2, "could not
+    # tell", which is what it is.
+    print(f"could not load .github/scripts/merge_gate.py ({exc}), which is the "
+          "rule this PR will actually be judged by. Nothing here can answer "
+          "without it.", file=sys.stderr)
     raise SystemExit(2)
 
-pr, payload_path, checks_path = sys.argv[1:4]
+pr, payload_path, checks_path, files_path = sys.argv[1:5]
 pull = json.load(open(payload_path))["data"]["repository"]["pullRequest"]
 view = json.load(open(checks_path))
 head = view.get("headRefOid") or ""
 checks = view.get("statusCheckRollup") or []
 merge_state = (view.get("mergeStateStatus") or "UNKNOWN").upper()
 queued = view.get("autoMergeRequest") is not None
-files = [f.get("path") for f in (view.get("files") or []) if f.get("path")]
+with open(files_path) as fh:
+    files = [line.strip() for line in fh if line.strip()]
 
 problems = []
 
@@ -116,8 +132,11 @@ gate_view = dict(pull, reviewThreads={"nodes": []})
 ok, lines = evaluate(head, gate_view, [f for f in files if f not in protected])
 if not ok:
     # evaluate() returns a heading plus two-space-indented problems; this prints
-    # its own heading.
-    problems.extend(line[2:] for line in lines[1:])
+    # its own heading, and un-indents defensively rather than by slicing blind --
+    # the gate is a separate file, and a change to how it formats must not be
+    # able to swallow a character of the reason it gives.
+    problems.extend(line[2:] if line.startswith("  ") else line
+                    for line in lines[1:])
 
 unresolved = [t for t in pull["reviewThreads"]["nodes"] if not t["isResolved"]]
 if unresolved:
@@ -140,9 +159,18 @@ if unresolved:
 
 
 def when(check):
-    """When GitHub would consider this run the newest of its name."""
-    return (check.get("completedAt") or check.get("startedAt")
-            or check.get("createdAt") or "")
+    """When GitHub would consider this run the newest of its name.
+
+    By start, never by completion. The gate job is `cancel-in-progress`, so the
+    ordinary sequence on any PR is: a run starts, the review lands, a second run
+    starts and cancels the first -- which means the CANCELLED run finishes
+    seconds AFTER the live one began. Ordered by completion, that cancelled run
+    is the newest of its name, and this reports "check failed: merge-gate" while
+    the real gate is still running: the misreport this script exists to remove,
+    arriving through the clock instead of through the rollup.
+    """
+    return (check.get("startedAt") or check.get("createdAt")
+            or check.get("completedAt") or "")
 
 
 # Newest run per check NAME, which is how branch protection resolves a required
@@ -163,8 +191,11 @@ for i, c in enumerate(checks):
 DEAD = ("FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "ERROR")
 # A check that has not finished is not a failure, but it is not ready either.
 bad = [c for c in newest.values() if (c.get("conclusion") or c.get("state")) in DEAD]
+# `status` is a CheckRun field; a legacy commit status carries `state` instead,
+# so PENDING has to be looked for in both or it counts as green.
 pending = [c for c in newest.values()
            if c.get("status") in ("IN_PROGRESS", "QUEUED", "PENDING")
+           or (c.get("state") or "").upper() in ("PENDING", "EXPECTED")
            or not (c.get("conclusion") or c.get("state"))]
 for c in bad:
     name = c.get("name") or c.get("context")
@@ -180,6 +211,20 @@ if problems:
         print("  " + p)
     raise SystemExit(1)
 
+# Before the human-merge verdict, because exit 4 tells the agent to stop and a
+# conflict blocks EVERY merge, a person's included. Announcing "nothing here is
+# left to fix" on a conflicted branch parks the PR with the one thing that had to
+# be said unsaid.
+if merge_state in ("DIRTY", "BEHIND"):
+    print(f"PR #{pr} is not ready, and GitHub says {merge_state}:")
+    if merge_state == "DIRTY":
+        print("  the branch conflicts with its base. Rebase, push, and come back.")
+    else:
+        print("  the branch is behind its base and the base requires being up to "
+              "date. Update it.")
+    print("  Do NOT wait for another review; no review can fix this.")
+    raise SystemExit(1)
+
 if protected:
     print(f"PR #{pr} is ready, and a human merges it.")
     print("  It touches the enforcement layer, which never merges itself:")
@@ -189,6 +234,11 @@ if protected:
           "rules judging")
     print("  PRs is not merged by the machinery those rules govern. Nothing here "
           "is left to fix.")
+    if ".github/scripts/merge_gate.py" in protected:
+        print("  Note that CI judged this PR by the BASE branch's copy of that "
+              "script and this")
+        print("  read the one in the worktree, so the two answered by different "
+              "rules.")
     print("  Set the worktree comment to \"ready, needs a human merge -- touches "
           f"{protected[0]}\" and stop.")
     raise SystemExit(4)
@@ -197,37 +247,46 @@ if protected:
 # is one this script cannot see from the rollup: a stale run of a name whose
 # newest run is green, still counted by branch protection. That is #84, and it
 # is silent -- the PR sits at BLOCKED with auto-merge queued and never fires.
-if merge_state in ("BLOCKED", "BEHIND", "DIRTY"):
-    print(f"PR #{pr} looks ready here, and GitHub says {merge_state}:")
-    if merge_state == "DIRTY":
-        print("  the branch conflicts with its base. Rebase, push, and come back.")
-    elif merge_state == "BEHIND":
-        print("  the branch is behind its base and the base requires being up to "
-              "date. Update it.")
+if merge_state == "BLOCKED":
+    print(f"PR #{pr} looks ready here, and GitHub says BLOCKED:")
+    # Newest first, so the run most likely to be the one still counted is the
+    # one read first. Which of these branch protection actually requires is not
+    # knowable without admin on the branch rules, so they are all offered rather
+    # than one of them asserted -- re-running a job that was not the problem
+    # costs a minute; naming the wrong one as the answer costs a review round.
+    left = sorted((c for c in superseded
+                   if (c.get("conclusion") or c.get("state")) in DEAD),
+                  key=when, reverse=True)
+    if left:
+        print("  a stale run whose own newer run passed is still on this commit, "
+              "and if it is")
+        print("  a required check then branch protection is still counting it:")
+        for c in left:
+            print(f"    {c.get('name') or c.get('context')}  "
+                  f"{c.get('conclusion') or c.get('state')}  "
+                  f"{c.get('detailsUrl') or ''}")
+        print("  Re-running one updates its check in place, which is what clears "
+              "it:")
+        print("    gh run rerun --job <the job id at the end of that URL>")
+        print("  then run this again. Do NOT wait for another review -- there is "
+              "nothing to review.")
     else:
-        left = [c for c in superseded
-                if (c.get("conclusion") or c.get("state")) in DEAD]
-        if left:
-            print("  branch protection is still counting a stale run whose own "
-                  "newer run passed:")
-            for c in left:
-                print(f"    {c.get('name') or c.get('context')}  "
-                      f"{c.get('conclusion') or c.get('state')}  "
-                      f"{c.get('detailsUrl') or ''}")
-            print("  Re-running that run updates its check in place, which is what "
-                  "clears it:")
-            print("    gh run rerun --job <the job id at the end of that URL>")
-            print("  then run this again. Do NOT wait for another review -- there "
-                  "is nothing to review.")
-        else:
-            print("  and nothing here can see why. Look at the PR's checks in the "
-                  "browser; a required")
-            print("  check may never have run on this head. Do NOT wait for "
-                  "another review.")
+        print("  and nothing here can see why. Look at the PR's checks in the "
+              "browser; a required")
+        print("  check may never have run on this head. Do NOT wait for another "
+              "review.")
     raise SystemExit(1)
 
 print(f"PR #{pr} is ready: every thread resolved, every check green, no standing "
       "objection.")
+if merge_state == "UNKNOWN":
+    # GitHub computes mergeability lazily and answers UNKNOWN until it has. That
+    # is usually transient and usually harmless -- but it is also the one state
+    # in which the BLOCKED check above cannot run, so say so rather than let a
+    # wedge pass as a clean bill of health.
+    print("GitHub had not computed this PR's mergeability yet, so a stale check "
+          "run could not be")
+    print("ruled out. If it has not merged in a few minutes, run this again.")
 if queued:
     print("Auto-merge is queued; GitHub merges it when the last required check "
           "passes. Stop here.")
