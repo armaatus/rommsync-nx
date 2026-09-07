@@ -53,28 +53,19 @@ owner="$orca_owner"; name="$orca_repo_name"
 payload="$(mktemp)"; checks="$(mktemp)"; files="$(mktemp)"
 trap 'rm -f "$payload" "$checks" "$files"' EXIT
 
-# Written to files and read back, never spliced into a Python source string.
+# Written to a file and read back, never spliced into a Python source string.
 # Review bodies are third-party text: one containing a quote sequence would
 # otherwise break the parse, or worse.
 #
-# `body`, `author` and each review's own body and inline-comment count are here
-# because merge_gate.evaluate() reads them -- this is the same shape the gate
-# gathers in CI, so the two see the same pull request.
-GH_PAGER=cat gh api graphql -F owner="$owner" -F name="$name" -F pr="$pr" -f query='
-query($owner:String!,$name:String!,$pr:Int!){
-  repository(owner:$owner,name:$name){
-    pullRequest(number:$pr){
-      body
-      author{login}
-      reviews(last:50){ nodes{ state submittedAt commit{oid} author{login}
-                               body comments(first:1){ totalCount } } }
-      reviewThreads(first:100){
-        nodes{ id isResolved isOutdated path line
-               comments(first:1){ nodes{ author{login} body } } }
-      }
-    }
-  }
-}' >"$payload" 2>/dev/null || { echo "could not read the PR's reviews" >&2; exit 2; }
+# The query is .github/scripts/pr_payload.sh, which is what merge-gate.yml's
+# Gather step runs too. Same reason as the merge_gate import below: this used to
+# carry its own copy, and a copy of a query is a copy of its bugs -- both asked
+# for `reviewThreads(first:100)` and both reported a clean thread list from the
+# first page of a longer one.
+# No 2>/dev/null here either: pr_payload.sh has already said which failure it
+# was, on stderr, and this line adds what that means rather than replacing it.
+orca_pr_payload "$pr" "$payload" \
+  || { echo "could not read the PR's reviews" >&2; exit 2; }
 
 # `mergeStateStatus` is the only thing that can see a stale check run branch
 # protection is still counting -- the wedge in #84, which is invisible from the
@@ -95,7 +86,7 @@ import json, sys
 
 sys.path.insert(0, ".github/scripts")
 try:
-    from merge_gate import HUMAN_ONLY_PREFIXES, evaluate
+    from merge_gate import HUMAN_ONLY_PREFIXES, evaluate, unresolved_threads
 except Exception as exc:  # missing, half-edited, or broken at import time
     # Deliberately not ImportError alone. merge_gate.py is a file agents in this
     # repo edit, and a SyntaxError in it would otherwise reach the caller as an
@@ -128,7 +119,15 @@ protected = sorted(f for f in files if f.startswith(HUMAN_ONLY_PREFIXES))
 # Everything about reviews comes from the gate itself, on the same pull request
 # minus the two things answered better here: threads (listed in full below) and
 # the protected paths (their own verdict, not a problem to fix).
-gate_view = dict(pull, reviewThreads={"nodes": []})
+#
+# The thread NODES are held back; the pageInfo is not. "This list is only the
+# first page" is the gate's verdict to give, not a thread to report, and
+# dropping it here would make the local answer cleaner than the one CI gives --
+# the drift the import above exists to prevent.
+gate_view = dict(pull, reviewThreads={
+    "nodes": [],
+    "pageInfo": (pull.get("reviewThreads") or {}).get("pageInfo") or {},
+})
 ok, lines = evaluate(head, gate_view, [f for f in files if f not in protected])
 if not ok:
     # evaluate() returns a heading plus two-space-indented problems; this prints
@@ -138,7 +137,7 @@ if not ok:
     problems.extend(line[2:] if line.startswith("  ") else line
                     for line in lines[1:])
 
-unresolved = [t for t in pull["reviewThreads"]["nodes"] if not t["isResolved"]]
+unresolved = unresolved_threads(pull)
 if unresolved:
     # The whole thread, not just where it is. An agent that has to go and fetch
     # each body separately reaches for
@@ -156,6 +155,17 @@ if unresolved:
         problems.append(f"      thread: {t.get('id')}")
         for line in (first.get("body") or "").splitlines():
             problems.append(f"      {line}")
+    # Named here rather than left to the reader, because resolving by hand is
+    # only half of it: no GitHub event re-runs merge-gate when a thread closes,
+    # so a thread resolved with the bare mutation leaves the gate red on a
+    # problem that no longer exists.
+    # EVERY id, not a sample. A command that resolves some of them is a command
+    # an agent runs and then believes it is done, which is the same wrong answer
+    # from the other end.
+    problems.append("  Resolve them with:  ./scripts/orca/resolve-thread.sh "
+                    + " ".join(t.get("id") or "?" for t in unresolved))
+    problems.append("  That also asks merge-gate again once the last one is "
+                    "shut; nothing else does.")
 
 
 def when(check):

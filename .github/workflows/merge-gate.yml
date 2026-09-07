@@ -19,8 +19,16 @@ on:
   # There is NO trigger for thread resolution itself: `pull_request_review_thread`
   # is a webhook event, not a workflow trigger, and putting it here makes the
   # whole file invalid -- which shows up as a failed run with no jobs, named
-  # after the file. So resolving the last thread does not re-run this on its own;
-  # the push or the re-request that follows it does.
+  # after the file. actionlint rejects it too, so the check in evals/lint.sh
+  # catches a re-attempt before CI does.
+  #
+  # So resolving the last thread does not re-run this on its own, and for a long
+  # while nothing else did either: the gate stayed red on a thread that was
+  # already closed and auto-merge never fired. `scripts/orca/resolve-thread.sh`
+  # is what closes that -- it resolves the threads and then re-runs this
+  # workflow's own failed run on the head, which updates that check run IN
+  # PLACE, the same mechanism `clear-stale` below relies on. A dispatch could
+  # not: its check runs attach to the ref dispatched, not to a PR head.
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review, edited, review_requested]
   pull_request_review:
@@ -71,6 +79,20 @@ jobs:
           sparse-checkout: .github/scripts
           sparse-checkout-cone-mode: false
 
+      # BEFORE Gather, because Gather now runs a script from that same base
+      # checkout. A base predating it would otherwise kill the step with
+      # `No such file or directory` under `set -euo pipefail` -- a raw shell
+      # error in place of the deliberate notice below, on exactly the PR that
+      # introduces the file.
+      - name: Is there an agreed rule to judge this by?
+        run: |
+          set -euo pipefail
+          for f in .github/scripts/merge_gate.py .github/scripts/pr_payload.sh; do
+            [ -f "$f" ] && continue
+            echo "::error title=Human merge required::${{ github.event.pull_request.base.ref }} does not have $f yet, so there is no agreed rule to judge this PR by. A repository admin merges it by hand; every PR opened after it will be gated normally."
+            exit 1
+          done
+
       - name: Gather
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -80,34 +102,21 @@ jobs:
           set -euo pipefail
           owner="${NWO%%/*}"; name="${NWO##*/}"
           gh api --paginate "repos/$NWO/pulls/$PR/files" --jq '.[].filename' >files.txt
-          # The query is single-quoted on purpose: $owner, $name and $pr are
-          # GraphQL variables bound by the -F flags above, and must reach the
-          # server unexpanded.
-          # shellcheck disable=SC2016
-          gh api graphql -F owner="$owner" -F name="$name" -F pr="$PR" -f query='
-            query($owner:String!,$name:String!,$pr:Int!){
-              repository(owner:$owner,name:$name){
-                pullRequest(number:$pr){
-                  body
-                  author{login}
-                  reviews(last:50){ nodes{ state submittedAt commit{oid} author{login}
-                                          body comments(first:1){ totalCount } } }
-                  reviewThreads(first:100){ nodes{ isResolved path line } }
-                }
-              }
-            }' >pr.json
+          # The query itself is in .github/scripts/pr_payload.sh, next to the
+          # script that judges what it returns and checked out with it. It PAGES
+          # the review threads: `reviewThreads(first:100)` inline here was the
+          # first hundred, so a PR past that lost its newest threads and this
+          # step handed the gate a partial list to call clean.
+          bash .github/scripts/pr_payload.sh "$owner" "$name" "$PR" >pr.json
 
+      # The base branch may not have the gate yet -- on the pull request that
+      # introduces it, and on any PR opened from a base predating it. That is not
+      # an error to hide behind a Python traceback: it is a PR a person merges,
+      # for exactly the reason the gate exists. The step above says so, once, for
+      # both files rather than once per file at the point each is first touched.
       - name: Decide
         run: |
           set -euo pipefail
-          # The base branch may not have the gate yet -- on the pull request that
-          # introduces it, and on any PR opened from a base predating it. That is
-          # not an error to hide behind a Python traceback: it is a PR a person
-          # merges, for exactly the reason the gate exists. Say so.
-          if [ ! -f .github/scripts/merge_gate.py ]; then
-            echo "::error title=Human merge required::${{ github.event.pull_request.base.ref }} does not have .github/scripts/merge_gate.py yet, so there is no agreed rule to judge this PR by. A repository admin merges it by hand; every PR opened after it will be gated normally."
-            exit 1
-          fi
           python3 .github/scripts/merge_gate.py \
             "${{ github.event.pull_request.head.sha }}" pr.json files.txt
 
@@ -155,7 +164,9 @@ jobs:
           # reason -- an auth hiccup, an API shape change -- used to print the
           # same "nothing to do" as the true no-op, removing the one trail that
           # would explain why the fix silently did nothing.
-          if ! listing="$(gh run list --repo "$NWO" --workflow "merge gate" --limit 40 \
+          # By FILE NAME. `name:` is prose; a reworded one would make this find
+          # nothing and report the same "no stale gate runs" as the true no-op.
+          if ! listing="$(gh run list --repo "$NWO" --workflow merge-gate.yml --limit 40 \
                             --json databaseId,conclusion,headSha 2>&1)"; then
             echo "::warning title=Could not look for stale gate failures::$listing"
             exit 0

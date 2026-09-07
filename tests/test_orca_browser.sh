@@ -165,7 +165,10 @@ make_review_status_fixture() {
   make_fixture
   mkdir -p "$TMPDIR_FIXTURE/.github/scripts" "$TMPDIR_FIXTURE/stub-bin"
   cp "$REPO_ROOT"/scripts/orca/{review-status.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
-  cp "$REPO_ROOT"/.github/scripts/*.py "$TMPDIR_FIXTURE/.github/scripts/"
+  # The gate AND the gather: review-status.sh reads the PR through
+  # pr_payload.sh, which is the same paginated query merge-gate.yml runs.
+  cp "$REPO_ROOT"/.github/scripts/*.py \
+     "$REPO_ROOT/.github/scripts/pr_payload.sh" "$TMPDIR_FIXTURE/.github/scripts/"
   cat >"$TMPDIR_FIXTURE/stub-bin/gh" <<'GHSTUB'
 #!/usr/bin/env bash
 case "$*" in
@@ -182,13 +185,17 @@ GHSTUB
 
 # The reviews/threads half of the answer. $1 is the reviews array, $2 the
 # threads array, $3 the PR body.
+# $4, when given, is the reviewThreads pageInfo -- the default says the list is
+# complete, which is what every case but the truncation one wants.
 write_pr_reviews() {
+  local page_info="${4:-}"
+  [ -n "$page_info" ] || page_info='{"hasNextPage":false,"endCursor":null}'
   cat >"$TMPDIR_FIXTURE/graphql.json" <<JSON
 {"data":{"repository":{"pullRequest":{
   "body": $3,
   "author":{"login":"armaatus"},
   "reviews":{"nodes":[$1]},
-  "reviewThreads":{"nodes":[$2]}
+  "reviewThreads":{"pageInfo":$page_info,"nodes":[$2]}
 }}}}
 JSON
 }
@@ -1279,6 +1286,34 @@ core/src/sync.cpp'
     echo "PASS: the newest run of a name is the one that started last, not the one that ended last"
     ;;
 
+  review_status_refuses_a_partial_thread_page)
+    # The local answer must be no cleaner than the one CI gives. `merge-gate`
+    # refuses to answer when the thread list came back truncated -- every thread
+    # it did get can be resolved while an open one sits on the next page -- and
+    # review-status.sh hands the gate that pageInfo so it refuses here too.
+    # Without it the agent is told the PR is ready and the gate then blocks it.
+    make_review_status_fixture
+    write_pr_reviews \
+      '{"state":"COMMENTED","submittedAt":"2026-09-06T00:00:00Z",
+        "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
+        "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.",
+        "comments":{"totalCount":0}}' \
+      '{"id":"T_done","isResolved":true,"isOutdated":false,
+        "path":"core/src/sync.cpp","line":10,
+        "comments":{"nodes":[{"author":{"login":"claude"},"body":"RESOLVED"}]}}' \
+      '"## Plan\n/code-review high\nmattpocock-skills:code-review\n"' \
+      '{"hasNextPage":true,"endCursor":null}'
+    write_pr_checks \
+      '{"name":"host-tests","status":"COMPLETED","conclusion":"SUCCESS",
+        "startedAt":"2026-09-06T09:00:00Z","completedAt":"2026-09-06T09:30:00Z"}' \
+      CLEAN core/src/sync.cpp
+    out="$(run_review_status)"; rc=$?
+    [ "$rc" = 1 ] || fail "expected exit 1 on a half-read thread list, got $rc: $out"
+    grep -qi "truncated" <<<"$out" \
+      || fail "did not say the thread list was only partly read: $out"
+    echo "PASS: a truncated thread page is refused here as well as in the gate"
+    ;;
+
   review_status_reports_a_conflict_before_the_human_merge)
     # Exit 4 tells the agent to stop, so it must not be reachable while something
     # is still wrong. A conflict with the base blocks EVERY merge, a person's
@@ -2081,6 +2116,7 @@ STUB
     echo "       fleet_sees_a_merged_pr_that_says_fixes" >&2
     echo "       fleet_cannot_tell_when_the_pr_lookup_fails" >&2
     echo "       fleet_leaves_a_timed_out_agent_when_it_cannot_tell" >&2
+    echo "       review_status_refuses_a_partial_thread_page" >&2
     exit 2
     ;;
 esac

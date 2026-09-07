@@ -267,7 +267,7 @@ echo "== the flow's own scripts"
 # The brief names these by path. A rename that misses the brief turns into an
 # agent halfway through a task running a command that does not exist.
 for script in fleet.sh stop.sh await-review.sh review-status.sh record-review.sh \
-              issue-command.sh agent-autostart.sh; do
+              resolve-thread.sh issue-command.sh agent-autostart.sh; do
   path="scripts/orca/$script"
   [ -x "$path" ] || { fail "$path is missing or not executable"; continue; }
   bash -n "$path" || { fail "$path does not parse"; continue; }
@@ -275,7 +275,7 @@ for script in fleet.sh stop.sh await-review.sh review-status.sh record-review.sh
 done
 # ...and the brief must still name them.
 brief="$(sed -n "/^sed .*BRIEF/,/^BRIEF$/p" scripts/orca/issue-command.sh)"
-for named in record-review.sh await-review.sh review-status.sh; do
+for named in record-review.sh await-review.sh review-status.sh resolve-thread.sh; do
   grep -q "$named" <<<"$brief" \
     || fail "the agent brief no longer mentions $named, so the loop stops at that step"
 done
@@ -408,6 +408,89 @@ if [ -f "$review_wf" ]; then
   ok "the no-verdict notice is a comment, never a review"
 fi
 
+# The reviewer is told to submit its verdict with a command it can actually run.
+#
+# `claude_args` grants Read, Grep, Glob and a fixed list of gh/git calls -- no
+# Write, no generic Bash, no redirection and no mktemp. The prompt nonetheless
+# told it to submit with `--body-file <file>`, a file it had no way to create.
+# So a run only submitted at all if it improvised away from its instruction, and
+# PR #131 got three green review runs and zero reviews out of it. A green job
+# that did nothing is the shape nothing else here catches.
+if [ -f "$review_wf" ]; then
+  # 2>&1 because the checks below report by `sys.exit("...")`, which writes to
+  # stderr; without it the failure would print a reason that is an empty string.
+  if reason="$(python3 - "$review_wf" 2>&1 <<'REVIEWCMD'
+import re, sys
+
+text = open(sys.argv[1]).read()
+# From `review:` to the next top-level job key, BY SHAPE. Naming the job that
+# follows would hard-code the very thing the comment on the sed below says not
+# to, and the two slices of this same file must not disagree.
+start = text.find("\n  review:")
+if start < 0:
+    sys.exit("claude-review.yml has no `review:` job")
+after = re.search(r"\n  [a-z][a-z_-]*:\n", text[start + 1:])
+job = text[start:start + 1 + after.start()] if after else text[start:]
+
+args = re.search(r"claude_args:\s*(.+)", job)
+if not args:
+    sys.exit("the review job has no claude_args, so what it may run is unknown")
+allowed = args.group(1)
+# Anything that could create a file for --body-file to read.
+can_write = ("Write" in allowed
+             or re.search(r"Bash(?!\()", allowed)
+             or "Bash(mktemp" in allowed)
+# The COMMAND, not the word: the prompt explains why --body-file is wrong, and a
+# bare search flags its own explanation.
+told_to = [ln for ln in job.splitlines()
+           if "gh pr review" in ln and "--body-file" in ln]
+if told_to and not can_write:
+    sys.exit("the review prompt submits with `--body-file`, and the job grants "
+             "no tool that can create a file: " + told_to[0].strip())
+if "gh pr review" not in job:
+    sys.exit("the review prompt no longer names `gh pr review`, so nothing tells "
+             "it to submit a review at all")
+if "Bash(gh pr review:" not in allowed:
+    sys.exit("the review job does not allow `gh pr review`, so it cannot submit")
+REVIEWCMD
+)"
+  then
+    ok "the reviewer can run the command it is told to submit with"
+  else
+    # The check's OWN words. A fixed string here reported a renamed job or a
+    # missing claude_args as "the reviewer cannot run its submit command",
+    # which sends the reader to the wrong line.
+    fail "claude-review.yml: $reason"
+  fi
+
+  # A review is not a build. Cancelling the run that was producing the verdict
+  # leaves that head with none -- and the no-verdict notice is `needs: review`,
+  # so it does not fire either. #86's merged head and #81's both show
+  # `cancelled` for this job.
+  # From `review:` to the next top-level job key, by shape rather than by name:
+  # a range hard-coded to `verdict:` would silently swallow the rest of the file
+  # the day that job is renamed, and pick up the `mention` job's own
+  # cancel-in-progress -- a failure about the wrong job.
+  if sed -n '/^  review:/,/^  [a-z][a-z_-]*:$/p' "$review_wf" \
+       | grep -qE "^[[:space:]]*cancel-in-progress:[[:space:]]*true"; then
+    fail "the review job cancels in progress; a killed review leaves the head with no verdict and nothing that says so"
+  fi
+  ok "a review in flight is never cancelled by the next event"
+
+  # ...and when a review IS silent, the pipeline asks once more on its own. The
+  # comment alone named two remedies and both were manual, so a PR whose review
+  # said nothing waited for a person to notice it.
+  grep -q 'gh workflow run claude-review.yml' "$review_wf" \
+    || fail "a review that submitted nothing no longer asks for another one; the PR waits for a person"
+  # ...and the run it asks for must be allowed to happen. A dispatch by
+  # GITHUB_TOKEN runs as github-actions[bot], and claude-code-action refuses a
+  # non-human actor unless it is named here -- so without this the retry starts
+  # a run that always declines, which is a mechanism that cannot fire.
+  grep -qE "^[[:space:]]*allowed_bots:.*(github-actions|\*)" "$review_wf" \
+    || fail "the review job does not allow github-actions, so the review it asks for after a silent one is refused as a non-human actor"
+  ok "a silent review asks for exactly one more, and that one is allowed to run"
+fi
+
 # A cancelled run is not a green run. `cancel-in-progress` is right on a branch,
 # where only the newest push matters, and wrong on main, where every commit is
 # one somebody has to be able to trust: two merges close together cancelled the
@@ -497,6 +580,36 @@ else
   fail "merge_gate.py does not import with only .github/scripts on disk, which is all the gate job checks out: $(tr '\n' ' ' <"$sparse_tmp/err")"
 fi
 rm -rf "$sparse_tmp"
+
+# One query, paginated, in one file. `reviewThreads(first:100)` is the FIRST
+# hundred: past that a PR silently loses its newest threads and the gate reports
+# "no review thread is unresolved" from a page it knew was partial. Both readers
+# used to carry their own copy of that query, and so their own copy of the bug.
+if [ -x .github/scripts/pr_payload.sh ]; then
+  bash -n .github/scripts/pr_payload.sh || fail ".github/scripts/pr_payload.sh does not parse"
+  for reader in .github/workflows/merge-gate.yml scripts/orca/review-status.sh; do
+    grep -q 'pr_payload.sh' "$reader" \
+      || fail "$reader does not read the PR through .github/scripts/pr_payload.sh, so it is paging threads on its own again"
+    # Comment lines excluded: both files EXPLAIN what `reviewThreads(first:100)`
+    # got wrong, and a bare grep flags its own explanation.
+    grep -vE '^[[:space:]]*#' "$reader" | grep -q 'reviewThreads(first:' \
+      && fail "$reader carries its own reviewThreads query again; the first page is not the list"
+  done
+  # merge-gate.yml runs BOTH of these out of the BASE branch's checkout, and a
+  # base predating either one is a PR a person merges -- which has to be SAID.
+  # Before the guard named both, the second one to be added killed the step with
+  # `No such file or directory` on exactly the PR introducing it.
+  for needed in merge_gate.py pr_payload.sh; do
+    sed -n '/agreed rule to judge this by/,/^      - name:/p' \
+      .github/workflows/merge-gate.yml | grep -q "$needed" \
+      || fail "merge-gate.yml runs $needed from the base checkout without checking the base has it; a base predating it dies with a shell error instead of the human-merge notice"
+  done
+  ok "a base without the gate's own scripts is told, not crashed into"
+
+  ok "the gate and review-status read one paginated payload"
+else
+  fail ".github/scripts/pr_payload.sh is missing or not executable"
+fi
 
 echo "== orca.yaml"
 if [ ! -f orca.yaml ]; then

@@ -139,9 +139,16 @@ say whether a thread is resolved, so on round two it hands you every comment
 ever left with the live ones buried among them.
 
 Fix what is real; where you disagree, reply on the thread with your reasoning --
-both are acceptable, silence is not. Then RESOLVE each thread (the
-`resolveReviewThread` GraphQL mutation), push if you changed anything, and run
-it again:
+both are acceptable, silence is not. Then RESOLVE each thread:
+
+    ./scripts/orca/resolve-thread.sh <thread-id> [<thread-id>...]
+
+Use that, not the `resolveReviewThread` mutation by hand. NOTHING on GitHub
+re-runs `merge-gate` when a thread is resolved -- `pull_request_review_thread`
+is a webhook event, not a workflow trigger -- so the gate stays red on a thread
+you already closed, and auto-merge never fires. That script resolves the
+threads and, once the last one is shut, asks the gate again. Push if you changed
+anything, and run it again:
 
     ./scripts/orca/review-status.sh
 
