@@ -130,7 +130,11 @@ inline void Discard(const std::filesystem::path& path) {
     if (marker) {
       std::cerr << "  scratch kept at " << path.string() << "\n";
     } else {
-      std::cerr << "  could not keep " << path.string() << ": it is already gone\n";
+      // Deliberately not naming a cause. The leaf being gone is the likely one,
+      // but a full disk or a permission answers here identically, and a keep
+      // that says the wrong reason is worse than one that says none.
+      std::cerr << "  could not mark " << path.string()
+                << " to be kept; it will be swept\n";
     }
     return;
   }
@@ -223,6 +227,15 @@ inline const std::string& Dir() {
 
     std::error_code made_root;
     std::filesystem::create_directories(root, made_root);
+    if (made_root) {
+      // Checked rather than discarded, for the reason the rest of this function
+      // exists: an ignored `error_code` here is the same shape as the one that
+      // let a dead run's leaf be adopted. `create_directories` on a directory
+      // that is already there is not an error, so this fires only on a real one.
+      std::cerr << "could not create " << root.string() << ": " << made_root.message()
+                << "\n  the test scratch directory is not usable\n";
+      std::exit(2);
+    }
     Sweep(root, mine);
 
     // An `error_code` each, because the next call clears the last one's -- and

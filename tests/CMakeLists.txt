@@ -581,6 +581,21 @@ foreach(scenario IN LISTS HTTP_SCENARIOS)
   set_tests_properties(http.${scenario} PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 endforeach()
 
+# --- refusing a leaf rather than adopting one --------------------------------
+# #169. `scratch::Dir()` memoizes in a function-local static, so the fork this
+# needs -- plant a leaf under the CHILD's pid that the child cannot empty, and
+# watch it stop -- has to happen in a process that has not called `Dir()` yet.
+# `test_harness` has, from its own `main`, so this is a binary of its own rather
+# than one more `harness.` scenario. Needs no server and no root, so it never
+# skips: it is the half of the per-process leaf that no green suite proves.
+add_executable(test_scratch test_scratch.cpp)
+target_link_libraries(test_scratch PRIVATE rommsync::core)
+target_include_directories(test_scratch PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_scratch PRIVATE
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+add_test(NAME scratch.refuses COMMAND test_scratch)
+set_tests_properties(scratch.refuses PROPERTIES TIMEOUT 60)
+
 # --- and the same build tree under two `ctest`s at once ----------------------
 # M0-2 (#151). `http.download` is the shape that broke: a fixed destination name
 # in a directory every process shares, so the local loop's `ctest` and the
