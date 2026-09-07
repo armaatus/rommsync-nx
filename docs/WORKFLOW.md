@@ -478,8 +478,9 @@ error it can cause keeps a worktree rather than deleting one.
 
 A time-box release has one extra half. Releasing the slot would otherwise hand
 the issue straight back to the front of the queue and to the same three hours, so
-the dispatcher records that it gave up and declines the issue for the rest of the
-run — visible in `fleet.sh status`, and cleared **by name**:
+the dispatcher records that it gave up and declines the issue — in `--auto` and
+from an explicit `fleet.sh run 44` alike, the same way `needs-human-step` is
+declined from both. It is listed by `fleet.sh status`, and cleared **by name**:
 
 ```bash
 ./scripts/orca/fleet.sh retry 44
@@ -628,6 +629,7 @@ does. Sweep anything left behind with `./scripts/orca/reap.sh --yes`.
 |---|---|---|
 | `fleet.sh run` opens nothing | the stop file is set | `./scripts/orca/fleet.sh resume` |
 | `fleet.sh status` shows no next issue | everything `ready` is already in flight | merge something, or file work |
+| ...and `status` lists the issue you want under "gave up on" | the time-box stopped it, and the fleet will not start it again on its own | `./scripts/orca/fleet.sh retry <n>` |
 | Worktree provisioned, agent idle, nothing in the composer | Orca drafts the issue prompt instead of sending it | `./scripts/orca/agent-autostart.sh` — `setup.sh` starts the `--watch` form |
 | Every hook says "this worktree has no linked issue" | the `orca` CLI on `PATH` cannot find `Orca.app` | nothing — the hooks probe it and fall back. If it persists: `sudo chmod -h 755 /usr/local/bin/orca` |
 | `git push` refused, "nothing leaves one of those unreviewed" | the local review is not recorded for this commit | run both passes, then `./scripts/orca/record-review.sh` |

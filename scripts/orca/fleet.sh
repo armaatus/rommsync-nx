@@ -97,6 +97,9 @@ HUMAN_STEP_LABEL="${ROMMSYNC_HUMAN_STEP_LABEL:-needs-human-step}"
 # blocked with its worktree open and kept #119, #122 and #139 queued behind work
 # that could not start.
 BLOCKED_LABEL="${ROMMSYNC_BLOCKED_LABEL:-blocked}"
+# poll_issue answers two questions in one string; issue_state_in and
+# issue_labels_in split it here.
+ANSWER_SEP="$(printf '\t')"
 
 mkdir -p "$OWNED_DIR" "$STARTED_DIR"
 forget_poll_answers
@@ -169,6 +172,20 @@ for t in json.load(sys.stdin)["result"]["terminals"]:
             and not t.get("orphaned")):
         print(t["handle"]); break
 ' "$1"
+}
+
+# Interrupt the agent in one worktree, if it has one. Both callers are about to
+# take something away from it -- the time-box the rest of its hours, the release
+# its whole directory -- and an agent that is not told keeps working against a rig
+# that is going or already gone. `cmd_stop` spells this out for itself instead: it
+# reports each interrupt it managed, which needs the exit code this swallows.
+interrupt_agent_in() {
+  local handle
+  handle="$(agent_terminal_in "$1")"
+  [ -n "$handle" ] || return 0
+  orca_run_with_deadline 20 /dev/null "$ORCA_CLI" terminal send \
+    --terminal "$handle" --interrupt --json >/dev/null 2>&1
+  return 0
 }
 
 # --------------------------------------------------------------- the state ---
@@ -363,7 +380,6 @@ poll_issue() {
 # The two halves of what poll_issue prints. Split here rather than at each call
 # site so a `gh` that ever answers without the separator cannot be read as a
 # state that is also a label list: both print nothing at all instead.
-ANSWER_SEP="$(printf '\t')"
 issue_state_in()  { case "$1" in *"$ANSWER_SEP"*) printf '%s' "${1%%"$ANSWER_SEP"*}" ;; esac; }
 issue_labels_in() { case "$1" in *"$ANSWER_SEP"*) printf '%s' "${1#*"$ANSWER_SEP"}" ;; esac; }
 
@@ -408,9 +424,8 @@ count_startable() {
   live="$(live_worktrees)" || return 1
   prs="$(GH_PAGER=cat gh pr list --state open --json body --limit 100 2>/dev/null)" || return 1
   ready="$(ready_issues)" || return 1
-  # Zero here also means "nothing to wait for" to the run loop, so an issue this
-  # dispatcher has given up on has to come OUT of the count: counted, the loop
-  # polls forever waiting to start work it will always decline.
+  # An issue the fleet gave up on is one it will decline every pass, so counting
+  # it is the run loop polling forever for work that never starts.
   gaveup="$(gave_up_issues)"
   printf '%s\n' "$ready" | PYTHONPATH="$ISSUE_REFS" python3 -c '
 import json, sys
@@ -627,7 +642,7 @@ worktree_holdings() {
 # worktree whose PR merged is reap_merged's, and by the time this runs it has
 # already been disowned. What is left here is what will never merge.
 reap_abandoned() {
-  local f num path answer reason holds agent
+  local f num path answer reason holds
   for f in "$OWNED_DIR"/*; do
     [ -e "$f" ] || continue
     num="$(basename "$f")"; path="$(cat "$f")"
@@ -640,8 +655,14 @@ reap_abandoned() {
 
     reason=""
     if answer="$(poll_issue "$num")"; then
+      # "Closed", and not "closed with no merged PR": reap_merged asks that
+      # question and this one does not, so the two ways it leaves a closed issue
+      # owned -- unpushed commits, and a `gh pr list --head` that could not
+      # answer -- would make the fuller sentence a false one in the line a person
+      # reads. The release itself is unaffected: both of those leave something in
+      # the worktree, or leave everything already in origin/main.
       if [ "$(issue_state_in "$answer")" = CLOSED ]; then
-        reason="its issue is closed and no PR from this branch merged"
+        reason="its issue is closed"
       elif has_label "$(issue_labels_in "$answer")" "$BLOCKED_LABEL"; then
         reason="its issue went $BLOCKED_LABEL"
       elif has_label "$(issue_labels_in "$answer")" "$HUMAN_STEP_LABEL"; then
@@ -657,6 +678,7 @@ reap_abandoned() {
       [ -e "$STATE_DIR/held-$num" ] && continue
       : >"$STATE_DIR/held-$num"
       say "#$num: $reason, but its git state could not be read -- leaving it"
+      card "$path" --comment "#$num: $reason; kept -- git could not say what is in it"
       continue
     fi
     if [ -n "$holds" ]; then
@@ -676,21 +698,23 @@ reap_abandoned() {
     # Before the removal, not after: `--run-hooks` archives this worktree's RomM
     # stack, and an agent still running in there would lose its rig mid-suite and
     # then keep writing into a directory that is being deleted (#163).
-    agent="$(agent_terminal_in "$path")"
-    [ -n "$agent" ] && orca_run_with_deadline 20 /dev/null "$ORCA_CLI" terminal send \
-      --terminal "$agent" --interrupt --json >/dev/null 2>&1
+    interrupt_agent_in "$path"
     # The comment and no status. `completed` is reap_merged's word for work that
-    # landed, and this worktree is being released precisely because it did not --
-    # and if the removal below refuses, that card is what a person reads.
-    card "$path" --comment "#$num: $reason; releasing the worktree, nothing was in it"
+    # landed, and this worktree is being released precisely because it did not.
+    # Phrased as what it is about to do, not as done: if the removal refuses, this
+    # card is still on the board and still the line a person reads.
+    card "$path" --comment "#$num: $reason; nothing is in it, removing the worktree"
     if remove_worktree "$path"; then
       disown_issue "$num"
     else
       # NOT disowned. reap_merged iterates OWNED issues only, so an issue dropped
       # on a failed removal is a worktree nothing ever looks at again -- #122's
-      # stood from 16:49 until it was removed by hand.
+      # stood from 16:49 until it was removed by hand. Kept owned and not retried,
+      # so it is a slot this dispatcher will go on counting until a person takes
+      # it -- which is why both lines below say so.
       : >"$STATE_DIR/stuck-$num"
-      say "  could not remove it; by hand: git worktree remove --force '$path'"
+      say "  could not remove it; it keeps its slot until you do: git worktree remove --force '$path'"
+      card "$path" --comment "#$num: the removal refused -- still here, still counted; git worktree remove --force '$path'"
     fi
   done
 }
@@ -790,7 +814,7 @@ except Exception:
 # worktree deliberately, since releasing the slot would otherwise hand it straight
 # back to the same three hours. `fleet.sh retry N` is how it comes back.
 enforce_timebox() {
-  local f num path started now agent
+  local f num path started now
   now="$(date +%s)"
   for f in "$STARTED_DIR"/*; do
     [ -e "$f" ] || continue
@@ -856,15 +880,13 @@ enforce_timebox() {
     forget_box_markers "$num"
 
     say "#$num: $((TIMEBOX_SECONDS / 3600))h with no PR -- stopping it; the worktree goes if it holds nothing"
-    agent="$(agent_terminal_in "$path")"
-    [ -n "$agent" ] && orca_run_with_deadline 20 /dev/null "$ORCA_CLI" terminal send \
-      --terminal "$agent" --interrupt --json >/dev/null 2>&1
+    interrupt_agent_in "$path"
     card "$path" --comment "#$num: timed out after $((TIMEBOX_SECONDS / 3600))h -- needs you"
     GH_PAGER=cat gh issue comment "$num" --body "The fleet stopped work on this after $((TIMEBOX_SECONDS / 3600)) hours with no pull request opened. Its worktree at \`$path\` is kept if it holds uncommitted work or commits that are not on \`main\`, and released otherwise so the slot is free. The fleet will not start this issue again on its own; \`./scripts/orca/fleet.sh retry $num\` hands it back." >/dev/null 2>&1 || true
     notify "#$num gave up" "$((TIMEBOX_SECONDS / 3600))h with no PR. Not starting it again."
-    # Read by reap_abandoned on the next pass, and by the queue for as long as
-    # this dispatcher runs. Outlives the worktree on purpose -- see
-    # clear_issue_markers, which deliberately does not clear it.
+    # Read by reap_abandoned on the next pass, and by the queue for as long as it
+    # stands. Outlives the worktree on purpose -- see clear_issue_markers, which
+    # deliberately does not clear it, and cmd_retry, which does.
     : >"$STATE_DIR/gaveup-$num"
     rm -f "$f"
   done
