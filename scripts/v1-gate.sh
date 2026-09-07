@@ -428,8 +428,18 @@ repo_release() {
     return 1
   fi
 
-  # Newest first, so a repo with v1.0.0 and v1.1.0 is judged on the latest.
-  tag="$(echo "$tags" | sort -V | tail -1)"
+  # Newest first, so a repo with v1.0.0 and v1.1.0 is judged on the latest --
+  # but STABLE tags first, and candidates only when there is no stable one.
+  # `sort -V` orders `v1.0.0-rc1` above `v1.0.0`, on GNU sort and on BSD sort
+  # alike, so "the newest tag" is not "the newest release" the moment the
+  # release-candidate path docs/DEVELOPMENT.md#releases recommends has been
+  # taken: a repository holding a correct, published v1.0.0 would be judged on
+  # the rc before it and reported as disagreeing with VERSION. This is the same
+  # rule scripts/release-notes.sh applies when it picks the previous tag
+  # (`--exclude '*-*'` on a stable release), for the same reason.
+  local stable
+  stable="$(printf '%s\n' "$tags" | grep -v -- '-' || true)"
+  tag="$(printf '%s\n' "${stable:-$tags}" | sort -V | tail -1)"
   if ! git -C "$REPO_ROOT" merge-base --is-ancestor "$tag" origin/main 2>/dev/null \
      && ! git -C "$REPO_ROOT" merge-base --is-ancestor "$tag" main 2>/dev/null; then
     echo "    $tag is not reachable from main -- ci.yml refuses to publish it"
