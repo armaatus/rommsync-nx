@@ -590,6 +590,13 @@ reap_merged() {
 # abandoned mid-change may hold the only copy of real work. So this refuses
 # rather than guesses, on exactly the pair verified by hand before each of those
 # removals -- `git status --porcelain` empty AND nothing absent from origin/main.
+#
+# Whether an agent is still live in there is deliberately NOT part of that guard.
+# #148's was, and releasing it is the whole point. The same pair is what protects
+# it: an agent an hour into a change has files on disk, so its worktree is kept,
+# and one with nothing on disk has nothing to lose but a prompt. It is
+# interrupted before the removal rather than left writing into a directory that
+# is going away.
 
 # What removing this worktree would destroy. Prints one phrase naming it, or
 # nothing at all when there is nothing. Non-zero means it could not tell, which
@@ -672,7 +679,10 @@ reap_abandoned() {
     agent="$(agent_terminal_in "$path")"
     [ -n "$agent" ] && orca_run_with_deadline 20 /dev/null "$ORCA_CLI" terminal send \
       --terminal "$agent" --interrupt --json >/dev/null 2>&1
-    card "$path" --workspace-status completed --comment "#$num: $reason; worktree released, nothing was in it"
+    # The comment and no status. `completed` is reap_merged's word for work that
+    # landed, and this worktree is being released precisely because it did not --
+    # and if the removal below refuses, that card is what a person reads.
+    card "$path" --comment "#$num: $reason; releasing the worktree, nothing was in it"
     if remove_worktree "$path"; then
       disown_issue "$num"
     else
