@@ -37,6 +37,34 @@ inline constexpr const char* kLeafPrefix = "pid-";
 /// `rig::sessions` attributes a live sync session through (#174).
 inline std::filesystem::path Root() { return ROMMSYNC_TEST_SCRATCH; }
 
+/// The digits of `text` as a number no larger than `limit`, or 0 for anything
+/// that is not one.
+///
+/// Names carry the numbers here -- a leaf is `pid-4213`, a session claim is
+/// `session-815-pid-4213` -- so every reader has to take one apart, and a name
+/// this suite did not write must read as 0 rather than as something plausible.
+inline long long Digits(const std::string& text, long long limit) {
+  if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos) {
+    return 0;
+  }
+  errno = 0;
+  const long long value = std::strtoll(text.c_str(), nullptr, 10);
+  if (errno == ERANGE || value > limit) {
+    return 0;
+  }
+  return value;
+}
+
+/// The same, bounded to what a `pid_t` can hold.
+///
+/// A number no `pid_t` can hold is not one this suite wrote, whatever it looks
+/// like, and casting it would hand `kill` a truncated or saturated value -- 0 is
+/// this process's group and -1 is every process the user can signal, and both
+/// answer "running".
+inline long long Pid(const std::string& text) {
+  return Digits(text, static_cast<long long>(std::numeric_limits<pid_t>::max()));
+}
+
 /// Is `pid` a process that still exists?
 ///
 /// `ESRCH` is the only answer that means gone. `EPERM` is a live process this
@@ -67,20 +95,7 @@ inline long long LeafOwner(const std::string& name) {
   if (name.size() <= prefix.size() || name.compare(0, prefix.size(), prefix) != 0) {
     return 0;
   }
-  const std::string digits = name.substr(prefix.size());
-  if (digits.find_first_not_of("0123456789") != std::string::npos) {
-    return 0;
-  }
-  // A number no `pid_t` can hold is not one this suite wrote, whatever it looks
-  // like, and casting it would hand `kill` a truncated or saturated value --
-  // 0 is this process's group and -1 is every process the user can signal, and
-  // both answer "running".
-  errno = 0;
-  const long long owner = std::strtoll(digits.c_str(), nullptr, 10);
-  if (errno == ERANGE || owner > static_cast<long long>(std::numeric_limits<pid_t>::max())) {
-    return 0;
-  }
-  return owner;
+  return Pid(name.substr(prefix.size()));
 }
 
 /// Set by `scratch::Keep()`, and read once the process is on its way out.

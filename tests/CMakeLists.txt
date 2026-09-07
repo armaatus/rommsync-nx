@@ -631,6 +631,10 @@ target_include_directories(test_http_wire PRIVATE
 target_compile_definitions(test_http_wire PRIVATE
   ROMMSYNC_TEST_WIRE_BACKEND
   ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  # A scratch root of its own, because `wire.*` and `http.*` are the same
+  # scenarios writing the same fixed names. It also puts this binary's
+  # `rig::sessions` claims somewhere nobody else reads -- harmless while it only
+  # GETs, and the reason to think twice before giving it a negotiate (#174).
   ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch-wire")
 
 foreach(scenario IN LISTS HTTP_SCENARIOS)

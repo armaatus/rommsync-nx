@@ -873,12 +873,17 @@ inline void CloseSession(http::HttpClient& client, const std::string& base,
 /// clears them at the start of each one, which is the only place that cannot be
 /// forgotten by a scenario that negotiates and walks away.
 ///
-/// A leftover only: a session a run that is still going holds is left alone.
-/// Until #174 this closed every IN_PROGRESS session on the device, and a second
-/// `ctest` against the same worktree therefore ended this one's LIVE session
-/// merely by starting up -- cleanup that cannot fail its own scenario ruining
-/// somebody else's. `rig::sessions` is where the ownership is kept, and why it
-/// cannot be kept on the session row itself.
+/// A session another run is still holding is left alone. Until #174 this closed
+/// every IN_PROGRESS session on the device, and a second `ctest` against the
+/// same worktree therefore ended this one's LIVE session merely by starting up
+/// -- cleanup that cannot fail its own scenario ruining somebody else's.
+/// `rig::sessions` is where the ownership is kept, and why it cannot be kept on
+/// the session row itself.
+///
+/// This process's OWN sessions are still closed, which is what the trailing
+/// calls in tests/test_sync_tick.cpp and tests/test_play_sessions.cpp are for:
+/// a scenario whose `complete` failed still holds its claim, and leaving it for
+/// the next process is the leftover #76 is about.
 ///
 /// Best effort by design: this is cleanup, and a scenario must not fail because
 /// tidying up did not work.
@@ -925,7 +930,7 @@ inline void CloseOpenSessions(http::HttpClient& client, const std::string& base,
       continue;
     }
     if (live.Holds(id)) {
-      continue;  // a run that is still going opened it
+      continue;  // another run, still going, opened it
     }
     PostJson(client, base + "/api/sync/sessions/" + std::to_string(id) + "/complete", fixture,
              R"({"operations_completed":0,"operations_failed":0,"play_sessions":[]})");

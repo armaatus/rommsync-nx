@@ -298,23 +298,11 @@ inline std::filesystem::path ClaimsDir() { return scratch::Root() / "sessions"; 
 
 inline long long Self() { return static_cast<long long>(::getpid()); }
 
-/// `"4213"` -> 4213, and 0 for anything that is not a plain number this platform
-/// can hold. The bound is `scratch::LeafOwner`'s and for its reason: a value
-/// `kill` would read as a process group answers "running" for everybody.
-inline long long Digits(const std::string& text, long long limit) {
-  if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos) {
-    return 0;
-  }
-  errno = 0;
-  const long long value = std::strtoll(text.c_str(), nullptr, 10);
-  if (errno == ERANGE || value > limit) {
-    return 0;
-  }
-  return value;
-}
-
-inline long long Pid(const std::string& text) {
-  return Digits(text, static_cast<long long>(std::numeric_limits<pid_t>::max()));
+/// `"815"` -> 815, and 0 for anything that is not a session id. The digits and
+/// the pid in these names are taken apart by `scratch`'s readers, which the
+/// scratch leaves are taken apart by too.
+inline std::int64_t SessionId(const std::string& text) {
+  return scratch::Digits(text, std::numeric_limits<std::int64_t>::max());
 }
 
 inline std::string ClaimName(std::int64_t id) {
@@ -334,9 +322,8 @@ inline bool ReadClaim(const std::string& name, std::int64_t* id, long long* owne
   if (infix == std::string::npos) {
     return false;
   }
-  *id = Digits(name.substr(prefix.size(), infix - prefix.size()),
-               std::numeric_limits<std::int64_t>::max());
-  *owner = Pid(name.substr(infix + std::string(kPidInfix).size()));
+  *id = SessionId(name.substr(prefix.size(), infix - prefix.size()));
+  *owner = scratch::Pid(name.substr(infix + std::string(kPidInfix).size()));
   return *id != 0 && *owner != 0;
 }
 
@@ -346,11 +333,12 @@ inline bool ReadNegotiating(const std::string& name, long long* owner) {
   if (name.compare(0, prefix.size(), prefix) != 0) {
     return false;
   }
-  *owner = Pid(name.substr(prefix.size()));
+  *owner = scratch::Pid(name.substr(prefix.size()));
   return *owner != 0;
 }
 
-inline void Write(const std::filesystem::path& file) {
+/// Create `file`, empty: everything one of these says is in its name.
+inline void Touch(const std::filesystem::path& file) {
   std::error_code error;
   std::filesystem::create_directories(file.parent_path(), error);
   const std::ofstream created(file);
@@ -361,8 +349,25 @@ inline void Erase(const std::filesystem::path& file) {
   std::filesystem::remove(file, error);
 }
 
-/// Remove every file in the claims directory this pid's name is on -- both
-/// kinds, since `negotiating-pid-4213` ends the same way a claim does.
+/// Walk the claims directory, handing each entry to `visit`.
+///
+/// The step is taken before the visit, and reported rather than thrown, for
+/// `scratch::Sweep`'s reason: every caller here removes entries from the
+/// directory it is walking, and a second process removes more.
+template <typename Visit>
+inline void ForEachClaim(const Visit& visit) {
+  std::error_code error;
+  std::filesystem::directory_iterator entry(ClaimsDir(), error);
+  const std::filesystem::directory_iterator end;
+  while (!error && entry != end) {
+    const std::filesystem::path file = entry->path();
+    entry.increment(error);
+    visit(file, file.filename().string());
+  }
+}
+
+/// Remove every file in the claims directory this pid's name is on -- claims and
+/// the in-flight marker alike.
 ///
 /// Called at both ends of the process, for the two different reasons a leftover
 /// of one's own is wrong: a pid is reused, so what is there when this run starts
@@ -370,23 +375,13 @@ inline void Erase(const std::filesystem::path& file) {
 /// for exactly this), and what is there when it ends would have every later
 /// reader skip a session nobody is holding until the pid comes round again.
 inline void ForgetMine() {
-  const std::string mine = std::string(kPidInfix) + std::to_string(Self());
-  std::error_code error;
-  std::filesystem::directory_iterator entry(ClaimsDir(), error);
-  const std::filesystem::directory_iterator end;
-  while (!error && entry != end) {
-    const std::filesystem::path file = entry->path();
-    // Stepped before the body, and reporting rather than throwing, for
-    // `scratch::Sweep`'s reason: this removes entries from the directory it is
-    // walking, and a second process removes more.
-    entry.increment(error);
-
-    const std::string name = file.filename().string();
-    if (name.size() > mine.size() &&
-        name.compare(name.size() - mine.size(), mine.size(), mine) == 0) {
+  ForEachClaim([](const std::filesystem::path& file, const std::string& name) {
+    std::int64_t id = 0;
+    long long owner = 0;
+    if ((ReadClaim(name, &id, &owner) || ReadNegotiating(name, &owner)) && owner == Self()) {
       Erase(file);
     }
-  }
+  });
 }
 
 /// Owns this process's claims for as long as the process lives. The sibling of
@@ -401,9 +396,9 @@ class Claims {
   Claims& operator=(const Claims&) = delete;
 };
 
-/// Constructed on the first claim or the first read, whichever this process
-/// reaches first.
-inline void Registered() {
+/// Install the guard above, on the first claim or the first read -- whichever
+/// this process reaches first.
+inline void EnsureRegistered() {
   static const Claims claims;
   (void)claims;
 }
@@ -429,8 +424,8 @@ inline void Claim(std::int64_t id) {
   if (id <= 0) {
     return;
   }
-  detail::Registered();
-  detail::Write(detail::ClaimsDir() / detail::ClaimName(id));
+  detail::EnsureRegistered();
+  detail::Touch(detail::ClaimsDir() / detail::ClaimName(id));
 }
 
 /// Give it up: the session is closed, or this run is done with it.
@@ -438,7 +433,7 @@ inline void Release(std::int64_t id) {
   if (id <= 0) {
     return;
   }
-  detail::Registered();
+  detail::EnsureRegistered();
   detail::Erase(detail::ClaimsDir() / detail::ClaimName(id));
 }
 
@@ -452,10 +447,10 @@ inline void Release(std::int64_t id) {
 class Negotiating {
  public:
   Negotiating() {
-    detail::Registered();
+    detail::EnsureRegistered();
     const std::lock_guard<std::mutex> held(detail::Lock());
     if (detail::InFlight()++ == 0) {
-      detail::Write(detail::ClaimsDir() / detail::NegotiatingName());
+      detail::Touch(detail::ClaimsDir() / detail::NegotiatingName());
     }
   }
 
@@ -470,13 +465,18 @@ class Negotiating {
   Negotiating& operator=(const Negotiating&) = delete;
 };
 
-/// What the runs that are still going are holding.
+/// What the OTHER runs still going are holding.
 struct LiveClaims {
-  /// The sessions they have claimed.
+  /// The sessions they have claimed. This process's own are deliberately absent:
+  /// a claim answers "is somebody ELSE still using this?", and a scenario that
+  /// ends by closing the session it just opened is entitled to -- #76 is what
+  /// happens when it does not, and several scenarios end with exactly that call.
   std::set<std::int64_t> ids;
 
-  /// True while one of them is between creating a session and claiming it, so
-  /// that an unclaimed session cannot be told from one about to be claimed.
+  /// True while a run is between creating a session and claiming it, so that an
+  /// unclaimed session cannot be told from one about to be claimed. This process
+  /// counts here, unlike above: another thread of it may be inside that window,
+  /// and the session it is about to own is not a leftover either.
   bool negotiating = false;
 
   bool Holds(std::int64_t id) const { return ids.find(id) != ids.end(); }
@@ -488,23 +488,16 @@ struct LiveClaims {
 /// does, so a snapshot taken first can miss a claim taken in between -- and the
 /// session it then fails to attribute is a live one (#174).
 inline LiveClaims Live() {
-  detail::Registered();
+  detail::EnsureRegistered();
   LiveClaims live;
-  std::error_code error;
-  std::filesystem::directory_iterator entry(detail::ClaimsDir(), error);
-  const std::filesystem::directory_iterator end;
-  while (!error && entry != end) {
-    const std::filesystem::path file = entry->path();
-    entry.increment(error);  // see detail::ForgetMine
-
-    const std::string name = file.filename().string();
+  detail::ForEachClaim([&live](const std::filesystem::path& file, const std::string& name) {
     std::int64_t id = 0;
     long long owner = 0;
     if (detail::ReadClaim(name, &id, &owner)) {
-      if (scratch::Running(owner)) {
-        live.ids.insert(id);
-      } else {
+      if (!scratch::Running(owner)) {
         detail::Erase(file);
+      } else if (owner != detail::Self()) {
+        live.ids.insert(id);
       }
     } else if (detail::ReadNegotiating(name, &owner)) {
       if (scratch::Running(owner)) {
@@ -513,7 +506,7 @@ inline LiveClaims Live() {
         detail::Erase(file);
       }
     }
-  }
+  });
   return live;
 }
 
@@ -578,9 +571,8 @@ class OwnedHttpClient : public http::HttpClient {
         path.compare(path.size() - suffix.size(), suffix.size(), suffix) != 0) {
       return 0;
     }
-    return sessions::detail::Digits(
-        path.substr(prefix.size(), path.size() - prefix.size() - suffix.size()),
-        std::numeric_limits<std::int64_t>::max());
+    return sessions::detail::SessionId(
+        path.substr(prefix.size(), path.size() - prefix.size() - suffix.size()));
   }
 
   /// The `session_id` a negotiate answered with, or 0 when it did not answer one

@@ -1748,8 +1748,17 @@ void FaultOwnerScenario(rig::Checks& checks, const std::string& base) {
 /// `rig::FaultOwner` exports `ROMMSYNC_FAULT_OWNER` so that a CHILD is part of
 /// its parent's scenario, and a stranger is the one thing that must not be.
 int RunStranger(const std::string& self) {
+  // Single-quoted, with any quote in the path closed and reopened around an
+  // escaped one: a build directory may be anywhere.
+  std::string quoted = "'";
+  for (const char character : self) {
+    quoted += character == '\'' ? std::string("'\\''") : std::string(1, character);
+  }
+  quoted += "'";
+  // Its stdout is noise; its stderr is the only thing that can say why it exited
+  // with something other than 2, and CTest shows neither unless the test is red.
   const std::string command =
-      "ROMMSYNC_FAULT_OWNER= '" + self + "' __not_a_scenario__ >/dev/null 2>&1";
+      "ROMMSYNC_FAULT_OWNER= " + quoted + " __not_a_scenario__ >/dev/null";
   const int status = std::system(command.c_str());
   return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
@@ -1797,25 +1806,37 @@ void SessionOwnerScenario(rig::Checks& checks, http::HttpClient& client, const s
   checks.ExpectEq(status_of(session), std::string("IN_PROGRESS"),
                   "a stranger's startup leaves a session it does not own alone");
 
-  // The other half, and the one a fix that simply stopped cleaning up would
-  // fail: a session nobody is holding is still closed, because that is what the
+  // The half a fix that simply stopped cleaning up would fail: a session no run
+  // is holding is still collected, and by a stranger, because that is what this
   // cleanup is for (#76). A claim lapses with the process that took it, and
   // dropping it by hand is that without waiting for a process to exit.
   rig::sessions::Release(session);
   std::string swept;
   for (int attempt = 0; attempt < 5 && swept != "COMPLETED"; ++attempt) {
-    if (attempt > 0) {
-      // A stranger with a negotiate in flight defers cleanup by design, since
-      // while it is inside that window an unclaimed session cannot be told from
-      // one about to be claimed. That is milliseconds, not a verdict -- and this
-      // suite is built to be run twice at once, so it can genuinely happen here.
-      std::this_thread::sleep_for(std::chrono::milliseconds{250});
-    }
-    harness::CloseOpenSessions(client, base, fixture);
+    // Retried because a run with a negotiate in flight defers the cleanup by
+    // design -- inside that window an unclaimed session cannot be told from one
+    // about to be claimed. That is a round trip, not a verdict, and this suite
+    // is built to be run twice at once, so a third party can genuinely be in it.
+    RunStranger(self);
     swept = status_of(session);
   }
   checks.ExpectEq(swept, std::string("COMPLETED"),
-                  "and still closes a leftover no run is holding");
+                  "and a stranger still collects a leftover no run is holding");
+
+  // And a run may always close what it opened, claim or no claim: several
+  // scenarios END with this call, on a session whose own `complete` failed and
+  // whose claim is therefore still held. Leaving that for the next process is
+  // the leftover #76 is about, so ownership must not have quietly disabled it.
+  const http::Result reopened = harness::Negotiate(checks, client, base, fixture, payload);
+  const json::ParseResult second = json::Parse(reopened.response.body);
+  const std::int64_t own = second.ok() ? harness::Number(second.value, "session_id") : 0;
+  if (own == 0) {
+    checks.Expect(false, "a second negotiate opened a session to close");
+    return;
+  }
+  harness::CloseOpenSessions(client, base, fixture);
+  checks.ExpectEq(status_of(own), std::string("COMPLETED"),
+                  "and a run's own cleanup still closes the session it opened");
 }
 
 
