@@ -19,6 +19,7 @@
 #   5  the third round is over; stop and say what is unresolved
 #   6  the review job failed on this commit; the reason is printed
 #   7  the PR's build is red; a review cannot fix that
+#   8  the PR conflicts with its base; a review cannot fix that either
 #
 # The round cap is counted HERE rather than left to the agent to remember. Three
 # rounds is more than almost any PR needs, and a fourth is not what a
@@ -89,6 +90,7 @@ broken_before=""
 # Set from the rollup inside the throttled block below; declared here so a poll
 # that skips the block still has a value under `set -u`.
 review_dead=""
+merge_state=""
 while [ "$waited" -lt "$DEADLINE_SECONDS" ]; do
   if orca_fleet_stopped; then
     echo
@@ -115,11 +117,15 @@ while [ "$waited" -lt "$DEADLINE_SECONDS" ]; do
   # same failure twice.
   checks_due=$((checks_due + 1))
   if [ "$((checks_due % 4))" = "1" ]; then
-    rollup="$(GH_PAGER=cat gh pr view "$pr" --json statusCheckRollup 2>/dev/null \
+    # `mergeStateStatus` rides along on the rollup call rather than costing a
+    # second one -- the same reasoning as everything else in this block, and
+    # #83's finding was an unthrottled check exactly here.
+    rollup="$(GH_PAGER=cat gh pr view "$pr" --json statusCheckRollup,mergeStateStatus 2>/dev/null \
               | python3 -c "
 import json, sys
 try:
-    checks = json.load(sys.stdin).get('statusCheckRollup') or []
+    doc = json.load(sys.stdin)
+    checks = doc.get('statusCheckRollup') or []
 except Exception:
     raise SystemExit
 skip = ('merge-gate', 'review against REVIEW.md')
@@ -130,26 +136,59 @@ review_dead = any(c.get('name') == 'review against REVIEW.md'
                   and (c.get('conclusion') or '') in dead for c in checks)
 print(', '.join(n for n in bad if n))
 print('REVIEW_FAILED' if review_dead else '')
+print((doc.get('mergeStateStatus') or '').upper())
 " 2>/dev/null)"
-    # Two lines out of one capture: the failing check names, then the marker
-    # saying the review check itself is among the dead. Read from `rollup` rather
-    # than from `broken` -- reusing one name as both the here-string source and
-    # the first read target works, but reads like a bug.
+    # Three lines out of one capture: the failing check names, then the marker
+    # saying the review check itself is among the dead, then what GitHub makes
+    # of the branch against its base. Read from `rollup` rather than from
+    # `broken` -- reusing one name as both the here-string source and the first
+    # read target works, but reads like a bug.
     #
     # Cleared first, and that is deliberate. `$(...)` strips ALL trailing
-    # newlines, so a healthy answer -- whose second line is empty -- comes back
-    # as ONE line, and the second `read` then hits EOF. bash assigns the empty
-    # line it did not get and returns non-zero, so `review_dead` does end up
-    # empty (verified on 3.2.57 and 5.3.15, the oldest and newest bash this repo
-    # can meet). But the recovery path depends entirely on that: if `read` left
-    # the variable untouched on EOF, a `REVIEW_FAILED` set on one throttle check
-    # would survive every later one, and the `gh run list` below would run on
-    # every poll for the rest of the 45-minute wait -- reintroducing exactly the
-    # cost the throttle above exists to remove. One assignment makes the
-    # recovery explicit instead of a consequence of how `read` handles EOF.
+    # newlines, so an answer whose tail lines are empty comes back short and the
+    # later `read`s hit EOF. bash assigns the empty line it did not get and
+    # returns non-zero, so those variables do end up empty (verified on 3.2.57
+    # and 5.3.15, the oldest and newest bash this repo can meet). But the
+    # recovery path depends entirely on that: if `read` left the variable
+    # untouched on EOF, a `REVIEW_FAILED` set on one throttle check would survive
+    # every later one, and the `gh run list` below would run on every poll for
+    # the rest of the 45-minute wait -- reintroducing exactly the cost the
+    # throttle above exists to remove. One assignment makes the recovery explicit
+    # instead of a consequence of how `read` handles EOF.
     # `await_stops_paying_once_the_review_recovers` pins it.
     review_dead=""
-    { IFS= read -r broken; IFS= read -r review_dead; } <<<"$rollup" || true
+    merge_state=""
+    { IFS= read -r broken; IFS= read -r review_dead; IFS= read -r merge_state; } \
+      <<<"$rollup" || true
+
+    # A conflict with the base is not something a review can answer, and it
+    # blocks every merge -- a person's included. #99 sat here for the full 45
+    # minutes, got its review, resolved its threads and still could not merge,
+    # because this was the blocker the whole time.
+    #
+    # Acted on from ONE sighting, unlike the red build below: `DIRTY` is not a
+    # flake, and a branch that conflicts has to be rebased whatever else is true.
+    # Anything else -- `UNKNOWN` while GitHub is still computing mergeability,
+    # `BLOCKED`, `BEHIND` -- is left to review-status.sh, which sees the whole
+    # picture; only the state that makes waiting pointless exits here.
+    if [ "$merge_state" = "DIRTY" ]; then
+      cat <<CONFLICT
+
+GitHub says DIRTY: this PR conflicts with its base.
+
+No review will fix a merge conflict, and a conflicted branch cannot merge at
+all. Rebase it:
+  git fetch origin && git rebase origin/main
+resolve the conflicts, re-run the build and the tests, then -- because the review
+marker is per-commit and a rebase changes every sha -- record the review again
+for the new head:
+  ./scripts/orca/record-review.sh findings.md
+and push the rewritten branch:
+  git push --force-with-lease
+Then come back here.
+CONFLICT
+      exit 8
+    fi
     if [ -n "$broken" ] && [ "$broken" = "$broken_before" ]; then
       cat <<RED
 

@@ -114,8 +114,14 @@ while it waits:
 
     ./scripts/orca/await-review.sh
 
-It returns when the review lands. **A clean verdict is not the same as no
-findings.** A review can come back COMMENTED and still carry inline comments,
+It returns when the review lands -- or early, without one, when nothing a review
+could say would help: exit 7 for a red build, and exit 8 when GitHub says `DIRTY`
+because something merged underneath your branch. Exit 8 wants a rebase, a fresh
+`./scripts/orca/record-review.sh` for the new head, and `git push
+--force-with-lease`; it prints all three. Do not come back here until it is
+rebased.
+
+**A clean verdict is not the same as no findings.** A review can come back COMMENTED and still carry inline comments,
 each of which is a THREAD, and `merge-gate` refuses to merge while any thread is
 unresolved. #88 and #89 both sat blocked on exactly one unresolved thread with
 every check green.
