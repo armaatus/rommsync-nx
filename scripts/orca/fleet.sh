@@ -1652,8 +1652,19 @@ cmd_run() {
     # down and RUNS it as a command (`! $draining`). Both branches here die, so
     # the collision is harmless today and would not stay that way.
     local held; held="$(cat "$PIDFILE" 2>/dev/null)"
-    if dispatcher_alive "$held"; then
-      die "the fleet is stopped ($STOP_FILE), and pid $held is still DRAINING:
+    # All three answers here too, not two. "Cannot say" reaches this branch as
+    # well -- it is still a live pid, and the plain "clear it with resume" is
+    # still the sentence that sends somebody to start a second dispatcher. What
+    # changes is the claim: only answer 0 has established that it is draining.
+    dispatcher_alive "$held"; local held_is=$? verdict
+    if [ "$held_is" = 0 ]; then
+      verdict="pid $held is still DRAINING"
+    else
+      verdict="pid $held is alive, and ps would not say what it is -- if it is a
+dispatcher it is DRAINING"
+    fi
+    if [ "$held_is" != 1 ]; then
+      die "the fleet is stopped ($STOP_FILE), and $verdict:
 launching nothing new, and reaping what is in flight until nothing it owns is
 left, which is what a drain is. It exits on its own; watch it with
 \`fleet.sh status\`, and only then start one.

@@ -293,6 +293,19 @@
 #                                         because it promises the dispatcher is
 #                                         down when it returns.
 #
+# ...and the stop's own message, which is checked BEFORE any of that and is the
+# sentence that produces the second dispatcher: a drain leaves the dispatcher up
+# on purpose, and "the fleet is stopped -- clear it with resume" is what somebody
+# reads before they run `resume` and `run --auto`.
+#
+#   test_orca_fleet.sh stopped_names_drain  it names the pid that is draining,
+#                                           rather than only offering `resume`.
+#   test_orca_fleet.sh stopped_blind_ps     ...and when ps will not say, it still
+#                                           names the pid but does not claim the
+#                                           drain it never established. This is
+#                                           the one call site that had dropped
+#                                           back to two answers.
+#
 # The Orca CLI and gh are stubbed on PATH; the fleet state dir is a temp dir.
 # Nothing here touches a real worktree, docker, or GitHub.
 set -uo pipefail
@@ -1543,6 +1556,32 @@ JSON
       || fail "it stopped the dispatcher and did not say so: $out"
     echo "ok: ...and still stops the one that is really there"
     ;;
+  stopped_names_drain)
+    make_fixture ok
+    hold_pidfile_with_dispatcher
+    : >"$ROMMSYNC_FLEET_DIR/STOP"
+    out="$(run_one_pass)"; rc=$?
+    [ "$rc" = 0 ] && fail "it started a dispatcher while the fleet was stopped: $out"
+    grep -q "DRAINING" <<<"$out" \
+      || fail "'stopped, clear it with resume' is the sentence that produces the second dispatcher, and it is still all this says: $out"
+    grep -q "$HELD_PID" <<<"$out" \
+      || fail "it did not name the dispatcher that is still draining behind the stop: $out"
+    echo "ok: stopped-but-still-draining says so, and names the pid"
+    ;;
+  stopped_blind_ps)
+    make_fixture ok
+    hold_pidfile_with_dispatcher
+    blind_ps
+    : >"$ROMMSYNC_FLEET_DIR/STOP"
+    out="$(run_one_pass)"; rc=$?
+    [ "$rc" = 0 ] && fail "it started a dispatcher while the fleet was stopped: $out"
+    grep -q "$HELD_PID" <<<"$out" \
+      || fail "the one call site that dropped back to two answers: a live pid behind the stop went unmentioned: $out"
+    # ...and it must not claim the drain it never established.
+    grep -q "ps would not say" <<<"$out" \
+      || fail "it asserted a drain on an answer nobody gave: $out"
+    echo "ok: ...and says which of the two it could actually establish"
+    ;;
   run_blind_ps)
     make_fixture ok
     hold_pidfile_with_dispatcher
@@ -1630,6 +1669,6 @@ JSON
     echo "ok: a pidfile whose process is gone does not refuse"
     ;;
   *)
-    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind|status_stale|status_current|status_unrecorded|status_from_worktree|status_draining|status_drained|status_behind|status_behind_revert|status_unreadable|status_names_root|run_refuses|run_stale_recycled|run_stale_gone|status_recycled|stop_spares_stranger|stop_stops_dispatcher|run_blind_ps|status_blind_ps|stop_blind_ps" >&2
+    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind|status_stale|status_current|status_unrecorded|status_from_worktree|status_draining|status_drained|status_behind|status_behind_revert|status_unreadable|status_names_root|run_refuses|run_stale_recycled|run_stale_gone|status_recycled|stop_spares_stranger|stop_stops_dispatcher|run_blind_ps|status_blind_ps|stop_blind_ps|stopped_names_drain|stopped_blind_ps" >&2
     exit 2 ;;
 esac
