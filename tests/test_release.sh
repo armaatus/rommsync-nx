@@ -590,18 +590,21 @@ phase_history() {
 # review passes. It has no exemption for a release and none for its author, so
 # the maintainer's bump is judged by exactly the rule an agent's PR is.
 #
-# `gh pr create --fill` -- which is what this guide's own code block hands a
-# maintainer -- fills the body from the commit message, and a `Release 1.0.0`
-# commit carries neither phrase. The check comes back red on the one pull
-# request nobody has ever practised opening, at the moment a release is being
-# cut. Documenting the two commands without documenting that is how the
+# `gh pr create --fill` -- which is what this guide's own code block used to
+# hand a maintainer -- fills the body from the commit message, and a
+# `Release 1.0.0` commit carries neither phrase. The check comes back red on the
+# one pull request nobody has ever practised opening, at the moment a release is
+# being cut. Documenting the two commands without documenting that is how the
 # procedure gets walked for the first time under exactly the wrong conditions.
 #
-# What this pins is that the guide QUOTES what the gate will demand, read out of
-# the gate rather than typed here -- the rule phase_compatibility applies to the
-# compatibility line, for the same reason. Renaming a pass in merge_gate.py
-# turns this red instead of leaving the guide asking a maintainer for something
-# the check no longer accepts.
+# Two assertions, because the guide has two halves and a maintainer follows the
+# second one. The prose has to QUOTE what the gate will demand, read out of the
+# gate rather than typed here -- the rule phase_compatibility applies to the
+# compatibility line, for the same reason, so renaming a pass in merge_gate.py
+# turns this red instead of leaving the guide asking for something the check no
+# longer accepts. And the command block may not go back to filling the body from
+# the commit message, which a correct bullet three lines above it would not
+# stop.
 phase_procedure() {
   local gate="$REPO_ROOT/.github/scripts/merge_gate.py"
   local guide="$REPO_ROOT/docs/DEVELOPMENT.md"
