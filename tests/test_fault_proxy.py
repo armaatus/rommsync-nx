@@ -106,6 +106,15 @@ class Ownership(unittest.TestCase):
         self.assertIsNotNone(self.registry.peek("mine"))
 
     # -- the registry does not grow forever -----------------------------------
+    def test_an_expired_scenario_does_not_fire_on_the_request_path(self):
+        # The path every proxied request takes, and the one nothing sweeps: a
+        # `curl` that armed a fault and went to lunch damages traffic whether or
+        # not anybody arms or peeks in between, so `claim` has to find it dead.
+        self.registry.arm(ANONYMOUS, status())
+        for fault in self.registry._faults.values():
+            fault.armed_at = time.monotonic() - fault_proxy.OWNER_TTL_SECONDS - 1
+        self.assertIsNone(self.claim("mine"))
+
     def test_an_abandoned_scenario_expires(self):
         # A client killed between arming and firing, and the `curl` whose author
         # moved on. Nobody else may clear either, so age has to.

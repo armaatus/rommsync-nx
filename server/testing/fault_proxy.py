@@ -228,11 +228,22 @@ class Registry:
         this path is not falling through to somebody else's. Faults are claimed
         by their owner, and the untagged entry is the exception rather than a
         second chance.
+
+        The age is checked HERE rather than only in `_prune`, because this is the
+        path every proxied request takes and `_prune` runs on the control API.
+        A forgotten `curl` -- the case the TTL exists for -- damages traffic
+        whether or not anybody arms or peeks in between, so an expired scenario
+        has to be dead on the request path too, not merely swept later.
         """
+        cutoff = time.monotonic() - OWNER_TTL_SECONDS
         for key in (owner, ANONYMOUS):
             fault = self._faults.get(key)
-            if fault is not None:
-                return key, fault
+            if fault is None:
+                continue
+            if fault.armed_at < cutoff:
+                del self._faults[key]
+                continue
+            return key, fault
         return None, None
 
     def _prune(self) -> None:
