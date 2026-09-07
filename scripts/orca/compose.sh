@@ -26,10 +26,18 @@ set -a; . ./.env; set +a
 # name `tls` on their own `down`; this is the same hole in the path a person
 # types.
 #
-# `*` rather than a list, so a profile added to the compose file later is
-# covered by this line as it stands. --remove-orphans for the same reason
-# teardown wants it there: a container compose no longer recognises as a service
-# is still labelled with this project, and reap.sh would find it later.
+# `tls` by name, not `--profile '*'`. The wildcard would cover a profile added
+# later without a second edit, but it is a Compose 2.24 feature and an older one
+# treats `*` as the literal name of a profile that does not exist -- which
+# activates nothing and restores this leak in silence, on the one teardown path
+# a person types by hand. Naming the profile has no such floor, and it is what
+# archive.sh and reap.sh already do; tests/test_orca_teardown.sh reads the
+# profiles out of the compose file and fails all three the day a new one is
+# added, which is the second edit made loud instead of unnecessary.
+#
+# --remove-orphans for the same reason teardown wants it there: a container
+# compose no longer recognises as a service is still labelled with this project,
+# and reap.sh would find it later.
 #
 # Only `down`. An ordinary `up -d` must keep starting neither the terminator nor
 # anything else profiled -- that is what keeps the host suite talking plain HTTP
@@ -53,7 +61,7 @@ done
 
 if [ "$subcommand" = down ]; then
   exec docker compose -f server/testing/docker-compose.yml \
-    --profile '*' "$@" --remove-orphans
+    --profile tls "$@" --remove-orphans
 fi
 
 exec docker compose -f server/testing/docker-compose.yml "$@"

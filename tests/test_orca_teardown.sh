@@ -18,11 +18,11 @@
 #                                   the way out, and a pid it merely left behind
 #                                   -- one the system has since handed to
 #                                   something else -- is not. Needs no docker.
-#   test_orca_teardown.sh compose   `compose.sh down` -- the teardown README, CI
-#                                   and provision.py all point at -- activates
-#                                   every profile and removes orphans, while
-#                                   `up -d` still activates none. Stubbed
-#                                   docker, so it needs none.
+#   test_orca_teardown.sh compose   `compose.sh down` -- the teardown ci.yml and
+#                                   provision.py both point at -- activates every
+#                                   profile and removes orphans, while `up -d`
+#                                   still activates none. Stubbed docker, so it
+#                                   needs none.
 #   test_orca_teardown.sh compose_live
 #                                   the same question put to a real daemon: #122's
 #                                   acceptance, that nothing carrying the
@@ -40,6 +40,11 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SKIP=77
+
+# For orca_project_remnants: the phases below and the scripts they judge then
+# ask docker the same three questions, rather than two hand-copied sets of
+# filters that can drift apart.
+. "$REPO_ROOT/scripts/orca/lib.sh"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -67,6 +72,42 @@ free_port() {
   return 1
 }
 
+# Whether $2 -- a `down` invocation -- activates every profile the compose file
+# defines. $1 names what is being judged, so the failure says which.
+#
+# Two spellings arrive here and mean the same thing: the literal text of
+# archive.sh, reap.sh and compose.sh carries the source's own quoting, while a
+# stubbed docker's log has had the shell strip it already. Accepting both in one
+# place is what keeps that difference deliberate rather than a coincidence
+# repeated at three call sites.
+assert_activates_every_profile() {
+  local what="$1" invocation="$2" profile
+  for profile in $(compose_profiles); do
+    case "$invocation" in
+      *"--profile $profile"*|*"--profile '*'"*|*"--profile *"*|*'COMPOSE_PROFILES'*) ;;
+      *) fail "$what does not activate the '$profile' profile, so $profile services"\
+              "survive teardown, restart themselves, and hold the network behind"\
+              "them: $invocation" ;;
+    esac
+  done
+}
+
+# Remove everything docker holds under one project label. Only ever used to
+# clean up after a phase: a test that fabricates a stack and leaves it behind is
+# committing the exact leak this file exists to catch.
+remove_project() {
+  local kind name
+  while IFS="$(printf '\t')" read -r kind name; do
+    [ -n "${name:-}" ] || continue
+    case "$kind" in
+      container) docker rm -f "$name" >/dev/null 2>&1 ;;
+      volume)    docker volume rm "$name" >/dev/null 2>&1 ;;
+      network)   docker network rm "$name" >/dev/null 2>&1 ;;
+    esac
+  done < <(orca_project_remnants "$1")
+  return 0
+}
+
 FIXTURE=""
 ORPHAN=""
 SPACED=""
@@ -78,21 +119,15 @@ cleanup() {
     git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1
     rm -rf "$(dirname "$SPACED")"
   fi
-  # Never leave the fabricated stack behind -- that would be this test
-  # committing the exact leak it exists to catch.
-  if [ -n "$ORPHAN" ]; then
-    docker network rm "${ORPHAN}_default" >/dev/null 2>&1
-    docker volume rm "${ORPHAN}_db_data" >/dev/null 2>&1
-  fi
-  # Same reason, for the stack compose_live really starts: its fixture root is
-  # deleted above, so nothing else on the machine could find it afterwards.
+  # Never leave a fabricated stack behind -- that would be this test committing
+  # the exact leak it exists to catch. compose_live's is the one that matters
+  # most: the fixture root holding its compose file is deleted just above, so
+  # nothing on the machine could find it afterwards.
+  [ -n "$ORPHAN" ] && remove_project "$ORPHAN"
   if [ -n "$LIVE" ]; then
-    docker ps -aq --filter "label=com.docker.compose.project=$LIVE" \
-      | while read -r c; do docker rm -f "$c" >/dev/null 2>&1; done
-    docker volume ls -q --filter "label=com.docker.compose.project=$LIVE" \
-      | while read -r v; do docker volume rm "$v" >/dev/null 2>&1; done
-    docker network ls -q --filter "label=com.docker.compose.project=$LIVE" \
-      | while read -r n; do docker network rm "$n" >/dev/null 2>&1; done
+    # Unlabelled, so remove_project cannot see it -- see compose_live.
+    docker rm -f "$LIVE-upstream" >/dev/null 2>&1
+    remove_project "$LIVE"
   fi
   return 0
 }
@@ -296,13 +331,7 @@ FAKE
       down="$(grep -A2 -E 'docker compose -p "\$project"' \
                 "$REPO_ROOT/scripts/orca/$script" | tr '\n' ' ')"
       [ -n "$down" ] || fail "$script no longer runs docker compose down on a project"
-      for profile in $profiles; do
-        case "$down" in
-          *"--profile $profile"*|*"--profile '*'"*|*'COMPOSE_PROFILES'*) ;;
-          *) fail "$script's \`down\` does not activate the '$profile' profile, so"\
-                  "$profile services survive teardown and restart themselves" ;;
-        esac
-      done
+      assert_activates_every_profile "$script's \`down\`" "$down"
     done
 
     echo "PASS: teardown activates every compose profile ($(echo $profiles | tr '\n' ' '))"
@@ -311,8 +340,8 @@ FAKE
   compose)
     # The documented teardown path (#122). archive.sh and reap.sh name the `tls`
     # profile outright, but `./scripts/orca/compose.sh down -v` -- the command
-    # README, CI and provision.py all point at -- did not, so the TLS terminator
-    # survived it and held the network behind it.
+    # ci.yml's teardown step and provision.py both point at -- did not, so the
+    # TLS terminator survived it and held the network behind it.
     #
     # Stubbed docker, so this asserts what the wrapper ASKED FOR rather than what
     # a daemon happened to leave; `compose_live` is the same question put to a
@@ -343,13 +372,7 @@ FAKE
       || fail "compose.sh down -v exited non-zero against a stubbed docker"
     down="$(cat "$log")"
     grep -q ' down ' <<<" $down " || fail "compose.sh down ran no down: $down"
-    for profile in $profiles; do
-      case "$down" in
-        *"--profile $profile"*|*"--profile *"*|*'COMPOSE_PROFILES'*) ;;
-        *) fail "compose.sh down does not activate the '$profile' profile, so"\
-                "$profile services survive the documented teardown: $down" ;;
-      esac
-    done
+    assert_activates_every_profile "compose.sh down" "$down"
     # A container compose no longer recognises as a service is still this
     # worktree's, and teardown is the moment to say so -- archive.sh and reap.sh
     # already do.
@@ -386,12 +409,7 @@ FAKE
       "$FIXTURE/scripts/orca/compose.sh" -p rmx-other down -v >/dev/null 2>&1 \
       || fail "compose.sh -p ... down -v exited non-zero against a stubbed docker"
     flagged="$(cat "$log")"
-    for profile in $profiles; do
-      case "$flagged" in
-        *"--profile $profile"*|*"--profile *"*|*'COMPOSE_PROFILES'*) ;;
-        *) fail "a \`down\` behind a global flag activated no profile: $flagged" ;;
-      esac
-    done
+    assert_activates_every_profile "compose.sh -p ... down" "$flagged"
 
     echo "PASS: compose.sh down activates every profile ($(echo $profiles | tr '\n' ' ')), up -d none"
     ;;
@@ -420,25 +438,62 @@ FAKE
     # nothing but romm-tls starts below.
     printf 'COMPOSE_PROJECT_NAME=%s\nTLS_PORT=%s\n' "$LIVE" "$port" >"$FIXTURE/.env"
 
-    # Only the terminator, and without its dependencies: this phase is about
-    # whether teardown SEES a profiled container, which does not need a RomM
-    # behind it. nginx exits on the unresolvable upstream, and that is fine --
-    # `docker ps -a` is what the acceptance names, and an exited container is
-    # still a container the next `reap.sh` would find.
+    # A certificate, because nginx will not start without one, and it has to be
+    # RUNNING for this phase to reproduce what #122 reported: an exited container
+    # is still left behind, but only a running one pins the network, which is the
+    # other half of the report.
+    command -v openssl >/dev/null 2>&1 || { echo "SKIP: no openssl"; exit $SKIP; }
+    openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+      -subj "/CN=romm.fixture.local" \
+      -keyout "$FIXTURE/server/testing/tls/generated/server.key" \
+      -out "$FIXTURE/server/testing/tls/generated/server.crt" >/dev/null 2>&1 \
+      || fail "could not mint the fixture certificate"
+
+    # The terminator alone, without the RomM behind it: a whole rig would cost a
+    # database healthcheck for a question that is only about what teardown sees.
+    # nginx resolves `proxy_pass ${UPSTREAM}` once, at start-up, so it needs the
+    # name `romm` to exist for exactly that long -- hence a stand-in on the
+    # network for the duration of the start, removed again immediately. It
+    # carries no compose label on purpose: teardown must not be able to claim
+    # credit for removing it, and cleanup() takes it by name.
     "$FIXTURE/scripts/orca/compose.sh" --profile tls up -d --no-deps romm-tls >/dev/null 2>&1 \
+      || fail "could not create the fixture terminator"
+    docker run -d --name "$LIVE-upstream" --network "${LIVE}_default" \
+      --network-alias romm nginx:1.27-alpine >/dev/null 2>&1 \
+      || fail "could not stand in for the terminator's upstream"
+    docker start "$LIVE-romm-tls-1" >/dev/null 2>&1 \
       || fail "could not start the fixture terminator"
-    [ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$LIVE")" ] \
-      || fail "the fixture terminator never existed; this phase would pass vacuously"
+    for _ in $(seq 1 50); do
+      [ "$(docker inspect -f '{{.State.Running}}' "$LIVE-romm-tls-1" 2>/dev/null)" = true ] && break
+      sleep 0.1
+    done
+    docker rm -f "$LIVE-upstream" >/dev/null 2>&1
+
+    # Assert the fixture is really in the shape the bug needs before tearing it
+    # down. Without this the phase passes when nothing was ever started.
+    [ "$(docker inspect -f '{{.State.Running}}' "$LIVE-romm-tls-1" 2>/dev/null)" = true ] \
+      || fail "the fixture terminator is not running, so it would not hold the network: $(docker logs "$LIVE-romm-tls-1" 2>&1 | tail -1)"
+    [ -n "$(docker volume ls -q --filter "label=com.docker.compose.project=$LIVE")" ] \
+      || fail "the fixture created no volumes, so the volume half of this would pass vacuously"
+    [ -n "$(docker network ls -q --filter "label=com.docker.compose.project=$LIVE")" ] \
+      || fail "the fixture created no network, so the network half of this would pass vacuously"
 
     "$FIXTURE/scripts/orca/compose.sh" down -v >/dev/null 2>&1 \
       || fail "compose.sh down -v exited non-zero"
 
-    remnants="$(
-      docker ps -a      --filter "label=com.docker.compose.project=$LIVE" --format 'container {{.Names}}'
-      docker volume ls  --filter "label=com.docker.compose.project=$LIVE" --format 'volume {{.Name}}'
-      docker network ls --filter "label=com.docker.compose.project=$LIVE" --format 'network {{.Name}}'
-    )"
+    remnants="$(orca_project_remnants "$LIVE")"
     [ -z "$remnants" ] || fail "compose.sh down -v left this behind: $(echo $remnants)"
+
+    # By label above, because that is how archive.sh and reap.sh find a stack.
+    # By name here, because #122 asks about the project PREFIX, and a remnant
+    # that lost its label is exactly what the by-label sweep cannot see either.
+    named="$(
+      docker ps -a      --format '{{.Names}}'
+      docker volume ls  --format '{{.Name}}'
+      docker network ls --format '{{.Name}}'
+    )"
+    leftover="$(grep "^$LIVE" <<<"$named")"
+    [ -z "$leftover" ] || fail "something carrying the project prefix survived: $(echo $leftover)"
 
     echo "PASS: compose.sh down -v leaves no container, volume or network for $LIVE"
     ;;
