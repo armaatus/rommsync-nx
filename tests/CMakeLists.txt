@@ -1492,6 +1492,8 @@ endforeach()
 # guessed would delete the work it exists to protect.
 set(ORCA_FLEET_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_orca_fleet.sh")
 foreach(phase card_says card_quiet remove_forces remove_advice
+              remove_keeps_stack remove_sweeps_stack
+              merged_keeps_dirty merged_keeps_owned
               stall_expected stall_reports timebox_waits timebox_stops queue_skips
               list_declines timebox_rearms labels_unknown outage_once one_lookup
               timebox_clears stop_clears own_clears one_card

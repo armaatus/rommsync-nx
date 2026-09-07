@@ -20,6 +20,28 @@
 #                                     which skips exactly this case and prints
 #                                     "nothing to reap".
 #
+# ...and the removal's ORDER, because "could not remove it" used to mean the
+# stack had already been torn down anyway (#163): `--run-hooks` ran archive.sh
+# BEFORE Orca refused the removal, so a worktree that was still there, still
+# owned and still being worked in lost its RomM mid-ctest.
+#
+#   test_orca_fleet.sh remove_keeps_stack   the removal refuses -> the hook was
+#                                           never asked for, the sweep never ran,
+#                                           and it says the stack is still up.
+#   test_orca_fleet.sh remove_sweeps_stack  it worked -> the stack is swept only
+#                                           NOW. Dropping --run-hooks without
+#                                           this would leak two ports and four
+#                                           volumes per merged worktree.
+#   test_orca_fleet.sh merged_keeps_dirty   reap_merged leaves a dirty worktree
+#                                           and says what it holds, exactly as it
+#                                           already does for unpushed commits --
+#                                           #122's held two review fixes.
+#   test_orca_fleet.sh merged_keeps_owned   a refused removal keeps the issue
+#                                           OWNED and is said once, the way
+#                                           reap_abandoned already does. Disowned,
+#                                           nothing ever looks at that worktree
+#                                           again.
+#
 # ...and the three places `needs-human-step` has to be honoured, because an
 # issue whose last step is outward and the maintainer's is not a stalled one:
 #
@@ -235,7 +257,19 @@ STUB
   printf '#!/usr/bin/env bash\nexit 0\n' >"$WORK/bin/osascript"
   chmod +x "$WORK/bin/osascript"
 
+  # The sweep the removal now runs ITSELF, because it no longer asks the Orca CLI
+  # to run the archive hook (#163). Stubbed rather than real: the real one talks
+  # to docker, and what these tests are about is WHEN it is called, not what it
+  # tears down.
+  cat >"$WORK/repo/scripts/orca/reap.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$REAP_CALLS"
+exit 0
+STUB
+  chmod +x "$WORK/repo/scripts/orca/reap.sh"
+
   ORCA_CALLS="$WORK/calls"; : >"$ORCA_CALLS"
+  REAP_CALLS="$WORK/reap-calls"; : >"$REAP_CALLS"
   ORCA_MODE="$WORK/mode"; printf '%s' "${1:-ok}" >"$ORCA_MODE"
   GH_CALLS="$WORK/gh-calls"; : >"$GH_CALLS"
   # The defaults are the quiet answers: no agent running, no terminal, no open
@@ -253,7 +287,7 @@ STUB
   GH_MERGED="$WORK/merged";         echo 7 >"$GH_MERGED"
   WORK_FOR_STUB="$WORK"; mkdir -p "$WORK/created"
   export ORCA_CALLS ORCA_MODE GH_CALLS ORCA_PS ORCA_WORKTREES ORCA_TERMINALS \
-         GH_PRS GH_ISSUES GH_LABELS GH_STATE GH_MERGED WORK_FOR_STUB
+         GH_PRS GH_ISSUES GH_LABELS GH_STATE GH_MERGED WORK_FOR_STUB REAP_CALLS
   # cmd_run sleeps between passes; a test that reached one would otherwise sit
   # for a minute before failing.
   export ROMMSYNC_FLEET_POLL=1
@@ -405,6 +439,59 @@ case "${1:-}" in
     grep -q "containing submodules" <<<"$out" \
       || fail "the reason git gave was dropped; it is the difference between this and a hung CLI: $out"
     echo "ok: a failed removal says something that would actually clean it up"
+    ;;
+  remove_keeps_stack)
+    make_fixture rm_never_works
+    make_worktree
+    out="$(in_fleet remove_worktree "$WORK/wt" 2>&1)"
+    grep -q -- "--run-hooks" "$ORCA_CALLS" \
+      && fail "the removal still asks Orca to run the archive hook, so a refusal tears the stack down anyway: $(cat "$ORCA_CALLS")"
+    [ -s "$REAP_CALLS" ] \
+      && fail "it swept the stack of a worktree it did not remove: $(cat "$REAP_CALLS")"
+    grep -q "still up" <<<"$out" \
+      || fail "it did not say the stack survived, which is the whole difference: $out"
+    echo "ok: a refused removal leaves that worktree's stack running"
+    ;;
+  remove_sweeps_stack)
+    make_fixture rm_needs_force
+    make_worktree
+    out="$(in_fleet remove_worktree "$WORK/wt" 2>&1)" \
+      || fail "remove_worktree gave up on a worktree --force would have removed: $out"
+    [ -d "$WORK/wt" ] && fail "it reported success and the worktree is still there"
+    grep -q -- "--yes" "$REAP_CALLS" \
+      || fail "the stack was never swept, so every merged worktree leaks it: $(cat "$REAP_CALLS")"
+    echo "ok: the stack is torn down once the worktree is actually gone"
+    ;;
+  merged_keeps_dirty)
+    make_fixture ok
+    make_worktree
+    add_origin
+    dirty_worktree
+    out="$(in_fleet reap_merged 2>&1)"
+    grep -q "worktree rm" "$ORCA_CALLS" \
+      && fail "a dirty worktree reached the removal: $(cat "$ORCA_CALLS")"
+    [ -d "$WORK/wt" ] || fail "it removed a worktree holding uncommitted work: $out"
+    [ -e "$ROMMSYNC_FLEET_DIR/worktrees/42" ] \
+      || fail "it disowned a worktree it kept, so nothing looks at it again: $out"
+    grep -q "uncommitted" <<<"$out" \
+      || fail "it did not say WHAT the worktree holds: $out"
+    echo "ok: reap_merged leaves a dirty worktree and says what is in it"
+    ;;
+  merged_keeps_owned)
+    make_fixture rm_never_works
+    make_worktree
+    add_origin
+    out="$(in_fleet reap_merged 2>&1)"
+    grep -q "could not remove it" <<<"$out" \
+      || fail "a failed removal was not reported: $out"
+    [ -e "$ROMMSYNC_FLEET_DIR/worktrees/42" ] \
+      || fail "the issue was disowned on a removal that refused, so that worktree is one nothing ever looks at again: $out"
+    [ -e "$ROMMSYNC_FLEET_DIR/stuck-42" ] \
+      || fail "nothing recorded the refusal, so the next poll retries it: $out"
+    again="$(in_fleet reap_merged 2>&1)"
+    grep -q "could not remove it" <<<"$again" \
+      && fail "it says so again every poll, and retries the removal with it: $again"
+    echo "ok: a refused removal keeps its issue owned, and is said once"
     ;;
   stall_expected)
     make_fixture ok
@@ -928,6 +1015,6 @@ JSON
     echo "ok: a lookup that failed leaves the markers, and the notice, where they were"
     ;;
   *)
-    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind" >&2
+    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind" >&2
     exit 2 ;;
 esac
