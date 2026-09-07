@@ -320,7 +320,13 @@ case "${1:-}" in
       || fail "an ordinary overrun was not stopped: $out"
     grep -q "issue comment" "$GH_CALLS" \
       || fail "an ordinary overrun left nothing on the issue: $out"
-    echo "ok: an ordinary overrun is still stopped"
+    # The other exit from enforce_timebox, and it owes the same tidiness: a
+    # marker left here is inherited by the next worktree for this issue.
+    for m in unreachable box-labels human-step; do
+      [ -e "$ROMMSYNC_FLEET_DIR/$m-42" ] \
+        && fail "$m-42 survives the stop, and it silences the next worktree first report"
+    done
+    echo "ok: an ordinary overrun is still stopped, and leaves no marker behind"
     ;;
   queue_skips)
     make_fixture ok
@@ -427,7 +433,6 @@ JSON
       || fail "the outage marker was never set, so this asserts nothing"
     # Then a PR opens, which ends the time-box for this worktree entirely.
     echo '[{"number":9,"body":"Closes #42"}]' >"$GH_PRS"
-    make_overdue
     in_fleet enforce_timebox >/dev/null 2>&1
     [ -e "$ROMMSYNC_FLEET_DIR/box-labels-42" ] \
       && fail "a stale outage marker survives, and it swallows the next worktree first report"
