@@ -30,13 +30,23 @@ work="$(mktemp -d)"
 first=""
 second=""
 
+# Job control, so that each backgrounded `ctest` below leads a process group of
+# its own. Without it they share this script's, and the only thing that could be
+# signalled is a group that includes the OUTER ctest running this test.
+set -m
+
 # The jobs are killed as well as the directory removed. If CTest ends this script
 # on TIMEOUT, two detached `ctest`s would otherwise keep hammering the shared
 # RomM fixture while the outer run moves on to other rig tests -- which presents
 # as those tests failing, with nothing pointing back here.
+#
+# The GROUP is signalled, not the pid: what holds a connection to the fixture is
+# the `test_http_native` an inner `ctest` spawned, and killing the inner `ctest`
+# alone leaves that grandchild orphaned and still connected on any path where
+# `ctest` does not forward the signal itself.
 cleanup() {
   for job in $first $second; do
-    kill "$job" 2>/dev/null
+    kill -- "-$job" 2>/dev/null || kill "$job" 2>/dev/null
   done
   wait 2>/dev/null
   rm -rf "$work"

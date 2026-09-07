@@ -123,8 +123,15 @@ inline constexpr const char* kKeepMarker = ".keep";
 inline void Discard(const std::filesystem::path& path) {
   std::error_code error;
   if (Keeping()) {
+    // The marker is the whole of the request -- without it the next process's
+    // sweep takes the leaf. Announcing a path that was not marked would be a
+    // lie told in exactly the debugging session this exists for.
     std::ofstream marker(path / kKeepMarker);
-    std::cerr << "  scratch kept at " << path.string() << "\n";
+    if (marker) {
+      std::cerr << "  scratch kept at " << path.string() << "\n";
+    } else {
+      std::cerr << "  could not keep " << path.string() << ": it is already gone\n";
+    }
     return;
   }
   std::filesystem::remove_all(path, error);
@@ -208,13 +215,25 @@ inline const std::string& Dir() {
     const std::filesystem::path root = Root();
     const std::filesystem::path mine = root / LeafName(static_cast<long long>(::getpid()));
 
-    std::error_code error;
-    std::filesystem::create_directories(root, error);
+    // An `error_code` each, because the next call clears the last one's. A
+    // `remove_all` that failed and then a `create_directories` that returned
+    // false for "it is already there" would otherwise report success, and this
+    // process would ADOPT a dead run's leaf -- the one case in which a `.part`
+    // from another run can still be sitting in a fresh scratch directory.
+    std::error_code made_root;
+    std::filesystem::create_directories(root, made_root);
     Sweep(root, mine);
-    std::filesystem::remove_all(mine, error);
-    std::filesystem::create_directories(mine, error);
-    if (error) {
-      std::cerr << "could not create " << mine.string() << ": " << error.message() << "\n";
+
+    std::error_code removed;
+    std::filesystem::remove_all(mine, removed);
+    if (removed) {
+      std::cerr << "could not clear " << mine.string() << ": " << removed.message()
+                << "\n  it belonged to a run that is over; remove it by hand\n";
+    }
+    std::error_code made;
+    std::filesystem::create_directories(mine, made);
+    if (made) {
+      std::cerr << "could not create " << mine.string() << ": " << made.message() << "\n";
     }
 
     static const detail::Leaf leaf(mine);
