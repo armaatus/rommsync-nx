@@ -163,15 +163,38 @@ for t in json.load(sys.stdin)["result"]["terminals"]:
 }
 
 # --------------------------------------------------------------- the state ---
-own()          { printf '%s\n' "$2" >"$OWNED_DIR/$1"; date +%s >"$STARTED_DIR/$1"; }
+own() {
+  printf '%s\n' "$2" >"$OWNED_DIR/$1"; date +%s >"$STARTED_DIR/$1"
+  clear_issue_markers "$1"
+}
 owned_path()   { cat "$OWNED_DIR/$1" 2>/dev/null; }
-# ...including the stall marker, which notice_stalled writes once per stall and
-# nothing else removed -- one small file leaked per issue that ever stalled.
-disown_issue() {
-  rm -f "$OWNED_DIR/$1" "$STARTED_DIR/$1" "$STATE_DIR/stalled-$1" \
-        "$STATE_DIR/stall-labels-$1" "$STATE_DIR/box-labels-$1" \
-        "$STATE_DIR/queue-labels-$1" "$STATE_DIR/unreachable-$1" \
+
+# Every per-issue marker the dispatcher writes, in one list, because the bug
+# this replaces was exactly one list drifting from another.
+#
+# All of these throttle a message to once per event. A marker that outlives the
+# worktree that wrote it therefore does not misreport anything -- it SILENCES
+# the next worktree for the same issue, which is worse, because the thing that
+# goes missing is the line saying why. `own()` clears them for that reason: a
+# fresh worktree starts with nothing already said on its behalf, and so does
+# `disown_issue`, which is what stopped `stalled-` leaking one small file per
+# issue that ever stalled. That is the root fix; the two exits in
+# enforce_timebox tidying up after themselves is the belt.
+clear_issue_markers() {
+  rm -f "$STATE_DIR/stalled-$1" "$STATE_DIR/stall-labels-$1" \
+        "$STATE_DIR/box-labels-$1" "$STATE_DIR/queue-labels-$1" \
+        "$STATE_DIR/unreachable-$1" "$STATE_DIR/human-step-$1"
+}
+
+# The subset enforce_timebox owns, for its two exits.
+forget_box_markers() {
+  rm -f "$STATE_DIR/unreachable-$1" "$STATE_DIR/box-labels-$1" \
         "$STATE_DIR/human-step-$1"
+}
+
+disown_issue() {
+  rm -f "$OWNED_DIR/$1" "$STARTED_DIR/$1"
+  clear_issue_markers "$1"
 }
 
 # Non-zero when the answer could not be read, which is NOT the same as "nothing
@@ -550,7 +573,9 @@ except Exception:
     # single `gh` blip would otherwise record a #142-style false stall and never
     # re-evaluate it, which is the exact noise this change exists to remove.
     # `stall-labels-` throttles it instead. Each watcher owns its own
-    # once-per-outage marker and clears only that one: this branch above drops
+    # once-per-outage marker and clears only that one -- the single exception
+    # being `$POLL_CACHE/carded-`, which enforce_timebox writes and this
+    # function only reads, and which the next pass empties anyway: this branch above drops
     # `stall-labels-` whenever the agent stops being `waiting`, which is the
     # ordinary state of a grinding overrun, and a marker shared with
     # enforce_timebox would be deleted seconds after that function set it --
@@ -567,7 +592,11 @@ except Exception:
     : >"$STATE_DIR/stalled-$num"
     if [ "$rc" = 0 ]; then
       say "#$num is waiting for you, as expected -- its last step is yours to take"
-      card "$path" --comment "#$num: waiting for you -- as expected, not a stall"
+      # ...unless enforce_timebox, which runs first in this same pass, already
+      # said it. Only for this pass: the board is not a log, but a stall that
+      # starts later is news no earlier comment covered.
+      [ -e "$POLL_CACHE/carded-$num" ] \
+        || card "$path" --comment "#$num: waiting for you -- as expected, not a stall"
       notify "#$num is waiting for you" "Its last step is yours to take."
     else
       say "#$num is waiting for input -- in auto mode nothing should be asking"
@@ -597,8 +626,9 @@ enforce_timebox() {
     # that failed is no basis for either. The started marker stays, so the next
     # pass asks again -- an agent is only ever stopped on an answer.
     has_open_pr "$num"; case $? in
-      0) rm -f "$f" "$STATE_DIR/unreachable-$num" "$STATE_DIR/human-step-$num"
-         continue ;;
+      # Every marker this function owns, not only the ones it happened to set on
+      # the way here.
+      0) rm -f "$f"; forget_box_markers "$num"; continue ;;
       # Once per outage, not once per poll, the same way notice_stalled does it:
       # the dispatcher polls every POLL_SECONDS, and an hour of GitHub being
       # unreachable would otherwise bury the log a person scans overnight under
@@ -619,7 +649,10 @@ enforce_timebox() {
     # back to an agent -- which would then run uncapped forever. Said once, by
     # its own marker, rather than once a minute for as long as the label is on.
     issue_needs_human_step "$num"; case $? in
-      0) rm -f "$STATE_DIR/box-labels-$num"
+      # Not an exit -- the issue stays owned and past its box -- so it clears
+      # only what this poll just proved stale, and keeps `human-step-` because
+      # that is the marker it is about to write.
+      0) rm -f "$STATE_DIR/box-labels-$num" "$STATE_DIR/unreachable-$num"
          [ -e "$STATE_DIR/human-step-$num" ] && continue
          : >"$STATE_DIR/human-step-$num"
          say "#$num: past the time-box, but it is labelled $HUMAN_STEP_LABEL -- leaving it to wait for you"
@@ -627,14 +660,22 @@ enforce_timebox() {
          # `waiting`, so notice_stalled never speaks for it, and this worktree
          # keeps a slot until a person looks at it -- one line in fleet.log is
          # not where WORKFLOW.md says status lives.
-         card "$path" --comment "#$num: waiting for you -- as expected, past the time-box"
+         card "$path" --comment "#$num: waiting for you -- as expected, not a stall; past the time-box"
+         # For notice_stalled, which runs later in THIS pass and would otherwise
+         # repeat it. Scoped to the poll, not to the exemption: a stall that
+         # begins hours from now is news, and has to reach the board.
+         : >"$POLL_CACHE/carded-$num"
          continue ;;
       2) [ -e "$STATE_DIR/box-labels-$num" ] && continue
          : >"$STATE_DIR/box-labels-$num"
          say "#$num: timed out, but could not read its labels -- leaving it for the next pass"
          continue ;;
     esac
-    rm -f "$STATE_DIR/box-labels-$num" "$STATE_DIR/human-step-$num"
+    # The other exit, and it owes the same tidiness. `unreachable-` is the one
+    # this path used to drop: a PR lookup that failed on an earlier poll, then
+    # answered on this one, left its marker standing for the next worktree on
+    # the same issue to inherit and be silenced by.
+    forget_box_markers "$num"
 
     say "#$num: $((TIMEBOX_SECONDS / 3600))h with no PR -- stopping it and leaving the worktree for you"
     agent="$(agent_terminal_in "$path")"
@@ -792,6 +833,10 @@ cmd_run() {
 
     forget_poll_answers
     reap_merged
+    # enforce_timebox BEFORE notice_stalled: the first writes
+    # `$POLL_CACHE/carded-`, the second reads it to avoid repeating a board
+    # comment it has already made. Swapping these two lines silently restores
+    # the duplicate.
     enforce_timebox
     notice_stalled
 
@@ -833,7 +878,7 @@ cmd_run() {
             # expensive direction and the next pass asks again.
             issue_needs_human_step "$n"; case $? in
               0) say "#$n is labelled $HUMAN_STEP_LABEL -- it is yours to take; remove the label to hand it to an agent"
-                 continue ;;
+                 rm -f "$STATE_DIR/queue-labels-$n"; continue ;;
               2) if [ ! -e "$STATE_DIR/queue-labels-$n" ]; then
                    : >"$STATE_DIR/queue-labels-$n"
                    say "#$n: could not read its labels -- not starting it this pass"
