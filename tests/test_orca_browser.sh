@@ -1058,6 +1058,18 @@ case "\$1" in
 esac
 STUB
     chmod +x "$stub/orca"
+    # notice_stalled asks GitHub for the issue's state and labels before it
+    # decides whether a wait is a stall. Stubbed, and not left to whatever `gh`
+    # is on PATH: an unstubbed one passes on a laptop where `gh` is signed in and
+    # fails in CI where it is not, which is a test reporting on its environment
+    # rather than on the code. `ready` and nothing else, so the ordinary-stall
+    # branch below is the one under test -- the exemption has its own phases in
+    # tests/test_orca_fleet.sh.
+    cat >"$stub/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+printf 'OPEN\tready\n'
+GHSTUB
+    chmod +x "$stub/gh"
     : >"$TMPDIR_FIXTURE/orca-calls.log"
     # ORCA_CLI/ORCA_CLI_COMMAND cleared for the reason the time-box phase below
     # spells out: orca_cli_resolve honours either over the stub on PATH.
