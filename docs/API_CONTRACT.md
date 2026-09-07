@@ -747,8 +747,8 @@ downloaded. `download::EnqueueRom` refuses it with `ipc::Error::kMultiFile` from
 the rom index the engine already holds, and the worker is the backstop for an
 entry that reached the queue anyway — it settles `kSkipped` with a sentence
 naming the disc set, so the overlay can say why nothing arrived. Verified
-against a live 5.2.0 by `harness.multifile`, `download.multifile` and
-`download.nested`; [ARCHITECTURE.md](ARCHITECTURE.md#explicitly-out-of-scope-v1)
+against a live 5.2.0 by `harness.multifile`, `download.multifile`,
+`download.nested` and `download.nestedname`; [ARCHITECTURE.md](ARCHITECTURE.md#explicitly-out-of-scope-v1)
 records the same decision.
 
 Three things here are silent, and together they are the reason:
@@ -792,15 +792,17 @@ The HTTP is the easy half. What is actually missing for a disc set is on the
 card: an `.m3u` listing the discs, a per-emulator folder layout to put them in,
 and per-file verification. `config::ValidRomFileName()` is the check to reuse
 for `files[].file_name` — those names come off the server's filesystem exactly
-as `fs_name` does, and nothing else validates them.
+as `fs_name` does, and nothing else validates them. The nested single-file path
+below already reuses it that way, and `download::RomDetail::file_names` is
+already parsed off `files[]`, so a v2 inherits both.
 
 #### `has_nested_single_file` is not a disc set
 
 A rom is exactly one of `has_simple_single_file`, `has_nested_single_file` and
 `has_multiple_files`. The middle one is a **directory holding exactly one
 file**, and it is an ordinary download — the skip must not fire on it. Pinned by
-`harness.multifile` and `download.nested` against the seeded
-`Synthetic Nested Game`:
+`harness.multifile`, `download.nested` and `download.nestedname` against the
+seeded `Synthetic Nested Game`:
 
 - the whole-rom `content` endpoint serves **the file itself** —
   `application/octet-stream`, a real `Content-Length` equal to
@@ -809,14 +811,47 @@ file**, and it is an ordinary download — the skip must not fire on it. Pinned 
   the way any other rom's does.
 
 One consequence, and it is a real one: `fs_name` is the **directory's** name and
-`fs_extension` is `""`, so the rom lands on the card *without* the inner file's
-extension — `Synthetic Nested Game`, not `Synthetic Nested Game.bin`. The bytes
-are right and the digest verifies them, so the entry settles `kDone` while
-RetroArch and hbmenu, which pick a core by extension, will not load it. M3-4
-pinned this with `download.nested` rather than changing it — the name is also
-what `AlreadyOnTheCard` looks for and what the overlay renders — and **#92**
-carries the decision. The name a fix would use is `files[0].file_name` from
-`GET /api/roms/{id}`.
+`fs_extension` is `""`. A client that wrote the bytes under `fs_name` would land
+`Synthetic Nested Game` rather than `Synthetic Nested Game.bin` — right bytes, a
+digest that verifies them, an entry that settles `kDone`, and a file RetroArch
+and hbmenu will not load, because both pick a core by extension. M3-4 pinned that
+behaviour with `download.nested` rather than changing it, and **#92** decided it:
+
+- **The leaf on the card is `files[0].file_name`** from `GET /api/roms/{id}`, not
+  `fs_name` and never `fs_extension`. It is also the name RomM itself gives those
+  bytes: the whole-rom `content` request for this fixture answers
+  `content-disposition: attachment; filename="Synthetic Nested Game.bin"`.
+- That name comes off the server's filesystem exactly as `fs_name` does and
+  nothing else validates it, so it goes through `config::ValidRomFileName()`
+  before it is joined onto a mapped folder. A name that check refuses — and a
+  rom that claims the flag with a `files[]` that is not exactly one entry — is a
+  `kSkipped` carrying the reason, with nothing written. Refused, never repaired,
+  for the reason [CONFIG.md](CONFIG.md) gives: a name this client quietly changed
+  is one it would look for under a name nothing ever wrote, and download forever.
+- **`download::QueueEntry::fs_name` still holds the rom's name**, the directory's,
+  and `destination` is the field that says what the file is called.
+  `lists::Service` puts that same `fs_name` on the library row from the *list*
+  schema, where `files[]` is empty and always will be, so the alternative is two
+  rows about one rom disagreeing about what it is called.
+- `AlreadyOnTheCard` looks for that same leaf, so a second drain over a nested rom
+  is a no-op rather than a re-download. `download.nested` asserts both halves.
+- The gap this leaves, and it is not closable from the list schema: the library
+  browser's `on_disk` flag (`lists::Service::OnDisk`, #25) is computed from the
+  list row's `fs_name`, so a **downloaded nested rom is not reported as on disk**.
+  `files[]` is empty on that schema and `fs_extension` is `""`, so nothing there
+  names the file. A fix needs a per-rom detail call the browser deliberately does
+  not make.
+
+Two more things verified live while deciding it, both of which mean the transfer
+itself needed no change:
+
+- the `{file_name}` segment of `GET /api/roms/{id}/content/{file_name}` is
+  **decorative on a single-file rom too**, not only on the `files/content` path
+  above: `…/content/anything.xyz` serves the same rom with the same
+  `content-disposition`. So the client keeps building that URL from `fs_name`.
+- `files[0].sha1_hash` and the rom-level `sha1_hash` are the same digest for a
+  nested single-file rom, which is what makes the rom-level one usable — the
+  opposite of the disc-set case above.
 
 ### Platform → folder mapping
 

@@ -29,7 +29,9 @@
 //   staging    -- what an interrupted attempt leaves behind: salvaged, or discarded
 //   disabled   -- `[downloads] enabled = false` drains nothing and loses nothing
 //   multifile  -- a disc set is refused with a reason and no archive reaches the card
-//   nested     -- ...and the directory-shaped rom beside it is downloaded, not refused
+//   nested     -- ...and the directory-shaped rom beside it is downloaded, not refused,
+//                 under the name of the one file inside it
+//   nestedname -- ...unless that name is one the card cannot hold, which is a skip
 //   missing    -- a rom the server's library no longer holds fails with a sentence
 //   progress   -- how far a transfer has got, read from a second thread while it moves
 #include <algorithm>
@@ -676,7 +678,7 @@ void Endpoint(checks::Checks& c) {
       "\"platform_slug\":\"nes\",\"fs_size_bytes\":65552,"
       "\"sha1_hash\":\"ff66e33efc818b516f7994f3027a72f4bc629b30\","
       "\"md5_hash\":\"06b44b6cbb2ecfca4325537ccb4d32a7\","
-      "\"has_multiple_files\":false,\"missing_from_fs\":false}";
+      "\"has_multiple_files\":false,\"has_nested_single_file\":false,\"missing_from_fs\":false}";
   download::RomDetail detail;
   c.Expect(download::ParseRomDetail(body, &detail).ok(), "a rom detail body reads");
   c.ExpectEq(detail.id, std::int64_t{4}, "with its id");
@@ -694,7 +696,7 @@ void Endpoint(checks::Checks& c) {
   const std::string null_hash =
       "{\"id\":4,\"fs_name\":\"a.nes\",\"platform_fs_slug\":\"nes\",\"fs_size_bytes\":1,"
       "\"sha1_hash\":null,\"md5_hash\":null,\"has_multiple_files\":false,"
-      "\"missing_from_fs\":false}";
+      "\"has_nested_single_file\":false,\"missing_from_fs\":false}";
   c.Expect(download::ParseRomDetail(null_hash, &unhashed).ok(), "a null sha1_hash is still a rom");
   c.Expect(unhashed.sha1_hash.empty() && unhashed.md5_hash.empty(),
            "with nothing to check the bytes against, which the worker records as unverified "
@@ -706,7 +708,7 @@ void Endpoint(checks::Checks& c) {
   const std::string no_sha1 =
       "{\"id\":4,\"fs_name\":\"a.nes\",\"platform_fs_slug\":\"nes\",\"fs_size_bytes\":1,"
       "\"sha1_hash\":null,\"md5_hash\":\"06b44b6cbb2ecfca4325537ccb4d32a7\","
-      "\"has_multiple_files\":false,\"missing_from_fs\":false}";
+      "\"has_multiple_files\":false,\"has_nested_single_file\":false,\"missing_from_fs\":false}";
   c.Expect(download::ParseRomDetail(no_sha1, &md5_only).ok(), "a library with only an MD5 reads");
   c.ExpectEq(md5_only.md5_hash, std::string("06b44b6cbb2ecfca4325537ccb4d32a7"),
              "and the fallback digest is what comes back");
@@ -732,6 +734,13 @@ void Endpoint(checks::Checks& c) {
   refused("\"has_multiple_files\":false", "\"has_multiple_files\":0",
           "a multi-file flag sent as a number");
   refused("\"missing_from_fs\":false", "\"missing\":false", "a renamed missing_from_fs");
+  // Held to exactly the bar `has_multiple_files` is, because reading its absence
+  // as `false` is the bug #92 exists to end: the rom lands under the directory's
+  // name, verifies against the rom-level hash, and reports success.
+  refused("\"has_nested_single_file\":false", "\"has_nested\":false",
+          "a renamed has_nested_single_file");
+  refused("\"has_nested_single_file\":false", "\"has_nested_single_file\":\"false\"",
+          "a nested flag sent as a string");
   refused("\"sha1_hash\":\"ff66e33efc818b516f7994f3027a72f4bc629b30\"", "\"sha1\":\"x\"",
           "a sha1_hash that is not on the body at all");
   // The same bar as `sha1_hash`, and for the same reason: a body with no
@@ -745,6 +754,46 @@ void Endpoint(checks::Checks& c) {
   download::RomDetail nothing;
   c.Expect(!download::ParseRomDetail("{\"id\":4,", &nothing).ok(), "a truncated body is refused");
   c.Expect(!download::ParseRomDetail("", &nothing).ok(), "and so is an empty one");
+
+  // `files[]`, which is what names a nested single-file rom on the card (#92).
+  // It is the one field read only when the body carries it: it is present and
+  // always empty on the *list* schema, and only `GET /api/roms/{id}` fills it,
+  // so requiring it of every body would add a way for an ordinary rom to fail
+  // and buy nothing. The refusal for a nested rom without one is the worker's.
+  c.Expect(detail.file_names.empty(), "a body with no files[] parses, with no names on it");
+
+  download::RomDetail nested;
+  const std::string nested_body =
+      "{\"id\":6,\"fs_name\":\"Synthetic Nested Game\",\"platform_fs_slug\":\"psx\","
+      "\"fs_size_bytes\":37,\"sha1_hash\":null,\"md5_hash\":null,"
+      "\"has_multiple_files\":false,\"has_nested_single_file\":true,"
+      "\"missing_from_fs\":false,\"files\":[{\"id\":6,\"file_name\":"
+      "\"Synthetic Nested Game.bin\",\"file_size_bytes\":37}]}";
+  c.Expect(download::ParseRomDetail(nested_body, &nested).ok(), "a nested rom's body reads");
+  c.Expect(nested.has_nested_single_file,
+           "with the flag that says it is a folder holding one file");
+  c.ExpectEq(nested.file_names.size(), std::size_t{1}, "and the one name inside it");
+  c.ExpectEq(nested.file_names.front(), std::string("Synthetic Nested Game.bin"),
+             "which carries the extension `fs_name` does not");
+
+  // The names in `files[]` come off the server's filesystem exactly as `fs_name`
+  // does, so a list with a hole in it is a named refusal rather than a vector a
+  // caller reads `front()` off and gets something else.
+  const auto malformed = [&c](const std::string& files, std::string_view what) {
+    std::string body =
+        "{\"id\":6,\"fs_name\":\"g\",\"platform_fs_slug\":\"psx\",\"fs_size_bytes\":1,"
+        "\"sha1_hash\":null,\"md5_hash\":null,\"has_multiple_files\":false,"
+        "\"has_nested_single_file\":true,\"missing_from_fs\":false,\"files\":" +
+        files + "}";
+    download::RomDetail out;
+    const json::Error error = download::ParseRomDetail(body, &out);
+    c.Expect(!error.ok(), std::string(what) + " is a named refusal");
+    c.Expect(!error.Describe().empty(), std::string(what) + " says which field");
+  };
+  malformed("{\"file_name\":\"a.bin\"}", "a files that is an object rather than an array");
+  malformed("[{\"id\":6}]", "a files entry with no file_name");
+  malformed("[{\"file_name\":42}]", "a file_name that is not a string");
+  malformed("[\"a.bin\"]", "a files entry that is a bare string");
 }
 
 // --- against the real library -------------------------------------------------
@@ -1227,7 +1276,8 @@ std::string DetailBody(const harness::Rom& rom, const char* slug, const std::str
   return "{\"id\":" + std::to_string(rom.id) + ",\"fs_name\":" + json::Quote(rom.fs_name) +
          ",\"platform_fs_slug\":\"" + slug + "\",\"fs_size_bytes\":" + std::to_string(rom.size) +
          ",\"sha1_hash\":" + quoted(sha1) + ",\"md5_hash\":" + quoted(md5) +
-         ",\"has_multiple_files\":false,\"missing_from_fs\":false}";
+         ",\"has_multiple_files\":false,\"has_nested_single_file\":false"
+         ",\"missing_from_fs\":false}";
 }
 
 /// Arm the proxy to answer this rom's *detail* call with `body`.
@@ -1887,6 +1937,106 @@ void Nested(checks::Checks& c, http::HttpClient& client, const std::string& base
   c.Expect(rig.sandbox.Read(destination) == expected, "which still holds the rom's bytes");
 }
 
+/// The other half of #92: a nested single-file rom this client will not name.
+///
+/// `files[0].file_name` comes off the server's filesystem exactly as `fs_name`
+/// does and nothing else has looked at it, so it goes through
+/// `config::ValidRomFileName` before it is joined onto a mapped folder -- and is
+/// refused rather than repaired, for the reason config.hpp gives: a name this
+/// client quietly changed is one it would look for under a name nothing ever
+/// wrote, and download again forever.
+///
+/// The fixture library is healthy and nothing here may make it otherwise, so
+/// both bodies are the proxy's, read by the real parser and acted on by the real
+/// worker. The rom underneath is the real `Synthetic Nested Game`, so a bug that
+/// let either body through would put a file on the card where these assert there
+/// is none.
+void NestedName(checks::Checks& c, http::HttpClient& client, const std::string& base,
+                const harness::Fixture& fixture) {
+  Rig rig(c, "download-nested-name", base, fixture);
+  harness::Rom rom;
+  const std::int64_t rom_id =
+      Queued(c, client, base, fixture, &rig.queue, "Synthetic Nested Game", &rom);
+  if (rom_id == 0) {
+    return;
+  }
+
+  const auto nested_body = [&rom](const std::string& files) {
+    return "{\"id\":" + std::to_string(rom.id) + ",\"fs_name\":" + json::Quote(rom.fs_name) +
+           ",\"platform_fs_slug\":\"psx\",\"fs_size_bytes\":" + std::to_string(rom.size) +
+           ",\"sha1_hash\":null,\"md5_hash\":null,\"has_multiple_files\":false"
+           ",\"has_nested_single_file\":true,\"missing_from_fs\":false,\"files\":" +
+           files + "}";
+  };
+
+  // A separator is the refusal that matters most. It is not a deeper folder
+  // anybody asked for -- it is a server naming a path inside this console's SD
+  // card, and `../../atmosphere` under a mapped folder is how a download becomes
+  // a system file (config.hpp).
+  {
+    harness::Fault fault(
+        c, client, base,
+        DetailFault(rom_id, nested_body("[{\"file_name\":\"../../atmosphere/boot.bin\"}]")));
+    const download::DrainResult result = rig.Drain(client);
+    c.Expect(result.outcome == download::DrainOutcome::kCompleted,
+             std::string("a name the card cannot hold does not stop the drain -- got ") +
+                 download::ToString(result.outcome) + " (" + result.message + ")");
+    c.ExpectEq(result.skipped, 1, "the entry is skipped");
+    c.ExpectEq(result.downloaded, 0, "and nothing came down");
+  }
+
+  const QueueEntry refused = rig.Persisted(rom_id);
+  c.Expect(refused.state == QueueState::kSkipped,
+           "a name this client will not write is a skip -- the client's decision, with a reason");
+  c.Expect(!refused.message.empty(), "which says why");
+  c.Expect(refused.message.find("atmosphere") == std::string::npos,
+           "without quoting the name back into the queue file, which is the point of refusing it");
+  c.Expect(refused.message.find("folder") != std::string::npos,
+           "and says it was the file inside the rom's folder, not the rom: " + refused.message);
+  c.Expect(refused.destination.empty(), "with no destination recorded");
+  c.ExpectEq(refused.fs_name, std::string("Synthetic Nested Game"),
+             "though the rom's own name -- which is fine -- is still on the entry");
+  c.Expect(!rig.sandbox.Exists("/tico/roms/psx/Synthetic Nested Game"),
+           "and nothing was written under the rom's name");
+  c.Expect(!rig.sandbox.Exists("/tico/atmosphere/boot.bin"), "nor anywhere the name pointed");
+  c.Expect(!rig.sandbox.Exists("/atmosphere/boot.bin"), "nor above the mapped folder");
+
+  // RomM sets `has_nested_single_file` exactly when the rom is a folder holding
+  // one file, so a body claiming it with an empty `files[]` is the server
+  // contradicting itself. Falling back to `fs_name` there is the silent failure
+  // this whole issue is about, so it is refused too.
+  std::int32_t again = 0;
+  c.Expect(rig.queue.Enqueue(rom_id, &again) == ipc::Error::kOk, "the rom is queued again");
+  {
+    harness::Fault fault(c, client, base, DetailFault(rom_id, nested_body("[]")));
+    const download::DrainResult result = rig.Drain(client);
+    c.Expect(result.outcome == download::DrainOutcome::kCompleted,
+             std::string("a nested rom with no file in it does not stop the drain -- got ") +
+                 download::ToString(result.outcome) + " (" + result.message + ")");
+    c.ExpectEq(result.skipped, 1, "it is skipped as well");
+  }
+  const QueueEntry nameless = rig.Persisted(rom_id);
+  c.Expect(nameless.state == QueueState::kSkipped, "with a skip on the card");
+  c.Expect(nameless.message.find("single file") != std::string::npos,
+           "saying the server did not name the file: " + nameless.message);
+  c.Expect(!rig.sandbox.Exists("/tico/roms/psx/Synthetic Nested Game"),
+           "and still nothing under the directory's name");
+  c.Expect(!rig.sandbox.Exists("/tico/roms/psx/Synthetic Nested Game.bin"),
+           "nor under the one a healthy body would have given it");
+  c.ExpectEq(rig.queue.pending(), std::size_t{0}, "the worker has nothing left to do");
+
+  // The queue is still writable and the next rom still drains: a refusal here is
+  // one entry's, and must not cost the sixty-three behind it.
+  harness::Rom healthy;
+  const std::int64_t healthy_id =
+      Queued(c, client, base, fixture, &rig.queue, "240pee.nes", &healthy);
+  const download::DrainResult after = rig.Drain(client);
+  c.Expect(after.outcome == download::DrainOutcome::kCompleted,
+           std::string("and the next rom still drains -- got ") +
+               download::ToString(after.outcome) + " (" + after.message + ")");
+  c.Expect(rig.Persisted(healthy_id).state == QueueState::kDone, "all the way to done");
+}
+
 /// `missing_from_fs: true` -- RomM knows the rom and its file is gone from the
 /// server's own filesystem.
 ///
@@ -1909,7 +2059,7 @@ void Missing(checks::Checks& c, http::HttpClient& client, const std::string& bas
       "{\"id\":" + std::to_string(rom_id) +
       ",\"fs_name\":\"240pee.nes\",\"platform_fs_slug\":\"nes\",\"fs_size_bytes\":65552,"
       "\"sha1_hash\":null,\"md5_hash\":null,\"has_multiple_files\":false,"
-      "\"missing_from_fs\":true}";
+      "\"has_nested_single_file\":false,\"missing_from_fs\":true}";
   {
     harness::Fault fault(c, client, base,
                          "{\"mode\":\"status\",\"status\":200,\"path\":\"/api/roms/" +
@@ -1950,7 +2100,8 @@ void Missing(checks::Checks& c, http::HttpClient& client, const std::string& bas
   const std::string enormous =
       "{\"id\":" + std::to_string(long_id) + ",\"fs_name\":\"" + std::string(900, 'n') +
       "\",\"platform_fs_slug\":\"nes\",\"fs_size_bytes\":1,\"sha1_hash\":null,"
-      "\"md5_hash\":null,\"has_multiple_files\":false,\"missing_from_fs\":false}";
+      "\"md5_hash\":null,\"has_multiple_files\":false,\"has_nested_single_file\":false,"
+      "\"missing_from_fs\":false}";
   {
     harness::Fault fault(c, client, base,
                          "{\"mode\":\"status\",\"status\":200,\"path\":\"/api/roms/" +
@@ -2329,6 +2480,8 @@ int main(int argc, char** argv) {
     Multifile(checks, *client, base, fixture);
   } else if (scenario == "nested") {
     Nested(checks, *client, base, fixture);
+  } else if (scenario == "nestedname") {
+    NestedName(checks, *client, base, fixture);
   } else if (scenario == "missing") {
     Missing(checks, *client, base, fixture);
   } else if (scenario == "progress") {

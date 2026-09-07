@@ -984,9 +984,44 @@ json::Error ParseRomDetail(std::string_view body, RomDetail* out) {
   reader.Required("platform_fs_slug", &detail.platform_fs_slug);
   reader.Required("fs_size_bytes", &detail.size_bytes);
   reader.Required("has_multiple_files", &detail.has_multiple_files);
+  // The same bar as `has_multiple_files`, and for a sharper reason: reading a
+  // missing `has_nested_single_file` as `false` is exactly the bug #92 exists to
+  // end -- the rom lands under the directory's name, verifies, and says it
+  // worked.
+  reader.Required("has_nested_single_file", &detail.has_nested_single_file);
   reader.Required("missing_from_fs", &detail.missing_from_fs);
   if (!reader.ok()) {
     return reader.error();
+  }
+
+  // `files[]` is the one field read only when the body carries it. It is present
+  // and always empty on the *list* schema and only filled by
+  // `GET /api/roms/{id}` (docs/API_CONTRACT.md), and the only rom whose name
+  // depends on it is the nested single-file one -- which the worker refuses
+  // rather than guessing at when the list is not exactly one name. Requiring it
+  // of every body would add a way for an ordinary rom to fail and buy nothing.
+  //
+  // What it holds is still held to the shape: an element that is not an object,
+  // or one whose `file_name` is not a string, is a named refusal rather than a
+  // list with a hole in it. A caller reading `file_names.front()` must be
+  // reading a name the server actually sent.
+  if (const json::Value* files = document.value.Find("files"); files != nullptr) {
+    if (!files->is_array()) {
+      json::Error error;
+      error.field = "files";
+      error.message = "field files: expected an array";
+      return error;
+    }
+    for (const json::Value& file : files->elements()) {
+      const json::Value* name = file.is_object() ? file.Find("file_name") : nullptr;
+      if (name == nullptr || !name->is_string()) {
+        json::Error error;
+        error.field = "files";
+        error.message = "field files: expected every entry to carry a file_name string";
+        return error;
+      }
+      detail.file_names.push_back(name->string());
+    }
   }
 
   // The two digests are `string | null` and the only fields here allowed to have
@@ -1530,12 +1565,24 @@ class Drainer {
                     "the server's library no longer holds this rom's file");
     }
 
-    // 3. Where does it go? `DestinationFor` refuses rather than repairs, and a
+    // 3. What is the file called? `fs_name` for every rom but one, and the
+    // exception is why this is a step rather than an argument: a nested
+    // single-file rom is a directory holding one file, so `fs_name` is that
+    // directory and `fs_extension` is `""`. Written under it the bytes verify,
+    // the entry settles `kDone`, and the user has a file no emulator picks a
+    // core for (#92).
+    std::string leaf;
+    if (const std::optional<Step> refused = NameOnTheCard(&entry, detail, &leaf);
+        refused.has_value()) {
+      return *refused;
+    }
+
+    // 4. Where does it go? `DestinationFor` refuses rather than repairs, and a
     // refused entry is a skip carrying its reason -- never a guessed folder
     // (config.hpp). That reason never quotes `fs_name`, which is why it can go
     // into the queue file as it stands.
     const config::RomDestination target =
-        config_.DestinationFor({detail.platform_fs_slug, detail.fs_name});
+        config_.DestinationFor({detail.platform_fs_slug, leaf});
     if (!target.ok()) {
       return Settle(std::move(entry), QueueState::kSkipped, target.reason);
     }
@@ -1552,23 +1599,62 @@ class Drainer {
     // is written by `Verify` and by nothing else (download.hpp).
     staging_ = io::TempPathFor(destination_);
 
-    // 4. Is it already on the card? Every folder the platform maps, not only the
+    // 5. Is it already on the card? Every folder the platform maps, not only the
     // write target: the later `roms` entries are exactly the folders where
     // someone already keeps that platform's roms (config.hpp), and a check that
-    // skipped them re-downloads a rom the card has.
+    // skipped them re-downloads a rom the card has. It looks for `leaf`, which
+    // is the name step 3 decided and step 4 wrote -- looking for `fs_name`
+    // instead would miss every nested rom the card already holds and fetch it
+    // again on every drain.
     //
     // Answered with the digest or not at all. Without one there is no way to
     // tell "already there and correct" from "already there and truncated", and
     // skipping the second is how a user is left with a broken rom and a queue
     // that says done -- so a library with no hash, or `verify_hash = false`,
     // downloads it again rather than assuming.
-    const std::optional<Step> present = AlreadyOnTheCard(&entry, detail);
+    const std::optional<Step> present = AlreadyOnTheCard(&entry, detail, leaf);
     if (present.has_value()) {
       return *present;
     }
 
-    // 5. The bytes.
+    // 6. The bytes.
     return Transfer(std::move(entry), detail);
+  }
+
+  /// The leaf the rom is written under, or the refusal that stops it.
+  ///
+  /// `fs_name` for every rom but a nested single-file one, where it is
+  /// `files[0].file_name` -- the name RomM's own `content-disposition` gives the
+  /// bytes it serves for that rom (docs/API_CONTRACT.md).
+  ///
+  /// That name comes off the server's filesystem exactly as `fs_name` does and
+  /// nothing else has looked at it, so `ValidRomFileName` is asked here rather
+  /// than left to `DestinationFor`: both would refuse, but only this one can say
+  /// it was the file *inside* the folder that was unusable, and a sentence
+  /// blaming the rom's own name when the rom's name is fine sends whoever reads
+  /// it to the wrong place. It never quotes the name, for
+  /// `config::RomDestination::reason`'s reason.
+  std::optional<Step> NameOnTheCard(QueueEntry* entry, const RomDetail& detail,
+                                    std::string* leaf) {
+    if (!detail.has_nested_single_file) {
+      *leaf = detail.fs_name;
+      return std::nullopt;
+    }
+    // RomM sets the flag exactly when the rom is a folder holding one file, so a
+    // body saying otherwise is the server contradicting itself. Falling back to
+    // `fs_name` would be the silent failure this refusal exists to end, and
+    // picking one of several files would be a guess at which rom the user gets.
+    if (detail.file_names.size() != 1) {
+      return Settle(std::move(*entry), QueueState::kSkipped,
+                    "this rom is a folder and the server did not say which single file is in it");
+    }
+    std::string why;
+    if (!config::ValidRomFileName(detail.file_names.front(), &why)) {
+      return Settle(std::move(*entry), QueueState::kSkipped,
+                    "the file inside this rom's folder cannot be written to the card -- " + why);
+    }
+    *leaf = detail.file_names.front();
+    return std::nullopt;
   }
 
   /// Nothing when the rom is not already on the card, so the caller carries on.
@@ -1576,13 +1662,14 @@ class Drainer {
   /// The size is checked first because it is free and a digest is not: hashing
   /// every candidate path would read a rom off the card per drain, and a file of
   /// the wrong length is already a no.
-  std::optional<Step> AlreadyOnTheCard(QueueEntry* entry, const RomDetail& detail) {
+  std::optional<Step> AlreadyOnTheCard(QueueEntry* entry, const RomDetail& detail,
+                                       const std::string& leaf) {
     if (!Checkable(detail, config_.downloads.verify_hash) || detail.size_bytes <= 0) {
       return std::nullopt;
     }
 
     for (const std::string& candidate :
-         config_.ExistingRomPaths({detail.platform_fs_slug, detail.fs_name})) {
+         config_.ExistingRomPaths({detail.platform_fs_slug, leaf})) {
       const std::string real = filesystem_.Resolve(candidate);
       if (real.empty() || FileSizeBytes(real) != detail.size_bytes) {
         continue;

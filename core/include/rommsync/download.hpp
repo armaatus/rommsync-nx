@@ -170,6 +170,15 @@ struct QueueEntry {
   std::string platform_fs_slug;
 
   /// The rom's name on the server's filesystem. Empty until resolved.
+  ///
+  /// The **rom's** name, which is not always the name of the file on the card:
+  /// for a nested single-file rom this is the directory RomM keeps that one
+  /// file in, and `destination` ends in the file's own name instead (#92). It
+  /// stays the rom's because `lists::Service` puts the same `fs_name` on the
+  /// library row from the *list* schema -- where `files[]` is empty and always
+  /// will be -- and two rows about one rom disagreeing about what it is called
+  /// is worse than a row that does not name the file. `destination` is where to
+  /// look for that.
   std::string fs_name;
 
   /// `fs_size_bytes`, and what `http::DownloadTarget::expected_size` is set to.
@@ -189,6 +198,12 @@ struct QueueEntry {
   /// The absolute SD path this rom is written to, from
   /// `config::Config::DestinationFor`. Empty until resolved, and empty forever
   /// on an entry that was refused a destination.
+  ///
+  /// Its leaf is `fs_name` for every rom but one: a nested single-file rom is
+  /// written under `RomDetail::file_names.front()`, because `fs_name` there is
+  /// a directory and carries no extension for an emulator to pick a core from
+  /// (#92). This is therefore the only field that says what the file on the
+  /// card is called.
   std::string destination;
 
   QueueState state = QueueState::kQueued;
@@ -622,9 +637,9 @@ std::string ContentUrl(std::string_view base_url, std::int64_t rom_id, std::stri
 
 /// The rom fields the worker reads out of `GET /api/roms/{id}`.
 ///
-/// Five of about eighty, for `roms::Rom`'s reason: the rest are not the client's
-/// to hold. `sha1_hash` is `string | null` -- an unscanned library leaves it
-/// null -- and is the only one that is allowed to be absent.
+/// Eight of about eighty, for `roms::Rom`'s reason: the rest are not the
+/// client's to hold. `sha1_hash` is `string | null` -- an unscanned library
+/// leaves it null -- and is the only one that is allowed to be absent.
 struct RomDetail {
   std::int64_t id = 0;
   std::string fs_name;
@@ -641,6 +656,31 @@ struct RomDetail {
 
   bool has_multiple_files = false;
 
+  /// The rom is a **directory on the server holding exactly one file**, and it
+  /// is an ordinary download -- the disc-set skip must not fire on it (#21).
+  ///
+  /// What it changes is the *name*. `fs_name` is the directory's and
+  /// `fs_extension` is `""` for exactly these roms, so a client that wrote the
+  /// bytes under `fs_name` would land a file RetroArch and hbmenu cannot pick a
+  /// core for, with a queue saying it worked. The leaf comes from `file_names`
+  /// instead (#92).
+  bool has_nested_single_file = false;
+
+  /// `files[].file_name`, in the order the server listed them.
+  ///
+  /// The one field here that is a *name on the server's filesystem* without
+  /// being `fs_name`, and it is held to the same suspicion: nothing has
+  /// validated it, so `config::ValidRomFileName` is asked before it is joined
+  /// onto a mapped folder.
+  ///
+  /// Empty on any body that carried no `files` -- **not** a shape error, unlike
+  /// the digests. `files[]` is only filled by `GET /api/roms/{id}` (it is
+  /// present and always empty on the list schema), and the one rom whose name
+  /// depends on it is the nested single-file one, which is where the worker
+  /// refuses an empty list rather than guessing. Requiring it of every body
+  /// would add a way for an ordinary rom's download to fail and buy nothing.
+  std::vector<std::string> file_names;
+
   /// RomM knows the rom and its file is gone from the server's own filesystem.
   /// A download would 404 a third of the way in; the entry fails with a sentence
   /// instead.
@@ -649,11 +689,16 @@ struct RomDetail {
 
 /// Read one `DetailedRomSchema` body, or say which field was wrong.
 ///
-/// Six of about eighty fields. A *missing* `sha1_hash` or `md5_hash` key is a
-/// shape error even though a null value is not: a body without them is not the
-/// schema this was written against, and reading it as "this rom has no hash"
-/// would turn a client talking to the wrong server into a library of unverified
-/// roms.
+/// Seven required fields of about eighty, and `files[]` if the body carries one.
+/// A *missing* `sha1_hash` or `md5_hash` key is a shape error even though a null
+/// value is not: a body without them is not the schema this was written against,
+/// and reading it as "this rom has no hash" would turn a client talking to the
+/// wrong server into a library of unverified roms.
+///
+/// `has_nested_single_file` is required for that same reason and not a softer
+/// one: reading its absence as `false` is exactly the bug #92 exists to end --
+/// the rom lands under the directory's name and nothing says so. `files` is the
+/// one field read only when it is there; `file_names` says why.
 json::Error ParseRomDetail(std::string_view body, RomDetail* out);
 
 /// How hard the worker tries, and how it reaches the world.
@@ -769,12 +814,27 @@ struct DrainResult {
 /// radio buy nothing.
 ///
 /// Per entry: `GET /api/roms/{id}` -> refuse a disc set or a rom missing from
-/// the server -> `config::Config::DestinationFor` -> is it already on the card?
+/// the server -> name the file -> `config::Config::DestinationFor` -> is it
+/// already on the card?
 /// -> stream the content to `<destination>.tmp.part`, which the backend renames
 /// onto `<destination>.tmp` -> `kVerifying` -> hash it -> `io::CommitStaged`
 /// onto the destination -> `kDone`. The queue is written after every one of
 /// those transitions, which is what makes a power cut resumable rather than a
 /// restart.
+///
+/// **A nested single-file rom is written under the file's name, not the rom's.**
+/// `has_nested_single_file` means a directory on the server holding exactly one
+/// file, so `fs_name` is that directory and `fs_extension` is `""`: the bytes
+/// verify, the entry settles `kDone`, and the user has a file RetroArch and
+/// hbmenu will not load. The leaf is `files[0].file_name` from the detail body
+/// instead -- the name RomM's own `content-disposition` gives those bytes -- and
+/// it is held to `config::ValidRomFileName` exactly as `fs_name` is, since it
+/// comes off the same filesystem with nothing else checking it. A name that
+/// check refuses, or a nested rom whose `files[]` is not exactly one entry, is a
+/// `kSkipped` carrying the reason and nothing written: writing under the
+/// directory's name anyway is the silent failure this exists to end.
+/// `QueueEntry::fs_name` still records the rom's name; `destination` is what
+/// says where the file went.
 ///
 /// **"Already on the card" is answered with the hash, or not at all.** Every
 /// path `config::Config::ExistingRomPaths` names is checked, not just the write
