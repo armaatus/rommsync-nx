@@ -197,12 +197,25 @@ pending = [c for c in newest.values()
            if c.get("status") in ("IN_PROGRESS", "QUEUED", "PENDING")
            or (c.get("state") or "").upper() in ("PENDING", "EXPECTED")
            or not (c.get("conclusion") or c.get("state"))]
+def is_the_expected_gate_failure(check):
+    """A merge-gate on a protected-path PR, whichever state it is in.
+
+    Answered below as the human-merge verdict rather than here as a problem --
+    and that has to include the run still IN_PROGRESS, not only the concluded
+    one. A gate that has not landed yet on such a PR is a gate that is going to
+    fail, so reporting "check still running" makes exit 4 unreachable on the
+    first ask and sends the agent round again for an answer that will not change.
+    """
+    return bool(protected) and (check.get("name") or check.get("context")) == "merge-gate"
+
+
 for c in bad:
-    name = c.get("name") or c.get("context")
-    if protected and name == "merge-gate":
-        continue  # expected, and answered below rather than as a failure
-    problems.append(f"check failed: {name}")
+    if is_the_expected_gate_failure(c):
+        continue
+    problems.append(f"check failed: {c.get('name') or c.get('context')}")
 for c in pending:
+    if is_the_expected_gate_failure(c):
+        continue
     problems.append(f"check still running: {c.get('name') or c.get('context')}")
 
 if problems:

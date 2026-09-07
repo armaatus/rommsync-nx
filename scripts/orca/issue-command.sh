@@ -143,13 +143,15 @@ the same on a PR only a person can merge -- both are done, stop there. Exit 1
 prints the reasons; go back to `await-review.sh` for the ones a review can
 answer.
 
-Two of those reasons are NOT waiting for a review, and it says so in the output:
+Three of those reasons are NOT waiting for a review, and it says so in the output:
 
 - **`GitHub says BLOCKED`** with every check green is #84 -- branch protection is
   still counting a stale run whose newer run passed. Run the `gh run rerun --job`
   it prints, then run `review-status.sh` again. Waiting for another review here
   costs 45 minutes and changes nothing.
 - **`GitHub says DIRTY`** is a conflict with the base. Rebase and push.
+- **`GitHub says BEHIND`** means the base moved and the branch has to catch up.
+  Rebase and push.
 
 **At most THREE rounds of this.** If a third round still leaves something
 unresolved, stop: comment on the PR saying exactly what is unresolved and why you

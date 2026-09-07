@@ -971,6 +971,22 @@ core/src/sync.cpp'
       || fail "did not say a person merges this one: $out"
     grep -q ".github/workflows/merge-gate.yml" <<<"$out" \
       || fail "did not name the path that makes it human-merge-only: $out"
+    # And before the gate has concluded, which is where an agent asks first. A
+    # gate still running on such a PR is a gate that is going to fail, so
+    # reporting it as "still running" makes exit 4 unreachable on the first ask
+    # and sends the agent round again for an answer that cannot change.
+    write_pr_checks \
+      '{"name":"merge-gate","status":"IN_PROGRESS","conclusion":null,
+        "startedAt":"2026-09-06T11:00:00Z","completedAt":null,
+        "detailsUrl":"https://github.com/armaatus/rommsync-nx/actions/runs/2/job/22"},
+       {"name":"host-tests","status":"COMPLETED","conclusion":"SUCCESS",
+        "startedAt":"2026-09-06T09:00:00Z","completedAt":"2026-09-06T09:30:00Z"}' \
+      BLOCKED '.github/workflows/merge-gate.yml
+core/src/sync.cpp'
+    out="$(run_review_status)"; rc=$?
+    [ "$rc" = 4 ] || fail "the gate had not concluded yet, and its answer on this PR is not in doubt; got $rc: $out"
+    grep -q "check still running: merge-gate" <<<"$out" \
+      && fail "waited on a gate whose verdict on this PR is already decided: $out"
     echo "PASS: an enforcement-layer PR is reported as human-merge, not as a failure to fix"
     ;;
 
