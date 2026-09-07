@@ -281,6 +281,51 @@ for named in record-review.sh await-review.sh review-status.sh; do
 done
 ok "the brief still names the review loop"
 
+echo "== every test phase actually runs"
+# A phase defined in test_orca_browser.sh and missing from the foreach() list in
+# tests/CMakeLists.txt never runs -- not in ctest, not in CI -- and is
+# indistinguishable from a phase that passes. It happened: the assertions for a
+# whole behaviour shipped green by never being executed. The script and the list
+# are two files, so only something reading both can say they agree.
+if python3 - <<'PHASES'
+import re, sys
+
+# Heredoc bodies are dropped first. The phases write stub `orca` and `gh`
+# scripts, and those carry their own two-space `case` arms -- `worktree)`,
+# `terminal)` -- which are shell being generated, not phases of this file.
+lines, kept, delim = open("tests/test_orca_browser.sh").read().splitlines(), [], None
+for line in lines:
+    if delim is not None:
+        if line.strip() == delim:
+            delim = None
+        continue
+    here = re.search(r"<<-?\s*[\'\"]?([A-Za-z_][A-Za-z0-9_]*)[\'\"]?\s*$", line)
+    if here:
+        delim = here.group(1)
+    kept.append(line)
+body = "\n".join(kept).split('case "${1:-}" in', 1)[1]
+# What is left: the phase labels are the only ones at exactly two spaces, and
+# `*)` is the usage fallback.
+defined = set(re.findall(r"^  ([a-z0-9_]+)\)$", body, re.M))
+
+cml = open("tests/CMakeLists.txt").read()
+listed = set(re.search(r"foreach\(phase\b(.*?)\)", cml, re.S).group(1).split())
+
+bad = False
+for name in sorted(defined - listed):
+    print(f"{name}: defined in test_orca_browser.sh, never registered in tests/CMakeLists.txt")
+    bad = True
+for name in sorted(listed - defined):
+    print(f"{name}: registered in tests/CMakeLists.txt, but the script has no such phase")
+    bad = True
+sys.exit(1 if bad else 0)
+PHASES
+then
+  ok "every test_orca_browser.sh phase is registered, and every registration exists"
+else
+  fail "test_orca_browser.sh and tests/CMakeLists.txt disagree about which phases exist; the ones above never run"
+fi
+
 echo "== the workflows parse as GitHub reads them"
 # An invalid workflow file does not fail loudly: GitHub creates a run with no
 # jobs, named after the file, and the check it was meant to report simply never
@@ -375,6 +420,56 @@ if [ -f .github/workflows/ci.yml ]; then
   ok "main's builds are never cancelled by the next merge"
 fi
 
+echo "== the cross-reference conventions"
+# `Closes #N` and `Blocked by #N` are read by three parsers -- GitHub itself,
+# unblock.yml, and fleet.sh via merge_gate.py's neighbour -- and every way they
+# disagree is silent. The fleet either opens a second worktree for work already
+# in flight, or reports "nothing startable" with the backlog wide open.
+if [ -x .github/scripts/issue_refs.py ]; then
+  python3 .github/scripts/issue_refs.py --selftest 2>&1 | sed 's/^/  /'
+  [ "${PIPESTATUS[0]}" = 0 ] || fail "the issue-reference selftest does not hold"
+else
+  fail ".github/scripts/issue_refs.py is missing or not executable"
+fi
+
+# unblock.yml is JavaScript inside YAML and cannot import the module, so the one
+# thing keeping the two in step is that they spell the pattern identically.
+# Asserted from BOTH ends: change either alone and this goes red.
+grep -qF 'blocked\s+by\s+#(\d+)/gi' .github/workflows/unblock.yml \
+  || fail "unblock.yml no longer matches blocked\\s+by\\s+#(\\d+)/gi; issue_refs.BLOCKED_BY is now a different rule from the one that maintains the labels"
+python3 -c '
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("r", ".github/scripts/issue_refs.py")
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+sys.exit(0 if m.BLOCKED_BY.pattern == r"blocked\s+by\s+#(\d+)" else 1)
+' || fail "issue_refs.BLOCKED_BY no longer spells unblock.yml's pattern character for character"
+ok "the fleet and unblock.yml read the same blockers"
+
+# ...and EVERY function in the fleet that reads one of the two conventions gets
+# it from the module. A `grep -q issue_refs` over the whole file would be
+# satisfied by one surviving import while the other three regrew patterns of
+# their own, which is precisely the drift this section exists to catch -- so
+# each function is checked on its own, by name.
+fleet_reads_shared=1
+for fn in ready_issues has_open_pr issue_is_done count_startable; do
+  body="$(sed -n "/^$fn()/,/^}/p" scripts/orca/fleet.sh)"
+  [ -n "$body" ] \
+    || { fail "scripts/orca/fleet.sh has no $fn(); this check no longer covers what it names"
+         fleet_reads_shared=0; continue; }
+  grep -q 'from issue_refs import' <<<"$body" \
+    || { fail "fleet.sh's $fn() no longer imports issue_refs; it can drift from GitHub and unblock.yml again"
+         fleet_reads_shared=0; }
+  # Any regex of its own over either convention, in any spelling and either
+  # language -- not just the two capitalisations it used to carry.
+  if grep -inE '(close[sd]?|fix(e[sd])?|resolve[sd]?|blocked[^"]*by)[^"]*#' <<<"$body" \
+     | grep -vi '^ *[0-9]*: *#' | grep -q .; then
+    fail "fleet.sh's $fn() spells out a closing or blocker reference again; there is one place for those, .github/scripts/issue_refs.py"
+    fleet_reads_shared=0
+  fi
+done
+[ "$fleet_reads_shared" = 1 ] && ok "every fleet function reading a body reads the shared patterns"
+
 echo "== the merge gate"
 # The one required check `gh pr merge --auto` waits on. Its decision lives in a
 # script rather than in the YAML precisely so it can be tested without a pull
@@ -387,6 +482,21 @@ else
 fi
 grep -q 'merge_gate.py' .github/workflows/merge-gate.yml \
   || fail "merge-gate.yml no longer calls merge_gate.py, so the check decides nothing"
+# merge_gate.py imports issue_refs.py, and the gate job checks out
+# `.github/scripts` ALONE. Widen that import to anything outside this directory
+# and the gate stops with an ImportError -- a required check that can never
+# conclude, on every PR.
+if ! grep -q 'sparse-checkout: .github/scripts' .github/workflows/merge-gate.yml; then
+  fail "merge-gate.yml no longer sparse-checks-out .github/scripts; the paths merge_gate.py imports from are no longer the ones it gets"
+fi
+sparse_tmp="$(mktemp -d)"
+cp -R .github/scripts "$sparse_tmp/scripts"
+if ( cd "$sparse_tmp/scripts" && python3 -c 'import merge_gate' ) 2>"$sparse_tmp/err"; then
+  ok "the gate still imports from the only directory it is given"
+else
+  fail "merge_gate.py does not import with only .github/scripts on disk, which is all the gate job checks out: $(tr '\n' ' ' <"$sparse_tmp/err")"
+fi
+rm -rf "$sparse_tmp"
 
 echo "== orca.yaml"
 if [ ! -f orca.yaml ]; then

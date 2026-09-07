@@ -12,7 +12,8 @@ produced it:
      invalidates it and a re-review is required;
   3. that review's latest word is not "changes requested";
   4. no review thread is still open;
-  5. it does not touch the enforcement layer, which never merges itself.
+  5. it says which issue it closes, in a form GitHub will act on;
+  6. it does not touch the enforcement layer, which never merges itself.
 
 Point 3 reads the LATEST review per author rather than GitHub's
 `reviewDecision`, and that is the whole trick. `reviewDecision` is sticky: once
@@ -29,7 +30,11 @@ Exits 0 when the PR may merge, 1 when it may not, and prints why either way.
 """
 
 import json
+import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from issue_refs import CLOSING_KEYWORDS, closes  # noqa: E402
 
 # Paths that never merge themselves. `.claude/**` is the enforcement layer --
 # the guards and the settings that register them -- and `.github/workflows/**`
@@ -121,6 +126,18 @@ def evaluate(head_sha, pull_request, changed_files):
                 "read them."
             )
 
+    # A PR that merges without a closing line closes nothing, so unblock.yml
+    # relabels nothing and the fleet reports "nothing startable" with the work
+    # available. CLAUDE.md's finishing steps have always said the wording
+    # matters; until now nothing checked it. Any of GitHub's nine keywords
+    # counts, because any of them is what GitHub itself acts on.
+    if not closes(body):
+        problems.append(
+            "the PR body names no issue it closes. Add `Closes #N` -- so "
+            "merging it unblocks whatever was waiting on that issue. GitHub "
+            "accepts any of " + ", ".join(CLOSING_KEYWORDS) + ", in any case."
+        )
+
     # Who counts, and what counts as a review -- both from the functions above,
     # which is what `review-status.sh` and `await-review.sh` import so that the
     # three answers cannot drift apart again.
@@ -200,7 +217,7 @@ SELFTEST = [
         "a clean PR merges",
         "abc123",
         {
-            "body": "## Review findings\n/code-review high\nmattpocock-skills:code-review\n",
+            "body": "Closes #7\n## Review findings\n/code-review high\nmattpocock-skills:code-review\n",
             "reviews": {"nodes": [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
@@ -228,7 +245,7 @@ SELFTEST = [
         "the review is against an older commit",
         "def456",
         {
-            "body": "/code-review\nmattpocock-skills:code-review",
+            "body": "Closes #7\n/code-review\nmattpocock-skills:code-review",
             "reviews": {"nodes": [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
@@ -242,7 +259,7 @@ SELFTEST = [
         "changes requested, and nothing since",
         "abc123",
         {
-            "body": "/code-review\nmattpocock-skills:code-review",
+            "body": "Closes #7\n/code-review\nmattpocock-skills:code-review",
             "reviews": {"nodes": [
                 {"state": "CHANGES_REQUESTED", "submittedAt": "2026-09-05T10:00:00Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
@@ -258,7 +275,7 @@ SELFTEST = [
         "a clean re-review supersedes an earlier changes-requested",
         "abc123",
         {
-            "body": "/code-review\nmattpocock-skills:code-review",
+            "body": "Closes #7\n/code-review\nmattpocock-skills:code-review",
             "reviews": {"nodes": [
                 {"state": "CHANGES_REQUESTED", "submittedAt": "2026-09-05T10:00:00Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
@@ -274,7 +291,7 @@ SELFTEST = [
         "an unresolved thread holds it",
         "abc123",
         {
-            "body": "/code-review\nmattpocock-skills:code-review",
+            "body": "Closes #7\n/code-review\nmattpocock-skills:code-review",
             "reviews": {"nodes": [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
@@ -291,7 +308,7 @@ SELFTEST = [
         "abc123",
         {
             "author": {"login": "armaatus"},
-            "body": "/code-review\nmattpocock-skills:code-review",
+            "body": "Closes #7\n/code-review\nmattpocock-skills:code-review",
             "reviews": {"nodes": [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "armaatus"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
@@ -306,7 +323,7 @@ SELFTEST = [
         "abc123",
         {
             "author": {"login": "armaatus"},
-            "body": "/code-review\nmattpocock-skills:code-review",
+            "body": "Closes #7\n/code-review\nmattpocock-skills:code-review",
             "reviews": {"nodes": [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
@@ -320,7 +337,7 @@ SELFTEST = [
         "the enforcement layer never merges itself",
         "abc123",
         {
-            "body": "/code-review\nmattpocock-skills:code-review",
+            "body": "Closes #7\n/code-review\nmattpocock-skills:code-review",
             "reviews": {"nodes": [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
@@ -334,7 +351,7 @@ SELFTEST = [
         "...nor a change to this gate itself",
         "abc123",
         {
-            "body": "/code-review\nmattpocock-skills:code-review",
+            "body": "Closes #7\n/code-review\nmattpocock-skills:code-review",
             "reviews": {"nodes": [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
@@ -348,7 +365,7 @@ SELFTEST = [
         "...and neither does a workflow change",
         "abc123",
         {
-            "body": "/code-review\nmattpocock-skills:code-review",
+            "body": "Closes #7\n/code-review\nmattpocock-skills:code-review",
             "reviews": {"nodes": [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
@@ -362,7 +379,7 @@ SELFTEST = [
         "a review with nothing in it does not count",
         "abc123",
         {
-            "body": "## Review findings\n/code-review high\nmattpocock-skills:code-review\n",
+            "body": "Closes #7\n## Review findings\n/code-review high\nmattpocock-skills:code-review\n",
             "reviews": {"nodes": [
                 # PR #95 merged on exactly this: body "test", no inline comments.
                 {"state": "COMMENTED", "submittedAt": "2026-09-06T02:45:34Z",
@@ -378,7 +395,7 @@ SELFTEST = [
         "...but an empty body with an inline comment does",
         "abc123",
         {
-            "body": "## Review findings\n/code-review high\nmattpocock-skills:code-review\n",
+            "body": "Closes #7\n## Review findings\n/code-review high\nmattpocock-skills:code-review\n",
             "reviews": {"nodes": [
                 {"state": "COMMENTED", "submittedAt": "2026-09-06T02:45:34Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"},
@@ -393,7 +410,7 @@ SELFTEST = [
         "an empty review does not supersede a real CHANGES_REQUESTED",
         "abc123",
         {
-            "body": "## Review findings\n/code-review high\nmattpocock-skills:code-review\n",
+            "body": "Closes #7\n## Review findings\n/code-review high\nmattpocock-skills:code-review\n",
             "reviews": {"nodes": [
                 {"state": "CHANGES_REQUESTED", "submittedAt": "2026-09-06T10:00:00Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"},
@@ -409,6 +426,40 @@ SELFTEST = [
         },
         ["core/src/sync.cpp"],
         False,
+    ),
+    (
+        # The closing line is what unblock.yml acts on. Without it a PR merges,
+        # closes nothing, and the fleet reports "nothing startable" while the
+        # work it just finished sits waiting to free three more issues.
+        "no closing line, so merging it would unblock nothing",
+        "abc123",
+        {
+            "body": "## Review findings\n/code-review high\nmattpocock-skills:code-review\n",
+            "reviews": {"nodes": [
+                {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
+            ]},
+            "reviewThreads": {"nodes": []},
+        },
+        ["core/src/sync.cpp"],
+        False,
+    ),
+    (
+        # Any of GitHub's nine, in any case: what the gate requires and what
+        # GitHub acts on have to be the same set, or the gate blocks a PR that
+        # would have worked.
+        "...and any keyword GitHub closes on satisfies it",
+        "abc123",
+        {
+            "body": "resolved #7\n/code-review\nmattpocock-skills:code-review",
+            "reviews": {"nodes": [
+                {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
+            ]},
+            "reviewThreads": {"nodes": []},
+        },
+        ["core/src/sync.cpp"],
+        True,
     ),
 ]
 

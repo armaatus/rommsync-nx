@@ -56,6 +56,17 @@ STATE_DIR="$ORCA_FLEET_DIR"
 STOP_FILE="$ORCA_FLEET_STOP"
 OWNED_DIR="$ORCA_FLEET_OWNED"
 STARTED_DIR="$STATE_DIR/started"
+# The `Closes #N` and `Blocked by #N` patterns, shared with merge_gate.py so the
+# dispatcher, the gate and GitHub cannot read the same body three ways. It sits
+# under .github/scripts/ because merge-gate.yml sparse-checks out that directory
+# alone; see the module's docstring.
+#
+# Set on each `python3` below rather than exported: the dispatcher runs for
+# hours and shells out to gh, git, the Orca CLI and python constantly, and an
+# exported PYTHONPATH would put this directory at the front of sys.path for
+# every one of them. The first module added here whose name shadowed a stdlib
+# one would then quietly change what they all import.
+ISSUE_REFS="$REPO_ROOT/.github/scripts"
 LOG="$STATE_DIR/fleet.log"
 PIDFILE="$STATE_DIR/fleet.pid"
 
@@ -167,13 +178,15 @@ live_count() {
 # to be maintained.
 ready_issues() {
   GH_PAGER=cat gh issue list --state open --limit 200 \
-    --json number,title,body,labels 2>/dev/null | python3 -c '
-import json, re, sys
+    --json number,title,body,labels 2>/dev/null \
+    | PYTHONPATH="$ISSUE_REFS" python3 -c '
+import json, sys
+from issue_refs import blocked_by
 issues = json.load(sys.stdin)
 blocks = {}
 for i in issues:
-    for m in re.finditer(r"Blocked by #(\d+)", i.get("body") or ""):
-        blocks[int(m.group(1))] = blocks.get(int(m.group(1)), 0) + 1
+    for n in blocked_by(i.get("body")):
+        blocks[n] = blocks.get(n, 0) + 1
 ready = [i for i in issues
          if any(l["name"] == "ready" for l in i.get("labels", []))]
 # Most-unblocking first, then oldest issue number: predictable inside a tie.
@@ -185,28 +198,41 @@ for i in sorted(ready, key=lambda i: (-blocks.get(i["number"], 0), i["number"]))
 
 # `ready` overstates availability: the label stays until the PR merges, so an
 # issue with a PR already open still carries it.
+# 0 = a PR closes it, 1 = none does, 2 = could not tell. The third answer is
+# not decoration: python printing nothing is what "no PR" looks like, and it is
+# also what a failed import or a malformed listing looks like. Read as "free",
+# that opens a second worktree for work already in flight -- which is the whole
+# failure this shared module exists to prevent.
 has_open_pr() {
+  local found
   # The issue number goes in as an ARGUMENT, not spliced into the source. A PR
-  # body is third-party text and so, in principle, is anything that reaches this
-  # regex.
-  GH_PAGER=cat gh pr list --state open --json number,body --limit 100 2>/dev/null \
-    | python3 -c '
-import json, re, sys
-want = re.compile(r"Closes #" + re.escape(sys.argv[1]) + r"\b")
-for p in json.load(sys.stdin):
-    if want.search(p.get("body") or ""):
+  # body is third-party text and so, in principle, is anything that reaches the
+  # pattern.
+  found="$(GH_PAGER=cat gh pr list --state open --json number,body --limit 100 2>/dev/null \
+    | PYTHONPATH="$ISSUE_REFS" python3 -c '
+import json, sys
+from issue_refs import closes_issue
+try:
+    prs = json.load(sys.stdin)
+except ValueError:
+    raise SystemExit("could not read the pull request listing")
+for p in prs:
+    if closes_issue(p.get("body"), sys.argv[1]):
         print(p["number"]); break
-' "$1" | grep -q .
+' "$1")" || return 2
+  [ -n "$found" ]
 }
 
 # 0 = in flight, 1 = free, 2 = could not tell. The third answer matters: a
 # caller that treats "could not tell" as "free" opens a second worktree for work
 # that is already running.
 in_flight() {
-  local list
+  local list rc
   list="$(live_worktrees)" || return 2
   printf '%s\n' "$list" | cut -f1 | grep -qx "$1" && return 0
-  has_open_pr "$1" && return 0
+  has_open_pr "$1"; rc=$?
+  [ "$rc" = 0 ] && return 0
+  [ "$rc" = 2 ] && return 2
   return 1
 }
 
@@ -219,35 +245,50 @@ issue_is_done() {
   local state
   state="$(GH_PAGER=cat gh issue view "$1" --json state --jq .state 2>/dev/null)"
   [ "$state" = "CLOSED" ] && return 0
-  GH_PAGER=cat gh pr list --state merged --limit 50 --json body 2>/dev/null \
-    | python3 -c '
-import json, re, sys
-want = re.compile(r"Closes #" + re.escape(sys.argv[1]) + r"\b")
-for p in json.load(sys.stdin):
-    if want.search(p.get("body") or ""):
+  local landed
+  # A failed lookup answers "not done", the same as before: an issue that stays
+  # on `fleet.sh run 11 12 13` is retried, which is the harmless direction. It
+  # is not silently conflated with a real answer, though -- see has_open_pr.
+  landed="$(GH_PAGER=cat gh pr list --state merged --limit 50 --json body 2>/dev/null \
+    | PYTHONPATH="$ISSUE_REFS" python3 -c '
+import json, sys
+from issue_refs import closes_issue
+try:
+    prs = json.load(sys.stdin)
+except ValueError:
+    raise SystemExit("could not read the pull request listing")
+for p in prs:
+    if closes_issue(p.get("body"), sys.argv[1]):
         print("done"); break
-' "$1" | grep -q .
+' "$1")" || return 1
+  [ -n "$landed" ]
 }
 
 # How many `ready` issues could start right now, from ONE worktree list and ONE
 # PR list. Zero also means "nothing to wait for" to the run loop, so it must not
 # silently answer zero when a lookup failed -- it returns non-zero instead.
 count_startable() {
-  local live prs
+  local live prs ready
   live="$(live_worktrees)" || return 1
-  prs="$(GH_PAGER=cat gh pr list --state open --json body --limit 100 --jq '.[].body' 2>/dev/null)" || return 1
-  ready_issues | python3 -c '
-import re, sys
+  prs="$(GH_PAGER=cat gh pr list --state open --json body --limit 100 2>/dev/null)" || return 1
+  ready="$(ready_issues)" || return 1
+  printf '%s\n' "$ready" | PYTHONPATH="$ISSUE_REFS" python3 -c '
+import json, sys
+from issue_refs import closes
 running = {line.split("\t")[0] for line in sys.argv[1].splitlines() if line.strip()}
-bodies = sys.argv[2]
+# One parse per BODY, not one over all of them joined: a keyword may be the last
+# word of one body and `#12` the first token of the next, and `\s+` would span
+# the join -- claiming an issue nobody is working on and hiding it from the
+# count. One parse per issue would be the other way round; this is neither.
+claimed = set()
+for p in json.loads(sys.argv[2]):
+    claimed.update(closes(p.get("body")))
 n = 0
 for line in sys.stdin:
     if not line.strip():
         continue
     issue = line.split("\t")[0]
-    if issue in running:
-        continue
-    if re.search(r"Closes #" + re.escape(issue) + r"\b", bodies):
+    if issue in running or int(issue) in claimed:
         continue
     n += 1
 print(n)
@@ -415,8 +456,14 @@ enforce_timebox() {
     [ -d "$path" ] || continue
     [ $((now - started)) -ge "$TIMEBOX_SECONDS" ] || continue
     # A PR being up means it got where it was going; the review loop has its own
-    # cap and is not this timer's business.
-    has_open_pr "$num" && { rm -f "$f"; continue; }
+    # cap and is not this timer's business. "Could not tell" is not "no PR":
+    # this branch interrupts an agent and comments on its issue, and a lookup
+    # that failed is no basis for either.
+    has_open_pr "$num"; case $? in
+      0) rm -f "$f"; continue ;;
+      2) say "#$num: timed out, but the PR lookup failed -- leaving it for the next pass"
+         continue ;;
+    esac
 
     say "#$num: $((TIMEBOX_SECONDS / 3600))h with no PR -- stopping it and leaving the worktree for you"
     agent="$(agent_terminal_in "$path")"
