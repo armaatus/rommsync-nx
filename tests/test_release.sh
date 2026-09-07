@@ -35,9 +35,9 @@
 #                             ships -- v0.1.0, some rcs, then v0.2.0 -- can only
 #                             be seen here.
 #
-# All three read files in the checkout. None of them needs Docker, a network or a
-# tag, so none of them ever skips -- a release path that is only exercised by
-# releasing is a release path nobody has tested.
+# Every phase reads files in the checkout. None of them needs Docker, a network
+# or a tag, so none of them ever skips -- a release path that is only exercised
+# by releasing is a release path nobody has tested.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -395,25 +395,58 @@ phase_compatibility() {
   # ...and there is no THIRD place. Every version of Atmosphere written down in
   # a tracked file has to be one of those two, or the claim that the constant is
   # the single source is already false and the next correction will miss a copy.
+  # That is not a hypothetical: these two drifted for a year with INSTALL.md
+  # asking in prose for someone to check them, and #43's body held a third,
+  # stale copy the whole time.
+  #
+  # `git ls-files` is what scopes this to prose this project writes:
+  # lib/libultrahand is a submodule, so it comes back as one gitlink and its
+  # sources are never read. A vendored library is not making this project's
+  # compatibility claim.
+  #
   # The pattern is spelt with a character class so this file does not match it.
-  local strays
-  strays="$(git -C "$REPO_ROOT" ls-files -z \
-            | xargs -0 grep -lE 'Atmosph[eè]re? [0-9]' 2>/dev/null \
+  # `git grep`, not `ls-files | xargs grep`: it resolves paths against the
+  # repository rather than against the caller's cwd, and ctest runs this from
+  # build/tests. The xargs form silently found nothing there -- every path
+  # missed, and `2>/dev/null` swallowed the errors -- so the assertion passed
+  # by looking at no files at all. `-I` skips binaries.
+  #
+  # The pattern is built from two pieces so this file cannot match itself, and
+  # it spells the accented letter as `[^ ]*` rather than a bracket holding a
+  # multibyte character: `[eè]` is three BYTES in the C locale, where it cannot
+  # match `Atmosphère` at all. That is the same silent pass wearing a different
+  # hat, and CI does not promise a UTF-8 locale.
+  local mention strays
+  mention='Atmosph[^ ]*'
+  strays="$(git -C "$REPO_ROOT" grep -lIE "$mention [0-9]" -- . \
             | grep -v -e '^scripts/release-notes\.sh$' -e '^docs/INSTALL\.md$' || true)"
   [ -z "$strays" ] || fail "an Atmosphere version is written down outside the two
-places that are allowed to hold one -- correct these, or this constant is no
-longer the single source it claims to be:
+places that are allowed to hold one. Point at ATMOSPHERE_TARGET instead of
+restating it -- or, if a third place genuinely has to carry the numbers, add it
+here deliberately rather than letting the copies drift:
 $strays"
   echo "ok: no third copy of the compatibility line"
 
   # The Horizon number in that sentence is not a number somebody typed: it is
-  # the highest firmware version anything in the tree checks for. Every
+  # the highest firmware version this project's OWN code checks for. Every
   # `hosversionAtLeast` guard marks an optional path -- guarded precisely
   # because the build still works below it -- so the highest of them is the
-  # version at and above which every path this code can take is live, which is
-  # what "targets Horizon X" means for a build that degrades rather than
+  # version at and above which every path rommsync-nx can take is live, which
+  # is what "targets Horizon X" means for a build that degrades rather than
   # refuses. Derived rather than declared, so a call added against a newer
   # firmware turns this red instead of quietly widening what the release claims.
+  #
+  # It is a textual match, not a parse: a `hosversionAtLeast(18, 0, 0)` written
+  # inside a comment counts as a gate. That is the conservative direction --
+  # it asks a question rather than missing one -- and the answer is to write
+  # the comment without a literal call in it.
+  #
+  # sysmodule/source and overlay/source, and NOT overlay/lib/libultrahand: the
+  # vendored overlay library carries gates of its own, up to
+  # `hosversionAtLeast(21, 0, 0)`, and they are guarded for the same reason
+  # these are. Deriving the target from them would raise what a release claims
+  # because a UI library gained a progressive-enhancement path, which is not a
+  # statement about whether rommsync-nx runs.
   local stated gated
   stated="$(printf '%s' "$target" \
             | sed -n 's/.*Horizon \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')"
@@ -422,14 +455,15 @@ $strays"
              "$REPO_ROOT/sysmodule/source" "$REPO_ROOT/overlay/source" 2>/dev/null \
            | sed -E 's/.*\(([0-9]+), *([0-9]+), *([0-9]+)\)/\1.\2.\3/' \
            | sort -V | tail -1)"
-  [ -n "$gated" ] || fail "nothing in sysmodule/ or overlay/ gates on a firmware
-version any more, so the Horizon $stated in ATMOSPHERE_TARGET is derived from
-nothing. Say where the number comes from, or drop it from the line."
+  [ -n "$gated" ] || fail "nothing in sysmodule/source or overlay/source gates on
+a firmware version any more, so the Horizon $stated in ATMOSPHERE_TARGET is
+derived from nothing. Say where the number comes from, or drop it from the line."
   [ "$stated" = "$gated" ] || fail "the compatibility line targets Horizon $stated,
-but the highest firmware gate in the tree is $gated (hosversionAtLeast). One of
-the two is wrong: either the line claims a floor nothing needs, or a call was
-added against a firmware the release does not say it targets."
-  echo "ok: the Horizon target is the highest firmware gate the code checks for"
+but the highest firmware gate in this project's own code is $gated
+(hosversionAtLeast, in sysmodule/source or overlay/source). One of the two is
+wrong: either the line claims a target nothing needs, or a call was added
+against a firmware the release does not say it targets."
+  echo "ok: the Horizon target is the highest firmware gate first-party code checks for"
 }
 
 # --- which releases are prereleases -------------------------------------------
@@ -548,5 +582,6 @@ case "${1:-}" in
   prerelease) phase_prerelease ;;
   history)    phase_history ;;
   compatibility) phase_compatibility ;;
-  *)          echo "usage: $0 {version|ci|notes|prerelease|history}" >&2; exit 2 ;;
+  *)          echo "usage: $0 {version|ci|notes|prerelease|history|compatibility}" >&2
+              exit 2 ;;
 esac

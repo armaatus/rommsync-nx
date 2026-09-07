@@ -574,6 +574,17 @@ $out" ;;
   release_says "$dir/rc-two" "is published, on main, and agrees with VERSION" PASS \
     "with only candidates, the row is judged on the newest of them" "$build"
 
+  # ...and the cycle AFTER a stable release, which is the case preferring stable
+  # tags gets wrong if it is applied unconditionally: v1.0.0 shipped, VERSION is
+  # now 1.1.0-rc1, and the newest tag is that candidate. Preferring stable here
+  # would judge the row on v1.0.0 and report it as disagreeing with a VERSION
+  # that has moved on. Which tags are eligible depends on what VERSION is, the
+  # same way scripts/release-notes.sh chooses the tag it counts changes from.
+  release_repo "$dir/rc-after-stable" 1.1.0-rc1 "v1.0.0 v1.1.0-rc1" \
+    '{"isDraft":false,"assets":[{"name":"rommsync-nx-1.1.0-rc1.zip"},{"name":"SHA256SUMS"}]}'
+  release_says "$dir/rc-after-stable" "is published, on main, and agrees with VERSION" PASS \
+    "a candidate cut after a stable release is judged on the candidate" "$build"
+
   # ...and --dry does not reach for the network at all. The stub here fails the
   # test if it is called, which is the only way to assert an absence.
   release_repo "$dir/dry" 1.0.0 v1.0.0 "$published"

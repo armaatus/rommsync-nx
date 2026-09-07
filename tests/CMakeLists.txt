@@ -1572,13 +1572,11 @@ set_tests_properties(release.history PROPERTIES TIMEOUT 120)
 
 # The one compatibility statement a release makes, and the fact that there is
 # only one of it. `ATMOSPHERE_TARGET` is restated in docs/INSTALL.md's "Before
-# you start" -- the guide and the release page have to say the same thing to a
-# user who reads both -- and INSTALL.md asked for this check in prose long
-# before anything ran it. The Horizon half is derived from the highest
-# `hosversionAtLeast` gate in sysmodule/ and overlay/ rather than declared, so a
-# call added against a newer firmware turns this red instead of quietly widening
-# what a release claims. It asserts no particular version: which versions those
-# are is a target M8-2 (#44) settles on a console.
+# you start", and INSTALL.md asked for this check in prose long before anything
+# ran it. It asserts no particular version -- which versions those are is a
+# target M8-2 (#44) settles on a console -- only that there is one answer and
+# that the Horizon half is derived from the source rather than typed. The
+# reasoning is with the phase, in tests/test_release.sh.
 add_test(NAME release.compatibility
          COMMAND "${BASH_PROGRAM}" "${RELEASE_TEST}" compatibility)
 set_tests_properties(release.compatibility PROPERTIES TIMEOUT 60)

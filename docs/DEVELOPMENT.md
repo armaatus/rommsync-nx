@@ -337,11 +337,14 @@ Six things are worth knowing before you do it:
   Atmosphère release added support for, and that series runs on every firmware
   from `1.0.0` up, so the line told a console one version behind it that it was
   out of range for a reason that does not exist. The Horizon number is now the
-  highest firmware gate the code actually checks for. Every `hosversionAtLeast`
-  guard marks an *optional* path — guarded precisely because the build works
-  below it — so the highest of them is the version at and above which every
-  path this code can take is live, which is what "targets" means for a build
-  that degrades rather than refuses. `release.compatibility` derives it from the
+  highest firmware gate this project's own code checks for. Every
+  `hosversionAtLeast` guard marks an *optional* path — guarded precisely because
+  the build works below it — so the highest of them is the version at and above
+  which every path rommsync-nx can take is live, which is what "targets" means
+  for a build that degrades rather than refuses. The vendored overlay library
+  gates as high as `21.0.0`; `release.compatibility` does not read it, because
+  raising what a release claims because a UI library gained a
+  progressive-enhancement path would say nothing about whether this runs. `release.compatibility` derives it from the
   source, so a call added against a newer firmware goes red instead of quietly
   widening what a release claims. Neither number has been observed on hardware;
   M8-2 (#44) is still what settles them.

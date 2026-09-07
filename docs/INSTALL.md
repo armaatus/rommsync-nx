@@ -30,11 +30,12 @@ you have installed homebrew on a Switch before and have never seen RomM.
   ([#44](https://github.com/armaatus/rommsync-nx/issues/44)).
 
   Older than that is a target missed, not a refusal. The only firmware-gated
-  call in the whole tree is `sslConnectionSetIoTimeout` [16.0.0+], and it is
+  call rommsync-nx makes is `sslConnectionSetIoTimeout` [16.0.0+], and it is
   guarded — below 16.0.0 the `ssl` service's own I/O ceiling stays five minutes
-  and rommsync-nx bounds the wait itself. Nothing has been booted on any
-  firmware, so treat both numbers as what the build aims at rather than a
-  compatibility list.
+  and rommsync-nx bounds the wait itself. The vendored overlay library carries
+  gates of its own, up to `[21.0.0+]`, and they are guarded for the same reason.
+  Nothing has been booted on any firmware, so treat both numbers as what the
+  build aims at rather than a compatibility list.
 - **Ultrahand or Tesla already installed and working.** The control UI is an
   overlay; if your overlay menu does not open today, fix that first — none of
   what follows is visible without it.

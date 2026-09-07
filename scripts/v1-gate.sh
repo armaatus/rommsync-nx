@@ -428,24 +428,37 @@ repo_release() {
     return 1
   fi
 
+  version="$(sed -n '1{s/^[[:space:]]*//;s/[[:space:]]*$//;p;}' "$REPO_ROOT/VERSION" 2>/dev/null)"
+
   # Newest first, so a repo with v1.0.0 and v1.1.0 is judged on the latest --
-  # but STABLE tags first, and candidates only when there is no stable one.
-  # `sort -V` orders `v1.0.0-rc1` above `v1.0.0`, on GNU sort and on BSD sort
-  # alike, so "the newest tag" is not "the newest release" the moment the
+  # but `sort -V` orders `v1.0.0-rc1` ABOVE `v1.0.0`, on GNU sort and on BSD
+  # sort alike, so "the newest tag" is not "the newest release" once the
   # release-candidate path docs/DEVELOPMENT.md#releases recommends has been
   # taken: a repository holding a correct, published v1.0.0 would be judged on
-  # the rc before it and reported as disagreeing with VERSION. This is the same
-  # rule scripts/release-notes.sh applies when it picks the previous tag
-  # (`--exclude '*-*'` on a stable release), for the same reason.
-  local stable
-  stable="$(printf '%s\n' "$tags" | grep -v -- '-' || true)"
-  tag="$(printf '%s\n' "${stable:-$tags}" | sort -V | tail -1)"
+  # the rc before it and reported as disagreeing with VERSION.
+  #
+  # Which tags are eligible therefore depends on what VERSION says, and it is
+  # the rule scripts/release-notes.sh already applies when it picks the tag to
+  # count changes from: cutting a STABLE release ignores every candidate
+  # (`--exclude '*-*'` there), and cutting a candidate keeps them. Filtering
+  # unconditionally would break the other half of the same cycle -- v1.0.0
+  # released, VERSION bumped to 1.1.0-rc1, v1.1.0-rc1 tagged -- by judging the
+  # row on v1.0.0 and calling a correct repository wrong.
+  local eligible
+  case "$version" in
+    *-*) eligible="$tags" ;;
+    *)   eligible="$(printf '%s\n' "$tags" | grep -v -- '-')" ;;
+  esac
+  # Only when VERSION is stable and every tag is a candidate: nothing survived
+  # the filter, so judge on what there is and let the VERSION comparison below
+  # be the thing that reports it.
+  [ -n "$eligible" ] || eligible="$tags"
+  tag="$(printf '%s\n' "$eligible" | sort -V | tail -1)"
   if ! git -C "$REPO_ROOT" merge-base --is-ancestor "$tag" origin/main 2>/dev/null \
      && ! git -C "$REPO_ROOT" merge-base --is-ancestor "$tag" main 2>/dev/null; then
     echo "    $tag is not reachable from main -- ci.yml refuses to publish it"
     ok=1
   fi
-  version="$(sed -n '1{s/^[[:space:]]*//;s/[[:space:]]*$//;p;}' "$REPO_ROOT/VERSION" 2>/dev/null)"
   if [ "$tag" != "v$version" ]; then
     echo "    $tag disagrees with VERSION ($version) -- ctest -R version.tag is what says so on a tag push"
     ok=1

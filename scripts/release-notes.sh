@@ -48,10 +48,14 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 #            stable 1.7.0 -- the tag is `1.7.0-prerelease` (2024-03-29) and
 #            1.7.1 (2024-06-11) is the release behind it -- so the line as
 #            written asked for something nobody can download.
-#   16.0.0   the highest firmware version anything in this tree checks for:
+#   16.0.0   the highest firmware version this project's own code checks for:
 #            `hosversionAtLeast(16, 0, 0)` around `sslConnectionSetIoTimeout`
 #            in sysmodule/source/http/ssl_http_client.cpp, which is the only
-#            firmware-gated call there is. It is a target and not a floor --
+#            firmware-gated call rommsync-nx makes. (The vendored overlay
+#            library gates as high as 21.0.0, and `release.compatibility`
+#            deliberately does not read it: raising what a release claims
+#            because a UI library gained a progressive-enhancement path would
+#            say nothing about whether this runs.) It is a target, not a floor --
 #            the call is guarded because the build works below it, where the
 #            `ssl` service's own I/O ceiling stays five minutes and `SslStream`
 #            bounds the wait on its own. The line said 18.0.0, which was never
