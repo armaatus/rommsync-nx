@@ -144,9 +144,8 @@ that defines an interface later issues include (M0-2's `HttpClient` is the
 standing example) merges before anything depending on it starts. Label it
 `foundation` and `fleet.sh` holds the fan-out for it.
 
-And one the labels express badly: **an issue no agent can carry to a merged PR.**
-Label it **`needs-human-step`**. That happens two ways, and the label means
-either of them:
+And one the labels express badly: **an issue no agent can close.** Label it
+**`needs-human-step`**. That happens two ways, and the label means either:
 
 - **The last step is a person's.** Tagging a v1 (#148), touching a real console
   (#44) — outward, irreversible, and the maintainer's call. `ready` cannot say
@@ -157,20 +156,19 @@ either of them:
 - **No agent can start at all.** #139 is the standing example: its scope is
   `.claude/hooks/guard.py`, and `.claude/hooks/` is in `PROTECTED_TAILS` in
   [`guard.py`](../.claude/hooks/guard.py), so from a fleet worktree the guard
-  refuses every write there — from an `Edit` and from a shell command alike, and
-  `guard.py --selftest` pins both forms. #139's agent hit exactly that, produced
-  no PR, and applied the label itself. Going around the guard would be the one
-  thing the guard is for.
+  refuses to write there — from an `Edit` and from a shell command alike. #139's
+  agent hit exactly that, produced no PR, and applied the label itself: the rule
+  it would have had to go around is the rule its own issue exists to tighten.
 
 Both want the **same queue behaviour** — never open a worktree — so both carry
-the same label, and the four effects below follow for either. Which one you have
-is in the issue's own **Scope**, not in the label: read it before assuming there
-is agent-ready work behind the label.
+the same label. Which one you have is in the issue's own **Scope**, not in the
+label: read it before assuming there is agent-ready work behind it.
 
 `fleet.sh` does four things with it:
 
 - it is **not startable** — the dispatcher opens no worktree for it, in `--auto`
-  or from an explicit `fleet.sh run 148`. Remove the label to hand it to an agent;
+  or from an explicit `fleet.sh run 148`. Removing the label hands it to an
+  agent, which only ever makes sense in the first sense above;
 - an agent `waiting` on one is reported as **waiting for you, as expected**
   rather than as a stall. #142 stopped before `git tag` exactly as its issue told
   it to, and was flagged for it — noise on the one signal that is supposed to
@@ -178,8 +176,8 @@ is agent-ready work behind the label.
 - it is **exempt from the time-box**. This is the half that matters: #44 was
   interrupted at three hours for correctly producing nothing;
 - and its worktree is **released** once there is nothing left in it — see
-  "Releasing a worktree" below. #139 correctly produced no PR at all; without
-  this, its worktree waits for a merged PR that can never exist.
+  "Releasing a worktree" below. Without this, #139's worktree waits for a merged
+  PR that can never exist.
 
 **In the first meaning only**, the label is a claim about the *last* step, not
 the whole issue — and where there is real agent work in front of that step, it
@@ -192,9 +190,9 @@ moment it is filed.
 **In the second, do nothing but label it.** There is no preparation to carve out:
 a child issue of #139 is no more doable than #139 — the same guard refuses the
 same writes for the same reason — and it would arrive `ready`, so the fleet would
-open a worktree for it. That is the loop #145 closed on #148, re-entered through
-the front door. The work is the maintainer's start to finish; leave it in the
-queue's hands as one issue.
+open a worktree for it. That is the once-per-cycle re-pick above, the loop #145
+closed on #148, coming back through the front door. The work is the maintainer's
+start to finish; leave it as one issue.
 
 ### Stage 3 — Build, in the worktree
 
