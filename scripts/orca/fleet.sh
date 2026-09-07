@@ -113,10 +113,30 @@ orca_json() {
 # The Orca board is the status surface: `in-progress` while it builds,
 # `in-review` once the PR is up (the agent sets that itself), `completed` on
 # merge. The comment is the one line the card shows.
+#
+# A failed update is SAID, not swallowed. WORKFLOW.md calls the board the status
+# surface, so a card that did not update is a board showing something that is not
+# true -- and the `|| true` this replaces meant the dispatcher reported nothing
+# wrong while it happened. When the Orca CLI broke on 2026-09-05 (lib.sh's
+# orca_cli_resolve records it) every card in the fleet would have frozen in
+# silence. Still non-fatal: the board is a display, and a display that cannot be
+# written is not a reason to stop dispatching work.
 card() {
-  local path="$1"; shift
-  orca_run_with_deadline 30 /dev/null "$ORCA_CLI" worktree set \
-    --worktree "path:$path" "$@" --json >/dev/null 2>&1 || true
+  local path="$1" out rc; shift
+  out="$(mktemp)"
+  orca_run_with_deadline 30 "$out" "$ORCA_CLI" worktree set \
+    --worktree "path:$path" "$@" --json
+  rc=$?
+  if [ "$rc" != 0 ]; then
+    say "  board update FAILED (rc $rc) for $path: $*"
+    # The CLI's own words, capped: they are the difference between "the app is
+    # not running" and "that worktree is gone", and both look like silence.
+    while IFS= read -r line; do
+      [ -n "$line" ] && say "    $line"
+    done < <(sed -n '1,3p' "$out")
+  fi
+  rm -f "$out"
+  return 0
 }
 
 # The agent terminal in one worktree, if it has one. The path goes in as an
@@ -371,13 +391,40 @@ except Exception:
 # This matters more than one stuck worktree. The fleet runs at a cap of three,
 # and a slot held by a worktree whose work is already merged is a slot that never
 # starts the next issue -- the loop quietly runs at two, then one.
+#
+# The second attempt adds --force, and that is the one that works.
+#
+# This repository has a real submodule -- overlay/lib/libultrahand, pinned in
+# .gitmodules -- and `git worktree remove` refuses outright:
+#
+#   fatal: working trees containing submodules cannot be moved or removed
+#
+# So the plain call fails on every worktree the fleet has ever created, every
+# time, and it is not intermittent. Three accumulated in about eighteen hours on
+# 2026-09-07, each holding four containers, two ports and four volumes that come
+# back on every `docker start` under `restart: unless-stopped`. Worse for
+# throughput: reap_merged has already marked the card `completed` and disowned
+# the issue by then, so `fleet.sh status` still shows the worktree while the
+# dispatcher no longer counts it -- one slot idle for nearly three hours.
+#
+# Forcing is safe HERE specifically: the only caller checks the PR is merged and
+# that nothing is unpushed first. --force forces the worktree removal, not the
+# branch deletion.
 remove_worktree() {
-  local path="$1" attempt
-  for attempt in 1 2; do
-    orca_run_with_deadline 180 /dev/null "$ORCA_CLI" worktree rm \
-      --worktree "path:$path" --run-hooks --json >/dev/null 2>&1
-    [ -d "$path" ] || return 0
-  done
+  local path="$1" out
+  out="$(mktemp)"
+  orca_run_with_deadline 180 "$out" "$ORCA_CLI" worktree rm \
+    --worktree "path:$path" --run-hooks --json
+  if [ ! -d "$path" ]; then rm -f "$out"; return 0; fi
+  orca_run_with_deadline 180 "$out" "$ORCA_CLI" worktree rm \
+    --worktree "path:$path" --run-hooks --force --json
+  if [ ! -d "$path" ]; then rm -f "$out"; return 0; fi
+  # Labelled, because the caller's "could not remove it" comes after these and
+  # an unlabelled fatal: line above it reads like the fleet's own.
+  while IFS= read -r line; do
+    [ -n "$line" ] && say "  the removal refused: $line"
+  done < <(sed -n '1,3p' "$out")
+  rm -f "$out"
   return 1
 }
 
@@ -401,8 +448,11 @@ reap_merged() {
 
     say "#$num: PR #$merged is merged; marking it done and removing the worktree"
     card "$path" --workspace-status completed --comment "#$num: merged in PR #$merged"
+    # NOT reap.sh: that removes RomM stacks whose WORKTREE IS GONE, so a worktree
+    # that failed to delete is precisely the case it skips -- and it says
+    # "nothing to reap", which reads like success.
     remove_worktree "$path" \
-      || say "  could not remove it; sweep later with ./scripts/orca/reap.sh --yes"
+      || say "  could not remove it; by hand: git worktree remove --force '$path'"
     disown_issue "$num"
   done
 }
@@ -727,6 +777,10 @@ cmd_run() {
   say "fleet down: $reason"
   notify "fleet down" "$reason. $opened worktree(s) opened."
 }
+
+# Sourced by tests/test_orca_fleet.sh, which exercises one function against a
+# stubbed CLI. Executed, it dispatches as usual.
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0
 
 case "${1:-}" in
   run)    shift; cmd_run "$@" ;;
