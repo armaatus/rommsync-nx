@@ -1546,6 +1546,18 @@ int main(int argc, char** argv) {
                   R"({"mode":"drop","bytes":4,"path":"/api/sync/sessions","count":9})",
                   /*then_normally=*/false, "a reset at complete");
   } else if (scenario == "complete_stall") {
+    // The prefix is the session collection rather than `/{id}/complete`, because
+    // the id does not exist until the negotiation has answered. It costs
+    // nothing: inside the armed scope the tick sends two requests under that
+    // prefix and both are the completion's attempts (`OptionsAt` sets
+    // `finish.complete.max_attempts = 2`), so nine is four and a half times the
+    // budget and nothing earlier in the scenario can spend the arm.
+    //
+    // Written down because #156 read that count as the explanation for a
+    // `complete` that once succeeded straight through this stall, and it is not
+    // the one -- the stranger was at the proxy rather than in the tick. The
+    // account is docs/TESTING.md, "One proxy, several clients"; the regression
+    // pin is harness.fault_owner.
     CompleteFault(checks, *client, base, fixture, rom,
                   R"({"mode":"stall","seconds":3,"path":"/api/sync/sessions","count":9})",
                   /*then_normally=*/true, "a stall at complete");
