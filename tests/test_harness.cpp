@@ -1749,9 +1749,11 @@ void FaultOwnerScenario(rig::Checks& checks, const std::string& base) {
 //
 // The stranger is a real second process, because nothing inside one can see
 // this -- RUN_SERIAL orders tests within one invocation and says nothing about a
-// second one. It is this same binary under a scenario name no `main` knows,
-// which runs exactly the startup every rig test shares and then exits 2: the
-// reproduction measured in the issue, run from inside the suite.
+// second one. It is this same binary, running the startup every rig test shares
+// and then stopping there: the reproduction measured in the issue, run from
+// inside the suite. `kStrangerScenario` below is the name it does that under,
+// and says why it is a reserved one rather than the unrecognised one the issue
+// used.
 
 /// The scenario name `session_owner` spawns this binary under.
 ///

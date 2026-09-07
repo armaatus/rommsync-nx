@@ -304,8 +304,9 @@ inline std::filesystem::path ClaimsDir() { return scratch::Root() / "sessions"; 
 /// is recycled, and one recycled to some long-lived process reads as alive for
 /// as long as that process runs. Age is the backstop, and the two bounds are the
 /// two different things being bounded. A scenario may legitimately hold a
-/// session for as long as CTest lets it run -- the longest TIMEOUT in
-/// tests/CMakeLists.txt is 900s -- while a negotiate is one request. The
+/// session for as long as CTest lets it run -- the longest TIMEOUT on a test
+/// that negotiates at all is `download.resume`'s 600s -- while a negotiate is
+/// one request. The
 /// in-flight marker is also the more dangerous of the two to leave lying around,
 /// since it defers cleanup of EVERY session rather than of one, so it is held to
 /// the tighter bound.
