@@ -25,6 +25,15 @@
 # rounds is more than almost any PR needs, and a fourth is not what a
 # disagreement needs -- a person is. The count lives in .orca/review-rounds,
 # which is per-worktree and gitignored, and resets when the PR number changes.
+#
+# WHAT COUNTS AS THE REVIEW IS NOT DECIDED HERE. This imports
+# .github/scripts/merge_gate.py and asks it, exactly as review-status.sh does,
+# because a wait that ends on a review merge-gate does not count ends it for
+# nothing: the agent reads its own thread reply back as "the review", spends one
+# of its three rounds on it, and the PR then sits BLOCKED for the reason the
+# wait just called satisfied. That was #114, and it needed the GraphQL query
+# below -- `gh pr view --json reviews` reports neither the review's commit nor
+# enough to tell the author's own record from a reviewer's.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -75,24 +84,40 @@ CAP
   exit 5
 fi
 
-# Reviews already present are not the answer to the push just made. The cut-off
-# is the current head's own commit time rather than "now": a review submitted
-# while this script was starting still belongs to this round.
+# Reviews already present are not the answer to the push just made, and what
+# separates the two is the COMMIT, not a timestamp. A review cannot be submitted
+# against a commit that does not exist yet, so "on this head" is strictly
+# stronger than any freshness cut-off this script could compute -- and unlike a
+# cut-off it cannot be wrong.
 #
-# In UTC, and with a Z, because the comparison below is a STRING comparison
-# against GitHub's `submittedAt`, which is always UTC. A local-offset stamp
-# (`...T14:00:00+02:00`) compares wrongly against `...T12:05:00Z` -- the review
-# that arrived five minutes later sorts earlier, `fresh` stays empty, and every
-# worktree on a machine east of UTC waits out the full deadline and exits 4.
-since="$(TZ=UTC0 git log -1 --format=%cd --date=format:%Y-%m-%dT%H:%M:%SZ HEAD)"
+# It used to compare `submittedAt` against the HEAD commit's own time, which is
+# not when the branch was pushed. Commit at T0, push at T0+3min, and a review
+# from the PREVIOUS round submitted at T0+1min passes that test (#114). The
+# commit time was never the push time and there is no cheap way to ask GitHub
+# for the push time; the head makes the question unnecessary.
+# Checked for emptiness as well as for gh's exit status. An owner of "" builds a
+# query that can never match, and this loop would then poll it for the full 45
+# minutes and report that no review arrived -- the same silent, wrong answer the
+# rest of this script exists to stop giving.
+owner_repo="$(GH_PAGER=cat gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null)"
+case "$owner_repo" in
+  */*) ;;
+  *) echo "could not read this repository's name from gh (got \"$owner_repo\"); nothing here can ask about the reviews" >&2
+     exit 2 ;;
+esac
+owner="${owner_repo%%/*}"; name="${owner_repo##*/}"
 
-echo "round $round of $MAX_ROUNDS -- waiting for a review on PR #$pr after $since"
+echo "round $round of $MAX_ROUNDS -- waiting for a review on PR #$pr, on its current head"
 echo "  (polling every ${POLL_SECONDS}s; stop everything with ./scripts/orca/stop.sh)"
 
-payload="$(mktemp)"; trap 'rm -f "$payload"' EXIT
+payload="$(mktemp)"; reviews_out="$(mktemp)"
+trap 'rm -f "$payload" "$reviews_out"' EXIT
 waited=0
 checks_due=0
 broken_before=""
+# Set when a poll saw review records on this head that none of the gate rules
+# count. Only ever read by the timeout message below.
+discounted=""
 # Set from the rollup inside the throttled block below; declared here so a poll
 # that skips the block still has a value under `set -u`.
 review_dead=""
@@ -302,25 +327,93 @@ RED
     exit 6
   fi
 
+  # GraphQL rather than `gh pr view --json reviews`, which can report neither the
+  # commit a review was submitted against nor the PR's own author to compare a
+  # reviewer against -- the two things that decide whether this is the review
+  # being waited for. `headRefOid` comes from the same answer, so the head judged
+  # here is the one merge-gate will judge, not whatever is in the working tree.
+  #
   # Written to a file and read back, never spliced into a Python source string:
   # a review body is third-party text.
-  if GH_PAGER=cat gh pr view "$pr" --json reviews,reviewDecision >"$payload" 2>/dev/null; then
-    if body="$(python3 - "$since" "$payload" <<'PY'
+  if GH_PAGER=cat gh api graphql -F owner="$owner" -F name="$name" -F pr="$pr" -f query='
+query($owner:String!,$name:String!,$pr:Int!){
+  repository(owner:$owner,name:$name){
+    pullRequest(number:$pr){
+      headRefOid
+      author{login}
+      reviews(last:50){ nodes{ state submittedAt commit{oid} author{login}
+                               body comments(first:1){ totalCount } } }
+    }
+  }
+}' >"$payload" 2>/dev/null; then
+    # Its output goes to a file rather than into `$(...)`, and that is not
+    # style. bash 3.2 -- which macOS still ships, and which this repo therefore
+    # has to parse under -- tracks single quotes while scanning for the closing
+    # paren of a command substitution, THROUGH a quoted heredoc. One apostrophe
+    # in a comment inside the block below is enough to make the whole script a
+    # syntax error, and the message it gives names neither the line nor the
+    # quote. Outside `$(...)` the heredoc is just a heredoc.
+    python3 - "$payload" "$head" >"$reviews_out" <<'PY'
 import json, sys
-since, path = sys.argv[1], sys.argv[2]
-d = json.load(open(path))
-fresh = [r for r in d.get("reviews") or [] if (r.get("submittedAt") or "") > since]
-if not fresh:
+
+sys.path.insert(0, ".github/scripts")
+try:
+    from merge_gate import independent_reviews, is_substantive
+except Exception as exc:  # missing, half-edited, or broken at import time
+    # Not ImportError alone: merge_gate.py is a file agents in this repo edit,
+    # and a SyntaxError in it must not read as "no review yet" for the rest of a
+    # 45-minute wait. Said once per poll on stderr and then waited out, because
+    # there is nothing here that could answer instead.
+    print(f"  note: could not load .github/scripts/merge_gate.py ({exc}), which "
+          "decides what counts as a review. Nothing can end this wait until it "
+          "imports.", file=sys.stderr)
     raise SystemExit(1)
-for r in fresh:
+
+path, local_head = sys.argv[1], sys.argv[2]
+try:
+    pull = json.load(open(path))["data"]["repository"]["pullRequest"] or {}
+except Exception:
+    raise SystemExit(1)
+
+head = pull.get("headRefOid") or ""
+if not head:
+    raise SystemExit(1)
+if head != local_head:
+    # Not fatal: the head GitHub reports is still the one being reviewed and
+    # the one merge-gate will judge. But an agent that forgot to push is
+    # waiting for a review of code it did not send, and nothing else here
+    # would ever say so.
+    print(f"  note: this worktree is on {local_head[:8]} and the PR's head is "
+          f"{head[:8]} -- there is something unpushed. The review being waited "
+          "for is of what GitHub has.", file=sys.stderr)
+
+# The rules the gate itself uses, imported rather than paraphrased: not by the
+# PR author, on this head, and carrying something to act on.
+on_head = independent_reviews(pull, head)
+reviews = [r for r in on_head if is_substantive(r)]
+if not reviews:
+    # 3 rather than 1 when review RECORDS exist on this head and none of them
+    # counted. Nothing to act on either way, so the wait continues -- but a
+    # timeout after this has a real reason to give, and "nothing arrived" would
+    # be the wrong one. Counted from every record on the head, the PR's own
+    # author included, because the record an agent most often mistakes for a
+    # review is the one its own thread reply created.
+    records = [r for r in ((pull.get("reviews") or {}).get("nodes") or [])
+               if ((r.get("commit") or {}).get("oid") == head)]
+    raise SystemExit(3 if records else 1)
+for r in reviews:
     who = (r.get("author") or {}).get("login", "?")
     print(f"--- {r.get('state')} by {who} at {r.get('submittedAt')}")
     print(r.get("body") or "(no body; see the inline comments)")
     print()
 PY
-)"; then
+    verdict=$?
+    # 3 is "records on this head, none of them a review" -- remembered for the
+    # timeout message rather than repeated on all ninety polls.
+    [ "$verdict" = 3 ] && discounted=1
+    if [ "$verdict" = 0 ]; then
       echo
-      echo "$body"
+      cat "$reviews_out"
       echo "--- inline comments"
       GH_PAGER=cat gh api "repos/{owner}/{repo}/pulls/$pr/comments" \
         --jq '.[] | "\(.path):\(.line // .original_line)  \(.user.login)\n\(.body)\n"' \
@@ -348,4 +441,13 @@ broken review looks like a green run with no comments. Check:
   gh run list --branch $(git rev-parse --abbrev-ref HEAD) --limit 5
 and whether CLAUDE_CODE_OAUTH_TOKEN is set as a repository secret.
 TIMEOUT
+if [ -n "$discounted" ]; then
+  cat <<DISCOUNTED
+Review RECORDS were submitted against this head, and none of them is a review
+merge-gate would count: a record by the PR's own author (every reply to a review
+thread creates one), or one with no body worth reading and no inline comment.
+This waited rather than handing one back, because merge-gate would have refused
+the PR straight afterwards for the reason the wait had just called satisfied.
+DISCOUNTED
+fi
 exit 4

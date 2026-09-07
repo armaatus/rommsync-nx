@@ -696,6 +696,7 @@ JSON
 #!/usr/bin/env bash
 case "$*" in
   *"pr list"*)  printf '[{"number":80}]\n' ;;
+  *"repo view"*) printf 'armaatus/rommsync-nx\n' ;;
   *"run list"*) printf '4242\n' ;;
   *"run view"*) printf '##[error] Execution failed: Reached maximum number of turns (30)\n' ;;
   # The rollup is what the script asks first: the review CHECK is dead, so it
@@ -745,6 +746,7 @@ GHSTUB
 #!/usr/bin/env bash
 case "$*" in
   *"pr list"*)  printf '[{"number":80}]\n' ;;
+  *"repo view"*) printf 'armaatus/rommsync-nx\n' ;;
   *"run list"*)
     limit=1
     for a in "$@"; do
@@ -802,6 +804,7 @@ GHSTUB
 #!/usr/bin/env bash
 case "$*" in
   *"pr list"*)  printf '[{"number":80}]\n' ;;
+  *"repo view"*) printf 'armaatus/rommsync-nx\n' ;;
   # The review check stays dead all the way through, so review_dead is true on
   # every poll after the first throttled check.
   *statusCheckRollup*)
@@ -841,6 +844,7 @@ GHSTUB
 #!/usr/bin/env bash
 case "$*" in
   *"pr list"*)              printf '[{"number":88}]\n' ;;
+  *"repo view"*)            printf 'armaatus/rommsync-nx\n' ;;
   *statusCheckRollup*)      printf '{"statusCheckRollup":[{"name":"host-tests","conclusion":"FAILURE"},{"name":"merge-gate","conclusion":"FAILURE"}]}\n' ;;
   *"pr view"*)              printf '{"reviews":[]}\n' ;;
   *"run list"*)             printf '\n' ;;
@@ -883,6 +887,7 @@ GHSTUB
 #!/usr/bin/env bash
 case "$*" in
   *"pr list"*)         printf '[{"number":99}]\n' ;;
+  *"repo view"*)       printf 'armaatus/rommsync-nx\n' ;;
   *statusCheckRollup*)
     echo x >>"$ROLLUP_LOG"
     printf '{"statusCheckRollup":[{"name":"host-tests","conclusion":"SUCCESS"}],"mergeStateStatus":"DIRTY","baseRefName":"release/v1"}\n' ;;
@@ -1273,6 +1278,8 @@ $step4"
 case "$*" in
   *"pr list"*)          printf '[{"number":80}]
 ' ;;
+  *"repo view"*)        printf 'armaatus/rommsync-nx
+' ;;
   *"run list"*)         echo "$*" >>"$RUNLIST_LOG"; printf '
 ' ;;
   *statusCheckRollup*)  printf '{"statusCheckRollup":[{"name":"host-tests","conclusion":"SUCCESS"}]}
@@ -1321,6 +1328,8 @@ GHSTUB
 case "$*" in
   *"pr list"*)
     printf '[{"number":80}]\n' ;;
+  *"repo view"*)
+    printf 'armaatus/rommsync-nx\n' ;;
   *"run list"*)
     # Stamped with how many rollups have been served, so the assertion can tell
     # a call made while the check was dead from one made after it recovered.
@@ -1400,6 +1409,11 @@ GHSTUB
     # that was never a review is a round the real disagreement does not get.
     [ ! -f "$TMPDIR_FIXTURE/.orca/review-rounds" ] \
       || fail "burned a review round on a review the gate does not count: $(cat "$TMPDIR_FIXTURE/.orca/review-rounds")"
+    # And the timeout gives the real reason. "No review arrived" is true and
+    # useless here -- three records did arrive, and an agent told only that
+    # goes looking at the review workflow instead of at what it discounted.
+    grep -q "none of them is a review" <<<"$out" \
+      || fail "timed out on records that did not count and reported plain silence: $out"
     echo "PASS: await-review counts a review the way merge_gate.py does"
     ;;
 
@@ -1428,6 +1442,29 @@ GHSTUB
     grep -q "114 1" "$TMPDIR_FIXTURE/.orca/review-rounds" \
       || fail "read a review without counting the round; the cap of three stops bounding anything: $(cat "$TMPDIR_FIXTURE/.orca/review-rounds" 2>&1)"
     echo "PASS: a real independent review on this head still ends the wait"
+    ;;
+
+  await_judges_the_head_github_has)
+    # "This head" is the head on the PULL REQUEST, not the one in the worktree,
+    # because that is the head merge-gate judges. They differ exactly when
+    # something was committed and not pushed -- and then an agent is waiting on
+    # a review of code it never sent, which nothing else in this loop would say.
+    #
+    # So: the review is on the PR head, the worktree is somewhere else, and this
+    # has to end with the review in hand AND with the divergence named.
+    make_await_fixture
+    AW_HEAD=1111111111111111111111111111111111111111
+    write_await_reviews \
+      '{"state":"COMMENTED","submittedAt":"2099-01-01T03:00:00Z",
+        "commit":{"oid":"'"$AW_HEAD"'"},"author":{"login":"claude"},
+        "body":"A real review of what GitHub actually has, long enough to clear MIN_REVIEW_BODY.",
+        "comments":{"totalCount":0}}'
+    out="$(run_await_review 6)"; rc=$?
+    [ "$rc" = 0 ] \
+      || fail "judged the worktree head rather than the PR head, so a review merge-gate counts was invisible (exit $rc): $out"
+    grep -q "something unpushed" <<<"$out" \
+      || fail "the worktree is on a commit the PR does not have and nothing said so: $out"
+    echo "PASS: the head judged is the PR head, and a divergence is named"
     ;;
 
   review_status_matches_the_gate_on_a_thread_reply)

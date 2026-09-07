@@ -57,6 +57,57 @@ LOCAL_PASSES = (
 )
 
 
+def independent_reviews(pull_request, head_sha):
+    """The reviews on `head_sha` that could be an independent review, oldest first.
+
+    Two of the gate's conditions on WHO reviewed, in one place the fleet's own
+    scripts can import. `scripts/orca/review-status.sh` and
+    `scripts/orca/await-review.sh` both answer "has this PR been reviewed yet?",
+    and both used to paraphrase this -- every paraphrase drifted the same way,
+    more permissive than the gate, so the local answer said yes on a PR
+    `merge-gate` then refused (#114).
+
+    A review by the PR's own author is not an independent review. GitHub refuses
+    a self-`--approve` but permits a self-`--comment`, and `gh pr review` is on
+    the agent's allowlist -- so without this the author could satisfy the
+    independence requirement by reviewing itself. Replying to a review THREAD
+    creates one of these too, with an empty body and the replier as its author,
+    which is how an agent answering findings manufactured its own review.
+
+    On this head, because pushing a fix invalidates the review of the commit
+    before it. For a caller waiting on a review this is also strictly stronger
+    than any freshness cut-off it could compute: a review cannot be submitted
+    against a commit that does not exist yet.
+    """
+    pr_author = ((pull_request.get("author") or {}).get("login") or "").lower()
+    return sorted(
+        (r for r in ((pull_request.get("reviews") or {}).get("nodes") or [])
+         if ((r.get("author") or {}).get("login") or "").lower() != pr_author
+         and ((r.get("commit") or {}).get("oid") == head_sha)),
+        key=lambda r: r.get("submittedAt") or "",
+    )
+
+
+def is_substantive(review):
+    """Whether a review record carries anything a person could act on.
+
+    A review RECORD is not a review. PR #95 merged on one whose entire body was
+    the word "test": the reviewer posted it at 02:45:34, the gate went green 13
+    seconds later, and the real review -- 3812 characters, CHANGES_REQUESTED --
+    arrived at 03:01, six minutes after the code was already on main.
+
+    So a review has to carry a body with substance, or at least one inline
+    comment. Empty COMMENTED records are routine and harmless in themselves --
+    every thread reply creates one -- but they must not be what satisfies the
+    independence requirement, nor what a waiting agent is handed as "the review".
+
+    The bar is deliberately low. It is here to catch nothing-at-all, not to judge
+    quality, which no substring test can do.
+    """
+    return (len((review.get("body") or "").strip()) >= MIN_REVIEW_BODY
+            or ((review.get("comments") or {}).get("totalCount") or 0) > 0)
+
+
 def evaluate(head_sha, pull_request, changed_files):
     """Returns (ok, [lines to print])."""
     problems = []
@@ -70,34 +121,11 @@ def evaluate(head_sha, pull_request, changed_files):
                 "read them."
             )
 
-    # A review by the PR's own author is not an independent review. GitHub
-    # refuses a self-`--approve` but permits a self-`--comment`, and
-    # `gh pr review` is on the agent's allowlist -- so without this the author
-    # could satisfy the independence requirement by reviewing itself.
-    pr_author = ((pull_request.get("author") or {}).get("login") or "").lower()
-    reviews = [
-        r for r in ((pull_request.get("reviews") or {}).get("nodes") or [])
-        if ((r.get("author") or {}).get("login") or "").lower() != pr_author
-    ]
-    on_head = [r for r in reviews if ((r.get("commit") or {}).get("oid") == head_sha)]
-
-    # A review RECORD is not a review. PR #95 merged on one whose entire body was
-    # the word "test": the reviewer posted it at 02:45:34, this gate went green
-    # 13 seconds later, and the real review -- 3812 characters, CHANGES_REQUESTED
-    # -- arrived at 03:01, six minutes after the code was already on main.
-    #
-    # So a review has to carry something a person could act on: a body with
-    # substance, or at least one inline comment. Empty COMMENTED records are
-    # routine and harmless in themselves -- every thread reply creates one -- but
-    # they must not be what satisfies the independence requirement.
-    #
-    # The bar is deliberately low. It is here to catch nothing-at-all, not to
-    # judge quality, which no substring test can do.
-    substantive = [
-        r for r in on_head
-        if len((r.get("body") or "").strip()) >= MIN_REVIEW_BODY
-        or ((r.get("comments") or {}).get("totalCount") or 0) > 0
-    ]
+    # Who counts, and what counts as a review -- both from the functions above,
+    # which is what `review-status.sh` and `await-review.sh` import so that the
+    # three answers cannot drift apart again.
+    on_head = independent_reviews(pull_request, head_sha)
+    substantive = [r for r in on_head if is_substantive(r)]
     if on_head and not substantive:
         problems.append(
             f"the only reviews on {head_sha[:8]} are empty -- no body worth "

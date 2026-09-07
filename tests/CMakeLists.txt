@@ -1306,6 +1306,7 @@ foreach(phase opens reuses foreign no_romm submits no_draft unstable
               review_status_matches_the_gate_on_a_thread_reply
               await_ignores_what_the_gate_would_not_count
               await_reports_the_independent_review_on_this_head
+              await_judges_the_head_github_has
               review_status_says_a_human_merges_this_one
               review_status_names_the_wedge
               review_status_waits_for_the_run_in_flight
