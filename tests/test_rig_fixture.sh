@@ -34,6 +34,12 @@ phase_recycling() {
   # under `romm-db` or `fault-proxy` would satisfy a whole-file grep while RomM
   # went on recycling, and this is the half that has to hold when docker is
   # stopped and recycling_live can only skip.
+  #
+  # By indentation, because the alternative is `docker compose config` and the
+  # point of this phase is that it needs no daemon. A service header is the only
+  # thing at exactly two spaces, so everything printed between `  romm:` and the
+  # next one is that service's block. Reindent the file and this stops finding
+  # anything, which is a failure, not a false pass.
   local block
   block="$(awk '
     /^  [a-z0-9_-]+:$/ { inside = ($0 == "  romm:") ; next }
@@ -109,6 +115,8 @@ phase_recycling_live() {
   $args
   Nothing is holding the fixture to the setting #155 needs, so read /init and
   find what replaced it rather than deleting this test."
+  # `?` is a glob, matching whichever of `=` or a space the spelling used, so
+  # what is left is the value on its own.
   [ "${setting#--max-requests?}" = "$MAX_REQUESTS" ] || fail \
 "$container runs gunicorn with '$setting', not '--max-requests $MAX_REQUESTS'
   This stack predates the setting, so it still recycles a worker every ~1000

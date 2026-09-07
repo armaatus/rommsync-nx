@@ -24,9 +24,9 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 # --- what RUN_SERIAL is for, and what it is not -------------------------------
 #
-# Nearly every rig test below carries RUN_SERIAL (`rig.smoke`, `rig.provisioned`
-# and `engine.server` are the exceptions, being read-only against the fixture),
-# and the reason is the SHARED FIXTURE:
+# Nearly every rig test below carries RUN_SERIAL (`rig.smoke`, `rig.provisioned`,
+# `rig.recycling_live` and `engine.server` are the exceptions, being read-only
+# against the fixture), and the reason is the SHARED FIXTURE:
 # one RomM, one library, one fixture device with ONE active sync session on it
 # (#76), and a ten-inits-a-minute rate limit that is per IP and so per suite. Two
 # rig tests at once read, upload and delete each other's saves.
@@ -496,13 +496,12 @@ set_tests_properties(rig.smoke PROPERTIES TIMEOUT 120)
 # rig.smoke asks "is RomM up?", rig.provisioned asks "is it usable?"; this asks
 # "will it answer the same way for the ten-thousandth call as for the first?".
 #
-# It will not by default. RomM launches gunicorn with `--max-requests 1000
-# --max-requests-jitter 100`, so each worker is retired after roughly a thousand
-# requests -- and a request nginx has already handed to the worker that is on its
-# way out comes back as a 502 the client never asked for. Nothing about the call
-# is wrong, and the harness does not retry it, so it surfaces as one test in a
-# few hundred failing on whatever it happened to be doing. That is #155, and it
-# is why harness.partial carried a quarantine.
+# It will not by default: RomM retires each gunicorn worker after a thousand-odd
+# requests, and whatever nginx had already handed it comes back as a 502 the
+# client never asked for -- one test in a few hundred, failing or SKIPPING on
+# whatever it happened to be doing. server/testing/docker-compose.yml is where
+# the setting and the whole argument live; #155 is the issue, and that flake is
+# what harness.partial's quarantine was catching.
 #
 # `recycling` reads the compose file, so the setting stays checkable with docker
 # stopped. `recycling_live` asks the daemon, because a stack started before the
@@ -1334,38 +1333,6 @@ foreach(scenario IN LISTS TICK_RIG_SCENARIOS)
   # would cancel each other's sessions (#76).
   set_tests_properties(tick.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 endforeach()
-
-# harness.partial carried a QUARANTINE here until #155. What it was catching was
-# not a race in this test at all: RomM launches gunicorn with `--max-requests
-# 1000 --max-requests-jitter 100`, so a worker is retired every thousand-odd
-# requests, and the request nginx has already handed to the one on its way out
-# comes back as a 502 nobody asked for. The fixture no longer recycles
-# (server/testing/docker-compose.yml, held by rig.recycling), and this test then
-# ran 2000 repetitions clean without the retry -- four times the 500 #155 asked
-# for -- while a control with recycling put back reproduced the 502.
-#
-# #119 measured the rate right and named the wrong mode, and the reason is worth
-# keeping: `FAIL: the MD5 of partial-2.srm` was equally true of an upload that
-# never landed and of a save row RomM answered with no digest on it, and
-# `ServerMd5` left the caller's hash empty either way, so the two lines under it
-# followed either way too. A message that cannot say what it saw does not just
-# cost repetitions; it can spend them proving the wrong thing. That is what
-# tests/harness.hpp's diagnostics and harness.md5_diagnosis are for.
-#
-# What #119's 489 repetitions did NOT produce is the failure the comment here
-# described before that. #76's second sync session, and the `Session is already
-# CANCELLED` that comes of it, never appeared once -- which is not proof it is
-# gone, only that it is rarer than this. So the diagnostics `Partial` prints for
-# it, every session the device has, stay.
-#
-# The comparison #119 and #109 both proposed -- this loop again with the fault
-# proxy's #109 fix reverted -- could never have settled anything, and that needs
-# no experiment to see: neither this test nor execute.occupied ever arms a
-# `stall`, so the replayed-request path #109 fixed is not on either side of the
-# comparison. It was run both ways regardless, 196 repetitions unfixed and 293
-# fixed with one failure in each, and one failure per arm cannot measure a rate.
-# Both arms printed the message that cannot separate the two modes, so neither
-# arm is evidence for either of them.
 
 # --- the committed API captures still match a live RomM ----------------------
 # server/contract/captures/ is what the docs quote and what M1/M2 will be coded

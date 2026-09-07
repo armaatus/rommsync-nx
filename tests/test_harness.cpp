@@ -601,6 +601,19 @@ void SameTimestamp(rig::Checks& checks, http::HttpClient& client, const std::str
 // A plan whose Nth operation fails. The client owes the server an accurate
 // `operations_failed` at `complete` and owes the next tick the files it did not
 // manage -- never a half-written one.
+//
+// This scenario carried a `REPEAT UNTIL_PASS:3` quarantine in tests/CMakeLists.txt
+// until #155, which found what it was catching: RomM retiring a gunicorn worker
+// under a request in flight, answered as a 502 by its own nginx. The fixture no
+// longer recycles, and 2000 repetitions without the retry are clean.
+//
+// The diagnostics below are the other half of that history, and they stay. #119
+// ran 489 repetitions looking for #76 -- a SECOND sync session appearing
+// mid-scenario, RomM cancelling the one this test opened, planned 3 and completed
+// 0 -- and never saw it once. That is not proof it is gone, only that it is rarer
+// than that, and this is still the only scenario that completes its session and
+// so the only one that could notice. So every session the device has is printed
+// on the way out rather than left for the next person to go and ask CI about.
 
 void Partial(rig::Checks& checks, http::HttpClient& client, const std::string& base,
              const Fixture& fixture, const harness::Rom& rom) {
