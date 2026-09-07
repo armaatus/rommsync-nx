@@ -224,11 +224,18 @@ def answered(pull_request, head_sha, review):
         if ((comment.get("author") or {}).get("login") or "").lower() != author:
             continue
         body = comment.get("body") or ""
-        match = ANSWER_RE.search(body)
+        # The LAST marker, for the same reason `declared_findings()` reads the
+        # last trailer: an answer that quotes the format before giving the real
+        # one -- explaining it to a human, or answering a finding about it --
+        # would otherwise be judged on the quoted sha. This one fails CLOSED,
+        # which is why it is a nit rather than the hole the other was: a correct
+        # answer is read as no answer and the PR stays held. Found by the
+        # independent review of this PR.
+        found = list(ANSWER_RE.finditer(body))
         # A PREFIX, because `scripts/orca/answer-review.sh` writes the full sha but
         # a person answering by hand writes the short one they were shown. Six
         # hex digits of a named PR's head is not a collision anybody can reach.
-        if not match or not head_sha.lower().startswith(match.group(1).lower()):
+        if not found or not head_sha.lower().startswith(found[-1].group(1).lower()):
             continue
         if (comment.get("createdAt") or "") <= since:
             continue
@@ -965,6 +972,34 @@ SELFTEST = [
         },
         ["core/src/sync.cpp"],
         False,
+    ),
+    (
+        # The mirror of the quoted-trailer case, on the answer side. An answer
+        # that explains the format before giving the real one -- or answers a
+        # finding ABOUT the format, which is how this was found -- must be
+        # judged on the marker it ends with.
+        "a marker quoted inside an answer does not become the answer's sha",
+        "abc123",
+        {
+            "author": {"login": "armaatus"},
+            "body": "Closes #7\n/code-review\nmattpocock-skills:code-review",
+            "reviews": {"nodes": [
+                {"state": "COMMENTED", "submittedAt": "2026-09-06T02:00:00Z",
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"},
+                 "body": "Important: the retry has no backoff.\n"
+                         "<!-- review-findings: 1 -->"},
+            ]},
+            "comments": {"nodes": [
+                {"author": {"login": "armaatus"},
+                 "createdAt": "2026-09-06T02:06:00Z",
+                 "body": "The marker is written `<!-- review-answered def456 -->` "
+                         "for the head it answers.\nAdded the backoff.\n"
+                         "<!-- review-answered abc123 -->"},
+            ]},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+        },
+        ["core/src/sync.cpp"],
+        True,
     ),
     (
         # PR #95's lesson, one layer out: a record is not the thing. An answer
