@@ -91,16 +91,15 @@ public CI. Homebrew and freely redistributable only.
 
 At most **3 worktrees** run at once, and an issue is startable only when it
 carries `ready` rather than `blocked` — those labels are maintained by
-[`.github/workflows/unblock.yml`](.github/workflows/unblock.yml) from the
-`Blocked by #N` lines in each issue body. Do not hand-edit them, and do not
-start a `blocked` issue.
+[`unblock.yml`](.github/workflows/unblock.yml) from the `Blocked by #N` lines in
+each issue body. Do not hand-edit them. Do not start a `blocked` issue, nor a
+**`needs-human-step`** one — its last step is the maintainer's ([WORKFLOW.md](docs/WORKFLOW.md)).
 
-One exception the labels cannot express: **a foundation issue lands alone.**
-When an issue defines an interface that later issues include — M0-2's
-`HttpClient` is the standing example — it merges before anything that depends on
-it starts, even if the labels say several things are ready. Three agents each
-inventing their own version of a shared header is the one merge conflict worth
-serialising to avoid.
+One exception the labels cannot express: **a foundation issue lands alone.** When
+an issue defines an interface that later issues include — M0-2's `HttpClient` —
+it merges before anything that depends on it starts, even if the labels say
+several things are ready. Three agents each inventing their own version of a
+shared header is the one merge conflict worth serialising to avoid.
 
 ## Plan before you edit
 

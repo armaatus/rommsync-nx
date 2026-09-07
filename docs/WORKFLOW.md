@@ -144,6 +144,32 @@ that defines an interface later issues include (M0-2's `HttpClient` is the
 standing example) merges before anything depending on it starts. Label it
 `foundation` and `fleet.sh` holds the fan-out for it.
 
+And one the labels express badly: **an issue whose last step is a person's.**
+Tagging a v1 (#148), touching a real console (#44) — outward, irreversible, and
+the maintainer's call. `ready` cannot say this: every blocker really is closed,
+and the label stays through the PR that does the preparatory work, so the issue
+comes back to the front of the queue the moment that PR merges. #148 was picked
+up again eighteen seconds after its own preparation landed, and would have been
+picked up once per cycle forever.
+
+Label it **`needs-human-step`**. `fleet.sh` then does three things with it:
+
+- it is **not startable** — the dispatcher opens no worktree for it, in `--auto`
+  or from an explicit `fleet.sh run 148`. Remove the label to hand it to an agent;
+- an agent `waiting` on one is reported as **waiting for you, as expected**
+  rather than as a stall. #142 stopped before `git tag` exactly as its issue told
+  it to, and was flagged for it — noise on the one signal that is supposed to
+  mean something is wrong;
+- it is **exempt from the time-box**. This is the half that matters: #44 was
+  interrupted at three hours for correctly producing nothing.
+
+The label is a claim about the *last* step, not the whole issue — and where there
+is real agent work in front of that step, it belongs in **its own issue with its
+own `Closes` line**, because `merge-gate` refuses a PR that closes nothing. That
+is what #142 and #148 are: #142 prepared the release and closed on PR #146; #148
+*is* the release and only the maintainer can close it. An issue split that way
+can carry `needs-human-step` from the moment it is filed.
+
 ### Stage 3 — Build, in the worktree
 
 `fleet.sh` creates the worktree with the issue linked and the brief already sent;
