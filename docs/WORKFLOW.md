@@ -132,20 +132,40 @@ running   (pid 59280)
 It answers about the **dispatcher's** checkout — the main worktree it was
 started in, recorded at start — not about the one you are standing in. So
 running it from a fleet worktree branched before the fix still says the
-dispatcher is stale, which is the case that actually comes up. A dispatcher that
-recorded nothing (one started before this existed, or whose checkout has since
-gone) says "cannot say" and prints the restart anyway: a staleness report that
-fails open is the same silence.
+dispatcher is stale, which is the case that actually comes up.
+
+There are two ways to be behind, and it distinguishes them, because they need
+different things done:
+
+- **STALE** — the checkout has the fix and the dispatcher is running the file as
+  it was. A restart is enough.
+- **BEHIND** — the fix merged and *nothing pulled that checkout*. Nothing in the
+  fleet does: an agent rebases its own worktree, never the main one. So the
+  bytes on disk are still the bytes the dispatcher parsed, and a restart alone
+  would start the same old code again. It says so, and prints the `git pull`
+  first. (This is read from the shared `origin/main`, so it costs no network and
+  is as fresh as the last fetch any worktree of this repo made.)
+
+A dispatcher that recorded nothing — one started before this existed, or whose
+checkout has since gone — says "cannot say" and prints the restart anyway. A
+staleness report that fails open is the same silence.
 
 To make a change live:
 
 ```bash
 ./scripts/orca/stop.sh          # drain: running agents finish, the dispatcher
                                 # stays up to reap their worktrees, then exits
-./scripts/orca/fleet.sh status  # until it says `idle`
+./scripts/orca/fleet.sh status  # until it says `idle` (it says that while
+                                # stopped too — that is how a drain ends)
+git -C /path/to/rommsync-nx pull --ff-only   # if it said BEHIND
 ./scripts/orca/fleet.sh resume  # clear the stop
-./scripts/orca/fleet.sh run --auto
+cd /path/to/rommsync-nx && ./scripts/orca/fleet.sh run --auto
 ```
+
+Start it from the **main worktree**, and only there — which is why `status`
+names that path rather than printing a relative command. A dispatcher started
+inside a fleet worktree has its cwd and its own `fleet.sh` under a directory the
+fleet removes as soon as that worktree's PR merges.
 
 A drain is the polite version and it can take hours — the dispatcher is what
 reaps a worktree once its PR merges, so killing it strands the stacks under

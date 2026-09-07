@@ -213,6 +213,22 @@
 #                                         drain leaves the dispatcher running on
 #                                         purpose, and the code it is draining
 #                                         with is the stale code.
+#   test_orca_fleet.sh status_drained     ...and once it exits, `idle` prints
+#                                         WHILE stopped. That line is what the
+#                                         documented restart waits for, and the
+#                                         stop file used to swallow it.
+#   test_orca_fleet.sh status_behind      the checkout it started from never
+#                                         pulled the fix -> BEHIND, naming it and
+#                                         the pull. Nothing in the fleet updates
+#                                         that checkout, so "the bytes on disk
+#                                         are the bytes it parsed" is true of the
+#                                         exact 27 hours #173 is about.
+#   test_orca_fleet.sh status_names_root  the restart it prints names the
+#                                         dispatcher's OWN checkout. This report
+#                                         is read from a fleet worktree, and a
+#                                         relative `run --auto` there starts a
+#                                         dispatcher in a directory the fleet
+#                                         removes when that PR merges.
 #
 # The Orca CLI and gh are stubbed on PATH; the fleet state dir is a temp dir.
 # Nothing here touches a real worktree, docker, or GitHub.
@@ -480,6 +496,19 @@ in_fleet_at() { local at="$1"; shift; (cd "$at" && . ./scripts/orca/fleet.sh && 
 # started from: a worktree branched before the fix landed.
 older_checkout() {
   git -C "$WORK/repo" worktree add -q --detach "$WORK/wt2" "$1"
+}
+
+# The fix merged and pushed, with the dispatcher's own checkout left exactly
+# where it was: `origin/main` moves, the file on disk does not. Nothing in the
+# fleet pulls it, so this is what a merge during a run actually looks like.
+merged_but_not_pulled() {
+  local parked; parked="$(git -C "$WORK/repo" rev-parse HEAD)"
+  git -C "$WORK/repo" init -q --bare "$WORK/repo-origin.git" 2>/dev/null
+  git -C "$WORK/repo" remote add origin "$WORK/repo-origin.git" 2>/dev/null
+  git -C "$WORK/repo" push -q origin HEAD:main
+  merge_fleet_fix "$1"
+  git -C "$WORK/repo" push -q origin HEAD:main
+  git -C "$WORK/repo" reset -q --hard "$parked"
 }
 
 case "${1:-}" in
@@ -1229,7 +1258,47 @@ JSON
       || fail "a draining dispatcher hid its staleness behind the stop, and a drain is exactly when it keeps running: $out"
     echo "ok: stopped and still up says both"
     ;;
+  status_drained)
+    make_fixture ok
+    make_repo_git
+    mkdir -p "$ROMMSYNC_FLEET_DIR"; : >"$ROMMSYNC_FLEET_DIR/STOP"
+    out="$(in_fleet cmd_status 2>&1)"
+    grep -q "STOPPED" <<<"$out" || fail "a stop stopped being reported: $out"
+    grep -q "idle" <<<"$out" \
+      || fail "the stop swallowed the line the documented restart waits for: $out"
+    echo "ok: a drained fleet says idle while stopped"
+    ;;
+  status_behind)
+    make_fixture ok
+    make_repo_git
+    dispatcher_running
+    in_fleet record_dispatcher
+    merged_but_not_pulled "a fix that merged while the dispatcher ran"
+    out="$(in_fleet cmd_status 2>&1)"
+    grep -qi "not live" <<<"$out" \
+      || fail "a fix merged under a dispatcher whose checkout never pulled was reported as live: $out"
+    grep -q "a fix that merged while the dispatcher ran" <<<"$out" \
+      || fail "it did not name the merged commit: $out"
+    grep -q "pull --ff-only" <<<"$out" \
+      || fail "it advised a restart that on its own would change nothing: $out"
+    echo "ok: merged-but-not-pulled is reported, and the pull is said first"
+    ;;
+  status_names_root)
+    make_fixture ok
+    make_repo_git
+    dispatcher_running
+    in_fleet record_dispatcher
+    parked="$(git -C "$WORK/repo" rev-parse HEAD)"
+    merge_fleet_fix "a fix the running dispatcher never parsed"
+    older_checkout "$parked"
+    out="$(in_fleet_at "$WORK/wt2" cmd_status 2>&1)"
+    grep -q "cd $WORK/repo && ./scripts/orca/fleet.sh run --auto" <<<"$out" \
+      || fail "read from a worktree, it told you to start a dispatcher in that worktree: $out"
+    grep -q "cd $WORK/wt2" <<<"$out" \
+      && fail "it named the caller's worktree, which the fleet removes when its PR merges: $out"
+    echo "ok: the restart it prints names the dispatcher's own checkout"
+    ;;
   *)
-    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind|status_stale|status_current|status_unrecorded|status_from_worktree|status_draining" >&2
+    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind|status_stale|status_current|status_unrecorded|status_from_worktree|status_draining|status_drained|status_behind|status_names_root" >&2
     exit 2 ;;
 esac

@@ -1229,6 +1229,15 @@ fleet_code_commit() {
   git -C "$1" log -1 --format=%H -- scripts/orca/fleet.sh 2>/dev/null
 }
 
+# The fleet.sh commits in $2..$3, in the repo at $1, or nothing. A ref that does
+# not resolve -- no `origin`, a checkout with no history in common -- is nothing
+# to name rather than an error on the screen.
+fleet_commits_between() {
+  [ -n "$2" ] || return 0
+  git -C "$1" rev-parse --verify --quiet "$3" >/dev/null 2>&1 || return 0
+  git -C "$1" log --oneline "$2..$3" -- scripts/orca/fleet.sh 2>/dev/null
+}
+
 # BSD date and GNU date spell "format this epoch" differently, and this runs on
 # both -- macOS here, Linux in CI.
 fmt_epoch() {
@@ -1247,15 +1256,28 @@ record_dispatcher() {
 }
 dispatcher_field() { sed -n "s/^$1=//p" "$DISPATCHER_FILE" 2>/dev/null | head -1; }
 
+release_dispatcher_files() {
+  [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ] || return 0
+  rm -f "$PIDFILE" "$DISPATCHER_FILE"
+}
+
 # How to make a change live, said wherever the change is not. The cap is here
 # because it has the same shape and is asked about far more often: MAX_WORKTREES
 # is read once at start, so `ROMMSYNC_FLEET_MAX=4` in front of `status` changes
 # nothing at all.
 restart_advice() {
+  local root="${1:-}"
   echo "  Restart it -- it is the only way a change to fleet.sh takes effect:"
   echo "    ./scripts/orca/stop.sh          # drains; --now interrupts the agents"
-  echo "    ./scripts/orca/fleet.sh resume  # once it is down"
-  echo "    ./scripts/orca/fleet.sh run --auto"
+  echo "    ./scripts/orca/fleet.sh resume  # once status stops saying 'running'"
+  # Named, not relative. This report is meant to be read from a fleet worktree,
+  # and `./scripts/orca/fleet.sh run --auto` there starts a dispatcher whose cwd
+  # and checkout the fleet removes as soon as that worktree's PR merges.
+  if [ -n "$root" ]; then
+    echo "    cd $root && ./scripts/orca/fleet.sh run --auto"
+  else
+    echo "    ./scripts/orca/fleet.sh run --auto   # from the MAIN worktree"
+  fi
   echo "  ROMMSYNC_FLEET_MAX, _POLL and _TIMEBOX are read at start too, so they"
   echo "  change only across a restart. docs/WORKFLOW.md, 'Restart it'."
 }
@@ -1278,20 +1300,36 @@ report_dispatcher_code() {
   fi
   [ -n "$started" ] && echo "  up since $(fmt_epoch "$started")${commit:+, running fleet.sh @ ${commit:0:7}}"
   now="$(fleet_code_hash "$root")"
-  [ -n "$now" ] && [ "$now" = "$hash" ] && return 0
+  if [ -n "$now" ] && [ "$now" = "$hash" ]; then
+    # The bytes it parsed are still the bytes on disk, which is not the end of
+    # it: nothing in the fleet pulls that checkout, so a fix MERGED while it ran
+    # -- #173's own case -- leaves the file untouched and the hashes equal. The
+    # remote-tracking ref is shared by every worktree of this repo, so asking it
+    # costs nothing and needs no network; a checkout that has genuinely never
+    # fetched simply has nothing to name.
+    log="$(fleet_commits_between "$root" "$commit" origin/main)"
+    [ -n "$log" ] || return 0
+    echo
+    echo "  BEHIND -- $root has not pulled these, so they are NOT live in the"
+    echo "  dispatcher running, and a restart alone will not make them live:"
+    printf '%s\n' "$log" | sed 's/^/    /'
+    echo "    git -C $root pull --ff-only"
+    restart_advice "$root"
+    return 0
+  fi
 
   echo
   echo "  STALE -- $root/scripts/orca/fleet.sh has changed since it started, and"
   echo "  it parses the file once. These are NOT live in the dispatcher running:"
-  [ -n "$commit" ] && log="$(git -C "$root" log --oneline "$commit..HEAD" -- scripts/orca/fleet.sh 2>/dev/null)"
-  if [ -n "${log:-}" ]; then
+  log="$(fleet_commits_between "$root" "$commit" HEAD)"
+  if [ -n "$log" ]; then
     printf '%s\n' "$log" | sed 's/^/    /'
   else
     # The bytes differ and git cannot name the difference -- an uncommitted edit,
-    # or a `status` run from a checkout that never had that commit. Still stale.
+    # or a checkout that never had that commit. Still stale.
     echo "    (git cannot name them from ${commit:-nothing recorded}; the file on disk differs)"
   fi
-  restart_advice
+  restart_advice "$root"
 }
 
 # --------------------------------------------------------------- commands ---
@@ -1306,7 +1344,9 @@ cmd_status() {
   if [ -e "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
     echo "running   (pid $(cat "$PIDFILE"))"
     report_dispatcher_code
-  elif ! stopped; then
+  else
+    # Printed while stopped too. A drain ends when the dispatcher exits, and
+    # this is the line that says it has -- WORKFLOW.md's restart waits for it.
     echo "idle      (no dispatcher running)"
   fi
   echo
@@ -1452,7 +1492,12 @@ cmd_run() {
   # Written next to the pidfile and removed with it: a record of a dispatcher
   # that is not running would report staleness about nothing.
   record_dispatcher
-  trap 'rm -f "$PIDFILE" "$DISPATCHER_FILE"' EXIT
+  # ...but removed only while they still name THIS process. Nothing stops a
+  # second dispatcher from starting and claiming both files, and an unconditional
+  # `rm` would then have the first one's exit delete the second one's record --
+  # leaving a live dispatcher reported as idle, with nothing to check its code
+  # against. That is the silence this whole file's staleness report exists to end.
+  trap 'release_dispatcher_files' EXIT
   say "fleet up: max $MAX_WORKTREES worktrees, polling every ${POLL_SECONDS}s, ${TIMEBOX_SECONDS}s per issue"
   $auto && say "mode: auto -- most-unblocking first, until the backlog is empty or you stop it" \
         || say "mode: list -- ${wanted[*]}"
