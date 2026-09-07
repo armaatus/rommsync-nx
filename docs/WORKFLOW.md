@@ -173,6 +173,27 @@ reaps a worktree once its PR merges, so killing it strands the stacks under
 agents and stops the dispatcher immediately; anything it had not reaped is then
 yours, with `./scripts/orca/reap.sh --yes`.
 
+**With agents mid-work, a drain is the wrong tool.** The stop file it writes is
+also what `guard.py` reads before it lets an agent push, open a PR or comment —
+so the PRs the drain is waiting on cannot land while it waits for them, and it
+ends only when the time-box gives each worktree up, three hours at a time. To
+restart the dispatcher and leave the agents alone, take it over directly:
+
+```bash
+kill $(cat ~/.rommsync-fleet/fleet.pid)
+./scripts/orca/fleet.sh status  # until it says `idle`
+cd /path/to/rommsync-nx && ./scripts/orca/fleet.sh run --auto
+```
+
+**Only one dispatcher runs at a time**, and `fleet.sh run` refuses to be the
+second: `MAX_WORKTREES` is enforced per process, so two of them count the same
+worktrees and open twice the cap between them, then reap, card and interrupt
+each other's (#179). The refusal names the pid that holds
+`~/.rommsync-fleet/fleet.pid` and prints both restarts above. It refuses only to
+a dispatcher this machine can still see running one — a pidfile a `kill -9` left
+behind, or whose pid the OS has since handed to an unrelated process, is taken
+over rather than obeyed.
+
 **The settings work the same way.** `ROMMSYNC_FLEET_MAX` (how many worktrees run
 at once, default 3), `ROMMSYNC_FLEET_POLL` and `ROMMSYNC_FLEET_TIMEBOX` are read
 once at start, so putting one in front of `fleet.sh status` changes nothing. The
