@@ -911,11 +911,19 @@ inline void CloseOpenSessions(http::HttpClient& client, const std::string& base,
   // creates one and its claim is written when the response naming it arrives, so
   // a snapshot taken first can miss a claim taken in between -- and the session
   // it then fails to attribute is a live one.
-  const rig::sessions::LiveClaims live = rig::sessions::Live();
+  //
+  // A run inside that window defers this entirely, since nothing unattributed
+  // can be told apart from what it is about to own. Waited out rather than
+  // simply accepted: every rig `main()` calls this once and then negotiates, so
+  // a leftover left here is the cancel #76 races. What is being waited for is a
+  // round trip; a stalled negotiate holds the marker longer than this, and that
+  // one is left to the next process to start, which is what best effort costs.
+  rig::sessions::LiveClaims live = rig::sessions::Live();
+  for (int waited = 0; live.negotiating && waited < 10; ++waited) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    live = rig::sessions::Live();
+  }
   if (live.negotiating) {
-    // Somebody is inside that window right now, so nothing unclaimed here can be
-    // told apart from what they are about to own. Leftovers keep; the next
-    // process to start clears them.
     return;
   }
   for (const json::Value& session : sessions->elements()) {

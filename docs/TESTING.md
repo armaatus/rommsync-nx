@@ -105,11 +105,26 @@ still collectable and nothing that has to clean up after it.
 The window between the row and the claim is covered by a second marker,
 `negotiating-pid-4213`. While a running process is inside it, nothing
 unattributed can be told from what that process is about to own, so the cleanup
-defers entirely — it is best effort by design, and the next process to start
-does it instead. `harness.session_owner` pins both halves: a live session a
-stranger may not end, and a leftover the cleanup still collects. It runs a real
-second process to do it, for the reason `RUN_SERIAL` cannot help either — nothing
-inside one invocation can see the other.
+defers entirely — waited out for a couple of seconds first, since every rig
+`main()` calls the cleanup once and then negotiates, and a leftover left here is
+the cancel #76 races. Beyond that it is best effort by design and the next
+process to start does it instead. `harness.session_owner` pins all three of the
+rules: a live session a stranger may not end, a leftover the cleanup still
+collects, and the session a run opened itself, which it may always close — the
+last one because several scenarios *end* with that call, and ownership must not
+have quietly turned it into a no-op. It runs a real second process to do it, for
+the reason `RUN_SERIAL` cannot help either: nothing inside one invocation can see
+the other.
+
+**What this does not fix**, because it cannot be fixed from this side: RomM keeps
+one active sync session per device and cancels the existing one on every
+negotiate (`/backend/endpoints/sync.py` in 5.2.0), and every rig process
+negotiates as the fixture's single device. A second `ctest` therefore still ends
+this run's session the moment it reaches its own first negotiate. What #174
+closed is the *startup* door — a second run clears sessions before it has done
+anything else, which is the window it spends most of its life in, and the one
+`#156` was measured through. Closing the rest would mean a registered device per
+process, not a claim file.
 
 Two `ctest`s at once broke a second thing, on disk rather than on the wire, and
 for the same reason (#151). `ROMMSYNC_TEST_SCRATCH` is per build tree, so it kept

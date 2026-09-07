@@ -47,13 +47,17 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 # way -- per process, in tests/scratch.hpp -- and held by `scratch.concurrent`,
 # which runs two `ctest`s at once because nothing inside one can see this.
 #
-# Ownership had to cover a third thing before two invocations were really safe:
-# the sync session a rig test opens. Every rig `main()` clears the sessions left
-# on the fixture device, and until #174 that meant another run's LIVE one --
-# the same "an earlier run's leftovers must not damage this one" that #118 fixed
-# for faults, and the same second `ctest`. `rig::sessions` attributes them by
-# process, `harness.session_owner` holds it, and RUN_SERIAL is again beside the
-# point.
+# Ownership had to cover a third thing: the sync session a rig test opens. Every
+# rig `main()` clears the sessions left on the fixture device, and until #174
+# that meant another run's LIVE one -- the same "an earlier run's leftovers must
+# not damage this one" that #118 fixed for faults, and the same second `ctest`.
+# `rig::sessions` attributes them by process and `harness.session_owner` holds
+# it; RUN_SERIAL is again beside the point.
+#
+# It closes the STARTUP door and not the whole room. RomM cancels a device's
+# active session on every negotiate and every rig process shares the fixture
+# device, so a second `ctest` still ends this one's session once it negotiates.
+# A device per process is what would close that, and docs/TESTING.md says so.
 
 # --- unit tests: no external services ---------------------------------------
 add_executable(test_version test_version.cpp)

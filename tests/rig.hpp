@@ -242,10 +242,12 @@ inline constexpr const char* kFaultOwnerHeader = "X-Fault-Owner";
 /// between processes.
 ///
 /// Exported into the environment, so that a child process is part of its
-/// parent's scenario rather than a stranger to it. Nothing in the suite forks a
-/// client today (the two tests that do fork -- test_conflicts and
-/// test_token_store -- make no requests from the child), and the export is what
-/// keeps that from silently mattering the day one does.
+/// parent's scenario rather than a stranger to it. test_conflicts and
+/// test_token_store fork without making a request from the child, so the export
+/// has never mattered to them; `harness.session_owner` runs a child that does
+/// make requests and wants the opposite, and clears the variable in the child so
+/// that it mints one of its own -- a stranger is the one thing that must not
+/// inherit this.
 ///
 /// The random suffix is there because a pid alone is reused: the proxy outlives
 /// the process that armed a fault, and a later process inheriting that pid would
@@ -296,6 +298,31 @@ inline constexpr const char* kNegotiatingPrefix = "negotiating-pid-";
 
 inline std::filesystem::path ClaimsDir() { return scratch::Root() / "sessions"; }
 
+/// How long one of these files can be trusted, by kind.
+///
+/// `kill(pid, 0)` is how a claim lapses, and it is not enough on its own: a pid
+/// is recycled, and one recycled to some long-lived process reads as alive for
+/// as long as that process runs. Age is the backstop, and the two bounds are the
+/// two different things being bounded. A scenario may legitimately hold a
+/// session for as long as CTest lets it run -- the longest TIMEOUT in
+/// tests/CMakeLists.txt is 900s -- while a negotiate is one request. The
+/// in-flight marker is also the more dangerous of the two to leave lying around,
+/// since it defers cleanup of EVERY session rather than of one, so it is held to
+/// the tighter bound.
+inline constexpr std::chrono::seconds kClaimLifetime{1800};
+inline constexpr std::chrono::seconds kNegotiatingLifetime{120};
+
+/// Is `file` young enough to still mean what it says? A file that cannot be
+/// read is treated as gone, never as a veto that cannot be cleared.
+inline bool Fresh(const std::filesystem::path& file, std::chrono::seconds lifetime) {
+  std::error_code error;
+  const std::filesystem::file_time_type written = std::filesystem::last_write_time(file, error);
+  if (error) {
+    return false;
+  }
+  return std::filesystem::file_time_type::clock::now() - written < lifetime;
+}
+
 inline long long Self() { return static_cast<long long>(::getpid()); }
 
 /// `"815"` -> 815, and 0 for anything that is not a session id. The digits and
@@ -342,6 +369,13 @@ inline void Touch(const std::filesystem::path& file) {
   std::error_code error;
   std::filesystem::create_directories(file.parent_path(), error);
   const std::ofstream created(file);
+  if (!created) {
+    // A claim that was not written is indistinguishable from no claim, and what
+    // that costs is #174 itself: another run's cleanup ending this one's live
+    // session. Nothing here may fail a scenario, so it says so instead.
+    std::cerr << "  rig::sessions could not write " << file.string()
+              << " -- this run's sync sessions are unattributed\n";
+  }
 }
 
 inline void Erase(const std::filesystem::path& file) {
@@ -494,13 +528,13 @@ inline LiveClaims Live() {
     std::int64_t id = 0;
     long long owner = 0;
     if (detail::ReadClaim(name, &id, &owner)) {
-      if (!scratch::Running(owner)) {
+      if (!scratch::Running(owner) || !detail::Fresh(file, detail::kClaimLifetime)) {
         detail::Erase(file);
       } else if (owner != detail::Self()) {
         live.ids.insert(id);
       }
     } else if (detail::ReadNegotiating(name, &owner)) {
-      if (scratch::Running(owner)) {
+      if (scratch::Running(owner) && detail::Fresh(file, detail::kNegotiatingLifetime)) {
         live.negotiating = true;
       } else {
         detail::Erase(file);
