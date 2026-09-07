@@ -53,6 +53,12 @@
 #                                     stopped and the stall is not decided.
 #                                     Every lookup here has a third answer, and
 #                                     an agent is only ever stopped on an answer.
+#   test_orca_fleet.sh outage_once    ...and it is said ONCE across a real poll:
+#                                     notice_stalled must not clear the marker
+#                                     enforce_timebox set moments earlier, which
+#                                     is the line-a-minute the markers prevent.
+#   test_orca_fleet.sh one_lookup     both watchers in one poll -> one `gh` call
+#                                     for one issue's labels, not two.
 #
 # The Orca CLI and gh are stubbed on PATH; the fleet state dir is a temp dir.
 # Nothing here touches a real worktree, docker, or GitHub.
@@ -202,6 +208,11 @@ make_overdue() { mkdir -p "$ROMMSYNC_FLEET_DIR/started"; echo 0 >"$ROMMSYNC_FLEE
 # fleet.sh returns instead of dispatching when it is sourced, so one function can
 # be exercised without starting a dispatcher.
 in_fleet() { (cd "$WORK/repo" && . ./scripts/orca/fleet.sh && "$@"); }
+
+# Both watchers in ONE process, which is what a real poll is: they share the
+# per-poll answer cache and the state dir, and only there can one of them undo
+# what the other just wrote.
+in_poll() { (cd "$WORK/repo" && . ./scripts/orca/fleet.sh && "$1"; "$2"); }
 
 case "${1:-}" in
   card_says)
@@ -368,7 +379,35 @@ JSON
       && fail "the once-per-stall marker was written on a non-answer, so it is never re-evaluated"
     echo "ok: a label lookup that failed stops nothing and decides nothing"
     ;;
+  outage_once)
+    make_fixture ok
+    make_worktree
+    make_overdue
+    # `working`, not `waiting`: the ordinary state of a grinding overrun, and
+    # the one that sends notice_stalled down its clearing branch.
+    agent_state working
+    issue_labels FAIL
+    out="$(in_poll enforce_timebox notice_stalled 2>&1)"
+    grep -q "could not read its labels" <<<"$out" \
+      || fail "the outage was not reported at all: $out"
+    again="$(in_poll enforce_timebox notice_stalled 2>&1)"
+    grep -q "could not read its labels" <<<"$again" \
+      && fail "it says so every poll: one watcher cleared the other watcher marker: $again"
+    echo "ok: an unreadable label is reported once, not once a minute"
+    ;;
+  one_lookup)
+    make_fixture ok
+    make_worktree
+    make_overdue
+    agent_state waiting
+    issue_labels "ready,needs-human-step"
+    in_poll enforce_timebox notice_stalled >/dev/null 2>&1
+    n="$(grep -c -- "--json labels" "$GH_CALLS")"
+    [ "$n" = 1 ] \
+      || fail "asked GitHub $n times for one issue labels in one poll"
+    echo "ok: one poll asks for an issue labels once"
+    ;;
   *)
-    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown" >&2
+    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup" >&2
     exit 2 ;;
 esac

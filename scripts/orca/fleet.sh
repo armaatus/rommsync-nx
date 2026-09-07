@@ -67,6 +67,10 @@ STARTED_DIR="$STATE_DIR/started"
 # every one of them. The first module added here whose name shadowed a stdlib
 # one would then quietly change what they all import.
 ISSUE_REFS="$REPO_ROOT/.github/scripts"
+# One pass's worth of answers, and no longer. Emptied at the top of every poll
+# and once at startup, so a dispatcher never trusts a previous run's.
+POLL_CACHE="$STATE_DIR/poll-cache"
+forget_poll_answers() { rm -rf "$POLL_CACHE"; mkdir -p "$POLL_CACHE"; }
 LOG="$STATE_DIR/fleet.log"
 PIDFILE="$STATE_DIR/fleet.pid"
 
@@ -86,6 +90,7 @@ FOUNDATION_LABEL="${ROMMSYNC_FOUNDATION_LABEL:-foundation}"
 HUMAN_STEP_LABEL="${ROMMSYNC_HUMAN_STEP_LABEL:-needs-human-step}"
 
 mkdir -p "$OWNED_DIR" "$STARTED_DIR"
+forget_poll_answers
 
 say() { printf '%s  %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$LOG"; }
 die() { printf '%s\n' "$*" >&2; exit 1; }
@@ -164,7 +169,8 @@ owned_path()   { cat "$OWNED_DIR/$1" 2>/dev/null; }
 # nothing else removed -- one small file leaked per issue that ever stalled.
 disown_issue() {
   rm -f "$OWNED_DIR/$1" "$STARTED_DIR/$1" "$STATE_DIR/stalled-$1" \
-        "$STATE_DIR/labels-unknown-$1" "$STATE_DIR/unreachable-$1" \
+        "$STATE_DIR/stall-labels-$1" "$STATE_DIR/box-labels-$1" \
+        "$STATE_DIR/queue-labels-$1" "$STATE_DIR/unreachable-$1" \
         "$STATE_DIR/human-step-$1"
 }
 
@@ -285,11 +291,24 @@ is_foundation() { has_label "$1" "$FOUNDATION_LABEL"; }
 # callers below interrupt an agent and comment on an issue, and a label listing
 # that could not be read is no basis for either. Asked live rather than cached at
 # launch, because the label is often what a person adds AFTER seeing the card.
+#
+# One answer per issue per POLL, though. enforce_timebox and notice_stalled both
+# ask about the same issue in the same pass -- an issue stuck long enough to
+# overrun is often also the one sitting at a prompt -- and two calls for one
+# answer is the pattern count_startable exists to avoid. The cache lives for one
+# pass, so a label a person adds is still seen on the next one.
 issue_needs_human_step() {
-  local labels
-  labels="$(GH_PAGER=cat gh issue view "$1" --json labels \
-              --jq '[.labels[].name]|join(",")' 2>/dev/null)" || return 2
-  has_label "$labels" "$HUMAN_STEP_LABEL"
+  local cached="$POLL_CACHE/human-step-$1" labels rc
+  [ -s "$cached" ] && return "$(cat "$cached")"
+  if labels="$(GH_PAGER=cat gh issue view "$1" --json labels \
+                 --jq '[.labels[].name]|join(",")' 2>/dev/null)"; then
+    has_label "$labels" "$HUMAN_STEP_LABEL"; rc=$?
+  else
+    rc=2
+  fi
+  mkdir -p "$POLL_CACHE" 2>/dev/null
+  printf '%s' "$rc" >"$cached" 2>/dev/null || true
+  return "$rc"
 }
 
 # Landed: the issue is closed, or a PR that closes it has merged. `ready` does
@@ -523,26 +542,28 @@ except Exception:
     pass
 " "$path" 2>/dev/null)"
     [ "$state" = "waiting" ] || {
-      rm -f "$STATE_DIR/stalled-$num" "$STATE_DIR/labels-unknown-$num"; continue; }
+      rm -f "$STATE_DIR/stalled-$num" "$STATE_DIR/stall-labels-$num"; continue; }
     # Once per stall, not once per poll -- and checked before the lookup, so a
     # settled stall costs no `gh` call at all.
     [ -e "$STATE_DIR/stalled-$num" ] && continue
     # The third answer, and it must not be frozen behind the stall marker: a
     # single `gh` blip would otherwise record a #142-style false stall and never
     # re-evaluate it, which is the exact noise this change exists to remove.
-    # `labels-unknown-` throttles it instead -- one marker for "this issue's
-    # labels could not be read", shared by the two branches below and by list
-    # mode, and cleared by whichever of them gets a real answer first. It is NOT
-    # `unreachable-`: that one means the PR lookup failed, and a marker standing
-    # for two different outages silently swallows the second one.
+    # `stall-labels-` throttles it instead. Each watcher owns its own
+    # once-per-outage marker and clears only that one: this branch above drops
+    # `stall-labels-` whenever the agent stops being `waiting`, which is the
+    # ordinary state of a grinding overrun, and a marker shared with
+    # enforce_timebox would be deleted seconds after that function set it --
+    # restoring the line-a-minute the split exists to prevent. Distinct from
+    # `unreachable-` for the same reason: that one means the PR lookup failed.
     issue_needs_human_step "$num"; rc=$?
     if [ "$rc" = 2 ]; then
-      [ -e "$STATE_DIR/labels-unknown-$num" ] && continue
-      : >"$STATE_DIR/labels-unknown-$num"
+      [ -e "$STATE_DIR/stall-labels-$num" ] && continue
+      : >"$STATE_DIR/stall-labels-$num"
       say "#$num is waiting for input, and its labels could not be read -- asking again next poll"
       continue
     fi
-    rm -f "$STATE_DIR/labels-unknown-$num"
+    rm -f "$STATE_DIR/stall-labels-$num"
     : >"$STATE_DIR/stalled-$num"
     if [ "$rc" = 0 ]; then
       say "#$num is waiting for you, as expected -- its last step is yours to take"
@@ -598,7 +619,7 @@ enforce_timebox() {
     # back to an agent -- which would then run uncapped forever. Said once, by
     # its own marker, rather than once a minute for as long as the label is on.
     issue_needs_human_step "$num"; case $? in
-      0) rm -f "$STATE_DIR/labels-unknown-$num"
+      0) rm -f "$STATE_DIR/box-labels-$num"
          [ -e "$STATE_DIR/human-step-$num" ] && continue
          : >"$STATE_DIR/human-step-$num"
          say "#$num: past the time-box, but it is labelled $HUMAN_STEP_LABEL -- leaving it to wait for you"
@@ -608,12 +629,12 @@ enforce_timebox() {
          # not where WORKFLOW.md says status lives.
          card "$path" --comment "#$num: waiting for you -- as expected, past the time-box"
          continue ;;
-      2) [ -e "$STATE_DIR/labels-unknown-$num" ] && continue
-         : >"$STATE_DIR/labels-unknown-$num"
+      2) [ -e "$STATE_DIR/box-labels-$num" ] && continue
+         : >"$STATE_DIR/box-labels-$num"
          say "#$num: timed out, but could not read its labels -- leaving it for the next pass"
          continue ;;
     esac
-    rm -f "$STATE_DIR/labels-unknown-$num" "$STATE_DIR/human-step-$num"
+    rm -f "$STATE_DIR/box-labels-$num" "$STATE_DIR/human-step-$num"
 
     say "#$num: $((TIMEBOX_SECONDS / 3600))h with no PR -- stopping it and leaving the worktree for you"
     agent="$(agent_terminal_in "$path")"
@@ -769,6 +790,7 @@ cmd_run() {
       reason="the deadline passed"
     fi
 
+    forget_poll_answers
     reap_merged
     enforce_timebox
     notice_stalled
@@ -812,13 +834,13 @@ cmd_run() {
             issue_needs_human_step "$n"; case $? in
               0) say "#$n is labelled $HUMAN_STEP_LABEL -- it is yours to take; remove the label to hand it to an agent"
                  continue ;;
-              2) if [ ! -e "$STATE_DIR/labels-unknown-$n" ]; then
-                   : >"$STATE_DIR/labels-unknown-$n"
+              2) if [ ! -e "$STATE_DIR/queue-labels-$n" ]; then
+                   : >"$STATE_DIR/queue-labels-$n"
                    say "#$n: could not read its labels -- not starting it this pass"
                  fi
                  remaining+=("$n"); continue ;;
             esac
-            rm -f "$STATE_DIR/labels-unknown-$n"
+            rm -f "$STATE_DIR/queue-labels-$n"
             picked="$n"
           fi
           remaining+=("$n")
