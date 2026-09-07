@@ -19,6 +19,10 @@ server/testing/fixture-auth.env
 .venv/
 .orca/
 TASK.md
+# the scratch file /code-review output is piped into before record-review.sh
+# copies it into .orca/ -- local working paper, and the findings themselves
+# belong in the PR body
+findings.md
 
 # build output
 build/

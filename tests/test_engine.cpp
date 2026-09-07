@@ -1195,7 +1195,7 @@ int Repairs(http::HttpClient& client, const std::string& base) {
 /// attempt's own failure rather than a command that lied about starting one --
 /// and, above all, the card is untouched.
 void Unreachable(checks::Checks& c) {
-  const std::unique_ptr<http::HttpClient> client = rommsync::host::MakeCurlHttpClient();
+  const std::unique_ptr<http::HttpClient> client = rig::MakeClient();
   Console console(c, "engine-unreachable");
   // Port 9 is discard: nothing listens, so the connect is refused at once. A
   // hostname that does not resolve would test DNS timeouts instead.
@@ -1828,7 +1828,7 @@ int main(int argc, char** argv) {
     const std::string base = rig::BaseUrl();
     std::error_code error;
     std::filesystem::create_directories(rig::ScratchDir(), error);
-    const std::unique_ptr<http::HttpClient> client = rommsync::host::MakeCurlHttpClient();
+    const std::unique_ptr<http::HttpClient> client = rig::MakeClient();
     if (!rig::Reachable(*client, base)) {
       std::cerr << "rig unreachable at " << base
                 << "\n  start it with: ./scripts/orca/compose.sh up -d\n";

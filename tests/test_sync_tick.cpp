@@ -490,7 +490,7 @@ void Offline(rig::Checks& checks) {
   sync::TickOptions options = OptionsAt(1'757'000'100);
   Impatient(&options);
   const sync::TickResult tick =
-      sync::RunTick(*rommsync::host::MakeCurlHttpClient(), *files, token, {local}, targets,
+      sync::RunTick(*rig::MakeClient(), *files, token, {local}, targets,
                     baseline, options);
 
   checks.Expect(tick.outcome == sync::TickOutcome::kOffline,
@@ -528,7 +528,7 @@ void Offline(rig::Checks& checks) {
   const std::string baseline_before = sandbox.Read(sync::kStateSdPath);
 
   const sync::TickResult sweeping =
-      sync::RunTick(*rommsync::host::MakeCurlHttpClient(), *files, token, {local}, targets,
+      sync::RunTick(*rig::MakeClient(), *files, token, {local}, targets,
                     baseline, options);
   checks.Expect(sweeping.outcome == sync::TickOutcome::kOffline,
                 std::string("the second offline tick is offline too: ") +
@@ -1457,7 +1457,7 @@ int main(int argc, char** argv) {
   }
 
   const std::string base = rig::BaseUrl();
-  const std::unique_ptr<http::HttpClient> client = rommsync::host::MakeCurlHttpClient();
+  const std::unique_ptr<http::HttpClient> client = rig::MakeClient();
   if (!rig::Reachable(*client, base)) {
     std::cerr << "rig unreachable at " << base
               << "\n  start it with: ./scripts/orca/compose.sh up -d\n";

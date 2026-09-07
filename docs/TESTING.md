@@ -47,6 +47,31 @@ curl -XPOST "$PROXY_BASE_URL/__fault" \
 The proxy never synthesises a RomM response of its own — that is what keeps the
 fidelity while still making failure deterministic and repeatable in CI.
 
+### One proxy, several clients
+
+A fault belongs to the client that armed it. Every request the suite makes
+carries an `X-Fault-Owner` tag (`tests/rig.hpp`, `rig::MakeClient`), the proxy
+keys the armed scenario by it, and only requests carrying that tag can claim it —
+so `after` and `count` count *your* traffic rather than everything moving through
+the proxy.
+
+Before #118 there was one armed scenario for the whole proxy, and the failure it
+produced is worth recognising because it lands somewhere else entirely: a second
+`ctest` against the same worktree — an agent's run beside a review's run — spent
+the positional budget of a fault it knew nothing about, so the fault fired on a
+stranger's request. The test that armed it then failed with an off-by-one in an
+assertion about something unrelated, or with a timeout on the side that was
+waiting for a fault already consumed. `RUN_SERIAL` cannot help with that and
+never could: it orders tests inside one `ctest` invocation and says nothing about
+a second one.
+
+A scenario armed with no tag is still global, and applies to whoever asks next —
+that is what the one-line `curl` above does, and a tagged client falls back to it
+only when it has none of its own. `DELETE /__fault` clears the caller's own
+scenario and nothing else — one client may not disarm another's — so an untagged
+scenario is cleared by an untagged `DELETE`, the same `curl` that armed it, or by
+age (`OWNER_TTL_SECONDS`, an hour).
+
 `truncate` and `drop` differ in exactly one header, and the difference is the
 point. A server whose connection dies mid-transfer had already promised a
 `Content-Length`, so `drop` keeps it: the client is owed bytes it never gets, and
@@ -242,10 +267,12 @@ ctest --test-dir build --output-on-failure
   `range`, `drop`, `resume`, `resume_no_range`, `resume_empty_body`,
   `resume_stale_range`, `range_expected_size`, `not_found`, `truncate`, `stall`,
   `cancel`. One CTest entry each, so a red run names the behaviour rather than
-  "the http tests". They run `RUN_SERIAL` because the fault proxy holds one
-  armed scenario for all clients. The streaming ones pull RomM's own frontend
-  bundle — the only large resource the rig serves that does not first need a
-  library scan, which is socket.io-driven rig work belonging to M0-5.
+  "the http tests". They run `RUN_SERIAL` because they share one RomM fixture,
+  not because they share a fault: since #118 an armed scenario belongs to the
+  client that armed it (see *One proxy, several clients* above). The streaming
+  ones pull RomM's own frontend bundle — the only large resource the rig serves
+  that does not first need a library scan, which is socket.io-driven rig work
+  belonging to M0-5.
 - **`wire.*` is the same eighteen scenarios against the console's backend**
   (M1-7, #126), out of the same source file compiled twice rather than a copy of
   it. `sysmodule/source/http/http_wire.cpp` is the HTTP half of the Horizon
@@ -267,7 +294,7 @@ ctest --test-dir build --output-on-failure
   assumes. They wait out real poll intervals rather than faking a clock, because
   RomM answers `slow_down` to a client that undercuts the `interval` it asked
   for, and that is the one rule the loop has to obey. `RUN_SERIAL`, like the
-  `http.*` tests, for the same fault-proxy reason.
+  `http.*` tests, for the same shared-fixture reason.
 - One rig constraint worth knowing before it looks like a flake: RomM rate
   limits `POST /api/auth/device/init` to **ten a minute, per IP**. A console
   pairs once; the suite opens a dozen codes from one address, so `pair.*` waits
@@ -285,9 +312,8 @@ ctest --test-dir build --output-on-failure
   of accreting a device per boot on a console. `impostor` and `offline` use the
   fault proxy for the answers a healthy RomM will not give: a `200` about a
   different device, a body that is not JSON, a stall, a `503`, and a connection
-  that dies mid-body. They are `RUN_SERIAL` for the fault proxy, for the
-  ten-inits-a-minute limit below, and because two of them at once would count
-  each other's device rows.
+  that dies mid-body. They are `RUN_SERIAL` for the ten-inits-a-minute limit
+  below, and because two of them at once would count each other's device rows.
 - `device.shapes` is the no-network half: `DeviceSchema` parsed out of
   `captures/devices-get.json`, and the classification the sysmodule acts on —
   registered / paired-but-not / unpaired, and whether a failure is worth

@@ -14,14 +14,31 @@
 // code. Production HTTP goes through the HttpClient interface built in M0-2.
 
 #include <curl/curl.h>
+#include <unistd.h>  // getpid: the owner tag below is per process
 
 #include <cstdlib>
 #include <iostream>
+#include <random>
 #include <string>
 
 namespace {
 
 constexpr int kSkip = 77;  // CTest SKIP_RETURN_CODE -- see tests/CMakeLists.txt
+
+/// Whose fault this process arms and claims. One proxy serves every client that
+/// dials this worktree, and an untagged scenario is claimed by whichever request
+/// arrives next -- including one from a second `ctest` running against the same
+/// rig, which is how this file used to fail with "expected the armed fault to
+/// yield 401" having done nothing wrong (#118). tests/rig.hpp says the same
+/// thing for the tests that speak through `HttpClient`; this one is raw libcurl
+/// on purpose, so it repeats it rather than sharing it -- random suffix
+/// included, because the proxy outlives this process and pids come round again.
+const std::string& OwnerTag() {
+  static const std::string tag = "rig-smoke-" +
+                                 std::to_string(static_cast<long>(::getpid())) + "-" +
+                                 std::to_string(std::random_device{}());
+  return tag;
+}
 
 std::size_t Collect(char* data, std::size_t size, std::size_t nmemb, void* out) {
   static_cast<std::string*>(out)->append(data, size * nmemb);
@@ -43,6 +60,8 @@ Response Request(const std::string& url, const char* method = "GET",
     return response;
   }
 
+  curl_slist* headers = curl_slist_append(nullptr, ("X-Fault-Owner: " + OwnerTag()).c_str());
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, Collect);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response.body);
@@ -55,6 +74,7 @@ Response Request(const std::string& url, const char* method = "GET",
   response.code = curl_easy_perform(curl);
   curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.status);
   curl_easy_cleanup(curl);
+  curl_slist_free_all(headers);
   return response;
 }
 

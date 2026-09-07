@@ -14,9 +14,14 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <memory>
+#include <random>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
+
+#include <unistd.h>  // getpid: the owner tag below is per process
 
 #include "checks.hpp"
 #include "rommsync/host/curl_http_client.hpp"
@@ -215,6 +220,93 @@ inline http::Result DenyDeviceCode(http::HttpClient& client, const std::string& 
 }
 
 // --- the rig ------------------------------------------------------------------
+
+/// The header a client puts its fault-proxy identity in.
+///
+/// A scenario armed with it is claimed only by requests carrying the same value,
+/// so `after` and `count` count this client's traffic rather than everything
+/// moving through the proxy. Why that matters, and what the failure looked like
+/// before #118: docs/TESTING.md, "One proxy, several clients".
+inline constexpr const char* kFaultOwnerHeader = "X-Fault-Owner";
+
+/// This process's identity at the fault proxy. Stable for the process, unique
+/// between processes.
+///
+/// Exported into the environment, so that a child process is part of its
+/// parent's scenario rather than a stranger to it. Nothing in the suite forks a
+/// client today (the two tests that do fork -- test_conflicts and
+/// test_token_store -- make no requests from the child), and the export is what
+/// keeps that from silently mattering the day one does.
+///
+/// The random suffix is there because a pid alone is reused: the proxy outlives
+/// the process that armed a fault, and a later process inheriting that pid would
+/// inherit the leftover with it.
+inline const std::string& FaultOwner() {
+  static const std::string owner = [] {
+    if (const char* inherited = std::getenv("ROMMSYNC_FAULT_OWNER");
+        inherited != nullptr && *inherited != '\0') {
+      return std::string(inherited);
+    }
+    const std::string minted = "pid" + std::to_string(static_cast<long>(::getpid())) + "-" +
+                               std::to_string(std::random_device{}());
+    ::setenv("ROMMSYNC_FAULT_OWNER", minted.c_str(), 1);
+    return minted;
+  }();
+  return owner;
+}
+
+/// An `HttpClient` that signs its proxy-bound requests with an owner tag.
+///
+/// A decorator rather than a change to the curl backend: `core/` and `host/`
+/// know nothing about the fault proxy, and this is a property of the test rig.
+class OwnedHttpClient : public http::HttpClient {
+ public:
+  OwnedHttpClient(std::unique_ptr<http::HttpClient> inner, std::string owner)
+      : inner_(std::move(inner)), owner_(std::move(owner)) {}
+
+  http::Result Send(const http::Request& request) override {
+    return inner_->Send(Signed(request));
+  }
+
+  http::Result Download(const http::Request& request,
+                        const http::DownloadTarget& target) override {
+    return inner_->Download(Signed(request), target);
+  }
+
+ private:
+  /// Only what goes through the proxy is signed. The suite also drives a
+  /// loopback server of its own (tests/loopback_server.hpp) and asserts on the
+  /// headers that reach it, and a rig concern has no business appearing there.
+  http::Request Signed(const http::Request& request) const {
+    if (request.url.rfind(BaseUrl(), 0) != 0) {
+      return request;
+    }
+    http::Request signed_request = request;
+    signed_request.headers.push_back({kFaultOwnerHeader, owner_});
+    return signed_request;
+  }
+
+  std::unique_ptr<http::HttpClient> inner_;
+  std::string owner_;
+};
+
+/// Sign an existing client's proxy traffic. `MakeClient` is this over a fresh
+/// libcurl client; a test that needs a different backend -- the sysmodule's wire
+/// client in tests/test_http_native.cpp -- wraps that one instead.
+inline std::unique_ptr<http::HttpClient> Own(std::unique_ptr<http::HttpClient> inner,
+                                             std::string owner = FaultOwner()) {
+  return std::make_unique<OwnedHttpClient>(std::move(inner), std::move(owner));
+}
+
+/// A client whose faults are its own. What every rig test builds.
+inline std::unique_ptr<http::HttpClient> MakeClientAs(std::string owner,
+                                                      const http::ClientOptions& options = {}) {
+  return Own(rommsync::host::MakeCurlHttpClient(options), std::move(owner));
+}
+
+inline std::unique_ptr<http::HttpClient> MakeClient(const http::ClientOptions& options = {}) {
+  return MakeClientAs(FaultOwner(), options);
+}
 
 /// Arm a fault-proxy scenario. `spec` is the JSON body documented in
 /// server/testing/fault_proxy.py.

@@ -19,7 +19,8 @@
 // plus the harness's own two guarantees, which are the ones that keep the rest
 // honest: `sandbox` (the per-test SD card, and the backup rule it enforces
 // whether or not a test remembers to look) and `disarms` (a fault cannot
-// outlive the scope that armed it).
+// outlive the scope that armed it), and `fault_owner` (a fault belongs to the
+// client that armed it, so a second `ctest` cannot spend it -- #118).
 //
 // **What is deliberately not here.** The issue's wording asks for the client's
 // *behaviour* on a conflict and on a partial plan -- resolve by policy, count
@@ -906,11 +907,12 @@ void StallDropped(rig::Checks& checks, http::HttpClient& client, const std::stri
   checks.ExpectEq(rows_for_slot(&in_slot), 0,
                   "the slot starts empty, so a row in it can only be this upload");
 
-  // The fault is armed with `count:1` on a path prefix, and the proxy holds one
-  // armed scenario for every client -- so this scenario, like every other rig
-  // scenario, depends on running alone (RUN_SERIAL). The listings are
-  // deliberately outside the fault scope: `/api/saves` is a prefix of this
-  // fault's path, and a listing inside it would spend the stall on itself.
+  // The fault is armed with `count:1` on a path prefix, and one client holds one
+  // armed scenario at a time -- so the listings are deliberately outside the
+  // fault scope: `/api/saves` is a prefix of this fault's path, and a listing
+  // inside it would spend the stall on itself. Another client's traffic cannot
+  // spend it (#118); this scenario still runs alone (RUN_SERIAL) because it
+  // uploads to the shared fixture.
   const auto upload_started = std::chrono::steady_clock::now();
   {
     harness::Fault fault(checks, client, base,
@@ -1445,6 +1447,75 @@ void Backup(rig::Checks& checks, http::HttpClient& client, const std::string& ba
   harness::DeleteSave(client, base, fixture, server.id);
 }
 
+// --- fault_owner --------------------------------------------------------------
+//
+// Two clients, one proxy (#118). Everything above arms a fault and then counts
+// its own requests, and until this scenario existed nothing checked that the
+// requests being counted were its own: the proxy held ONE armed scenario, so a
+// second `ctest` against the same rig spent this test's `after`/`count` budget
+// and the fault fired on a stranger. What that looks like from here is an
+// off-by-one in an assertion about something else, or a wait that times out
+// because the fault it was waiting for was already gone -- in a test file
+// nobody touched, which is why it cost four runs to attribute.
+//
+// The two clients here stand in for the two `ctest` processes. They are the
+// same code with different owner tags, and the tags are what the proxy sorts
+// them by.
+
+void FaultOwnerScenario(rig::Checks& checks, const std::string& base) {
+  // Both tags carry this process's own, because a second `ctest` runs this same
+  // scenario: two runs sharing the literal "mine" would spend each other's
+  // budget, which is the defect rather than a way to test it.
+  const std::unique_ptr<http::HttpClient> mine = rig::MakeClientAs(rig::FaultOwner() + "-mine");
+  const std::unique_ptr<http::HttpClient> stranger =
+      rig::MakeClientAs(rig::FaultOwner() + "-stranger");
+
+  const auto heartbeat = [&base](http::HttpClient& client) {
+    http::Request request;
+    request.url = base + "/api/heartbeat";
+    return client.Send(request).response.status;
+  };
+
+  {
+    // "The third heartbeat I send fails." Positional, which is exactly the
+    // shape a stranger's traffic used to break.
+    harness::Fault fault(
+        checks, *mine, base,
+        R"({"mode":"status","status":418,"path":"/api/heartbeat","after":2,"count":1})");
+
+    for (int i = 0; i < 5; ++i) {
+      checks.ExpectEq(heartbeat(*stranger), 200,
+                      "a stranger's heartbeat is untouched by a fault it did not arm");
+    }
+
+    checks.ExpectEq(heartbeat(*mine), 200, "my first heartbeat passes through");
+    checks.ExpectEq(heartbeat(*mine), 200, "my second heartbeat passes through");
+    checks.ExpectEq(heartbeat(*mine), 418, "and my third is the one that fails");
+  }
+  harness::ExpectDisarmed(checks, *mine, base, "the scope disarmed it");
+
+  {
+    // Arming used to overwrite whatever was there, so the stranger arming its
+    // own scenario silently threw mine away. Both are live now, and each fires
+    // for its owner only.
+    harness::Fault theirs(checks, *stranger, base,
+                          R"({"mode":"status","status":429,"path":"/api/heartbeat","count":1})");
+    harness::Fault ours(checks, *mine, base,
+                        R"({"mode":"status","status":418,"path":"/api/heartbeat","count":1})");
+
+    checks.ExpectEq(heartbeat(*stranger), 429, "the stranger's own fault still fires for it");
+    checks.ExpectEq(heartbeat(*mine), 418, "and mine survived it being armed");
+  }
+  harness::ExpectDisarmed(checks, *mine, base, "both scopes disarmed");
+
+  // The untagged scenario -- the documented one-line `curl`, which arms for
+  // whichever request comes next -- is deliberately NOT asserted here. There is
+  // one of those for the whole proxy by design, so a second `ctest` arming its
+  // own would replace the one this scenario was about: asserting on it against
+  // the shared proxy is the flake this file exists to rule out. It is pinned in
+  // process instead, by `proxy.ownership` (tests/test_fault_proxy.py).
+}
+
 
 }  // namespace
 
@@ -1478,7 +1549,7 @@ int main(int argc, char** argv) {
     return checks.failures() == 0 ? 0 : 1;
   }
 
-  const std::unique_ptr<http::HttpClient> client = rommsync::host::MakeCurlHttpClient();
+  const std::unique_ptr<http::HttpClient> client = rig::MakeClient();
   if (!rig::Reachable(*client, base)) {
     std::cerr << "rig unreachable at " << base
               << "\n  start it with: ./scripts/orca/compose.sh up -d\n";
@@ -1499,6 +1570,8 @@ int main(int argc, char** argv) {
 
   if (scenario == "disarms") {
     Disarms(checks, *client, base);
+  } else if (scenario == "fault_owner") {
+    FaultOwnerScenario(checks, base);
   } else if (scenario == "expired") {
     Expired(checks, *client, base, fixture);
   } else if (scenario == "stall") {
