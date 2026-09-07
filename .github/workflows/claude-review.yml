@@ -70,9 +70,33 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     continue-on-error: true
+    # Per HEAD, and never cancelled.
+    #
+    # A build can be cancelled by the next push because only the newest build
+    # matters. A review cannot: `merge-gate` requires a review on a SPECIFIC
+    # commit, so killing the run that was producing one leaves that commit with
+    # no verdict -- and the "no verdict" job below is `needs: review`, so a
+    # cancelled review does not even leave the comment that would say so. On
+    # #86's merged head and #81's, `review against REVIEW.md` shows `cancelled`;
+    # both survived only because another run happened to submit.
+    #
+    # Keyed on the head sha so two pushes never contend at all, and grouped
+    # rather than ungrouped so several events on ONE head still produce one
+    # review rather than three.
     concurrency:
-      group: claude-review-${{ github.event.pull_request.number || inputs.pr }}
-      cancel-in-progress: true
+      group: claude-review-${{ github.event.pull_request.number || inputs.pr }}-${{ github.event.pull_request.head.sha || inputs.pr }}
+      cancel-in-progress: false
+    # Explicit, so that the `verdict` job below can hold `actions: write` --
+    # which it needs to ask for one more review -- without this job inheriting
+    # it. This is the job that runs an agent over untrusted PR text; the ability
+    # to start workflow runs does not belong in it.
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    outputs:
+      have_token: ${{ steps.token.outputs.have_token }}
     steps:
       # The head commit, not refs/pull/N/merge: the review should read what the
       # author actually pushed.
@@ -158,8 +182,16 @@ jobs:
             Submit a REVIEW, not a comment, because the verdict has to live in
             the PR's own state where the worktree can read it back:
 
-              gh pr review <N> --request-changes --body-file <file>   # any Important finding
-              gh pr review <N> --comment         --body-file <file>   # nothing Important
+              gh pr review <N> --request-changes --body "<your findings>"   # any Important finding
+              gh pr review <N> --comment         --body "<your findings>"   # nothing Important
+
+            `--body`, never `--body-file`. The tools this job grants you are
+            Read, Grep, Glob and a fixed list of `gh` and `git` commands: there
+            is no Write, no generic Bash, no mktemp and no shell redirection, so
+            there is no way for you to create a file for `--body-file` to read.
+            This instruction used to name one anyway -- so a run submitted only
+            if it improvised away from what it was told, and PR #131 got three
+            green review runs and no reviews.
 
             Never `--approve`. The agent that wrote the code has no route to
             approve it, and neither do you.
@@ -201,25 +233,40 @@ jobs:
             work to do, and it clears when the author pushes fixes and
             re-requests review.
 
-      # Silence is the failure mode here, and it is invisible: the action can
-      # burn 35 turns and real money, decide a verdict, and end without ever
-      # running `gh pr review` -- `is_error: false`, job green, nothing on the
-      # PR. `merge-gate` then blocks on a review that never arrives, and the
-      # watcher on the other side re-fires the event forever.
-      #
+  # A JOB, not a step in the review above -- for the same reason merge-gate.yml
+  # splits `clear-stale` out: this one holds `actions: write`, which the job
+  # running an agent over untrusted PR text must not.
+  #
+  # Silence is the review's failure mode, and it is invisible: the action can
+  # burn 35 turns and real money, decide a verdict, and end without ever running
+  # `gh pr review` -- `is_error: false`, job green, nothing on the PR.
+  # `merge-gate` then blocks on a review that never arrives.
+  verdict:
+    name: say so if no verdict was submitted
+    needs: review
+    # `!cancelled()` rather than a bare condition: a step or job `if` with no
+    # status function gets an implicit `success()`, so this would be SKIPPED
+    # exactly when the review FAILED -- the case where the silence is loudest
+    # and least visible.
+    if: ${{ !cancelled() && needs.review.outputs.have_token == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      # To ask for exactly one more review. `workflow_dispatch` is one of the
+      # two events GitHub still creates a run for when GITHUB_TOKEN fires it.
+      actions: write
+    steps:
       # This does not fail the job (a broken review must not hold up a PR) and
       # it deliberately does NOT submit a review of its own: an auto-generated
       # "no verdict" review would satisfy merge-gate's requirement for an
       # independent review while carrying no judgement at all, which is worse
       # than the silence. It leaves a plain comment -- visible to a person, and
       # not something the gate will ever mistake for a review.
-      - name: say so if no verdict was submitted
-        # `!cancelled()` rather than a bare condition: a step `if` with no status
-        # function gets an implicit `success()`, so this would be SKIPPED exactly
-        # when the review action FAILED -- the case where the silence is loudest
-        # and least visible. Found in review of this PR.
-        if: ${{ !cancelled() && steps.token.outputs.have_token == 'true' }}
-        continue-on-error: true
+      - name: say so, and ask once more
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR: ${{ github.event.pull_request.number || inputs.pr }}
@@ -236,8 +283,13 @@ jobs:
           fi
           echo "::warning title=No verdict::The reviewer ran but submitted no review on ${sha:0:8}."
           marker="<!-- review-produced-no-verdict ${sha} -->"
+          # The marker is what makes the retry below happen EXACTLY ONCE per
+          # head. If it is already there, this head has had its second chance
+          # and a third would be a loop: the review job dispatched from here
+          # ends in this same job, which would dispatch again forever.
           if gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --jq '.[].body' 2>/dev/null \
                | grep -qF "$marker"; then
+            echo "::warning title=No verdict, twice::${sha:0:8} has already been re-reviewed once and still has no verdict. A person decides from here."
             exit 0
           fi
           body="$(mktemp)"
@@ -245,10 +297,31 @@ jobs:
             printf '%s\n\n' "$marker"
             printf "The review job ran to completion on \`%s\` and submitted **no review**, so there is no verdict for \`merge-gate\` to read and nothing for the author to resolve. The job is green because a broken review must never hold up a PR -- this comment is the visible half of that silence.\n\n" "${sha:0:8}"
             printf 'This is a comment and not a review on purpose: an auto-generated verdict would satisfy the gate requirement for an independent review while carrying no judgement, which is worse than saying nothing.\n\n'
-            printf "Push a change, or re-run \`claude review\` for this PR, to ask for another one.\n"
+            printf "One more review has been asked for automatically -- once, for this commit. If that one is silent too, this comment stays as it is and a person decides: push a change, or re-run \`claude review\` for this PR by hand.\n"
           } >"$body"
-          gh pr comment "$PR" --body-file "$body" >/dev/null 2>&1 || true
+          posted=1
+          gh pr comment "$PR" --body-file "$body" >/dev/null 2>&1 || posted=0
           rm -f "$body"
+          if [ "$posted" = 0 ]; then
+            # The comment IS the once-only marker. Dispatching without it would
+            # ask again on every pass, forever, because the next pass would find
+            # no marker either.
+            echo "::warning title=Could not say so::The no-verdict comment did not post, so no further review is asked for. Re-run \`claude review\` for PR #$PR by hand."
+            exit 0
+          fi
+
+          # ...and ask. Without this the two remedies the comment names are both
+          # manual, so a PR whose review was silent waits for a person to notice
+          # -- which is the same dead end as a gate nothing re-runs.
+          #
+          # By FILE NAME, not by display name: `name:` is prose and gets
+          # reworded, and a dispatch that stops resolving is a silence of its
+          # own.
+          if gh workflow run claude-review.yml -f pr="$PR" >/dev/null 2>&1; then
+            echo "asked for one more review of #$PR"
+          else
+            echo "::warning title=Could not ask again::Re-run \`claude review\` for PR #$PR by hand."
+          fi
 
   mention:
     name: respond to @claude
