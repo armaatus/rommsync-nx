@@ -801,6 +801,51 @@ GHSTUB
     echo "PASS: a red build is reported at once, and merge-gate is not mistaken for one"
     ;;
 
+  await_reports_a_conflicted_pr)
+    # #99 sat in await-review.sh for the full 45 minutes while the PR was DIRTY:
+    # something had merged underneath it, and no review can fix a merge conflict.
+    # It then got its review, resolved its threads, and still could not merge,
+    # because the conflict was the blocker the whole time.
+    #
+    # Same shape as the red build above, and reported on the FIRST throttled
+    # check rather than on two consecutive ones: a conflict is not a flake, and
+    # the branch cannot merge until it is rebased whatever else is true. So the
+    # stub keeps every check green -- if this exits, it is mergeStateStatus that
+    # made it exit.
+    make_fixture
+    cp "$REPO_ROOT"/scripts/orca/{await-review.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+    stub="$TMPDIR_FIXTURE/stub-bin"; mkdir -p "$stub"
+    cat >"$stub/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"pr list"*)         printf '[{"number":99}]\n' ;;
+  *statusCheckRollup*) printf '{"statusCheckRollup":[{"name":"host-tests","conclusion":"SUCCESS"}],"mergeStateStatus":"DIRTY"}\n' ;;
+  *"pr view"*)         printf '{"reviews":[]}\n' ;;
+  *"run list"*)        printf '\n' ;;
+  *)                   printf '\n' ;;
+esac
+GHSTUB
+    chmod +x "$stub/gh"
+    ( cd "$TMPDIR_FIXTURE" && git init -q . && git commit -q --allow-empty -m fixture ) 2>/dev/null
+    started=$SECONDS
+    out="$(cd "$TMPDIR_FIXTURE" &&
+           PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$TMPDIR_FIXTURE/fleet" \
+           AWAIT_REVIEW_DEADLINE=12 AWAIT_REVIEW_POLL=1 \
+           bash "$TMPDIR_FIXTURE/scripts/orca/await-review.sh" 99 2>&1)"
+    rc=$?
+    [ "$rc" = 8 ] \
+      || fail "expected exit 8 for a conflicted PR, got $rc; the wait would run its full deadline and then ask for a review that cannot help: $out"
+    [ "$((SECONDS - started))" -lt 5 ] \
+      || fail "took $((SECONDS - started))s to report a conflict; it must go on the first throttled check, not on two consecutive ones: $out"
+    grep -q "DIRTY" <<<"$out" \
+      || fail "did not name the state GitHub reports, so the agent cannot match it to review-status.sh: $out"
+    grep -q -- "--force-with-lease" <<<"$out" \
+      || fail "told the agent to rebase without saying how to push the rewritten branch: $out"
+    grep -q "record-review.sh" <<<"$out" \
+      || fail "a rebase changes every sha and the review marker is per-commit; the push will be refused without a new one: $out"
+    echo "PASS: a conflicted PR is reported at once, with the rebase it needs"
+    ;;
+
   fleet_notices_a_stalled_agent)
     # The other half of this PR, which shipped untested and should not have.
     # An agent in `waiting` is at a prompt, not working -- the board still reads
@@ -1338,6 +1383,7 @@ PYCHECK
     echo "       watch_needs_issue|watch_late_draft|watch_grace|watch_submits|watch_single" >&2
     echo "       watch_bare_url|watch_full_draft_untouched|cli_broken" >&2
     echo "       await_reports_failed_review|await_reports_a_red_build" >&2
+    echo "       await_reports_a_conflicted_pr" >&2
     echo "       await_finds_the_failed_run_under_newer_skipped_ones" >&2
     echo "       await_throttles_the_lookup_when_the_run_is_never_found" >&2
     echo "       fleet_notices_a_stalled_agent" >&2
