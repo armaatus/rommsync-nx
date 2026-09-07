@@ -251,6 +251,22 @@ what to do instead — for the conflict that is a rebase, a fresh
 `record-review.sh` (the marker is per-commit, and a rebase changes every sha),
 and `git push --force-with-lease`.
 
+What it waits *for* is not "any review record": it imports
+[`merge_gate.py`](../.github/scripts/merge_gate.py) and asks the gate, exactly as
+`review-status.sh` does. A review counts when it is not by the PR's own author,
+is on the head GitHub currently has, and carries a body worth reading or at least
+one inline comment. That matters because replying to a review thread submits a
+`COMMENTED` review attributed to the replier — so an agent answering findings
+used to be handed its own empty reply back as "the review", spend one of its
+three rounds on it, and then watch `merge-gate` refuse the PR for the reason the
+wait had just called satisfied ([#114](https://github.com/armaatus/rommsync-nx/issues/114)).
+
+It also hands a given review back exactly once. A round can begin on an unchanged
+head — `claude-review.yml` fires on `review_requested` as well as on
+`synchronize` — so the wait remembers the newest review it reported, in
+`.orca/review-rounds` beside the round count, and waits for a *newer* one rather
+than spending a second round on findings already in hand.
+
 Then it fixes what is real, replies with a reason where it disagrees, resolves
 every thread, pushes, re-requests review, and checks:
 
@@ -468,7 +484,8 @@ does. Sweep anything left behind with `./scripts/orca/reap.sh --yes`.
 | Worktree provisioned, agent idle, nothing in the composer | Orca drafts the issue prompt instead of sending it | `./scripts/orca/agent-autostart.sh` — `setup.sh` starts the `--watch` form |
 | Every hook says "this worktree has no linked issue" | the `orca` CLI on `PATH` cannot find `Orca.app` | nothing — the hooks probe it and fall back. If it persists: `sudo chmod -h 755 /usr/local/bin/orca` |
 | `git push` refused, "nothing leaves one of those unreviewed" | the local review is not recorded for this commit | run both passes, then `./scripts/orca/record-review.sh` |
-| `await-review.sh` times out | the review job never ran | `gh run list`; check `CLAUDE_CODE_OAUTH_TOKEN` is a repo secret |
+| `await-review.sh` times out | the review job never ran. Any other reason the wait had — records the gate discounts, a review already handed back, an unpushed worktree — it printed the moment it found it | `gh run list`; check `CLAUDE_CODE_OAUTH_TOKEN` is a repo secret |
+| `await-review.sh` exits 2, naming `merge_gate.py` | that file is what decides which reviews count, and it does not import | fix the syntax or the missing name; nothing in the loop can answer until it does |
 | `await-review.sh` exits 8, "GitHub says DIRTY" | something merged underneath the branch | rebase, re-run `record-review.sh`, `git push --force-with-lease` |
 | `merge-gate` red on a PR that looks fine | usually the body is missing a review section, or the review predates the last push | read the check's output; it says which of the five |
 | A PR sits queued and never merges | a required check never reported | `gh pr checks <n>` |
