@@ -13,8 +13,9 @@
 #
 # Exit codes, so the caller can tell the cases apart:
 #   0  a review is in hand
-#   2  could not tell -- no PR to wait on, or gh could not say what repository
-#      this is, which leaves nothing here able to ask about the reviews
+#   2  could not tell -- no PR to wait on; or gh could not say what repository
+#      this is; or .github/scripts/merge_gate.py, which decides which reviews
+#      count, does not import. Each leaves nothing here able to answer.
 #   3  the fleet was stopped while waiting
 #   4  nothing arrived before the deadline -- look at Actions
 #   5  the third round is over; stop and say what is unresolved
