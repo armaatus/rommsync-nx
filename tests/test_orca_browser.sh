@@ -321,10 +321,12 @@ GHSTUB
 run_fleet_fn() {
   local fn="$1"; shift
   local src
-  # The `ISSUE_REFS=` line comes out of fleet.sh too, rather than being written
-  # here: it is how the snippets find issue_refs at all, and a wrong path in it
-  # would otherwise stay green through every phase below.
-  src="$(sed -n '/^ISSUE_REFS=/p; /^has_open_pr()/,/^}/p; /^in_flight()/,/^}/p;
+  # The `ISSUE_REFS=` and `HUMAN_STEP_LABEL=` lines come out of fleet.sh too,
+  # rather than being written here: the first is how the snippets find
+  # issue_refs at all, the second is what ready_issues filters on, and a wrong
+  # value in either would otherwise stay green through every phase below.
+  src="$(sed -n '/^ISSUE_REFS=/p; /^HUMAN_STEP_LABEL=/p;
+                 /^has_open_pr()/,/^}/p; /^in_flight()/,/^}/p;
                  /^ready_issues()/,/^}/p; /^issue_is_done()/,/^}/p;
                  /^count_startable()/,/^}/p' \
          "$TMPDIR_FIXTURE/scripts/orca/fleet.sh")"

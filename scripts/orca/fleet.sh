@@ -164,7 +164,8 @@ owned_path()   { cat "$OWNED_DIR/$1" 2>/dev/null; }
 # nothing else removed -- one small file leaked per issue that ever stalled.
 disown_issue() {
   rm -f "$OWNED_DIR/$1" "$STARTED_DIR/$1" "$STATE_DIR/stalled-$1" \
-        "$STATE_DIR/unreachable-$1"
+        "$STATE_DIR/labels-unknown-$1" "$STATE_DIR/unreachable-$1" \
+        "$STATE_DIR/human-step-$1"
 }
 
 # Non-zero when the answer could not be read, which is NOT the same as "nothing
@@ -273,8 +274,9 @@ in_flight() {
 
 # $1 is a comma-separated label list, $2 one label. Exact matches only: `ready`
 # must not answer for `ready-ish`, and `foundation` must not answer for
-# `foundational`.
-has_label() { printf '%s' "$1" | tr ',' '\n' | grep -qx "$2"; }
+# `foundational`. -F and -- keep that true for a label carrying a regex
+# metacharacter or a leading dash, both of which the env overrides above allow.
+has_label() { printf '%s' "$1" | tr ',' '\n' | grep -qxF -- "$2"; }
 is_foundation() { has_label "$1" "$FOUNDATION_LABEL"; }
 
 # Is this issue's last step a person's? 0 = yes, 1 = no, 2 = could not tell.
@@ -501,7 +503,7 @@ reap_merged() {
 # what changes is which signal they are. A stall means something is wrong; this
 # one means the work is done as far as an agent may take it.
 notice_stalled() {
-  local f num path state listing
+  local f num path state listing rc
   # ONE listing per poll, matched against every owned worktree -- not one CLI
   # round-trip per worktree, which is three 30-second-deadline calls a minute
   # for an answer that arrives in a single response.
@@ -520,15 +522,29 @@ try:
 except Exception:
     pass
 " "$path" 2>/dev/null)"
-    [ "$state" = "waiting" ] || { rm -f "$STATE_DIR/stalled-$num"; continue; }
-    # Once per stall, not once per poll.
+    [ "$state" = "waiting" ] || {
+      rm -f "$STATE_DIR/stalled-$num" "$STATE_DIR/labels-unknown-$num"; continue; }
+    # Once per stall, not once per poll -- and checked before the lookup, so a
+    # settled stall costs no `gh` call at all.
     [ -e "$STATE_DIR/stalled-$num" ] && continue
+    # The third answer, and it must not be frozen behind the stall marker: a
+    # single `gh` blip would otherwise record a #142-style false stall and never
+    # re-evaluate it, which is the exact noise this change exists to remove.
+    # `labels-unknown-` throttles it instead -- one marker for "this issue's
+    # labels could not be read", shared by the two branches below and by list
+    # mode, and cleared by whichever of them gets a real answer first. It is NOT
+    # `unreachable-`: that one means the PR lookup failed, and a marker standing
+    # for two different outages silently swallows the second one.
+    issue_needs_human_step "$num"; rc=$?
+    if [ "$rc" = 2 ]; then
+      [ -e "$STATE_DIR/labels-unknown-$num" ] && continue
+      : >"$STATE_DIR/labels-unknown-$num"
+      say "#$num is waiting for input, and its labels could not be read -- asking again next poll"
+      continue
+    fi
+    rm -f "$STATE_DIR/labels-unknown-$num"
     : >"$STATE_DIR/stalled-$num"
-    # "Could not tell" reads as an ordinary stall here, which is the direction
-    # that costs a line of noise rather than a silence on a genuinely stuck
-    # worktree. Nothing is stopped on this answer -- the time-box below is the
-    # one that acts, and it does not accept "could not tell".
-    if issue_needs_human_step "$num"; then
+    if [ "$rc" = 0 ]; then
       say "#$num is waiting for you, as expected -- its last step is yours to take"
       card "$path" --comment "#$num: waiting for you -- as expected, not a stall"
       notify "#$num is waiting for you" "Its last step is yours to take."
@@ -560,7 +576,8 @@ enforce_timebox() {
     # that failed is no basis for either. The started marker stays, so the next
     # pass asks again -- an agent is only ever stopped on an answer.
     has_open_pr "$num"; case $? in
-      0) rm -f "$f" "$STATE_DIR/unreachable-$num"; continue ;;
+      0) rm -f "$f" "$STATE_DIR/unreachable-$num" "$STATE_DIR/human-step-$num"
+         continue ;;
       # Once per outage, not once per poll, the same way notice_stalled does it:
       # the dispatcher polls every POLL_SECONDS, and an hour of GitHub being
       # unreachable would otherwise bury the log a person scans overnight under
@@ -574,17 +591,29 @@ enforce_timebox() {
     # overrun: the box exists to stop work that will not get green, and a
     # decision only the maintainer can make is not that. #44 -- hardware, which
     # hard rule 1 forbids before the v1 gate -- was stopped at three hours for
-    # correctly producing nothing. Dropping the started marker is the exemption:
-    # it disarms the timer for good rather than re-asking GitHub every poll.
+    # correctly producing nothing.
+    #
+    # The started marker is KEPT. Deleting it would disarm the box for good, and
+    # the label is exactly the thing a person takes off again to hand the issue
+    # back to an agent -- which would then run uncapped forever. Said once, by
+    # its own marker, rather than once a minute for as long as the label is on.
     issue_needs_human_step "$num"; case $? in
-      0) say "#$num: past the time-box, but it is labelled $HUMAN_STEP_LABEL -- leaving it to wait for you"
-         rm -f "$f" "$STATE_DIR/unreachable-$num"; continue ;;
-      2) [ -e "$STATE_DIR/unreachable-$num" ] && continue
-         : >"$STATE_DIR/unreachable-$num"
+      0) rm -f "$STATE_DIR/labels-unknown-$num"
+         [ -e "$STATE_DIR/human-step-$num" ] && continue
+         : >"$STATE_DIR/human-step-$num"
+         say "#$num: past the time-box, but it is labelled $HUMAN_STEP_LABEL -- leaving it to wait for you"
+         # On the board too. An agent that finished its part and exited is not
+         # `waiting`, so notice_stalled never speaks for it, and this worktree
+         # keeps a slot until a person looks at it -- one line in fleet.log is
+         # not where WORKFLOW.md says status lives.
+         card "$path" --comment "#$num: waiting for you -- as expected, past the time-box"
+         continue ;;
+      2) [ -e "$STATE_DIR/labels-unknown-$num" ] && continue
+         : >"$STATE_DIR/labels-unknown-$num"
          say "#$num: timed out, but could not read its labels -- leaving it for the next pass"
          continue ;;
     esac
-    rm -f "$STATE_DIR/unreachable-$num"
+    rm -f "$STATE_DIR/labels-unknown-$num" "$STATE_DIR/human-step-$num"
 
     say "#$num: $((TIMEBOX_SECONDS / 3600))h with no PR -- stopping it and leaving the worktree for you"
     agent="$(agent_terminal_in "$path")"
@@ -769,15 +798,29 @@ cmd_run() {
             say "#$n has landed"
             continue
           fi
-          # Named on the command line or picked from the queue, the fleet cannot
-          # finish it either way. Dropped rather than skipped: an issue kept in
-          # `wanted` that can never be launched is a run loop that never ends.
-          if issue_needs_human_step "$n"; then
-            say "#$n is labelled $HUMAN_STEP_LABEL -- it is yours to take; remove the label to hand it to an agent"
-            continue
-          fi
           in_flight "$n"; rc=$?
-          if [ -z "$picked" ] && [ "$rc" = 1 ]; then picked="$n"; fi
+          if [ -z "$picked" ] && [ "$rc" = 1 ]; then
+            # Asked only of the one issue this pass would actually launch, not
+            # of every issue in the list: count_startable exists because a `gh`
+            # call per queued issue per poll is how you meet the secondary rate
+            # limit. Named on the command line or picked from the queue, the
+            # fleet cannot finish this one either way -- so it is DROPPED rather
+            # than skipped, because an issue kept in `wanted` that can never be
+            # launched is a run loop that never ends. "Could not tell" keeps it,
+            # since opening a worktree for work no agent may finish is the
+            # expensive direction and the next pass asks again.
+            issue_needs_human_step "$n"; case $? in
+              0) say "#$n is labelled $HUMAN_STEP_LABEL -- it is yours to take; remove the label to hand it to an agent"
+                 continue ;;
+              2) if [ ! -e "$STATE_DIR/labels-unknown-$n" ]; then
+                   : >"$STATE_DIR/labels-unknown-$n"
+                   say "#$n: could not read its labels -- not starting it this pass"
+                 fi
+                 remaining+=("$n"); continue ;;
+            esac
+            rm -f "$STATE_DIR/labels-unknown-$n"
+            picked="$n"
+          fi
           remaining+=("$n")
         done
         wanted=("${remaining[@]+"${remaining[@]}"}")

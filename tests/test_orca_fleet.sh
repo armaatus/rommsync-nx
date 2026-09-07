@@ -32,14 +32,27 @@
 #                                     keeps meaning something.
 #   test_orca_fleet.sh timebox_waits  past the box, no PR, labelled -> NOT
 #                                     interrupted, no "gave up" comment on the
-#                                     issue, and the timer is dropped so the
-#                                     next poll does not ask GitHub again.
+#                                     issue, said once rather than once a
+#                                     minute, and on the board rather than only
+#                                     in the log.
 #   test_orca_fleet.sh timebox_stops  past the box, no PR, unlabelled -> still
 #                                     interrupted and still commented on.
 #   test_orca_fleet.sh queue_skips    a labelled issue is not startable: the
 #                                     dispatcher must not open a worktree for
 #                                     work no agent may finish, or it opens one
 #                                     per cycle forever (#148).
+#   test_orca_fleet.sh list_declines  ...and `fleet.sh run 148` declines it too,
+#                                     dropping it rather than skipping it: an
+#                                     issue kept in `wanted` that can never be
+#                                     launched is a run loop that never ends.
+#   test_orca_fleet.sh timebox_rearms the label comes off -> the box fires. The
+#                                     exemption keeps the started marker for
+#                                     exactly this: deleting it would leave a
+#                                     handed-back agent running uncapped.
+#   test_orca_fleet.sh labels_unknown the label lookup FAILS -> the agent is not
+#                                     stopped and the stall is not decided.
+#                                     Every lookup here has a third answer, and
+#                                     an agent is only ever stopped on an answer.
 #
 # The Orca CLI and gh are stubbed on PATH; the fleet state dir is a temp dir.
 # Nothing here touches a real worktree, docker, or GitHub.
@@ -73,6 +86,10 @@ esac
 # Matched on the pair, because `list` alone is both `worktree list` and
 # `terminal list` and the dispatcher asks for both.
 case "$1 ${2:-}" in
+  "worktree list")   cat "$ORCA_WORKTREES"; exit 0 ;;
+  # A create that SUCCEEDS, so the negative case terminates on --max-prs rather
+  # than looping on "leaving it in the queue to try again".
+  "worktree create") echo "{\"result\":{\"worktree\":{\"path\":\"$WORK_FOR_STUB/created\"}}}"; exit 0 ;;
   "worktree ps")   cat "$ORCA_PS"; exit 0 ;;
   "terminal list") cat "$ORCA_TERMINALS"; exit 0 ;;
   "terminal send") echo '{"ok":true}'; exit 0 ;;
@@ -111,12 +128,21 @@ case "$*" in
   *"pr list"*)        cat "$GH_PRS"; exit 0 ;;
   *"issue list"*)     cat "$GH_ISSUES"; exit 0 ;;
   # gh applies --jq itself, so the stub answers what the filter would produce.
-  *"issue view"*"--json labels"*) cat "$GH_LABELS"; exit 0 ;;
+  # The literal FAIL stands for a gh that could not answer at all -- the third
+  # answer the dispatcher is built around.
+  *"issue view"*"--json labels"*)
+    [ "$(cat "$GH_LABELS")" = FAIL ] && { echo "gh: could not connect" >&2; exit 1; }
+    cat "$GH_LABELS"; exit 0 ;;
+  *"issue view"*"--json state"*) echo OPEN; exit 0 ;;
   *"issue comment"*)  exit 0 ;;
 esac
 echo ""
 STUB
   chmod +x "$WORK/bin/gh"
+
+  # cmd_run ends in notify(); a test suite must not put banners on the screen.
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$WORK/bin/osascript"
+  chmod +x "$WORK/bin/osascript"
 
   ORCA_CALLS="$WORK/calls"; : >"$ORCA_CALLS"
   ORCA_MODE="$WORK/mode"; printf '%s' "${1:-ok}" >"$ORCA_MODE"
@@ -124,11 +150,17 @@ STUB
   # The defaults are the quiet answers: no agent running, no terminal, no open
   # PR, no labels. Each test overrides only the one it is about.
   ORCA_PS="$WORK/ps";               echo '{"result":{"worktrees":[]}}' >"$ORCA_PS"
+  ORCA_WORKTREES="$WORK/wtlist";    echo '{"result":{"worktrees":[]}}' >"$ORCA_WORKTREES"
   ORCA_TERMINALS="$WORK/terminals"; echo '{"result":{"terminals":[]}}' >"$ORCA_TERMINALS"
   GH_PRS="$WORK/prs";               echo '[]' >"$GH_PRS"
   GH_ISSUES="$WORK/issues";         echo '[]' >"$GH_ISSUES"
   GH_LABELS="$WORK/labels";         : >"$GH_LABELS"
-  export ORCA_CALLS ORCA_MODE GH_CALLS ORCA_PS ORCA_TERMINALS GH_PRS GH_ISSUES GH_LABELS
+  WORK_FOR_STUB="$WORK"; mkdir -p "$WORK/created"
+  export ORCA_CALLS ORCA_MODE GH_CALLS ORCA_PS ORCA_WORKTREES ORCA_TERMINALS \
+         GH_PRS GH_ISSUES GH_LABELS WORK_FOR_STUB
+  # cmd_run sleeps between passes; a test that reached one would otherwise sit
+  # for a minute before failing.
+  export ROMMSYNC_FLEET_POLL=1
   export ORCA_CLI_COMMAND="$WORK/bin/orca-stub"
   export ROMMSYNC_FLEET_DIR="$WORK/fleet"
   PATH="$WORK/bin:$PATH"
@@ -246,10 +278,16 @@ case "${1:-}" in
       && fail "the time-box interrupted an agent that was correctly waiting: $out"
     grep -q "issue comment" "$GH_CALLS" \
       && fail "it told the issue the fleet gave up on work that is waiting on a person"
-    [ -e "$ROMMSYNC_FLEET_DIR/started/42" ] \
-      && fail "the timer is still armed, so every poll re-asks GitHub for the same answer"
     grep -q "needs-human-step" <<<"$out" \
       || fail "the log does not say why it was left alone: $out"
+    grep -q "waiting for you" "$ORCA_CALLS" \
+      || fail "nothing reached the board, and one line in fleet.log is not the status surface"
+    [ -e "$ROMMSYNC_FLEET_DIR/started/42" ] \
+      || fail "the timer was disarmed for good, so removing the label leaves the agent uncapped"
+    # Once per exemption, not once per poll: the dispatcher polls every minute.
+    again="$(in_fleet enforce_timebox 2>&1)"
+    grep -q "needs-human-step" <<<"$again" \
+      && fail "it says so again every poll: $again"
     echo "ok: the time-box exempts an issue whose last step is yours"
     ;;
   timebox_stops)
@@ -278,7 +316,59 @@ JSON
       && fail "an issue no agent may close is still startable, so the fleet opens a worktree per cycle for it: $out"
     echo "ok: an issue whose last step is yours is not startable"
     ;;
+  list_declines)
+    make_fixture ok
+    issue_labels "ready,needs-human-step"
+    # `fleet.sh run 148` with nothing owned and nothing live: one pass, then it
+    # runs out of queue. If the decline leaked into `wanted` instead of dropping
+    # the issue, this would never return.
+    # --max-prs 1 bounds it either way: if the decline ever stops working, the
+    # run opens its one worktree and stops, and the assertion below fires --
+    # rather than the test hanging, which is a much worse way to fail.
+    out="$(in_fleet cmd_run --max-prs 1 148 2>&1)"
+    grep -q "is labelled needs-human-step" <<<"$out" \
+      || fail "an explicitly named issue whose last step is yours was not declined: $out"
+    grep -q "worktree create" "$ORCA_CALLS" \
+      && fail "it opened a worktree for work no agent may finish: $(cat "$ORCA_CALLS")"
+    grep -q "fleet down" <<<"$out" \
+      || fail "the run never terminated, so the declined issue stayed in the queue: $out"
+    echo "ok: an explicitly named issue whose last step is yours is declined and dropped"
+    ;;
+  timebox_rearms)
+    make_fixture ok
+    make_worktree
+    make_overdue
+    agent_state waiting
+    issue_labels "ready,needs-human-step"
+    in_fleet enforce_timebox >/dev/null 2>&1
+    # The maintainer takes the label off to hand the worktree back to an agent.
+    issue_labels "ready"
+    out="$(in_fleet enforce_timebox 2>&1)"
+    grep -q -- "--interrupt" "$ORCA_CALLS" \
+      || fail "the box stayed disarmed after the label came off, so the agent runs uncapped: $out"
+    echo "ok: removing the label re-arms the time-box"
+    ;;
+  labels_unknown)
+    make_fixture ok
+    make_worktree
+    make_overdue
+    agent_state waiting
+    issue_labels FAIL
+    out="$(in_fleet enforce_timebox 2>&1)"
+    grep -q -- "--interrupt" "$ORCA_CALLS" \
+      && fail "an agent was stopped on a lookup that failed, not on an answer: $out"
+    [ -e "$ROMMSYNC_FLEET_DIR/started/42" ] \
+      || fail "the timer was disarmed by a failed lookup, so the box never fires again"
+    grep -q "could not read its labels" <<<"$out" \
+      || fail "the outage was not reported: $out"
+    out="$(in_fleet notice_stalled 2>&1)"
+    grep -q "nothing should be asking" <<<"$out" \
+      && fail "a failed lookup was frozen as a stall, which is the noise this change removes: $out"
+    [ -e "$ROMMSYNC_FLEET_DIR/stalled-42" ] \
+      && fail "the once-per-stall marker was written on a non-answer, so it is never re-evaluated"
+    echo "ok: a label lookup that failed stops nothing and decides nothing"
+    ;;
   *)
-    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips" >&2
+    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown" >&2
     exit 2 ;;
 esac

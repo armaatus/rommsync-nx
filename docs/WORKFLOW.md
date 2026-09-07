@@ -163,10 +163,12 @@ Label it **`needs-human-step`**. `fleet.sh` then does three things with it:
 - it is **exempt from the time-box**. This is the half that matters: #44 was
   interrupted at three hours for correctly producing nothing.
 
-The label is a claim about the *last* step, not the whole issue. An issue with
-real agent work in front of that step is worked normally, by a PR that carries no
-closing line; the label goes on when the preparation lands, so the maintainer's
-step is the only one left.
+The label is a claim about the *last* step, not the whole issue — and where there
+is real agent work in front of that step, it belongs in **its own issue with its
+own `Closes` line**, because `merge-gate` refuses a PR that closes nothing. That
+is what #142 and #148 are: #142 prepared the release and closed on PR #146; #148
+*is* the release and only the maintainer can close it. An issue split that way
+can carry `needs-human-step` from the moment it is filed.
 
 ### Stage 3 — Build, in the worktree
 
