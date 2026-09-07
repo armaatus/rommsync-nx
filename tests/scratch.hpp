@@ -210,30 +210,40 @@ inline void Sweep(const std::filesystem::path& root, const std::filesystem::path
 /// this process is about to write into is no longer the one that was kept --
 /// which is what makes "a partial file left from an earlier run" mean an earlier
 /// run of *this* process.
+///
+/// If that leaf cannot be removed, this process **stops**, with `exit(2)` and the
+/// reason. There is nothing else honest to do: a binary that could not get a
+/// scratch directory of its own cannot produce a result anyone should read, and
+/// carrying on means running the assertions against another run's leftovers.
+/// 2 is what the test mains already return for a setup they cannot complete.
 inline const std::string& Dir() {
   static const std::string dir = [] {
     const std::filesystem::path root = Root();
     const std::filesystem::path mine = root / LeafName(static_cast<long long>(::getpid()));
 
-    // An `error_code` each, because the next call clears the last one's. A
-    // `remove_all` that failed and then a `create_directories` that returned
-    // false for "it is already there" would otherwise report success, and this
-    // process would ADOPT a dead run's leaf -- the one case in which a `.part`
-    // from another run can still be sitting in a fresh scratch directory.
     std::error_code made_root;
     std::filesystem::create_directories(root, made_root);
     Sweep(root, mine);
 
+    // An `error_code` each, because the next call clears the last one's -- and
+    // the failure is acted on rather than only announced. A `remove_all` that
+    // failed, followed by a `create_directories` that returns cleanly for "it is
+    // already there", is how this process would ADOPT a dead run's leaf: the one
+    // case in which a `.part` from another run can still be sitting in what a
+    // scenario believes is a fresh scratch directory.
     std::error_code removed;
     std::filesystem::remove_all(mine, removed);
     if (removed) {
       std::cerr << "could not clear " << mine.string() << ": " << removed.message()
-                << "\n  it belonged to a run that is over; remove it by hand\n";
+                << "\n  it belongs to a run that is over, and this one will not write"
+                   " into it\n  remove it by hand and run again\n";
+      std::exit(2);
     }
     std::error_code made;
     std::filesystem::create_directories(mine, made);
     if (made) {
       std::cerr << "could not create " << mine.string() << ": " << made.message() << "\n";
+      std::exit(2);
     }
 
     static const detail::Leaf leaf(mine);
