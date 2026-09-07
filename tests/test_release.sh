@@ -318,11 +318,17 @@ phase_notes() {
   # The changes. This repo has no tags yet, so the fallback -- the whole history
   # -- is what runs here, and it must not come out empty either way.
   grep -qi 'change' "$body" || fail "the notes have no changes section"
+  # The newest commit the notes are *supposed* to list, which is not always the
+  # one at HEAD: `release-notes.sh` passes `--no-merges` on purpose (a
+  # squash-merge repo has no merge worth listing), so `--no-merges` here too.
+  # Without it this phase went red on any branch that had merged `main` back in
+  # -- an ordinary thing to do when a PR falls behind -- by demanding the notes
+  # carry the one subject the generator is documented to leave out.
   local head_subject
-  head_subject="$(git -C "$REPO_ROOT" log -1 --pretty=format:%s 2>/dev/null)"
+  head_subject="$(git -C "$REPO_ROOT" log -1 --no-merges --pretty=format:%s 2>/dev/null)"
   if [ -n "$head_subject" ]; then
     grep -qF "$head_subject" "$body" ||
-      fail "the notes do not list the commit at HEAD ($head_subject)"
+      fail "the notes do not list the newest non-merge commit ($head_subject)"
   fi
 
   echo "ok: the notes name the archive, the guide, the target and the checksums"
