@@ -1243,8 +1243,11 @@ endforeach()
 # proxy's #109 fix reverted -- cannot settle anything here, and that needs no
 # experiment to see: neither this test nor execute.occupied ever arms a `stall`,
 # so the replayed-request path #109 fixed is not on either side of the
-# comparison. It was run both ways regardless (196 repetitions unfixed, 293
-# fixed) and failed once in each, which is the same rate twice.
+# comparison. It was run both ways regardless -- 196 repetitions unfixed and 293
+# fixed, one failure in each -- and those two numbers are consistent with each
+# other and with no difference at all. They are not evidence OF no difference:
+# one failure per arm cannot measure a rate, which is this issue's own complaint
+# turned on its own experiment. The argument above is what carries the point.
 #
 # So this is still a QUARANTINE, not a fix: retry it rather than leave `main` red
 # on a race nobody has explained. It is deliberately narrow -- one test, named,

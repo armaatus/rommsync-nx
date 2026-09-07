@@ -102,44 +102,22 @@ const sync::SyncOperation* Classified(rig::Checks& checks, const std::string& bo
 using harness::PassASecond;
 using harness::SavePath;
 
-/// Swallow `std::cerr` for the duration of a scope.
+/// Take `std::cerr` over for the duration of a scope, and keep what it caught.
 ///
 /// Only for the handful of assertions below that *expect* a failure -- proving
 /// the sandbox audit and the fault-proxy arm check are load-bearing means making
 /// them fire, and `checks::Checks` reports a failure by printing one. Without
 /// this a green run prints FAIL lines and reads like a broken test.
-class Quiet {
- public:
-  Quiet() : previous_(std::cerr.rdbuf(&sink_)) {}
-  ~Quiet() { std::cerr.rdbuf(previous_); }
-
-  Quiet(const Quiet&) = delete;
-  Quiet& operator=(const Quiet&) = delete;
-
- private:
-  /// Discards everything written to it. A null buffer would set badbit instead,
-  /// which some standard libraries then report on their own.
-  class Sink : public std::streambuf {
-   protected:
-    int overflow(int character) override { return character; }
-  };
-
-  Sink sink_;
-  std::streambuf* previous_;
-};
-
-/// `Quiet`, but it keeps what it swallowed.
 ///
-/// For the assertions that are about the *wording* of a failure rather than the
-/// fact of one. `harness.md5_diagnosis` is the only scenario that needs it, and
-/// it needs it because the wording is the whole defect it guards.
-class Captured {
+/// `harness.md5_diagnosis` is the one scenario that reads `text()` back, because
+/// what it guards is the *wording* of a failure rather than the fact of one.
+class CapturedCerr {
  public:
-  Captured() : previous_(std::cerr.rdbuf(sink_.rdbuf())) {}
-  ~Captured() { std::cerr.rdbuf(previous_); }
+  CapturedCerr() : previous_(std::cerr.rdbuf(sink_.rdbuf())) {}
+  ~CapturedCerr() { std::cerr.rdbuf(previous_); }
 
-  Captured(const Captured&) = delete;
-  Captured& operator=(const Captured&) = delete;
+  CapturedCerr(const CapturedCerr&) = delete;
+  CapturedCerr& operator=(const CapturedCerr&) = delete;
 
   std::string text() const { return sink_.str(); }
 
@@ -147,6 +125,9 @@ class Captured {
   std::ostringstream sink_;
   std::streambuf* previous_;
 };
+
+/// The name the scenarios that only want the silence have always used.
+using Quiet = CapturedCerr;
 
 // --- sandbox ------------------------------------------------------------------
 //
@@ -388,10 +369,11 @@ void Conflict(rig::Checks& checks, http::HttpClient& client, const std::string& 
   // And so did this device's, to different bytes.
   sandbox.Write(SavePath(name), "device v2\n");
   std::string device_hash;
-  checks.Expect(
-      harness::ServerMd5(checks, client, base, fixture, rom.id, sandbox.Host(SavePath(name)),
-                         &device_hash),
-      "the device copy's MD5");
+  if (!harness::ServerMd5(checks, client, base, fixture, rom.id, sandbox.Host(SavePath(name)),
+                          &device_hash)) {
+    harness::DeleteSave(client, base, fixture, server.id);
+    return;
+  }
 
   sync::SyncNegotiatePayload payload;
   payload.device_id = fixture.device_id;
@@ -483,10 +465,11 @@ void SameTimestamp(rig::Checks& checks, http::HttpClient& client, const std::str
 
   sandbox.Write(SavePath(name), "device copy\n");
   std::string device_hash;
-  checks.Expect(
-      harness::ServerMd5(checks, client, base, fixture, rom.id, sandbox.Host(SavePath(name)),
-                         &device_hash),
-      "the device copy's MD5");
+  if (!harness::ServerMd5(checks, client, base, fixture, rom.id, sandbox.Host(SavePath(name)),
+                          &device_hash)) {
+    harness::DeleteSave(client, base, fixture, server.id);
+    return;
+  }
   checks.Expect(device_hash != server.content_hash, "the two copies really are different bytes");
 
   sync::SyncNegotiatePayload payload;
@@ -559,9 +542,10 @@ void Partial(rig::Checks& checks, http::HttpClient& client, const std::string& b
     sandbox.Write(SavePath(entry.name), bytes);
 
     std::string hash;
-    checks.Expect(harness::ServerMd5(checks, client, base, fixture, rom.id,
-                                     sandbox.Host(SavePath(entry.name)), &hash),
-                  "the MD5 of " + entry.name);
+    if (!harness::ServerMd5(checks, client, base, fixture, rom.id,
+                            sandbox.Host(SavePath(entry.name)), &hash)) {
+      return;
+    }
     payload.saves.push_back(harness::LocalSave(
         rom.id, entry.name, entry.slot, "harness", hash,
         std::chrono::system_clock::now() + std::chrono::seconds{300},
@@ -1339,7 +1323,6 @@ void ContentHash(rig::Checks& checks, http::HttpClient& client, const std::strin
 
   std::string server_digest;
   if (!harness::ServerMd5(checks, client, base, fixture, rom.id, path, &server_digest)) {
-    checks.Expect(false, "RomM computed a digest for the uploaded save");
     return;
   }
 
@@ -1398,7 +1381,7 @@ void ContentHash(rig::Checks& checks, http::HttpClient& client, const std::strin
 // All the failure said was `FAIL: the MD5 of partial-2.srm`. That one line is
 // true of two entirely different events -- an upload that never landed, and an
 // upload that landed on a row RomM handed back with no `content_hash` on it --
-// and telling them apart cost a 250-repetition run. It is the same complaint
+// and telling them apart cost 489 repetitions. It is the same complaint
 // `Partial` records above about `Session is already CANCELLED`: an assertion
 // that cannot say what it saw sends the next person back to CI to guess.
 //
@@ -1424,7 +1407,7 @@ void Md5Diagnosis(rig::Checks& checks, http::HttpClient& client, const std::stri
                            R"({"mode":"status","status":200,"path":"/api/saves","count":1,)"
                            R"("body":"{\"id\":424242,\"file_name\":\"harness-md5.srm\",)"
                            R"(\"content_hash\":\"\",\"file_size_bytes\":13}"})");
-      Captured captured;
+      CapturedCerr captured;
       answered = harness::ServerMd5(reported, client, base, fixture, rom.id, path, &digest);
       text = captured.text();
     }
@@ -1446,14 +1429,14 @@ void Md5Diagnosis(rig::Checks& checks, http::HttpClient& client, const std::stri
     {
       harness::Fault fault(checks, client, base,
                            R"({"mode":"status","status":500,"path":"/api/saves","count":1})");
-      Captured captured;
+      CapturedCerr captured;
       answered = harness::ServerMd5(reported, client, base, fixture, rom.id, path, &digest);
       text = captured.text();
     }
     checks.Expect(!answered, "an upload that failed is not an answer either");
     checks.ExpectEq(reported.failures(), 1, "and that is one failure, not two");
-    checks.Expect(text.find("could not upload") != std::string::npos,
-                  "the message says the upload is what failed -- " + text);
+    checks.Expect(text.find("HTTP 500") != std::string::npos,
+                  "the message carries what RomM actually answered -- " + text);
   }
 }
 

@@ -366,7 +366,9 @@ ctest --test-dir build --output-on-failure
 - `harness.content_hash` is the half of M2-3 no vector suite can check: the
   digest `state::HashFile` computes for a save on the card is compared against
   the one **RomM itself** computed for the same bytes (`harness::ServerMd5`
-  uploads them under a throwaway slot and deletes it again). A SHA1 or an
+  uploads them under a throwaway slot and deletes it again — and reports its own
+  failure, so a caller checks the bool and gives up rather than asserting a
+  second time over the top). A SHA1 or an
   uppercase hexdigest is accepted by the server without complaint and matches
   nothing, so the only symptom is a library that re-uploads every tick. The
   scenario also runs the digest through `sync::Validate` and a `state.db` round
@@ -491,8 +493,15 @@ ctest --test-dir build --output-on-failure
   `multifile` (the two-disc fixture: the zip with
   no length, the rom digest that is neither disc's, the unscoped `/files/content/`
   id, the `?file_ids=` route a v2 would take, and the nested single-file rom the
-  skip must not fire on), `backup`, and `content_hash` (M2-3's digest, checked
-  against the one the server computed).
+  skip must not fire on), `backup`, `content_hash` (M2-3's digest, checked
+  against the one the server computed) and `md5_diagnosis` (what
+  `harness::ServerMd5` *says* when it cannot get that digest).
+- `harness.md5_diagnosis` is about that oracle's failure *message*, because
+  `ServerMd5` fails intermittently — about one call in 250 (#155) — and used to
+  report an upload that never landed and a row RomM answered with an empty
+  `content_hash` in the same words. #119 spent 489 repetitions telling those
+  apart. The scenario forces both through the fault proxy, one of them with a
+  synthesised `mode: status` body, and asserts on the wording.
 - Two of them are about the harness rather than the engine, and they are the
   ones that keep the rest honest. `harness.sandbox` needs no server and never
   skips: it covers the per-test SD card (`tests/harness.hpp`), which maps the

@@ -8,13 +8,18 @@ drops a connection half way through a ``Range`` download -- and those are exactl
 the paths where a save file gets corrupted.
 
 This proxy closes that gap without giving up fidelity. It forwards every request
-to the real RomM untouched, and only when a scenario is armed does it damage one
-specific thing about a genuine response. It never synthesises a RomM response of
-its own, so it cannot drift from RomM the way a hand-written mock would.
+to the real RomM untouched, and by default the only thing an armed scenario does
+is damage one specific thing about a genuine response -- so it cannot drift from
+RomM the way a hand-written mock would.
 
-``stall`` is the one mode that does not forward at all, and deliberately: see
-``seconds`` below. The other three damage a real response; a stall models a
-server that never produced one.
+Two modes do not forward. ``stall`` never does, deliberately: see ``seconds``
+below, and a stall models a server that never produced a response at all.
+``status`` does not either, and with a ``body`` it is the one way to make this
+proxy synthesise a response RomM did not send -- which is a real mock, with a
+real mock's drift, and is why it is used for shapes RomM produces rarely rather
+than for shapes it produces every day. ``harness.md5_diagnosis`` is the standing
+example: RomM answers a save row with an empty ``content_hash`` about one call in
+250 (#155), and waiting for it costs hundreds of repetitions.
 
 Control API (not forwarded upstream)::
 

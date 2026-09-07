@@ -607,10 +607,15 @@ inline bool ReadSave(const http::Result& result, Save* out) {
 /// which is the single input that separates the two conflict reasons a client
 /// has to handle. Passing it is not cosmetic: without a sync row RomM compares
 /// timestamps, with one it compares both sides against the row.
+///
+/// `raw`, when given, receives the POST's own result. Only `ServerMd5` asks for
+/// it, and it asks because `ReadSave` answers false for a transport error, for a
+/// refusal, and for a 2xx whose body it cannot read as a save row -- three
+/// different things this helper's bool cannot tell apart (#155).
 inline bool UploadSave(http::HttpClient& client, const std::string& base, const Fixture& fixture,
                        std::int64_t rom_id, const std::string& slot, const std::string& emulator,
                        const std::string& local_path, const std::string& file_name,
-                       bool with_device, Save* out) {
+                       bool with_device, Save* out, http::Result* raw = nullptr) {
   std::string url = base + "/api/saves?rom_id=" + std::to_string(rom_id) + "&emulator=" + emulator +
                     "&slot=" + slot + "&overwrite=true";
   if (with_device) {
@@ -623,7 +628,11 @@ inline bool UploadSave(http::HttpClient& client, const std::string& base, const 
   part.file_name = file_name;
   part.content_type = "application/octet-stream";
   request.form.push_back(part);
-  return ReadSave(client.Send(request), out);
+  const http::Result posted = client.Send(request);
+  if (raw != nullptr) {
+    *raw = posted;
+  }
+  return ReadSave(posted, out);
 }
 
 /// `PUT /api/saves/{id}` -- replace the bytes of a save **in place**.
@@ -738,27 +747,39 @@ inline void DeleteState(http::HttpClient& client, const std::string& base, const
 /// string RomM will compare against on every later negotiation, and only RomM
 /// can say what that is; `harness.content_hash` is where the two are compared.
 ///
-/// It takes `checks` for the reason `Partial` reads the session state before it
-/// completes one: this fails intermittently, and it used to say only "the MD5 of
-/// partial-2.srm". Two different things produce that -- an upload that never
-/// landed, and an upload that landed on a row RomM handed back with an empty
-/// `content_hash` -- and the message could not tell them apart, so #119 spent a
-/// 250-repetition run to learn which. It says so now: the row, and what came
-/// back in place of the digest.
+/// It takes `checks` and reports its own failure, the way `UploadState` and
+/// `ListStates` do -- so a caller checks the bool and gives up, and does not
+/// assert a second time over the top.
+///
+/// That is not house style for its own sake. This fails intermittently, about
+/// one call in 250 (#155), and all it used to say was "the MD5 of
+/// partial-2.srm". Two entirely different events produce that line -- an upload
+/// that never landed, and an upload that landed on a row RomM handed back with
+/// an empty `content_hash` -- and telling them apart cost #119 a 489-repetition
+/// experiment. It says which now: the file it was asked about, the row it got,
+/// and what came back in place of the digest.
 inline bool ServerMd5(::checks::Checks& checks, http::HttpClient& client, const std::string& base,
                       const Fixture& fixture, std::int64_t rom_id, const std::string& local_path,
                       std::string* out) {
   Save scratch;
+  http::Result posted;
   if (!UploadSave(client, base, fixture, rom_id, UniqueSlot("harness-md5"), "harness-md5", local_path,
-                  "harness-md5.srm", /*with_device=*/false, &scratch)) {
-    checks.Expect(false, "the harness could not upload the scratch save RomM computes the MD5 of");
+                  "harness-md5.srm", /*with_device=*/false, &scratch, &posted)) {
+    // Deliberately not "the upload failed": a 2xx whose body is not a save row
+    // reaches here too, and then a row DID land and this cannot name it to
+    // delete it. Print what came back and let the reader tell which it was.
+    checks.Expect(false, "the MD5 of " + local_path +
+                             " -- the scratch upload came back as no save row this harness could "
+                             "read: HTTP " +
+                             std::to_string(posted.response.status) + " " +
+                             http::ToString(posted.error) + " " + posted.response.body);
     return false;
   }
   *out = scratch.content_hash;
   DeleteSave(client, base, fixture, scratch.id);
   if (out->size() != sync::kContentHashDigits) {
-    checks.Expect(false, "RomM returned save row " + std::to_string(scratch.id) + " (" +
-                             scratch.file_name + ", " +
+    checks.Expect(false, "the MD5 of " + local_path + " -- RomM returned save row " +
+                             std::to_string(scratch.id) + " (" + scratch.file_name + ", " +
                              std::to_string(scratch.file_size_bytes) + " bytes) with content_hash " +
                              "\"" + *out + "\" -- expected " +
                              std::to_string(sync::kContentHashDigits) + " hex digits");
