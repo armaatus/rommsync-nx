@@ -801,6 +801,16 @@ Removing a worktree signals the watcher on the way out (`archive.sh`). It
 identifies the process before signalling it, because a pidfile outlives a
 `kill -9` and a reboot, and the number in it is then whatever the system reused.
 
+Tearing the stack down by hand is `./scripts/orca/compose.sh down -v`, and the
+wrapper adds two flags of its own to it: `--profile '*'` and `--remove-orphans`.
+A service behind a `profiles:` key is invisible to a `docker compose` command
+that has not activated its profile, so a bare `down` left the TLS terminator
+running — `restart: unless-stopped` brought it back on every docker start, and
+it held that worktree's `TLS_PORT` and the network the rest of the teardown was
+waiting on. `up -d` is deliberately left alone: it still starts neither the
+terminator nor anything else profiled, which is what keeps the host suite
+talking plain HTTP to the fault proxy.
+
 Removing a worktree runs `scripts/orca/archive.sh`, which takes that worktree's
 stack and volumes down with it. It derives the project name from the worktree
 path rather than reading `.env` back, so a worktree whose `.env` never got
