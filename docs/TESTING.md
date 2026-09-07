@@ -562,7 +562,13 @@ ctest --test-dir build --output-on-failure
   makes to one copy — `ATMOSPHERE_TARGET` and the guide line in
   [INSTALL.md](INSTALL.md) that quotes it — and derives its Horizon number from
   the `hosversionAtLeast` gates in `sysmodule/source` and `overlay/source`
-  rather than trusting the constant. See
+  rather than trusting the constant. `release.procedure` holds the last of it
+  that is not a script -- the steps a person follows: the `VERSION` bump is an
+  ordinary pull request, so it meets `merge-gate` like any other, and the
+  procedure has to quote what that gate will ask of its body. It reads the
+  required phrases out of `merge_gate.py`'s own `LOCAL_PASSES`, so renaming a
+  pass turns the guide red instead of leaving it asking for something the gate
+  no longer accepts. See
   [DEVELOPMENT.md](DEVELOPMENT.md#releases) for the procedure they hold.
 
 ### Provisioning the fixture

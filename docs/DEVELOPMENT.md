@@ -275,7 +275,8 @@ directly:
 git switch -c release-0.2.0
 echo 0.2.0 > VERSION            # or 0.2.0-rc1 for a prerelease
 git commit -am "Release 0.2.0"
-gh pr create --fill             # ...and a person merges it
+gh pr create                    # ...and a person merges it. Not --fill:
+                                # the body carries both review passes
 
 git switch main && git pull     # now the bump is on main
 git tag v0.2.0
@@ -298,7 +299,20 @@ page advertising a truncated download whenever an upload failed. The body is
 `scripts/release-notes.sh`: the install lines, what the build targets, the
 commits since the previous tag, and those checksums.
 
-Six things are worth knowing before you do it:
+Eight things are worth knowing before you do it:
+
+- **That pull request meets `merge-gate` like any other, and `--fill` does not
+  satisfy it.** `.github/scripts/merge_gate.py` is a required check on `main`,
+  and it exempts neither a release nor whoever opened it: the body has to show
+  both local passes — `/code-review` and `mattpocock-skills:code-review` — an
+  independent review has to exist on the current head, and no review thread may
+  be left open (`required_conversation_resolution` is on). `gh pr create --fill`
+  writes the body from the commit message, so a `Release 0.2.0` commit produces
+  a body that satisfies none of it. Run the two passes on the bump the way you
+  would on anything else and put the findings in the body; `release.procedure`
+  is what keeps this paragraph and that script in step. `enforce_admins` is off,
+  so an admin *can* merge it with the check red — that is the escape hatch for a
+  broken review job, not the route.
 
 - **The tag and `VERSION` must agree**, or the build is red rather than a release
   labelled with a version nothing inside it reports. `ctest -R version.tag` is
