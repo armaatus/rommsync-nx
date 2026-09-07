@@ -48,6 +48,7 @@
 #include <unistd.h>    // fork/execl, and getpid/getppid for the scratch scenario
 
 #include "harness.hpp"
+#include "scratch.hpp"
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/host/file_sync.hpp"
 #include "rommsync/md5.hpp"
