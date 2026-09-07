@@ -1792,7 +1792,10 @@ int RunStranger(const std::string& self) {
     ::_exit(127);
   }
 
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{60};
+  // Six of these at most -- one, plus the five the sweep half may retry -- and
+  // `harness.*` gets 300s from CTest, so the deadline has to leave room for all
+  // six inside it. A stranger that is working takes under two seconds.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
   int status = 0;
   while (std::chrono::steady_clock::now() < deadline) {
     const pid_t reaped = ::waitpid(stranger, &status, WNOHANG);

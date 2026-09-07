@@ -382,6 +382,14 @@ inline void Touch(const std::filesystem::path& file) {
 inline void Erase(const std::filesystem::path& file) {
   std::error_code error;
   std::filesystem::remove(file, error);
+  if (error) {
+    // A file already gone is not an error here (`remove` says so by returning
+    // false), so this is a real failure -- and a claim that would not erase
+    // looks exactly like one still legitimately held, which is a session no
+    // cleanup will ever close. Same argument as `Touch`, from the other side.
+    std::cerr << "  rig::sessions could not remove " << file.string() << ": " << error.message()
+              << "\n";
+  }
 }
 
 /// Walk the claims directory, handing each entry to `visit`.
