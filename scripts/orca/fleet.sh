@@ -567,7 +567,11 @@ except Exception:
     : >"$STATE_DIR/stalled-$num"
     if [ "$rc" = 0 ]; then
       say "#$num is waiting for you, as expected -- its last step is yours to take"
-      card "$path" --comment "#$num: waiting for you -- as expected, not a stall"
+      # ...unless enforce_timebox, which runs first in the same poll, already put
+      # the same news on the board. Its wording carries the time-box fact too, so
+      # the one worth keeping is the one already there.
+      [ -e "$STATE_DIR/human-step-$num" ] \
+        || card "$path" --comment "#$num: waiting for you -- as expected, not a stall"
       notify "#$num is waiting for you" "Its last step is yours to take."
     else
       say "#$num is waiting for input -- in auto mode nothing should be asking"
@@ -597,7 +601,12 @@ enforce_timebox() {
     # that failed is no basis for either. The started marker stays, so the next
     # pass asks again -- an agent is only ever stopped on an answer.
     has_open_pr "$num"; case $? in
-      0) rm -f "$f" "$STATE_DIR/unreachable-$num" "$STATE_DIR/human-step-$num"
+      # Every marker this function owns, not only the two it happened to set on
+      # the way here: an issue whose PR closed unmerged goes `ready` again and
+      # gets a second worktree, and a `box-labels-` left over from the first one
+      # would silently swallow that worktree's first outage report.
+      0) rm -f "$f" "$STATE_DIR/unreachable-$num" "$STATE_DIR/human-step-$num" \
+               "$STATE_DIR/box-labels-$num"
          continue ;;
       # Once per outage, not once per poll, the same way notice_stalled does it:
       # the dispatcher polls every POLL_SECONDS, and an hour of GitHub being
