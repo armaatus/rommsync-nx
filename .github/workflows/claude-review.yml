@@ -301,6 +301,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     continue-on-error: true
+    # BY PULL REQUEST, not by head, and this job needs a group of its own.
+    #
+    # "Exactly once per head" is enforced by a check-then-post on the marker
+    # comment, which is only safe if two of these never run at once. That used
+    # to be free: every run for a PR shared the review job's group, so their
+    # verdict jobs were serialised behind it. Giving dispatches their own group
+    # (see `review` above) took that away -- two concurrent dispatches could
+    # both read "no marker" and both post, and both ask for another review.
+    #
+    # Keyed on the PR alone because a dispatch cannot resolve a head sha, and
+    # `cancel-in-progress: false` so a queued one waits rather than dying. A
+    # queued verdict that is later cancelled costs nothing: whichever ran first
+    # has already posted the marker for that head.
+    #
+    # Raised as a question rather than a finding by the review on f33bd10e, and
+    # it was right to ask -- the hole was opened by the fix two commits earlier.
+    concurrency:
+      group: claude-verdict-${{ github.event.pull_request.number || inputs.pr }}
+      cancel-in-progress: false
     permissions:
       contents: read
       pull-requests: write
