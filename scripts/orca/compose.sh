@@ -16,4 +16,52 @@ cd "$REPO_ROOT"
 [ -f .env ] || ./scripts/orca/env.sh >/dev/null
 set -a; . ./.env; set +a
 
+# `down` has to remove everything this worktree started, and a bare
+# `docker compose down` does not: a service behind a `profiles:` key is
+# invisible to any command that has not activated its profile. The TLS
+# terminator (server/testing/docker-compose.yml, profile `tls`) therefore
+# survived the documented teardown, `restart: unless-stopped` brought it back on
+# every docker start, and it held this worktree's TLS_PORT and the network the
+# rest of the teardown was waiting on -- #122. archive.sh and reap.sh already
+# name `tls` on their own `down`; this is the same hole in the path a person
+# types.
+#
+# `tls` by name, not `--profile '*'`. The wildcard would cover a profile added
+# later without a second edit, but it is a Compose 2.24 feature and an older one
+# treats `*` as the literal name of a profile that does not exist -- which
+# activates nothing and restores this leak in silence, on the one teardown path
+# a person types by hand. Naming the profile has no such floor, and it is what
+# archive.sh and reap.sh already do; tests/test_orca_teardown.sh reads the
+# profiles out of the compose file and fails all three the day a new one is
+# added, which is the second edit made loud instead of unnecessary.
+#
+# --remove-orphans for the same reason teardown wants it there: a container
+# compose no longer recognises as a service is still labelled with this project,
+# and reap.sh would find it later.
+#
+# Only `down`. An ordinary `up -d` must keep starting neither the terminator nor
+# anything else profiled -- that is what keeps the host suite talking plain HTTP
+# to the fault proxy, and tls-fixture.sh is what asks for the other thing.
+subcommand=""
+want_value=false
+for arg in "$@"; do
+  if $want_value; then want_value=false; continue; fi
+  case "$arg" in
+    --) break ;;
+    # `--flag=value` carries its own value; the separated spelling eats the next
+    # argument, and a scan that does not know which is which reads
+    # `compose.sh -p rmx-other down` as a `-p` subcommand and activates nothing.
+    --*=*) ;;
+    -f|--file|-p|--project-name|--profile|--project-directory|--env-file|\
+    --parallel|--progress|--ansi|--log-level) want_value=true ;;
+    -*) ;;
+    *) subcommand="$arg"; break ;;
+  esac
+done
+
+if [ "$subcommand" = down ]; then
+  exec docker compose -f server/testing/docker-compose.yml \
+    --profile tls "$@" --remove-orphans
+fi
+
 exec docker compose -f server/testing/docker-compose.yml "$@"

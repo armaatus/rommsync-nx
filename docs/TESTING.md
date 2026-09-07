@@ -810,6 +810,25 @@ Removing a worktree signals the watcher on the way out (`archive.sh`). It
 identifies the process before signalling it, because a pidfile outlives a
 `kill -9` and a reboot, and the number in it is then whatever the system reused.
 
+Tearing the stack down by hand is `./scripts/orca/compose.sh down -v`, and the
+wrapper adds two flags of its own to it: `--profile tls` and `--remove-orphans`.
+A service behind a `profiles:` key is invisible to a `docker compose` command
+that has not activated its profile, so a bare `down` left the TLS terminator
+running — `restart: unless-stopped` brought it back on every docker start, and
+it held that worktree's `TLS_PORT` and, because a running container pins it, the
+network the rest of the teardown was waiting on (`Resource is still in use`).
+`archive.sh` and `reap.sh` already named the profile; this is the same hole in
+the path a person types.
+
+`up -d` is deliberately left alone: it still starts neither the terminator nor
+anything else profiled, which is what keeps the host suite talking plain HTTP to
+the fault proxy. And the profile is named rather than wildcarded — `--profile
+'*'` would cover a profile added later without a second edit, but it needs
+Compose 2.24 and an older one reads `*` as a literal profile name, activating
+nothing and restoring the leak in silence. `orca.teardown_covers_profiles` and
+`orca.compose_down_covers_profiles` read the profiles out of the compose file
+instead, so adding one fails the suite rather than passing quietly.
+
 Removing a worktree runs `scripts/orca/archive.sh`, which takes that worktree's
 stack and volumes down with it. It derives the project name from the worktree
 path rather than reading `.env` back, so a worktree whose `.env` never got
