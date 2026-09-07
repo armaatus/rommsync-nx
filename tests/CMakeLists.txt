@@ -1365,8 +1365,16 @@ endforeach()
 # The board is the status surface, and `card()` ended in `|| true`; the worktree
 # removal ended in advice that could not work, on a call a submodule makes fail
 # every time. Both stub the Orca CLI, so neither needs a workspace.
+#
+# The same file also covers `needs-human-step`: the detector read `waiting` as a
+# stall on the premise that "in auto mode nothing should be asking", which is
+# false for an issue whose last step is outward and the maintainer's. The three
+# controls (an ordinary stall, an ordinary overrun, an ordinary ready issue) are
+# the half that matters -- an exemption that swallowed the real signal would be
+# worse than the noise it removes.
 set(ORCA_FLEET_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_orca_fleet.sh")
-foreach(phase card_says card_quiet remove_forces remove_advice)
+foreach(phase card_says card_quiet remove_forces remove_advice
+              stall_expected stall_reports timebox_waits timebox_stops queue_skips)
   add_test(NAME orca.fleet_${phase}
            COMMAND "${BASH_PROGRAM}" "${ORCA_FLEET_TEST}" ${phase})
   set_tests_properties(orca.fleet_${phase} PROPERTIES TIMEOUT 60)

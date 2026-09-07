@@ -20,6 +20,27 @@
 #                                     which skips exactly this case and prints
 #                                     "nothing to reap".
 #
+# ...and the three places `needs-human-step` has to be honoured, because an
+# issue whose last step is outward and the maintainer's is not a stalled one:
+#
+#   test_orca_fleet.sh stall_expected an agent `waiting` on a labelled issue ->
+#                                     reported as waiting for you AS EXPECTED,
+#                                     and never as "nothing should be asking".
+#   test_orca_fleet.sh stall_reports  an agent `waiting` on an ordinary issue ->
+#                                     still the stall it always was. The whole
+#                                     point of the exemption is that the signal
+#                                     keeps meaning something.
+#   test_orca_fleet.sh timebox_waits  past the box, no PR, labelled -> NOT
+#                                     interrupted, no "gave up" comment on the
+#                                     issue, and the timer is dropped so the
+#                                     next poll does not ask GitHub again.
+#   test_orca_fleet.sh timebox_stops  past the box, no PR, unlabelled -> still
+#                                     interrupted and still commented on.
+#   test_orca_fleet.sh queue_skips    a labelled issue is not startable: the
+#                                     dispatcher must not open a worktree for
+#                                     work no agent may finish, or it opens one
+#                                     per cycle forever (#148).
+#
 # The Orca CLI and gh are stubbed on PATH; the fleet state dir is a temp dir.
 # Nothing here touches a real worktree, docker, or GitHub.
 set -uo pipefail
@@ -38,6 +59,9 @@ make_fixture() {
   mkdir -p "$WORK/repo/scripts/orca" "$WORK/bin"
   cp "$REPO_ROOT/scripts/orca/fleet.sh" "$REPO_ROOT/scripts/orca/lib.sh" \
      "$WORK/repo/scripts/orca/"
+  # ready_issues imports it, and $ISSUE_REFS is derived from the repo root.
+  mkdir -p "$WORK/repo/.github/scripts"
+  cp "$REPO_ROOT/.github/scripts/issue_refs.py" "$WORK/repo/.github/scripts/"
 
   cat >"$WORK/bin/orca-stub" <<'STUB'
 #!/usr/bin/env bash
@@ -45,6 +69,13 @@ mode="$(cat "$ORCA_MODE")"
 printf '%s\n' "$*" >>"$ORCA_CALLS"
 case "$1" in
   --version) echo "orca 0.0.0-test"; exit 0 ;;
+esac
+# Matched on the pair, because `list` alone is both `worktree list` and
+# `terminal list` and the dispatcher asks for both.
+case "$1 ${2:-}" in
+  "worktree ps")   cat "$ORCA_PS"; exit 0 ;;
+  "terminal list") cat "$ORCA_TERMINALS"; exit 0 ;;
+  "terminal send") echo '{"ok":true}'; exit 0 ;;
 esac
 target=""
 for arg in "$@"; do
@@ -71,8 +102,17 @@ STUB
 
   cat >"$WORK/bin/gh" <<'STUB'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >>"$GH_CALLS"
 case "$*" in
-  *"pr list"*) echo 7; exit 0 ;;
+  # reap_merged asking whether this branch's PR merged. The other `pr list` is
+  # has_open_pr, which parses JSON -- answering `7` there is a parse failure,
+  # which the dispatcher reads as "could not tell" rather than as "no PR".
+  *"pr list --head"*) echo 7; exit 0 ;;
+  *"pr list"*)        cat "$GH_PRS"; exit 0 ;;
+  *"issue list"*)     cat "$GH_ISSUES"; exit 0 ;;
+  # gh applies --jq itself, so the stub answers what the filter would produce.
+  *"issue view"*"--json labels"*) cat "$GH_LABELS"; exit 0 ;;
+  *"issue comment"*)  exit 0 ;;
 esac
 echo ""
 STUB
@@ -80,7 +120,15 @@ STUB
 
   ORCA_CALLS="$WORK/calls"; : >"$ORCA_CALLS"
   ORCA_MODE="$WORK/mode"; printf '%s' "${1:-ok}" >"$ORCA_MODE"
-  export ORCA_CALLS ORCA_MODE
+  GH_CALLS="$WORK/gh-calls"; : >"$GH_CALLS"
+  # The defaults are the quiet answers: no agent running, no terminal, no open
+  # PR, no labels. Each test overrides only the one it is about.
+  ORCA_PS="$WORK/ps";               echo '{"result":{"worktrees":[]}}' >"$ORCA_PS"
+  ORCA_TERMINALS="$WORK/terminals"; echo '{"result":{"terminals":[]}}' >"$ORCA_TERMINALS"
+  GH_PRS="$WORK/prs";               echo '[]' >"$GH_PRS"
+  GH_ISSUES="$WORK/issues";         echo '[]' >"$GH_ISSUES"
+  GH_LABELS="$WORK/labels";         : >"$GH_LABELS"
+  export ORCA_CALLS ORCA_MODE GH_CALLS ORCA_PS ORCA_TERMINALS GH_PRS GH_ISSUES GH_LABELS
   export ORCA_CLI_COMMAND="$WORK/bin/orca-stub"
   export ROMMSYNC_FLEET_DIR="$WORK/fleet"
   PATH="$WORK/bin:$PATH"
@@ -96,6 +144,28 @@ make_worktree() {
   mkdir -p "$ROMMSYNC_FLEET_DIR/worktrees"
   printf '%s\n' "$WORK/wt" >"$ROMMSYNC_FLEET_DIR/worktrees/42"
 }
+
+# The agent Orca reports for the worktree, and the terminal the time-box would
+# interrupt. Written as files so the stub answers the same thing every call.
+agent_state() {
+  python3 -c '
+import json, sys
+print(json.dumps({"result": {"worktrees": [
+    {"path": sys.argv[1], "agents": [{"state": sys.argv[2]}]}]}}))
+' "$WORK/wt" "$1" >"$ORCA_PS"
+  python3 -c '
+import json, sys
+print(json.dumps({"result": {"terminals": [
+    {"handle": "t1", "worktreePath": sys.argv[1], "agentIdentity": "claude"}]}}))
+' "$WORK/wt" >"$ORCA_TERMINALS"
+}
+
+# What `gh issue view N --json labels --jq ...` would print.
+issue_labels() { printf '%s' "$1" >"$GH_LABELS"; }
+
+# An issue that is past its box with no PR open: the started marker is old, and
+# the PR listing is empty.
+make_overdue() { mkdir -p "$ROMMSYNC_FLEET_DIR/started"; echo 0 >"$ROMMSYNC_FLEET_DIR/started/42"; }
 
 # fleet.sh returns instead of dispatching when it is sourced, so one function can
 # be exercised without starting a dispatcher.
@@ -143,7 +213,72 @@ case "${1:-}" in
       || fail "the reason git gave was dropped; it is the difference between this and a hung CLI: $out"
     echo "ok: a failed removal says something that would actually clean it up"
     ;;
+  stall_expected)
+    make_fixture ok
+    make_worktree
+    agent_state waiting
+    issue_labels "ready,needs-human-step"
+    out="$(in_fleet notice_stalled 2>&1)"
+    grep -q "nothing should be asking" <<<"$out" \
+      && fail "a correct refusal to act alone was called a stall: $out"
+    grep -qi "as expected" <<<"$out" \
+      || fail "it did not say the wait was the expected one: $out"
+    echo "ok: an issue whose last step is yours is reported as waiting for you"
+    ;;
+  stall_reports)
+    make_fixture ok
+    make_worktree
+    agent_state waiting
+    issue_labels "ready"
+    out="$(in_fleet notice_stalled 2>&1)"
+    grep -q "nothing should be asking" <<<"$out" \
+      || fail "an ordinary agent sitting at a prompt was not reported: $out"
+    echo "ok: an ordinary waiting agent is still a stall"
+    ;;
+  timebox_waits)
+    make_fixture ok
+    make_worktree
+    make_overdue
+    agent_state waiting
+    issue_labels "ready,needs-human-step"
+    out="$(in_fleet enforce_timebox 2>&1)"
+    grep -q -- "--interrupt" "$ORCA_CALLS" \
+      && fail "the time-box interrupted an agent that was correctly waiting: $out"
+    grep -q "issue comment" "$GH_CALLS" \
+      && fail "it told the issue the fleet gave up on work that is waiting on a person"
+    [ -e "$ROMMSYNC_FLEET_DIR/started/42" ] \
+      && fail "the timer is still armed, so every poll re-asks GitHub for the same answer"
+    grep -q "needs-human-step" <<<"$out" \
+      || fail "the log does not say why it was left alone: $out"
+    echo "ok: the time-box exempts an issue whose last step is yours"
+    ;;
+  timebox_stops)
+    make_fixture ok
+    make_worktree
+    make_overdue
+    agent_state working
+    issue_labels "ready"
+    out="$(in_fleet enforce_timebox 2>&1)"
+    grep -q -- "--interrupt" "$ORCA_CALLS" \
+      || fail "an ordinary overrun was not stopped: $out"
+    grep -q "issue comment" "$GH_CALLS" \
+      || fail "an ordinary overrun left nothing on the issue: $out"
+    echo "ok: an ordinary overrun is still stopped"
+    ;;
+  queue_skips)
+    make_fixture ok
+    cat >"$GH_ISSUES" <<'JSON'
+[{"number":148,"title":"cut the v1 release","body":"","labels":[{"name":"ready"},{"name":"needs-human-step"}]},
+ {"number":151,"title":"an ordinary one","body":"","labels":[{"name":"ready"}]}]
+JSON
+    out="$(in_fleet ready_issues 2>&1)"
+    grep -q "^151" <<<"$out" \
+      || fail "an ordinary ready issue stopped being startable: $out"
+    grep -q "^148" <<<"$out" \
+      && fail "an issue no agent may close is still startable, so the fleet opens a worktree per cycle for it: $out"
+    echo "ok: an issue whose last step is yours is not startable"
+    ;;
   *)
-    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice" >&2
+    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips" >&2
     exit 2 ;;
 esac
