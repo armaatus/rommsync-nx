@@ -170,6 +170,15 @@ struct QueueEntry {
   std::string platform_fs_slug;
 
   /// The rom's name on the server's filesystem. Empty until resolved.
+  ///
+  /// The **rom's** name, which is not always the name of the file on the card:
+  /// for a nested single-file rom this is the directory RomM keeps that one
+  /// file in, and `destination` ends in the file's own name instead (#92). It
+  /// stays the rom's because `lists::Service` puts the same `fs_name` on the
+  /// library row from the *list* schema -- where `files[]` is empty and always
+  /// will be -- and two rows about one rom disagreeing about what it is called
+  /// is worse than a row that does not name the file. `destination` is where to
+  /// look for that.
   std::string fs_name;
 
   /// `fs_size_bytes`, and what `http::DownloadTarget::expected_size` is set to.
@@ -189,6 +198,12 @@ struct QueueEntry {
   /// The absolute SD path this rom is written to, from
   /// `config::Config::DestinationFor`. Empty until resolved, and empty forever
   /// on an entry that was refused a destination.
+  ///
+  /// Its leaf is `fs_name` for every rom but one: a nested single-file rom is
+  /// written under `fs_name` with the **extension of `file_names.front()`** on
+  /// the end, because `fs_name` there is a directory and carries none for an
+  /// emulator to pick a core from (#92). This is therefore the only field that
+  /// says what the file on the card is called.
   std::string destination;
 
   QueueState state = QueueState::kQueued;
@@ -622,9 +637,10 @@ std::string ContentUrl(std::string_view base_url, std::int64_t rom_id, std::stri
 
 /// The rom fields the worker reads out of `GET /api/roms/{id}`.
 ///
-/// Five of about eighty, for `roms::Rom`'s reason: the rest are not the client's
-/// to hold. `sha1_hash` is `string | null` -- an unscanned library leaves it
-/// null -- and is the only one that is allowed to be absent.
+/// Ten of about eighty, for `roms::Rom`'s reason: the rest are not the client's
+/// to hold. Three of the ten may be absent from a body and each says so on
+/// itself -- the two digests, which are `string | null` on an unscanned library,
+/// and `file_names`, whose key only the detail body carries at all.
 struct RomDetail {
   std::int64_t id = 0;
   std::string fs_name;
@@ -632,14 +648,45 @@ struct RomDetail {
   std::int64_t size_bytes = 0;
 
   /// The two digests RomM records for a rom, lowercase hex. Both are
-  /// `string | null` -- an unscanned library leaves them null -- and they are
-  /// the only fields here allowed to be absent. `sha1_hash` is what a download
-  /// is checked against; `md5_hash` is the fallback for a library that has one
-  /// and not the other (docs/API_CONTRACT.md#resume--integrity).
+  /// `string | null` -- an unscanned library leaves them null. `sha1_hash` is
+  /// what a download is checked against; `md5_hash` is the fallback for a
+  /// library that has one and not the other
+  /// (docs/API_CONTRACT.md#resume--integrity).
   std::string sha1_hash;
   std::string md5_hash;
 
   bool has_multiple_files = false;
+
+  /// The rom is a **directory on the server holding exactly one file**, and it
+  /// is an ordinary download -- the disc-set skip must not fire on it (#21).
+  ///
+  /// What it changes is the *name*: the destination leaf comes from
+  /// `file_names` rather than from `fs_name`, which is the directory's. The
+  /// whole rule, and what goes wrong without it, is
+  /// docs/API_CONTRACT.md#has_nested_single_file-is-not-a-disc-set (#92).
+  bool has_nested_single_file = false;
+
+  /// `files[].file_name`, in the order the server listed them.
+  ///
+  /// The one field here that is a *name on the server's filesystem* without
+  /// being `fs_name`, and it is held to the same suspicion: nothing has
+  /// validated it, so `config::ValidRomFileName` is asked before it is joined
+  /// onto a mapped folder.
+  ///
+  /// Empty on any body that carried no `files` -- **not** a shape error, unlike
+  /// the digests. `files[]` is only filled by `GET /api/roms/{id}` (it is
+  /// present and always empty on the list schema), and the one rom whose name
+  /// depends on it is the nested single-file one, which is where the worker
+  /// refuses an empty list rather than guessing. Requiring the *key* of every
+  /// body would add a way for an ordinary rom's download to fail and buy
+  /// nothing.
+  ///
+  /// Its *shape*, once the key is there, is held to the bar every other field
+  /// here is: a `files` that is not an array of objects carrying a `file_name`
+  /// string is a named refusal. That is not the same trade -- a library serving
+  /// one body of that shape serves them all, and the next rom out of it is the
+  /// nested one whose name this decides.
+  std::vector<std::string> file_names;
 
   /// RomM knows the rom and its file is gone from the server's own filesystem.
   /// A download would 404 a third of the way in; the entry fails with a sentence
@@ -649,11 +696,16 @@ struct RomDetail {
 
 /// Read one `DetailedRomSchema` body, or say which field was wrong.
 ///
-/// Six of about eighty fields. A *missing* `sha1_hash` or `md5_hash` key is a
-/// shape error even though a null value is not: a body without them is not the
-/// schema this was written against, and reading it as "this rom has no hash"
-/// would turn a client talking to the wrong server into a library of unverified
-/// roms.
+/// Nine required keys of about eighty, and `files[]` if the body carries it. A
+/// *missing* `sha1_hash` or `md5_hash` key is a shape error even though a null
+/// value is not: a body without them is not the schema this was written against,
+/// and reading it as "this rom has no hash" would turn a client talking to the
+/// wrong server into a library of unverified roms.
+///
+/// `has_nested_single_file` is required for that same reason and not a softer
+/// one: reading its absence as `false` is exactly the bug #92 exists to end --
+/// the rom lands under the directory's name and nothing says so. `files` is the
+/// one field read only when it is there; `file_names` says why.
 json::Error ParseRomDetail(std::string_view body, RomDetail* out);
 
 /// How hard the worker tries, and how it reaches the world.
@@ -769,12 +821,28 @@ struct DrainResult {
 /// radio buy nothing.
 ///
 /// Per entry: `GET /api/roms/{id}` -> refuse a disc set or a rom missing from
-/// the server -> `config::Config::DestinationFor` -> is it already on the card?
+/// the server -> name the file -> `config::Config::DestinationFor` -> is it
+/// already on the card?
 /// -> stream the content to `<destination>.tmp.part`, which the backend renames
 /// onto `<destination>.tmp` -> `kVerifying` -> hash it -> `io::CommitStaged`
 /// onto the destination -> `kDone`. The queue is written after every one of
 /// those transitions, which is what makes a power cut resumable rather than a
 /// restart.
+///
+/// **A nested single-file rom gains the inner file's extension, and keeps the
+/// rom's name.** `has_nested_single_file` means a directory on the server
+/// holding exactly one file, so `fs_name` is that directory and `fs_extension`
+/// is `""`: the bytes verify, the entry settles `kDone`, and the user has a file
+/// RetroArch and hbmenu will not load. The leaf is `fs_name` plus the extension
+/// of `files[0].file_name` -- not that name itself, which is neither unique
+/// across roms nor what an emulator names the save after; `NameOnTheCard` has
+/// the whole of that reasoning. `files[0].file_name` is still held to
+/// `config::ValidRomFileName`, since it comes off the same filesystem as
+/// `fs_name` with nothing else checking it. A name that check refuses, or a
+/// nested rom whose `files[]` is not exactly one entry, is a `kSkipped` carrying
+/// the reason and nothing written: writing under the directory's name anyway is
+/// the silent failure this exists to end. `QueueEntry::fs_name` still records
+/// the rom's name; `destination` is what says where the file went.
 ///
 /// **"Already on the card" is answered with the hash, or not at all.** Every
 /// path `config::Config::ExistingRomPaths` names is checked, not just the write

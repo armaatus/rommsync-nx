@@ -1726,6 +1726,7 @@ set(DOWNLOAD_RIG_SCENARIOS
   disabled   # `[downloads] enabled = false` drains nothing and loses nothing
   multifile  # a disc set is refused with a reason and no archive reaches the card
   nested     # ...and a directory holding ONE file is downloaded, not refused
+  nestedname # #92: a nested rom this client will not name is skipped, not guessed
   missing    # a rom the server's library no longer holds fails with a sentence
 )
 foreach(scenario IN LISTS DOWNLOAD_RIG_SCENARIOS)

@@ -211,8 +211,11 @@ worker: GET /api/roms/{id} → resolve fs_name, platform_fs_slug, size, sha1
 
   `has_nested_single_file` — a directory holding exactly **one** file — is *not*
   this case. It is an ordinary download and the skip must not fire on it
-  (`download.nested`). It does land under the *directory's* name, so without the
-  inner file's extension; #92 carries that.
+  (`download.nested`). It lands under `fs_name` with the **extension of the one
+  file inside the directory** on the end — `fs_name` alone carries none for an
+  emulator to pick a core from, and the inner file's own name is neither unique
+  across roms nor what an emulator names the save after (#92,
+  [API_CONTRACT.md](API_CONTRACT.md#has_nested_single_file-is-not-a-disc-set)).
 - Save **states** sync on by default (fragile across cores) — supported but
   opt-in.
 - Installing NSP/XCI Switch titles — this project is emulator content only;
