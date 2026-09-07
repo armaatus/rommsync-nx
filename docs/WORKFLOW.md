@@ -189,10 +189,15 @@ cd /path/to/rommsync-nx && ./scripts/orca/fleet.sh run --auto
 second: `MAX_WORKTREES` is enforced per process, so two of them count the same
 worktrees and open twice the cap between them, then reap, card and interrupt
 each other's (#179). The refusal names the pid that holds
-`~/.rommsync-fleet/fleet.pid` and prints both restarts above. It refuses only to
-a dispatcher this machine can still see running one — a pidfile a `kill -9` left
-behind, or whose pid the OS has since handed to an unrelated process, is taken
-over rather than obeyed.
+`~/.rommsync-fleet/fleet.pid` and prints both restarts above.
+
+It refuses only to a dispatcher this machine can still see running one: `kill
+-0` *and* `ps` still naming a `fleet.sh run`. A pidfile a `kill -9` left behind,
+or whose pid the OS has since handed to an unrelated process, is taken over
+rather than obeyed — otherwise one stale file would hold the fleet down for
+good. `status` and `stop --now` ask the same question, so they cannot disagree
+about whether the fleet is up, and `--now` will not signal a pid that is no
+longer a dispatcher.
 
 **The settings work the same way.** `ROMMSYNC_FLEET_MAX` (how many worktrees run
 at once, default 3), `ROMMSYNC_FLEET_POLL` and `ROMMSYNC_FLEET_TIMEBOX` are read

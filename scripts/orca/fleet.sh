@@ -1286,55 +1286,6 @@ dispatcher_alive() {
     | grep -Eq 'fleet\.sh[[:space:]]+run([[:space:]]|$)'
 }
 
-# The refusal, and how to get past it. A person starting a second dispatcher is
-# usually doing the right thing for the wrong reason -- the first one is running
-# stale code and a restart is the remedy `status` names -- so this ends with a
-# takeover they can follow rather than just a no.
-#
-# BOTH restarts, in that order, because they are for different situations and
-# only one of them is in docs/WORKFLOW.md. The drain is the documented one and
-# restart_advice prints it a few lines above this; it is also unusable with
-# worktrees mid-work, because the stop file it writes is what guard.py reads
-# before it lets an agent push, open a PR or comment -- so the PRs that drain is
-# waiting on cannot land while it waits for them. A bare `kill` is what a person
-# actually does then, and saying so here is the difference between a refusal
-# somebody can act on and one they work around by ignoring it.
-refuse_second_dispatcher() {
-  local holder="$1"
-  cat >&2 <<REFUSED
-a dispatcher is already running (pid $holder).
-
-MAX_WORKTREES is enforced per process, so a second one would count the same
-worktrees this one is counting and launch on top of them -- twice the cap
-between them, and two of every reap, board comment and time-box interrupt.
-
-  ./scripts/orca/fleet.sh status
-      what it is running, and whether the fleet.sh it parsed is still current.
-
-To take over -- the usual reason to start a second one is that the first is
-running stale code, and a restart is the only way a change to fleet.sh, or to
-ROMMSYNC_FLEET_MAX, becomes live. With nothing in flight, drain it, which is
-the sequence docs/WORKFLOW.md gives under "Restart it":
-
-  ./scripts/orca/stop.sh
-  ./scripts/orca/fleet.sh status        # until it says idle
-  ./scripts/orca/fleet.sh resume
-  ./scripts/orca/fleet.sh run --auto
-
-With agents mid-work, do NOT drain: the stop file it writes also stops every
-agent pushing, opening a PR or commenting, so the PRs the drain is waiting for
-cannot land. Take this dispatcher over and leave the agents alone:
-
-  kill $holder
-  ./scripts/orca/fleet.sh status        # until it says idle
-  ./scripts/orca/fleet.sh run --auto
-
-Both are in docs/WORKFLOW.md, under "Restart it". The pid above came from
-$PIDFILE; nothing here removed it, because it is the running dispatcher's.
-REFUSED
-  exit 1
-}
-
 # How to make a change live, said wherever the change is not. The cap is here
 # because it has the same shape and is asked about far more often: MAX_WORKTREES
 # is read once at start, so `ROMMSYNC_FLEET_MAX=4` in front of `status` changes
@@ -1361,6 +1312,73 @@ restart_advice() {
   fi
   echo "  ROMMSYNC_FLEET_MAX, _POLL and _TIMEBOX are read at start too, so they"
   echo "  change only across a restart. docs/WORKFLOW.md, 'Restart it'."
+}
+
+# The refusal `fleet.sh run` prints when a dispatcher is already up, and how to
+# get past it. A person starting a second one is usually doing the right thing
+# for the wrong reason -- the first is running stale code and a restart is the
+# remedy `status` names -- so this ends with a takeover they can follow rather
+# than just a no.
+#
+# It calls restart_advice() for the drain rather than restating it. That
+# sequence is docs/WORKFLOW.md's, restart_advice's comment says it has to stay
+# in that order, and a second copy here is a second place to forget -- it also
+# gets the `cd $root` for free, which matters most in exactly this message: the
+# refusal is read from wherever you typed `run`, and a relative `run --auto`
+# there starts a dispatcher in a directory the fleet removes when that
+# worktree's PR merges (status_names_root is the test for it).
+#
+# BOTH restarts, because only one of them is in WORKFLOW.md and the documented
+# one is unusable with worktrees mid-work: the stop file a drain writes is what
+# guard.py reads before it lets an agent push, open a PR or comment, so the PRs
+# the drain is waiting on cannot land while it waits for them. A bare `kill` is
+# what a person actually does then, and saying so is the difference between a
+# refusal somebody can act on and one they work around by ignoring it.
+refuse_second_dispatcher() {
+  local holder="$1" root
+  # The dispatcher's OWN checkout, not this caller's -- the same asymmetry the
+  # staleness report is built on.
+  root="$(dispatcher_field root)"
+  {
+    cat <<REFUSED
+a dispatcher is already running (pid $holder).
+
+MAX_WORKTREES is enforced per process, so a second one would count the same
+worktrees this one is counting and launch on top of them -- twice the cap
+between them, and two of every reap, board comment and time-box interrupt.
+
+  ./scripts/orca/fleet.sh status
+      what it is running, whether the fleet.sh it parsed is still current, and
+      the \`git pull --ff-only\` when its checkout never pulled the fix -- a
+      restart without that one starts the same bytes over.
+
+To take over -- the usual reason to start a second one is that the first is
+running stale code. With nothing in flight, drain it:
+
+REFUSED
+    restart_advice "$root"
+    cat <<REFUSED
+
+With agents mid-work, do NOT drain: the stop file it writes is what guard.py
+reads before it lets an agent push, open a PR or comment, so the PRs the drain
+is waiting for cannot land while it waits for them. Take this dispatcher over
+and leave the agents alone:
+
+  kill $holder
+  ./scripts/orca/fleet.sh status  # until it says idle
+REFUSED
+    if [ -n "$root" ]; then
+      echo "  cd $root && ./scripts/orca/fleet.sh run --auto"
+    else
+      echo "  ./scripts/orca/fleet.sh run --auto   # from the MAIN worktree"
+    fi
+    cat <<REFUSED
+
+Both are docs/WORKFLOW.md, "Restart it". The pid above came from
+$PIDFILE, and nothing here removed it: it is the running dispatcher's.
+REFUSED
+  } >&2
+  exit 1
 }
 
 # What `status` says about the dispatcher's own code. Three answers, because
@@ -1431,7 +1449,12 @@ cmd_status() {
   if stopped; then
     echo "STOPPED  ($STOP_FILE -- clear with: ./scripts/orca/fleet.sh resume)"
   fi
-  if [ -e "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  # dispatcher_alive, not `kill -0` alone: a pidfile a `kill -9` left behind,
+  # whose pid the OS has since handed to somebody else, would otherwise be
+  # reported as a dispatcher that is running -- and `run` would start one
+  # anyway, because it asks the stricter question. Two screens disagreeing about
+  # whether the fleet is up is worse than either answer.
+  if dispatcher_alive "$(cat "$PIDFILE" 2>/dev/null)"; then
     echo "running   (pid $(cat "$PIDFILE"))"
     report_dispatcher_code
   else
@@ -1508,8 +1531,16 @@ for t in json.load(sys.stdin)["result"]["terminals"]:
       fi
       # Only here. A drain has to leave the dispatcher alive: it is what reaps a
       # worktree once its PR merges, and killing it strands them.
-      if [ -e "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-        kill "$(cat "$PIDFILE")" 2>/dev/null && echo "  dispatcher stopped."
+      #
+      # dispatcher_alive before the signal, which is the whole of lib.sh's
+      # orca_stop_autostart_watcher in one line: this is the only place the
+      # fleet SIGNALS a pid it read out of a file, and a pidfile a `kill -9`
+      # left behind names whoever the OS has since given that number to.
+      local held; held="$(cat "$PIDFILE" 2>/dev/null)"
+      if dispatcher_alive "$held"; then
+        kill "$held" 2>/dev/null && echo "  dispatcher stopped."
+      elif [ -e "$PIDFILE" ]; then
+        echo "  no dispatcher to stop; $PIDFILE names pid ${held:-nothing}, which is not one."
       fi ;;
     "")
       echo "  running agents finish what they are on, and the dispatcher stays up to"
@@ -1576,7 +1607,26 @@ cmd_run() {
     esac
   done
   $auto || [ "${#wanted[@]}" -gt 0 ] || die "give issue numbers, or --auto"
-  stopped && die "the fleet is stopped ($STOP_FILE). Clear it with: fleet.sh resume"
+  # The stop is checked first, and it has to say more than "stopped" when a
+  # dispatcher is still draining behind it. That sentence IS the way in: a drain
+  # leaves the dispatcher up on purpose, `status` says `running (pid N)`
+  # throughout, and somebody who reads "stopped" as "down" runs `resume` and
+  # `run --auto`. The refusal below would then catch them, but a message that
+  # sends them there in the first place is a worse place to be caught.
+  if stopped; then
+    local draining; draining="$(cat "$PIDFILE" 2>/dev/null)"
+    if dispatcher_alive "$draining"; then
+      die "the fleet is stopped ($STOP_FILE), and pid $draining is still DRAINING:
+launching nothing new, and reaping what is in flight until nothing it owns is
+left, which is what a drain is. It exits on its own; watch it with
+\`fleet.sh status\`, and only then start one.
+
+\`fleet.sh resume\` clears the stop. It does NOT make room for a second
+dispatcher -- MAX_WORKTREES is enforced per process, so \`run\` would refuse
+while that one is up."
+    fi
+    die "the fleet is stopped ($STOP_FILE). Clear it with: fleet.sh resume"
+  fi
 
   # One dispatcher per machine, checked before the pidfile is claimed rather
   # than trusted from it: `fleet.pid` names whoever started LAST, so before this
@@ -1589,6 +1639,13 @@ cmd_run() {
   # report answers "a dispatcher older than its own fleet.sh" with "restart it",
   # so making staleness visible is also what multiplies the restarts this has to
   # catch.
+  #
+  # Read-then-claim, and the window between them is not closed: two dispatchers
+  # started inside the same millisecond would both get past this. That is not
+  # the way in -- the drain leaves the first one up for HOURS and somebody
+  # resumes on top of it -- and an atomic claim wants a temp file or an
+  # O_EXCL dance whose leftovers are their own failure mode in a state dir a
+  # `kill -9` already litters.
   local holder; holder="$(cat "$PIDFILE" 2>/dev/null)"
   dispatcher_alive "$holder" && refuse_second_dispatcher "$holder"
 

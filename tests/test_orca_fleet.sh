@@ -264,6 +264,18 @@
 #   test_orca_fleet.sh run_stale_gone     the process is simply gone -> it
 #                                         starts.
 #
+# ...and the same question asked in the two other places this file reads that
+# pidfile, because a `status` that says `running` while `run` starts anyway is
+# two screens disagreeing about whether the fleet is up -- and `stop --now` is
+# the one place the fleet SIGNALS a pid it read out of a file.
+#
+#   test_orca_fleet.sh status_recycled    the pid is a stranger's -> `idle`.
+#   test_orca_fleet.sh stop_spares_stranger
+#                                         ...and `stop --now` does not signal
+#                                         it, and says why.
+#   test_orca_fleet.sh stop_stops_dispatcher
+#                                         the control: a real one still goes.
+#
 # The Orca CLI and gh are stubbed on PATH; the fleet state dir is a temp dir.
 # Nothing here touches a real worktree, docker, or GitHub.
 set -uo pipefail
@@ -527,38 +539,53 @@ merge_fleet_fix() {
   git -C "$WORK/repo" -c user.email=t@t -c user.name=t commit -q -am "$1"
 }
 
-# A dispatcher this shell can answer `kill -0` for.
-dispatcher_running() { mkdir -p "$ROMMSYNC_FLEET_DIR"; echo $$ >"$ROMMSYNC_FLEET_DIR/fleet.pid"; }
+# The pidfile, naming whatever pid the phase wants it to name.
+hold_pidfile() { mkdir -p "$ROMMSYNC_FLEET_DIR"; printf '%s\n' "$1" >"$ROMMSYNC_FLEET_DIR/fleet.pid"; }
 
 # A live process that LOOKS like a dispatcher, and a pidfile naming it. The
-# identity check reads `ps -o command=` rather than trusting `kill -0` alone, so
-# a stand-in needs a real command line and not just a pid -- `bash <path>/fleet.sh
-# run --auto` is what ps prints for the dispatcher this machine is running now.
+# fleet asks `ps -o command=` as well as `kill -0` before it believes a pidfile
+# -- before it refuses a second `run`, before `status` says `running`, and
+# before `stop --now` SIGNALs -- so a stand-in needs a real command line and not
+# just a pid. `bash <path>/fleet.sh run --auto` is what ps prints for the
+# dispatcher this machine is running now.
 hold_pidfile_with_dispatcher() {
   mkdir -p "$WORK/other/scripts/orca"
-  printf '#!/usr/bin/env bash\nsleep 30\n' >"$WORK/other/scripts/orca/fleet.sh"
+  # A loop of short sleeps rather than one long one: cleanup kills this bash,
+  # and whatever it is blocked in is orphaned rather than killed with it. A
+  # `sleep 30` left holding the inherited stdout is 30 seconds ctest spends
+  # waiting for a test that finished -- which is also why it is redirected.
+  printf '#!/usr/bin/env bash\nfor _ in $(seq 60); do sleep 1; done\n' \
+    >"$WORK/other/scripts/orca/fleet.sh"
   chmod +x "$WORK/other/scripts/orca/fleet.sh"
-  bash "$WORK/other/scripts/orca/fleet.sh" run --auto &
+  bash "$WORK/other/scripts/orca/fleet.sh" run --auto >/dev/null 2>&1 &
   HELD_PID=$!
   # Off the job table, or bash announces "Terminated" on stderr when cleanup
   # kills it and a passing test looks like a broken one.
   disown "$HELD_PID" 2>/dev/null
   hold_pidfile "$HELD_PID"
-  # A stand-in ps would not recognise makes every assertion below it vacuous --
-  # cmd_run would decline for the ordinary reason and the test would still pass.
+  # A stand-in ps would not recognise makes every assertion after it vacuous --
+  # the fleet would answer "no dispatcher" for the ordinary reason and the
+  # phases that assert a refusal would pass without one.
   ps -o command= -p "$HELD_PID" 2>/dev/null | grep -q 'fleet\.sh run' \
-    || fail "the stand-in dispatcher does not look like one to ps; the refusal below would be vacuous"
+    || fail "the stand-in dispatcher does not look like one to ps; every assertion below would be vacuous"
 }
 
-# A pid that is alive and is NOT a dispatcher: what a `kill -9`'d pidfile turns
-# into once the OS wraps round and hands the number to somebody else.
+# What the status_ phases mean by "a dispatcher is up". It is the real thing
+# now, and it has to be: `status` no longer believes a pid it cannot also see
+# running a dispatcher, so a bare `echo $$` here would report `idle` and every
+# staleness assertion would be about a screen that never printed.
+dispatcher_running() { hold_pidfile_with_dispatcher; }
+
+# A pid that is alive and is NOT a dispatcher: what a pidfile a `kill -9` left
+# behind turns into once the OS wraps round and hands the number to somebody
+# else. Killing THIS is the thing `stop --now` must not do.
 hold_pidfile_with_stranger() {
   sleep 30 &
   HELD_PID=$!
   disown "$HELD_PID" 2>/dev/null
   hold_pidfile "$HELD_PID"
   ps -o command= -p "$HELD_PID" 2>/dev/null | grep -q 'fleet\.sh' \
-    && fail "the stranger looks like a dispatcher; the test would assert nothing"
+    && fail "the stranger looks like a dispatcher; the phase would assert nothing"
   return 0
 }
 
@@ -567,16 +594,27 @@ hold_pidfile_with_ghost() {
   sleep 0 &
   local gone=$!
   wait "$gone" 2>/dev/null
-  kill -0 "$gone" 2>/dev/null && fail "the ghost pid is still alive; the test would assert nothing"
+  kill -0 "$gone" 2>/dev/null && fail "the ghost pid is still alive; the phase would assert nothing"
   hold_pidfile "$gone"
 }
 
-hold_pidfile() { mkdir -p "$ROMMSYNC_FLEET_DIR"; printf '%s\n' "$1" >"$ROMMSYNC_FLEET_DIR/fleet.pid"; }
-
 # `cmd_run` in list mode against an issue that has already landed: one pass, no
-# sleep, and it comes back. Enough to see whether the claim refused or not
-# without leaving a dispatcher polling in the test.
+# sleep, and it comes back. Every run_ phase goes through this, the refusing one
+# included -- `--auto` would sit polling until CTest's timeout if the refusal
+# ever regressed, and a phase that fails by hanging says far less than one that
+# fails by returning.
 run_one_pass() { issue_state CLOSED; in_fleet cmd_run 42 2>&1; }
+
+# `kill` returns once the signal is delivered, not once the target is gone, so
+# the assertion that it went waits rather than races it.
+pid_gone() {
+  local i=0
+  while [ "$i" -lt 50 ]; do
+    kill -0 "$1" 2>/dev/null || return 0
+    sleep 0.1; i=$((i + 1))
+  done
+  return 1
+}
 
 # fleet.sh sourced from somewhere OTHER than the dispatcher's own checkout --
 # what an agent in a fleet worktree runs.
@@ -1437,10 +1475,43 @@ JSON
       && fail "it named the caller's worktree, which the fleet removes when its PR merges: $out"
     echo "ok: the restart it prints names the dispatcher's own checkout"
     ;;
+  status_recycled)
+    make_fixture ok
+    make_repo_git
+    hold_pidfile_with_stranger
+    out="$(in_fleet cmd_status 2>&1)"
+    grep -q "running   (pid $HELD_PID)" <<<"$out" \
+      && fail "a pidfile whose pid the OS recycled onto a stranger was reported as a running dispatcher: $out"
+    grep -q "idle" <<<"$out" \
+      || fail "it said neither running nor idle about a pid that is not a dispatcher: $out"
+    echo "ok: status asks the same question run does, so the two cannot disagree"
+    ;;
+  stop_spares_stranger)
+    make_fixture ok
+    hold_pidfile_with_stranger
+    out="$(in_fleet cmd_stop --now 2>&1)"
+    kill -0 "$HELD_PID" 2>/dev/null \
+      || fail "stop --now signalled a pid out of a stale pidfile, and it was somebody else's process: $out"
+    grep -q "dispatcher stopped" <<<"$out" \
+      && fail "it reported stopping a dispatcher it never found: $out"
+    grep -q "not one" <<<"$out" \
+      || fail "it said nothing about a pidfile naming something that is not a dispatcher: $out"
+    echo "ok: stop --now checks what it is about to signal, the way lib.sh does"
+    ;;
+  stop_stops_dispatcher)
+    make_fixture ok
+    hold_pidfile_with_dispatcher
+    out="$(in_fleet cmd_stop --now 2>&1)"
+    pid_gone "$HELD_PID" \
+      || fail "stop --now left the dispatcher running; the check it gained is refusing everything: $out"
+    grep -q "dispatcher stopped" <<<"$out" \
+      || fail "it stopped the dispatcher and did not say so: $out"
+    echo "ok: ...and still stops the one that is really there"
+    ;;
   run_refuses)
     make_fixture ok
     hold_pidfile_with_dispatcher
-    out="$(in_fleet cmd_run --auto 2>&1)"; rc=$?
+    out="$(run_one_pass)"; rc=$?
     [ "$rc" = 0 ] \
       && fail "a second dispatcher started while one was already running: $out"
     grep -q "$HELD_PID" <<<"$out" \
@@ -1480,6 +1551,6 @@ JSON
     echo "ok: a pidfile whose process is gone does not refuse"
     ;;
   *)
-    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind|status_stale|status_current|status_unrecorded|status_from_worktree|status_draining|status_drained|status_behind|status_behind_revert|status_unreadable|status_names_root|run_refuses|run_stale_recycled|run_stale_gone" >&2
+    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind|status_stale|status_current|status_unrecorded|status_from_worktree|status_draining|status_drained|status_behind|status_behind_revert|status_unreadable|status_names_root|run_refuses|run_stale_recycled|run_stale_gone|status_recycled|stop_spares_stranger|stop_stops_dispatcher" >&2
     exit 2 ;;
 esac
