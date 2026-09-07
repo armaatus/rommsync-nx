@@ -65,6 +65,22 @@ waiting for a fault already consumed. `RUN_SERIAL` cannot help with that and
 never could: it orders tests inside one `ctest` invocation and says nothing about
 a second one.
 
+Two `ctest`s at once broke a second thing, on disk rather than on the wire, and
+for the same reason (#151). `ROMMSYNC_TEST_SCRATCH` is per build tree, so it kept
+three worktrees apart but not two runs against one of them: `http.download` wrote
+a fixed `download.bin` into it, and the second run read a half-written file or
+renamed a `.part` the first was still using. Since then `tests/scratch.hpp` hands
+each process a leaf of its own named for its pid — created on first use, removed
+at exit, with the leaves of processes that are gone swept first, since CTest
+kills a test on `TIMEOUT` and it never removes its own. `harness::Sandbox` always
+worked this way and is now one level inside it.
+
+Set `ROMMSYNC_KEEP_SCRATCH=1` to keep the leaf and have its path printed, which
+is the only way to look at what a red run downloaded; `ROMMSYNC_KEEP_SANDBOX=1`
+implies it, since the sandbox it keeps lives inside the leaf. A kept leaf is
+marked, so the next test binary's sweep spares it too — which means it stays
+until you remove it.
+
 A scenario armed with no tag is still global, and applies to whoever asks next —
 that is what the one-line `curl` above does, and a tagged client falls back to it
 only when it has none of its own. `DELETE /__fault` clears the caller's own
@@ -528,7 +544,7 @@ ctest --test-dir build --output-on-failure
   `content_hash` in the same words. #119 spent 489 repetitions telling those
   apart. The scenario forces both through the fault proxy, one of them with a
   synthesised `mode: status` body, and asserts on the wording.
-- Two of them are about the harness rather than the engine, and they are the
+- Three of them are about the harness rather than the engine, and they are the
   ones that keep the rest honest. `harness.sandbox` needs no server and never
   skips: it covers the per-test SD card (`tests/harness.hpp`), which maps the
   SD-root paths the engine actually names onto a temp directory, is torn down
@@ -539,7 +555,12 @@ ctest --test-dir build --output-on-failure
   checks the audit fires for each way of getting it wrong, the commonest being a
   backup taken *after* the write. `harness.disarms` covers the other one: an
   armed fault cannot outlive the scope that armed it, and a spec the proxy
-  refuses fails the test rather than letting it run unarmed.
+  refuses fails the test rather than letting it run unarmed. `harness.scratch`
+  is the third, and needs no server either: it pins which leaves the scratch
+  sweep removes, since that sweep deletes directories in the build tree, and that
+  `scratch::Keep()` spares one. `scratch.concurrent` is its rig-side other half
+  — two real `ctest` invocations at once, because nothing inside one can see the
+  case at all.
 - `harness.backup` is where "back up **first**" is separated from "back up
   eventually", and the only way to tell them apart is to interrupt the
   overwrite: the download is cut mid-body, the save is untouched because

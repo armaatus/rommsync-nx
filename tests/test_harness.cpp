@@ -31,6 +31,7 @@
 // reasonable client would guess wrong, which are named at each scenario.
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -148,23 +149,23 @@ using Quiet = CapturedCerr;
 // it plants.
 
 void ScratchScenario(rig::Checks& checks) {
-  const std::string prefix = scratch::kLeafPrefix;
   const auto self = static_cast<long long>(::getpid());
 
   checks.ExpectEq(std::filesystem::path(scratch::Dir()).filename().string(),
-                  prefix + std::to_string(self), "the scratch leaf is named for this process");
+                  scratch::LeafName(self), "the scratch leaf is named for this process");
   checks.Expect(std::filesystem::is_directory(scratch::Dir()), "and it exists");
 
+  // 1. what the sweep removes ------------------------------------------------
   const std::filesystem::path root = std::filesystem::path(scratch::Dir()) / "sweep";
-  const std::filesystem::path mine = root / (prefix + std::to_string(self));
+  const std::filesystem::path mine = root / scratch::LeafName(self);
   // A pid above any a kernel hands out: `kill` answers ESRCH for it, which is
   // the only answer that means the owner is gone.
-  const std::filesystem::path dead = root / (prefix + "2147483646");
+  const std::filesystem::path dead = root / scratch::LeafName(2147483646);
   // Whatever started this process -- ctest, or a shell. Alive for the duration.
   const std::filesystem::path live =
-      root / (prefix + std::to_string(static_cast<long long>(::getppid())));
+      root / scratch::LeafName(static_cast<long long>(::getppid()));
   const std::filesystem::path stranger = root / "captures";
-  const std::filesystem::path malformed = root / (prefix + "12x");
+  const std::filesystem::path malformed = root / (std::string(scratch::kLeafPrefix) + "12x");
 
   std::error_code ignored;
   for (const std::filesystem::path& leaf : {mine, dead, live, stranger, malformed}) {
@@ -180,6 +181,33 @@ void ScratchScenario(rig::Checks& checks) {
   checks.Expect(std::filesystem::exists(mine), "nor is the caller's own");
   checks.Expect(std::filesystem::exists(stranger), "nor is a directory that is not a leaf");
   checks.Expect(std::filesystem::exists(malformed), "nor is a name that only looks like one");
+
+  // 2. and what keeps one from being removed at all ---------------------------
+  // `ROMMSYNC_KEEP_SANDBOX` keeps a tree that lives INSIDE the leaf, so it has
+  // to keep the leaf too or it keeps nothing. `scratch::Keep()` is what it asks
+  // with, and this is the destructor's decision made early against a stand-in.
+  const std::filesystem::path kept = root / "kept";
+  std::filesystem::create_directories(kept, ignored);
+  {
+    // Discard() announces a leaf it spares, and a green run should not.
+    Quiet quiet;
+    scratch::Keep();
+    scratch::detail::Discard(kept);
+  }
+  checks.Expect(std::filesystem::exists(kept), "Keep() spares a leaf on the way out");
+  checks.Expect(std::filesystem::exists(kept / scratch::detail::kKeepMarker),
+                "and marks it, so the NEXT process's sweep spares it too");
+
+  scratch::detail::Kept() = false;
+  // `ROMMSYNC_KEEP_SCRATCH` is the other half of `Keeping()`, and under it the
+  // rest of this cannot be asked -- the same reason `sandbox` stops asserting
+  // teardown under `ROMMSYNC_KEEP_SANDBOX`. A debugging switch may not turn a
+  // green suite red.
+  const char* keep_scratch = std::getenv("ROMMSYNC_KEEP_SCRATCH");
+  if (keep_scratch == nullptr || *keep_scratch == '\0') {
+    scratch::detail::Discard(kept);
+    checks.Expect(!std::filesystem::exists(kept), "and without it the leaf goes");
+  }
 
   std::filesystem::remove_all(root, ignored);
 }

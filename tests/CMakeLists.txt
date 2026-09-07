@@ -551,10 +551,19 @@ endforeach()
 # It runs `ctest` recursively, which is the case itself rather than a model of
 # it. The anchored regex is what keeps that from including this test.
 find_program(BASH_PROGRAM bash REQUIRED)
-set(CONCURRENT_CTEST_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_concurrent_ctest.sh")
+set(SCRATCH_CONCURRENT_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_scratch_concurrent.sh")
+# Which scenarios, and why these: each writes a fixed name into the scratch
+# directory, which is the mechanism, and each is READ-ONLY against RomM -- a GET
+# plus, since #118, a fault only its own client can claim. That second condition
+# is the load-bearing one, because the two invocations run at the same time
+# against one fixture: adding `post_form` or `multipart` here would put two
+# writers on the one fixture device and two logins against the rate limit. Cost
+# is the third filter -- `stall` and `cancel` take seconds, `progress` moves
+# 120 MiB -- and it is the only one that is merely a preference.
 add_test(NAME scratch.concurrent
-         COMMAND "${BASH_PROGRAM}" "${CONCURRENT_CTEST_TEST}"
-                 "${CMAKE_CTEST_COMMAND}" "${CMAKE_BINARY_DIR}" "^http\\.download$")
+         COMMAND "${BASH_PROGRAM}" "${SCRATCH_CONCURRENT_TEST}"
+                 "${CMAKE_CTEST_COMMAND}" "${CMAKE_BINARY_DIR}"
+                 "^http\\.(download|range|drop|resume|truncate|not_found)$")
 if(NOT ROMMSYNC_REQUIRE_RIG)
   set_tests_properties(scratch.concurrent PROPERTIES SKIP_RETURN_CODE 77)
 endif()

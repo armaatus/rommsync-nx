@@ -12,7 +12,7 @@
 # `download.bin.part` at once, each removing and renaming the other's file.
 # Either invocation could see it, so both are required to pass.
 #
-#   test_concurrent_ctest.sh <ctest> <build-dir> <regex>
+#   test_scratch_concurrent.sh <ctest> <build-dir> <regex>
 #
 # Skips with 77, like rig.smoke, when the tests it drives skip for want of RomM.
 set -uo pipefail
@@ -27,7 +27,21 @@ PATTERN="$3"
 SKIP=77
 
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+first=""
+second=""
+
+# The jobs are killed as well as the directory removed. If CTest ends this script
+# on TIMEOUT, two detached `ctest`s would otherwise keep hammering the shared
+# RomM fixture while the outer run moves on to other rig tests -- which presents
+# as those tests failing, with nothing pointing back here.
+cleanup() {
+  for job in $first $second; do
+    kill "$job" 2>/dev/null
+  done
+  wait 2>/dev/null
+  rm -rf "$work"
+}
+trap cleanup EXIT
 
 # Backgrounded and then waited on individually: `wait` without arguments loses
 # the exit status of each job, and it is precisely each job that has to pass.
@@ -40,18 +54,39 @@ wait "$first"
 first_status=$?
 wait "$second"
 second_status=$?
+first=""
+second=""
+
+# A failure is reported before anything else, so that one invocation skipping
+# while the other went red cannot be filed as "skipped".
+if [[ "$first_status" -ne 0 || "$second_status" -ne 0 ]]; then
+  echo "FAIL: concurrent ctest invocations of $PATTERN corrupted each other" >&2
+  echo "  first exited $first_status, second exited $second_status" >&2
+  for log in a b; do
+    echo "--- $log ---" >&2
+    cat "$work/$log.log" >&2
+  done
+  exit 1
+fi
 
 # A rig that is not running makes both invocations green without either having
-# downloaded anything, which proves nothing -- say so rather than pass.
-if grep -q '\*\*\*Skipped' "$work/a.log" "$work/b.log"; then
+# downloaded anything, which proves nothing -- say so rather than pass. Counted
+# per invocation, because ONE of them skipping is not a skip: it is half a run
+# reported as none, and the half that did download proved nothing on its own.
+skipped=0
+for log in a b; do
+  if grep -q '\*\*\*Skipped' "$work/$log.log"; then
+    skipped=$((skipped + 1))
+  fi
+done
+if [[ "$skipped" -eq 2 ]]; then
   echo "skipped: $PATTERN needs RomM"
   echo "  start it with: ./scripts/orca/compose.sh up -d"
   exit "$SKIP"
 fi
-
-if [[ "$first_status" -ne 0 || "$second_status" -ne 0 ]]; then
-  echo "FAIL: concurrent ctest invocations of $PATTERN corrupted each other" >&2
-  echo "  first exited $first_status, second exited $second_status" >&2
+if [[ "$skipped" -eq 1 ]]; then
+  echo "FAIL: one invocation of $PATTERN reached RomM and the other did not," >&2
+  echo "  so nothing ran concurrently and the result means nothing" >&2
   for log in a b; do
     echo "--- $log ---" >&2
     cat "$work/$log.log" >&2

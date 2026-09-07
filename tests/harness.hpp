@@ -132,6 +132,9 @@ class Sandbox {
       Audit(*checks_);
     }
     if (const char* keep = std::getenv("ROMMSYNC_KEEP_SANDBOX"); keep != nullptr && *keep != '\0') {
+      // The scratch leaf this sits in is removed when the process exits
+      // (tests/scratch.hpp), which would take the kept tree with it.
+      scratch::Keep();
       std::cerr << "  sandbox kept at " << root_.string() << "\n";
       return;
     }
