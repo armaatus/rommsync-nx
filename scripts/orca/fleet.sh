@@ -1820,10 +1820,16 @@ while that one is up."
        say "           ps -p $holder" ;;
   esac
 
-  echo $$ >"$PIDFILE"
-  # Written next to the pidfile and removed with it: a record of a dispatcher
-  # that is not running would report staleness about nothing.
+  # The record BEFORE the pidfile, and the order is the whole of it: every
+  # reader of the record reaches it through the pidfile -- `status` and
+  # `warn_blind_dispatcher` both ask `dispatcher_alive` first -- so a pid
+  # claimed before the record exists is a window in which this dispatcher is
+  # live, current, and has recorded nothing. `stop.sh` landing in it would
+  # announce that a dispatcher which reads the drain file perfectly well cannot
+  # see it. A record with no pidfile is inert the other way round: nothing looks
+  # at it, and the next dispatcher overwrites it.
   record_dispatcher
+  echo $$ >"$PIDFILE"
   # ...but removed only while they still name THIS process. Nothing stops a
   # second dispatcher from starting and claiming both files, and an unconditional
   # `rm` would then have the first one's exit delete the second one's record --
