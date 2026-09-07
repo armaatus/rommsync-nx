@@ -38,8 +38,11 @@ make_fixture() {
      "$WORK/repo/scripts/orca/"
   # merge_gate.py as well as the gather: resolve-thread.sh asks the gate whether
   # a thread list may be read as "none left" rather than deciding that itself.
-  cp "$REPO_ROOT/.github/scripts/pr_payload.sh" \
-     "$REPO_ROOT/.github/scripts/merge_gate.py" "$WORK/repo/.github/scripts/"
+  # EVERY .py, not merge_gate.py alone -- it imports its siblings (issue_refs),
+  # so naming one file makes this fixture break the next time the gate grows a
+  # module, which is exactly what it did.
+  cp "$REPO_ROOT"/.github/scripts/*.py \
+     "$REPO_ROOT/.github/scripts/pr_payload.sh" "$WORK/repo/.github/scripts/"
   git -C "$WORK/repo" init -q -b work
   git -C "$WORK/repo" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
 
