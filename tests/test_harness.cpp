@@ -1664,6 +1664,31 @@ void FaultOwnerScenario(rig::Checks& checks, const std::string& base) {
   }
   harness::ExpectDisarmed(checks, *mine, base, "both scopes disarmed");
 
+  {
+    // The other half of the same defect, and the half that damages nothing
+    // visible (#156): a stranger's DISARM. Every rig test that arms a fault
+    // opens with `rig::DisarmFault` -- "whatever an earlier run left armed must
+    // not damage this one" -- so before #118 a second `ctest` merely *starting
+    // up* cleared the scenario this one had just armed, and a fault that never
+    // fires fails its test on a call that SUCCEEDED. What that costs to
+    // attribute is in docs/TESTING.md, "One proxy, several clients".
+    //
+    // The stranger arms one of its own first, and the disarm is asserted to have
+    // cleared *that*. Without it this block passes on a `DELETE` that never
+    // arrived -- a proxy that 500s, or a connection that drops, leaves my fault
+    // armed for the same reason a correct proxy does, and 418 comes back either
+    // way. `harness::Fault`'s constructor makes the same argument about arming.
+    harness::Fault theirs(checks, *stranger, base,
+                          R"({"mode":"status","status":429,"path":"/api/heartbeat","count":1})");
+    harness::Fault ours(checks, *mine, base,
+                        R"({"mode":"status","status":418,"path":"/api/heartbeat","count":1})");
+    rig::DisarmFault(*stranger, base);
+    harness::ExpectDisarmed(checks, *stranger, base,
+                            "the stranger's disarm reached the proxy and cleared its own");
+    checks.ExpectEq(heartbeat(*mine), 418, "and did not clear mine with it");
+  }
+  harness::ExpectDisarmed(checks, *mine, base, "the third scope disarmed too");
+
   // The untagged scenario -- the documented one-line `curl`, which arms for
   // whichever request comes next -- is deliberately NOT asserted here. There is
   // one of those for the whole proxy by design, so a second `ctest` arming its

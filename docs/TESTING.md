@@ -65,6 +65,23 @@ waiting for a fault already consumed. `RUN_SERIAL` cannot help with that and
 never could: it orders tests inside one `ctest` invocation and says nothing about
 a second one.
 
+The scenario was not the only global thing: so was the `DELETE`, and every rig
+test that arms a fault opens with one (`rig::DisarmFault`, so that nothing an
+earlier run left armed damages this one). A second `ctest` merely starting up
+therefore cleared the scenario this one had just armed, and that symptom is the
+opposite of an off-by-one — the fault never fires at all, so the test fails on a
+call that *succeeded*. #156 is the measured instance: `tick.complete_stall`
+reported `completed` where it wanted `unreported`, which reads as a bug in the
+tick rather than as a stranger at the proxy. `harness.fault_owner` pins both
+halves, and it is the canonical account — the two comments at the scenes point
+here rather than repeating it.
+
+The fault is the half that was fixed. A rig test's *other* opening act,
+`harness::CloseOpenSessions`, is still global — it closes every `IN_PROGRESS`
+session belonging to the fixture device, and every rig process shares that
+device, so a second `ctest` starting up still ends this one's live session. That
+is #174, and it is the second half of what #156 turned out to be.
+
 Two `ctest`s at once broke a second thing, on disk rather than on the wire, and
 for the same reason (#151). `ROMMSYNC_TEST_SCRATCH` is per build tree, so it kept
 three worktrees apart but not two runs against one of them: `http.download` wrote
