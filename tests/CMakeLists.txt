@@ -532,6 +532,28 @@ foreach(scenario IN LISTS HTTP_SCENARIOS)
   set_tests_properties(http.${scenario} PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 endforeach()
 
+# --- and the same build tree under two `ctest`s at once ----------------------
+# M0-2 (#151). `http.download` is the shape that broke: a fixed destination name
+# in a directory every process shares, so the local loop's `ctest` and the
+# review's `ctest` removed and renamed each other's `download.bin.part`.
+# RUN_SERIAL cannot reach this -- it orders tests within ONE invocation (see the
+# top of this file) -- so the fix is in tests/scratch.hpp, and this is what holds
+# it. `harness.scratch` pins the same rule without a server.
+#
+# It runs `ctest` recursively, which is the case itself rather than a model of
+# it. The anchored regex is what keeps that from including this test.
+find_program(BASH_PROGRAM bash REQUIRED)
+set(CONCURRENT_CTEST_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_concurrent_ctest.sh")
+add_test(NAME scratch.concurrent
+         COMMAND "${BASH_PROGRAM}" "${CONCURRENT_CTEST_TEST}"
+                 "${CMAKE_CTEST_COMMAND}" "${CMAKE_BINARY_DIR}" "^http\\.download$")
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(scratch.concurrent PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+# RUN_SERIAL because the two invocations it starts are already two rig clients,
+# and nothing else may be a third.
+set_tests_properties(scratch.concurrent PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+
 # --- the console's HttpClient against the same rig ---------------------------
 # M1-7 (#126). The Horizon backend is split so that the half that can be got
 # wrong is reachable from here: `sysmodule/source/http/http_wire.cpp` speaks
@@ -1314,8 +1336,8 @@ set_tests_properties(contract.captures PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 # --- worktree environment: the `romm` tab in orca.yaml -----------------------
 # Shell, not C++, because the thing under test is a shell script. Splitting the
 # two phases keeps the regression (`waits`) meaningful with Docker stopped --
-# only `follows` needs the rig, so only it can skip.
-find_program(BASH_PROGRAM bash REQUIRED)
+# only `follows` needs the rig, so only it can skip. BASH_PROGRAM is found above,
+# for scratch.concurrent.
 set(ROMM_TAB_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_romm_tab.sh")
 
 add_test(NAME orca.romm_tab_waits COMMAND "${BASH_PROGRAM}" "${ROMM_TAB_TEST}" wait)
