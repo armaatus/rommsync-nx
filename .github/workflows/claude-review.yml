@@ -136,6 +136,21 @@ jobs:
         if: steps.token.outputs.have_token == 'true'
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The ONE bot allowed to start this job, and it is the one below.
+          #
+          # The `verdict` job asks for a second review with `gh workflow run`,
+          # which runs as `github-actions[bot]`. The action refuses a non-human
+          # actor by default -- "Workflow initiated by non-human actor:
+          # github-actions (type: Bot)" -- so without this the retry dispatches
+          # a run that always declines, and the whole "ask once more" is a
+          # mechanism that cannot fire. Observed on PR #147, this PR.
+          #
+          # Named, never `*`: on a public repository `*` lets any external App
+          # invoke this action with a prompt it controls (the action's own
+          # docs/security.md). Scoped to THIS job, which is read-only over the
+          # tree and can do nothing but submit a review; the `mention` job below
+          # is the one that can write, and it keeps its author-association gate.
+          allowed_bots: github-actions
           # No `track_progress`. It forces TAG mode, which waits for an @claude
           # trigger phrase in the pull request -- there is none on an automatic
           # review, so the action logged

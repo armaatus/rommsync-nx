@@ -482,7 +482,13 @@ REVIEWCMD
   # said nothing waited for a person to notice it.
   grep -q 'gh workflow run claude-review.yml' "$review_wf" \
     || fail "a review that submitted nothing no longer asks for another one; the PR waits for a person"
-  ok "a silent review asks for exactly one more"
+  # ...and the run it asks for must be allowed to happen. A dispatch by
+  # GITHUB_TOKEN runs as github-actions[bot], and claude-code-action refuses a
+  # non-human actor unless it is named here -- so without this the retry starts
+  # a run that always declines, which is a mechanism that cannot fire.
+  grep -qE "^[[:space:]]*allowed_bots:.*(github-actions|\*)" "$review_wf" \
+    || fail "the review job does not allow github-actions, so the review it asks for after a silent one is refused as a non-human actor"
+  ok "a silent review asks for exactly one more, and that one is allowed to run"
 fi
 
 # A cancelled run is not a green run. `cancel-in-progress` is right on a branch,

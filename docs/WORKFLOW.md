@@ -245,9 +245,27 @@ On GitHub:
   specific commit and a cancelled run leaves that commit with none — and the
   no-verdict notice is `needs: review`, so it does not fire either. And when a
   run finishes having submitted nothing, the `verdict` job says so in a comment
-  *and asks for one more review, once per head*. Before that, both remedies the
+  *and asks for one more review, once per head*. That dispatch runs as
+  `github-actions[bot]`, which the action refuses as a non-human actor unless it
+  is named in `allowed_bots` — so the review job names it, and only it. Before that, both remedies the
   comment named were manual, so a PR whose review was silent waited for a person
   to notice — which is the same dead end as a gate nothing re-runs.
+
+  **A PR that edits this file gets no review at all, and that is the action's
+  rule rather than this repository's.** `claude-code-action` refuses to run
+  unless the workflow file is byte-identical to the copy on the default branch:
+
+  > Skipping action due to workflow validation: Workflow validation failed. The
+  > workflow file must exist and have identical content to the version on the
+  > repository's default branch.
+
+  It is a supply-chain control — otherwise a pull request could rewrite the
+  prompt and the tool list of the agent reviewing it — and it makes the review
+  structurally impossible on any PR touching `claude-review.yml`. Those are
+  human-merge PRs anyway (`merge_gate.py` refuses `.github/workflows/**`), so
+  nothing is lost but the second opinion; what matters is not to spend review
+  rounds waiting for one. The `verdict` job says so in a comment rather than
+  leaving the silence unexplained. Observed on PR #147.
 
   The reviewer is also told to submit with `gh pr review --body`, not
   `--body-file`. Its allowed tools are Read, Grep, Glob and a fixed list of
