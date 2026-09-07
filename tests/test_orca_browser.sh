@@ -165,7 +165,8 @@ make_review_status_fixture() {
   make_fixture
   mkdir -p "$TMPDIR_FIXTURE/.github/scripts" "$TMPDIR_FIXTURE/stub-bin"
   cp "$REPO_ROOT"/scripts/orca/{review-status.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
-  cp "$REPO_ROOT/.github/scripts/merge_gate.py" "$TMPDIR_FIXTURE/.github/scripts/"
+  cp "$REPO_ROOT"/.github/scripts/{merge_gate.py,issue_refs.py} \
+     "$TMPDIR_FIXTURE/.github/scripts/"
   cat >"$TMPDIR_FIXTURE/stub-bin/gh" <<'GHSTUB'
 #!/usr/bin/env bash
 case "$*" in
@@ -1085,7 +1086,7 @@ STUB
        {"id":"T_live","isResolved":false,"isOutdated":true,
         "path":"core/src/sync.cpp","line":288,
         "comments":{"nodes":[{"author":{"login":"claude"},"body":"THE ONE STILL OPEN"}]}}' \
-      '"## Plan\n/code-review high\nmattpocock-skills:code-review\n"'
+      '"## Plan\nCloses #84\n/code-review high\nmattpocock-skills:code-review\n"'
     write_pr_checks \
       '{"name":"host-tests","status":"COMPLETED","conclusion":"SUCCESS",
         "startedAt":"2026-09-06T09:00:00Z","completedAt":"2026-09-06T09:30:00Z"}' \
@@ -1120,7 +1121,7 @@ STUB
         "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
         "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.",
         "comments":{"totalCount":0}}' \
-      '' '"## Plan\n/code-review high\nmattpocock-skills:code-review\n"'
+      '' '"## Plan\nCloses #84\n/code-review high\nmattpocock-skills:code-review\n"'
     write_pr_checks \
       '{"name":"merge-gate","status":"COMPLETED","conclusion":"FAILURE",
         "startedAt":"2026-09-06T09:00:00Z","completedAt":"2026-09-06T09:00:10Z",
@@ -1154,7 +1155,7 @@ STUB
        {"state":"COMMENTED","submittedAt":"2026-09-06T10:05:00Z",
         "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
         "body":"test","comments":{"totalCount":0}}' \
-      '' '"## Plan\n/code-review high\nmattpocock-skills:code-review\n"'
+      '' '"## Plan\nCloses #84\n/code-review high\nmattpocock-skills:code-review\n"'
     write_pr_checks \
       '{"name":"host-tests","status":"COMPLETED","conclusion":"SUCCESS",
         "startedAt":"2026-09-06T09:00:00Z","completedAt":"2026-09-06T09:30:00Z"}' \
@@ -1178,7 +1179,7 @@ STUB
         "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
         "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.",
         "comments":{"totalCount":0}}' \
-      '' '"## Plan\n/code-review high\nmattpocock-skills:code-review\n"'
+      '' '"## Plan\nCloses #84\n/code-review high\nmattpocock-skills:code-review\n"'
     write_pr_checks \
       '{"name":"merge-gate","status":"COMPLETED","conclusion":"FAILURE",
         "startedAt":"2026-09-06T11:00:00Z","completedAt":"2026-09-06T11:00:10Z",
@@ -1224,7 +1225,7 @@ core/src/sync.cpp'
         "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
         "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.",
         "comments":{"totalCount":0}}' \
-      '' '"## Plan\n/code-review high\nmattpocock-skills:code-review\n"'
+      '' '"## Plan\nCloses #84\n/code-review high\nmattpocock-skills:code-review\n"'
     write_pr_checks \
       '{"name":"merge-gate","status":"COMPLETED","conclusion":"FAILURE",
         "startedAt":"2026-09-06T09:00:00Z","completedAt":"2026-09-06T09:00:10Z",
@@ -1258,7 +1259,7 @@ core/src/sync.cpp'
         "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
         "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.",
         "comments":{"totalCount":0}}' \
-      '' '"## Plan\n/code-review high\nmattpocock-skills:code-review\n"'
+      '' '"## Plan\nCloses #84\n/code-review high\nmattpocock-skills:code-review\n"'
     write_pr_checks \
       '{"name":"merge-gate","status":"COMPLETED","conclusion":"CANCELLED",
         "startedAt":"2026-09-06T09:00:00Z","completedAt":"2026-09-06T09:10:05Z",
@@ -1287,7 +1288,7 @@ core/src/sync.cpp'
         "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
         "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.",
         "comments":{"totalCount":0}}' \
-      '' '"## Plan\n/code-review high\nmattpocock-skills:code-review\n"'
+      '' '"## Plan\nCloses #84\n/code-review high\nmattpocock-skills:code-review\n"'
     write_pr_checks \
       '{"name":"host-tests","status":"COMPLETED","conclusion":"SUCCESS",
         "startedAt":"2026-09-06T09:00:00Z","completedAt":"2026-09-06T09:30:00Z"}' \

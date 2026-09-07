@@ -375,6 +375,41 @@ if [ -f .github/workflows/ci.yml ]; then
   ok "main's builds are never cancelled by the next merge"
 fi
 
+echo "== the cross-reference conventions"
+# `Closes #N` and `Blocked by #N` are read by three parsers -- GitHub itself,
+# unblock.yml, and fleet.sh via merge_gate.py's neighbour -- and every way they
+# disagree is silent. The fleet either opens a second worktree for work already
+# in flight, or reports "nothing startable" with the backlog wide open.
+if [ -x .github/scripts/issue_refs.py ]; then
+  python3 .github/scripts/issue_refs.py --selftest 2>&1 | sed 's/^/  /'
+  [ "${PIPESTATUS[0]}" = 0 ] || fail "the issue-reference selftest does not hold"
+else
+  fail ".github/scripts/issue_refs.py is missing or not executable"
+fi
+
+# unblock.yml is JavaScript inside YAML and cannot import the module, so the one
+# thing keeping the two in step is that they spell the pattern identically.
+# Asserted from BOTH ends: change either alone and this goes red.
+grep -qF 'blocked\s+by\s+#(\d+)/gi' .github/workflows/unblock.yml \
+  || fail "unblock.yml no longer matches blocked\\s+by\\s+#(\\d+)/gi; issue_refs.BLOCKED_BY is now a different rule from the one that maintains the labels"
+python3 -c '
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("r", ".github/scripts/issue_refs.py")
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+sys.exit(0 if m.BLOCKED_BY.pattern == r"blocked\s+by\s+#(\d+)" else 1)
+' || fail "issue_refs.BLOCKED_BY no longer spells unblock.yml's pattern character for character"
+ok "the fleet and unblock.yml read the same blockers"
+
+# ...and the fleet reads the shared module rather than a pattern of its own. A
+# hand-rolled `Closes #` here is exactly the drift this file exists to catch.
+grep -q 'issue_refs' scripts/orca/fleet.sh \
+  || fail "fleet.sh no longer imports issue_refs; its parsers can drift from GitHub's again"
+if grep -nE 'r"(Closes|Blocked by) #' scripts/orca/fleet.sh; then
+  fail "fleet.sh has grown its own closing/blocker pattern again; there is one, in .github/scripts/issue_refs.py"
+fi
+ok "fleet.sh reads the shared patterns, not its own"
+
 echo "== the merge gate"
 # The one required check `gh pr merge --auto` waits on. Its decision lives in a
 # script rather than in the YAML precisely so it can be tested without a pull
@@ -387,6 +422,16 @@ else
 fi
 grep -q 'merge_gate.py' .github/workflows/merge-gate.yml \
   || fail "merge-gate.yml no longer calls merge_gate.py, so the check decides nothing"
+# merge_gate.py imports issue_refs.py, and the gate job checks out
+# `.github/scripts` ALONE. Widen that import to anything outside this directory
+# and the gate stops with an ImportError -- a required check that can never
+# conclude, on every PR.
+if ! grep -q 'sparse-checkout: .github/scripts' .github/workflows/merge-gate.yml; then
+  fail "merge-gate.yml no longer sparse-checks-out .github/scripts; the paths merge_gate.py imports from are no longer the ones it gets"
+fi
+( cd .github/scripts && python3 -c 'import merge_gate' ) \
+  || fail "merge_gate.py does not import with only .github/scripts on disk, which is all the gate job checks out"
+ok "the gate still imports from the only directory it is given"
 
 echo "== orca.yaml"
 if [ ! -f orca.yaml ]; then

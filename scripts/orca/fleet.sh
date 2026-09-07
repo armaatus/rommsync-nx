@@ -56,6 +56,11 @@ STATE_DIR="$ORCA_FLEET_DIR"
 STOP_FILE="$ORCA_FLEET_STOP"
 OWNED_DIR="$ORCA_FLEET_OWNED"
 STARTED_DIR="$STATE_DIR/started"
+# The `Closes #N` and `Blocked by #N` patterns, shared with merge_gate.py so the
+# dispatcher, the gate and GitHub cannot read the same body three ways. It sits
+# under .github/scripts/ because merge-gate.yml sparse-checks out that directory
+# alone; see the module's docstring.
+ISSUE_REFS="$REPO_ROOT/.github/scripts"
 LOG="$STATE_DIR/fleet.log"
 PIDFILE="$STATE_DIR/fleet.pid"
 
@@ -168,19 +173,21 @@ live_count() {
 ready_issues() {
   GH_PAGER=cat gh issue list --state open --limit 200 \
     --json number,title,body,labels 2>/dev/null | python3 -c '
-import json, re, sys
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from issue_refs import blocked_by
 issues = json.load(sys.stdin)
 blocks = {}
 for i in issues:
-    for m in re.finditer(r"Blocked by #(\d+)", i.get("body") or ""):
-        blocks[int(m.group(1))] = blocks.get(int(m.group(1)), 0) + 1
+    for n in blocked_by(i.get("body")):
+        blocks[n] = blocks.get(n, 0) + 1
 ready = [i for i in issues
          if any(l["name"] == "ready" for l in i.get("labels", []))]
 # Most-unblocking first, then oldest issue number: predictable inside a tie.
 for i in sorted(ready, key=lambda i: (-blocks.get(i["number"], 0), i["number"])):
     labels = ",".join(l["name"] for l in i.get("labels", []))
     print(i["number"], blocks.get(i["number"], 0), labels, i["title"], sep="\t")
-'
+' "$ISSUE_REFS"
 }
 
 # `ready` overstates availability: the label stays until the PR merges, so an
@@ -191,12 +198,13 @@ has_open_pr() {
   # regex.
   GH_PAGER=cat gh pr list --state open --json number,body --limit 100 2>/dev/null \
     | python3 -c '
-import json, re, sys
-want = re.compile(r"Closes #" + re.escape(sys.argv[1]) + r"\b")
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from issue_refs import closes_issue
 for p in json.load(sys.stdin):
-    if want.search(p.get("body") or ""):
+    if closes_issue(p.get("body"), sys.argv[2]):
         print(p["number"]); break
-' "$1" | grep -q .
+' "$ISSUE_REFS" "$1" | grep -q .
 }
 
 # 0 = in flight, 1 = free, 2 = could not tell. The third answer matters: a
@@ -221,12 +229,13 @@ issue_is_done() {
   [ "$state" = "CLOSED" ] && return 0
   GH_PAGER=cat gh pr list --state merged --limit 50 --json body 2>/dev/null \
     | python3 -c '
-import json, re, sys
-want = re.compile(r"Closes #" + re.escape(sys.argv[1]) + r"\b")
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from issue_refs import closes_issue
 for p in json.load(sys.stdin):
-    if want.search(p.get("body") or ""):
+    if closes_issue(p.get("body"), sys.argv[2]):
         print("done"); break
-' "$1" | grep -q .
+' "$ISSUE_REFS" "$1" | grep -q .
 }
 
 # How many `ready` issues could start right now, from ONE worktree list and ONE
@@ -237,21 +246,23 @@ count_startable() {
   live="$(live_worktrees)" || return 1
   prs="$(GH_PAGER=cat gh pr list --state open --json body --limit 100 --jq '.[].body' 2>/dev/null)" || return 1
   ready_issues | python3 -c '
-import re, sys
-running = {line.split("\t")[0] for line in sys.argv[1].splitlines() if line.strip()}
-bodies = sys.argv[2]
+import sys
+sys.path.insert(0, sys.argv[1])
+from issue_refs import closes
+running = {line.split("\t")[0] for line in sys.argv[2].splitlines() if line.strip()}
+# One parse of every open PR body, not one regex per issue: the bodies arrive
+# concatenated, and what matters is the set of issues they close between them.
+claimed = set(closes(sys.argv[3]))
 n = 0
 for line in sys.stdin:
     if not line.strip():
         continue
     issue = line.split("\t")[0]
-    if issue in running:
-        continue
-    if re.search(r"Closes #" + re.escape(issue) + r"\b", bodies):
+    if issue in running or int(issue) in claimed:
         continue
     n += 1
 print(n)
-' "$live" "$prs"
+' "$ISSUE_REFS" "$live" "$prs"
 }
 
 # --------------------------------------------------------------- the launch ---
