@@ -251,6 +251,18 @@ every thread, pushes, re-requests review, and checks:
 ./scripts/orca/review-status.sh    # exit 0 = every thread resolved, every check green
 ```
 
+Exit 4 is the same verdict on a PR that touches `.claude/`, `.github/workflows/`
+or `.github/scripts/`: nothing left to fix, and a person merges it. Exit 1 prints
+the reasons, and three of them are not waiting on a review — GitHub answering
+`BLOCKED` while every check is green is [#84](https://github.com/armaatus/rommsync-nx/issues/84),
+a stale run still counted by branch protection, and the script prints the
+`gh run rerun --job` that clears it; `DIRTY` is a conflict with the base, and
+`BEHIND` is a base that moved. None of the three is answered by another review.
+
+Checks are judged the way GitHub judges them, newest run per check *name*.
+`merge-gate` runs several times on one head on purpose, and every run before the
+review lands is an honest failure its own later run supersedes.
+
 Resolution comes from GitHub's own state through GraphQL, not from whether a
 reply exists — the REST endpoint for PR comments cannot report it, and
 `isOutdated` is not `isResolved`.
