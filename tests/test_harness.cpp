@@ -19,8 +19,9 @@
 // plus the harness's own two guarantees, which are the ones that keep the rest
 // honest: `sandbox` (the per-test SD card, and the backup rule it enforces
 // whether or not a test remembers to look) and `disarms` (a fault cannot
-// outlive the scope that armed it), and `fault_owner` (a fault belongs to the
-// client that armed it, so a second `ctest` cannot spend it -- #118).
+// outlive the scope that armed it), `fault_owner` (a fault belongs to the
+// client that armed it, so a second `ctest` cannot spend it -- #118) and
+// `session_owner` (nor end its live sync session by starting up -- #174).
 //
 // **What is deliberately not here.** The issue's wording asks for the client's
 // *behaviour* on a conflict and on a partial plan -- resolve by policy, count
@@ -41,7 +42,8 @@
 #include <thread>
 #include <vector>
 
-#include <unistd.h>  // getpid/getppid: the scratch scenario names both
+#include <sys/wait.h>  // WEXITSTATUS: session_owner runs a second process
+#include <unistd.h>    // getpid/getppid: the scratch scenario names both
 
 #include "harness.hpp"
 #include "rommsync/atomic_file.hpp"
@@ -1719,6 +1721,86 @@ void FaultOwnerScenario(rig::Checks& checks, const std::string& base) {
 }
 
 
+// --- session_owner ------------------------------------------------------------
+//
+// The half of #156 that #118 did not fix, and the same shape as `fault_owner`
+// above. Every rig `main()` opens by clearing what an earlier run left behind,
+// and one of the two things it clears was still everybody's:
+// `harness::CloseOpenSessions` completes every IN_PROGRESS session belonging to
+// the fixture device, and every rig process negotiates as that one device. So a
+// second `ctest` against this worktree -- an agent's run beside a review's --
+// ended this one's LIVE session merely by starting up (#174).
+//
+// What that costs to attribute is why it is a bug rather than a line in the
+// docs: the owner's own `complete` is then answered "already completed", so the
+// scenario reads its accounting call as failed and fails on an outcome, in a
+// test that armed nothing and touched nothing.
+//
+// The stranger is a real second process, because nothing inside one can see
+// this -- RUN_SERIAL orders tests within one invocation and says nothing about a
+// second one. It is this same binary under a scenario name no `main` knows,
+// which runs exactly the startup every rig test shares and then exits 2: the
+// reproduction measured in the issue, run from inside the suite.
+
+/// Run this binary the way a second `ctest` would, and return its exit code.
+///
+/// With a fault-proxy identity of its own rather than this process's:
+/// `rig::FaultOwner` exports `ROMMSYNC_FAULT_OWNER` so that a CHILD is part of
+/// its parent's scenario, and a stranger is the one thing that must not be.
+int RunStranger(const std::string& self) {
+  const std::string command =
+      "ROMMSYNC_FAULT_OWNER= '" + self + "' __not_a_scenario__ >/dev/null 2>&1";
+  const int status = std::system(command.c_str());
+  return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+void SessionOwnerScenario(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                          const harness::Fixture& fixture, const std::string& self) {
+  // Asked of the session by id rather than off the listing: `GET
+  // /api/sync/sessions` is capped at 50 and ordered `initiated_at DESC` over the
+  // whole user, and this scenario has to be able to say what became of ONE row.
+  const auto status_of = [&](std::int64_t id) {
+    const http::Result got = client.Send(harness::Authed(
+        http::Method::kGet, base + "/api/sync/sessions/" + std::to_string(id), fixture));
+    if (!got.successful()) {
+      return std::string("unreadable");
+    }
+    const json::ParseResult parsed = json::Parse(got.response.body);
+    return parsed.ok() ? harness::Field(parsed.value, "status") : std::string("unreadable");
+  };
+
+  // Nothing local to report: "what am I missing?" is a legitimate negotiate --
+  // it is the shape the contract probe uses -- and it opens a session like any
+  // other.
+  sync::SyncNegotiatePayload payload;
+  payload.device_id = fixture.device_id;
+
+  const http::Result negotiated = harness::Negotiate(checks, client, base, fixture, payload);
+  const json::ParseResult opened = json::Parse(negotiated.response.body);
+  if (!negotiated.successful() || !opened.ok()) {
+    checks.Expect(false, "negotiate opened a session -- " +
+                             std::to_string(negotiated.response.status) + " " +
+                             negotiated.response.body);
+    return;
+  }
+  const std::int64_t session = harness::Number(opened.value, "session_id");
+  if (session == 0) {
+    checks.Expect(false, "the negotiate response names its session");
+    return;
+  }
+  checks.ExpectEq(status_of(session), std::string("IN_PROGRESS"), "the session is live");
+
+  checks.ExpectEq(RunStranger(self), 2,
+                  "the stranger ran the startup every rig test shares and then rejected its "
+                  "scenario -- any other code means it never got that far, and the check below "
+                  "would pass having exercised nothing");
+  checks.ExpectEq(status_of(session), std::string("IN_PROGRESS"),
+                  "a stranger's startup leaves a session it does not own alone");
+
+  harness::CloseSession(client, base, fixture, negotiated.response.body);
+}
+
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1729,6 +1811,10 @@ int main(int argc, char** argv) {
 
   const std::string scenario = argc > 1 ? argv[1] : "sandbox";
   const std::string base = rig::BaseUrl();
+  // `session_owner` runs this same binary again as a stranger would. Absolute,
+  // because the child inherits a working directory but not whatever PATH lookup
+  // found this one.
+  const std::string self = std::filesystem::absolute(argv[0]).string();
 
   std::error_code error;
   std::filesystem::create_directories(rig::ScratchDir(), error);
@@ -1779,6 +1865,8 @@ int main(int argc, char** argv) {
     Disarms(checks, *client, base);
   } else if (scenario == "fault_owner") {
     FaultOwnerScenario(checks, base);
+  } else if (scenario == "session_owner") {
+    SessionOwnerScenario(checks, *client, base, fixture, self);
   } else if (scenario == "expired") {
     Expired(checks, *client, base, fixture);
   } else if (scenario == "stall") {
