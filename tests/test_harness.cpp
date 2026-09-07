@@ -1463,9 +1463,12 @@ void Backup(rig::Checks& checks, http::HttpClient& client, const std::string& ba
 // them by.
 
 void FaultOwnerScenario(rig::Checks& checks, const std::string& base) {
-  const std::unique_ptr<http::HttpClient> mine = rig::MakeClientAs("harness-fault-owner-mine");
+  // Both tags carry this process's own, because a second `ctest` runs this same
+  // scenario: two runs sharing the literal "mine" would spend each other's
+  // budget, which is the defect rather than a way to test it.
+  const std::unique_ptr<http::HttpClient> mine = rig::MakeClientAs(rig::FaultOwner() + "-mine");
   const std::unique_ptr<http::HttpClient> stranger =
-      rig::MakeClientAs("harness-fault-owner-stranger");
+      rig::MakeClientAs(rig::FaultOwner() + "-stranger");
 
   const auto heartbeat = [&base](http::HttpClient& client) {
     http::Request request;
@@ -1505,19 +1508,12 @@ void FaultOwnerScenario(rig::Checks& checks, const std::string& base) {
   }
   harness::ExpectDisarmed(checks, *mine, base, "both scopes disarmed");
 
-  {
-    // The documented manual workflow (CLAUDE.md, docs/TESTING.md): a `curl`
-    // that arms without a tag is asking for the next request through the
-    // proxy, whoever makes it. That has to keep working, or the one-liner in
-    // the docs quietly does nothing.
-    const std::unique_ptr<http::HttpClient> anonymous = rommsync::host::MakeCurlHttpClient();
-    const http::Result armed = rig::ArmFault(
-        *anonymous, base, R"({"mode":"status","status":503,"path":"/api/heartbeat","count":1})");
-    checks.Expect(armed.successful(), "an untagged client may still arm: " + armed.response.body);
-    checks.ExpectEq(heartbeat(*mine), 503, "an untagged fault applies to everybody");
-    rig::DisarmFault(*mine, base);
-  }
-  harness::ExpectDisarmed(checks, *mine, base, "and a disarm clears the untagged one too");
+  // The untagged scenario -- the documented one-line `curl`, which arms for
+  // whichever request comes next -- is deliberately NOT asserted here. There is
+  // one of those for the whole proxy by design, so a second `ctest` arming its
+  // own would replace the one this scenario was about: asserting on it against
+  // the shared proxy is the flake this file exists to rule out. It is pinned in
+  // process instead, by `proxy.ownership` (tests/test_fault_proxy.py).
 }
 
 

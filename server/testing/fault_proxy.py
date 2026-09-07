@@ -37,8 +37,9 @@ one ``ctest`` invocation and says nothing about a second one.
 A scenario armed with no tag stays global, and applies to every client -- that is
 the one-line ``curl`` in CLAUDE.md and docs/TESTING.md, which arms a fault for
 whichever request comes next. A tagged client falls back to it only when it has
-none of its own. ``DELETE`` clears the caller's scenario and the untagged one, so
-"leave the proxy disarmed" still means what it says.
+none of its own. ``DELETE`` clears the caller's own scenario and nothing else, so
+one client cannot disarm another's; an untagged scenario is cleared by an
+untagged ``DELETE``, or by age (``OWNER_TTL_SECONDS``).
 
 Scenario fields::
 
@@ -96,10 +97,10 @@ CHUNK = 64 * 1024
 OWNER_HEADER = "X-Fault-Owner"
 ANONYMOUS = ""
 
-# A tagged client is a process, and a process can die between arming a scenario
-# and firing it -- a killed `ctest` is the ordinary way. The registry would then
-# hold that tag forever, which matters only because it is unbounded: nothing
-# else claims a dead client's scenario. Pruned on the next arm.
+# A client is a process, and a process can die between arming a scenario and
+# firing it -- a killed `ctest` is the ordinary way, and a `curl` whose author
+# moved on is another. Nobody else may clear somebody's scenario, so age is what
+# does: pruned on the next arm or peek.
 OWNER_TTL_SECONDS = 3600
 
 # Hop-by-hop headers must not be forwarded (RFC 9110 s7.6.1). Content-Length and
@@ -164,68 +165,87 @@ class Registry:
             self._faults[owner] = Fault(spec, time.monotonic())
 
     def disarm(self, owner: str) -> None:
-        """Clear the caller's scenario, and the untagged one it falls back to.
+        """Clear the caller's own scenario, and nothing else.
 
-        Both, because a test's "leave the proxy disarmed" has to hold for the
-        next test whatever armed what: an untagged scenario left behind damages
-        everybody's next request, which is the failure this guarantee exists to
-        prevent.
+        Not the untagged one as well, tempting as it is for "leave the proxy
+        disarmed": clearing it would put every suite back to reaching into a
+        scenario it did not arm, which is the whole of #118 in the other
+        direction. An untagged scenario is cleared by an untagged ``DELETE`` --
+        the same `curl` that armed it -- or by the prune below.
         """
         with self._lock:
             self._faults.pop(owner, None)
-            self._faults.pop(ANONYMOUS, None)
 
     def peek(self, owner: str) -> dict | None:
-        """The scenario that would apply to `owner`, the way `claim` resolves it."""
+        """The scenario that would apply to `owner`, the way `claim` resolves it.
+
+        Including an untagged one, because that is a scenario this caller really
+        can claim: `ExpectDisarmed` is asking "is anything about to damage me?"
+        rather than "did I leave something behind".
+        """
         with self._lock:
-            fault = self._resolve(owner)
+            self._prune()
+            _, fault = self._resolve(owner)
             return dict(fault.spec) if fault else None
 
-    def claim(self, path: str, owner: str) -> dict | None:
-        """Return the scenario if this request should be damaged, else None.
+    def claim(self, path: str, owner: str) -> tuple[dict | None, str | None]:
+        """The scenario if this request should be damaged, and whose it was.
 
         Counts only requests that match ``path`` AND belong to the owner that
         armed it, so an ``after`` of 2 means "the third matching request from
         this client" regardless of unrelated traffic -- from this client or from
-        any other.
+        any other. The second element is the key it was claimed under, so the
+        caller can say out loud when one client spent another's untagged fault.
         """
         with self._lock:
-            fault = self._resolve(owner)
+            key, fault = self._resolve(owner)
             if fault is None:
-                return None
+                return None, None
             spec = fault.spec
             prefix = spec.get("path")
             if prefix and not path.startswith(prefix):
-                return None
+                return None, None
 
             fault.seen += 1
             index = fault.seen - 1
             after = int(spec.get("after", 0))
             if index < after:
-                return None
+                return None, None
 
             applied = index - after + 1
             if applied >= int(spec.get("count", 1)):
                 # Auto-disarm removes the entry rather than emptying it: an owner
                 # with nothing armed must fall back to the untagged scenario, the
                 # same as one that never armed anything.
-                self._drop(fault)
-            return dict(spec)
+                del self._faults[key]
+            return dict(spec), key
 
     # -- internals, all called under the lock ---------------------------------
-    def _resolve(self, owner: str) -> Fault | None:
-        """Your own scenario, or the untagged one when you have none."""
-        return self._faults.get(owner) or self._faults.get(ANONYMOUS)
+    def _resolve(self, owner: str) -> tuple[str | None, Fault | None]:
+        """Your own scenario, or the untagged one when you have none.
 
-    def _drop(self, fault: Fault) -> None:
-        for key, value in list(self._faults.items()):
-            if value is fault:
-                del self._faults[key]
+        Your own first and only: an owner holding a scenario that does not match
+        this path is not falling through to somebody else's. Faults are claimed
+        by their owner, and the untagged entry is the exception rather than a
+        second chance.
+        """
+        for key in (owner, ANONYMOUS):
+            fault = self._faults.get(key)
+            if fault is not None:
+                return key, fault
+        return None, None
 
     def _prune(self) -> None:
+        """Drop scenarios nobody is coming back for.
+
+        The untagged one included: a `curl` that armed a fault and then went to
+        lunch would otherwise damage the next request of every client that has
+        none of its own, for as long as this container lives -- and since no
+        other client may clear it (see `disarm`), the age is what does.
+        """
         cutoff = time.monotonic() - OWNER_TTL_SECONDS
         for key, value in list(self._faults.items()):
-            if key != ANONYMOUS and value.armed_at < cutoff:
+            if value.armed_at < cutoff:
                 del self._faults[key]
 
 
@@ -298,7 +318,14 @@ class Handler(BaseHTTPRequestHandler):
         # (/api/sync/negotiate, /api/auth/device/token) is a POST.
         body = self._read_body()
 
-        fault = FAULT.claim(self.path, self._owner())
+        owner = self._owner()
+        fault, claimed_from = FAULT.claim(self.path, owner)
+        if fault is not None and claimed_from == ANONYMOUS and owner != ANONYMOUS:
+            # The one case ownership cannot separate, said out loud rather than
+            # left to surface as an off-by-one somewhere else (#118): an untagged
+            # scenario is claimable by anybody, so this request may have just
+            # spent a fault somebody else was waiting for.
+            self.log_message("%s claimed the untagged scenario on %s", owner, self.path)
 
         if fault and fault["mode"] == "stall":
             # Hold the connection, then drop it -- and never forward. This is

@@ -223,23 +223,24 @@ inline http::Result DenyDeviceCode(http::HttpClient& client, const std::string& 
 
 /// The header a client puts its fault-proxy identity in.
 ///
-/// One proxy serves every client that dials this worktree, and before #118 it
-/// held ONE armed scenario for all of them: a second `ctest` running against
-/// the same rig spent another test's `after`/`count` budget, so the fault fired
-/// on a stranger's request and the test that armed it saw an off-by-one or a
-/// timeout in a file nobody had touched. A scenario armed with this header set
-/// is claimed only by requests carrying the same value.
+/// A scenario armed with it is claimed only by requests carrying the same value,
+/// so `after` and `count` count this client's traffic rather than everything
+/// moving through the proxy. Why that matters, and what the failure looked like
+/// before #118: docs/TESTING.md, "One proxy, several clients".
 inline constexpr const char* kFaultOwnerHeader = "X-Fault-Owner";
 
 /// This process's identity at the fault proxy. Stable for the process, unique
 /// between processes.
 ///
-/// Exported into the environment so a `fork()`ed child claims its parent's
-/// faults rather than becoming a stranger to them -- tests/test_conflicts.cpp
-/// and tests/test_token_store.cpp both fork, and the child's requests are part
-/// of the same scenario. The random suffix is there because a pid alone is
-/// reused: the proxy outlives the process that armed a fault, and a later
-/// process inheriting that pid would inherit the leftover with it.
+/// Exported into the environment, so that a child process is part of its
+/// parent's scenario rather than a stranger to it. Nothing in the suite forks a
+/// client today (the two tests that do fork -- test_conflicts and
+/// test_token_store -- make no requests from the child), and the export is what
+/// keeps that from silently mattering the day one does.
+///
+/// The random suffix is there because a pid alone is reused: the proxy outlives
+/// the process that armed a fault, and a later process inheriting that pid would
+/// inherit the leftover with it.
 inline const std::string& FaultOwner() {
   static const std::string owner = [] {
     if (const char* inherited = std::getenv("ROMMSYNC_FAULT_OWNER");
@@ -271,8 +272,6 @@ class OwnedHttpClient : public http::HttpClient {
                         const http::DownloadTarget& target) override {
     return inner_->Download(Signed(request), target);
   }
-
-  const std::string& owner() const { return owner_; }
 
  private:
   /// Only what goes through the proxy is signed. The suite also drives a

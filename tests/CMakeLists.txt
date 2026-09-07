@@ -18,9 +18,15 @@ else()
 endif()
 message(STATUS "rig: ${PROXY_BASE_URL}")
 
+# Several tests here are Python: the fault proxy's own rules, the contract probe,
+# the policy phases and the docs checks. One interpreter for all of them.
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+
 # --- what RUN_SERIAL is for, and what it is not -------------------------------
 #
-# Every rig test below carries RUN_SERIAL, and the reason is the SHARED FIXTURE:
+# Nearly every rig test below carries RUN_SERIAL (`rig.smoke`, `rig.provisioned`
+# and `engine.server` are the exceptions, being read-only against the fixture),
+# and the reason is the SHARED FIXTURE:
 # one RomM, one library, one fixture device with ONE active sync session on it
 # (#76), and a ten-inits-a-minute rate limit that is per IP and so per suite. Two
 # rig tests at once read, upload and delete each other's saves.
@@ -926,6 +932,15 @@ set(HARNESS_SCENARIOS
   content_hash    # the MD5 this client computes is the one RomM compares against
 )
 
+# The proxy's ownership rules again, in process. `harness.fault_owner` proves
+# them end to end over a socket; this proves the half that cannot be asserted
+# against a SHARED proxy at all -- there is one untagged scenario for the whole
+# of it by design, so a second `ctest` arming its own would replace the one an
+# assertion was about. No socket and no container, so it never skips.
+add_test(NAME proxy.ownership
+         COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_fault_proxy.py")
+set_tests_properties(proxy.ownership PROPERTIES TIMEOUT 60)
+
 foreach(scenario IN LISTS HARNESS_SCENARIOS)
   add_test(NAME harness.${scenario} COMMAND test_harness ${scenario})
 
@@ -1249,9 +1264,9 @@ set_tests_properties(harness.partial PROPERTIES REPEAT UNTIL_PASS:3)
 # server/contract/captures/ is what the docs quote and what M1/M2 will be coded
 # against. Re-running the probe here is what stops a RomM upgrade from being
 # discovered on a console: the shapes are compared, not the ids and timestamps.
-# Python, because the probe it drives is python and shares its redaction rules.
-find_package(Python3 COMPONENTS Interpreter REQUIRED)
-
+# Python, because the probe it drives is python and shares its redaction rules;
+# the interpreter is found at the top of this file, where the first Python test
+# needs it.
 add_test(NAME contract.captures
          COMMAND ${Python3_EXECUTABLE}
                  "${CMAKE_CURRENT_SOURCE_DIR}/test_contract_captures.py"
@@ -1830,8 +1845,9 @@ foreach(scenario IN LISTS DOWNLOAD_RIG_SCENARIOS)
     set_tests_properties(download.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
   endif()
   # RUN_SERIAL for the reason every rig test has it (see the top of this file):
-  # these move the shared fixture's roms, and two at once would compete for the
-  # rig's bandwidth as well as its library.
+  # these download the shared fixture's roms, and they download them into one
+  # scratch directory under fixed names, so two at once read each other's
+  # half-written files (#151).
   set_tests_properties(download.${scenario} PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
 endforeach()
 

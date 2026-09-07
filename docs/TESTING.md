@@ -268,8 +268,9 @@ ctest --test-dir build --output-on-failure
   "the http tests". They run `RUN_SERIAL` because they share one RomM fixture,
   not because they share a fault: since #118 an armed scenario belongs to the
   client that armed it (see *One proxy, several clients* above). The streaming
-  ones pull RomM's own frontend bundle — the only large resource the rig serves that does not first need a
-  library scan, which is socket.io-driven rig work belonging to M0-5.
+  ones pull RomM's own frontend bundle — the only large resource the rig serves
+  that does not first need a library scan, which is socket.io-driven rig work
+  belonging to M0-5.
 - **`wire.*` is the same eighteen scenarios against the console's backend**
   (M1-7, #126), out of the same source file compiled twice rather than a copy of
   it. `sysmodule/source/http/http_wire.cpp` is the HTTP half of the Horizon

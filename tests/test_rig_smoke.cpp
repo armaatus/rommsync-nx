@@ -18,6 +18,7 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <random>
 #include <string>
 
 namespace {
@@ -30,9 +31,13 @@ constexpr int kSkip = 77;  // CTest SKIP_RETURN_CODE -- see tests/CMakeLists.txt
 /// rig, which is how this file used to fail with "expected the armed fault to
 /// yield 401" having done nothing wrong (#118). tests/rig.hpp says the same
 /// thing for the tests that speak through `HttpClient`; this one is raw libcurl
-/// on purpose, so it repeats it rather than sharing it.
-std::string OwnerTag() {
-  return "rig-smoke-" + std::to_string(static_cast<long>(::getpid()));
+/// on purpose, so it repeats it rather than sharing it -- random suffix
+/// included, because the proxy outlives this process and pids come round again.
+const std::string& OwnerTag() {
+  static const std::string tag = "rig-smoke-" +
+                                 std::to_string(static_cast<long>(::getpid())) + "-" +
+                                 std::to_string(std::random_device{}());
+  return tag;
 }
 
 std::size_t Collect(char* data, std::size_t size, std::size_t nmemb, void* out) {
