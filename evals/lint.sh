@@ -131,6 +131,12 @@ echo "== guards actually guard"
 # The exhaustive table lives in the hook itself (`guard.py --selftest`), next to
 # the code it constrains, so a guard and its assertion cannot drift into
 # separate files. It runs here so `ctest -R agent.config` and CI both cover it.
+#
+# One deliberate exception, below: the fleet's self-protection is asserted HERE
+# rather than in the table, because a fleet-opened worktree cannot write
+# `.claude/hooks/` -- which is the very rule being asserted. The table cannot
+# grow an assertion that only a hand-opened worktree may add, so `guard.py
+# --selftest` alone is no longer the whole record. This file is the rest of it.
 if [ -x .claude/hooks/guard.py ]; then
   python3 .claude/hooks/guard.py --selftest 2>&1 | sed 's/^/  /'
   [ "${PIPESTATUS[0]}" = 0 ] || fail "the guard selftest does not hold"
@@ -146,8 +152,77 @@ if [ -x .claude/hooks/guard.py ]; then
   printf '%s\n' "$REPO_ROOT" >"$guard_tmp/worktrees/999"
   ROMMSYNC_FLEET_DIR="$guard_tmp" python3 .claude/hooks/guard.py --selftest >/dev/null 2>&1 \
     || fail "the guard selftest depends on where it is run: it fails inside a fleet worktree"
-  rm -rf "$guard_tmp"
   ok "the guard selftest holds from inside a fleet worktree too"
+
+  # ...and the fleet gate has to cover every path in SELF_PROTECTED, not just
+  # the hook. `_stateful_checks` drives `.claude/hooks/` and stops there, so
+  # dropping `.claude/settings.json` from SELF_PROTECTED leaves every one of its
+  # assertions green. settings.local.json is the sharper half -- it is
+  # gitignored, so a permission rule written into it appears in no diff, which
+  # is exactly why the guard covers it.
+  #
+  # Nothing stops `_stateful_checks` from asserting this; what stops it is the
+  # workflow constraint at the top of this section -- a fleet-opened worktree
+  # cannot write `.claude/hooks/`, so the table cannot grow the assertion. Here
+  # it can.
+  #
+  # Absolute and root-relative paths only. The `cd`-relative form is a real hole
+  # in the guard rather than a gap in these assertions -- see #139.
+  tool_call() {
+    python3 -c 'import json, sys; print(json.dumps({"tool_name": sys.argv[1], "tool_input": {sys.argv[2]: sys.argv[3]}}))' \
+      "$1" "$2" "$3"
+  }
+  assert_fleet_blocks() {
+    local why
+    why="$(printf '%s' "$1" \
+      | ROMMSYNC_FLEET_DIR="$guard_tmp" python3 .claude/hooks/guard.py 2>&1 >/dev/null)"
+    local got=$?
+    # Exit 2 on its own is not proof: the guard also exits 2 for a payload it
+    # cannot read (asserted below), so a malformed tool call would report ok for
+    # a check that never reached the self-protection branch. Match the reason.
+    case "$got:$why" in
+      2:*"enforcement layer"*) ok "$2" ;;
+      2:*) fail "$2: blocked, but not as the enforcement layer: $why" ;;
+      *)   fail "$2: the fleet gate let it through (exit $got)" ;;
+    esac
+  }
+
+  # The list below is literal on purpose: derived from SELF_PROTECTED, removing
+  # an entry would remove its own check. That catches a removal but not an
+  # ADDITION -- a fourth marker would get no assertion and the claim above would
+  # quietly narrow -- so pin the set as well.
+  if sp_drift="$(python3 -c '
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("g", ".claude/hooks/guard.py")
+g = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(g)
+want = {"/.claude/hooks/", "/.claude/settings.json", "/.claude/settings.local.json"}
+if set(g.SELF_PROTECTED) != want:
+    print(repr(sorted(g.SELF_PROTECTED)))
+    sys.exit(1)
+')"; then
+    ok "SELF_PROTECTED still names exactly the paths asserted below"
+  else
+    fail "SELF_PROTECTED is now $sp_drift; give each entry an assertion below and update this list"
+  fi
+
+  # guard.py decides ownership from `git rev-parse --show-toplevel`, and with no
+  # repo root it correctly allows the write. Without this the six assertions
+  # below would go red claiming the fleet gate leaked, when the real cause is
+  # git -- dubious-ownership inside a container, a source export with no .git,
+  # no git on PATH. `_stateful_checks` guards the same dependency with `if root:`.
+  if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+    fail "git cannot resolve this checkout, so the fleet gate cannot be exercised"
+  else
+    for target in .claude/hooks/guard.py .claude/settings.json .claude/settings.local.json; do
+      assert_fleet_blocks "$(tool_call Edit file_path "$REPO_ROOT/$target")" \
+        "a fleet worktree cannot edit $target"
+      assert_fleet_blocks "$(tool_call Bash command "echo x > $target")" \
+        "...nor rewrite $target from the shell"
+    done
+  fi
+
+  rm -rf "$guard_tmp"
 else
   fail ".claude/hooks/guard.py is missing or not executable"
 fi
