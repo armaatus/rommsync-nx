@@ -1490,6 +1490,12 @@ endforeach()
 # `keeps` and `unknown_git` phases are the half that matters -- the release is
 # guarded by "clean, and nothing absent from origin/main", and a guard that
 # guessed would delete the work it exists to protect.
+#
+# ...and the removal's ORDER (#163). `--run-hooks` archived a worktree's RomM
+# stack before Orca had agreed to remove anything, so "could not remove it" left
+# a live worktree with no rig -- #122's, mid-ctest. The `remove_` pair fixes the
+# order without leaking the stack; the `merged_` pair is reap_merged catching up
+# with what reap_abandoned already does, on a dirty tree and on a refusal.
 set(ORCA_FLEET_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_orca_fleet.sh")
 foreach(phase card_says card_quiet remove_forces remove_advice
               remove_keeps_stack remove_sweeps_stack

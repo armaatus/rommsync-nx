@@ -447,10 +447,20 @@ because that is the job that can write.
 ### Stage 6 — Maintain
 
 Once the PR merges, `fleet.sh` marks the card `completed`, comments which PR
-landed, and removes the worktree with `--run-hooks` — which is not optional:
-without it `orca.yaml`'s archive hook never runs and that worktree's RomM stack
-survives under `restart: unless-stopped`, holding two ports forever with nothing
-left on disk to identify it by. Then the next `ready` issue takes the slot.
+landed, and removes the worktree — first checking the working tree is clean, the
+way it already checks nothing is unpushed. Then the next `ready` issue takes the
+slot.
+
+The removal runs **no Orca hooks**, and sweeps the stack itself once the worktree
+is confirmed gone. `--run-hooks` looks like the obvious way to run `orca.yaml`'s
+archive hook, and it is the wrong one: Orca runs the hook *before* it decides
+whether it will remove the worktree at all, so a removal it then refuses — a
+dirty tree, the submodule — has already taken that worktree's RomM stack and
+volumes down. #163 caught this in #122's worktree: the agent was mid-`ctest`,
+`ipc.engine` failed after 90s with ~130 tests skipped behind it, and the log said
+only "could not remove it". So `fleet.sh` removes without hooks and then runs
+`./scripts/orca/reap.sh --yes`, which needs no worktree; a refused removal now
+leaves the stack up and says so.
 
 #### Releasing a worktree
 
@@ -633,8 +643,9 @@ are shared (`.cache/roms`, `.cache/ccache`), so no agent can corrupt another's
 fixtures.
 
 Removing a worktree from the **Orca UI** runs the teardown hook. `orca worktree
-rm` does **not** unless you pass `--run-hooks` — which is why `fleet.sh` always
-does. Sweep anything left behind with `./scripts/orca/reap.sh --yes`.
+rm` does **not** unless you pass `--run-hooks`. Sweep anything left behind with
+`./scripts/orca/reap.sh --yes` — which is what `fleet.sh` does deliberately
+rather than passing the flag, for the reason in Stage 6.
 
 ## When the loop stalls
 

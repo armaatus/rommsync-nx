@@ -778,7 +778,7 @@ JSON
       || fail "it kept the directory but disowned the issue, so nothing looks at it again"
     grep -q "uncommitted" <<<"$out" || fail "it did not say what is in there: $out"
     grep -q "worktree rm" "$ORCA_CALLS" \
-      && fail "it attempted the removal anyway, and --run-hooks archives the stack first"
+      && fail "it attempted the removal anyway, on a worktree holding uncommitted work"
     # Once per worktree, not once per poll.
     again="$(release_pass)"
     grep -q "uncommitted" <<<"$again" && fail "it says so every poll: $again"

@@ -42,9 +42,11 @@
 #
 # It does not merge -- `merge-gate` and GitHub's auto-merge do that. It does not
 # touch a worktree it did not create. And it removes one only when nothing goes
-# with it: either that worktree's PR merged and nothing is unpushed, or its issue
-# can no longer produce a merged PR at all and the worktree is clean and holds no
-# commit that is not already in origin/main.
+# with it: either that worktree's PR merged and the worktree is clean with
+# nothing unpushed, or its issue can no longer produce a merged PR at all and the
+# worktree is clean and holds no commit that is not already in origin/main. A
+# removal that is REFUSED changes nothing either -- the stack comes down after
+# the worktree is gone, never before.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -512,11 +514,12 @@ except Exception:
 }
 
 # ---------------------------------------------------------------- the reap ---
-# A worktree whose PR is merged has done its job and is holding a slot. Only
-# ones this dispatcher created are touched, and only when nothing is unpushed.
-# `--run-hooks` is not optional: without it orca.yaml's archive hook never runs,
-# and the worktree's RomM stack survives under `restart: unless-stopped`, holding
-# two ports forever with nothing left on disk to identify it by.
+# A worktree whose PR is merged has done its job and is holding a slot. Only ones
+# this dispatcher created are touched, and only when nothing goes with them:
+# nothing unpushed, and a clean working tree. Its RomM stack has to come down
+# with it, or it survives under `restart: unless-stopped` holding two ports
+# forever with nothing left on disk to identify it by -- but AFTER the removal,
+# not before it. See remove_worktree.
 # Remove a worktree, judged by whether it is GONE rather than by an exit code.
 #
 # #27 logged "could not remove it" at 02:08 and kept the slot; the very same
@@ -545,33 +548,92 @@ except Exception:
 # the issue by then, so `fleet.sh status` still shows the worktree while the
 # dispatcher no longer counts it -- one slot idle for nearly three hours.
 #
-# Forcing is safe HERE specifically: the only caller checks the PR is merged and
-# that nothing is unpushed first. --force forces the worktree removal, not the
-# branch deletion.
+# Forcing is safe HERE specifically: both callers check the worktree holds
+# nothing first. --force forces the worktree removal, not the branch deletion.
+#
+# ## Why the archive hook does not run through the CLI (#163)
+#
+# `orca worktree rm --run-hooks` runs orca.yaml's archive hook -- archive.sh,
+# which takes the stack and its volumes down -- and it runs it BEFORE Orca
+# decides whether it will remove the worktree at all. Orca then refuses (a dirty
+# working tree, the submodule), and "could not remove it" has already destroyed
+# the thing the worktree could not be worked in without:
+#
+#   16:49:15  #122: PR #159 is merged; marking it done and removing the worktree
+#   16:49:32    could not remove it; sweep later with ./scripts/orca/reap.sh
+#
+# That agent was mid-ctest. `ipc.engine` failed after 90s with ~130 tests skipped
+# behind it, and the fixture had lost its scan and its token -- none of which the
+# log above suggests. So the order is inverted here: the removal is attempted
+# with no hooks at all, and only a worktree that is genuinely GONE gets its stack
+# swept. A refusal now changes nothing.
+#
+# The sweep is reap.sh, which is exactly the tool for "a stack whose worktree no
+# longer exists" and needs no worktree to run -- CLAUDE.md names it as the manual
+# counterpart of this same trade. It is the whole sweep rather than one project
+# because it derives what is live from `git worktree list`, refuses to guess, and
+# an orphan left by an earlier refused removal is one this pass should collect
+# too.
+#
+# The autostart watcher is the hook's other half, and it does not survive
+# dropping --run-hooks by itself: its pidfile lives INSIDE the worktree, so it is
+# read before the removal and signalled after one that worked. A watcher left
+# behind polls the Orca runtime for a directory that is gone, forever.
 remove_worktree() {
-  local path="$1" out
+  local path="$1" out watcher
+  # Pure reads, before anything can be destroyed.
+  watcher="$(cat "$path/.orca/agent-autostart.pid" 2>/dev/null || true)"
   out="$(mktemp)"
   ORCA_RUN_CAPTURE_STDERR=1 orca_run_with_deadline 180 "$out" "$ORCA_CLI" worktree rm \
-    --worktree "path:$path" --run-hooks --json
-  if [ ! -d "$path" ]; then rm -f "$out"; return 0; fi
+    --worktree "path:$path" --json
+  if [ ! -d "$path" ]; then rm -f "$out"; archive_removed "$path" "$watcher"; return 0; fi
   ORCA_RUN_CAPTURE_STDERR=1 orca_run_with_deadline 180 "$out" "$ORCA_CLI" worktree rm \
-    --worktree "path:$path" --run-hooks --force --json
-  if [ ! -d "$path" ]; then rm -f "$out"; return 0; fi
+    --worktree "path:$path" --force --json
+  if [ ! -d "$path" ]; then rm -f "$out"; archive_removed "$path" "$watcher"; return 0; fi
   # Labelled, because the caller's "could not remove it" comes after these and
   # an unlabelled fatal: line above it reads like the fleet's own.
   while IFS= read -r line; do
     [ -n "$line" ] && say "  the removal refused: $line"
   done < <(sed -n '1,3p' "$out")
+  # The line #122 needed and did not get. Whoever is in there keeps a working
+  # rig, and the next thing they read should say so rather than leaving them to
+  # discover it from a ctest that fails in a way the log never explains.
+  say "  nothing was torn down -- its RomM stack is still up and the worktree is still usable"
   rm -f "$out"
   return 1
 }
 
+# What --run-hooks used to do, run only once the worktree is established to be
+# gone. Never fatal: the worktree IS removed by the time this is called, so a
+# docker that is down or a sweep that half-finished is a stack to collect later,
+# not a removal to report as failed.
+archive_removed() {
+  local path="$1" watcher="$2"
+  # The identity check is archive.sh's: a pidfile outlives a `kill -9` and a
+  # reboot, and signalling a recycled pid means signalling something else of the
+  # user's.
+  if [ -n "$watcher" ] && kill -0 "$watcher" 2>/dev/null \
+     && ps -o command= -p "$watcher" 2>/dev/null | grep -q 'agent-autostart'; then
+    kill "$watcher" 2>/dev/null || true
+  fi
+  # Named in the log because it deletes databases, and because a sweep that
+  # refused is two ports and four volumes coming back on every `docker start`.
+  if ! "$REPO_ROOT/scripts/orca/reap.sh" --yes >>"$LOG" 2>&1; then
+    say "  removed, but the stack sweep did not finish -- see $LOG, then ./scripts/orca/reap.sh"
+  fi
+  return 0
+}
+
 reap_merged() {
-  local f num path branch merged unpushed
+  local f num path branch merged unpushed dirty
   for f in "$OWNED_DIR"/*; do
     [ -e "$f" ] || continue
     num="$(basename "$f")"; path="$(cat "$f")"
     [ -d "$path" ] || { disown_issue "$num"; continue; }
+    # Already attempted once, and refused. Not retried, for reap_abandoned's
+    # reason: a retry loop is an interruption and a board comment once a minute
+    # under whoever is still working in there.
+    [ -e "$STATE_DIR/stuck-$num" ] && continue
     branch="$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null)" || continue
     merged="$(GH_PAGER=cat gh pr list --head "$branch" --state merged \
                 --json number --jq '.[0].number' 2>/dev/null)"
@@ -583,15 +645,37 @@ reap_merged() {
       card "$path" --comment "#$num: PR #$merged merged, $unpushed unpushed commit(s) here"
       continue
     fi
+    # The other half of the same question, and the half #122 fell through (#163).
+    # A merged PR says nothing about the WORKING TREE: auto-merge fires the
+    # moment the last check passes, so review fixes made after it -- #122's
+    # became #160 -- are sitting uncommitted here while `@{u}..HEAD` is empty.
+    #
+    # Not worktree_holdings, which reap_abandoned uses: that also asks what is
+    # absent from origin/main, and a SQUASH merge leaves every commit on this
+    # branch absent from it by construction. Asked here, no merged worktree would
+    # ever be released again.
+    dirty="$(git -C "$path" status --porcelain 2>/dev/null | grep -c .)"
+    if [ "${dirty:-0}" != 0 ]; then
+      say "#$num: PR #$merged merged, but the worktree holds $dirty uncommitted change(s) -- leaving it"
+      card "$path" --comment "#$num: PR #$merged merged, $dirty uncommitted change(s) here"
+      continue
+    fi
 
     say "#$num: PR #$merged is merged; marking it done and removing the worktree"
     card "$path" --workspace-status completed --comment "#$num: merged in PR #$merged"
-    # NOT reap.sh: that removes RomM stacks whose WORKTREE IS GONE, so a worktree
-    # that failed to delete is precisely the case it skips -- and it says
-    # "nothing to reap", which reads like success.
-    remove_worktree "$path" \
-      || say "  could not remove it; by hand: git worktree remove --force '$path'"
-    disown_issue "$num"
+    if remove_worktree "$path"; then
+      disown_issue "$num"
+    else
+      # NOT disowned, and NOT pointed at reap.sh. This function iterates OWNED
+      # issues only, so an issue dropped on a refused removal is a worktree
+      # nothing ever looks at again -- #122's stood from 16:49 until a person
+      # removed it. And reap.sh removes stacks whose WORKTREE IS GONE, so a
+      # worktree that is still there is precisely the case it skips: it would
+      # print "nothing to reap", which reads like success.
+      : >"$STATE_DIR/stuck-$num"
+      say "  could not remove it; it keeps its slot until you do: git worktree remove --force '$path'"
+      card "$path" --comment "#$num: merged in PR #$merged, but the removal refused -- still here, still counted"
+    fi
   done
 }
 
@@ -660,10 +744,11 @@ reap_abandoned() {
     [ -e "$f" ] || continue
     num="$(basename "$f")"; path="$(cat "$f")"
     [ -d "$path" ] || { disown_issue "$num"; continue; }
-    # Already tried once, and the removal refused. Not retried, because
-    # `orca worktree rm --run-hooks` takes the RomM stack down BEFORE the removal
-    # is known to succeed (#163) -- so a retry loop is a stack torn down once a
-    # minute under whoever is still working in there.
+    # Already tried once, and the removal refused. Not retried: the removal
+    # interrupts the agent and writes to the board, so a retry loop is both, once
+    # a minute, under whoever is still working in there. (It is no longer a stack
+    # torn down once a minute -- that was the ordering defect, fixed in
+    # remove_worktree for #163 -- but the noise alone is reason enough.)
     [ -e "$STATE_DIR/stuck-$num" ] && continue
 
     reason=""; asked=1
@@ -763,9 +848,9 @@ reap_abandoned() {
     fi
 
     say "#$num: $reason, and the worktree still holds nothing -- releasing the slot"
-    # Interrupted again before the removal: `--run-hooks` archives this worktree's
-    # RomM stack, and an agent that ignored the warning would lose its rig
-    # mid-suite and then keep writing into a directory being deleted (#163).
+    # Interrupted again before the removal: an agent that ignored the warning
+    # would otherwise keep writing into a directory being deleted, and lose its
+    # rig with it the moment the removal lands (#163).
     interrupt_agent_in "$path"
     # The comment and no status. `completed` is reap_merged's word for work that
     # landed, and this worktree is being released precisely because it did not.
