@@ -84,16 +84,26 @@ jobs:
     # rather than ungrouped so several PULL_REQUEST events on one head run one
     # at a time.
     #
-    # Pull_request events only. On a `workflow_dispatch` there is no
-    # `pull_request` in the event context, so both halves fall back to
-    # `inputs.pr` and the group becomes `claude-review-<N>-<N>` -- which never
-    # matches the head-keyed group a pushed event uses, so a dispatched review
-    # can run alongside one rather than queuing behind it. It cannot be fixed
-    # here: `concurrency` is evaluated before any step runs, so there is nothing
-    # to resolve the head sha with. `cancel-in-progress: false` on both means
-    # the worst case is two reviews of one head, never a lost verdict. Said
-    # rather than left implied, because a comment claiming a serialisation it
-    # does not provide is the same defect this file is being changed to fix.
+    # A DISPATCH GETS ITS OWN GROUP, via `github.run_id`.
+    #
+    # There is no `pull_request` in a `workflow_dispatch` event, so the sha half
+    # has to fall back to something. It used to fall back to `inputs.pr`, which
+    # made every dispatched run for one PR share `claude-review-<N>-<N>` -- and
+    # `cancel-in-progress: false` does not save you there, because GitHub keeps
+    # at most ONE pending run per group and cancels the pending one when a newer
+    # arrives.
+    #
+    # That is not theoretical: on this PR, a manual dispatch (a human actor,
+    # which the action accepts) was cancelled 21 seconds later by the `verdict`
+    # job's automatic retry (a bot, which main's copy of this file still
+    # refuses). A review that would have produced a verdict was killed by one
+    # that could not. An earlier version of this comment claimed the worst case
+    # was "two reviews of one head, never a lost verdict"; that was wrong, and
+    # the run that disproved it is 34116465221.
+    #
+    # `github.run_id` is unique per run, so dispatches never contend with each
+    # other or with a pushed event. Pushed events still group by head sha, which
+    # is what keeps several events on one head to one review.
     #
     # SERIALISED, NOT DEDUPLICATED, and the difference matters. `synchronize`
     # and `review_requested` both fire on the ordinary "push a fix, re-request
@@ -108,7 +118,7 @@ jobs:
     # cancelled review leaves the head with no verdict and nothing that says so.
     # Left standing and written down rather than half-fixed here.
     concurrency:
-      group: claude-review-${{ github.event.pull_request.number || inputs.pr }}-${{ github.event.pull_request.head.sha || inputs.pr }}
+      group: claude-review-${{ github.event.pull_request.number || inputs.pr }}-${{ github.event.pull_request.head.sha || github.run_id }}
       cancel-in-progress: false
     # Explicit, so that the `verdict` job below can hold `actions: write` --
     # which it needs to ask for one more review -- without this job inheriting
