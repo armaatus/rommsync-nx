@@ -500,9 +500,9 @@ set_tests_properties(rig.smoke PROPERTIES TIMEOUT 120)
 # --max-requests-jitter 100`, so each worker is retired after roughly a thousand
 # requests -- and a request nginx has already handed to the worker that is on its
 # way out comes back as a 502 the client never asked for. Nothing about the call
-# is wrong and nothing retries it, so it surfaces as one test in a few hundred
-# failing on whatever it happened to be doing. That is #155, and it is why
-# harness.partial carried a quarantine.
+# is wrong, and the harness does not retry it, so it surfaces as one test in a
+# few hundred failing on whatever it happened to be doing. That is #155, and it
+# is why harness.partial carried a quarantine.
 #
 # `recycling` reads the compose file, so the setting stays checkable with docker
 # stopped. `recycling_live` asks the daemon, because a stack started before the
@@ -1328,45 +1328,37 @@ foreach(scenario IN LISTS TICK_RIG_SCENARIOS)
   set_tests_properties(tick.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 endforeach()
 
-# harness.partial is intermittently red, and #119 measured how often instead of
-# sampling it: quarantine off, alone on the stack, `--repeat until-fail`. It
-# failed twice in 489 repetitions -- at 84 and again at 243 -- so roughly one run
-# in 250. It is not fixed, and the retry stays.
+# harness.partial carried a QUARANTINE here until #155. What it was catching was
+# not a race in this test at all: RomM launches gunicorn with `--max-requests
+# 1000 --max-requests-jitter 100`, so a worker is retired every thousand-odd
+# requests, and the request nginx has already handed to the one on its way out
+# comes back as a 502 nobody asked for. The fixture no longer recycles
+# (server/testing/docker-compose.yml, held by rig.recycling), and this test then
+# ran 2000 repetitions clean without the retry -- four times the 500 #155 asked
+# for -- while a control with recycling put back reproduced the 502.
 #
-# What those 489 repetitions did NOT produce is the failure this comment used to
-# describe. #76's second sync session, and the `Session is already CANCELLED`
-# that comes of it, never appeared once. BOTH failures were `harness::ServerMd5`
-# reading back a save row RomM had answered with an empty `content_hash` -- a
-# third mode, nothing to do with the session, and now filed as #155. All the test
-# said about it was `FAIL: the MD5 of partial-2.srm`, which is why ServerMd5 now
-# names the row and what came back in place of the digest (tests/harness.hpp,
-# and harness.md5_diagnosis holds it to that).
+# #119 measured the rate right and named the wrong mode, and the reason is worth
+# keeping: `FAIL: the MD5 of partial-2.srm` was equally true of an upload that
+# never landed and of a save row RomM answered with no digest on it, and
+# `ServerMd5` left the caller's hash empty either way, so the two lines under it
+# followed either way too. A message that cannot say what it saw does not just
+# cost repetitions; it can spend them proving the wrong thing. That is what
+# tests/harness.hpp's diagnostics and harness.md5_diagnosis are for.
 #
-# 489 repetitions of not seeing #76's mechanism -- a SECOND session appearing
-# mid-scenario, RomM cancelling the one the test opened, planned 3 and completed
-# 0 -- is not proof it is gone, only that it is rarer than this. So the
-# diagnostics `Partial` prints for it, every session the device has, stay.
+# What #119's 489 repetitions did NOT produce is the failure the comment here
+# described before that. #76's second sync session, and the `Session is already
+# CANCELLED` that comes of it, never appeared once -- which is not proof it is
+# gone, only that it is rarer than this. So the diagnostics `Partial` prints for
+# it, every session the device has, stay.
 #
 # The comparison #119 and #109 both proposed -- this loop again with the fault
-# proxy's #109 fix reverted -- cannot settle anything here, and that needs no
-# experiment to see: neither this test nor execute.occupied ever arms a `stall`,
-# so the replayed-request path #109 fixed is not on either side of the
-# comparison. It was run both ways regardless -- 196 repetitions unfixed and 293
-# fixed, one failure in each -- and those two numbers are consistent with each
-# other and with no difference at all. They are not evidence OF no difference:
-# one failure per arm cannot measure a rate, which is this issue's own complaint
-# turned on its own experiment. The argument above is what carries the point.
-#
-# So this is still a QUARANTINE, not a fix: retry it rather than leave `main` red
-# on a race nobody has explained. It is deliberately narrow -- one test, named,
-# with the issue on it -- because a repo that retries tests by default has
-# stopped being able to tell flaky from broken.
-#
-# It comes out when #155 is fixed and 500 repetitions are clean WITHOUT it -- not
-# when an issue closes. #76 is closed and this is still here, because closing it
-# measured nothing. Green with the retry is not evidence the race is gone --
-# green WITHOUT it is.
-set_tests_properties(harness.partial PROPERTIES REPEAT UNTIL_PASS:3)
+# proxy's #109 fix reverted -- could never have settled anything, and that needs
+# no experiment to see: neither this test nor execute.occupied ever arms a
+# `stall`, so the replayed-request path #109 fixed is not on either side of the
+# comparison. It was run both ways regardless, 196 repetitions unfixed and 293
+# fixed with one failure in each, and one failure per arm cannot measure a rate.
+# Both arms printed the message that cannot separate the two modes, so neither
+# arm is evidence for either of them.
 
 # --- the committed API captures still match a live RomM ----------------------
 # server/contract/captures/ is what the docs quote and what M1/M2 will be coded

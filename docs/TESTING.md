@@ -155,6 +155,7 @@ that demonstrates it. A box checked because someone believes it is not checked.
 | 1 | The engine builds on a laptop with warnings as errors, and the same `core/` sources still build for Horizon — compiled and linked, not just parsed. | `cmake --build build`; CI `switch-build` (a real devkitA64 build of both targets, checked to be a PFS0 and an `ULTR`-signed `.ovl`); `switch.builds`, `switch.ci_requires_artifacts` |
 | 2 | One command brings up a real RomM 5.2.0 on a throwaway volume, isolated per worktree. | `scripts/orca/compose.sh up -d`; `rig.smoke`; `orca.env_*` |
 | 3 | That fixture is *usable*, not merely running: library scanned, collection created, client token minted with no human in the loop. | `rig.provisioned`; [`provision.py`](../server/testing/provision.py) |
+| 3b | ...and *stable*: it answers the ten-thousandth call the way it answered the first, rather than retiring a worker under a request in flight. | `rig.recycling`, `rig.recycling_live` |
 | 4 | The failure paths a healthy RomM will not produce on demand can be forced, deterministically, in CI. | `http.status`, `http.truncate`, `http.drop`, `http.stall`, `pair.stall`, `pair.drop`, and the whole `harness.*` set |
 | 5 | Nothing in the engine names a transport: every network call goes through `HttpClient`. | CI `static` → *core/ includes nothing platform-specific* |
 | 6 | The response shapes the docs quote are the ones a live RomM returns, and the structs read those same bytes. | `contract.captures`, `auth.shapes`, `device.shapes` |
@@ -311,8 +312,19 @@ ctest --test-dir build --output-on-failure
   RomM answers `slow_down` to a client that undercuts the `interval` it asked
   for, and that is the one rule the loop has to obey. `RUN_SERIAL`, like the
   `http.*` tests, for the same shared-fixture reason.
-- One rig constraint worth knowing before it looks like a flake: RomM rate
-  limits `POST /api/auth/device/init` to **ten a minute, per IP**. A console
+- Two rig constraints worth knowing before either looks like a flake. The first
+  no longer bites, and is here because it did: RomM launches gunicorn with
+  `--max-requests 1000 --max-requests-jitter 100`, so each worker is retired
+  after roughly a thousand requests, and whatever nginx had already handed it
+  comes back as a **502 the client never asked for**. Against a suite this size
+  that is about one call in a few hundred, landing on whichever test was holding
+  it — which is what `harness.partial`'s quarantine was catching (#155). The
+  fixture sets `WEB_SERVER_MAX_REQUESTS: "0"`, and `rig.recycling` /
+  `rig.recycling_live` hold both the setting and the running stack to it. A
+  stack started before that line existed still recycles:
+  `./scripts/orca/compose.sh up -d romm` picks it up.
+- The second is still live: RomM rate limits
+  `POST /api/auth/device/init` to **ten a minute, per IP**. A console
   pairs once; the suite opens a dozen codes from one address, so `pair.*` waits
   a rate-limited init out rather than failing on it. The wait is bounded, so an
   init broken for any other reason still goes red.
@@ -539,11 +551,16 @@ ctest --test-dir build --output-on-failure
   against the one the server computed) and `md5_diagnosis` (what
   `harness::ServerMd5` *says* when it cannot get that digest).
 - `harness.md5_diagnosis` is about that oracle's failure *message*, because
-  `ServerMd5` fails intermittently — about one call in 250 (#155) — and used to
-  report an upload that never landed and a row RomM answered with an empty
-  `content_hash` in the same words. #119 spent 489 repetitions telling those
-  apart. The scenario forces both through the fault proxy, one of them with a
-  synthesised `mode: status` body, and asserts on the wording.
+  `ServerMd5` used to fail about one call in 250 and reported an upload that
+  never landed and a row RomM answered with an empty `content_hash` in the same
+  words. #119 spent 489 repetitions on those failures and, because the message
+  could not separate them, filed the rate against the second; #155 reproduced the
+  first at that rate with RomM's log to match — a 502 from its own nginx when
+  gunicorn retired the worker holding the request, now off in the fixture (see
+  the rig constraints above) — and never once saw the second. The scenario
+  forces both shapes through the fault proxy, one of them with a
+  synthesised `mode: status` body, and asserts on the wording, which is what
+  makes the next one answerable in a single run instead of five hundred.
 - Three of them are about the harness rather than the engine, and they are the
   ones that keep the rest honest. `harness.sandbox` needs no server and never
   skips: it covers the per-test SD card (`tests/harness.hpp`), which maps the
@@ -668,9 +685,12 @@ Credentials land in `server/testing/fixture-auth.env` (gitignored):
 `tests/rig.hpp`, which creates the same user itself — whichever runs first wins,
 and they only agree because the constants are kept identical.
 
-`rig.smoke` asks whether RomM is up; `rig.provisioned` asks whether it is usable.
-Both are needed: the first passed throughout the entire period the library was
-empty.
+`rig.smoke` asks whether RomM is up; `rig.provisioned` asks whether it is usable;
+`rig.recycling` and `rig.recycling_live` ask whether it will still answer the
+same way ten thousand calls in. All three are needed, and each one passed through
+the whole period the next was false: the first throughout the entire period the
+library was empty, and the second throughout the period every full run had a
+one-in-a-few-hundred chance of a 502 from a retired worker (#155).
 
 ### Keeping the captured contract honest
 

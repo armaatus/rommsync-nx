@@ -18,8 +18,12 @@ below, and a stall models a server that never produced a response at all.
 proxy synthesise a response RomM did not send -- which is a real mock, with a
 real mock's drift, and is why it is used for shapes RomM produces rarely rather
 than for shapes it produces every day. ``harness.md5_diagnosis`` is the standing
-example: RomM answers a save row with an empty ``content_hash`` about one call in
-250 (#155), and waiting for it costs hundreds of repetitions.
+example: RomM's schema allows a save row with no ``content_hash`` on it -- the
+column is nullable, and the hash is None for any file the server cannot read --
+and nobody has ever seen 5.2.0 emit one, so there is nothing to wait for. (The
+one-call-in-250 rate this used to cite belonged to a different failure: a 502
+from RomM's nginx when gunicorn retired a worker mid-request, which the fixture
+no longer does -- #155.)
 
 Control API (not forwarded upstream)::
 

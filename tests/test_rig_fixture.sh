@@ -42,11 +42,23 @@ phase_recycling_live() {
   . "$REPO_ROOT/scripts/orca/lib.sh"
 
   orca_docker_ready || { echo "docker is not answering -- skipping"; exit "$SKIP"; }
-  orca_derive_env "$REPO_ROOT" || fail "could not derive this worktree's compose project"
+
+  # The stack the tests are actually talking to. .env is what compose.sh reads,
+  # so it is the authority here -- unlike teardown, which recomputes precisely
+  # because it must work when .env is gone (scripts/orca/lib.sh). The derivation
+  # is the fallback for a checkout that has not generated one yet.
+  local project=""
+  if [ -f "$REPO_ROOT/.env" ]; then
+    project="$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' "$REPO_ROOT/.env" | head -1)"
+  fi
+  if [ -z "$project" ]; then
+    orca_derive_env "$REPO_ROOT" || fail "no COMPOSE_PROJECT_NAME in .env, and none derivable"
+    project="$orca_project"
+  fi
 
   local container
   container="$(docker ps \
-    --filter "label=com.docker.compose.project=$orca_project" \
+    --filter "label=com.docker.compose.project=$project" \
     --filter "label=com.docker.compose.service=romm" \
     --format '{{.Names}}' 2>/dev/null | head -1)"
   [ -n "$container" ] || { echo "this worktree's RomM is not running -- skipping"; exit "$SKIP"; }
@@ -65,7 +77,10 @@ phase_recycling_live() {
       line="$(tr "\0" " " < "$proc" 2>/dev/null)" || continue
       case "$line" in *gunicorn*--max-requests*) printf "%s\n" "$line"; break ;; esac
     done' 2>/dev/null)"
-  [ -n "$args" ] || fail "no gunicorn process in $container"
+  # A container that is up but has not reached gunicorn yet is a stack still
+  # starting, not a stack misconfigured -- the same condition every rig test
+  # skips on, and one -DROMMSYNC_REQUIRE_RIG=ON turns back into a failure.
+  [ -n "$args" ] || { echo "$container has not started gunicorn yet -- skipping"; exit "$SKIP"; }
 
   local setting
   setting="$(printf '%s\n' "$args" | grep -oE -- '--max-requests [0-9]+' | head -1)"
