@@ -1288,12 +1288,16 @@ restart_advice() {
 # "could not tell" is not "current": a staleness report that fails open is the
 # same silence #173 was.
 report_dispatcher_code() {
-  local root started commit hash now log
+  local root started commit hash now log remote
   root="$(dispatcher_field root)"
   started="$(dispatcher_field started)"
   hash="$(dispatcher_field hash)"
   commit="$(dispatcher_field commit)"
-  if [ -z "$hash" ] || [ -z "$root" ] || [ ! -e "$root/scripts/orca/fleet.sh" ]; then
+  # -r, not -e: fleet_code_hash answers nothing for a file it cannot READ, and
+  # nothing compares unequal to the recorded hash -- which would report a
+  # dispatcher as STALE on the strength of a permission error. "Cannot say" is
+  # the honest answer to every question this cannot ask.
+  if [ -z "$hash" ] || [ -z "$root" ] || [ ! -r "$root/scripts/orca/fleet.sh" ]; then
     echo "  it recorded no fleet.sh at start -- it predates this check, or the"
     echo "  checkout it started from is gone -- so this cannot say whether a"
     echo "  recent fix is live in it."

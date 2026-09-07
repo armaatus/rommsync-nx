@@ -1508,7 +1508,8 @@ foreach(phase card_says card_quiet remove_forces remove_advice
               abandon_lookup_blind
               status_stale status_current status_unrecorded
               status_from_worktree status_draining status_drained
-              status_behind status_behind_revert status_names_root)
+              status_behind status_behind_revert status_unreadable
+              status_names_root)
   add_test(NAME orca.fleet_${phase}
            COMMAND "${BASH_PROGRAM}" "${ORCA_FLEET_TEST}" ${phase})
   set_tests_properties(orca.fleet_${phase} PROPERTIES TIMEOUT 60)

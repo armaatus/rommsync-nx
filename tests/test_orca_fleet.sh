@@ -230,6 +230,12 @@
 #                                         The commits are how the report names
 #                                         what changed; the bytes are what
 #                                         decides that anything did.
+#   test_orca_fleet.sh status_unreadable  the dispatcher's own fleet.sh cannot be
+#                                         READ -> "cannot say", not STALE. A hash
+#                                         nobody could take compares unequal to
+#                                         every recorded one, so a permission
+#                                         error would otherwise be reported as a
+#                                         change.
 #   test_orca_fleet.sh status_names_root  the restart it prints names the
 #                                         dispatcher's OWN checkout. This report
 #                                         is read from a fleet worktree, and a
@@ -1314,6 +1320,23 @@ JSON
       || fail "it stopped saying when the dispatcher started: $out"
     echo "ok: commits that cancel out are not something to pull for"
     ;;
+  status_unreadable)
+    make_fixture ok
+    make_repo_git
+    dispatcher_running
+    in_fleet record_dispatcher
+    # Asked from a second checkout, because a fleet.sh nothing can read is also
+    # a fleet.sh nothing can source.
+    older_checkout "$(git -C "$WORK/repo" rev-parse HEAD)"
+    chmod 000 "$WORK/repo/scripts/orca/fleet.sh"
+    out="$(in_fleet_at "$WORK/wt2" cmd_status 2>&1)"
+    chmod 644 "$WORK/repo/scripts/orca/fleet.sh"
+    grep -qi "cannot say" <<<"$out" \
+      || fail "a file it could not read was reported as an answer: $out"
+    grep -qi "STALE" <<<"$out" \
+      && fail "it read a permission error as a change to the file: $out"
+    echo "ok: a hash nobody could take is 'cannot say', not 'stale'"
+    ;;
   status_names_root)
     make_fixture ok
     make_repo_git
@@ -1330,6 +1353,6 @@ JSON
     echo "ok: the restart it prints names the dispatcher's own checkout"
     ;;
   *)
-    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind|status_stale|status_current|status_unrecorded|status_from_worktree|status_draining|status_drained|status_behind|status_behind_revert|status_names_root" >&2
+    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind|status_stale|status_current|status_unrecorded|status_from_worktree|status_draining|status_drained|status_behind|status_behind_revert|status_unreadable|status_names_root" >&2
     exit 2 ;;
 esac
