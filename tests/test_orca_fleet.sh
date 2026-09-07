@@ -126,6 +126,15 @@
 #                                           never go away.
 #   test_orca_fleet.sh list_says_declined   a run that declined every issue it was
 #                                           given does not report that they landed.
+#   test_orca_fleet.sh abandon_reason_flickers
+#                                           the reason goes away and comes back ->
+#                                           a FRESH pass of notice. unblock.yml
+#                                           re-derives `blocked` on every merge,
+#                                           so a label that flickers is the
+#                                           ordinary case, and a warning spent on
+#                                           the first occurrence must not be
+#                                           inherited by the second -- that is a
+#                                           worktree removed with no notice at all.
 #
 # The Orca CLI and gh are stubbed on PATH; the fleet state dir is a temp dir.
 # Nothing here touches a real worktree, docker, or GitHub.
@@ -854,7 +863,36 @@ JSON
     grep -q "declined" <<<"$out" || fail "the last line does not say what really happened: $out"
     echo "ok: a run that declined its issues does not report that they landed"
     ;;
+  abandon_reason_flickers)
+    make_fixture ok
+    make_worktree
+    add_origin
+    quiet_issue
+    agent_state working
+    # 1. It goes blocked, and the first pass warns.
+    issue_labels "blocked"
+    release_pass >/dev/null 2>&1
+    [ -e "$ROMMSYNC_FLEET_DIR/warned-42" ] \
+      || fail "could not arm warned-42, so the assertion that follows would be vacuous"
+    # 2. unblock.yml relabels it on somebody else's merge and the reason is gone.
+    issue_labels "ready"
+    out="$(release_pass)"
+    [ -n "$out" ] && fail "it had nothing to say about a worktree with no reason to release: $out"
+    [ -e "$ROMMSYNC_FLEET_DIR/warned-42" ] \
+      && fail "the spent warning outlived the reason that bought it"
+    # 3. A second dependency is added and it goes blocked again. This pass must
+    #    warn, not remove: the notice is per occasion, not once per worktree.
+    issue_labels "blocked"
+    out="$(release_pass)"
+    [ -d "$WORK/wt" ] \
+      || fail "it removed the worktree with no notice at all, on a warning spent for an earlier occurrence: $out"
+    grep -q "next pass" <<<"$out" || fail "it did not warn the second time: $out"
+    # 4. ...and then it goes, so this is a delay rather than a deadlock.
+    out="$(release_pass)"
+    [ -d "$WORK/wt" ] && fail "the second warning never turned into a release: $out"
+    echo "ok: a reason that comes back buys a fresh pass of notice"
+    ;;
   *)
-    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined" >&2
+    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers" >&2
     exit 2 ;;
 esac
