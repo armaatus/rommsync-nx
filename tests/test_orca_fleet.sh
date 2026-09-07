@@ -179,6 +179,26 @@
 #                                           could read, and the notice starts over
 #                                           every time GitHub hiccups -- silently.
 #
+# ...and the one thing the dispatcher cannot re-read: itself. `fleet.sh run`
+# parses its functions once, at start, so a fix merged to `main` is live in the
+# worktree and NOT live in the dispatcher that is running -- for 27 hours, over
+# four PRs, with nothing anywhere saying so (#173).
+#
+#   test_orca_fleet.sh status_stale       fleet.sh moved on since the dispatcher
+#                                         started -> status says when it started,
+#                                         NAMES the commits that are not live in
+#                                         it, and says a restart is what fixes
+#                                         it, the cap included.
+#   test_orca_fleet.sh status_current     it is running the file on disk ->
+#                                         still says when it started, and does
+#                                         not cry stale. A warning every poll on
+#                                         a current dispatcher teaches you to
+#                                         ignore the one that matters.
+#   test_orca_fleet.sh status_unrecorded  a dispatcher from before this check ->
+#                                         "cannot say", not "current". A staleness
+#                                         report that fails open is the silence
+#                                         #173 already was.
+#
 # The Orca CLI and gh are stubbed on PATH; the fleet state dir is a temp dir.
 # Nothing here touches a real worktree, docker, or GitHub.
 set -uo pipefail
@@ -418,6 +438,24 @@ in_fleet() { (cd "$WORK/repo" && . ./scripts/orca/fleet.sh && "$@"); }
 # per-poll answer cache and the state dir, and only there can one of them undo
 # what the other just wrote.
 in_poll() { (cd "$WORK/repo" && . ./scripts/orca/fleet.sh; for fn in "$@"; do "$fn"; done); }
+
+# The fixture repo under git, because "which fixes are not live in the running
+# dispatcher" is answered in commits and cannot be faked with a hash alone.
+make_repo_git() {
+  git -C "$WORK/repo" init -q -b main
+  git -C "$WORK/repo" -c user.email=t@t -c user.name=t add -A
+  git -C "$WORK/repo" -c user.email=t@t -c user.name=t commit -q -m "the fleet as the dispatcher parsed it"
+}
+
+# A commit that changes fleet.sh under a dispatcher that is already up. A
+# trailing comment, so the file the test itself sources still behaves.
+merge_fleet_fix() {
+  printf '# %s\n' "$1" >>"$WORK/repo/scripts/orca/fleet.sh"
+  git -C "$WORK/repo" -c user.email=t@t -c user.name=t commit -q -am "$1"
+}
+
+# A dispatcher this shell can answer `kill -0` for.
+dispatcher_running() { mkdir -p "$ROMMSYNC_FLEET_DIR"; echo $$ >"$ROMMSYNC_FLEET_DIR/fleet.pid"; }
 
 case "${1:-}" in
   card_says)
@@ -1091,7 +1129,51 @@ JSON
       && fail "the outage restarted the notice; under a flaky gh the release never happens: $out"
     echo "ok: a lookup that failed leaves the markers, and the notice, where they were"
     ;;
+  status_stale)
+    make_fixture ok
+    make_repo_git
+    dispatcher_running
+    # What a real dispatcher records at start: the fleet.sh it actually parsed.
+    in_fleet record_dispatcher
+    merge_fleet_fix "a fix the running dispatcher never parsed"
+    out="$(in_fleet cmd_status 2>&1)"
+    grep -q "up since" <<<"$out" \
+      || fail "status does not say when the dispatcher started: $out"
+    grep -qi "not live" <<<"$out" \
+      || fail "a dispatcher older than fleet.sh was not reported as stale: $out"
+    grep -q "a fix the running dispatcher never parsed" <<<"$out" \
+      || fail "it did not name the commit that is missing from it: $out"
+    grep -qi "restart" <<<"$out" \
+      || fail "it did not say a restart is what makes the fix live: $out"
+    grep -q "ROMMSYNC_FLEET_MAX" <<<"$out" \
+      || fail "it did not say the cap is read at start too, so it changes only across a restart: $out"
+    echo "ok: a dispatcher older than fleet.sh is reported stale, by commit"
+    ;;
+  status_current)
+    make_fixture ok
+    make_repo_git
+    dispatcher_running
+    in_fleet record_dispatcher
+    out="$(in_fleet cmd_status 2>&1)"
+    grep -q "up since" <<<"$out" \
+      || fail "status does not say when the dispatcher started: $out"
+    grep -qi "not live" <<<"$out" \
+      && fail "a dispatcher running the file on disk was reported stale: $out"
+    echo "ok: a current dispatcher says when it started and nothing more"
+    ;;
+  status_unrecorded)
+    make_fixture ok
+    make_repo_git
+    dispatcher_running
+    # No record at all -- a dispatcher started before this check existed.
+    out="$(in_fleet cmd_status 2>&1)"
+    grep -qi "cannot say" <<<"$out" \
+      || fail "a dispatcher whose fleet.sh nothing recorded was not reported as unknown: $out"
+    grep -qi "restart" <<<"$out" \
+      || fail "it did not say what to do about it: $out"
+    echo "ok: a dispatcher that recorded nothing is 'cannot say', not 'current'"
+    ;;
   *)
-    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind" >&2
+    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind|status_stale|status_current|status_unrecorded" >&2
     exit 2 ;;
 esac
