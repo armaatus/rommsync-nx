@@ -67,8 +67,10 @@ a second one.
 
 A scenario armed with no tag is still global, and applies to whoever asks next —
 that is what the one-line `curl` above does, and a tagged client falls back to it
-only when it has none of its own. `DELETE /__fault` clears the caller's scenario
-and the untagged one.
+only when it has none of its own. `DELETE /__fault` clears the caller's own
+scenario and nothing else — one client may not disarm another's — so an untagged
+scenario is cleared by an untagged `DELETE`, the same `curl` that armed it, or by
+age (`OWNER_TTL_SECONDS`, an hour).
 
 `truncate` and `drop` differ in exactly one header, and the difference is the
 point. A server whose connection dies mid-transfer had already promised a
