@@ -260,12 +260,22 @@ On GitHub:
   > repository's default branch.
 
   It is a supply-chain control — otherwise a pull request could rewrite the
-  prompt and the tool list of the agent reviewing it — and it makes the review
-  structurally impossible on any PR touching `claude-review.yml`. Those are
-  human-merge PRs anyway (`merge_gate.py` refuses `.github/workflows/**`), so
-  nothing is lost but the second opinion; what matters is not to spend review
-  rounds waiting for one. The `verdict` job says so in a comment rather than
-  leaving the silence unexplained. Observed on PR #147.
+  prompt and the tool list of the agent reviewing it.
+
+  **The remedy is a dispatch, not giving up.** A `workflow_dispatch` run uses
+  the DEFAULT BRANCH's copy of the workflow, so it passes that validation and
+  reviews `refs/pull/N/head` — the PR's content, judged by the agreed workflow:
+
+  ```bash
+  gh workflow run claude-review.yml -f pr=<N>
+  ```
+
+  The review it submits lands against the PR's current head, so `merge-gate`'s
+  independence requirement is genuinely satisfied by it. PR #87 was reviewed
+  this way while editing this same file, and so was #147, which is where the
+  rule was diagnosed. What must NOT happen is waiting out `await-review.sh` for
+  an automatic review that cannot start; the `verdict` job's comment is the
+  signal to dispatch one instead.
 
   The reviewer is also told to submit with `gh pr review --body`, not
   `--body-file`. Its allowed tools are Read, Grep, Glob and a fixed list of

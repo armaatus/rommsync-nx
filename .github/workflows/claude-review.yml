@@ -81,7 +81,19 @@ jobs:
     # both survived only because another run happened to submit.
     #
     # Keyed on the head sha so two pushes never contend at all, and grouped
-    # rather than ungrouped so several events on one head run one at a time.
+    # rather than ungrouped so several PULL_REQUEST events on one head run one
+    # at a time.
+    #
+    # Pull_request events only. On a `workflow_dispatch` there is no
+    # `pull_request` in the event context, so both halves fall back to
+    # `inputs.pr` and the group becomes `claude-review-<N>-<N>` -- which never
+    # matches the head-keyed group a pushed event uses, so a dispatched review
+    # can run alongside one rather than queuing behind it. It cannot be fixed
+    # here: `concurrency` is evaluated before any step runs, so there is nothing
+    # to resolve the head sha with. `cancel-in-progress: false` on both means
+    # the worst case is two reviews of one head, never a lost verdict. Said
+    # rather than left implied, because a comment claiming a serialisation it
+    # does not provide is the same defect this file is being changed to fix.
     #
     # SERIALISED, NOT DEDUPLICATED, and the difference matters. `synchronize`
     # and `review_requested` both fire on the ordinary "push a fix, re-request
