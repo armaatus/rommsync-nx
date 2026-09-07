@@ -479,17 +479,37 @@ JSON
   own_clears)
     make_fixture ok
     make_worktree
-    # What a previous worktree for this same issue would have left standing.
-    # `live_worktrees` skips an ARCHIVED worktree, so `in_flight` reads free and
-    # the dispatcher opens a second one for an issue whose markers are all set.
-    for m in stalled stall-labels box-labels queue-labels unreachable human-step; do
-      : >"$ROMMSYNC_FLEET_DIR/$m-42"
+    make_overdue
+    agent_state working
+    # Everything a previous worktree for this issue leaves standing, armed by
+    # driving the dispatcher through the poll that writes each one. `stalled-`
+    # and `stall-labels-` are alternatives -- notice_stalled clears one when it
+    # writes the other -- so they need two arrangements, not one.
+    arm_box_markers
+    agent_state waiting; issue_labels "ready"
+    in_fleet notice_stalled >/dev/null 2>&1
+    for m in $BOX_MARKERS stalled; do
+      [ -e "$ROMMSYNC_FLEET_DIR/$m-42" ] \
+        || fail "could not arm $m-42, so the assertion that follows would be vacuous"
     done
+    # `live_worktrees` skips an ARCHIVED worktree, so `in_flight` reads free and
+    # the dispatcher opens a SECOND worktree for an issue whose markers are all
+    # still set. Each of them throttles a message to once, so the new worktree
+    # inherits silence: a standing `stalled-42` makes notice_stalled say nothing
+    # at all for an agent that is genuinely stuck.
     in_fleet own 42 "$WORK/wt" >/dev/null 2>&1
-    for m in stalled stall-labels box-labels queue-labels unreachable human-step; do
+    for m in $BOX_MARKERS stalled; do
       [ -e "$ROMMSYNC_FLEET_DIR/$m-42" ] \
         && fail "$m-42 survived into a fresh worktree, which is silenced by it"
     done
+    # ...and the other half of that pair.
+    issue_labels FAIL
+    in_fleet notice_stalled >/dev/null 2>&1
+    [ -e "$ROMMSYNC_FLEET_DIR/stall-labels-42" ] \
+      || fail "could not arm stall-labels-42, so the assertion that follows would be vacuous"
+    in_fleet own 42 "$WORK/wt" >/dev/null 2>&1
+    [ -e "$ROMMSYNC_FLEET_DIR/stall-labels-42" ] \
+      && fail "stall-labels-42 survived into a fresh worktree, which is silenced by it"
     echo "ok: a fresh worktree starts with nothing already said on its behalf"
     ;;
   one_card)

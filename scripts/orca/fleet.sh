@@ -168,8 +168,7 @@ own() {
   clear_issue_markers "$1"
 }
 owned_path()   { cat "$OWNED_DIR/$1" 2>/dev/null; }
-# ...including the stall marker, which notice_stalled writes once per stall and
-# nothing else removed -- one small file leaked per issue that ever stalled.
+
 # Every per-issue marker the dispatcher writes, in one list, because the bug
 # this replaces was exactly one list drifting from another.
 #
@@ -177,8 +176,10 @@ owned_path()   { cat "$OWNED_DIR/$1" 2>/dev/null; }
 # worktree that wrote it therefore does not misreport anything -- it SILENCES
 # the next worktree for the same issue, which is worse, because the thing that
 # goes missing is the line saying why. `own()` clears them for that reason: a
-# fresh worktree starts with nothing already said on its behalf. That is the
-# root fix; the two exits below tidying up after themselves is the belt.
+# fresh worktree starts with nothing already said on its behalf, and so does
+# `disown_issue`, which is what stopped `stalled-` leaking one small file per
+# issue that ever stalled. That is the root fix; the two exits in
+# enforce_timebox tidying up after themselves is the belt.
 clear_issue_markers() {
   rm -f "$STATE_DIR/stalled-$1" "$STATE_DIR/stall-labels-$1" \
         "$STATE_DIR/box-labels-$1" "$STATE_DIR/queue-labels-$1" \
