@@ -2042,6 +2042,10 @@ STUB
                              # to the closing brace of whatever follows it.
                              /^owned_path()/p;
                              /^has_open_pr()/,/^}/p; /^agent_terminal_in()/,/^}/p;
+                             # enforce_timebox calls it on both of its exits; a
+                             # snippet without it clears no marker at all, and
+                             # phase 4 below is exactly that failure.
+                             /^forget_box_markers()/,/^}/p;
                              /^enforce_timebox()/,/^}/p' \
                     "$TMPDIR_FIXTURE/scripts/orca/fleet.sh")"'
                enforce_timebox' 2>&1
