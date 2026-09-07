@@ -19,14 +19,23 @@ you have installed homebrew on a Switch before and have never seen RomM.
 
 ## Before you start
 
-- **A modded console running Atmosphère 1.7.0 or newer (Horizon 18.0.0 and
-  up).** That is the version this project builds and states its releases for:
-  M6-3 ([#34](https://github.com/armaatus/rommsync-nx/issues/34)) keeps it as a
+- **A modded console running Atmosphère 1.7.1 or newer on Horizon 16.0.0 or
+  newer.** That is what this project builds and states its releases for: M6-3
+  ([#34](https://github.com/armaatus/rommsync-nx/issues/34)) keeps it as a
   single `ATMOSPHERE_TARGET` string that every release body prints, and this
-  line is the second place it is written — when #34 merges, the two should be
-  checked against each other rather than left to drift. Nothing in the build
-  enforces it, and confirming it on real hardware is part of M8-2
+  line is the second place it is written. `ctest -R release.compatibility` now
+  holds the two together rather than leaving them to drift, so a correction to
+  one is red until it is made to the other. Nothing in the build enforces the
+  versions themselves, and confirming them on real hardware is part of M8-2
   ([#44](https://github.com/armaatus/rommsync-nx/issues/44)).
+
+  Older than that is a target missed, not a refusal. The only firmware-gated
+  call rommsync-nx makes is `sslConnectionSetIoTimeout` [16.0.0+], and it is
+  guarded — below 16.0.0 the `ssl` service's own I/O ceiling stays five minutes
+  and rommsync-nx bounds the wait itself. The vendored overlay library carries
+  gates of its own, up to `[21.0.0+]`, and they are guarded for the same reason.
+  Nothing has been booted on any firmware, so treat both numbers as what the
+  build aims at rather than a compatibility list.
 - **Ultrahand or Tesla already installed and working.** The control UI is an
   overlay; if your overlay menu does not open today, fix that first — none of
   what follows is visible without it.

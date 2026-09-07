@@ -24,6 +24,10 @@
 #                             rule the release job creates the release by, so an
 #                             inverted answer is caught here rather than by a
 #                             v0.2.0-rc1 that published as a stable release.
+#   test_release.sh compatibility  the one compatibility statement a release
+#                             makes is written down ONCE, and the second place
+#                             it is quoted -- docs/INSTALL.md, which asks for
+#                             exactly this check -- still says the same thing.
 #   test_release.sh history   ...and it picks the right previous tag, against a
 #                             throwaway repo with real tags in it. This repo has
 #                             none, so `notes` only ever exercises the
@@ -31,9 +35,9 @@
 #                             ships -- v0.1.0, some rcs, then v0.2.0 -- can only
 #                             be seen here.
 #
-# All three read files in the checkout. None of them needs Docker, a network or a
-# tag, so none of them ever skips -- a release path that is only exercised by
-# releasing is a release path nobody has tested.
+# Every phase reads files in the checkout. None of them needs Docker, a network
+# or a tag, so none of them ever skips -- a release path that is only exercised
+# by releasing is a release path nobody has tested.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -334,6 +338,134 @@ phase_notes() {
   echo "ok: the notes name the archive, the guide, the target and the checksums"
 }
 
+# --- the compatibility statement, and its second copy -------------------------
+
+# `ATMOSPHERE_TARGET` is the sentence a release page makes its only
+# compatibility claim with, and docs/INSTALL.md restates it as the first line of
+# "Before you start" -- a user reading the guide and a user reading the release
+# meet the same two version numbers, and there is no third place. INSTALL.md
+# named the drift itself ("this line is the second place it is written -- the
+# two should be checked against each other rather than left to drift") and
+# nothing checked it; this is that check.
+#
+# It deliberately does NOT assert which versions those are. The numbers are a
+# target that M8-2 (#44) confirms or corrects on a console, and a test that
+# pinned them would have to be edited by the same commit that corrects them,
+# which is not a test. What it pins is that there is one answer and not two.
+phase_compatibility() {
+  [ -x "$NOTES" ] || fail "no executable $NOTES"
+
+  local target
+  target="$(sed -n 's/^readonly ATMOSPHERE_TARGET="\(.*\)"$/\1/p' "$NOTES")"
+  [ -n "$target" ] || \
+    fail "no ATMOSPHERE_TARGET assignment in $NOTES -- the compatibility line moved"
+
+  local version
+  version="$(read_version)"
+
+  SCRATCH="$(mktemp -d)"
+  local sums="$SCRATCH/SHA256SUMS"
+  printf '%s  rommsync-nx-%s.zip\n' \
+    "0000000000000000000000000000000000000000000000000000000000000000" \
+    "$version" > "$sums"
+  local body="$SCRATCH/notes.md"
+  "$NOTES" --checksums "$sums" > "$body" || fail "release-notes.sh failed"
+
+  grep -qF "$target" "$body" || \
+    fail "the notes do not carry ATMOSPHERE_TARGET verbatim:
+  wanted: $target"
+  echo "ok: the release body carries the compatibility line verbatim"
+
+  # INSTALL.md wraps its prose, so the comparison is on the text with runs of
+  # whitespace flattened -- a line break between two words is not a difference
+  # in what the sentence says, and demanding one file match the other's line
+  # width would make this a formatting test.
+  local flat_target flat_install
+  flat_target="$(printf '%s' "$target" | tr -s '[:space:]' ' ')"
+  flat_install="$(tr -s '[:space:]' ' ' < "$REPO_ROOT/docs/INSTALL.md")"
+  case "$flat_install" in
+    *"$flat_target"*) ;;
+    *) fail "docs/INSTALL.md and $NOTES disagree about what this build targets.
+  release-notes.sh: $flat_target
+  INSTALL.md says something else -- the two are one sentence, in two places, and
+  a user meets both. Update the guide in the commit that moves the constant." ;;
+  esac
+  echo "ok: docs/INSTALL.md restates the same compatibility line"
+
+  # ...and there is no THIRD place. Every version of Atmosphere written down in
+  # a tracked file has to be one of those two, or the claim that the constant is
+  # the single source is already false and the next correction will miss a copy.
+  # That is not a hypothetical: these two drifted for a year with INSTALL.md
+  # asking in prose for someone to check them, and #43's body held a third,
+  # stale copy the whole time.
+  #
+  # `git ls-files` is what scopes this to prose this project writes:
+  # lib/libultrahand is a submodule, so it comes back as one gitlink and its
+  # sources are never read. A vendored library is not making this project's
+  # compatibility claim.
+  #
+  # The pattern is spelt with a character class so this file does not match it.
+  # `git grep`, not `ls-files | xargs grep`: it resolves paths against the
+  # repository rather than against the caller's cwd, and ctest runs this from
+  # build/tests. The xargs form silently found nothing there -- every path
+  # missed, and `2>/dev/null` swallowed the errors -- so the assertion passed
+  # by looking at no files at all. `-I` skips binaries.
+  #
+  # The pattern is built from two pieces so this file cannot match itself, and
+  # it spells the accented letter as `[^ ]*` rather than a bracket holding a
+  # multibyte character: `[eè]` is three BYTES in the C locale, where it cannot
+  # match `Atmosphère` at all. That is the same silent pass wearing a different
+  # hat, and CI does not promise a UTF-8 locale.
+  local mention strays
+  mention='Atmosph[^ ]*'
+  strays="$(git -C "$REPO_ROOT" grep -lIE "$mention [0-9]" -- . \
+            | grep -v -e '^scripts/release-notes\.sh$' -e '^docs/INSTALL\.md$' || true)"
+  [ -z "$strays" ] || fail "an Atmosphere version is written down outside the two
+places that are allowed to hold one. Point at ATMOSPHERE_TARGET instead of
+restating it -- or, if a third place genuinely has to carry the numbers, add it
+here deliberately rather than letting the copies drift:
+$strays"
+  echo "ok: no third copy of the compatibility line"
+
+  # The Horizon number in that sentence is not a number somebody typed: it is
+  # the highest firmware version this project's OWN code checks for. Every
+  # `hosversionAtLeast` guard marks an optional path -- guarded precisely
+  # because the build still works below it -- so the highest of them is the
+  # version at and above which every path rommsync-nx can take is live, which
+  # is what "targets Horizon X" means for a build that degrades rather than
+  # refuses. Derived rather than declared, so a call added against a newer
+  # firmware turns this red instead of quietly widening what the release claims.
+  #
+  # It is a textual match, not a parse: a `hosversionAtLeast(18, 0, 0)` written
+  # inside a comment counts as a gate. That is the conservative direction --
+  # it asks a question rather than missing one -- and the answer is to write
+  # the comment without a literal call in it.
+  #
+  # sysmodule/source and overlay/source, and NOT overlay/lib/libultrahand: the
+  # vendored overlay library carries gates of its own, up to
+  # `hosversionAtLeast(21, 0, 0)`, and they are guarded for the same reason
+  # these are. Deriving the target from them would raise what a release claims
+  # because a UI library gained a progressive-enhancement path, which is not a
+  # statement about whether rommsync-nx runs.
+  local stated gated
+  stated="$(printf '%s' "$target" \
+            | sed -n 's/.*Horizon \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')"
+  [ -n "$stated" ] || fail "ATMOSPHERE_TARGET names no Horizon version: $target"
+  gated="$(grep -rhoE 'hosversionAtLeast\([0-9]+, *[0-9]+, *[0-9]+\)' \
+             "$REPO_ROOT/sysmodule/source" "$REPO_ROOT/overlay/source" 2>/dev/null \
+           | sed -E 's/.*\(([0-9]+), *([0-9]+), *([0-9]+)\)/\1.\2.\3/' \
+           | sort -V | tail -1)"
+  [ -n "$gated" ] || fail "nothing in sysmodule/source or overlay/source gates on
+a firmware version any more, so the Horizon $stated in ATMOSPHERE_TARGET is
+derived from nothing. Say where the number comes from, or drop it from the line."
+  [ "$stated" = "$gated" ] || fail "the compatibility line targets Horizon $stated,
+but the highest firmware gate in this project's own code is $gated
+(hosversionAtLeast, in sysmodule/source or overlay/source). One of the two is
+wrong: either the line claims a target nothing needs, or a call was added
+against a firmware the release does not say it targets."
+  echo "ok: the Horizon target is the highest firmware gate first-party code checks for"
+}
+
 # --- which releases are prereleases -------------------------------------------
 
 phase_prerelease() {
@@ -449,5 +581,7 @@ case "${1:-}" in
   notes)      phase_notes ;;
   prerelease) phase_prerelease ;;
   history)    phase_history ;;
-  *)          echo "usage: $0 {version|ci|notes|prerelease|history}" >&2; exit 2 ;;
+  compatibility) phase_compatibility ;;
+  *)          echo "usage: $0 {version|ci|notes|prerelease|history|compatibility}" >&2
+              exit 2 ;;
 esac

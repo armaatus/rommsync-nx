@@ -319,12 +319,35 @@ Six things are worth knowing before you do it:
   tag that already has one is a hard failure, on purpose: the alternative is
   attaching these bytes to a release built from other ones.
 - **The compatibility line in the notes is a target, not a result.**
-  `ATMOSPHERE_TARGET` in `scripts/release-notes.sh` is the only place any
-  Atmosphère version is written down in this repo, and nothing here has run on a
-  console — the notes say so in the release itself. Confirming or correcting it
-  is part of the M8-1 gate (#43), on the `media` row, which prints it beside the
-  NAND backup because the same first boot settles both; the fix is that one
-  constant.
+  `ATMOSPHERE_TARGET` in `scripts/release-notes.sh` is where the two versions a
+  release states are written down, and the first line of "Before you start" in
+  [INSTALL.md](INSTALL.md) is the only other place they appear — a user reading
+  the guide and a user reading the release page meet the same sentence.
+  `ctest -R release.compatibility` holds those two together and refuses a third
+  copy, so the fix is still that one constant and a guide edit in the same
+  commit. Nothing here has run on a console — the notes say so in the release
+  itself. Confirming or correcting the numbers is part of the M8-1 gate (#43),
+  on the `media` row, which prints them beside the NAND backup because the same
+  first boot settles both.
+- **Both halves of that line were corrected, not confirmed, by M6-4 (#142)** —
+  against libnx and the Atmosphère release list, never against a console. The
+  Atmosphère half named a version with no stable release behind it, only a
+  prerelease tag, so the line asked for something nobody can install. The
+  Horizon half was never a floor at all: it was the newest firmware that
+  Atmosphère release added support for, and that series runs on every firmware
+  from `1.0.0` up, so the line told a console one version behind it that it was
+  out of range for a reason that does not exist. The Horizon number is now the
+  highest firmware gate this project's own code checks for. Every
+  `hosversionAtLeast` guard marks an *optional* path — guarded precisely because
+  the build works below it — so the highest of them is the version at and above
+  which every path rommsync-nx can take is live, which is what "targets" means
+  for a build that degrades rather than refuses. The vendored overlay library
+  gates as high as `21.0.0`; `release.compatibility` does not read it, because
+  raising what a release claims because a UI library gained a
+  progressive-enhancement path would say nothing about whether this runs. `release.compatibility` derives it from the
+  source, so a call added against a newer firmware goes red instead of quietly
+  widening what a release claims. Neither number has been observed on hardware;
+  M8-2 (#44) is still what settles them.
 
 The zip is the only thing to download. `switch-build`'s per-push artifact is the
 three loose files, for debugging; a `.nsp` under its build name installs cleanly

@@ -557,8 +557,13 @@ ctest --test-dir build --output-on-failure
   exists); `release.ci` reads the release job out of `.github/workflows/ci.yml`;
   `release.notes` and `release.history` run `scripts/release-notes.sh`, the
   second against a throwaway repo with real tags in it, because this one has
-  none; and `release.prerelease` checks the semver rule the release is created
-  by. See [DEVELOPMENT.md](DEVELOPMENT.md#releases) for the procedure they hold.
+  none; `release.prerelease` checks the semver rule the release is created by;
+  and `release.compatibility` holds the one compatibility sentence a release
+  makes to one copy — `ATMOSPHERE_TARGET` and the guide line in
+  [INSTALL.md](INSTALL.md) that quotes it — and derives its Horizon number from
+  the `hosversionAtLeast` gates in `sysmodule/source` and `overlay/source`
+  rather than trusting the constant. See
+  [DEVELOPMENT.md](DEVELOPMENT.md#releases) for the procedure they hold.
 
 ### Provisioning the fixture
 

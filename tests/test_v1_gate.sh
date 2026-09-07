@@ -436,8 +436,11 @@ $out" ;;
 # whatever this test wants it to. The real repo has no tags at all, so every
 # branch below except the first is unreachable from the checkout -- and the
 # branch that actually ships is the one that says a release is published.
+# `$3` is a space-separated LIST, because the ordering bug below needs a
+# repository carrying two tags at once and one carrying a single tag is the
+# same call with one word in it.
 release_repo() {
-  local root="$1" version="$2" tag="$3" gh_json="$4"
+  local root="$1" version="$2" tags="$3" gh_json="$4"
   rm -rf "$root"; fake_repo "$root"
   printf '%s\n' "$version" > "$root/VERSION"
   mkdir -p "$root/bin"
@@ -465,7 +468,10 @@ EOF
       add -A >/dev/null 2>&1
   git -C "$root" -c user.email=t@example.invalid -c user.name=t \
       commit --quiet -m "fixture" >/dev/null 2>&1
-  [ -n "$tag" ] && git -C "$root" tag "$tag"
+  local tag
+  for tag in $tags; do
+    git -C "$root" tag "$tag"
+  done
   return 0
 }
 
@@ -541,6 +547,43 @@ $out" ;;
   release_repo "$dir/zero" 0.9.0 v0.9.0 "$published"
   release_says "$dir/zero" "no v1 tag in this repository" FAIL \
     "a 0.x tag does not satisfy a row that says v1" "$build"
+
+  # The rc path docs/DEVELOPMENT.md#releases recommends, one release further on:
+  # `v1.0.0-rc1` was cut, then `v1.0.0`. `sort -V` orders `v1.0.0-rc1` ABOVE
+  # `v1.0.0` -- on GNU sort and on BSD sort alike -- so "newest tag" and "newest
+  # release" are not the same tag once a release candidate exists, and the row
+  # would be judged on the rc while VERSION has moved on to the stable number.
+  # The finding is not that the rc is uninteresting; it is that a repository
+  # holding a correct, published v1.0.0 would report `disagrees with VERSION`.
+  release_repo "$dir/after-rc" 1.0.0 "v1.0.0-rc1 v1.0.0" "$published"
+  release_says "$dir/after-rc" "is published, on main, and agrees with VERSION" PASS \
+    "a stable v1 is judged on the stable tag, not on the rc that preceded it" "$build"
+
+  # ...and the rc still counts while it is the only v1 there is. Preferring a
+  # stable tag must not mean ignoring a repository that has not cut one yet:
+  # this is the state the day the first v1.0.0-rc1 is published, and the row it
+  # is meant to open is the same row.
+  release_repo "$dir/rc-only" 1.0.0-rc1 "v1.0.0-rc1" \
+    '{"isDraft":false,"assets":[{"name":"rommsync-nx-1.0.0-rc1.zip"},{"name":"SHA256SUMS"}]}'
+  release_says "$dir/rc-only" "is published, on main, and agrees with VERSION" PASS \
+    "a published v1 release candidate satisfies the row when no stable v1 exists" "$build"
+
+  # Two candidates and no stable release: the newest of them, not the first.
+  release_repo "$dir/rc-two" 1.0.0-rc2 "v1.0.0-rc1 v1.0.0-rc2" \
+    '{"isDraft":false,"assets":[{"name":"rommsync-nx-1.0.0-rc2.zip"},{"name":"SHA256SUMS"}]}'
+  release_says "$dir/rc-two" "is published, on main, and agrees with VERSION" PASS \
+    "with only candidates, the row is judged on the newest of them" "$build"
+
+  # ...and the cycle AFTER a stable release, which is the case preferring stable
+  # tags gets wrong if it is applied unconditionally: v1.0.0 shipped, VERSION is
+  # now 1.1.0-rc1, and the newest tag is that candidate. Preferring stable here
+  # would judge the row on v1.0.0 and report it as disagreeing with a VERSION
+  # that has moved on. Which tags are eligible depends on what VERSION is, the
+  # same way scripts/release-notes.sh chooses the tag it counts changes from.
+  release_repo "$dir/rc-after-stable" 1.1.0-rc1 "v1.0.0 v1.1.0-rc1" \
+    '{"isDraft":false,"assets":[{"name":"rommsync-nx-1.1.0-rc1.zip"},{"name":"SHA256SUMS"}]}'
+  release_says "$dir/rc-after-stable" "is published, on main, and agrees with VERSION" PASS \
+    "a candidate cut after a stable release is judged on the candidate" "$build"
 
   # ...and --dry does not reach for the network at all. The stub here fails the
   # test if it is called, which is the only way to assert an absence.
