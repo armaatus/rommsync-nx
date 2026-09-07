@@ -5,21 +5,31 @@
 #
 #   0  ready -- every thread resolved, every check green, no standing objection
 #   1  not ready -- the reasons are printed
-#   2  could not tell (no PR, gh failed)
+#   2  could not tell (no PR, gh failed, no gate to judge by)
 #   3  the fleet is stopped
+#   4  ready, but a person merges it -- the PR touches the enforcement layer,
+#      which merge-gate refuses by design. Nothing here is left to fix.
 #
 # "Resolved" is read from GitHub's own state. The REST endpoint for PR comments
 # cannot report it, so this goes through GraphQL -- `isResolved` on the thread,
 # which is the thing a human looks at. `isOutdated` is not `isResolved`: a thread
 # whose lines moved is still open.
 #
-# The verdict is read as the LATEST review per author, never as
-# `reviewDecision`. That field is sticky: once a reviewer requests changes it
-# stays CHANGES_REQUESTED until dismissed or until that reviewer approves -- and
-# this repo's reviewer never approves, by design. Reading it would report a PR
-# whose findings were all addressed as blocked forever. This mirrors
-# .github/scripts/merge_gate.py exactly, on purpose: the local answer and the
-# required check must not be able to disagree.
+# WHO COUNTS AS A REVIEWER IS NOT DECIDED HERE. This imports
+# .github/scripts/merge_gate.py and asks it, because the local answer and the
+# required check must not be able to disagree: a review-status that says "ready"
+# on a PR merge-gate refuses is precisely how a PR sits quietly BLOCKED. The
+# rules that mattered when this was a paraphrase -- the latest review per author
+# rather than the sticky `reviewDecision`, a self-review not counting, an empty
+# review record not counting -- now have one implementation and one place to
+# change them.
+#
+# Checks are judged as GitHub judges them: the NEWEST run of each check name.
+# `merge-gate` runs several times on one head by design, and every run before the
+# review lands is an honest failure that its own later run supersedes;
+# `statusCheckRollup` returns all of them. Reading the raw list reported
+# "check failed: merge-gate" on PRs that were mergeable and merged seconds later
+# (#100, #108), against a loop told to repeat until this exits 0.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -32,7 +42,6 @@ pr="${1:-}"
 [ -n "$pr" ] || pr="$(orca_pr_for_branch)" || {
   echo "no open PR for branch $(git rev-parse --abbrev-ref HEAD)" >&2; exit 2; }
 
-head_sha="$(GH_PAGER=cat gh pr view "$pr" --json headRefOid --jq .headRefOid 2>/dev/null)" || exit 2
 owner_repo="$(GH_PAGER=cat gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null)" || exit 2
 owner="${owner_repo%%/*}"; name="${owner_repo##*/}"
 
@@ -42,11 +51,18 @@ trap 'rm -f "$payload" "$checks"' EXIT
 # Written to files and read back, never spliced into a Python source string.
 # Review bodies are third-party text: one containing a quote sequence would
 # otherwise break the parse, or worse.
+#
+# `body`, `author` and each review's own body and inline-comment count are here
+# because merge_gate.evaluate() reads them -- this is the same shape the gate
+# gathers in CI, so the two see the same pull request.
 GH_PAGER=cat gh api graphql -F owner="$owner" -F name="$name" -F pr="$pr" -f query='
 query($owner:String!,$name:String!,$pr:Int!){
   repository(owner:$owner,name:$name){
     pullRequest(number:$pr){
-      reviews(last:50){ nodes{ state submittedAt commit{oid} author{login} } }
+      body
+      author{login}
+      reviews(last:50){ nodes{ state submittedAt commit{oid} author{login}
+                               body comments(first:1){ totalCount } } }
       reviewThreads(first:100){
         nodes{ id isResolved isOutdated path line
                comments(first:1){ nodes{ author{login} body } } }
@@ -55,16 +71,53 @@ query($owner:String!,$name:String!,$pr:Int!){
   }
 }' >"$payload" 2>/dev/null || { echo "could not read the PR's reviews" >&2; exit 2; }
 
-GH_PAGER=cat gh pr view "$pr" --json statusCheckRollup >"$checks" 2>/dev/null || exit 2
+# One call for everything GitHub itself knows about mergeability. `files` decides
+# whether this is a human-merge PR, and `mergeStateStatus` is the only thing that
+# can see a stale check run branch protection is still counting -- the wedge in
+# #84, which is invisible from the rollup alone because the newest run of every
+# name is green.
+GH_PAGER=cat gh pr view "$pr" \
+  --json headRefOid,statusCheckRollup,mergeStateStatus,autoMergeRequest,files \
+  >"$checks" 2>/dev/null || exit 2
 
-python3 - "$pr" "$head_sha" "$payload" "$checks" <<'PY'
+python3 - "$pr" "$payload" "$checks" <<'PY'
 import json, sys
 
-pr, head, payload_path, checks_path = sys.argv[1:5]
+sys.path.insert(0, ".github/scripts")
+try:
+    from merge_gate import HUMAN_ONLY_PREFIXES, evaluate
+except ImportError:
+    print("could not import .github/scripts/merge_gate.py, which is the rule this "
+          "PR will actually be judged by. Nothing here can answer without it.",
+          file=sys.stderr)
+    raise SystemExit(2)
+
+pr, payload_path, checks_path = sys.argv[1:4]
 pull = json.load(open(payload_path))["data"]["repository"]["pullRequest"]
-checks = json.load(open(checks_path)).get("statusCheckRollup") or []
+view = json.load(open(checks_path))
+head = view.get("headRefOid") or ""
+checks = view.get("statusCheckRollup") or []
+merge_state = (view.get("mergeStateStatus") or "UNKNOWN").upper()
+queued = view.get("autoMergeRequest") is not None
+files = [f.get("path") for f in (view.get("files") or []) if f.get("path")]
 
 problems = []
+
+# The enforcement layer, judged before anything else: merge-gate refuses these
+# paths on purpose, so its FAILURE on such a PR is the gate working, not a defect
+# to chase. Reported as a plain failed check it costs an agent its three review
+# rounds trying to turn green a gate that never will (#96).
+protected = sorted(f for f in files if f.startswith(HUMAN_ONLY_PREFIXES))
+
+# Everything about reviews comes from the gate itself, on the same pull request
+# minus the two things answered better here: threads (listed in full below) and
+# the protected paths (their own verdict, not a problem to fix).
+gate_view = dict(pull, reviewThreads={"nodes": []})
+ok, lines = evaluate(head, gate_view, [f for f in files if f not in protected])
+if not ok:
+    # evaluate() returns a heading plus two-space-indented problems; this prints
+    # its own heading.
+    problems.extend(line[2:] for line in lines[1:])
 
 unresolved = [t for t in pull["reviewThreads"]["nodes"] if not t["isResolved"]]
 if unresolved:
@@ -85,34 +138,39 @@ if unresolved:
         for line in (first.get("body") or "").splitlines():
             problems.append(f"      {line}")
 
-on_head = [r for r in pull["reviews"]["nodes"]
-           if (r.get("commit") or {}).get("oid") == head]
-if not on_head:
-    problems.append(
-        f"no review has been submitted against the current head ({head[:8]}). "
-        "Pushing a fix invalidates the previous one -- re-request review.")
-else:
-    latest = {}
-    for r in sorted(on_head, key=lambda r: r.get("submittedAt") or ""):
-        if r.get("state") in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"):
-            latest[(r.get("author") or {}).get("login") or "?"] = r
-    blocking = sorted(w for w, r in latest.items()
-                      if r.get("state") == "CHANGES_REQUESTED")
-    if blocking:
-        problems.append(
-            "the latest review from " + ", ".join(blocking) + " still requests "
-            "changes. Address it and re-request review; a clean re-review "
-            "supersedes it.")
 
+def when(check):
+    """When GitHub would consider this run the newest of its name."""
+    return (check.get("completedAt") or check.get("startedAt")
+            or check.get("createdAt") or "")
+
+
+# Newest run per check NAME, which is how branch protection resolves a required
+# check and how `gh pr checks` reports one. The index breaks ties in list order,
+# so two runs stamped the same second still resolve to one answer rather than to
+# whichever dict happened to come first.
+newest = {}
+superseded = []
+for i, c in enumerate(checks):
+    key = c.get("name") or c.get("context") or "?"
+    if key not in newest or (when(c), i) >= (when(newest[key]), newest[key]["_i"]):
+        if key in newest:
+            superseded.append(newest[key])
+        newest[key] = dict(c, _i=i)
+    else:
+        superseded.append(c)
+
+DEAD = ("FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "ERROR")
 # A check that has not finished is not a failure, but it is not ready either.
-bad = [c for c in checks
-       if (c.get("conclusion") or c.get("state")) in
-       ("FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "ERROR")]
-pending = [c for c in checks
+bad = [c for c in newest.values() if (c.get("conclusion") or c.get("state")) in DEAD]
+pending = [c for c in newest.values()
            if c.get("status") in ("IN_PROGRESS", "QUEUED", "PENDING")
            or not (c.get("conclusion") or c.get("state"))]
 for c in bad:
-    problems.append(f"check failed: {c.get('name') or c.get('context')}")
+    name = c.get("name") or c.get("context")
+    if protected and name == "merge-gate":
+        continue  # expected, and answered below rather than as a failure
+    problems.append(f"check failed: {name}")
 for c in pending:
     problems.append(f"check still running: {c.get('name') or c.get('context')}")
 
@@ -122,8 +180,58 @@ if problems:
         print("  " + p)
     raise SystemExit(1)
 
+if protected:
+    print(f"PR #{pr} is ready, and a human merges it.")
+    print("  It touches the enforcement layer, which never merges itself:")
+    for f in protected:
+        print(f"    {f}")
+    print("  merge-gate fails this PR by design -- a change that can rewrite the "
+          "rules judging")
+    print("  PRs is not merged by the machinery those rules govern. Nothing here "
+          "is left to fix.")
+    print("  Set the worktree comment to \"ready, needs a human merge -- touches "
+          f"{protected[0]}\" and stop.")
+    raise SystemExit(4)
+
+# Everything visible from here says yes, so if GitHub still says no, the reason
+# is one this script cannot see from the rollup: a stale run of a name whose
+# newest run is green, still counted by branch protection. That is #84, and it
+# is silent -- the PR sits at BLOCKED with auto-merge queued and never fires.
+if merge_state in ("BLOCKED", "BEHIND", "DIRTY"):
+    print(f"PR #{pr} looks ready here, and GitHub says {merge_state}:")
+    if merge_state == "DIRTY":
+        print("  the branch conflicts with its base. Rebase, push, and come back.")
+    elif merge_state == "BEHIND":
+        print("  the branch is behind its base and the base requires being up to "
+              "date. Update it.")
+    else:
+        left = [c for c in superseded
+                if (c.get("conclusion") or c.get("state")) in DEAD]
+        if left:
+            print("  branch protection is still counting a stale run whose own "
+                  "newer run passed:")
+            for c in left:
+                print(f"    {c.get('name') or c.get('context')}  "
+                      f"{c.get('conclusion') or c.get('state')}  "
+                      f"{c.get('detailsUrl') or ''}")
+            print("  Re-running that run updates its check in place, which is what "
+                  "clears it:")
+            print("    gh run rerun --job <the job id at the end of that URL>")
+            print("  then run this again. Do NOT wait for another review -- there "
+                  "is nothing to review.")
+        else:
+            print("  and nothing here can see why. Look at the PR's checks in the "
+                  "browser; a required")
+            print("  check may never have run on this head. Do NOT wait for "
+                  "another review.")
+    raise SystemExit(1)
+
 print(f"PR #{pr} is ready: every thread resolved, every check green, no standing "
       "objection.")
-print(f"Queue the merge and stop:  gh pr merge {pr} --auto --squash")
-print("That does not merge -- it asks GitHub to, once merge-gate passes.")
+if queued:
+    print("Auto-merge is queued; GitHub merges it when the last required check "
+          "passes. Stop here.")
+else:
+    print(f"Queue the merge and stop:  gh pr merge {pr} --auto --squash")
+    print("That does not merge -- it asks GitHub to, once merge-gate passes.")
 PY

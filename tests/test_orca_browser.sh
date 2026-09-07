@@ -849,39 +849,24 @@ STUB
     # cannot say whether a thread is resolved. On round two that returns every
     # comment ever left -- the fixed ones mixed in with the live one -- and a
     # thread lost in that noise is exactly what left #88 and #89 blocked.
-    make_fixture
-    cp "$REPO_ROOT"/scripts/orca/{review-status.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
-    stub="$TMPDIR_FIXTURE/stub-bin"
-    mkdir -p "$stub"
-    cat >"$stub/gh" <<'GHSTUB'
-#!/usr/bin/env bash
-case "$*" in
-  *"repo view"*) printf 'armaatus/rommsync-nx\n' ;;
-  *headRefOid*)  printf 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n' ;;
-  *statusCheckRollup*) printf '{"statusCheckRollup":[{"name":"host-tests","conclusion":"SUCCESS"}]}\n' ;;
-  *graphql*)
-    cat <<'JSON'
-{"data":{"repository":{"pullRequest":{
- "reviews":{"nodes":[{"state":"COMMENTED","submittedAt":"2026-09-06T00:00:00Z",
-                      "commit":{"oid":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"},
-                      "author":{"login":"claude"}}]},
- "reviewThreads":{"nodes":[
-  {"id":"T_settled","isResolved":true,"isOutdated":false,"path":"core/src/old.cpp","line":10,
-   "comments":{"nodes":[{"author":{"login":"claude"},"body":"ALREADY FIXED LAST ROUND"}]}},
-  {"id":"T_live","isResolved":false,"isOutdated":true,"path":"core/src/sync.cpp","line":288,
-   "comments":{"nodes":[{"author":{"login":"claude"},"body":"THE ONE STILL OPEN"}]}}
-]}}}}}
-JSON
-    ;;
-  *) printf '\n' ;;
-esac
-GHSTUB
-    chmod +x "$stub/gh"
-    ( cd "$TMPDIR_FIXTURE" && git init -q . && git commit -q --allow-empty -m fixture ) 2>/dev/null
-    out="$(cd "$TMPDIR_FIXTURE" &&
-           PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$TMPDIR_FIXTURE/fleet" \
-           bash "$TMPDIR_FIXTURE/scripts/orca/review-status.sh" 83 2>&1)"
-    rc=$?
+    make_review_status_fixture
+    write_pr_reviews \
+      '{"state":"COMMENTED","submittedAt":"2026-09-06T00:00:00Z",
+        "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
+        "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.",
+        "comments":{"totalCount":0}}' \
+      '{"id":"T_settled","isResolved":true,"isOutdated":false,
+        "path":"core/src/old.cpp","line":10,
+        "comments":{"nodes":[{"author":{"login":"claude"},"body":"ALREADY FIXED LAST ROUND"}]}},
+       {"id":"T_live","isResolved":false,"isOutdated":true,
+        "path":"core/src/sync.cpp","line":288,
+        "comments":{"nodes":[{"author":{"login":"claude"},"body":"THE ONE STILL OPEN"}]}}' \
+      '"## Plan\n/code-review high\nmattpocock-skills:code-review\n"'
+    write_pr_checks \
+      '{"name":"host-tests","status":"COMPLETED","conclusion":"SUCCESS",
+        "startedAt":"2026-09-06T09:00:00Z","completedAt":"2026-09-06T09:30:00Z"}' \
+      BLOCKED '{"path":"core/src/sync.cpp"}'
+    out="$(run_review_status)"; rc=$?
     [ "$rc" = 1 ] || fail "expected exit 1 (an unresolved thread is not ready), got $rc: $out"
     grep -q "THE ONE STILL OPEN" <<<"$out" \
       || fail "did not print the unresolved thread; got: $out"
