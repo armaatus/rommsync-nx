@@ -1463,6 +1463,25 @@ add_test(NAME orca.teardown_covers_profiles
          COMMAND "${BASH_PROGRAM}" "${ORCA_TEARDOWN_TEST}" profiles)
 set_tests_properties(orca.teardown_covers_profiles PROPERTIES TIMEOUT 60)
 
+# The same hole in the path a person actually types. archive.sh and reap.sh name
+# the `tls` profile outright, but `./scripts/orca/compose.sh down -v` -- what
+# README, ci.yml and provision.py all point at -- did not, so the documented
+# teardown left the terminator and the network it holds behind (#122). Stubbed
+# docker, so it needs none.
+add_test(NAME orca.compose_down_covers_profiles
+         COMMAND "${BASH_PROGRAM}" "${ORCA_TEARDOWN_TEST}" compose)
+set_tests_properties(orca.compose_down_covers_profiles PROPERTIES TIMEOUT 60)
+
+# And the same question put to a real daemon, which is #122's acceptance
+# verbatim: nothing carrying the project's label survives `down -v`. Starts and
+# destroys a stack of its own, never this worktree's.
+add_test(NAME orca.compose_down_leaves_nothing
+         COMMAND "${BASH_PROGRAM}" "${ORCA_TEARDOWN_TEST}" compose_live)
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(orca.compose_down_leaves_nothing PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+set_tests_properties(orca.compose_down_leaves_nothing PROPERTIES TIMEOUT 120)
+
 add_test(NAME orca.reap_spares_live_worktrees
          COMMAND "${BASH_PROGRAM}" "${ORCA_TEARDOWN_TEST}" reap)
 if(NOT ROMMSYNC_REQUIRE_RIG)

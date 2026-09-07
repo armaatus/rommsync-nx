@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Covers scripts/orca/archive.sh and reap.sh -- the removal half of a worktree's
-# life, the reverse of scripts/orca/setup.sh.
+# Covers scripts/orca/archive.sh, reap.sh and compose.sh's `down` -- the removal
+# half of a worktree's life, the reverse of scripts/orca/setup.sh.
 #
 # A stack that survives its worktree is not a cosmetic leak: the fixture restarts
 # `unless-stopped`, so it comes back on every docker start and holds two ports
@@ -18,6 +18,16 @@
 #                                   the way out, and a pid it merely left behind
 #                                   -- one the system has since handed to
 #                                   something else -- is not. Needs no docker.
+#   test_orca_teardown.sh compose   `compose.sh down` -- the teardown README, CI
+#                                   and provision.py all point at -- activates
+#                                   every profile and removes orphans, while
+#                                   `up -d` still activates none. Stubbed
+#                                   docker, so it needs none.
+#   test_orca_teardown.sh compose_live
+#                                   the same question put to a real daemon: #122's
+#                                   acceptance, that nothing carrying the
+#                                   project's label survives `down -v`. Skips
+#                                   with 77 when docker is down.
 #   test_orca_teardown.sh profiles  every profile in the compose file is named on
 #                                   the `down` that removes the stack. `down`
 #                                   only touches services whose profile is
@@ -33,9 +43,34 @@ SKIP=77
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+# Every profile the compose file defines, as bare names. A teardown is only
+# complete against the file it is tearing down, so the expectation is read from
+# there rather than written out here -- a profile added later then fails these
+# assertions instead of quietly escaping them.
+compose_profiles() {
+  grep -oE '^[[:space:]]*profiles:[[:space:]]*\[[^]]*\]' \
+      "$REPO_ROOT/server/testing/docker-compose.yml" \
+    | grep -oE '"[^"]+"' | tr -d '"' | sort -u
+}
+
+# A loopback port nothing is listening on. The fixture terminator publishes one,
+# and a collision would fail `up` for a reason that has nothing to do with
+# teardown. Deliberately above the 25000-26999 band lib.sh derives TLS ports
+# from, so this can never take a live worktree's.
+free_port() {
+  local p
+  for p in $(seq 27000 27099); do
+    (: </dev/tcp/127.0.0.1/"$p") >/dev/null 2>&1 && continue
+    printf '%s\n' "$p"
+    return 0
+  done
+  return 1
+}
+
 FIXTURE=""
 ORPHAN=""
 SPACED=""
+LIVE=""
 cleanup() {
   [ -n "$FIXTURE" ] && rm -rf "$FIXTURE"
   if [ -n "$SPACED" ]; then
@@ -48,6 +83,16 @@ cleanup() {
   if [ -n "$ORPHAN" ]; then
     docker network rm "${ORPHAN}_default" >/dev/null 2>&1
     docker volume rm "${ORPHAN}_db_data" >/dev/null 2>&1
+  fi
+  # Same reason, for the stack compose_live really starts: its fixture root is
+  # deleted above, so nothing else on the machine could find it afterwards.
+  if [ -n "$LIVE" ]; then
+    docker ps -aq --filter "label=com.docker.compose.project=$LIVE" \
+      | while read -r c; do docker rm -f "$c" >/dev/null 2>&1; done
+    docker volume ls -q --filter "label=com.docker.compose.project=$LIVE" \
+      | while read -r v; do docker volume rm "$v" >/dev/null 2>&1; done
+    docker network ls -q --filter "label=com.docker.compose.project=$LIVE" \
+      | while read -r n; do docker network rm "$n" >/dev/null 2>&1; done
   fi
   return 0
 }
@@ -240,10 +285,7 @@ FAKE
     ;;
 
   profiles)
-    # Every profile the compose file defines, as bare names.
-    profiles="$(grep -oE '^[[:space:]]*profiles:[[:space:]]*\[[^]]*\]' \
-                  "$REPO_ROOT/server/testing/docker-compose.yml" \
-                | grep -oE '"[^"]+"' | tr -d '"' | sort -u)"
+    profiles="$(compose_profiles)"
     if [ -z "$profiles" ]; then
       echo "PASS: the compose file defines no profiles; nothing to cover"
       exit 0
@@ -266,8 +308,143 @@ FAKE
     echo "PASS: teardown activates every compose profile ($(echo $profiles | tr '\n' ' '))"
     ;;
 
+  compose)
+    # The documented teardown path (#122). archive.sh and reap.sh name the `tls`
+    # profile outright, but `./scripts/orca/compose.sh down -v` -- the command
+    # README, CI and provision.py all point at -- did not, so the TLS terminator
+    # survived it and held the network behind it.
+    #
+    # Stubbed docker, so this asserts what the wrapper ASKED FOR rather than what
+    # a daemon happened to leave; `compose_live` is the same question put to a
+    # real one.
+    FIXTURE="$(mktemp -d)"
+    mkdir -p "$FIXTURE/scripts/orca" "$FIXTURE/server/testing" "$FIXTURE/bin"
+    cp "$REPO_ROOT"/scripts/orca/{lib.sh,env.sh,compose.sh} "$FIXTURE/scripts/orca/"
+    cp "$REPO_ROOT/server/testing/docker-compose.yml" "$FIXTURE/server/testing/"
+    # Hand-written, so env.sh never runs: this phase is about the wrapper's
+    # argument handling and nothing else.
+    printf 'COMPOSE_PROJECT_NAME=rmx-compose-stub-test\n' >"$FIXTURE/.env"
+
+    cat >"$FIXTURE/bin/docker" <<'FAKE'
+#!/usr/bin/env bash
+echo "$*" >> "$DOCKER_CALL_LOG"
+exit 0
+FAKE
+    chmod +x "$FIXTURE/bin/docker"
+
+    profiles="$(compose_profiles)"
+    [ -n "$profiles" ] || fail "the compose file defines no profiles; fixture is broken"
+
+    log="$FIXTURE/docker.log"
+
+    : > "$log"
+    DOCKER_CALL_LOG="$log" PATH="$FIXTURE/bin:$PATH" \
+      "$FIXTURE/scripts/orca/compose.sh" down -v >/dev/null 2>&1 \
+      || fail "compose.sh down -v exited non-zero against a stubbed docker"
+    down="$(cat "$log")"
+    grep -q ' down ' <<<" $down " || fail "compose.sh down ran no down: $down"
+    for profile in $profiles; do
+      case "$down" in
+        *"--profile $profile"*|*"--profile *"*|*'COMPOSE_PROFILES'*) ;;
+        *) fail "compose.sh down does not activate the '$profile' profile, so"\
+                "$profile services survive the documented teardown: $down" ;;
+      esac
+    done
+    # A container compose no longer recognises as a service is still this
+    # worktree's, and teardown is the moment to say so -- archive.sh and reap.sh
+    # already do.
+    grep -q -- '--remove-orphans' <<<"$down" \
+      || fail "compose.sh down leaves orphaned containers behind: $down"
+
+    # The other half, and the reason this is not simply a global flag: an
+    # ordinary `up -d` must still start neither the TLS terminator nor anything
+    # else profiled. tls-fixture.sh is what asks for that, and
+    # tests/test_tls_fixture.sh isolated is what the rig depends on.
+    : > "$log"
+    DOCKER_CALL_LOG="$log" PATH="$FIXTURE/bin:$PATH" \
+      "$FIXTURE/scripts/orca/compose.sh" up -d >/dev/null 2>&1 \
+      || fail "compose.sh up -d exited non-zero against a stubbed docker"
+    up="$(cat "$log")"
+    grep -q -- '--profile' <<<"$up" \
+      && fail "compose.sh up -d activated a profile; the rig would gain a TLS front door: $up"
+
+    # And a caller that names a profile itself still gets it through untouched:
+    # tls-fixture.sh's `up`, `ps` and `rm` are all of that shape.
+    : > "$log"
+    DOCKER_CALL_LOG="$log" PATH="$FIXTURE/bin:$PATH" \
+      "$FIXTURE/scripts/orca/compose.sh" --profile tls up -d romm-tls >/dev/null 2>&1 \
+      || fail "compose.sh --profile tls up -d exited non-zero against a stubbed docker"
+    passthrough="$(cat "$log")"
+    grep -q -- '--profile tls .*up -d romm-tls' <<<"$passthrough" \
+      || fail "compose.sh mangled a caller's own --profile: $passthrough"
+
+    # A `down` behind global flags is still a `down`. `-p` takes a value, so a
+    # scan that does not know that reads the project name as the subcommand and
+    # activates nothing.
+    : > "$log"
+    DOCKER_CALL_LOG="$log" PATH="$FIXTURE/bin:$PATH" \
+      "$FIXTURE/scripts/orca/compose.sh" -p rmx-other down -v >/dev/null 2>&1 \
+      || fail "compose.sh -p ... down -v exited non-zero against a stubbed docker"
+    flagged="$(cat "$log")"
+    for profile in $profiles; do
+      case "$flagged" in
+        *"--profile $profile"*|*"--profile *"*|*'COMPOSE_PROFILES'*) ;;
+        *) fail "a \`down\` behind a global flag activated no profile: $flagged" ;;
+      esac
+    done
+
+    echo "PASS: compose.sh down activates every profile ($(echo $profiles | tr '\n' ' ')), up -d none"
+    ;;
+
+  compose_live)
+    docker info >/dev/null 2>&1 || { echo "SKIP: docker is not running"; exit $SKIP; }
+
+    # The acceptance in #122, put to a real daemon: after `compose.sh down -v`,
+    # `docker ps -a`, `docker volume ls` and `docker network ls` show nothing
+    # carrying this project's label.
+    #
+    # A fixture root of its own -- compose.sh derives the repo root from its own
+    # path and reads the .env beside it -- so this can start and destroy a whole
+    # stack without going anywhere near the worktree's live one.
+    FIXTURE="$(mktemp -d)"
+    mkdir -p "$FIXTURE/scripts/orca" "$FIXTURE/server/testing/tls/generated" \
+             "$FIXTURE/server/testing/library"
+    cp "$REPO_ROOT"/scripts/orca/{lib.sh,env.sh,compose.sh} "$FIXTURE/scripts/orca/"
+    cp "$REPO_ROOT/server/testing/docker-compose.yml" "$FIXTURE/server/testing/"
+    cp "$REPO_ROOT/server/testing/tls/romm-tls.conf.template" "$FIXTURE/server/testing/tls/"
+    cp "$REPO_ROOT/server/testing/fault_proxy.py" "$FIXTURE/server/testing/"
+
+    LIVE="rmx-compose-down-test-$$"
+    port="$(free_port)" || fail "no free port in 27000-27099 for the fixture terminator"
+    # Written by hand rather than by env.sh, and only TLS_PORT is ever bound:
+    # nothing but romm-tls starts below.
+    printf 'COMPOSE_PROJECT_NAME=%s\nTLS_PORT=%s\n' "$LIVE" "$port" >"$FIXTURE/.env"
+
+    # Only the terminator, and without its dependencies: this phase is about
+    # whether teardown SEES a profiled container, which does not need a RomM
+    # behind it. nginx exits on the unresolvable upstream, and that is fine --
+    # `docker ps -a` is what the acceptance names, and an exited container is
+    # still a container the next `reap.sh` would find.
+    "$FIXTURE/scripts/orca/compose.sh" --profile tls up -d --no-deps romm-tls >/dev/null 2>&1 \
+      || fail "could not start the fixture terminator"
+    [ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$LIVE")" ] \
+      || fail "the fixture terminator never existed; this phase would pass vacuously"
+
+    "$FIXTURE/scripts/orca/compose.sh" down -v >/dev/null 2>&1 \
+      || fail "compose.sh down -v exited non-zero"
+
+    remnants="$(
+      docker ps -a      --filter "label=com.docker.compose.project=$LIVE" --format 'container {{.Names}}'
+      docker volume ls  --filter "label=com.docker.compose.project=$LIVE" --format 'volume {{.Name}}'
+      docker network ls --filter "label=com.docker.compose.project=$LIVE" --format 'network {{.Name}}'
+    )"
+    [ -z "$remnants" ] || fail "compose.sh down -v left this behind: $(echo $remnants)"
+
+    echo "PASS: compose.sh down -v leaves no container, volume or network for $LIVE"
+    ;;
+
   *)
-    echo "usage: $0 derives|reap|watcher|profiles" >&2
+    echo "usage: $0 derives|reap|watcher|profiles|compose|compose_live" >&2
     exit 2
     ;;
 esac
