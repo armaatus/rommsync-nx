@@ -245,7 +245,11 @@ esac
 GHSTUB
   chmod +x "$TMPDIR_FIXTURE/stub-bin/gh"
   ( cd "$TMPDIR_FIXTURE" && git init -q . && git commit -q --allow-empty -m fixture ) 2>/dev/null
-  AW_HEAD="$(cd "$TMPDIR_FIXTURE" && git rev-parse HEAD)"
+  # The head the fixture PR sits on -- the one `headRefOid` reports and the one
+  # reviews are attributed to. Started equal to the worktree HEAD because that is
+  # the ordinary case; a phase that wants them to DIFFER (something committed and
+  # not pushed) reassigns it before describing the reviews.
+  AW_PR_HEAD="$(cd "$TMPDIR_FIXTURE" && git rev-parse HEAD)"
 }
 
 # The reviews on the fixture PR, in $1, as GraphQL review nodes. The PR's own
@@ -258,7 +262,7 @@ GHSTUB
 write_await_reviews() {
   cat >"$TMPDIR_FIXTURE/graphql.json" <<JSON
 {"data":{"repository":{"pullRequest":{
-  "headRefOid":"$AW_HEAD",
+  "headRefOid":"$AW_PR_HEAD",
   "author":{"login":"armaatus"},
   "reviews":{"nodes":[$1]}
 }}}}
@@ -1388,7 +1392,7 @@ GHSTUB
     make_await_fixture
     write_await_reviews \
       '{"state":"COMMENTED","submittedAt":"2099-01-01T00:00:00Z",
-        "commit":{"oid":"'"$AW_HEAD"'"},"author":{"login":"armaatus"},
+        "commit":{"oid":"'"$AW_PR_HEAD"'"},"author":{"login":"armaatus"},
         "body":"","comments":{"totalCount":0}},
        {"state":"CHANGES_REQUESTED","submittedAt":"2099-01-01T01:00:00Z",
         "commit":{"oid":"0000000000000000000000000000000000000000"},
@@ -1396,7 +1400,7 @@ GHSTUB
         "body":"A real review of the commit before this one, long enough to clear MIN_REVIEW_BODY.",
         "comments":{"totalCount":3}},
        {"state":"COMMENTED","submittedAt":"2099-01-01T02:00:00Z",
-        "commit":{"oid":"'"$AW_HEAD"'"},"author":{"login":"claude"},
+        "commit":{"oid":"'"$AW_PR_HEAD"'"},"author":{"login":"claude"},
         "body":"test","comments":{"totalCount":0}}'
     out="$(run_await_review 6)"; rc=$?
     [ "$rc" = 4 ] \
@@ -1424,10 +1428,10 @@ GHSTUB
     make_await_fixture
     write_await_reviews \
       '{"state":"COMMENTED","submittedAt":"2099-01-01T00:00:00Z",
-        "commit":{"oid":"'"$AW_HEAD"'"},"author":{"login":"armaatus"},
+        "commit":{"oid":"'"$AW_PR_HEAD"'"},"author":{"login":"armaatus"},
         "body":"","comments":{"totalCount":0}},
        {"state":"CHANGES_REQUESTED","submittedAt":"2099-01-01T03:00:00Z",
-        "commit":{"oid":"'"$AW_HEAD"'"},"author":{"login":"claude"},
+        "commit":{"oid":"'"$AW_PR_HEAD"'"},"author":{"login":"claude"},
         "body":"IMPORTANT: the backup is written after the overwrite, not before.",
         "comments":{"totalCount":1}}'
     out="$(run_await_review 6)"; rc=$?
@@ -1444,6 +1448,56 @@ GHSTUB
     echo "PASS: a real independent review on this head still ends the wait"
     ;;
 
+  await_never_hands_back_the_same_review_twice)
+    # The round cap is three, and a round is spent whenever a review is read. So
+    # a review must be read once.
+    #
+    # A second visit on an UNCHANGED head is a real flow, not a mistake:
+    # claude-review.yml fires on `review_requested` as well as on `synchronize`,
+    # so an agent that re-requests without pushing is waiting for a SECOND review
+    # of the same commit. Neither the commit time this used to compare against
+    # nor the push time #114 asked for tells that apart from the review already
+    # acted on -- both are older than both reviews. What does is the newest one
+    # handed back, which is why record_round now writes it down.
+    make_await_fixture
+    write_await_reviews \
+      '{"state":"CHANGES_REQUESTED","submittedAt":"2099-01-01T03:00:00Z",
+        "commit":{"oid":"'"$AW_PR_HEAD"'"},"author":{"login":"claude"},
+        "body":"IMPORTANT: the backup is written after the overwrite, not before.",
+        "comments":{"totalCount":1}}'
+    out="$(run_await_review 6)"; rc=$?
+    [ "$rc" = 0 ] || fail "the first visit did not read the review at all (exit $rc): $out"
+
+    # Nothing pushed, nothing re-reviewed: the same payload, second visit.
+    out2="$(run_await_review 6)"; rc2=$?
+    [ "$rc2" != 0 ] \
+      || fail "handed the same review back a second time and burned round 2 of 3 on findings already in hand: $out2"
+    grep -q "already handed back" <<<"$out2" \
+      || fail "waited without saying why, which reads as the reviewer never running: $out2"
+    grep -q "^114 1 " "$TMPDIR_FIXTURE/.orca/review-rounds" \
+      || fail "the round count moved past 1 without a new review being read: $(cat "$TMPDIR_FIXTURE/.orca/review-rounds")"
+
+    # ...and a genuine re-review on the same head IS read. This is the half a
+    # blunt "same head, already answered" rule would break.
+    write_await_reviews \
+      '{"state":"CHANGES_REQUESTED","submittedAt":"2099-01-01T03:00:00Z",
+        "commit":{"oid":"'"$AW_PR_HEAD"'"},"author":{"login":"claude"},
+        "body":"IMPORTANT: the backup is written after the overwrite, not before.",
+        "comments":{"totalCount":1}},
+       {"state":"COMMENTED","submittedAt":"2099-01-01T09:00:00Z",
+        "commit":{"oid":"'"$AW_PR_HEAD"'"},"author":{"login":"claude"},
+        "body":"Re-reviewed on the same head after the request: the backup ordering is fixed.",
+        "comments":{"totalCount":0}}'
+    out3="$(run_await_review 6)"; rc3=$?
+    [ "$rc3" = 0 ] \
+      || fail "a re-review on the same head was never read, so a review_requested round can never end (exit $rc3): $out3"
+    grep -q "Re-reviewed on the same head" <<<"$out3" \
+      || fail "did not print the new review: $out3"
+    grep -q "the backup is written after the overwrite" <<<"$out3" \
+      && fail "reprinted the review already acted on alongside the new one: $out3"
+    echo "PASS: a review is handed back once, and a re-review still lands"
+    ;;
+
   await_judges_the_head_github_has)
     # "This head" is the head on the PULL REQUEST, not the one in the worktree,
     # because that is the head merge-gate judges. They differ exactly when
@@ -1453,10 +1507,11 @@ GHSTUB
     # So: the review is on the PR head, the worktree is somewhere else, and this
     # has to end with the review in hand AND with the divergence named.
     make_await_fixture
-    AW_HEAD=1111111111111111111111111111111111111111
+    # The PR is on a commit this worktree does not have.
+    AW_PR_HEAD=1111111111111111111111111111111111111111
     write_await_reviews \
       '{"state":"COMMENTED","submittedAt":"2099-01-01T03:00:00Z",
-        "commit":{"oid":"'"$AW_HEAD"'"},"author":{"login":"claude"},
+        "commit":{"oid":"'"$AW_PR_HEAD"'"},"author":{"login":"claude"},
         "body":"A real review of what GitHub actually has, long enough to clear MIN_REVIEW_BODY.",
         "comments":{"totalCount":0}}'
     out="$(run_await_review 6)"; rc=$?
@@ -1496,8 +1551,16 @@ GHSTUB
       || fail "the gate itself accepted the author's own thread reply as an independent review; the fixture proves nothing: $gate"
     [ "$rs_rc" = "$gate_rc" ] \
       || fail "review-status said $rs_rc where merge_gate.py says $gate_rc -- the local answer and the required check disagree, which is how a PR sits quietly BLOCKED: $out"
-    grep -qi "no independent review" <<<"$out" \
-      || fail "did not give the gate's own reason, so the agent cannot tell what to do next: $out"
+    # The exit codes alone would be a weak assertion: these are different spaces
+    # (0-4 here, 0/1 there) and review-status also exits 1 for BLOCKED and for
+    # DIRTY, so 1 == 1 can match for the wrong reason. The REASON is the thing
+    # that has to be the same one, so the gate's own sentence has to appear
+    # verbatim in what review-status printed.
+    reason="$(grep -F "no independent review" <<<"$gate" | sed 's/^ *//')"
+    [ -n "$reason" ] \
+      || fail "the gate refused for some reason other than independence; the fixture no longer describes the acceptance shape: $gate"
+    grep -qF "$reason" <<<"$out" \
+      || fail "review-status reached the same exit code by a different route -- it never gave the gate's reason, so the agent is sent to fix the wrong thing: $out"
     echo "PASS: review-status and merge_gate.py agree on a thread reply"
     ;;
 

@@ -74,10 +74,10 @@ def independent_reviews(pull_request, head_sha):
     creates one of these too, with an empty body and the replier as its author,
     which is how an agent answering findings manufactured its own review.
 
-    On this head, because pushing a fix invalidates the review of the commit
-    before it. For a caller waiting on a review this is also strictly stronger
-    than any freshness cut-off it could compute: a review cannot be submitted
-    against a commit that does not exist yet.
+    The review also has to be on this head, because pushing a fix invalidates
+    the review of the commit before it. For a caller waiting on a review that
+    condition is strictly stronger than any freshness cut-off it could compute:
+    a review cannot be submitted against a commit that does not exist yet.
     """
     pr_author = ((pull_request.get("author") or {}).get("login") or "").lower()
     return sorted(

@@ -91,6 +91,24 @@ orca_pr_for_branch() {
   printf '%s\n' "$pr"
 }
 
+# The `owner/name` this worktree's PRs live in, split into $orca_owner and
+# $orca_repo_name.
+#
+# Non-zero when gh cannot answer, and ALSO when it answers something that is not
+# `owner/name`. That second case is the one worth a function: an empty owner
+# builds a GraphQL query that matches nothing rather than one that errors, so a
+# caller polling on it waits out its whole deadline and then reports that nothing
+# arrived -- indistinguishable from the silence await-review.sh exists to
+# explain.
+orca_owner_repo() {
+  local answer
+  answer="$(GH_PAGER=cat gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null)" \
+    || return 1
+  case "$answer" in */*) ;; *) return 1 ;; esac
+  orca_owner="${answer%%/*}"
+  orca_repo_name="${answer##*/}"
+}
+
 # The Orca CLI this machine can actually run, in $ORCA_CLI.
 #
 # `orca` on PATH is a wrapper that locates Orca.app by reading its own symlink.

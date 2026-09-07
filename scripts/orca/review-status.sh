@@ -47,8 +47,8 @@ pr="${1:-}"
 [ -n "$pr" ] || pr="$(orca_pr_for_branch)" || {
   echo "no open PR for branch $(git rev-parse --abbrev-ref HEAD)" >&2; exit 2; }
 
-owner_repo="$(GH_PAGER=cat gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null)" || exit 2
-owner="${owner_repo%%/*}"; name="${owner_repo##*/}"
+orca_owner_repo || { echo "could not read this repository's name from gh" >&2; exit 2; }
+owner="$orca_owner"; name="$orca_repo_name"
 
 payload="$(mktemp)"; checks="$(mktemp)"; files="$(mktemp)"
 trap 'rm -f "$payload" "$checks" "$files"' EXIT

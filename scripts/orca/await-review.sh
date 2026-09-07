@@ -13,7 +13,8 @@
 #
 # Exit codes, so the caller can tell the cases apart:
 #   0  a review is in hand
-#   2  no PR to wait on
+#   2  could not tell -- no PR to wait on, or gh could not say what repository
+#      this is, which leaves nothing here able to ask about the reviews
 #   3  the fleet was stopped while waiting
 #   4  nothing arrived before the deadline -- look at Actions
 #   5  the third round is over; stop and say what is unresolved
@@ -61,9 +62,17 @@ head="$(git rev-parse HEAD)"
 
 mkdir -p "$REPO_ROOT/.orca"
 round=0
+seen_head=""
+seen_stamp=""
 if [ -r "$ROUNDS_FILE" ]; then
-  read -r seen_pr seen_round <"$ROUNDS_FILE" 2>/dev/null || true
+  # Four fields: the PR, the round, the head that round was answered on, and the
+  # newest `submittedAt` handed back. The last two are what stop a review being
+  # reported twice -- see the filter in the Python block below. Files written by
+  # an older version carry only the first two, and `read` leaves the rest empty,
+  # which is exactly the "nothing seen yet" state.
+  read -r seen_pr seen_round seen_head seen_stamp <"$ROUNDS_FILE" 2>/dev/null || true
   [ "${seen_pr:-}" = "$pr" ] && round="${seen_round:-0}"
+  if [ "${seen_pr:-}" != "$pr" ]; then seen_head=""; seen_stamp=""; fi
 fi
 round=$((round + 1))
 
@@ -71,7 +80,13 @@ round=$((round + 1))
 # below). A round the reviewer never answered is not a round of disagreement --
 # three CI timeouts in a row must not exhaust the cap without a single finding
 # having been seen.
-record_round() { printf '%s %s\n' "$pr" "$round" >"$ROUNDS_FILE"; }
+#
+# `$stamp` is written by the Python block: the head it judged and the newest
+# review it handed back, so the next round can tell a re-review from the one it
+# has already acted on.
+record_round() {
+  printf '%s %s %s\n' "$pr" "$round" "$(cat "$stamp" 2>/dev/null)" >"$ROUNDS_FILE"
+}
 
 if [ "$round" -gt "$MAX_ROUNDS" ]; then
   cat <<CAP
@@ -95,29 +110,24 @@ fi
 # from the PREVIOUS round submitted at T0+1min passes that test (#114). The
 # commit time was never the push time and there is no cheap way to ask GitHub
 # for the push time; the head makes the question unnecessary.
-# Checked for emptiness as well as for gh's exit status. An owner of "" builds a
-# query that can never match, and this loop would then poll it for the full 45
-# minutes and report that no review arrived -- the same silent, wrong answer the
-# rest of this script exists to stop giving.
-owner_repo="$(GH_PAGER=cat gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null)"
-case "$owner_repo" in
-  */*) ;;
-  *) echo "could not read this repository's name from gh (got \"$owner_repo\"); nothing here can ask about the reviews" >&2
-     exit 2 ;;
-esac
-owner="${owner_repo%%/*}"; name="${owner_repo##*/}"
+orca_owner_repo || {
+  echo "could not read this repository's name from gh; nothing here can ask about the reviews" >&2
+  exit 2; }
+owner="$orca_owner"; name="$orca_repo_name"
 
 echo "round $round of $MAX_ROUNDS -- waiting for a review on PR #$pr, on its current head"
 echo "  (polling every ${POLL_SECONDS}s; stop everything with ./scripts/orca/stop.sh)"
 
-payload="$(mktemp)"; reviews_out="$(mktemp)"
-trap 'rm -f "$payload" "$reviews_out"' EXIT
+payload="$(mktemp)"; reviews_out="$(mktemp)"; stamp="$(mktemp)"
+trap 'rm -f "$payload" "$reviews_out" "$stamp"' EXIT
 waited=0
 checks_due=0
 broken_before=""
 # Set when a poll saw review records on this head that none of the gate rules
-# count. Only ever read by the timeout message below.
+# count, and when the only ones that DO count were already handed back in an
+# earlier round. Only ever read by the timeout message below.
 discounted=""
+already_seen=""
 # Set from the rollup inside the throttled block below; declared here so a poll
 # that skips the block still has a value under `set -u`.
 review_dead=""
@@ -353,7 +363,8 @@ query($owner:String!,$name:String!,$pr:Int!){
     # in a comment inside the block below is enough to make the whole script a
     # syntax error, and the message it gives names neither the line nor the
     # quote. Outside `$(...)` the heredoc is just a heredoc.
-    python3 - "$payload" "$head" >"$reviews_out" <<'PY'
+    python3 - "$payload" "$head" "$seen_head" "$seen_stamp" "$stamp" \
+      >"$reviews_out" <<'PY'
 import json, sys
 
 sys.path.insert(0, ".github/scripts")
@@ -369,7 +380,7 @@ except Exception as exc:  # missing, half-edited, or broken at import time
           "imports.", file=sys.stderr)
     raise SystemExit(1)
 
-path, local_head = sys.argv[1], sys.argv[2]
+path, local_head, seen_head, seen_stamp, stamp_path = sys.argv[1:6]
 try:
     pull = json.load(open(path))["data"]["repository"]["pullRequest"] or {}
 except Exception:
@@ -391,6 +402,24 @@ if head != local_head:
 # PR author, on this head, and carrying something to act on.
 on_head = independent_reviews(pull, head)
 reviews = [r for r in on_head if is_substantive(r)]
+
+# What "already present" actually means, now that the head decides which reviews
+# belong to this push. A round can legitimately begin on an UNCHANGED head:
+# claude-review.yml fires on `review_requested` as well as on `synchronize`, so
+# an agent that re-requests without pushing is waiting for a second review of the
+# same commit. Neither the commit time this used to compare against nor the push
+# time the issue asked for separates that from the review it already acted on --
+# both are older than both reviews. What does is remembering the newest one
+# handed back, which record_round writes and this reads.
+if reviews and seen_head == head and seen_stamp:
+    unseen = [r for r in reviews if (r.get("submittedAt") or "") > seen_stamp]
+    if not unseen:
+        raise SystemExit(4)
+    reviews = unseen
+
+if reviews:
+    with open(stamp_path, "w") as fh:
+        fh.write("%s %s" % (head, reviews[-1].get("submittedAt") or ""))
 if not reviews:
     # 3 rather than 1 when review RECORDS exist on this head and none of them
     # counted. Nothing to act on either way, so the wait continues -- but a
@@ -411,6 +440,7 @@ PY
     # 3 is "records on this head, none of them a review" -- remembered for the
     # timeout message rather than repeated on all ninety polls.
     [ "$verdict" = 3 ] && discounted=1
+    [ "$verdict" = 4 ] && already_seen=1
     if [ "$verdict" = 0 ]; then
       echo
       cat "$reviews_out"
@@ -441,6 +471,15 @@ broken review looks like a green run with no comments. Check:
   gh run list --branch $(git rev-parse --abbrev-ref HEAD) --limit 5
 and whether CLAUDE_CODE_OAUTH_TOKEN is set as a repository secret.
 TIMEOUT
+if [ -n "$already_seen" ]; then
+  cat <<SEEN
+The only review on this head is the one an earlier round already handed back, so
+this waited for a NEW one rather than reporting the same findings twice and
+spending a second round on them. If there is nothing left to fix on it, the next
+step is ./scripts/orca/review-status.sh, not another wait; if there is, push the
+fix -- the push re-runs the reviewer.
+SEEN
+fi
 if [ -n "$discounted" ]; then
   cat <<DISCOUNTED
 Review RECORDS were submitted against this head, and none of them is a review

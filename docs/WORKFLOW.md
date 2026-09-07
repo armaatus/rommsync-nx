@@ -261,6 +261,12 @@ used to be handed its own empty reply back as "the review", spend one of its
 three rounds on it, and then watch `merge-gate` refuse the PR for the reason the
 wait had just called satisfied ([#114](https://github.com/armaatus/rommsync-nx/issues/114)).
 
+It also hands a given review back exactly once. A round can begin on an unchanged
+head — `claude-review.yml` fires on `review_requested` as well as on
+`synchronize` — so the wait remembers the newest review it reported, in
+`.orca/review-rounds` beside the round count, and waits for a *newer* one rather
+than spending a second round on findings already in hand.
+
 Then it fixes what is real, replies with a reason where it disagrees, resolves
 every thread, pushes, re-requests review, and checks:
 
