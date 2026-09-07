@@ -819,7 +819,9 @@ GHSTUB
 #!/usr/bin/env bash
 case "$*" in
   *"pr list"*)         printf '[{"number":99}]\n' ;;
-  *statusCheckRollup*) printf '{"statusCheckRollup":[{"name":"host-tests","conclusion":"SUCCESS"}],"mergeStateStatus":"DIRTY"}\n' ;;
+  *statusCheckRollup*)
+    echo x >>"$ROLLUP_LOG"
+    printf '{"statusCheckRollup":[{"name":"host-tests","conclusion":"SUCCESS"}],"mergeStateStatus":"DIRTY","baseRefName":"release/v1"}\n' ;;
   *"pr view"*)         printf '{"reviews":[]}\n' ;;
   *"run list"*)        printf '\n' ;;
   *)                   printf '\n' ;;
@@ -827,22 +829,49 @@ esac
 GHSTUB
     chmod +x "$stub/gh"
     ( cd "$TMPDIR_FIXTURE" && git init -q . && git commit -q --allow-empty -m fixture ) 2>/dev/null
-    started=$SECONDS
+    rolluplog="$TMPDIR_FIXTURE/rollup.log"; : >"$rolluplog"
     out="$(cd "$TMPDIR_FIXTURE" &&
            PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$TMPDIR_FIXTURE/fleet" \
+           ROLLUP_LOG="$rolluplog" \
            AWAIT_REVIEW_DEADLINE=12 AWAIT_REVIEW_POLL=1 \
            bash "$TMPDIR_FIXTURE/scripts/orca/await-review.sh" 99 2>&1)"
     rc=$?
     [ "$rc" = 8 ] \
       || fail "expected exit 8 for a conflicted PR, got $rc; the wait would run its full deadline and then ask for a review that cannot help: $out"
-    [ "$((SECONDS - started))" -lt 5 ] \
-      || fail "took $((SECONDS - started))s to report a conflict; it must go on the first throttled check, not on two consecutive ones: $out"
+    # One rollup fetched, so it went on the FIRST throttled check. Counting the
+    # stub's calls rather than the wall clock: the property is "one sighting is
+    # enough", not "it was quick", and a loaded CI box makes a timing assert
+    # flake on a script that behaved correctly.
+    [ "$(wc -l <"$rolluplog" | tr -d ' ')" = 1 ] \
+      || fail "fetched the rollup $(wc -l <"$rolluplog" | tr -d ' ') time(s) before reporting a conflict; it must go on the first sighting, not on two consecutive ones: $out"
     grep -q "DIRTY" <<<"$out" \
       || fail "did not name the state GitHub reports, so the agent cannot match it to review-status.sh: $out"
     grep -q -- "--force-with-lease" <<<"$out" \
       || fail "told the agent to rebase without saying how to push the rewritten branch: $out"
     grep -q "record-review.sh" <<<"$out" \
       || fail "a rebase changes every sha and the review marker is per-commit; the push will be refused without a new one: $out"
+    # The base is the PR's own, not a hardcoded origin/main -- which is right for
+    # every PR the fleet opens today and wrong the first time one is stacked.
+    grep -q "origin/release/v1" <<<"$out" \
+      || fail "printed a rebase against a base this PR does not have; the command it hands the agent has to be runnable: $out"
+
+    # Exit 8 fires on poll 1, so neither the deadline nor the round cap bounds
+    # it, and an agent whose force-push never ran would bounce here forever
+    # getting the same four instructions. A second visit on the SAME commit is
+    # proof nothing changed -- this reads GitHub's view, not the working tree --
+    # and it has to say so.
+    : >"$rolluplog"
+    out2="$(cd "$TMPDIR_FIXTURE" &&
+            PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$TMPDIR_FIXTURE/fleet" \
+            ROLLUP_LOG="$rolluplog" \
+            AWAIT_REVIEW_DEADLINE=12 AWAIT_REVIEW_POLL=1 \
+            bash "$TMPDIR_FIXTURE/scripts/orca/await-review.sh" 99 2>&1)"
+    [ "$?" = 8 ] || fail "the second visit did not still exit 8: $out2"
+    grep -q "SECOND time" <<<"$out2" \
+      || fail "came back on the same commit and repeated itself; nothing bounds this path, so an unpushed rebase loops forever: $out2"
+    grep -q "SECOND time" <<<"$out" \
+      && fail "called the first visit a repeat; the marker is not being keyed on the head at all: $out"
+
     echo "PASS: a conflicted PR is reported at once, with the rebase it needs"
     ;;
 
