@@ -92,6 +92,15 @@ assert_activates_every_profile() {
   done
 }
 
+# Whether $2 sweeps orphans. Beside the profile assertion because it is the
+# other half of the same guarantee: a `down` that keeps the profile but loses
+# this one removes the terminator and leaves whatever compose has stopped
+# recognising as a service, which is the half that leaves nothing to see.
+assert_removes_orphans() {
+  grep -q -- '--remove-orphans' <<<"$2" \
+    || fail "$1 leaves orphaned containers behind: $2"
+}
+
 # Remove everything docker holds under one project label. Only ever used to
 # clean up after a phase: a test that fabricates a stack and leaves it behind is
 # committing the exact leak this file exists to catch.
@@ -332,6 +341,11 @@ FAKE
                 "$REPO_ROOT/scripts/orca/$script" | tr '\n' ' ')"
       [ -n "$down" ] || fail "$script no longer runs docker compose down on a project"
       assert_activates_every_profile "$script's \`down\`" "$down"
+      # Both halves here, not just the profile: archive.sh's orphan sweep is
+      # pinned by `derives`, but reap.sh's was asserted nowhere, so dropping it
+      # left every test green while the sweep stopped removing containers
+      # compose had stopped recognising as services.
+      assert_removes_orphans "$script's \`down\`" "$down"
     done
 
     echo "PASS: teardown activates every compose profile ($(echo $profiles | tr '\n' ' '))"
@@ -376,8 +390,7 @@ FAKE
     # A container compose no longer recognises as a service is still this
     # worktree's, and teardown is the moment to say so -- archive.sh and reap.sh
     # already do.
-    grep -q -- '--remove-orphans' <<<"$down" \
-      || fail "compose.sh down leaves orphaned containers behind: $down"
+    assert_removes_orphans "compose.sh down" "$down"
 
     # The other half, and the reason this is not simply a global flag: an
     # ordinary `up -d` must still start neither the TLS terminator nor anything
@@ -410,6 +423,12 @@ FAKE
       || fail "compose.sh -p ... down -v exited non-zero against a stubbed docker"
     flagged="$(cat "$log")"
     assert_activates_every_profile "compose.sh -p ... down" "$flagged"
+    # Both flags come off the same branch today, so this asserts no new code
+    # path -- the profile assertion above already fails a `down` the scanner
+    # missed, since neither flag would be there. It pins the pair together: a
+    # change that ever routed a flagged `down` differently could not then keep
+    # the profile and quietly lose the sweep.
+    assert_removes_orphans "compose.sh -p ... down" "$flagged"
 
     echo "PASS: compose.sh down activates every profile ($(echo $profiles | tr '\n' ' ')), up -d none"
     ;;

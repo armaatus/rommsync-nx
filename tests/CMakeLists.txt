@@ -1481,7 +1481,8 @@ set_tests_properties(orca.env_concurrent_writers orca.env_never_partial
 # --- worktree teardown: the archive hook in orca.yaml -------------------------
 # `derives` needs no docker, so the regression it guards -- teardown falling back
 # to the compose default and removing nothing -- stays checkable with Docker
-# stopped. Only `reap` touches the daemon, so only it can skip.
+# stopped. `reap` and `compose_live` are the two that touch the daemon, so they
+# are the two that can skip.
 set(ORCA_TEARDOWN_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_orca_teardown.sh")
 
 add_test(NAME orca.teardown_derives_project
