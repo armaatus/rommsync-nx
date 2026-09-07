@@ -40,20 +40,18 @@ set -m
 # RomM fixture while the outer run moves on to other rig tests -- which presents
 # as those tests failing, with nothing pointing back here.
 #
-# The GROUP is signalled, not the pid: what holds a connection to the fixture is
-# the `test_http_native` an inner `ctest` spawned, and killing the inner `ctest`
-# alone leaves that grandchild orphaned and still connected on any path where
-# `ctest` does not forward the signal itself.
+# The GROUP is signalled, not the pid, because `ctest` does not pass a signal on
+# to the test it is running: measured, for TERM and for KILL alike, the inner
+# `test_http_native` stays alive and is reparented to init. What holds a
+# connection to the fixture is that grandchild, so killing the two `ctest` pids
+# leaves exactly the thing that had to go.
 #
-# Measured, from an interactive shell: TERM this script with a bare
-# `kill <ctest-pid>` and two `test_http_native` survive, on each of three trials;
-# with the group kill below, none does. **It is not covered by a test**, and not
-# for want of trying -- two attempts at one both went GREEN against a copy of
-# this script with the fix removed, so they proved nothing and were dropped
-# rather than shipped. What differs is process-group and session handling between
-# an interactive shell and the bash CTest spawns, where `set -m` itself reports
-# `setpgid: Operation not permitted`. Anyone who wants to close this should start
-# by making a deliberately-broken copy fail, before making the fixed one pass.
+# `scratch.orphans` (tests/test_scratch_orphans.sh) is the test of this, and it
+# is red against a copy of this script with the group kill taken out. Two earlier
+# attempts at that test were green against the same broken copy, because they
+# polled until no inner process was left -- which always comes true a few seconds
+# later when the scenario ends on its own. The question is whether anything is
+# orphaned *promptly* after the kill, not whether it dies eventually.
 cleanup() {
   for job in $first $second; do
     kill -- "-$job" 2>/dev/null || kill "$job" 2>/dev/null

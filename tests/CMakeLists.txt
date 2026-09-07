@@ -626,6 +626,29 @@ endif()
 # and nothing else may be a third.
 set_tests_properties(scratch.concurrent PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 
+# ...and what that script leaves behind when CTest ends it on TIMEOUT (#169).
+# `ctest` does NOT forward a signal to the test it is running -- measured, for
+# TERM and for KILL alike -- so killing the two inner `ctest`s leaves their
+# `test_http_native` alive and reparented to init, on the fixture the rest of the
+# run needs. The group kill in that script's trap is the fix, and this is the
+# test of it: red against a copy with the fix removed, green with it.
+#
+# `http.stall` for the pattern because the sample has to land while the scenario
+# is still running, and stall is the one that lasts seconds; the script's control
+# phase checks that rather than trusting it. It is read-only against RomM, which
+# is what makes two at once safe.
+set(SCRATCH_ORPHANS_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_scratch_orphans.sh")
+add_test(NAME scratch.orphans
+         COMMAND "${BASH_PROGRAM}" "${SCRATCH_ORPHANS_TEST}"
+                 "${CMAKE_CTEST_COMMAND}" "${CMAKE_BINARY_DIR}"
+                 "${SCRATCH_CONCURRENT_TEST}" "^http\\.stall$")
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(scratch.orphans PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+# RUN_SERIAL for the same reason, and more so: it kills rig clients mid-request
+# on purpose, so nothing else may be talking to the fixture while it does.
+set_tests_properties(scratch.orphans PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+
 # --- the console's HttpClient against the same rig ---------------------------
 # M1-7 (#126). The Horizon backend is split so that the half that can be got
 # wrong is reachable from here: `sysmodule/source/http/http_wire.cpp` speaks
