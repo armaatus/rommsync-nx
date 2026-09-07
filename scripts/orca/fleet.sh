@@ -1263,27 +1263,39 @@ release_dispatcher_files() {
   rm -f "$PIDFILE" "$DISPATCHER_FILE"
 }
 
-# Is $1 a pid this machine can still see running a DISPATCHER? Two questions
-# rather than one, and the second is the whole point. A `kill -9`'d dispatcher
-# leaves its pidfile behind, the OS wraps round and hands that number to
-# somebody else, and a check that asked `kill -0` alone would from then on
-# refuse to start the fleet at all -- forever, on the strength of a stranger's
-# process. lib.sh's orca_stop_autostart_watcher takes the same precaution for
-# the same reason, before it SIGNALS a pid it did not watch die.
+# Is $1 a pid this machine can still see running a DISPATCHER? THREE answers,
+# because "ps would not say" is not "no" -- the same shape report_dispatcher_code
+# already uses for a fleet.sh it cannot hash.
+#
+#   0  yes: alive, and its command line names a `fleet.sh run`.
+#   1  no:  the process is gone, or ps named something that is not a dispatcher.
+#   2  cannot say: it is alive, and ps produced no line to judge it by.
+#
+# The middle answer is the point. A `kill -9`'d dispatcher leaves its pidfile
+# behind, the OS wraps round and hands that number to somebody else, and a check
+# that asked `kill -0` alone would from then on refuse to start the fleet at all
+# -- forever, on the strength of a stranger's process. lib.sh's
+# orca_stop_autostart_watcher takes the same precaution for the same reason,
+# before it SIGNALS a pid it did not watch die.
 #
 # `run` as well as the file name, because only `fleet.sh run` is a dispatcher.
 # `fleet.sh status` is run constantly and from every worktree; a recycled pid
 # landing on one of those would be a refusal with nothing behind it to stop.
 #
-# Everything it cannot establish is NO: a `ps` that would not answer, a command
-# line that is not there. This gate decides whether the fleet may start at all,
-# and the direction to fail in is the one that starts it.
+# The third answer exists because the callers want opposite things from it. A
+# `ps` that cannot answer -- a container without procps, a launch shape whose
+# argv does not carry the script path -- must not let `run` hold the fleet down,
+# and must not stop `stop --now` SIGNALLING the dispatcher it promises to stop.
+# Collapsing it into "no" would do both: `--now` would interrupt every agent,
+# announce that there was no dispatcher, leave it polling, and let the next `run`
+# start a second one -- #179 rebuilt inside the check for it.
 dispatcher_alive() {
-  local pid="${1:-}"
+  local pid="${1:-}" line
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
   kill -0 "$pid" 2>/dev/null || return 1
-  ps -o command= -p "$pid" 2>/dev/null \
-    | grep -Eq 'fleet\.sh[[:space:]]+run([[:space:]]|$)'
+  line="$(ps -o command= -p "$pid" 2>/dev/null)"
+  [ -n "$line" ] || return 2
+  printf '%s\n' "$line" | grep -Eq 'fleet\.sh[[:space:]]+run([[:space:]]|$)'
 }
 
 # How to make a change live, said wherever the change is not. The cap is here
@@ -1454,8 +1466,16 @@ cmd_status() {
   # reported as a dispatcher that is running -- and `run` would start one
   # anyway, because it asks the stricter question. Two screens disagreeing about
   # whether the fleet is up is worse than either answer.
-  if dispatcher_alive "$(cat "$PIDFILE" 2>/dev/null)"; then
-    echo "running   (pid $(cat "$PIDFILE"))"
+  local pid; pid="$(cat "$PIDFILE" 2>/dev/null)"
+  dispatcher_alive "$pid"; local live=$?
+  if [ "$live" != 1 ]; then
+    if [ "$live" = 2 ]; then
+      # Alive, unidentifiable. Not `idle` -- a report that fails open here sends
+      # somebody to start a second dispatcher, which is the whole of #179.
+      echo "running?  (pid $pid -- alive, but ps would not say whether it is a dispatcher)"
+    else
+      echo "running   (pid $pid)"
+    fi
     report_dispatcher_code
   else
     # Printed while stopped too. A drain ends when the dispatcher exits, and
@@ -1537,8 +1557,15 @@ for t in json.load(sys.stdin)["result"]["terminals"]:
       # fleet SIGNALS a pid it read out of a file, and a pidfile a `kill -9`
       # left behind names whoever the OS has since given that number to.
       local held; held="$(cat "$PIDFILE" 2>/dev/null)"
-      if dispatcher_alive "$held"; then
+      dispatcher_alive "$held"; local held_is=$?
+      # Signalled on "yes" AND on "cannot say". `--now` promises the dispatcher
+      # is down when it returns, and a ps that would not answer is not a reason
+      # to break that promise and leave it polling -- it is exactly the state
+      # where a false "nothing to stop" produces the second dispatcher.
+      if [ "$held_is" != 1 ]; then
         kill "$held" 2>/dev/null && echo "  dispatcher stopped."
+        [ "$held_is" = 2 ] \
+          && echo "  (ps would not say what pid $held was; signalled it because --now promises it is down.)"
       elif [ -e "$PIDFILE" ]; then
         echo "  no dispatcher to stop; $PIDFILE names pid ${held:-nothing}, which is not one."
       fi ;;
@@ -1614,9 +1641,12 @@ cmd_run() {
   # `run --auto`. The refusal below would then catch them, but a message that
   # sends them there in the first place is a worse place to be caught.
   if stopped; then
-    local draining; draining="$(cat "$PIDFILE" 2>/dev/null)"
-    if dispatcher_alive "$draining"; then
-      die "the fleet is stopped ($STOP_FILE), and pid $draining is still DRAINING:
+    # `held`, not `draining`: cmd_run declares a `local draining=false` further
+    # down and RUNS it as a command (`! $draining`). Both branches here die, so
+    # the collision is harmless today and would not stay that way.
+    local held; held="$(cat "$PIDFILE" 2>/dev/null)"
+    if dispatcher_alive "$held"; then
+      die "the fleet is stopped ($STOP_FILE), and pid $held is still DRAINING:
 launching nothing new, and reaping what is in flight until nothing it owns is
 left, which is what a drain is. It exits on its own; watch it with
 \`fleet.sh status\`, and only then start one.
@@ -1647,7 +1677,20 @@ while that one is up."
   # O_EXCL dance whose leftovers are their own failure mode in a state dir a
   # `kill -9` already litters.
   local holder; holder="$(cat "$PIDFILE" 2>/dev/null)"
-  dispatcher_alive "$holder" && refuse_second_dispatcher "$holder"
+  dispatcher_alive "$holder"
+  case $? in
+    0) refuse_second_dispatcher "$holder" ;;
+    # Alive, and ps had nothing to judge it by. It starts -- a fleet one stale
+    # file can hold down forever is the failure this check exists to avoid, and
+    # the acceptance for #179 says so outright. But it does not start SILENTLY:
+    # if that pid really is a dispatcher, this is the two-of-them case and the
+    # only warning anybody gets.
+    2) say "WARNING: $PIDFILE names pid $holder, which is alive, and ps would not say what it is."
+       say "         Starting anyway -- one unreadable pidfile may not hold the fleet down."
+       say "         But if pid $holder IS a dispatcher there are now two, each enforcing"
+       say "         MAX_WORKTREES on its own. Find out before you leave this running:"
+       say "           ps -p $holder" ;;
+  esac
 
   echo $$ >"$PIDFILE"
   # Written next to the pidfile and removed with it: a record of a dispatcher

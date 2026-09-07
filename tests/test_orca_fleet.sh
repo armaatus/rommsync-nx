@@ -276,6 +276,23 @@
 #   test_orca_fleet.sh stop_stops_dispatcher
 #                                         the control: a real one still goes.
 #
+# ...and the THIRD answer, which is not "no": a `ps` that will not answer at all
+# -- no procps in the container, a launch shape whose argv never carried the
+# script path. The two callers want opposite things from it, and collapsing it
+# into "no" rebuilds #179 inside the check for it: `--now` would interrupt every
+# agent, announce there was no dispatcher, leave it polling, and let the next
+# `run` start a second one.
+#
+#   test_orca_fleet.sh run_blind_ps       it starts -- one stale file may not
+#                                         hold the fleet down -- and WARNS,
+#                                         naming the pid.
+#   test_orca_fleet.sh status_blind_ps    ...and `status` says so rather than
+#                                         `idle`, which is the line that sends
+#                                         somebody to start the second one.
+#   test_orca_fleet.sh stop_blind_ps      ...and `--now` signals it anyway,
+#                                         because it promises the dispatcher is
+#                                         down when it returns.
+#
 # The Orca CLI and gh are stubbed on PATH; the fleet state dir is a temp dir.
 # Nothing here touches a real worktree, docker, or GitHub.
 set -uo pipefail
@@ -378,6 +395,20 @@ esac
 echo ""
 STUB
   chmod +x "$WORK/bin/gh"
+
+  # A `ps` that can be blinded. Not "ps says this is not a dispatcher" -- ps says
+  # NOTHING, which is what a container without procps, or a launch shape whose
+  # argv never carried the script path, actually looks like. dispatcher_alive
+  # has to keep that apart from a definite no, because `run` and `stop --now`
+  # want opposite things from it.
+  cat >"$WORK/bin/ps" <<'STUB'
+#!/usr/bin/env bash
+[ -s "$PS_BLIND" ] && exit 1
+exec /bin/ps "$@"
+STUB
+  chmod +x "$WORK/bin/ps"
+  PS_BLIND="$WORK/ps-blind"; : >"$PS_BLIND"
+  export PS_BLIND
 
   # cmd_run ends in notify(); a test suite must not put banners on the screen.
   printf '#!/usr/bin/env bash\nexit 0\n' >"$WORK/bin/osascript"
@@ -604,6 +635,10 @@ hold_pidfile_with_ghost() {
 # ever regressed, and a phase that fails by hanging says far less than one that
 # fails by returning.
 run_one_pass() { issue_state CLOSED; in_fleet cmd_run 42 2>&1; }
+
+# ...from here on. Armed AFTER the stand-in dispatcher is made, because making
+# one asserts that ps can see it.
+blind_ps() { printf '1\n' >"$PS_BLIND"; }
 
 # `kill` returns once the signal is delivered, not once the target is gone, so
 # the assertion that it went waits rather than races it.
@@ -1482,7 +1517,7 @@ JSON
     out="$(in_fleet cmd_status 2>&1)"
     grep -q "running   (pid $HELD_PID)" <<<"$out" \
       && fail "a pidfile whose pid the OS recycled onto a stranger was reported as a running dispatcher: $out"
-    grep -q "idle" <<<"$out" \
+    grep -q "^idle" <<<"$out" \
       || fail "it said neither running nor idle about a pid that is not a dispatcher: $out"
     echo "ok: status asks the same question run does, so the two cannot disagree"
     ;;
@@ -1507,6 +1542,50 @@ JSON
     grep -q "dispatcher stopped" <<<"$out" \
       || fail "it stopped the dispatcher and did not say so: $out"
     echo "ok: ...and still stops the one that is really there"
+    ;;
+  run_blind_ps)
+    make_fixture ok
+    hold_pidfile_with_dispatcher
+    blind_ps
+    out="$(run_one_pass)"; rc=$?
+    [ "$rc" = 0 ] \
+      || fail "a ps that would not answer held the fleet down, which is the failure the check exists to avoid: $out"
+    grep -q "WARNING" <<<"$out" \
+      || fail "it started over an unverifiable pid in silence, and that silence IS the two-dispatcher case: $out"
+    grep -q "ps -p $HELD_PID" <<<"$out" \
+      || fail "the warning does not name the pid it could not identify, nor how to find out: $out"
+    # Not a bare `kill`: the whole reason this branch exists is that nothing
+    # established what that pid is, and WORKFLOW.md now says the same.
+    grep -q "kill $HELD_PID" <<<"$out" \
+      && fail "it handed out a kill for a pid it had just said it could not identify: $out"
+    echo "ok: an unanswerable ps starts the fleet, and says it could not tell"
+    ;;
+  status_blind_ps)
+    make_fixture ok
+    make_repo_git
+    hold_pidfile_with_dispatcher
+    blind_ps
+    out="$(in_fleet cmd_status 2>&1)"
+    # The idle LINE, not the word: restart_advice prints "until it says idle" in
+    # the instructions right below, and grepping for that would pass on anything.
+    grep -q "^idle" <<<"$out" \
+      && fail "a live dispatcher ps would not name was reported as idle, which sends you to start a second: $out"
+    grep -q "$HELD_PID" <<<"$out" \
+      || fail "it did not name the pid it could not identify: $out"
+    echo "ok: alive-but-unidentifiable is not idle"
+    ;;
+  stop_blind_ps)
+    make_fixture ok
+    hold_pidfile_with_dispatcher
+    blind_ps
+    out="$(in_fleet cmd_stop --now 2>&1)"
+    pid_gone "$HELD_PID" \
+      || fail "--now interrupted the agents, said nothing was there, and left the dispatcher polling: $out"
+    grep -q "dispatcher stopped" <<<"$out" \
+      || fail "it stopped the dispatcher and did not say so: $out"
+    grep -q "not one" <<<"$out" \
+      && fail "it called a dispatcher it had just signalled 'not one': $out"
+    echo "ok: --now keeps its promise when ps will not answer"
     ;;
   run_refuses)
     make_fixture ok
@@ -1551,6 +1630,6 @@ JSON
     echo "ok: a pidfile whose process is gone does not refuse"
     ;;
   *)
-    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind|status_stale|status_current|status_unrecorded|status_from_worktree|status_draining|status_drained|status_behind|status_behind_revert|status_unreadable|status_names_root|run_refuses|run_stale_recycled|run_stale_gone|status_recycled|stop_spares_stranger|stop_stops_dispatcher" >&2
+    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind|status_stale|status_current|status_unrecorded|status_from_worktree|status_draining|status_drained|status_behind|status_behind_revert|status_unreadable|status_names_root|run_refuses|run_stale_recycled|run_stale_gone|status_recycled|stop_spares_stranger|stop_stops_dispatcher|run_blind_ps|status_blind_ps|stop_blind_ps" >&2
     exit 2 ;;
 esac

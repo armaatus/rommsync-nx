@@ -180,10 +180,16 @@ ends only when the time-box gives each worktree up, three hours at a time. To
 restart the dispatcher and leave the agents alone, take it over directly:
 
 ```bash
-kill $(cat ~/.rommsync-fleet/fleet.pid)
+./scripts/orca/fleet.sh status  # names the pid, and verifies it is a dispatcher
+kill <that pid>
 ./scripts/orca/fleet.sh status  # until it says `idle`
 cd /path/to/rommsync-nx && ./scripts/orca/fleet.sh run --auto
 ```
+
+`status` first, and take the pid from it rather than from `cat fleet.pid`. The
+pidfile alone names whoever wrote it last; if a `kill -9` left it behind and the
+OS has since recycled that number, `kill $(cat …)` signals a stranger — plausibly
+one of the agents. `status` is what checks.
 
 **Only one dispatcher runs at a time**, and `fleet.sh run` refuses to be the
 second: `MAX_WORKTREES` is enforced per process, so two of them count the same
@@ -198,6 +204,13 @@ rather than obeyed — otherwise one stale file would hold the fleet down for
 good. `status` and `stop --now` ask the same question, so they cannot disagree
 about whether the fleet is up, and `--now` will not signal a pid that is no
 longer a dispatcher.
+
+There is a third answer, and the two commands want opposite things from it: a
+pid that is alive while `ps` says nothing at all about it. `status` reports
+`running?` rather than `idle`, because `idle` is the line that sends somebody to
+start a second dispatcher. `run` starts anyway — one unreadable pidfile may not
+hold the fleet down — but warns and names the pid. `stop --now` signals it
+anyway, because it promises the dispatcher is down when it returns.
 
 **The settings work the same way.** `ROMMSYNC_FLEET_MAX` (how many worktrees run
 at once, default 3), `ROMMSYNC_FLEET_POLL` and `ROMMSYNC_FLEET_TIMEBOX` are read
