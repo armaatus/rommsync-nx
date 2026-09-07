@@ -718,12 +718,24 @@ endforeach()
 # Same QUARANTINE, same terms, as harness.partial below: retried, named, and
 # with the issue on it.
 #
-# It does NOT come out when #85 closes -- #85 is closed, and this is still here.
-# It comes out when someone measures a rate rather than sampling one: #119 is
-# that experiment (`--repeat until-fail:50`, proxy unfixed then fixed). Three
-# green runs cannot tell "fixed" from "under 1 in 3", which is exactly what a
-# retry hides. Green with the retry is
-# not evidence the race is gone -- green WITHOUT it is.
+# #119 ran the experiment this comment used to ask for: quarantine off, alone on
+# the stack, 450 repetitions with the fault proxy as it stands and 300 more with
+# its #109 fix reverted. All green, and #85's signature -- a second row, and an
+# id naming the occupant's 41 bytes where 36 were expected -- appeared in none of
+# them.
+#
+# The retry stays anyway, because of what that number is a bound on. #85 is a CI
+# failure, and these repetitions ran alone on one laptop -- the configuration two
+# earlier 234/234 runs had already come back green in. However many times an
+# isolated loop repeats, it bounds the rate in isolation; it says nothing about
+# the configuration that has actually produced the failure. Removing the retry on
+# it would be the same mistake as removing it because #85 closed, with a bigger
+# number attached.
+#
+# So it comes out when a count like that one is clean where #85 happened -- CI,
+# or a loop carrying the rest of the suite with it -- or when someone names the
+# mechanism. Not when an issue closes: #85 is closed and this is still here.
+# Green with the retry is not evidence the race is gone -- green WITHOUT it is.
 set_tests_properties(execute.occupied PROPERTIES REPEAT UNTIL_PASS:3)
 
 # --- step 0: the local scan and its rom matching -----------------------------
@@ -1208,25 +1220,41 @@ foreach(scenario IN LISTS TICK_RIG_SCENARIOS)
   set_tests_properties(tick.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 endforeach()
 
-# harness.partial is intermittently red and the cause is NOT understood yet.
+# harness.partial is intermittently red, and #119 measured how often instead of
+# sampling it: quarantine off, alone on the stack, `--repeat until-fail`. It
+# failed twice in 489 repetitions -- at 84 and again at 243 -- so roughly one run
+# in 250. It is not fixed, and the retry stays.
 #
-# It fails when a SECOND sync session appears mid-scenario and RomM cancels the
-# one the test opened -- planned 3, completed 0, killed a second after it was
-# created. The diagnostics in the test print every session the device has, and
-# the evidence is on issue #76. What creates that second session is still open;
-# the leading theory is that a device-attributed save upload opens one, and
-# `partial` does three of those inside its own session.
+# What those 489 repetitions did NOT produce is the failure this comment used to
+# describe. #76's second sync session, and the `Session is already CANCELLED`
+# that comes of it, never appeared once. BOTH failures were `harness::ServerMd5`
+# reading back a save row RomM had answered with an empty `content_hash` -- a
+# third mode, nothing to do with the session, and now filed as #155. All the test
+# said about it was `FAIL: the MD5 of partial-2.srm`, which is why ServerMd5 now
+# names the row and what came back in place of the digest (tests/harness.hpp,
+# and harness.md5_diagnosis holds it to that).
 #
-# So this is a QUARANTINE, not a fix: retry it rather than leave `main` red on a
-# race nobody has explained. It is deliberately narrow -- one test, named, with
-# the issue on it -- because a repo that retries tests by default has stopped
-# being able to tell flaky from broken.
+# 489 repetitions of not seeing #76's mechanism -- a SECOND session appearing
+# mid-scenario, RomM cancelling the one the test opened, planned 3 and completed
+# 0 -- is not proof it is gone, only that it is rarer than this. So the
+# diagnostics `Partial` prints for it, every session the device has, stay.
 #
-# Do NOT remove this because #76 is closed. It is closed, and the retry is still
-# here: closing the issue did not measure anything. #119 is the experiment that
-# would justify removing it, and #109 -- the fault proxy replaying a stalled
-# request into a later test -- is a real defect that was fixed WITHOUT being
-# shown to cause this one.
+# The comparison #119 and #109 both proposed -- this loop again with the fault
+# proxy's #109 fix reverted -- cannot settle anything here, and that needs no
+# experiment to see: neither this test nor execute.occupied ever arms a `stall`,
+# so the replayed-request path #109 fixed is not on either side of the
+# comparison. It was run both ways regardless (196 repetitions unfixed, 293
+# fixed) and failed once in each, which is the same rate twice.
+#
+# So this is still a QUARANTINE, not a fix: retry it rather than leave `main` red
+# on a race nobody has explained. It is deliberately narrow -- one test, named,
+# with the issue on it -- because a repo that retries tests by default has
+# stopped being able to tell flaky from broken.
+#
+# It comes out when #155 is fixed and 500 repetitions are clean WITHOUT it -- not
+# when an issue closes. #76 is closed and this is still here, because closing it
+# measured nothing. Green with the retry is not evidence the race is gone --
+# green WITHOUT it is.
 set_tests_properties(harness.partial PROPERTIES REPEAT UNTIL_PASS:3)
 
 # --- the committed API captures still match a live RomM ----------------------
