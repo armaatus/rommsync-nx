@@ -150,6 +150,73 @@ orca_pr_payload() {
   bash .github/scripts/pr_payload.sh "$orca_owner" "$orca_repo_name" "$pr" >"$out"
 }
 
+# Ask merge-gate again about $1 at head $2, and say so with $3 in front of it.
+#
+# NOTHING ON GITHUB DOES THIS. `merge-gate.yml` re-runs on the events that can
+# change its answer, and two of the things that change it are not events it can
+# subscribe to: `pull_request_review_thread` is a webhook event and not a
+# workflow trigger (putting it in `on:` invalidates the whole file), and an
+# issue comment -- which is what an answer to a review is -- would run against
+# the default branch, so its check run would not attach to this PR's head at
+# all. So the gate stays red on a condition that is already satisfied and
+# `--auto` never fires.
+#
+# Re-running the gate's own earlier run is what asks it again, because a re-run
+# updates that check run IN PLACE, which is the thing branch protection counts.
+# `merge-gate.yml`'s own `clear-stale` job relies on the same mechanism.
+#
+# Here rather than in each caller because `resolve-thread.sh` and
+# `answer-review.sh` need exactly this, down to the reasons not to do it -- and
+# the one that matters is a rule, not a detail: only the NEWEST gate run on the
+# head, and only if it failed or was cancelled. Re-running an older failure that
+# a newer success already superseded enters merge-gate's cancel-in-progress
+# group and can kill a live run, which is #84's wedge inflicted from here.
+#
+# Exits 0 whether or not a re-run was needed, 2 when it could not tell.
+orca_reask_gate() {
+  local pr="$1" head="$2" said="$3" listing run job
+  listing="$(GH_PAGER=cat gh run list --repo "$orca_owner/$orca_repo_name" \
+               --workflow merge-gate.yml --limit 40 \
+               --json databaseId,conclusion,headSha 2>/dev/null)" || {
+    echo "$said, but could not list merge-gate runs; ask for the gate again with a push" >&2
+    return 2; }
+
+  run="$(printf '%s' "$listing" | python3 -c '
+import json, sys
+head = sys.argv[1]
+on_head = [r for r in json.load(sys.stdin) if r.get("headSha") == head]
+newest = on_head[0] if on_head else None
+print(newest["databaseId"]
+      if newest and newest.get("conclusion") in ("failure", "cancelled") else "")
+' "$head" 2>/dev/null)"
+
+  if [ -z "$run" ]; then
+    echo "$said; the newest merge-gate run on ${head:0:8} is not one to re-ask"
+    return 0
+  fi
+
+  job="$(GH_PAGER=cat gh api \
+           "repos/$orca_owner/$orca_repo_name/actions/runs/$run/jobs" \
+           --jq '[.jobs[] | select(.name == "merge-gate") | .id][0]' 2>/dev/null || echo "")"
+  if [ -z "$job" ] || [ "$job" = "null" ]; then
+    # The gate JOB, never the whole run: `clear-stale` is `needs: gate` and
+    # would run a second copy of its own rerun loop, which is the wedge it
+    # exists to clear reproduced one level down (merge-gate.yml says the same).
+    echo "$said, but the gate job of run $run could not be found." >&2
+    echo "Ask the gate again with: gh run rerun --job <gate job id of run $run>" >&2
+    return 2
+  fi
+
+  if GH_PAGER=cat gh run rerun --job "$job" --repo "$orca_owner/$orca_repo_name" \
+       >/dev/null 2>&1; then
+    echo "$said; re-ran the gate job ($job) so merge-gate is asked again"
+    return 0
+  fi
+  echo "$said, but re-running the gate job failed." >&2
+  echo "Ask it again with: gh run rerun --job $job" >&2
+  return 2
+}
+
 # The Orca CLI this machine can actually run, in $ORCA_CLI.
 #
 # `orca` on PATH is a wrapper that locates Orca.app by reading its own symlink.

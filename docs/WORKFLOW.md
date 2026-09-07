@@ -353,10 +353,11 @@ head — `claude-review.yml` fires on `review_requested` as well as on
 than spending a second round on findings already in hand.
 
 Then it fixes what is real, replies with a reason where it disagrees, resolves
-every thread, pushes, re-requests review, and checks:
+every thread, pushes, re-requests review, says what it did, and checks:
 
 ```bash
 ./scripts/orca/resolve-thread.sh <thread-id> ...   # close them, and re-ask the gate
+./scripts/orca/answer-review.sh "<what you did, or why you did not>"
 ./scripts/orca/review-status.sh    # exit 0 = every thread resolved, every check green
 ```
 
@@ -371,6 +372,54 @@ shut, re-runs the gate's own failed run on this head, which updates that check
 run in place. That is the same mechanism `merge-gate.yml`'s `clear-stale` job
 uses, and the only one available: a `workflow_dispatch` run's checks attach to
 the ref it was dispatched on, not to a PR head.
+
+### Answering the review, and why the branch waits for it
+
+`gh pr merge --auto --squash` is run the moment the PR exists, and the review
+only runs after that. So from the instant a review is submitted the branch is one
+green check away from merging — and `merge-gate`'s other conditions do not stop
+it. A standing `--request-changes` does. An open thread does. **Nits in the body
+of a `COMMENTED` review do not**: the gate is satisfied, `--auto` fires, and the
+branch goes in while the agent is still editing.
+
+That happened four times — [#146](https://github.com/armaatus/rommsync-nx/pull/146),
+[#154](https://github.com/armaatus/rommsync-nx/pull/154),
+[#159](https://github.com/armaatus/rommsync-nx/pull/159),
+[#168](https://github.com/armaatus/rommsync-nx/pull/168) — each leaving real work
+uncommitted in a worktree the dispatcher then tried to delete, and #154's took a
+defect that silences the stalled-agent detector to `main` with it
+([#170](https://github.com/armaatus/rommsync-nx/issues/170)).
+
+The window is not the life of the PR. `merge-gate` requires a review on the
+*current head*, so the agent's next push turns the gate red on its own; the race
+runs from the review being submitted until anything is pushed. What the agent
+does in between is read the findings, fix them, run `ctest`, and push — and a
+full suite here is 20 to 30 minutes. All four merged inside that run, because
+that run *is* the window.
+
+So the review declares what it left, and the author answers it:
+
+- every review body ends with `<!-- review-findings: N -->`
+  ([REVIEW.md](../REVIEW.md), and `claude-review.yml`'s prompt demands it). `0`
+  is the only thing that can tell "nothing at all" from "five nits" — both are a
+  `COMMENTED` verdict;
+- a review reporting anything other than `0`, **or not saying**, holds the PR
+  until its author comments an answer. `answer-review.sh` writes it, carrying the
+  head sha, and re-runs the gate's failed run exactly as `resolve-thread.sh` does
+  — an issue comment is not one of `merge-gate.yml`'s triggers and cannot be, since
+  an `issue_comment` run's check attaches to the default branch rather than to
+  this PR's head;
+- **"I am not doing this, because" is as good an answer as a fix.** The gate
+  cannot tell them apart and does not try. What it asserts is that somebody read
+  the findings and decided before the code went in;
+- a review reporting `0` needs no answer, so a finished PR still merges with
+  nobody watching. That is the property arming `--auto` early exists to keep
+  ([#90](https://github.com/armaatus/rommsync-nx/issues/90)), and it is why the
+  requirement is conditional rather than a blanket "the agent declares done" — an
+  agent that dies must not be able to strand a PR that nothing was wrong with.
+
+Missing the trailer fails *closed*: the PR is held as though findings were left.
+Guessing "clean" re-opens the race; guessing "found something" costs one command.
 
 Exit 4 is the same verdict on a PR that touches `.claude/`, `.github/workflows/`
 or `.github/scripts/`: nothing left to fix, and a person merges it. Exit 1 prints
@@ -400,7 +449,7 @@ merge — it asks GitHub to merge once the required checks pass. Then it stops.
 ### The merge gate
 
 [`merge_gate.py`](../.github/scripts/merge_gate.py) is the required check
-`--auto` waits on. It passes only when all six hold:
+`--auto` waits on. It passes only when all seven hold:
 
 1. the PR body shows a local `/code-review` pass;
 2. …and a local `/mattpocock-skills:code-review` pass;
@@ -412,7 +461,10 @@ merge — it asks GitHub to merge once the required checks pass. Then it stops.
 6. the body says which issue it closes. Any keyword GitHub acts on counts, so
    `Fixes #12` is as good as `Closes #12` — but a body with none merges without
    closing anything, `unblock.yml` relabels nothing, and the fleet then reports
-   "nothing startable" with the work available.
+   "nothing startable" with the work available;
+7. every review still standing that reports findings — or does not say what it
+   found — has been **answered** by the PR's author, on this head, since it was
+   submitted. "Answering the review" above is what that is for.
 
 Point 5's second half is its own trap. Both readers of the thread list asked for
 `reviewThreads(first:100)`, the first hundred, so on a longer PR the newest

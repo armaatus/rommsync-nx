@@ -501,8 +501,15 @@ PY
       echo
       echo "Fix what is real. Where you disagree, reply on the thread with the reason"
       echo "rather than ignoring it. Resolve every thread, push, and re-request review"
-      echo "-- the push itself re-runs the reviewer. Then:"
+      echo "-- the push itself re-runs the reviewer. Then say what you did about the"
+      echo "findings, which is what keeps the branch from merging out from under them:"
+      echo "  ./scripts/orca/answer-review.sh \"<what you did, or why you did not>\""
       echo "  ./scripts/orca/review-status.sh $pr"
+      echo
+      echo "Answer it whether or not you pushed. Auto-merge was armed when this PR was"
+      echo "opened, so from here the only thing holding the branch is that answer --"
+      echo "unless the review above said it found nothing, in which case it merges on"
+      echo "its own and there is nothing to answer."
       # The round cap counts rounds of DISAGREEMENT. A review of a head this
       # worktree has already moved past is not one: the agent will push what it
       # has, the reviewer will run again, and that answer is the round. Spending

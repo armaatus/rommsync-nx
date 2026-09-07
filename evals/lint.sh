@@ -57,6 +57,14 @@ else
     grep -q "$needle" REVIEW.md || fail "REVIEW.md has no '$needle' section"
   done
   ok "REVIEW.md names its passes and its thresholds"
+  # The trailer merge_gate.py reads. It is the only thing separating a review
+  # that found five nits from one that found nothing -- both are a COMMENTED
+  # verdict -- and a policy file that stops asking for it turns the gate's
+  # fail-closed default into the ordinary case, so every PR waits on an answer
+  # to a review that said nothing.
+  grep -q 'review-findings' REVIEW.md \
+    || fail "REVIEW.md no longer asks a review to say how many findings it left; merge_gate.py cannot tell a clean review from a nitty one without it"
+  ok "REVIEW.md asks for the findings count merge-gate reads"
 fi
 
 # A skill is a folder with a SKILL.md whose frontmatter says when it triggers.
@@ -267,7 +275,7 @@ echo "== the flow's own scripts"
 # The brief names these by path. A rename that misses the brief turns into an
 # agent halfway through a task running a command that does not exist.
 for script in fleet.sh stop.sh await-review.sh review-status.sh record-review.sh \
-              resolve-thread.sh issue-command.sh agent-autostart.sh; do
+              resolve-thread.sh answer-review.sh issue-command.sh agent-autostart.sh; do
   path="scripts/orca/$script"
   [ -x "$path" ] || { fail "$path is missing or not executable"; continue; }
   bash -n "$path" || { fail "$path does not parse"; continue; }
@@ -275,7 +283,8 @@ for script in fleet.sh stop.sh await-review.sh review-status.sh record-review.sh
 done
 # ...and the brief must still name them.
 brief="$(sed -n "/^sed .*BRIEF/,/^BRIEF$/p" scripts/orca/issue-command.sh)"
-for named in record-review.sh await-review.sh review-status.sh resolve-thread.sh; do
+for named in record-review.sh await-review.sh review-status.sh resolve-thread.sh \
+              answer-review.sh; do
   grep -q "$named" <<<"$brief" \
     || fail "the agent brief no longer mentions $named, so the loop stops at that step"
 done
@@ -431,6 +440,14 @@ if [ -f "$review_wf" ]; then
     fail "the no-verdict notice submits a REVIEW; that would satisfy merge-gate with no judgement"
   fi
   ok "the no-verdict notice is a comment, never a review"
+
+  # ...and the reviewer is told to declare what it found. Without the trailer
+  # every review fails closed, so this does not break a PR -- it makes every one
+  # of them wait for an answer to findings that may not exist, which is the
+  # slow way for a gate to stop meaning anything.
+  grep -q 'review-findings' "$review_wf" \
+    || fail "claude-review.yml no longer tells the reviewer to end with <!-- review-findings: N -->, which merge_gate.py reads to tell a clean review from one with findings"
+  ok "the reviewer is told to declare how many findings it left"
 fi
 
 # The reviewer is told to submit its verdict with a command it can actually run.
