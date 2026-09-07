@@ -1222,8 +1222,10 @@ DISPATCHER_FILE="$STATE_DIR/dispatcher"
 # fleet worktree at it. Hashing the caller's own copy compares a worktree
 # branched before the fix against a dispatcher that predates it too, matches,
 # and answers "current": #173's silence, rebuilt inside the check for it.
+fleet_hash_stdin() { cksum | awk '{print $1 "-" $2}'; }
 fleet_code_hash() {
-  cksum <"$1/scripts/orca/fleet.sh" 2>/dev/null | awk '{print $1 "-" $2}'
+  [ -r "$1/scripts/orca/fleet.sh" ] || return 0
+  fleet_hash_stdin <"$1/scripts/orca/fleet.sh"
 }
 fleet_code_commit() {
   git -C "$1" log -1 --format=%H -- scripts/orca/fleet.sh 2>/dev/null
@@ -1309,6 +1311,12 @@ report_dispatcher_code() {
     # fetched simply has nothing to name.
     log="$(fleet_commits_between "$root" "$commit" origin/main)"
     [ -n "$log" ] || return 0
+    # ...and those commits have to leave the file actually different. A change
+    # and its revert are two commits that name each other out, and telling
+    # somebody to pull and restart for bytes already running is the report
+    # crying wolf on its own first outing.
+    remote="$(git -C "$root" show origin/main:scripts/orca/fleet.sh 2>/dev/null | fleet_hash_stdin)"
+    [ -n "$remote" ] && [ "$remote" = "$hash" ] && return 0
     echo
     echo "  BEHIND -- $root has not pulled these, so they are NOT live in the"
     echo "  dispatcher running, and a restart alone will not make them live:"
