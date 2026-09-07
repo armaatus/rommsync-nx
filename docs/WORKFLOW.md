@@ -742,6 +742,6 @@ rather than passing the flag, for the reason in Stage 6.
 | `await-review.sh` times out | the review job never ran. Any other reason the wait had — records the gate discounts, a review already handed back, an unpushed worktree — it printed the moment it found it | `gh run list`; check `CLAUDE_CODE_OAUTH_TOKEN` is a repo secret |
 | `await-review.sh` exits 2, naming `merge_gate.py` | that file is what decides which reviews count, and it does not import | fix the syntax or the missing name; nothing in the loop can answer until it does |
 | `await-review.sh` exits 8, "GitHub says DIRTY" | something merged underneath the branch | rebase, re-run `record-review.sh`, `git push --force-with-lease` |
-| `merge-gate` red on a PR that looks fine | usually the body is missing a review section, or the review predates the last push | read the check's output; it says which of the six |
+| `merge-gate` red on a PR that looks fine | usually the body is missing a review section, the review predates the last push, or a review reporting findings has not been answered | read the check's output; it says which of the seven |
 | A PR sits queued and never merges | a required check never reported | `gh pr checks <n>` |
 | `ctest` reports `rig.smoke` **Skipped** | RomM is not running for this worktree | `./scripts/orca/compose.sh up -d` |
