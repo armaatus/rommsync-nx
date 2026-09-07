@@ -215,6 +215,70 @@ run_review_status() {
     bash "$TMPDIR_FIXTURE/scripts/orca/review-status.sh" 84 2>&1 )
 }
 
+# A worktree holding what await-review.sh reads. Like the review-status fixture
+# it carries the gate as well as the script, because await-review.sh asks
+# merge_gate.py who counts as a reviewer rather than deciding it again.
+#
+# The gh stub answers BOTH shapes of the reviews question -- the GraphQL one
+# that can see `commit` and `author`, and the older `gh pr view --json reviews`
+# that cannot -- so a phase describes one pull request and the assertion holds
+# whichever call the script makes.
+AW_PR=114
+make_await_fixture() {
+  make_fixture
+  mkdir -p "$TMPDIR_FIXTURE/.github/scripts" "$TMPDIR_FIXTURE/stub-bin"
+  cp "$REPO_ROOT"/scripts/orca/{await-review.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+  cp "$REPO_ROOT/.github/scripts/merge_gate.py" "$TMPDIR_FIXTURE/.github/scripts/"
+  cat >"$TMPDIR_FIXTURE/stub-bin/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"pr list"*)         printf '[{"number":114}]\n' ;;
+  *"repo view"*)       printf 'armaatus/rommsync-nx\n' ;;
+  # Everything green and no conflict: whatever ends this wait, it is the reviews.
+  *statusCheckRollup*) printf '{"statusCheckRollup":[{"name":"host-tests","conclusion":"SUCCESS"}],"mergeStateStatus":"CLEAN","baseRefName":"main"}\n' ;;
+  *graphql*)           cat "$AW_FIXTURE/graphql.json" ;;
+  *"run list"*)        printf '\n' ;;
+  *"pr view"*)         cat "$AW_FIXTURE/prview.json" ;;
+  *"/comments"*)       printf '[]\n' ;;
+  *)                   printf '\n' ;;
+esac
+GHSTUB
+  chmod +x "$TMPDIR_FIXTURE/stub-bin/gh"
+  ( cd "$TMPDIR_FIXTURE" && git init -q . && git commit -q --allow-empty -m fixture ) 2>/dev/null
+  AW_HEAD="$(cd "$TMPDIR_FIXTURE" && git rev-parse HEAD)"
+}
+
+# The reviews on the fixture PR, in $1, as GraphQL review nodes. The PR's own
+# author is `armaatus`, as it is on every PR the fleet opens.
+#
+# Written twice: once in the GraphQL shape, and once flattened into the
+# `gh pr view --json reviews` shape, which reports neither `commit` nor the
+# review author -- it is what the script used to read, and what made every one
+# of these filters unenforceable.
+write_await_reviews() {
+  cat >"$TMPDIR_FIXTURE/graphql.json" <<JSON
+{"data":{"repository":{"pullRequest":{
+  "headRefOid":"$AW_HEAD",
+  "author":{"login":"armaatus"},
+  "reviews":{"nodes":[$1]}
+}}}}
+JSON
+  python3 - "$TMPDIR_FIXTURE/graphql.json" "$TMPDIR_FIXTURE/prview.json" <<'FLATTEN'
+import json, sys
+pull = json.load(open(sys.argv[1]))["data"]["repository"]["pullRequest"]
+json.dump({"reviews": pull["reviews"]["nodes"], "reviewDecision": "COMMENTED"},
+          open(sys.argv[2], "w"))
+FLATTEN
+}
+
+run_await_review() {
+  ( cd "$TMPDIR_FIXTURE" &&
+    PATH="$TMPDIR_FIXTURE/stub-bin:$PATH" \
+    AW_FIXTURE="$TMPDIR_FIXTURE" ROMMSYNC_FLEET_DIR="$TMPDIR_FIXTURE/fleet" \
+    AWAIT_REVIEW_DEADLINE="${1:-6}" AWAIT_REVIEW_POLL=1 \
+    bash "$TMPDIR_FIXTURE/scripts/orca/await-review.sh" "$AW_PR" 2>&1 )
+}
+
 case "${1:-}" in
   opens)
     make_fixture
@@ -1295,6 +1359,109 @@ GHSTUB
     [ "${late:-0}" = 0 ] \
       || fail "spent $late run-list call(s) after the rollup said the review check had recovered; review_dead never cleared"
     echo "PASS: the run-list stops once the review check recovers"
+    ;;
+
+  await_ignores_what_the_gate_would_not_count)
+    # #114: await-review.sh said "the review is in" on three shapes merge-gate
+    # then refused, and every one of them cost a round out of three.
+    #
+    #   the PR author's own record -- replying to a review THREAD submits a
+    #     COMMENTED review attributed to the replier, so an agent answering
+    #     findings manufactured its own independent review. Verified on real
+    #     data: PR #108 had one at commit.oid == headRefOid, PR #95 had four;
+    #   a real review on an OLDER head -- the answer to the previous push, which
+    #     the fix being waited on has already invalidated;
+    #   an empty record on this head -- a review record is not a review (#95).
+    #
+    # All three are dated well into the future, so the freshness cut-off this
+    # script used to rely on -- the HEAD commit's own time -- accepts every one
+    # of them. Nothing but the gate's rules can turn this into a wait.
+    make_await_fixture
+    write_await_reviews \
+      '{"state":"COMMENTED","submittedAt":"2099-01-01T00:00:00Z",
+        "commit":{"oid":"'"$AW_HEAD"'"},"author":{"login":"armaatus"},
+        "body":"","comments":{"totalCount":0}},
+       {"state":"CHANGES_REQUESTED","submittedAt":"2099-01-01T01:00:00Z",
+        "commit":{"oid":"0000000000000000000000000000000000000000"},
+        "author":{"login":"claude"},
+        "body":"A real review of the commit before this one, long enough to clear MIN_REVIEW_BODY.",
+        "comments":{"totalCount":3}},
+       {"state":"COMMENTED","submittedAt":"2099-01-01T02:00:00Z",
+        "commit":{"oid":"'"$AW_HEAD"'"},"author":{"login":"claude"},
+        "body":"test","comments":{"totalCount":0}}'
+    out="$(run_await_review 6)"; rc=$?
+    [ "$rc" = 4 ] \
+      || fail "handed back a review merge-gate does not count (exit $rc); the PR would then sit BLOCKED for the reason the wait just called satisfied: $out"
+    grep -q "no body; see the inline comments" <<<"$out" \
+      && fail "printed the author's own empty thread reply as the review: $out"
+    grep -q "commit before this one" <<<"$out" \
+      && fail "printed a review of an older head as the answer to this push: $out"
+    # And it cost nothing. The round cap is three, and a round spent on a review
+    # that was never a review is a round the real disagreement does not get.
+    [ ! -f "$TMPDIR_FIXTURE/.orca/review-rounds" ] \
+      || fail "burned a review round on a review the gate does not count: $(cat "$TMPDIR_FIXTURE/.orca/review-rounds")"
+    echo "PASS: await-review counts a review the way merge_gate.py does"
+    ;;
+
+  await_reports_the_independent_review_on_this_head)
+    # The other half: the filters above must not have made the wait unsatisfiable.
+    # Same three records the phase above rejects, plus the real one, and this
+    # has to end at once with that review in hand and the round recorded.
+    make_await_fixture
+    write_await_reviews \
+      '{"state":"COMMENTED","submittedAt":"2099-01-01T00:00:00Z",
+        "commit":{"oid":"'"$AW_HEAD"'"},"author":{"login":"armaatus"},
+        "body":"","comments":{"totalCount":0}},
+       {"state":"CHANGES_REQUESTED","submittedAt":"2099-01-01T03:00:00Z",
+        "commit":{"oid":"'"$AW_HEAD"'"},"author":{"login":"claude"},
+        "body":"IMPORTANT: the backup is written after the overwrite, not before.",
+        "comments":{"totalCount":1}}'
+    out="$(run_await_review 6)"; rc=$?
+    [ "$rc" = 0 ] \
+      || fail "waited out the deadline with a real review on this head in hand (exit $rc): $out"
+    grep -q "the backup is written after the overwrite" <<<"$out" \
+      || fail "did not print the review it was waiting for: $out"
+    grep -q "CHANGES_REQUESTED by claude" <<<"$out" \
+      || fail "did not say who reviewed and what their verdict was: $out"
+    grep -q "armaatus" <<<"$out" \
+      && fail "printed the author's own empty record alongside the review: $out"
+    grep -q "114 1" "$TMPDIR_FIXTURE/.orca/review-rounds" \
+      || fail "read a review without counting the round; the cap of three stops bounding anything: $(cat "$TMPDIR_FIXTURE/.orca/review-rounds" 2>&1)"
+    echo "PASS: a real independent review on this head still ends the wait"
+    ;;
+
+  review_status_matches_the_gate_on_a_thread_reply)
+    # #114's acceptance, stated as the two answers being the same one. A PR
+    # whose only on-head review is the author's own reply to a review thread is
+    # the shape that made this diverge: GitHub attributes a COMMENTED review to
+    # the replier, so the PR looks reviewed to anything that does not ask who
+    # wrote it.
+    #
+    # The assertion runs merge_gate.py over the very same payload rather than
+    # hardcoding what it would say. That is the property worth pinning -- not
+    # "review-status exits 1 here", which a future rule change could make wrong
+    # in both places at once without this noticing.
+    make_review_status_fixture
+    write_pr_reviews \
+      '{"state":"COMMENTED","submittedAt":"2026-09-06T10:00:00Z",
+        "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"armaatus"},
+        "body":"","comments":{"totalCount":0}}' \
+      '' '"## Plan\n/code-review high\nmattpocock-skills:code-review\n"'
+    write_pr_checks \
+      '{"name":"host-tests","status":"COMPLETED","conclusion":"SUCCESS",
+        "startedAt":"2026-09-06T09:00:00Z","completedAt":"2026-09-06T09:30:00Z"}' \
+      BLOCKED core/src/sync.cpp
+    out="$(run_review_status)"; rs_rc=$?
+    gate="$(cd "$TMPDIR_FIXTURE" &&
+            python3 .github/scripts/merge_gate.py "$RS_HEAD" graphql.json files.txt 2>&1)"
+    gate_rc=$?
+    [ "$gate_rc" = 1 ] \
+      || fail "the gate itself accepted the author's own thread reply as an independent review; the fixture proves nothing: $gate"
+    [ "$rs_rc" = "$gate_rc" ] \
+      || fail "review-status said $rs_rc where merge_gate.py says $gate_rc -- the local answer and the required check disagree, which is how a PR sits quietly BLOCKED: $out"
+    grep -qi "no independent review" <<<"$out" \
+      || fail "did not give the gate's own reason, so the agent cannot tell what to do next: $out"
+    echo "PASS: review-status and merge_gate.py agree on a thread reply"
     ;;
 
   reap_judges_removal_by_the_directory)
