@@ -1318,7 +1318,8 @@ foreach(phase opens reuses foreign no_romm submits no_draft unstable
               fleet_counts_startable_by_the_same_rule
               fleet_sees_a_merged_pr_that_says_fixes
               fleet_cannot_tell_when_the_pr_lookup_fails
-              fleet_leaves_a_timed_out_agent_when_it_cannot_tell)
+              fleet_leaves_a_timed_out_agent_when_it_cannot_tell
+              review_status_refuses_a_partial_thread_page)
   add_test(NAME orca.browser_${phase}
            COMMAND "${BASH_PROGRAM}" "${ORCA_BROWSER_TEST}" ${phase})
   set_tests_properties(orca.browser_${phase} PROPERTIES TIMEOUT 60)
@@ -1334,6 +1335,42 @@ endforeach()
 add_test(NAME agent.config
          COMMAND "${BASH_PROGRAM}" "${CMAKE_SOURCE_DIR}/evals/lint.sh")
 set_tests_properties(agent.config PROPERTIES TIMEOUT 60)
+
+# --- the gate reads a whole thread list, not its first page ------------------
+# `reviewThreads(first:100)` is the FIRST hundred, and both readers of it used to
+# carry their own copy. A PR past that lost its newest threads and the gate
+# reported "no review thread is unresolved" from a page it knew was partial.
+# .github/scripts/pr_payload.sh pages them; merge_gate.py refuses to answer when
+# the paging ran out. `gh` is stubbed, so these never touch GitHub and never skip.
+set(PR_PAYLOAD_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_pr_payload.sh")
+foreach(phase pages capped fails)
+  add_test(NAME gate.payload_${phase}
+           COMMAND "${BASH_PROGRAM}" "${PR_PAYLOAD_TEST}" ${phase})
+  set_tests_properties(gate.payload_${phase} PROPERTIES TIMEOUT 60)
+endforeach()
+
+# --- resolving the last thread asks the gate again ---------------------------
+# Nothing on GitHub re-runs merge-gate when a thread is resolved:
+# `pull_request_review_thread` is a webhook event, not a workflow trigger. So the
+# gate stayed red on a thread that was already closed and auto-merge never fired.
+# scripts/orca/resolve-thread.sh closes the gap; `gh` is stubbed here too.
+set(ORCA_RESOLVE_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_orca_resolve_thread.sh")
+foreach(phase last more partial stopped)
+  add_test(NAME orca.resolve_${phase}
+           COMMAND "${BASH_PROGRAM}" "${ORCA_RESOLVE_TEST}" ${phase})
+  set_tests_properties(orca.resolve_${phase} PROPERTIES TIMEOUT 60)
+endforeach()
+
+# --- the dispatcher says when it did not do what it said ---------------------
+# The board is the status surface, and `card()` ended in `|| true`; the worktree
+# removal ended in advice that could not work, on a call a submodule makes fail
+# every time. Both stub the Orca CLI, so neither needs a workspace.
+set(ORCA_FLEET_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_orca_fleet.sh")
+foreach(phase card_says card_quiet remove_forces remove_advice)
+  add_test(NAME orca.fleet_${phase}
+           COMMAND "${BASH_PROGRAM}" "${ORCA_FLEET_TEST}" ${phase})
+  set_tests_properties(orca.fleet_${phase} PROPERTIES TIMEOUT 60)
+endforeach()
 
 # --- worktree environment: scripts/orca/env.sh -------------------------------
 # setup.sh's first step, and not its only caller -- compose.sh generates a

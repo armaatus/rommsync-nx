@@ -238,6 +238,24 @@ On GitHub:
   review, from a context that has not seen the conversation which produced the
   diff. It submits a **real GitHub review**: `REQUEST_CHANGES` when it has an
   Important finding, `COMMENT` when it does not, never `APPROVE`.
+
+  Silence is its failure mode, so two things guard it. The review job is keyed on
+  the **head sha** and never cancels in progress: a build can be superseded by
+  the next push, but a review cannot, because the gate wants a verdict on one
+  specific commit and a cancelled run leaves that commit with none — and the
+  no-verdict notice is `needs: review`, so it does not fire either. And when a
+  run finishes having submitted nothing, the `verdict` job says so in a comment
+  *and asks for one more review, once per head*. Before that, both remedies the
+  comment named were manual, so a PR whose review was silent waited for a person
+  to notice — which is the same dead end as a gate nothing re-runs.
+
+  The reviewer is also told to submit with `gh pr review --body`, not
+  `--body-file`. Its allowed tools are Read, Grep, Glob and a fixed list of
+  `gh`/`git` calls: no Write, no generic Bash, no redirection, so it had no way
+  to create the file the instruction named. A run submitted only if it
+  improvised away from what it was told, and PR #131 produced three green review
+  runs and zero reviews. `evals/lint.sh` now checks the documented command
+  against the granted tool list.
 - [`merge-gate.yml`](../.github/workflows/merge-gate.yml) — the required check
   that decides whether the PR may merge itself.
 
@@ -279,8 +297,21 @@ Then it fixes what is real, replies with a reason where it disagrees, resolves
 every thread, pushes, re-requests review, and checks:
 
 ```bash
+./scripts/orca/resolve-thread.sh <thread-id> ...   # close them, and re-ask the gate
 ./scripts/orca/review-status.sh    # exit 0 = every thread resolved, every check green
 ```
+
+Resolving goes through that script rather than the `resolveReviewThread` mutation
+because **no GitHub event re-runs `merge-gate` when a thread is resolved**.
+`pull_request_review_thread` is a webhook event, not a workflow trigger — putting
+it in `on:` invalidates the whole file, and actionlint rejects it — so the gate
+went red on an open thread, the agent closed the thread, and nothing asked the
+gate again. `--auto` never fired, and only a later push or `review_requested`
+rescued it. `resolve-thread.sh` resolves the threads and, once the *last* one is
+shut, re-runs the gate's own failed run on this head, which updates that check
+run in place. That is the same mechanism `merge-gate.yml`'s `clear-stale` job
+uses, and the only one available: a `workflow_dispatch` run's checks attach to
+the ref it was dispatched on, not to a PR head.
 
 Exit 4 is the same verdict on a PR that touches `.claude/`, `.github/workflows/`
 or `.github/scripts/`: nothing left to fix, and a person merges it. Exit 1 prints
@@ -317,11 +348,20 @@ merge — it asks GitHub to merge once the required checks pass. Then it stops.
 3. an independent review exists on the **current head SHA** — pushing a fix
    invalidates it, so a re-review is required;
 4. the **latest** review from each author is not `CHANGES_REQUESTED`;
-5. no review thread is unresolved;
+5. no review thread is unresolved — read from a **complete** thread list, not
+   from the first page of one;
 6. the body says which issue it closes. Any keyword GitHub acts on counts, so
    `Fixes #12` is as good as `Closes #12` — but a body with none merges without
    closing anything, `unblock.yml` relabels nothing, and the fleet then reports
    "nothing startable" with the work available.
+
+Point 5's second half is its own trap. Both readers of the thread list asked for
+`reviewThreads(first:100)`, the first hundred, so on a longer PR the newest
+threads fell off the end and the gate reported "no review thread is unresolved"
+about a state it had never established. The query now lives once, in
+[`pr_payload.sh`](../.github/scripts/pr_payload.sh), which pages to the end; if
+paging ever runs out the gate refuses to answer rather than answering from half
+a list.
 
 Point 4 is the whole trick. GitHub's `reviewDecision` is sticky: once a reviewer
 requests changes it stays `CHANGES_REQUESTED` until dismissed or until that
