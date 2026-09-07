@@ -458,10 +458,11 @@ enforce_timebox() {
     # A PR being up means it got where it was going; the review loop has its own
     # cap and is not this timer's business. "Could not tell" is not "no PR":
     # this branch interrupts an agent and comments on its issue, and a lookup
-    # that failed is no basis for either.
+    # that failed is no basis for either. The marker stays, so the next pass
+    # asks again -- an agent is only ever stopped on an answer.
     has_open_pr "$num"; case $? in
       0) rm -f "$f"; continue ;;
-      2) say "#$num: timed out, but the PR lookup failed -- leaving it for the next pass"
+      2) say "#$num: timed out, but could not tell whether a PR is open -- leaving it alone"
          continue ;;
     esac
 
