@@ -186,10 +186,15 @@ check: a fresh context that builds, runs the suite, hunts for the test that woul
 have failed, and answers `READY` or `NOT READY`. It fixes nothing, which is why
 its verdict is worth having.
 
-An issue gets **three hours**. On expiry the fleet interrupts the agent, comments
-on the issue saying so, and **leaves the worktree standing** — a stuck task is
-exactly the one worth looking at, and its fixture and build state are the
-evidence. You get a notification.
+An issue gets **three hours**. On expiry, if no PR closing it is open, the fleet
+interrupts the agent, comments on the issue saying so, and **leaves the worktree
+standing** — a stuck task is exactly the one worth looking at, and its fixture
+and build state are the evidence. You get a notification.
+
+If it cannot reach GitHub to find out, it does nothing and says so in the log:
+an agent is only ever stopped on an answer, never on a lookup that failed. The
+one it would otherwise stop is as likely to be the one waiting on a review as
+the one grinding.
 
 ### Stage 4 — Local review, before anything leaves
 
