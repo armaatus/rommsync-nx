@@ -10,10 +10,18 @@
 #
 #   ./scripts/orca/reap.sh          # list what is stale, change nothing
 #   ./scripts/orca/reap.sh --yes    # tear those stacks down, volumes included
+#   ./scripts/orca/reap.sh --yes --only rmx-foo-123   # ...that one, if it is stale
 #
 # This deletes databases, so every uncertainty resolves towards keeping a stack:
 # anything it cannot positively establish is stale is left alone, and it refuses
 # to run at all rather than sweep with an incomplete idea of what is live.
+#
+# `--only` narrows the result and can never widen it: the stale set is computed
+# exactly as it always was, and the named projects are then intersected with it.
+# It exists for fleet.sh, which removes worktrees with no Orca hooks and sweeps
+# afterwards (#163) -- a dispatcher releasing ONE worktree should not also delete
+# the database of an orphan somebody is still looking at. Repeatable, because a
+# renamed worktree runs its stack under a name that no longer matches its path.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -21,11 +29,23 @@ cd "$REPO_ROOT"
 . ./scripts/orca/lib.sh
 
 APPLY=false
-case "${1:-}" in
-  --yes|-y) APPLY=true ;;
-  ""|--dry-run) ;;
-  *) echo "usage: $0 [--yes]" >&2; exit 2 ;;
-esac
+ONLY=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --yes|-y)  APPLY=true ;;
+    --dry-run) ;;
+    # The `-*` check is not pedantry: `--only --yes` would otherwise scope the
+    # sweep to a project that cannot exist AND silently leave APPLY false, and
+    # the run would print "nothing to reap", which reads like success.
+    --only)    shift
+               case "${1:-}" in
+                 ""|-*) echo "usage: $0 [--yes] [--only <project>]..." >&2; exit 2 ;;
+               esac
+               ONLY="$ONLY $1" ;;
+    *) echo "usage: $0 [--yes] [--only <project>]..." >&2; exit 2 ;;
+  esac
+  shift
+done
 
 # Every query below reports "nothing found" when the daemon is unreachable, so
 # without this the tool documented as the recovery path for "docker was down"
@@ -104,11 +124,21 @@ found="$(
 stale=""
 for project in $found; do
   case " $protected " in *" $project "*) continue ;; esac
+  # Applied here, after the protected set has already had its say, so a name
+  # passed to --only can only ever be dropped from the sweep and never added to
+  # it. A live worktree's project is not removable by asking for it.
+  if [ -n "${ONLY// /}" ]; then
+    case " $ONLY " in *" $project "*) ;; *) continue ;; esac
+  fi
   stale="$stale $project"
 done
 
 if [ -z "${stale// /}" ]; then
-  echo "nothing to reap; every rmx-* stack belongs to a live worktree"
+  if [ -n "${ONLY// /}" ]; then
+    echo "nothing to reap;$ONLY has no stack left, or still has a worktree"
+  else
+    echo "nothing to reap; every rmx-* stack belongs to a live worktree"
+  fi
   exit 0
 fi
 

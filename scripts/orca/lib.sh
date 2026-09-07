@@ -1,6 +1,29 @@
 #!/usr/bin/env bash
 # Shared helpers for the Orca hooks. Sourced, never executed.
 
+# The agent autostart watcher, which outlives setup.sh and is the one thing a
+# worktree removal has to stop that is not a container. Two callers with opposite
+# timing: archive.sh runs INSIDE the worktree and reads the pidfile as it goes,
+# while fleet.sh has to read it before a removal it may not get and signal only
+# after one it did -- so reading and stopping are separate.
+#
+# The identity check is why this is shared rather than copied: a pidfile outlives
+# a `kill -9` and a reboot, and signalling a recycled pid means signalling an
+# unrelated process of the user's. One copy of that reasoning, not two.
+#
+# Non-zero means nothing was signalled, so a caller can report only a real stop.
+orca_read_autostart_watcher() {
+  cat "$1/.orca/agent-autostart.pid" 2>/dev/null || true
+}
+orca_stop_autostart_watcher() {
+  local pid="${1:-}"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  ps -o command= -p "$pid" 2>/dev/null | grep -q 'agent-autostart' || return 1
+  kill "$pid" 2>/dev/null || true
+  return 0
+}
+
 # A worktree's identity -- its compose project name and its ports -- is a
 # pure function of its absolute path. env.sh writes the result to .env when the
 # worktree is created; teardown recomputes it instead of reading .env back.

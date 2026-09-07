@@ -216,6 +216,8 @@ clear_issue_markers() {
         "$STATE_DIR/box-labels-$1" "$STATE_DIR/queue-labels-$1" \
         "$STATE_DIR/unreachable-$1" "$STATE_DIR/human-step-$1" \
         "$STATE_DIR/held-$1" "$STATE_DIR/stuck-$1" \
+        "$STATE_DIR/merge-blind-$1" "$STATE_DIR/merge-held-$1" \
+        "$STATE_DIR/orca-blind-$1" \
         "$STATE_DIR/git-blind-$1" "$STATE_DIR/warned-$1" \
         "$STATE_DIR/reason-blind-$1"
 }
@@ -570,111 +572,235 @@ except Exception:
 #
 # The sweep is reap.sh, which is exactly the tool for "a stack whose worktree no
 # longer exists" and needs no worktree to run -- CLAUDE.md names it as the manual
-# counterpart of this same trade. It is the whole sweep rather than one project
-# because it derives what is live from `git worktree list`, refuses to guess, and
-# an orphan left by an earlier refused removal is one this pass should collect
-# too.
+# counterpart of this same trade. Scoped with `--only` to the names read off the
+# worktree before it went, so releasing one worktree does not also delete the
+# database of an orphan somebody is still looking at; `--only` narrows reap.sh's
+# stale set and can never widen it.
 #
 # The autostart watcher is the hook's other half, and it does not survive
 # dropping --run-hooks by itself: its pidfile lives INSIDE the worktree, so it is
 # read before the removal and signalled after one that worked. A watcher left
 # behind polls the Orca runtime for a directory that is gone, forever.
+# Returns 0 when the worktree is gone, 2 when the CLI never answered, and 1 when
+# it answered and refused. The caller acts on the difference: a refusal is a
+# decision about THIS worktree and is not worth retrying, while a deadline is
+# Orca.app restarting and says nothing about the worktree at all.
 remove_worktree() {
-  local path="$1" out watcher
-  # Pure reads, before anything can be destroyed.
-  watcher="$(cat "$path/.orca/agent-autostart.pid" 2>/dev/null || true)"
+  local path="$1" out watcher projects env_project rc
+  # The deadline each `worktree rm` gets, LOCAL rather than a constant beside the
+  # other tunables: test_orca_browser.sh exercises this function by extracting it
+  # with `sed` and sourcing it alone, so anything it reads from the file around it
+  # arrives empty -- and an empty deadline is not 180, it is zero.
+  local deadline="${ROMMSYNC_FLEET_RM_DEADLINE:-180}"
+  # Pure reads, before anything can be destroyed. All three live INSIDE the
+  # worktree and the sweep below needs them after it is gone.
+  watcher="$(orca_read_autostart_watcher "$path")"
+  # Both names archive.sh would have used. The derived one is what setup.sh
+  # would have called this worktree; the one in .env is what its stack was
+  # actually created under, and after a directory rename the two disagree with
+  # the containers still running under the older name.
+  projects=""
+  orca_derive_env "$path" && projects="$orca_project"
+  env_project="$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' "$path/.env" 2>/dev/null | tail -1)"
+  case " $projects " in
+    *" $env_project "*) ;;
+    *) [ -n "$env_project" ] && projects="$projects $env_project" ;;
+  esac
   out="$(mktemp)"
-  ORCA_RUN_CAPTURE_STDERR=1 orca_run_with_deadline 180 "$out" "$ORCA_CLI" worktree rm \
+  ORCA_RUN_CAPTURE_STDERR=1 orca_run_with_deadline "$deadline" "$out" "$ORCA_CLI" worktree rm \
     --worktree "path:$path" --json
-  if [ ! -d "$path" ]; then rm -f "$out"; archive_removed "$path" "$watcher"; return 0; fi
-  ORCA_RUN_CAPTURE_STDERR=1 orca_run_with_deadline 180 "$out" "$ORCA_CLI" worktree rm \
-    --worktree "path:$path" --force --json
-  if [ ! -d "$path" ]; then rm -f "$out"; archive_removed "$path" "$watcher"; return 0; fi
+  rc=$?
+  if [ ! -d "$path" ]; then rm -f "$out"; finish_removal "$path" "$watcher" "$projects"; return 0; fi
+  # Only when the CLI actually answered. A first call that hit the deadline means
+  # nothing is answering, and a second 180s spent proving it doubles what a poll
+  # costs while Orca.app restarts.
+  if [ "$rc" != 124 ]; then
+    ORCA_RUN_CAPTURE_STDERR=1 orca_run_with_deadline "$deadline" "$out" "$ORCA_CLI" worktree rm \
+      --worktree "path:$path" --force --json
+    rc=$?
+    if [ ! -d "$path" ]; then rm -f "$out"; finish_removal "$path" "$watcher" "$projects"; return 0; fi
+  fi
+  if [ "$rc" = 124 ]; then
+    rm -f "$out"
+    say "  the Orca CLI did not answer in ${deadline}s -- nothing was torn down, and this is not a refusal"
+    return 2
+  fi
   # Labelled, because the caller's "could not remove it" comes after these and
   # an unlabelled fatal: line above it reads like the fleet's own.
   while IFS= read -r line; do
     [ -n "$line" ] && say "  the removal refused: $line"
   done < <(sed -n '1,3p' "$out")
-  # The line #122 needed and did not get. Whoever is in there keeps a working
-  # rig, and the next thing they read should say so rather than leaving them to
-  # discover it from a ctest that fails in a way the log never explains.
-  say "  nothing was torn down -- its RomM stack is still up and the worktree is still usable"
+  # The line #122 needed and did not get. Not "the worktree is still usable":
+  # reap_abandoned interrupts the agent immediately before calling this, so on
+  # that path somebody has just been stopped. What is true on both paths is that
+  # the removal changed nothing, which is the fact that saves the next ctest.
+  say "  nothing was torn down -- its RomM stack is still up, so whatever is in there still has its rig"
   rm -f "$out"
   return 1
 }
 
 # What --run-hooks used to do, run only once the worktree is established to be
-# gone. Never fatal: the worktree IS removed by the time this is called, so a
-# docker that is down or a sweep that half-finished is a stack to collect later,
-# not a removal to report as failed.
-archive_removed() {
-  local path="$1" watcher="$2"
-  # The identity check is archive.sh's: a pidfile outlives a `kill -9` and a
-  # reboot, and signalling a recycled pid means signalling something else of the
-  # user's.
-  if [ -n "$watcher" ] && kill -0 "$watcher" 2>/dev/null \
-     && ps -o command= -p "$watcher" 2>/dev/null | grep -q 'agent-autostart'; then
-    kill "$watcher" 2>/dev/null || true
+# gone: stop its autostart watcher, and take down the stack it left behind.
+# Named for the moment rather than for the hook, because it is no longer a hook
+# and no longer runs inside the worktree it is tearing down.
+#
+# Never fatal: the worktree IS removed by the time this is called, so a docker
+# that is down or a sweep that half-finished is a stack to collect later, not a
+# removal to report as failed.
+finish_removal() {
+  local path="$1" watcher="$2" projects="$3" name out rc only=""
+  orca_stop_autostart_watcher "$watcher" || true
+  # Scoped to the names read off this worktree before it went, so releasing ONE
+  # worktree does not also delete the database of an orphan somebody is still
+  # looking at. Unscoped only when neither name could be read at all -- an
+  # unswept stack comes back on every `docker start` holding two ports, with
+  # nothing left on disk to identify it by, so that failure resolves towards
+  # sweeping rather than towards leaking.
+  for name in $projects; do only="$only --only $name"; done
+  [ -n "$only" ] \
+    || say "  could not name $path's stack; sweeping every rmx-* stack with no worktree"
+  # On a deadline, and this is the reason the sweep is not simply run inline: the
+  # archive hook used to be Orca's problem and inherited the 180s above, while a
+  # `docker compose down` against a wedged daemon has no timeout of its own. The
+  # dispatcher polls every minute and would otherwise stop polling for as long as
+  # docker stayed stuck.
+  out="$(mktemp)"
+  # $only is a list of `--only <project>` pairs this function built itself, and a
+  # project name is [a-z0-9-] by construction, so the split is the point.
+  # shellcheck disable=SC2086
+  ORCA_RUN_CAPTURE_STDERR=1 orca_run_with_deadline 180 "$out" \
+    "$REPO_ROOT/scripts/orca/reap.sh" --yes $only
+  rc=$?
+  cat "$out" >>"$LOG"
+  rm -f "$out"
+  # Said rather than swallowed, because a sweep that did not finish is two ports
+  # and four volumes coming back on every `docker start`, with no worktree left
+  # on disk to identify them by.
+  [ "$rc" = 0 ] \
+    || say "  $path is gone, but the stack sweep did not finish (rc $rc) -- see $LOG, then ./scripts/orca/reap.sh"
+  return 0
+}
+
+# What both reaps do when a removal did not happen. `rc` is remove_worktree's:
+# 2 means nobody answered, and that is not a decision about this worktree, so it
+# is said once and retried on the next pass rather than parked.
+#
+# A parked worktree is NOT disowned. Both reaps iterate OWNED issues only, so an
+# issue dropped on a failed removal is a worktree nothing ever looks at again --
+# #122's stood from 16:49 until a person removed it. It keeps its slot, which is
+# why both lines say so.
+#
+# The by-hand recovery is TWO commands, and the second is the one that is easy to
+# forget: removing the directory makes the next pass disown the issue, and
+# nothing then ever calls finish_removal for it. Its stack would come back on
+# every `docker start` under `restart: unless-stopped`, holding two ports with no
+# directory left to identify it by -- and the sweep is `--only`-scoped now, so no
+# later removal collects it either.
+BY_HAND_REMOVAL="git worktree remove --force '%s' && ./scripts/orca/reap.sh --yes"
+park_worktree() {
+  local num="$1" path="$2" rc="$3" what="$4" byhand
+  # BY_HAND_REMOVAL is this file's own format string, not anything a caller sets.
+  # shellcheck disable=SC2059
+  byhand="$(printf "$BY_HAND_REMOVAL" "$path")"
+  if [ "$rc" = 2 ]; then
+    [ -e "$STATE_DIR/orca-blind-$num" ] && return 0
+    : >"$STATE_DIR/orca-blind-$num"
+    say "  could not ask -- leaving it owned, and trying again next pass"
+    card "$path" --comment "#$num: $what, but the Orca CLI did not answer -- retrying"
+    return 0
   fi
-  # Named in the log because it deletes databases, and because a sweep that
-  # refused is two ports and four volumes coming back on every `docker start`.
-  if ! "$REPO_ROOT/scripts/orca/reap.sh" --yes >>"$LOG" 2>&1; then
-    say "  removed, but the stack sweep did not finish -- see $LOG, then ./scripts/orca/reap.sh"
-  fi
+  rm -f "$STATE_DIR/orca-blind-$num"
+  : >"$STATE_DIR/stuck-$num"
+  say "  could not remove it; it keeps its slot until you do: $byhand"
+  card "$path" --comment "#$num: $what, but the removal refused -- still here, still counted"
   return 0
 }
 
 reap_merged() {
-  local f num path branch merged unpushed dirty
+  local f num path branch merged unpushed dirty holds blind rc
   for f in "$OWNED_DIR"/*; do
     [ -e "$f" ] || continue
     num="$(basename "$f")"; path="$(cat "$f")"
     [ -d "$path" ] || { disown_issue "$num"; continue; }
-    # Already attempted once, and refused. Not retried, for reap_abandoned's
-    # reason: a retry loop is an interruption and a board comment once a minute
-    # under whoever is still working in there.
+    # Already attempted once, and REFUSED -- a CLI that never answered does not
+    # get here, see park_worktree. Not retried: a refusal is a decision about
+    # this worktree, so retrying it is a board comment once a minute under
+    # whoever is still working in there, and an interruption with it down
+    # reap_abandoned's path.
+    #
+    # ONE marker shared with reap_abandoned, deliberately. It does not record
+    # which reap tried; it records that a removal was attempted here and refused,
+    # and the recovery is the same two commands whichever one asked. Two markers
+    # would buy a worktree already waiting on a person a second card saying so.
+    # Ahead of the `gh pr list` below for the same reason: nothing about the
+    # answer would change what happens.
     [ -e "$STATE_DIR/stuck-$num" ] && continue
     branch="$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null)" || continue
     merged="$(GH_PAGER=cat gh pr list --head "$branch" --state merged \
                 --json number --jq '.[0].number' 2>/dev/null)"
     [ -n "$merged" ] && [ "$merged" != "null" ] || continue
 
-    unpushed="$(git -C "$path" log '@{u}..HEAD' --oneline 2>/dev/null | grep -c .)"
-    if [ "${unpushed:-0}" != 0 ]; then
-      say "#$num: PR #$merged merged, but $unpushed commit(s) are unpushed -- leaving it"
-      card "$path" --comment "#$num: PR #$merged merged, $unpushed unpushed commit(s) here"
-      continue
-    fi
-    # The other half of the same question, and the half #122 fell through (#163).
-    # A merged PR says nothing about the WORKING TREE: auto-merge fires the
-    # moment the last check passes, so review fixes made after it -- #122's
-    # became #160 -- are sitting uncommitted here while `@{u}..HEAD` is empty.
+    # What is in there that a removal would take with it. Two questions, because
+    # a merged PR answers neither on its own.
     #
-    # Not worktree_holdings, which reap_abandoned uses: that also asks what is
-    # absent from origin/main, and a SQUASH merge leaves every commit on this
-    # branch absent from it by construction. Asked here, no merged worktree would
-    # ever be released again.
-    dirty="$(git -C "$path" status --porcelain 2>/dev/null | grep -c .)"
-    if [ "${dirty:-0}" != 0 ]; then
-      say "#$num: PR #$merged merged, but the worktree holds $dirty uncommitted change(s) -- leaving it"
-      card "$path" --comment "#$num: PR #$merged merged, $dirty uncommitted change(s) here"
+    # `@{u}..HEAD` is the older one. The WORKING TREE is the half #122 fell
+    # through (#163): auto-merge fires the moment the last check passes, so
+    # review fixes made after it -- #122's became #160 -- sit uncommitted here
+    # while `@{u}..HEAD` is empty.
+    #
+    # Not worktree_holdings, which reap_abandoned uses for the same job: that
+    # also asks what is absent from origin/main, and a SQUASH merge leaves every
+    # commit on this branch absent from it by construction. Asked here, no merged
+    # worktree would ever be released again.
+    #
+    # And a git that cannot answer is the THIRD answer. Reading it as "clean" is
+    # how this guard fails open on the one thing it exists to protect, so it is
+    # refused rather than guessed -- reap_abandoned's discipline exactly.
+    holds=""; blind=0
+    unpushed="$(git -C "$path" log '@{u}..HEAD' --oneline 2>/dev/null | grep -c .)"
+    [ "${unpushed:-0}" != 0 ] && holds="$unpushed unpushed commit(s)"
+    if ! dirty="$(worktree_dirty_count "$path")"; then
+      blind=1
+    elif [ "${dirty:-0}" != 0 ]; then
+      [ -n "$holds" ] && holds="$holds and "
+      holds="$holds$dirty uncommitted change(s)"
+    fi
+
+    # Two keeps, two markers, and each clears the other -- reap_abandoned's
+    # `held-`/`git-blind-` pair, for the same reason: one marker for both would
+    # mean whichever fired first silenced the other for good. Said once per
+    # worktree rather than once per poll, because a worktree this pass decided to
+    # keep is one the next pass in sixty seconds will decide to keep again, and
+    # the board card carries the standing state either way.
+    #
+    # Their own markers rather than reap_abandoned's: that function clears
+    # `held-` and `git-blind-` whenever an issue has no reason to be released,
+    # which for a MERGED issue is every single pass.
+    if [ "$blind" = 1 ]; then
+      rm -f "$STATE_DIR/merge-held-$num"
+      [ -e "$STATE_DIR/merge-blind-$num" ] && continue
+      : >"$STATE_DIR/merge-blind-$num"
+      say "#$num: PR #$merged merged, but git could not say what the worktree holds -- leaving it"
+      card "$path" --comment "#$num: PR #$merged merged; kept -- git could not say what is in it"
       continue
     fi
+    if [ -n "$holds" ]; then
+      rm -f "$STATE_DIR/merge-blind-$num"
+      [ -e "$STATE_DIR/merge-held-$num" ] && continue
+      : >"$STATE_DIR/merge-held-$num"
+      say "#$num: PR #$merged merged, but the worktree holds $holds -- leaving it"
+      card "$path" --comment "#$num: PR #$merged merged, $holds here"
+      continue
+    fi
+    rm -f "$STATE_DIR/merge-held-$num" "$STATE_DIR/merge-blind-$num"
 
     say "#$num: PR #$merged is merged; marking it done and removing the worktree"
     card "$path" --workspace-status completed --comment "#$num: merged in PR #$merged"
-    if remove_worktree "$path"; then
+    remove_worktree "$path"; rc=$?
+    if [ "$rc" = 0 ]; then
       disown_issue "$num"
     else
-      # NOT disowned, and NOT pointed at reap.sh. This function iterates OWNED
-      # issues only, so an issue dropped on a refused removal is a worktree
-      # nothing ever looks at again -- #122's stood from 16:49 until a person
-      # removed it. And reap.sh removes stacks whose WORKTREE IS GONE, so a
-      # worktree that is still there is precisely the case it skips: it would
-      # print "nothing to reap", which reads like success.
-      : >"$STATE_DIR/stuck-$num"
-      say "  could not remove it; it keeps its slot until you do: git worktree remove --force '$path'"
-      card "$path" --comment "#$num: merged in PR #$merged, but the removal refused -- still here, still counted"
+      park_worktree "$num" "$path" "$rc" "merged in PR #$merged"
     fi
   done
 }
@@ -710,6 +836,16 @@ reap_merged() {
 # afternoon, and it needs no lookup of agent state: an agent that has nothing on
 # disk after being told is one that had nothing to lose but a prompt.
 
+# How many lines `git status --porcelain` has, which is what both reaps mean by
+# "dirty". NON-ZERO when git could not answer, because zero would be the answer
+# that releases a worktree -- both callers refuse instead. `|| true` after the
+# count because `grep -c` exits 1 on no matches, and a clean tree is an answer.
+worktree_dirty_count() {
+  local out
+  out="$(git -C "$1" status --porcelain 2>/dev/null)" || return 1
+  printf '%s' "$out" | grep -c . || true
+}
+
 # What removing this worktree would destroy. Prints one phrase naming it, or
 # nothing at all when there is nothing. Non-zero means it could not tell, which
 # is NOT the same answer: a git that cannot speak is no basis for deleting
@@ -723,8 +859,7 @@ worktree_holdings() {
   local path="$1" dirty ahead out parts=""
   git -C "$path" rev-parse --verify --quiet HEAD >/dev/null 2>&1 || return 1
   git -C "$path" rev-parse --verify --quiet origin/main >/dev/null 2>&1 || return 1
-  out="$(git -C "$path" status --porcelain 2>/dev/null)" || return 1
-  dirty="$(printf '%s' "$out" | grep -c .)"
+  dirty="$(worktree_dirty_count "$path")" || return 1
   out="$(git -C "$path" log --oneline origin/main..HEAD 2>/dev/null)" || return 1
   ahead="$(printf '%s' "$out" | grep -c .)"
   [ "${dirty:-0}" != 0 ] && parts="$dirty uncommitted change(s)"
@@ -739,7 +874,7 @@ worktree_holdings() {
 # worktree whose PR merged is reap_merged's, and by the time this runs it has
 # already been disowned. What is left here is what will never merge.
 reap_abandoned() {
-  local f num path answer reason holds asked
+  local f num path answer reason holds asked rc
   for f in "$OWNED_DIR"/*; do
     [ -e "$f" ] || continue
     num="$(basename "$f")"; path="$(cat "$f")"
@@ -857,17 +992,11 @@ reap_abandoned() {
     # Phrased as what it is about to do, not as done: if the removal refuses, this
     # card is still on the board and still the line a person reads.
     card "$path" --comment "#$num: $reason; nothing is in it, removing the worktree"
-    if remove_worktree "$path"; then
+    remove_worktree "$path"; rc=$?
+    if [ "$rc" = 0 ]; then
       disown_issue "$num"
     else
-      # NOT disowned. reap_merged iterates OWNED issues only, so an issue dropped
-      # on a failed removal is a worktree nothing ever looks at again -- #122's
-      # stood from 16:49 until it was removed by hand. Kept owned and not retried,
-      # so it is a slot this dispatcher will go on counting until a person takes
-      # it -- which is why both lines below say so.
-      : >"$STATE_DIR/stuck-$num"
-      say "  could not remove it; it keeps its slot until you do: git worktree remove --force '$path'"
-      card "$path" --comment "#$num: the removal refused -- still here, still counted; git worktree remove --force '$path'"
+      park_worktree "$num" "$path" "$rc" "$reason"
     fi
   done
 }
