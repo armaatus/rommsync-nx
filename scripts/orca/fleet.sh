@@ -1267,11 +1267,18 @@ release_dispatcher_files() {
 # because it has the same shape and is asked about far more often: MAX_WORKTREES
 # is read once at start, so `ROMMSYNC_FLEET_MAX=4` in front of `status` changes
 # nothing at all.
+# $2 is the pull a BEHIND checkout needs, printed in its place in the sequence
+# rather than ahead of it. The steps are in the order docs/WORKFLOW.md gives
+# them, and they have to stay in it: this output points the reader at that
+# section, and a screen that contradicts the page it cites is worse than either
+# alone.
 restart_advice() {
-  local root="${1:-}"
+  local root="${1:-}" pull="${2:-}"
   echo "  Restart it -- it is the only way a change to fleet.sh takes effect:"
   echo "    ./scripts/orca/stop.sh          # drains; --now interrupts the agents"
-  echo "    ./scripts/orca/fleet.sh resume  # once status stops saying 'running'"
+  echo "    ./scripts/orca/fleet.sh status  # until it says idle"
+  [ -n "$pull" ] && echo "    $pull"
+  echo "    ./scripts/orca/fleet.sh resume"
   # Named, not relative. This report is meant to be read from a fleet worktree,
   # and `./scripts/orca/fleet.sh run --auto` there starts a dispatcher whose cwd
   # and checkout the fleet removes as soon as that worktree's PR merges.
@@ -1325,8 +1332,7 @@ report_dispatcher_code() {
     echo "  BEHIND -- $root has not pulled these, so they are NOT live in the"
     echo "  dispatcher running, and a restart alone will not make them live:"
     printf '%s\n' "$log" | sed 's/^/    /'
-    echo "    git -C $root pull --ff-only"
-    restart_advice "$root"
+    restart_advice "$root" "git -C $root pull --ff-only"
     return 0
   fi
 

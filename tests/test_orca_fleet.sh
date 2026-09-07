@@ -1303,7 +1303,15 @@ JSON
       || fail "it did not name the merged commit: $out"
     grep -q "pull --ff-only" <<<"$out" \
       || fail "it advised a restart that on its own would change nothing: $out"
-    echo "ok: merged-but-not-pulled is reported, and the pull is said first"
+    # The steps in docs/WORKFLOW.md's order, which is the section this output
+    # tells the reader to go and read. A screen that contradicts the page it
+    # cites is worse than either alone.
+    order="$(printf '%s\n' "$out" \
+      | sed -n 's/.*stop\.sh.*/stop/p; s/.*pull --ff-only.*/pull/p; s/.*fleet\.sh resume.*/resume/p' \
+      | tr '\n' ' ')"
+    [ "$order" = "stop pull resume " ] \
+      || fail "the steps are not in the order WORKFLOW.md gives them ($order): $out"
+    echo "ok: merged-but-not-pulled is reported, and the pull sits where the doc puts it"
     ;;
   status_behind_revert)
     make_fixture ok
