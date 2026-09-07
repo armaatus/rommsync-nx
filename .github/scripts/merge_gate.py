@@ -554,6 +554,203 @@ SELFTEST = [
         ["core/src/sync.cpp"],
         False,
     ),
+    (
+        # THE WINDOW THIS CONDITION EXISTS TO CLOSE. Auto-merge is armed when
+        # the PR is created -- deliberately, because that is what stops a
+        # finished PR sitting green and unmerged (#90) -- and the independent
+        # review only runs afterwards. A review that returns nits as a
+        # COMMENTED verdict satisfied every other gate here, so the branch
+        # merged while its author was still editing. Four times: #146, #154,
+        # #159, #168, and #154's took a real defect into main with it.
+        "a review that found something is not merged until the author answers it",
+        "abc123",
+        {
+            "author": {"login": "armaatus"},
+            "body": "Closes #7\n/code-review\nmattpocock-skills:code-review",
+            "reviews": {"nodes": [
+                {"state": "COMMENTED", "submittedAt": "2026-09-06T02:00:00Z",
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"},
+                 "body": "Nit: the comment above sync_tick() says what, not why.\n"
+                         "<!-- review-findings: 1 -->"},
+            ]},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+        },
+        ["core/src/sync.cpp"],
+        False,
+    ),
+    (
+        # "...or said it will not" is the same answer as "addressed them": both
+        # are the author having read the findings and decided. The gate cannot
+        # tell those apart and does not try -- what it requires is that somebody
+        # answered before the branch went in.
+        "...and merges once they have",
+        "abc123",
+        {
+            "author": {"login": "armaatus"},
+            "body": "Closes #7\n/code-review\nmattpocock-skills:code-review",
+            "reviews": {"nodes": [
+                {"state": "COMMENTED", "submittedAt": "2026-09-06T02:00:00Z",
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"},
+                 "body": "Nit: the comment above sync_tick() says what, not why.\n"
+                         "<!-- review-findings: 1 -->"},
+            ]},
+            "comments": {"nodes": [
+                {"author": {"login": "armaatus"},
+                 "createdAt": "2026-09-06T02:06:00Z",
+                 "body": "<!-- review-acknowledged abc123 -->\n"
+                         "Reworded the comment to say why. Nothing else was actionable."},
+            ]},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+        },
+        ["core/src/sync.cpp"],
+        True,
+    ),
+    (
+        # #90'S PROPERTY, KEPT. A review that says it found nothing needs no
+        # answer, so the PR still merges with nobody watching -- which is the
+        # whole reason auto-merge is armed early and the reason this condition
+        # is conditional rather than an unconditional "the agent must declare
+        # done".
+        "a review that reports nothing still merges unattended",
+        "abc123",
+        {
+            "author": {"login": "armaatus"},
+            "body": "Closes #7\n/code-review\nmattpocock-skills:code-review",
+            "reviews": {"nodes": [
+                {"state": "COMMENTED", "submittedAt": "2026-09-06T02:00:00Z",
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"},
+                 "body": "Correctness: nothing. Portability: nothing. Spec: matches "
+                         "the plan.\n<!-- review-findings: 0 -->"},
+            ]},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+        },
+        ["core/src/sync.cpp"],
+        True,
+    ),
+    (
+        # Fail CLOSED on a review that did not say. A reviewer that drops the
+        # trailer is the ordinary way this degrades, and the cost of guessing
+        # wrong is asymmetric: guessing "clean" re-opens the race the four PRs
+        # above were lost to, guessing "found something" costs one command.
+        "a review that does not say what it found is not assumed clean",
+        "abc123",
+        {
+            "author": {"login": "armaatus"},
+            "body": "Closes #7\n/code-review\nmattpocock-skills:code-review",
+            "reviews": {"nodes": [
+                {"state": "COMMENTED", "submittedAt": "2026-09-06T02:00:00Z",
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"},
+                 "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
+            ]},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+        },
+        ["core/src/sync.cpp"],
+        False,
+    ),
+    (
+        # The answer is per-head for the same reason the review is: pushing a
+        # fix invalidates both. Without the sha in it, the answer given to
+        # round one would still be standing over round two's findings.
+        "an answer to an earlier head does not answer this review",
+        "def456",
+        {
+            "author": {"login": "armaatus"},
+            "body": "Closes #7\n/code-review\nmattpocock-skills:code-review",
+            "reviews": {"nodes": [
+                {"state": "COMMENTED", "submittedAt": "2026-09-06T03:00:00Z",
+                 "commit": {"oid": "def456"}, "author": {"login": "claude[bot]"},
+                 "body": "Important: the retry has no backoff.\n"
+                         "<!-- review-findings: 1 -->"},
+            ]},
+            "comments": {"nodes": [
+                {"author": {"login": "armaatus"},
+                 "createdAt": "2026-09-06T03:10:00Z",
+                 "body": "<!-- review-acknowledged abc123 -->\n"
+                         "Answered round one's findings on the previous commit."},
+            ]},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+        },
+        ["core/src/sync.cpp"],
+        False,
+    ),
+    (
+        # Same head, and still not an answer: claude-review.yml fires on
+        # `review_requested` as well as on `synchronize`, so one commit can
+        # legitimately collect a second review. An answer written before that
+        # review existed cannot be about it.
+        "an answer written before the review does not answer it",
+        "abc123",
+        {
+            "author": {"login": "armaatus"},
+            "body": "Closes #7\n/code-review\nmattpocock-skills:code-review",
+            "reviews": {"nodes": [
+                {"state": "COMMENTED", "submittedAt": "2026-09-06T04:00:00Z",
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"},
+                 "body": "Important: the retry has no backoff.\n"
+                         "<!-- review-findings: 1 -->"},
+            ]},
+            "comments": {"nodes": [
+                {"author": {"login": "armaatus"},
+                 "createdAt": "2026-09-06T03:00:00Z",
+                 "body": "<!-- review-acknowledged abc123 -->\n"
+                         "Answered the first review of this commit."},
+            ]},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+        },
+        ["core/src/sync.cpp"],
+        False,
+    ),
+    (
+        # The reviewer answering itself is the same hole `independent_reviews`
+        # closes at the other end -- and it is reachable, because the review job
+        # holds `pull-requests: write` and can comment.
+        "an answer from anyone but the PR's author is not the author answering",
+        "abc123",
+        {
+            "author": {"login": "armaatus"},
+            "body": "Closes #7\n/code-review\nmattpocock-skills:code-review",
+            "reviews": {"nodes": [
+                {"state": "COMMENTED", "submittedAt": "2026-09-06T02:00:00Z",
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"},
+                 "body": "Important: the retry has no backoff.\n"
+                         "<!-- review-findings: 1 -->"},
+            ]},
+            "comments": {"nodes": [
+                {"author": {"login": "claude[bot]"},
+                 "createdAt": "2026-09-06T02:06:00Z",
+                 "body": "<!-- review-acknowledged abc123 -->\n"
+                         "Marking my own findings as dealt with."},
+            ]},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+        },
+        ["core/src/sync.cpp"],
+        False,
+    ),
+    (
+        # PR #95's lesson, one layer out: a record is not the thing. An answer
+        # whose entire content is the marker says nothing a human reading the
+        # PR could check the disposition against.
+        "an answer that says nothing is not an answer",
+        "abc123",
+        {
+            "author": {"login": "armaatus"},
+            "body": "Closes #7\n/code-review\nmattpocock-skills:code-review",
+            "reviews": {"nodes": [
+                {"state": "COMMENTED", "submittedAt": "2026-09-06T02:00:00Z",
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"},
+                 "body": "Important: the retry has no backoff.\n"
+                         "<!-- review-findings: 1 -->"},
+            ]},
+            "comments": {"nodes": [
+                {"author": {"login": "armaatus"},
+                 "createdAt": "2026-09-06T02:06:00Z",
+                 "body": "<!-- review-acknowledged abc123 -->\nok"},
+            ]},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+        },
+        ["core/src/sync.cpp"],
+        False,
+    ),
 ]
 
 
