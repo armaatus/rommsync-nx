@@ -79,6 +79,20 @@ jobs:
           sparse-checkout: .github/scripts
           sparse-checkout-cone-mode: false
 
+      # BEFORE Gather, because Gather now runs a script from that same base
+      # checkout. A base predating it would otherwise kill the step with
+      # `No such file or directory` under `set -euo pipefail` -- a raw shell
+      # error in place of the deliberate notice below, on exactly the PR that
+      # introduces the file.
+      - name: Is there an agreed rule to judge this by?
+        run: |
+          set -euo pipefail
+          for f in .github/scripts/merge_gate.py .github/scripts/pr_payload.sh; do
+            [ -f "$f" ] && continue
+            echo "::error title=Human merge required::${{ github.event.pull_request.base.ref }} does not have $f yet, so there is no agreed rule to judge this PR by. A repository admin merges it by hand; every PR opened after it will be gated normally."
+            exit 1
+          done
+
       - name: Gather
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -95,17 +109,14 @@ jobs:
           # step handed the gate a partial list to call clean.
           bash .github/scripts/pr_payload.sh "$owner" "$name" "$PR" >pr.json
 
+      # The base branch may not have the gate yet -- on the pull request that
+      # introduces it, and on any PR opened from a base predating it. That is not
+      # an error to hide behind a Python traceback: it is a PR a person merges,
+      # for exactly the reason the gate exists. The step above says so, once, for
+      # both files rather than once per file at the point each is first touched.
       - name: Decide
         run: |
           set -euo pipefail
-          # The base branch may not have the gate yet -- on the pull request that
-          # introduces it, and on any PR opened from a base predating it. That is
-          # not an error to hide behind a Python traceback: it is a PR a person
-          # merges, for exactly the reason the gate exists. Say so.
-          if [ ! -f .github/scripts/merge_gate.py ]; then
-            echo "::error title=Human merge required::${{ github.event.pull_request.base.ref }} does not have .github/scripts/merge_gate.py yet, so there is no agreed rule to judge this PR by. A repository admin merges it by hand; every PR opened after it will be gated normally."
-            exit 1
-          fi
           python3 .github/scripts/merge_gate.py \
             "${{ github.event.pull_request.head.sha }}" pr.json files.txt
 
@@ -153,7 +164,9 @@ jobs:
           # reason -- an auth hiccup, an API shape change -- used to print the
           # same "nothing to do" as the true no-op, removing the one trail that
           # would explain why the fix silently did nothing.
-          if ! listing="$(gh run list --repo "$NWO" --workflow "merge gate" --limit 40 \
+          # By FILE NAME. `name:` is prose; a reworded one would make this find
+          # nothing and report the same "no stale gate runs" as the true no-op.
+          if ! listing="$(gh run list --repo "$NWO" --workflow merge-gate.yml --limit 40 \
                             --json databaseId,conclusion,headSha 2>&1)"; then
             echo "::warning title=Could not look for stale gate failures::$listing"
             exit 0

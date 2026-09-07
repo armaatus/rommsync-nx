@@ -36,7 +36,10 @@ make_fixture() {
   mkdir -p "$WORK/repo/scripts/orca" "$WORK/repo/.github/scripts" "$WORK/bin"
   cp "$REPO_ROOT/scripts/orca/lib.sh" "$REPO_ROOT/scripts/orca/resolve-thread.sh" \
      "$WORK/repo/scripts/orca/"
-  cp "$REPO_ROOT/.github/scripts/pr_payload.sh" "$WORK/repo/.github/scripts/"
+  # merge_gate.py as well as the gather: resolve-thread.sh asks the gate whether
+  # a thread list may be read as "none left" rather than deciding that itself.
+  cp "$REPO_ROOT/.github/scripts/pr_payload.sh" \
+     "$REPO_ROOT/.github/scripts/merge_gate.py" "$WORK/repo/.github/scripts/"
   git -C "$WORK/repo" init -q -b work
   git -C "$WORK/repo" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
 
@@ -47,7 +50,16 @@ case "$*" in
   *"repo view"*)  echo "armaatus/rommsync-nx"; exit 0 ;;
   *"pr list"*)    echo 131; exit 0 ;;
   *"pr view"*)    echo "deadbeefcafe1234"; exit 0 ;;
-  *"run list"*)   echo '[{"databaseId":9,"conclusion":"failure","headSha":"deadbeefcafe1234"}]'; exit 0 ;;
+  *"run list"*)
+    if [ "$(cat "$GH_MODE")" = green ]; then
+      # Newest first, as gh returns them: a fresh gate already passed on this
+      # head, and an older failure sits under it.
+      echo '[{"databaseId":11,"conclusion":"success","headSha":"deadbeefcafe1234"},
+             {"databaseId":9,"conclusion":"failure","headSha":"deadbeefcafe1234"}]'
+    else
+      echo '[{"databaseId":9,"conclusion":"failure","headSha":"deadbeefcafe1234"}]'
+    fi
+    exit 0 ;;
   *"actions/runs/9/jobs"*) echo 4242; exit 0 ;;
   *"run rerun"*)  exit 0 ;;
 esac
@@ -102,9 +114,23 @@ case "${1:-}" in
     out="$(run_it T1 2>&1)" || fail "resolve-thread.sh exited non-zero: $out"
     grep -q 'run rerun' "$GH_CALLS" \
       && fail "the gate was re-run on the strength of a truncated thread list"
-    grep -qi 'one page' <<<"$out" || fail "it did not say the list was partial: $out"
+    grep -qi 'pages through' <<<"$out" \
+      || fail "it did not say the list was partial: $out"
     echo "ok: a truncated thread list is not a reason to declare the PR clean"
     ;;
+  green)
+    # The newest gate run on this head already passed, so there is nothing to
+    # re-ask. Re-running the older failure under it would enter merge-gate's
+    # `cancel-in-progress` group and could kill a live run -- the wedge that
+    # workflow's own clear-stale job is careful to avoid.
+    make_fixture green
+    out="$(run_it T1 2>&1)" || fail "resolve-thread.sh exited non-zero: $out"
+    grep -q 'run rerun' "$GH_CALLS" \
+      && fail "it re-ran an older failed gate while a newer one had already passed"
+    grep -q 'not one to re-ask' <<<"$out" || fail "it did not say why it stopped: $out"
+    echo "ok: a gate that already passed on this head is left alone"
+    ;;
+
   stopped)
     make_fixture last
     : >"$ROMMSYNC_FLEET_DIR/STOP"
@@ -115,5 +141,5 @@ case "${1:-}" in
     echo "ok: a stopped fleet resolves nothing"
     ;;
   *)
-    echo "usage: test_orca_resolve_thread.sh last|more|partial|stopped" >&2; exit 2 ;;
+    echo "usage: test_orca_resolve_thread.sh last|more|partial|green|stopped" >&2; exit 2 ;;
 esac

@@ -417,13 +417,20 @@ fi
 # PR #131 got three green review runs and zero reviews out of it. A green job
 # that did nothing is the shape nothing else here catches.
 if [ -f "$review_wf" ]; then
-  if python3 - "$review_wf" <<'REVIEWCMD'
+  # 2>&1 because the checks below report by `sys.exit("...")`, which writes to
+  # stderr; without it the failure would print a reason that is an empty string.
+  if reason="$(python3 - "$review_wf" 2>&1 <<'REVIEWCMD'
 import re, sys
 
 text = open(sys.argv[1]).read()
-start = text.index("\n  review:")
-end = text.index("\n  verdict:") if "\n  verdict:" in text else len(text)
-job = text[start:end]
+# From `review:` to the next top-level job key, BY SHAPE. Naming the job that
+# follows would hard-code the very thing the comment on the sed below says not
+# to, and the two slices of this same file must not disagree.
+start = text.find("\n  review:")
+if start < 0:
+    sys.exit("claude-review.yml has no `review:` job")
+after = re.search(r"\n  [a-z][a-z_-]*:\n", text[start + 1:])
+job = text[start:start + 1 + after.start()] if after else text[start:]
 
 args = re.search(r"claude_args:\s*(.+)", job)
 if not args:
@@ -446,10 +453,14 @@ if "gh pr review" not in job:
 if "Bash(gh pr review:" not in allowed:
     sys.exit("the review job does not allow `gh pr review`, so it cannot submit")
 REVIEWCMD
+)"
   then
     ok "the reviewer can run the command it is told to submit with"
   else
-    fail "claude-review.yml tells the reviewer to submit with a command its own allowed-tools cannot run"
+    # The check's OWN words. A fixed string here reported a renamed job or a
+    # missing claude_args as "the reviewer cannot run its submit command",
+    # which sends the reader to the wrong line.
+    fail "claude-review.yml: $reason"
   fi
 
   # A review is not a build. Cancelling the run that was producing the verdict
@@ -578,6 +589,17 @@ if [ -x .github/scripts/pr_payload.sh ]; then
     grep -vE '^[[:space:]]*#' "$reader" | grep -q 'reviewThreads(first:' \
       && fail "$reader carries its own reviewThreads query again; the first page is not the list"
   done
+  # merge-gate.yml runs BOTH of these out of the BASE branch's checkout, and a
+  # base predating either one is a PR a person merges -- which has to be SAID.
+  # Before the guard named both, the second one to be added killed the step with
+  # `No such file or directory` on exactly the PR introducing it.
+  for needed in merge_gate.py pr_payload.sh; do
+    sed -n '/agreed rule to judge this by/,/^      - name:/p' \
+      .github/workflows/merge-gate.yml | grep -q "$needed" \
+      || fail "merge-gate.yml runs $needed from the base checkout without checking the base has it; a base predating it dies with a shell error instead of the human-merge notice"
+  done
+  ok "a base without the gate's own scripts is told, not crashed into"
+
   ok "the gate and review-status read one paginated payload"
 else
   fail ".github/scripts/pr_payload.sh is missing or not executable"

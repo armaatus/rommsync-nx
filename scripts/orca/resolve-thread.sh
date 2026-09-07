@@ -67,50 +67,69 @@ done
 # it again then is worse than not asking.
 payload="$(mktemp)"
 trap 'rm -f "$payload"' EXIT
-bash .github/scripts/pr_payload.sh "$owner" "$name" "$pr" >"$payload" 2>/dev/null || {
+orca_pr_payload "$pr" "$payload" || {
   echo "resolved, but could not re-read PR #$pr to see whether any thread is left" >&2
   exit 2; }
 
-left="$(python3 -c '
+# From merge_gate.py, not re-derived here. Whether a thread list may be read as
+# "none left" is the gate's judgement, and this script exists precisely to act on
+# the gate's behalf -- a second copy of that rule is a second place for it to
+# drift, which is what the shared query already had to fix.
+answer="$(python3 -c '
 import json, sys
-threads = json.load(open(sys.argv[1]))["data"]["repository"]["pullRequest"]["reviewThreads"]
-# A truncated list is not zero. Saying "none left" from a first page is the very
-# thing merge_gate.py refuses to do.
-if (threads.get("pageInfo") or {}).get("hasNextPage"):
-    print("?")
-else:
-    print(sum(1 for t in threads["nodes"] if not t.get("isResolved")))
-' "$payload")"
+sys.path.insert(0, ".github/scripts")
+from merge_gate import thread_list_is_complete, unresolved_threads
+pull = json.load(open(sys.argv[1]))["data"]["repository"]["pullRequest"]
+print("complete" if thread_list_is_complete(pull) else "partial")
+print(len(unresolved_threads(pull)))
+' "$payload" 2>/dev/null)" || {
+  echo "resolved, but could not load .github/scripts/merge_gate.py to judge what is left" >&2
+  exit 2; }
+complete="$(printf '%s\n' "$answer" | sed -n 1p)"
+left="$(printf '%s\n' "$answer" | sed -n 2p)"
 
-case "$left" in
-  0) ;;
-  "?") echo "PR #$pr has more threads than one page; not re-running the gate on a partial answer"
-       exit 0 ;;
-  *)   echo "$left thread(s) still open on PR #$pr; the gate would fail for the same reason, so it is not re-run"
-       exit 0 ;;
-esac
+if [ "$complete" != complete ]; then
+  echo "PR #$pr has more threads than the gather pages through; not re-running the gate on a partial answer"
+  exit 0
+fi
+if [ "${left:-1}" != 0 ]; then
+  # `${left:-?}` in the message as well as in the test: an unreadable count is
+  # treated as "still open", and printing the raw value would say " thread(s)
+  # still open" with nothing in front of it.
+  echo "${left:-an unknown number of} thread(s) still open on PR #$pr; the gate would fail for the same reason, so it is not re-run"
+  exit 0
+fi
 
 head="$(GH_PAGER=cat gh pr view "$pr" --json headRefOid --jq .headRefOid 2>/dev/null)"
 [ -n "$head" ] || { echo "resolved, but could not read PR #$pr's head" >&2; exit 2; }
 
-listing="$(GH_PAGER=cat gh run list --repo "$owner/$name" --workflow "merge gate" \
+# By FILE NAME, not by display name: `name:` is prose and gets reworded, and a
+# lookup that stops resolving would degrade this to "could not tell" silently.
+listing="$(GH_PAGER=cat gh run list --repo "$owner/$name" --workflow merge-gate.yml \
              --limit 40 --json databaseId,conclusion,headSha 2>/dev/null)" || {
   echo "resolved, but could not list merge-gate runs; ask for the gate again with a push" >&2
   exit 2; }
 
-# The newest non-passing gate run on this head -- the check branch protection is
-# still counting. If the newest is already a success there is nothing to ask.
+# The NEWEST gate run on this head, and only if it is one that needs re-asking.
+#
+# `gh run list` returns newest first. If that newest run passed, the check is
+# already green and there is nothing to ask; if it is still in flight, it will
+# evaluate with the thread now resolved and asking again would only cancel it --
+# both are the no-op below. An older failure under a newer success is #84's
+# stale-check wedge, and merge-gate.yml's own `clear-stale` job is what clears
+# that; re-running it from here would race that job in the gate's
+# cancel-in-progress group.
 run="$(printf '%s' "$listing" | python3 -c '
 import json, sys
 head = sys.argv[1]
-runs = [r for r in json.load(sys.stdin)
-        if r.get("headSha") == head
-        and r.get("conclusion") in ("failure", "cancelled")]
-print(runs[0]["databaseId"] if runs else "")
+on_head = [r for r in json.load(sys.stdin) if r.get("headSha") == head]
+newest = on_head[0] if on_head else None
+print(newest["databaseId"]
+      if newest and newest.get("conclusion") in ("failure", "cancelled") else "")
 ' "$head" 2>/dev/null)"
 
 if [ -z "$run" ]; then
-  echo "every thread is resolved; no failed merge-gate run on ${head:0:8} to re-ask"
+  echo "every thread is resolved; the newest merge-gate run on ${head:0:8} is not one to re-ask"
   exit 0
 fi
 

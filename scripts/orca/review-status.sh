@@ -62,7 +62,7 @@ trap 'rm -f "$payload" "$checks" "$files"' EXIT
 # carry its own copy, and a copy of a query is a copy of its bugs -- both asked
 # for `reviewThreads(first:100)` and both reported a clean thread list from the
 # first page of a longer one.
-bash .github/scripts/pr_payload.sh "$owner" "$name" "$pr" >"$payload" 2>/dev/null \
+orca_pr_payload "$pr" "$payload" \
   || { echo "could not read the PR's reviews" >&2; exit 2; }
 
 # `mergeStateStatus` is the only thing that can see a stale check run branch
@@ -84,7 +84,7 @@ import json, sys
 
 sys.path.insert(0, ".github/scripts")
 try:
-    from merge_gate import HUMAN_ONLY_PREFIXES, evaluate
+    from merge_gate import HUMAN_ONLY_PREFIXES, evaluate, unresolved_threads
 except Exception as exc:  # missing, half-edited, or broken at import time
     # Deliberately not ImportError alone. merge_gate.py is a file agents in this
     # repo edit, and a SyntaxError in it would otherwise reach the caller as an
@@ -135,7 +135,7 @@ if not ok:
     problems.extend(line[2:] if line.startswith("  ") else line
                     for line in lines[1:])
 
-unresolved = [t for t in pull["reviewThreads"]["nodes"] if not t["isResolved"]]
+unresolved = unresolved_threads(pull)
 if unresolved:
     # The whole thread, not just where it is. An agent that has to go and fetch
     # each body separately reaches for

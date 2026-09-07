@@ -124,7 +124,7 @@ orca_json() {
 card() {
   local path="$1" out rc; shift
   out="$(mktemp)"
-  orca_run_with_deadline 30 "$out" "$ORCA_CLI" worktree set \
+  ORCA_RUN_CAPTURE_STDERR=1 orca_run_with_deadline 30 "$out" "$ORCA_CLI" worktree set \
     --worktree "path:$path" "$@" --json
   rc=$?
   if [ "$rc" != 0 ]; then
@@ -413,10 +413,10 @@ except Exception:
 remove_worktree() {
   local path="$1" out
   out="$(mktemp)"
-  orca_run_with_deadline 180 "$out" "$ORCA_CLI" worktree rm \
+  ORCA_RUN_CAPTURE_STDERR=1 orca_run_with_deadline 180 "$out" "$ORCA_CLI" worktree rm \
     --worktree "path:$path" --run-hooks --json
   if [ ! -d "$path" ]; then rm -f "$out"; return 0; fi
-  orca_run_with_deadline 180 "$out" "$ORCA_CLI" worktree rm \
+  ORCA_RUN_CAPTURE_STDERR=1 orca_run_with_deadline 180 "$out" "$ORCA_CLI" worktree rm \
     --worktree "path:$path" --run-hooks --force --json
   if [ ! -d "$path" ]; then rm -f "$out"; return 0; fi
   # Labelled, because the caller's "could not remove it" comes after these and

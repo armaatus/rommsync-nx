@@ -109,6 +109,19 @@ orca_owner_repo() {
   orca_repo_name="${answer##*/}"
 }
 
+# The pull request, in the shape .github/scripts/merge_gate.py judges, written
+# to $2. Needs orca_owner_repo to have run.
+#
+# Here rather than in each caller for the reason the query itself is one file:
+# `review-status.sh` and `resolve-thread.sh` both want exactly this, and "resolve
+# the repo, then run the gather" written twice is two places for it to drift --
+# which is how the local answer and the gate's answer came apart in #114.
+orca_pr_payload() {
+  local pr="$1" out="$2"
+  bash .github/scripts/pr_payload.sh "$orca_owner" "$orca_repo_name" "$pr" \
+    >"$out" 2>/dev/null
+}
+
 # The Orca CLI this machine can actually run, in $ORCA_CLI.
 #
 # `orca` on PATH is a wrapper that locates Orca.app by reading its own symlink.
@@ -169,9 +182,20 @@ orca_cli_resolve() {
 # to its 60s ctest timeout to go red on a loaded machine.
 #
 # Returns the command's status, or 124 when the deadline was hit.
+# $2 gets stdout only, unless ORCA_RUN_CAPTURE_STDERR=1 is set for the call --
+# `VAR=1 orca_run_with_deadline ...`, which bash scopes to that call alone.
+#
+# Off by default because most callers parse $2 as JSON, and a warning landing in
+# it is a parse error. On for the two that report a FAILURE: a CLI says why on
+# stderr, so dropping it leaves "it failed" with nothing after it -- and "the
+# app is not running" and "that worktree is gone" then look identical.
 orca_run_with_deadline() {
   local seconds="$1" out="$2"; shift 2
-  "$@" >"$out" 2>/dev/null &
+  if [ "${ORCA_RUN_CAPTURE_STDERR:-0}" = 1 ]; then
+    "$@" >"$out" 2>&1 &
+  else
+    "$@" >"$out" 2>/dev/null &
+  fi
   local cli=$! ticks=0 limit=$((seconds * 20))
   while kill -0 "$cli" 2>/dev/null; do
     if [ "$ticks" -ge "$limit" ]; then

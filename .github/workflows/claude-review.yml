@@ -81,8 +81,20 @@ jobs:
     # both survived only because another run happened to submit.
     #
     # Keyed on the head sha so two pushes never contend at all, and grouped
-    # rather than ungrouped so several events on ONE head still produce one
-    # review rather than three.
+    # rather than ungrouped so several events on one head run one at a time.
+    #
+    # SERIALISED, NOT DEDUPLICATED, and the difference matters. `synchronize`
+    # and `review_requested` both fire on the ordinary "push a fix, re-request
+    # review" path, so one head can get two full reviews -- the second queued
+    # behind the first rather than cancelling it. That costs a run, and it can
+    # cost more: merge_gate.py takes the latest SUBSTANTIVE review per author,
+    # so a real CHANGES_REQUESTED followed on the same head by a real COMMENTED
+    # is superseded, exactly as a re-review is meant to be, without the findings
+    # having been addressed in between. That property is older than this file
+    # and it is what makes a clean re-review clear a verdict at all; killing the
+    # first review to avoid it is the trade this change refuses, because a
+    # cancelled review leaves the head with no verdict and nothing that says so.
+    # Left standing and written down rather than half-fixed here.
     concurrency:
       group: claude-review-${{ github.event.pull_request.number || inputs.pr }}-${{ github.event.pull_request.head.sha || inputs.pr }}
       cancel-in-progress: false
@@ -269,12 +281,28 @@ jobs:
       - name: say so, and ask once more
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # This job deliberately does not check out -- it reads and writes a
+          # pull request and needs no tree -- so `gh pr` and `gh workflow` have
+          # no git remote to infer the repository from and would fail with "not
+          # a git repository". The `gh api repos/$GITHUB_REPOSITORY/...` calls
+          # below would keep working, which is what would have made that
+          # invisible: the comment simply never posts.
+          GH_REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number || inputs.pr }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -uo pipefail
           [ -n "${PR:-}" ] || exit 0
-          sha="${HEAD_SHA:-$(gh pr view "$PR" --json headRefOid --jq .headRefOid)}"
+          # On a workflow_dispatch there is no pull_request in the event, so the
+          # sha is looked up. If that lookup fails the marker below would become
+          # `<!-- review-produced-no-verdict  -->`, which matches nothing the
+          # first pass wrote -- so the once-per-head guarantee would quietly
+          # become once-per-run. Stop instead.
+          sha="${HEAD_SHA:-$(gh pr view "$PR" --json headRefOid --jq .headRefOid 2>/dev/null)}"
+          if [ -z "$sha" ]; then
+            echo "::warning title=No head::Could not read PR #$PR's head, so this cannot tell whether a review landed."
+            exit 0
+          fi
           n="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" \
                  --jq "[.[] | select(.commit_id == \"$sha\")] | length" 2>/dev/null || echo 0)"
           if [ "${n:-0}" -gt 0 ]; then

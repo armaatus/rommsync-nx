@@ -52,12 +52,15 @@ for arg in "$@"; do
 done
 case "$2" in
   set)
-    [ "$mode" = set_fails ] && { echo "Unable to determine Orca.app path from symlink"; exit 1; }
+    # On STDERR, where a CLI actually reports a failure. The point of the check
+    # under test is that the reason reaches the log, and a stub that printed it
+    # on stdout would pass a card() that drops stderr on the floor.
+    [ "$mode" = set_fails ] && { echo "Unable to determine Orca.app path from symlink" >&2; exit 1; }
     echo '{"ok":true}'; exit 0 ;;
   rm)
     case " $* " in *" --force "*) forced=1 ;; *) forced=0 ;; esac
     if [ "$mode" = rm_never_works ] || { [ "$mode" = rm_needs_force ] && [ "$forced" = 0 ]; }; then
-      echo "fatal: working trees containing submodules cannot be moved or removed"
+      echo "fatal: working trees containing submodules cannot be moved or removed" >&2
       exit 1
     fi
     rm -rf "$target"; echo '{"ok":true}'; exit 0 ;;
@@ -136,6 +139,8 @@ case "${1:-}" in
       || fail "it did not say how to remove it by hand: $out"
     grep -q "reap.sh" <<<"$out" \
       && fail "it still points at reap.sh, which skips a worktree that is still there: $out"
+    grep -q "containing submodules" <<<"$out" \
+      || fail "the reason git gave was dropped; it is the difference between this and a hung CLI: $out"
     echo "ok: a failed removal says something that would actually clean it up"
     ;;
   *)

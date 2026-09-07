@@ -1355,7 +1355,7 @@ endforeach()
 # gate stayed red on a thread that was already closed and auto-merge never fired.
 # scripts/orca/resolve-thread.sh closes the gap; `gh` is stubbed here too.
 set(ORCA_RESOLVE_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_orca_resolve_thread.sh")
-foreach(phase last more partial stopped)
+foreach(phase last more partial green stopped)
   add_test(NAME orca.resolve_${phase}
            COMMAND "${BASH_PROGRAM}" "${ORCA_RESOLVE_TEST}" ${phase})
   set_tests_properties(orca.resolve_${phase} PROPERTIES TIMEOUT 60)
