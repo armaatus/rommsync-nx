@@ -737,8 +737,11 @@ inline void DeleteState(http::HttpClient& client, const std::string& base, const
 /// read the digest the server computed, delete the save. What matters is the
 /// string RomM will compare against on every later negotiation, and only RomM
 /// can say what that is; `harness.content_hash` is where the two are compared.
-inline bool ServerMd5(http::HttpClient& client, const std::string& base, const Fixture& fixture,
-                      std::int64_t rom_id, const std::string& local_path, std::string* out) {
+///
+inline bool ServerMd5(::checks::Checks& checks, http::HttpClient& client, const std::string& base,
+                      const Fixture& fixture, std::int64_t rom_id, const std::string& local_path,
+                      std::string* out) {
+  (void)checks;
   Save scratch;
   if (!UploadSave(client, base, fixture, rom_id, UniqueSlot("harness-md5"), "harness-md5", local_path,
                   "harness-md5.srm", /*with_device=*/false, &scratch)) {

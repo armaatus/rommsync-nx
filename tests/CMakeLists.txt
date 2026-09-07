@@ -908,6 +908,7 @@ set(HARNESS_SCENARIOS
   multifile       # the two-disc fixture, its traps, and the nested rom beside it
   backup          # back up FIRST, proven by interrupting the overwrite
   content_hash    # the MD5 this client computes is the one RomM compares against
+  md5_diagnosis   # ...and when it cannot, the failure says which of two things it hit
 )
 
 foreach(scenario IN LISTS HARNESS_SCENARIOS)
