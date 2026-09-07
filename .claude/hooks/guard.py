@@ -664,6 +664,8 @@ SELFTEST = [
 # The hook's own path, assembled rather than written out: this module is full of
 # rules about writing to it, and a literal makes the file its own false positive.
 HOOK_REL = ".claude/" + "hooks/" + "guard.py"
+SETTINGS_REL = ".claude/" + "settings.json"
+LOCAL_SETTINGS_REL = ".claude/" + "settings.local.json"
 _stateful_ran = 0
 
 
@@ -744,6 +746,38 @@ def _stateful_checks():
                        "a fleet worktree cannot rewrite its own guards", tool="Edit")
                 expect(0, {"file_path": os.path.join(root, ".claude/skills/x/SKILL.md")},
                        "...but skills stay advisory even there", tool="Edit")
+
+                # Every path in SELF_PROTECTED, not just the hook. Dropping
+                # settings.local.json from that tuple used to leave every
+                # assertion here green; it is the sharp one, because it is
+                # gitignored and a permission rule written into it appears in
+                # no diff. Moved here from evals/lint.sh (#98) so that deleting
+                # them is itself a change to the enforcement layer, which never
+                # auto-merges -- parked in lint.sh they could be removed by a
+                # PR that merged itself.
+                for rel in (SETTINGS_REL, LOCAL_SETTINGS_REL):
+                    expect(2, {"file_path": os.path.join(root, rel)},
+                           f"...nor {rel}", tool="Edit")
+                    expect(2, {"command": "echo x > " + rel},
+                           f"...nor {rel} from the shell")
+
+                # ...and the same three through a path a `cd` has shortened,
+                # which is the whole of #139: the marker's own prefix is what
+                # the `cd` consumed, so nothing about `hooks/guard.py` looks
+                # like the enforcement layer until the prefix is put back.
+                for rel in (HOOK_REL, SETTINGS_REL, LOCAL_SETTINGS_REL):
+                    expect(2, {"command": "cd .claude && cp /tmp/x " + rel.split("/", 1)[1]},
+                           f"...nor {rel} after a cd, where the path is relative")
+                expect(2, {"command": "cd .claude/hooks && sed -i '' s/deny/allow/ guard.py"},
+                       "...nor two levels down, where only the basename is left")
+                expect(2, {"command": "cd .claude && cd hooks && cat > guard.py"},
+                       "...nor a cd reached in two steps")
+                expect(2, {"command": "cd .claude/hooks && cd .. && cp /tmp/x settings.json"},
+                       "...and .. walks back up rather than giving up")
+                expect(0, {"command": "cd .claude && cat > notes.md"},
+                       "...while an ordinary file under the same cd stays writable")
+                expect(0, {"command": "cd $SOMEWHERE && cat > guard.py"},
+                       "...and an unresolvable cd does not invent a path to blame")
             finally:
                 if os.path.exists(marker):
                     os.remove(marker)
