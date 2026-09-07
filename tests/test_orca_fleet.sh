@@ -532,8 +532,11 @@ case "${1:-}" in
     # poll costs while Orca.app restarts.
     [ "$(grep -c "worktree rm" "$ORCA_CALLS")" = 1 ] \
       || fail "it spent a second deadline on a CLI that had already timed out: $(cat "$ORCA_CALLS")"
+    # The COUNT, not its presence: $ORCA_CALLS is never truncated between the two
+    # passes, so `grep -q` would find the first call's line and pass even if the
+    # second pass made no call at all -- which is the regression this pins.
     again="$(ROMMSYNC_FLEET_RM_DEADLINE=1 in_fleet reap_merged 2>&1)"
-    grep -q "worktree rm" "$ORCA_CALLS" \
+    [ "$(grep -c "worktree rm" "$ORCA_CALLS")" = 2 ] \
       || fail "the next pass did not retry, so an Orca restart costs the slot permanently: $again"
     echo "ok: a CLI that never answered is retried, not parked"
     ;;
