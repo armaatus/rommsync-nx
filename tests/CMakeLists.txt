@@ -805,8 +805,8 @@ endforeach()
 # consecutive passes afterwards, alone and in groups, so it is a race rather
 # than a regression, and it is currently what makes `main` red.
 #
-# Same QUARANTINE, same terms, as harness.partial below: retried, named, and
-# with the issue on it.
+# Same QUARANTINE, same terms, as the one harness.partial carried below until
+# #155: retried, named, and with the issue on it. This one is still here.
 #
 # #119 ran the experiment this comment used to ask for: quarantine off, alone on
 # the stack, 450 repetitions with the fault proxy as it stands and 300 more with
@@ -826,6 +826,13 @@ endforeach()
 # or a loop carrying the rest of the suite with it -- or when someone names the
 # mechanism. Not when an issue closes: #85 is closed and this is still here.
 # Green with the retry is not evidence the race is gone -- green WITHOUT it is.
+#
+# #155 is a candidate mechanism that did not exist when this was written, and it
+# has NOT been re-measured against it. A 502 from a retired worker landing on
+# `POST /api/saves/delete` leaves a save row nobody deleted -- the harness ignores
+# that call's result by design -- and a stray row is close to what #85 reports
+# seeing. The fixture no longer recycles, so the loop above is worth running
+# again; until someone does, this is a lead and not a finding.
 set_tests_properties(execute.occupied PROPERTIES REPEAT UNTIL_PASS:3)
 
 # --- step 0: the local scan and its rom matching -----------------------------

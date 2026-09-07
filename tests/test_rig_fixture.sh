@@ -30,9 +30,20 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 readonly MAX_REQUESTS=0
 
 phase_recycling() {
-  grep -qE "^[[:space:]]*WEB_SERVER_MAX_REQUESTS:[[:space:]]*\"$MAX_REQUESTS\"[[:space:]]*$" \
-      "$COMPOSE_FILE" \
-    || fail "server/testing/docker-compose.yml does not set WEB_SERVER_MAX_REQUESTS: \"$MAX_REQUESTS\"
+  # Inside the `romm` service, not just somewhere in the file: the same line
+  # under `romm-db` or `fault-proxy` would satisfy a whole-file grep while RomM
+  # went on recycling, and this is the half that has to hold when docker is
+  # stopped and recycling_live can only skip.
+  local block
+  block="$(awk '
+    /^  [a-z0-9_-]+:$/ { inside = ($0 == "  romm:") ; next }
+    inside { print }
+  ' "$COMPOSE_FILE")"
+
+  printf '%s\n' "$block" \
+    | grep -qE "^[[:space:]]*WEB_SERVER_MAX_REQUESTS:[[:space:]]*\"$MAX_REQUESTS\"[[:space:]]*$" \
+    || fail "the romm service in server/testing/docker-compose.yml does not set
+  WEB_SERVER_MAX_REQUESTS: \"$MAX_REQUESTS\"
   gunicorn then recycles a worker every ~1000 requests, and a request in flight
   when it does comes back 502 from RomM's own nginx -- see #155."
   echo "rig.recycling ok"
@@ -67,24 +78,38 @@ phase_recycling_live() {
   # turns WEB_SERVER_MAX_REQUESTS into `--max-requests`, and it is the flag
   # gunicorn reads. Read from /proc rather than `ps`, whose output width is a
   # busybox build option.
+  # Selected on `gunicorn` alone, deliberately. Matching the flag too would make
+  # a gunicorn that carries no `--max-requests` -- a RomM that renamed the env
+  # var, or dropped the flag -- indistinguishable from a container that has not
+  # started one, and this would then skip forever with the wrong reason.
   local args
   args="$(docker exec "$container" sh -c '
     for proc in /proc/[0-9]*/cmdline; do
       pid="${proc#/proc/}"; pid="${pid%/cmdline}"
-      # This shell is a process in that container too, and the pattern it is
+      # This shell is a process in that container too, and the word it is
       # looking for is in its own argv -- so it matches itself first.
       [ "$pid" = "$$" ] && continue
       line="$(tr "\0" " " < "$proc" 2>/dev/null)" || continue
-      case "$line" in *gunicorn*--max-requests*) printf "%s\n" "$line"; break ;; esac
+      case "$line" in
+        *bin/gunicorn\ *) printf "%s\n" "$line"; break ;;
+      esac
     done' 2>/dev/null)"
   # A container that is up but has not reached gunicorn yet is a stack still
   # starting, not a stack misconfigured -- the same condition every rig test
   # skips on, and one -DROMMSYNC_REQUIRE_RIG=ON turns back into a failure.
   [ -n "$args" ] || { echo "$container has not started gunicorn yet -- skipping"; exit "$SKIP"; }
 
+  # Both spellings: `--max-requests 0` is what /init emits today, and a
+  # `--max-requests=0` that read as "flag absent" would fail a correctly
+  # configured stack with a message naming no value at all.
   local setting
-  setting="$(printf '%s\n' "$args" | grep -oE -- '--max-requests [0-9]+' | head -1)"
-  [ "$setting" = "--max-requests $MAX_REQUESTS" ] || fail \
+  setting="$(printf '%s\n' "$args" | grep -oE -- '--max-requests[= ][0-9]+' | head -1)"
+  [ -n "$setting" ] || fail \
+"$container runs gunicorn with no --max-requests at all:
+  $args
+  Nothing is holding the fixture to the setting #155 needs, so read /init and
+  find what replaced it rather than deleting this test."
+  [ "${setting#--max-requests?}" = "$MAX_REQUESTS" ] || fail \
 "$container runs gunicorn with '$setting', not '--max-requests $MAX_REQUESTS'
   This stack predates the setting, so it still recycles a worker every ~1000
   requests and answers 502 to whatever was in flight (#155). Pick it up with:

@@ -160,12 +160,13 @@ while [ "$waited" -lt "$DEADLINE_SECONDS" ]; do
   # run 45 minutes, and this repo is careful about gh's secondary rate limit
   # (see count_startable in fleet.sh).
   #
-  # Twice because `harness.partial` is a known intermittent race (#76, reopened)
-  # that runs inside host-tests. A single sighting is not evidence the PR is
-  # broken, and sending an agent to fix something that is not theirs costs it a
-  # whole cycle. The comparison is between CHECKS, not polls -- an earlier
-  # version reset its memory on the polls in between and could never see the
-  # same failure twice.
+  # Twice because host-tests drives a real RomM over thousands of requests and a
+  # single red is weak evidence about the PR. It used to say `harness.partial`
+  # here, whose flake #155 has since explained and removed; the reasoning does
+  # not depend on that test, only on sending an agent to fix something that is
+  # not theirs costing it a whole cycle. The comparison is between CHECKS, not
+  # polls -- an earlier version reset its memory on the polls in between and
+  # could never see the same failure twice.
   checks_due=$((checks_due + 1))
   if [ "$((checks_due % 4))" = "1" ]; then
     # `mergeStateStatus` and `baseRefName` ride along on the rollup call rather
@@ -284,9 +285,12 @@ No review will fix a red build. Reproduce it locally:
 then fix it, re-run the local reviews, ./scripts/orca/record-review.sh for the
 new commit, push, and come back here.
 
-One thing to rule out first: if the only failure is harness.partial, that is a
-known intermittent race (#76) and NOT yours. Re-run the job rather than
-changing code:  gh run rerun <run-id>
+A failure here is yours until you have shown otherwise. This used to name
+harness.partial as a known race to be re-run rather than investigated; #155 found
+what that actually was -- RomM retiring a gunicorn worker under a request in
+flight -- and turned it off in the fixture, so there is no longer a test whose
+red is somebody else's by default. execute.occupied still carries a retry
+(tests/CMakeLists.txt) and so cannot reach CI red on its own.
 RED
       exit 7
     fi
