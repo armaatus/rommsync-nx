@@ -585,6 +585,16 @@ $out" ;;
   release_says "$dir/rc-after-stable" "is published, on main, and agrees with VERSION" PASS \
     "a candidate cut after a stable release is judged on the candidate" "$build"
 
+  # The fallback the two rules above leave over: VERSION is stable, and every v1
+  # tag is a candidate. Nothing survives the filter, so the newest candidate is
+  # judged and the VERSION comparison is what reports it -- which is right. A
+  # `1.0.0` in VERSION with only a `v1.0.0-rc1` cut is a stable release somebody
+  # started and did not finish, and the row has to say so rather than silently
+  # finding no tag at all.
+  release_repo "$dir/stable-version-rc-tag" 1.0.0 "v1.0.0-rc1" "$published"
+  release_says "$dir/stable-version-rc-tag" "v1.0.0-rc1 disagrees with VERSION (1.0.0)" FAIL \
+    "a stable VERSION with only a candidate tag is judged on the candidate, and refused" "$build"
+
   # ...and --dry does not reach for the network at all. The stub here fails the
   # test if it is called, which is the only way to assert an absence.
   release_repo "$dir/dry" 1.0.0 v1.0.0 "$published"

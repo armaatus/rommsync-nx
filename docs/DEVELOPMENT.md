@@ -341,13 +341,14 @@ Six things are worth knowing before you do it:
   `hosversionAtLeast` guard marks an *optional* path — guarded precisely because
   the build works below it — so the highest of them is the version at and above
   which every path rommsync-nx can take is live, which is what "targets" means
-  for a build that degrades rather than refuses. The vendored overlay library
-  gates as high as `21.0.0`; `release.compatibility` does not read it, because
-  raising what a release claims because a UI library gained a
-  progressive-enhancement path would say nothing about whether this runs. `release.compatibility` derives it from the
-  source, so a call added against a newer firmware goes red instead of quietly
-  widening what a release claims. Neither number has been observed on hardware;
-  M8-2 (#44) is still what settles them.
+  for a build that degrades rather than refuses. `release.compatibility` derives
+  that number from the source, so a call added against a newer firmware goes red
+  instead of quietly widening what a release claims. It reads `sysmodule/source`
+  and `overlay/source` and not the vendored overlay library, which gates as high
+  as `21.0.0`: raising what a release claims because a UI library gained a
+  progressive-enhancement path would say nothing about whether this runs.
+  Neither number has been observed on hardware; M8-2 (#44) is still what settles
+  them.
 
 The zip is the only thing to download. `switch-build`'s per-push artifact is the
 three loose files, for debugging; a `.nsp` under its build name installs cleanly
