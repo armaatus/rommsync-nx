@@ -152,7 +152,7 @@ comes back to the front of the queue the moment that PR merges. #148 was picked
 up again eighteen seconds after its own preparation landed, and would have been
 picked up once per cycle forever.
 
-Label it **`needs-human-step`**. `fleet.sh` then does three things with it:
+Label it **`needs-human-step`**. `fleet.sh` then does four things with it:
 
 - it is **not startable** — the dispatcher opens no worktree for it, in `--auto`
   or from an explicit `fleet.sh run 148`. Remove the label to hand it to an agent;
@@ -161,7 +161,12 @@ Label it **`needs-human-step`**. `fleet.sh` then does three things with it:
   it to, and was flagged for it — noise on the one signal that is supposed to
   mean something is wrong;
 - it is **exempt from the time-box**. This is the half that matters: #44 was
-  interrupted at three hours for correctly producing nothing.
+  interrupted at three hours for correctly producing nothing;
+- and its worktree is **released** once there is nothing left in it — see
+  "Releasing a worktree" below. #139's agent needed a write under `.claude/hooks/`
+  that `guard.py` refuses from a fleet worktree, so it correctly produced no PR
+  and stopped; without this its worktree waits for a merged PR that can never
+  exist.
 
 The label is a claim about the *last* step, not the whole issue — and where there
 is real agent work in front of that step, it belongs in **its own issue with its
@@ -446,6 +451,42 @@ landed, and removes the worktree with `--run-hooks` — which is not optional:
 without it `orca.yaml`'s archive hook never runs and that worktree's RomM stack
 survives under `restart: unless-stopped`, holding two ports forever with nothing
 left on disk to identify it by. Then the next `ready` issue takes the slot.
+
+#### Releasing a worktree
+
+A merged PR is not the only way an issue stops being worked, and for a long time
+it was the only way a worktree was ever released — so a blocked or abandoned one
+held a slot forever. Two were cleared by hand on 2026-09-07, each holding four
+containers, two ports and four volumes; while #148 sat blocked with its worktree
+open, #119, #122 and #139 were queued behind work that could never start.
+
+So `fleet.sh` also releases a worktree whose issue **went `blocked`**, **closed
+with no merged PR for that branch**, **acquired `needs-human-step`**, or whose
+agent the **time-box stopped**. None of those carries the guarantee "the PR
+merged and nothing is unpushed" does — an abandoned worktree may hold the only
+copy of real work — so the release refuses rather than guesses, on the pair that
+was verified by hand before every one of those removals:
+
+- `git status --porcelain` empty, **and**
+- nothing in `git log origin/main..HEAD`.
+
+Fail either, or fail to answer at all, and the worktree is **kept** and the log
+says what is in there — the way the merged reap already reports unpushed commits
+rather than removing them. `origin/main` is read as it stands and never fetched:
+a stale one only ever makes commits look absent that are in fact merged, so every
+error it can cause keeps a worktree rather than deleting one.
+
+A time-box release has one extra half. Releasing the slot would otherwise hand
+the issue straight back to the front of the queue and to the same three hours, so
+the dispatcher records that it gave up and declines the issue for the rest of the
+run — visible in `fleet.sh status`, and cleared **by name**:
+
+```bash
+./scripts/orca/fleet.sh retry 44
+```
+
+Restarting the dispatcher deliberately does not clear it. A crash and a reboot
+are not decisions about an issue.
 
 And what comes back from the change re-enters at stage 1:
 
