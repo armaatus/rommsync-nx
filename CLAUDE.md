@@ -91,10 +91,10 @@ public CI. Homebrew and freely redistributable only.
 ## Working in parallel
 
 At most **3 worktrees** run at once, and an issue is startable only when it
-carries `ready` rather than `blocked` — those labels are maintained by
-[`unblock.yml`](.github/workflows/unblock.yml) from the `Blocked by #N` lines in
-each issue body. Do not hand-edit them. Do not start a `blocked` issue, nor a
-**`needs-human-step`** one — its last step is the maintainer's ([WORKFLOW.md](docs/WORKFLOW.md)).
+carries `ready` rather than `blocked` — labels [`unblock.yml`](.github/workflows/unblock.yml)
+derives from the `Blocked by #N` lines in each issue body, never by hand. Do not
+start a `blocked` issue, nor a **`needs-human-step`** one — its last step is the
+maintainer's, or no agent can do it at all ([WORKFLOW.md](docs/WORKFLOW.md)).
 
 One exception the labels cannot express: **a foundation issue lands alone.** When
 an issue defines an interface that later issues include — M0-2's `HttpClient` —
