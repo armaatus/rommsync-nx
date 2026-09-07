@@ -1436,11 +1436,22 @@ endforeach()
 # controls (an ordinary stall, an ordinary overrun, an ordinary ready issue) are
 # the half that matters -- an exemption that swallowed the real signal would be
 # worse than the noise it removes.
+#
+# ...and the other half of the reap (#153): `reap_merged` only ever removed a
+# worktree whose PR had MERGED, so an issue that went blocked, closed without
+# one, or turned out to need a person held one of three slots forever. The
+# `keeps` and `unknown_git` phases are the half that matters -- the release is
+# guarded by "clean, and nothing absent from origin/main", and a guard that
+# guessed would delete the work it exists to protect.
 set(ORCA_FLEET_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_orca_fleet.sh")
 foreach(phase card_says card_quiet remove_forces remove_advice
               stall_expected stall_reports timebox_waits timebox_stops queue_skips
               list_declines timebox_rearms labels_unknown outage_once one_lookup
-              timebox_clears stop_clears own_clears one_card)
+              timebox_clears stop_clears own_clears one_card
+              abandon_blocked abandon_closed abandon_human_step
+              abandon_keeps_dirty abandon_keeps_commits abandon_unknown_git
+              abandon_leaves_working abandon_timebox
+              gaveup_not_restarted gaveup_retry)
   add_test(NAME orca.fleet_${phase}
            COMMAND "${BASH_PROGRAM}" "${ORCA_FLEET_TEST}" ${phase})
   set_tests_properties(orca.fleet_${phase} PROPERTIES TIMEOUT 60)
