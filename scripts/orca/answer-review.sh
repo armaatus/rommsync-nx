@@ -115,12 +115,21 @@ trap 'rm -f "$payload"' EXIT
 orca_pr_payload "$pr" "$payload" || {
   echo "could not read PR #$pr's reviews, so whether there is one to answer cannot be told" >&2
   exit 2; }
-reviewed="$(gate_py '
+# "There is no review" and "this could not tell" are DIFFERENT refusals, and
+# collapsing them sends an agent to wait for a review that already arrived, for
+# a reason the message never names -- the same conflation the substance check
+# above is careful to avoid. Found by the independent review of this PR.
+if ! reviewed="$(gate_py '
 import json
 pull = json.load(open(sys.argv[2]))["data"]["repository"]["pullRequest"]
 print("yes" if any(merge_gate.is_substantive(r)
                    for r in merge_gate.independent_reviews(pull, sys.argv[3]))
-      else "no")' "$payload" "$head")" || reviewed=""
+      else "no")' "$payload" "$head")"; then
+  echo "could not tell whether PR #$pr has a review on ${head:0:8}: the payload did not" >&2
+  echo "load, or .github/scripts/merge_gate.py -- which decides which reviews count --" >&2
+  echo "did not answer. Nothing here can say what to do until it does." >&2
+  exit 2
+fi
 if [ "$reviewed" != yes ]; then
   echo "no independent review has been submitted against ${head:0:8} yet, so there is" >&2
   echo "nothing here to answer -- and an answer written now would be discarded by the" >&2
