@@ -326,11 +326,51 @@ def _written_paths(words):
     return [w for w in written if w and not w.startswith("-")]
 
 
+def _after_cd(prefix, words):
+    """Where a `cd` leaves the shell, as a prefix for the paths that follow.
+
+    `None` means "somewhere this cannot work out" -- a variable, a bare `cd`,
+    a `cd -`. Unknown has to stay unknown: guessing a prefix would resolve a
+    later path to a file the command never touches, and a guard that blocks the
+    wrong file gets switched off.
+    """
+    targets = [w for w in words[1:] if not w.startswith("-")]
+    if len(targets) != 1:
+        return None
+    target = targets[0]
+    if "$" in target or "`" in target or target == "-":
+        return None
+    if target.startswith("/"):
+        return target.rstrip("/") + "/"
+    if prefix is None:
+        return None
+    parts = [p for p in (prefix + target).split("/") if p and p != "."]
+    out = []
+    for part in parts:
+        if part == "..":
+            if not out:
+                return None
+            out.pop()
+        else:
+            out.append(part)
+    return "/".join(out) + "/" if out else ""
+
+
 def check_bash(command):
     branch = None
+    # What a `cd` earlier on this line has already consumed. Everything below
+    # matches a path by its tail, which is what survives a relative path -- but
+    # a marker whose own prefix is the thing the `cd` ate has no tail left to
+    # match: once `cd .claude` has run, `hooks/guard.py` shares nothing with
+    # `/.claude/hooks/`. Putting the prefix back is what makes it a path again.
+    cwd = ""
     for segment in _segments(command):
         words = _words(segment)
         if not words:
+            continue
+
+        if _verb(words) == "cd":
+            cwd = _after_cd(cwd, words)
             continue
 
         # `bash -c "..."` is a command in an argument. Judge what it will run.
@@ -483,6 +523,8 @@ def check_bash(command):
         # Every path this segment writes goes through the same rules an Edit
         # would. A write is a write whichever verb performs it.
         for path in _written_paths(words):
+            if cwd and not path.startswith("/"):
+                path = cwd + path
             if _touches_captures(path):
                 deny(
                     f"Blocked: {CAPTURES} is the pinned RomM 5.2.0 contract, and "
