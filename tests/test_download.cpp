@@ -1824,17 +1824,21 @@ void Nested(checks::Checks& c, http::HttpClient& client, const std::string& base
   c.ExpectEq(result.downloaded, 1, "the rom came down");
   c.ExpectEq(result.skipped, 0, "and nothing was skipped");
 
-  // `fs_name` is the *directory's* name, so that is what the rom is called on
-  // the card -- the inner file's `.bin` is not part of it, and an emulator that
-  // picks a core by extension will not load it. Pinned rather than corrected:
-  // the name is also what `AlreadyOnTheCard` looks for and what the overlay
-  // renders, so changing it is #92's decision and not M3-4's. This assertion is
-  // the one #92 has to update on purpose.
-  const std::string destination = "/tico/roms/psx/Synthetic Nested Game";
+  // #92's decision, and the assertion that is the whole of it. `fs_name` is the
+  // *directory's* name and `fs_extension` is `""`, so writing the rom under
+  // `fs_name` lands a file RetroArch and hbmenu will not load -- with a queue
+  // that says it worked. The leaf is `files[0].file_name` from
+  // `GET /api/roms/{id}` instead, which is the name RomM's own
+  // `content-disposition` gives the bytes it serves for this rom
+  // (docs/API_CONTRACT.md#has_nested_single_file-is-not-a-disc-set).
+  const std::string destination = "/tico/roms/psx/Synthetic Nested Game.bin";
   const std::string expected =
       FixtureRom("roms/psx/Synthetic Nested Game/Synthetic Nested Game.bin");
   c.Expect(!expected.empty(), "the fixture's nested file is readable");
-  c.Expect(rig.sandbox.Exists(destination), "the rom is at the destination the folder map names");
+  c.Expect(rig.sandbox.Exists(destination),
+           "the rom lands under the inner file's name, extension and all");
+  c.Expect(!rig.sandbox.Exists("/tico/roms/psx/Synthetic Nested Game"),
+           "and nothing is left under the directory's name, which no emulator would load");
   c.Expect(rig.sandbox.Read(destination) == expected,
            "and its bytes are the one file inside the rom's directory, exactly");
 
@@ -1843,6 +1847,11 @@ void Nested(checks::Checks& c, http::HttpClient& client, const std::string& base
   c.Expect(entry.message.find("disc") == std::string::npos,
            "with no disc-set refusal recorded against it");
   c.ExpectEq(entry.destination, destination, "and records where it went");
+  // The *rom's* name, not the file's. `QueueEntry::fs_name` is what RomM calls
+  // the rom and what `lists::Service` puts on the library row from the list
+  // schema -- where `files[]` is empty and always will be -- so the two rows
+  // about one rom would otherwise disagree about what it is called (#92).
+  // `destination` is the field that answers "what is the file called".
   c.ExpectEq(entry.fs_name, std::string("Synthetic Nested Game"),
              "under the name RomM gave the rom, which is the directory's");
   c.ExpectEq(entry.platform_fs_slug, std::string("psx"), "keyed on the fs slug");
@@ -1858,6 +1867,24 @@ void Nested(checks::Checks& c, http::HttpClient& client, const std::string& base
 
   c.Expect(!rig.sandbox.Exists(destination + ".tmp"), "nothing is left staged beside it");
   c.ExpectEq(rig.queue.pending(), std::size_t{0}, "and the worker has nothing left to do");
+
+  // A second drain over the same rom must be a no-op, and this is the assertion
+  // that says the two halves of the decision agree: `AlreadyOnTheCard` looks for
+  // the name the first drain *wrote*, not the one RomM calls the rom. Looking
+  // for the wrong one costs a re-download of every nested rom on every drain,
+  // and nothing would say so.
+  std::int32_t again = 0;
+  c.Expect(rig.queue.Enqueue(rom_id, &again) == ipc::Error::kOk, "the rom is queued a second time");
+  const download::DrainResult second = rig.Drain(client);
+  c.Expect(second.outcome == download::DrainOutcome::kCompleted,
+           std::string("the second drain completed -- got ") +
+               download::ToString(second.outcome) + " (" + second.message + ")");
+  c.ExpectEq(second.downloaded, 1, "the entry settles done");
+  const QueueEntry repeat = rig.Persisted(rom_id);
+  c.Expect(repeat.message.find("already on the card") != std::string::npos,
+           "from the card rather than from the network: " + repeat.message);
+  c.ExpectEq(repeat.destination, destination, "against the path the first drain wrote");
+  c.Expect(rig.sandbox.Read(destination) == expected, "which still holds the rom's bytes");
 }
 
 /// `missing_from_fs: true` -- RomM knows the rom and its file is gone from the
