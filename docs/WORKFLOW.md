@@ -725,9 +725,12 @@ fails if that entry disappears, because the agent brief names those skills.
 | pushing or opening a PR from a fleet worktree with no `.orca/reviewed-<sha>` | a PR arrives reviewed or it does not arrive |
 | anything outward while `~/.rommsync-fleet/STOP` exists (a drain sets `DRAIN`, which this does not read) | a stop that depends on cooperation is not a stop |
 
-The last three apply **only in a worktree the fleet opened**. In your own
-worktree you are the control, and a guard that argues with a person doing manual
-work is a guard people route around. It is also why the guards can still be
+Two of those apply **only in a worktree the fleet opened**: editing
+`.claude/hooks/` and `settings.json`, and pushing with no recorded review. In
+your own worktree you are the control, and a guard that argues with a person
+doing manual work is a guard people route around. The two stop rows apply
+everywhere — a stop that reached only the fleet's own worktrees would not be
+one. It is also why the guards can still be
 improved: the first version protected itself everywhere, and made its own bug
 unfixable.
 

@@ -46,8 +46,9 @@
 #           time.
 #   STOP    nothing goes out: no push, no PR, no comment, from any agent,
 #           whether or not it has read the news. `stop --now` and `stop --all`
-#           set it, and `await-review.sh` and `.claude/hooks/guard.py` are what
-#           make it hold without cooperation.
+#           set it, and `.claude/hooks/guard.py`, `await-review.sh`,
+#           `review-status.sh` and `resolve-thread.sh` are what make it hold
+#           without cooperation.
 #
 # ## What it will not do
 #
@@ -139,13 +140,22 @@ draining() { orca_fleet_draining; }
 # on it. Nothing in here gates on this: refusing to launch under one and not the
 # other is how the two would drift apart.
 hard_stopped() { orca_fleet_stopped; }
-check_stop() {
+# The word for the state in force, and the file carrying it, for the two screens
+# that need nothing more than the word: this one and `run`'s refusal. `status`
+# and the notification say a sentence per state rather than a word, so they
+# branch on `hard_stopped` themselves.
+#
+# Only meaningful once `draining` is true: with neither file set the state is
+# empty, and the file named is the one a drain WOULD write.
+stop_state() { hard_stopped && { echo stopped; return 0; }; draining && echo draining; }
+stop_state_file() { hard_stopped && { printf '%s\n' "$STOP_FILE"; return 0; }; printf '%s\n' "$DRAIN_FILE"; }
+
+# Named for what it gates rather than for the file it used to read: since the
+# split it is the DRAIN that stops a launch, and `check_stop` at the call site
+# read as the opposite of what it does.
+check_drain() {
   draining || return 1
-  if hard_stopped; then
-    say "stop file present ($STOP_FILE) -- not starting anything new"
-  else
-    say "drain file present ($DRAIN_FILE) -- not starting anything new"
-  fi
+  say "$(stop_state) ($(stop_state_file)) -- not starting anything new"
   return 0
 }
 
@@ -1395,7 +1405,8 @@ between them, and two of every reap, board comment and time-box interrupt.
       restart without that one starts the same bytes over.
 
 To take over -- the usual reason to start a second one is that the first is
-running stale code. With nothing in flight, drain it:
+running stale code. Drain it, which is safe with agents mid-work but waits for
+the PRs in flight to merge:
 
 REFUSED
     # No pull argument, deliberately, and this is the one caller that omits it.
@@ -1415,6 +1426,7 @@ and reap what it does not get to yourself:
 
   kill $holder
   ./scripts/orca/fleet.sh status  # until it says idle
+  ./scripts/orca/reap.sh --yes    # the stacks it did not live to reap
 REFUSED
     if [ -n "$root" ]; then
       echo "  cd $root && ./scripts/orca/fleet.sh run --auto"
@@ -1609,7 +1621,7 @@ cmd_stop() {
   case "$mode" in
     --now|--all)
       date '+stopped at %Y-%m-%d %H:%M:%S' >"$STOP_FILE"
-      echo "stop set: $STOP_FILE"
+      echo "stop set: $STOP_FILE (and the drain, $DRAIN_FILE)"
       echo "  no new worktrees, and no agent can push, open a PR or comment."
       # --now reaches the agents the fleet started. --all reaches every agent
       # Orca knows about, including sessions a person opened by hand -- which is
@@ -1660,13 +1672,24 @@ for t in json.load(sys.stdin)["result"]["terminals"]:
       fi ;;
     "")
       echo "drain set: $DRAIN_FILE"
-      echo "  no new worktrees. The agents in flight are NOT frozen: they finish,"
-      echo "  push, open their PRs and comment, because a merged PR is what releases"
-      echo "  the worktree this drain is waiting on."
-      echo "  The dispatcher stays up to reap those worktrees as their PRs land, and"
-      echo "  exits once nothing is left. Watch it with: fleet.sh status."
-      echo "  Use --now to interrupt the fleet's agents and freeze every outward"
-      echo "  effect, --all to interrupt every agent Orca knows about."
+      # ...but a drain does not LIFT a stop, and saying "the agents are not
+      # frozen" while $STOP_FILE is still there is the reassurance somebody
+      # would act on: `--now` to freeze, then a plain `stop.sh` later to let the
+      # work land, and the agents stay frozen with the screen saying otherwise.
+      if hard_stopped; then
+        echo "  ...but $STOP_FILE is STILL SET, so the agents stay frozen: no push,"
+        echo "  no PR, no comment. A drain does not lift a stop. To let the work in"
+        echo "  flight land, clear it and drain again:"
+        echo "    ./scripts/orca/fleet.sh resume && ./scripts/orca/stop.sh"
+      else
+        echo "  no new worktrees. The agents in flight are NOT frozen: they finish,"
+        echo "  push, open their PRs and comment, because a merged PR is what releases"
+        echo "  the worktree this drain is waiting on."
+        echo "  The dispatcher stays up to reap those worktrees as their PRs land, and"
+        echo "  exits once nothing is left. Watch it with: fleet.sh status."
+        echo "  Use --now to interrupt the fleet's agents and freeze every outward"
+        echo "  effect, --all to interrupt every agent Orca knows about."
+      fi
       # Last, because it is the line that changes what you do next.
       warn_blind_dispatcher ;;
   esac
@@ -1682,7 +1705,7 @@ cmd_resume() {
   # every `run` with the stop apparently lifted, or lets the agents out while
   # nothing may start -- neither is a state anybody asked for.
   rm -f "$STOP_FILE" "$DRAIN_FILE"
-  echo "stop cleared. Start again with: ./scripts/orca/fleet.sh run --auto"
+  echo "drain and stop cleared. Start again with: ./scripts/orca/fleet.sh run --auto"
 }
 
 # The counterpart to the time-box, and the ONLY way back onto the queue. By name
@@ -1748,9 +1771,10 @@ cmd_run() {
     # further down and RUNS it as a command (`! $drain_mode`). Both branches
     # here die, so the collision is harmless today and would not stay that way.
     local held; held="$(cat "$PIDFILE" 2>/dev/null)"
-    local which_file="$DRAIN_FILE"; hard_stopped && which_file="$STOP_FILE"
+    local state; state="$(stop_state)"
+    local which_file; which_file="$(stop_state_file)"
     if dispatcher_alive "$held"; then
-      die "the fleet is draining ($which_file), and pid $held is still DRAINING:
+      die "the fleet is $state ($which_file), and pid $held is still DRAINING:
 launching nothing new, and reaping what is in flight until nothing it owns is
 left, which is what a drain is. It exits on its own; watch it with
 \`fleet.sh status\`, and only then start one.
@@ -1759,7 +1783,7 @@ left, which is what a drain is. It exits on its own; watch it with
 dispatcher -- MAX_WORKTREES is enforced per process, so \`run\` would refuse
 while that one is up."
     fi
-    die "the fleet is draining ($which_file). Clear it with: fleet.sh resume"
+    die "the fleet is $state ($which_file). Clear it with: fleet.sh resume"
   fi
 
   # One dispatcher per machine, checked before the pidfile is claimed rather
@@ -1827,6 +1851,7 @@ while that one is up."
     # keeps reaping and exits when nothing it owns is left.
     if draining && ! $drain_mode; then
       drain_mode=true
+      reason="you stopped it"
       say "draining -- launching nothing more, still reaping what is in flight"
     fi
     if [ -n "$deadline" ] && [ "$(date +%s)" -ge "$deadline" ] && ! $drain_mode; then
@@ -1859,7 +1884,15 @@ while that one is up."
     fi
 
     while ! $drain_mode && [ "$live" -lt "$MAX_WORKTREES" ]; do
-      check_stop && { reason="you stopped it"; break 2; }
+      # `break`, not `break 2`: this is the drain arriving MID-PASS, after the
+      # check at the top of the loop and while worktrees are still owned, which
+      # is what `stop.sh` against a running fleet actually looks like. Leaving
+      # the whole loop here ended the dispatcher on the spot -- nothing reaped
+      # the worktrees it was holding, and their stacks stayed up under
+      # `restart: unless-stopped` with nothing left to take them down. It stops
+      # LAUNCHING here and keeps reaping, which is the same thing the top of the
+      # loop does one pass later.
+      if check_drain; then drain_mode=true; reason="you stopped it"; break; fi
       [ -n "$max_prs" ] && [ "$opened" -ge "$max_prs" ] && { reason="it opened $opened worktree(s)"; break 2; }
 
       local picked="" title="" labels=""

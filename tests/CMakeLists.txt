@@ -1535,6 +1535,7 @@ foreach(phase card_says card_quiet remove_forces remove_advice
               run_refuses run_stale_recycled run_stale_gone
               status_recycled stop_spares_stranger stop_stops_dispatcher
               run_blind_ps status_blind_ps stop_blind_ps
+              drain_ends_on_merge drain_after_stop
               stop_writes_drain stop_now_writes_both
               drain_lets_agents_finish stop_freezes_agents
               drain_launches_nothing resume_clears_both

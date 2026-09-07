@@ -122,7 +122,9 @@ orca_owner_repo || {
 owner="$orca_owner"; name="$orca_repo_name"
 
 echo "round $round of $MAX_ROUNDS -- waiting for a review on PR #$pr, on its current head"
-echo "  (polling every ${POLL_SECONDS}s; stop everything with ./scripts/orca/stop.sh)"
+# --now, not a bare stop.sh: a drain deliberately lets the work in flight
+# finish, which includes this wait (#183). Only the STOP file ends it.
+echo "  (polling every ${POLL_SECONDS}s; stop everything with ./scripts/orca/stop.sh --now)"
 
 payload="$(mktemp)"; reviews_out="$(mktemp)"; stamp="$(mktemp)"; notes="$(mktemp)"
 trap 'rm -f "$payload" "$reviews_out" "$stamp" "$notes"' EXIT

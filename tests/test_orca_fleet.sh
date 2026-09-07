@@ -299,6 +299,22 @@
 # itself forbidden, and ended only when the time-box gave three worktrees up.
 # `DRAIN` and `STOP` are now different files with different readers.
 #
+#   test_orca_fleet.sh drain_ends_on_merge
+#                                         the acceptance, end to end and against
+#                                         a real dispatcher: one worktree past
+#                                         its time-box, kept because its PR is
+#                                         open, a drain set WHILE it runs, and
+#                                         then that PR merges -> the run ends on
+#                                         the work landing, nothing is given up,
+#                                         and no agent is interrupted. It used to
+#                                         `break 2` out of the whole loop the
+#                                         moment the file appeared mid-pass,
+#                                         leaving the worktrees it held unreaped.
+#   test_orca_fleet.sh drain_after_stop   a drain asked for while STOP is still
+#                                         set changes nothing about the agents,
+#                                         and says so. It used to print the full
+#                                         "they are NOT frozen" reassurance over
+#                                         a stop that had them frozen.
 #   test_orca_fleet.sh stop_writes_drain  a drain writes DRAIN and NOT STOP.
 #   test_orca_fleet.sh stop_now_writes_both
 #                                         `--now` writes both: a hard stop is a
@@ -698,6 +714,29 @@ blind_ps() { printf '1\n' >"$PS_BLIND"; }
 pid_gone() {
   local i=0
   while [ "$i" -lt 50 ]; do
+    kill -0 "$1" 2>/dev/null || return 0
+    sleep 0.1; i=$((i + 1))
+  done
+  return 1
+}
+
+# A line the running dispatcher has printed, waited for rather than raced. Ten
+# seconds against a one-second poll: the phases that use it drive a real
+# dispatcher through two passes, and a fixed sleep would either be flaky or be
+# most of the suite's runtime.
+wait_for_log() {
+  local i=0
+  while [ "$i" -lt 100 ]; do
+    grep -q "$1" "$WORK/run.log" 2>/dev/null && return 0
+    sleep 0.1; i=$((i + 1))
+  done
+  fail "the dispatcher never said '$1': $(cat "$WORK/run.log" 2>/dev/null)"
+}
+
+# ...and its exit, which is the thing a drain is supposed to reach on its own.
+run_ended() {
+  local i=0
+  while [ "$i" -lt 200 ]; do
     kill -0 "$1" 2>/dev/null || return 0
     sleep 0.1; i=$((i + 1))
   done
@@ -1695,6 +1734,51 @@ JSON
       || fail "it never started: $out"
     echo "ok: a pidfile whose process is gone does not refuse"
     ;;
+  drain_ends_on_merge)
+    make_fixture ok
+    make_worktree
+    add_origin
+    # Past its time-box, and kept only because its PR is open -- which is the
+    # state every worktree in a real drain is in.
+    make_overdue
+    agent_state working
+    issue_state OPEN; issue_labels "ready"
+    echo '[{"number":9,"body":"Closes #42"}]' >"$GH_PRS"
+    : >"$GH_MERGED"
+    ( in_fleet cmd_run --auto >"$WORK/run.log" 2>&1 ) &
+    HELD_PID=$!
+    wait_for_log "fleet up"
+    in_fleet cmd_stop >/dev/null 2>&1
+    # Either line will do: the drain is noticed at the top of a pass, or in the
+    # launch loop when it appears mid-pass, and which one a real `stop.sh` hits
+    # is a race this phase must not depend on.
+    wait_for_log "draining"
+    # ...and now the PR the drain is waiting on merges, which is what a drain
+    # that also froze the agents made impossible.
+    echo 7 >"$GH_MERGED"
+    run_ended "$HELD_PID" \
+      || fail "the drain never ended; it is waiting for something only the time-box will now resolve: $(cat "$WORK/run.log")"
+    HELD_PID=""
+    grep -q "everything in flight has landed" "$WORK/run.log" \
+      || fail "it exited for some other reason than the work landing: $(cat "$WORK/run.log")"
+    [ -e "$ROMMSYNC_FLEET_DIR/gaveup-42" ] \
+      && fail "the time-box gave the worktree up; that is the three-hours-each ending #183 is about: $(cat "$WORK/run.log")"
+    grep -q -- "--interrupt" "$ORCA_CALLS" \
+      && fail "a drain interrupted an agent, which is --now's job and not this one"
+    echo "ok: a drain ends when the work in flight lands, not at the time-box"
+    ;;
+  drain_after_stop)
+    make_fixture ok
+    in_fleet cmd_stop --now >/dev/null 2>&1
+    out="$(in_fleet cmd_stop 2>&1)"
+    grep -q "STILL SET" <<<"$out" \
+      || fail "a drain over a stop said nothing about the stop, and the agents it promises are finishing are frozen: $out"
+    grep -q "NOT frozen" <<<"$out" \
+      && fail "it told you the agents were free to push while $ROMMSYNC_FLEET_DIR/STOP was still there: $out"
+    [ -e "$ROMMSYNC_FLEET_DIR/STOP" ] \
+      || fail "the drain cleared the stop; lifting one is resume's job and nothing here asked for it: $out"
+    echo "ok: a drain does not lift a stop, and does not pretend it did"
+    ;;
   stop_writes_drain)
     make_fixture ok
     out="$(in_fleet cmd_stop 2>&1)"
@@ -1777,18 +1861,24 @@ JSON
     out="$(in_fleet cmd_stop 2>&1)"
     grep -q "WARNING" <<<"$out" \
       && fail "it warned about a dispatcher that reads the drain file perfectly well: $out"
-    # ...and one from before #183, which reads STOP and nothing else. Recorded
-    # by removing the record, which is what such a dispatcher leaves: the field
-    # is how a running process says it understands the file.
-    rm -f "$ROMMSYNC_FLEET_DIR/dispatcher"
+    # ...and one from before #183. It leaves a FULL record that simply lacks the
+    # drain= line -- record_dispatcher has written root, started, commit and
+    # hash since #173 -- so removing the file instead would also empty `root`
+    # and only ever exercise the warning's fallback half.
+    grep -v '^drain=' "$ROMMSYNC_FLEET_DIR/dispatcher" >"$WORK/old-record"
+    mv "$WORK/old-record" "$ROMMSYNC_FLEET_DIR/dispatcher"
     out="$(in_fleet cmd_stop 2>&1)"
     grep -q "WARNING" <<<"$out" \
       || fail "a drain that pid $HELD_PID cannot see looked exactly like one it can, while it kept launching worktrees: $out"
     grep -q "kill $HELD_PID" <<<"$out" \
       || fail "the warning does not say how to take that dispatcher over: $out"
+    # Its OWN checkout, the way every other restart this file prints does: a
+    # relative `run --auto` starts a dispatcher in whatever worktree you typed it.
+    grep -q "cd $WORK/repo && ./scripts/orca/fleet.sh run --auto" <<<"$out" \
+      || fail "the takeover does not name the dispatcher's own checkout: $out"
     echo "ok: a dispatcher too old to see the drain is not drained in silence"
     ;;
   *)
-    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind|status_stale|status_current|status_unrecorded|status_from_worktree|status_draining|status_stopped|status_drained|status_behind|status_behind_revert|status_unreadable|status_names_root|run_refuses|run_stale_recycled|run_stale_gone|status_recycled|stop_spares_stranger|stop_stops_dispatcher|run_blind_ps|status_blind_ps|stop_blind_ps|stop_writes_drain|stop_now_writes_both|drain_lets_agents_finish|stop_freezes_agents|drain_launches_nothing|resume_clears_both|stop_drain_blind_dispatcher" >&2
+    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind|status_stale|status_current|status_unrecorded|status_from_worktree|status_draining|status_stopped|status_drained|status_behind|status_behind_revert|status_unreadable|status_names_root|run_refuses|run_stale_recycled|run_stale_gone|status_recycled|stop_spares_stranger|stop_stops_dispatcher|run_blind_ps|status_blind_ps|stop_blind_ps|drain_ends_on_merge|drain_after_stop|stop_writes_drain|stop_now_writes_both|drain_lets_agents_finish|stop_freezes_agents|drain_launches_nothing|resume_clears_both|stop_drain_blind_dispatcher" >&2
     exit 2 ;;
 esac
