@@ -422,8 +422,14 @@ what the client requests, and it is exactly the unconditional list in
 [API_CONTRACT.md](API_CONTRACT.md#scopes-to-request) — pinned to that document by
 the `auth.scopes` test, so the two cannot drift. Every `.write` in it is one the
 client performs; don't request a `*.write` you don't use. `me.write` is
-documented for recording play sessions, which this client does not do, so it is
-not requested — add it if and when M7-4 (#39) lands.
+documented and **not** requested, and the reason is worth stating because the
+obvious guess is wrong: it is not the play-session scope. It guards
+`PUT /api/users/{id}`, the `/api/client-tokens` family and
+`/api/auth/device/{approve,deny}` in 5.2.0's snapshot, none of which this client
+calls. M7-4 (#39) records play sessions and needed **no new scope**:
+`POST /api/play-sessions` declares `roms.user.write` and
+`POST /api/sync/sessions/{id}/complete` declares `devices.write`, both already on
+the list.
 
 **RomM may approve a subset**, which is why the granted set is read back off the
 token response rather than assumed, and why a `403` is a missing scope rather

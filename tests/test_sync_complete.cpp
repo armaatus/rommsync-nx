@@ -251,7 +251,7 @@ void Counts(rig::Checks& checks) {
       checks.Expect(false, "a cancelled completion must not spend a backoff");
     };
     const sync::Completion abandoned =
-        sync::CompleteSession(client, token, 12, counts, giving_up);
+        sync::CompleteSession(client, token, 12, counts, {}, giving_up);
     checks.Expect(abandoned.error == sync::CompleteError::kCanceled,
                   std::string("a cancelled completion is named as such: ") +
                       sync::ToString(abandoned.error));
@@ -317,7 +317,7 @@ void Parse(rig::Checks& checks) {
                 "and nothing here treats completed > planned as one");
   checks.Expect(session.completed_at.has_value(), "a completed session carries a completed_at");
   checks.Expect(!session.error_message.has_value(), "and no error_message");
-  checks.Expect(!parsed.value.play_session_ingest,
+  checks.Expect(!parsed.value.play_session_ingest.has_value(),
                 "a completion that sent no play sessions is answered with a null ingest");
   checks.Expect(parsed.value.warnings.empty(),
                 "the ordinary completion says nothing out loud: " +
@@ -336,22 +336,96 @@ void Parse(rig::Checks& checks) {
                 "and neither is a session missing the counts the call is about");
 
   // The two things the server can say that are worth a log line and are not
-  // errors: a session it had already ended, and an ingest for play sessions this
-  // client never sent.
-  const auth::Parsed<sync::SyncCompletion> cancelled = sync::ParseCompleteResponse(
-      R"({"session":{"id":7,"device_id":"d","user_id":1,"status":"CANCELLED",)"
-      R"("initiated_at":"2026-09-04T11:36:26+00:00","completed_at":null,)"
-      R"("operations_planned":2,"operations_completed":0,"operations_failed":0,)"
-      R"("error_message":"superseded","created_at":"2026-09-04T11:36:26+00:00",)"
-      R"("updated_at":"2026-09-04T11:36:26+00:00"},"play_session_ingest":{"created":0}})");
+  // errors: a session it had already ended, and an ingest carrying an entry it
+  // refused.
+  const std::string cancelled_body =
+      std::string(R"({"session":{"id":7,"device_id":"d","user_id":1,"status":"CANCELLED",)"
+                  R"("initiated_at":"2026-09-04T11:36:26+00:00","completed_at":null,)"
+                  R"("operations_planned":2,"operations_completed":0,"operations_failed":0,)"
+                  R"("error_message":"superseded","created_at":"2026-09-04T11:36:26+00:00",)"
+                  R"("updated_at":"2026-09-04T11:36:26+00:00"},"play_session_ingest":)"
+                  R"({"results":[{"index":0,"status":"created","id":9,"detail":null},)"
+                  R"({"index":1,"status":"error","id":null,"detail":"end before start"}],)"
+                  R"("created_count":1,"skipped_count":1}})");
+  const auth::Parsed<sync::SyncCompletion> cancelled =
+      sync::ParseCompleteResponse(cancelled_body);
   checks.Expect(cancelled.ok(), "a session that is not COMPLETED still parses: " +
                                     cancelled.error.Describe());
   if (cancelled.ok()) {
     checks.ExpectEq(static_cast<int>(cancelled.value.warnings.size()), 3,
-                    "...with a line for the status, the error_message and the ingest");
-    checks.Expect(cancelled.value.play_session_ingest,
-                  "an ingest for play sessions that were never sent is noticed");
+                    "...with a line for the status, the error_message and the refused session");
+    checks.Expect(cancelled.value.play_session_ingest.has_value(),
+                  "a non-null play_session_ingest is read rather than noted");
   }
+  if (cancelled.ok() && cancelled.value.play_session_ingest.has_value()) {
+    const sync::PlaySessionIngest& ingest = *cancelled.value.play_session_ingest;
+    checks.ExpectEq(static_cast<int>(ingest.results.size()), 2, "both results are read");
+    checks.ExpectEq(ingest.created_count, static_cast<std::int64_t>(1), "and the created count");
+    checks.ExpectEq(ingest.skipped_count, static_cast<std::int64_t>(1), "and the skipped count");
+    if (ingest.results.size() == 2) {
+      checks.Expect(ingest.results[0].status == sync::IngestStatus::kCreated,
+                    "the first entry was created");
+      checks.Expect(ingest.results[0].id.has_value() && *ingest.results[0].id == 9,
+                    "...and carries the row id RomM wrote");
+      checks.Expect(ingest.results[1].status == sync::IngestStatus::kError,
+                    "the second was refused");
+      checks.Expect(ingest.results[1].detail.has_value(),
+                    "...and RomM's own sentence is carried rather than classified");
+    }
+  }
+
+  // An ingest that will not read is a **warning**, not an error, and the
+  // completion still succeeds. Failing here would make a malformed play-session
+  // answer into `CompleteError::kMalformed` for a session the server actually
+  // completed, which the tick turns into a failed outcome and a backoff -- a
+  // play session costing a sync tick, which is the one thing this feature may
+  // not do. Leaving the ingest absent is the right fallback because absent
+  // already means "keep them buffered".
+  const std::string bad_ingest =
+      std::string(R"({"session":{"id":7,"device_id":"d","user_id":1,"status":"COMPLETED",)"
+                  R"("initiated_at":"2026-09-04T11:36:26+00:00",)"
+                  R"("completed_at":"2026-09-04T11:36:26+00:00",)"
+                  R"("operations_planned":0,"operations_completed":0,"operations_failed":0,)"
+                  R"("error_message":null,"created_at":"2026-09-04T11:36:26+00:00",)"
+                  R"("updated_at":"2026-09-04T11:36:26+00:00"},)"
+                  R"("play_session_ingest":{"created":0}})");
+  const auth::Parsed<sync::SyncCompletion> unreadable = sync::ParseCompleteResponse(bad_ingest);
+  checks.Expect(unreadable.ok(),
+                "an ingest missing its counts does not fail the completion: " +
+                    unreadable.error.Describe());
+  if (unreadable.ok()) {
+    checks.Expect(!unreadable.value.play_session_ingest.has_value(),
+                  "...it leaves the ingest absent, which already means \"keep them buffered\"");
+    checks.ExpectEq(static_cast<int>(unreadable.value.warnings.size()), 1,
+                    "...and says so in one line rather than silently");
+    checks.ExpectEq(unreadable.value.session.status, std::string("COMPLETED"),
+                    "the session itself is read exactly as it would have been");
+  }
+
+  // And a status word nobody has read cannot answer "may this session be
+  // dropped", so the ingest is refused -- as a warning, for the reason above --
+  // rather than downgraded to an outcome nobody chose.
+  const std::string odd_status =
+      std::string(R"({"session":{"id":7,"device_id":"d","user_id":1,"status":"COMPLETED",)"
+                  R"("initiated_at":"2026-09-04T11:36:26+00:00",)"
+                  R"("completed_at":"2026-09-04T11:36:26+00:00",)"
+                  R"("operations_planned":0,"operations_completed":0,"operations_failed":0,)"
+                  R"("error_message":null,"created_at":"2026-09-04T11:36:26+00:00",)"
+                  R"("updated_at":"2026-09-04T11:36:26+00:00"},"play_session_ingest":)"
+                  R"({"results":[{"index":0,"status":"queued","id":null,"detail":null}],)"
+                  R"("created_count":0,"skipped_count":0}})");
+  const auth::Parsed<sync::SyncCompletion> unknown = sync::ParseCompleteResponse(odd_status);
+  checks.Expect(unknown.ok(), "a status this build does not know does not fail the completion");
+  if (unknown.ok()) {
+    checks.Expect(!unknown.value.play_session_ingest.has_value(),
+                  "an ingest status this build does not know is refused, not guessed at");
+    checks.Expect(!unknown.value.warnings.empty(), "...and named");
+  }
+
+  // The invariant those two serve, stated once: nothing about a play session
+  // reaches `CompleteError`. Only the *session* can fail this parse.
+  checks.Expect(!sync::ParseCompleteResponse("{\"play_session_ingest\":null}").ok(),
+                "a 200 with no session in it is still a named error");
 }
 
 // --- stamps -------------------------------------------------------------------
@@ -881,7 +955,8 @@ void Session(rig::Checks& checks, http::HttpClient& client, const std::string& b
   // and a tick that gave up on a negotiation completes an id the next negotiate
   // already cancelled (docs/API_CONTRACT.md).
   const sync::Completion again = sync::CompleteSession(
-      client, TokenFor(base, fixture), plan.session_id, tick.counts, FinishInstantly().complete);
+      client, TokenFor(base, fixture), plan.session_id, tick.counts, {},
+      FinishInstantly().complete);
   checks.Expect(again.error == sync::CompleteError::kAlreadyCompleted,
                 std::string("a session completed twice is named as already accounted for, not "
                             "as a refused body: ") +
@@ -890,7 +965,7 @@ void Session(rig::Checks& checks, http::HttpClient& client, const std::string& b
                 "...and it is not retried, because the thing it wanted already happened");
 
   const sync::Completion missing =
-      sync::CompleteSession(client, TokenFor(base, fixture), 999'999'999, tick.counts,
+      sync::CompleteSession(client, TokenFor(base, fixture), 999'999'999, tick.counts, {},
                             FinishInstantly().complete);
   checks.Expect(missing.error == sync::CompleteError::kNoSuchSession,
                 std::string("a session id RomM does not know is named: ") +
@@ -912,8 +987,8 @@ void Session(rig::Checks& checks, http::HttpClient& client, const std::string& b
       checks.Expect(first.session_id != second.session_id,
                     "negotiating twice opens a second session");
       const sync::Completion stale =
-          sync::CompleteSession(client, TokenFor(base, fixture), first.session_id, tick.counts,
-                                FinishInstantly().complete);
+          sync::CompleteSession(client, TokenFor(base, fixture), first.session_id,
+                                tick.counts, {}, FinishInstantly().complete);
       checks.Expect(stale.error == sync::CompleteError::kSuperseded,
                     std::string("a session a later negotiation cancelled is named apart from a "
                                 "refused body: ") +

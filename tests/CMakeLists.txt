@@ -1032,6 +1032,53 @@ foreach(scenario IN LISTS COMPLETE_RIG_SCENARIOS)
   set_tests_properties(complete.${scenario} PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
 endforeach()
 
+# --- M7-4: play-session recording --------------------------------------------
+# The most droppable thing in the client: it writes no save and nothing depends
+# on it, so most of what these pin is what it does *not* do -- it does not invent
+# a session out of an unset clock, it does not grow a file forever, it does not
+# re-send what RomM already has, and it never fails a sync tick.
+#
+# `encode`, `derive`, `store`, `reconcile` and `tick` are deliberately NOT in the
+# skippable list. `derive` in particular is the acceptance criterion that the
+# mtime fallback is checked host-side with an injected clock and the harness
+# sandbox -- nothing here is verified on hardware (hard rule 1), so nothing here
+# may need a server to be checked.
+add_executable(test_play_sessions test_play_sessions.cpp)
+target_link_libraries(test_play_sessions PRIVATE rommsync::host)
+target_include_directories(test_play_sessions PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_play_sessions PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+
+set(PLAY_UNIT_SCENARIOS
+  encode     # the entry both endpoints carry, and every refusal that keeps a wrong number out
+  derive     # the mtime arithmetic, on an injected clock: an upper bound, and the cases it declines
+  carded     # the same, over mtimes off a real card in the harness sandbox -- the archival slot included
+  store      # play.db: bounded, oldest-dropped, survives a reboot, one bad row costs one row
+  reconcile  # what an answer releases -- duplicate is success, and a refusal is dropped, not retried
+  tick       # a session the encoder refuses costs the play time and never the completion
+)
+foreach(scenario IN LISTS PLAY_UNIT_SCENARIOS)
+  add_test(NAME play.${scenario} COMMAND test_play_sessions ${scenario})
+  set_tests_properties(play.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
+set(PLAY_RIG_SCENARIOS
+  ingest    # POST /api/play-sessions with the token the client already has; re-sent is duplicate
+  carried   # the preferred route: play_sessions[] on the completion, and created_count matches
+  buffered  # a 500 on the ingest leaves them buffered and the next sync tick completing
+)
+foreach(scenario IN LISTS PLAY_RIG_SCENARIOS)
+  add_test(NAME play.${scenario} COMMAND test_play_sessions ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(play.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  # RUN_SERIAL for the reasons every rig test here has: one armed fault proxy for
+  # every client, and RomM keeps ONE active sync session per device (#76).
+  set_tests_properties(play.${scenario} PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+endforeach()
+
 # --- M7-2: when a tick runs ---------------------------------------------------
 # The scheduler and the one backoff curve it shares with `auth::PairingSession`.
 # Every scenario drives an injected steady clock and an injected wall clock, so

@@ -14,12 +14,19 @@
 // Which is exactly why sync_finish.hpp persists the baseline *before* calling
 // this: the expensive thing to lose is the client's own record of what it
 // hashed, and that is local.
+//
+// M7-4 added the second thing the body carries -- `play_sessions[]` -- and the
+// answer it produces, `play_session_ingest`. Both live here rather than in
+// play_sessions.hpp because they are fields of *this* call's request and reply;
+// what fills the array and what becomes of the entries afterwards is that
+// module's, and it includes this one rather than the other way round.
 #include <chrono>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "rommsync/auth.hpp"
 #include "rommsync/http.hpp"
@@ -234,7 +241,154 @@ auth::Answer AnswerOf(CompleteError error) {
   return auth::Answer::kSilent;
 }
 
-Encoded EncodeCompleteRequest(const CompletionCounts& counts) {
+const char* ToString(IngestStatus status) {
+  switch (status) {
+    case IngestStatus::kCreated:
+      return "created";
+    case IngestStatus::kDuplicate:
+      return "duplicate";
+    case IngestStatus::kError:
+      return "error";
+  }
+  return "error";
+}
+
+bool Ingested(IngestStatus status) {
+  return status == IngestStatus::kCreated || status == IngestStatus::kDuplicate;
+}
+
+json::Error Validate(const PlaySession& session) {
+  const std::int64_t start = UnixSeconds(session.start_time);
+  const std::int64_t end = UnixSeconds(session.end_time);
+  if (start < kMinTimestampSeconds || start > kMaxTimestampSeconds) {
+    // The epoch is what an unset console clock produces, and a session stamped
+    // with it is play time RomM would file under 1970 forever. Refused for
+    // `ClientSaveState::updated_at`'s reason, and the same bound.
+    return Fail("start_time", "is not an instant this client can spell");
+  }
+  if (end < kMinTimestampSeconds || end > kMaxTimestampSeconds) {
+    return Fail("end_time", "is not an instant this client can spell");
+  }
+  if (end < start) {
+    return Fail("end_time", "is before start_time");
+  }
+  if (session.duration_ms < 0) {
+    return Fail("duration_ms", "is negative");
+  }
+  // A duration longer than the window it sits in is arithmetic that went wrong
+  // upstream. It reaches a user as play time that never happened, in a total
+  // nothing else contradicts, so it is refused here rather than clamped: a
+  // clamp would hide the bug and still report a number nobody derived.
+  const std::int64_t window_ms = (end - start) * 1000;
+  if (session.duration_ms > window_ms) {
+    return Fail("duration_ms", "is longer than the window between start_time and end_time");
+  }
+  if (session.rom_id.has_value() && *session.rom_id <= 0) {
+    return Fail("rom_id", "is not a positive rom id");
+  }
+  if (session.save_slot.has_value() && session.save_slot->empty()) {
+    // `""` and `null` are different values to the server and only one of them
+    // is a value -- `Validate(ClientSaveState)`'s rule on `slot`.
+    return Fail("save_slot", "is present and empty; send null instead");
+  }
+  return {};
+}
+
+Encoded EncodePlaySessions(const std::vector<PlaySession>& sessions) {
+  Encoded encoded;
+  std::string body("[");
+  for (std::size_t index = 0; index < sessions.size(); ++index) {
+    const PlaySession& session = sessions[index];
+    if (const json::Error error = Validate(session); !error.ok()) {
+      encoded.error = error;
+      encoded.error.field = "play_sessions[" + std::to_string(index) + "]." + error.field;
+      return encoded;
+    }
+    if (index != 0) {
+      body += ',';
+    }
+    // Field order follows the snapshot, for `EncodeNegotiateRequest`'s reason:
+    // nothing depends on it, and it makes an encoded body and a captured one
+    // diffable by eye.
+    body += "{\"rom_id\":";
+    body += session.rom_id.has_value() ? std::to_string(*session.rom_id) : "null";
+    body += ",\"save_slot\":";
+    body += session.save_slot.has_value() ? json::Quote(*session.save_slot) : "null";
+    body += ",\"start_time\":";
+    body += json::Quote(FormatTimestamp(session.start_time));
+    body += ",\"end_time\":";
+    body += json::Quote(FormatTimestamp(session.end_time));
+    body += ",\"duration_ms\":";
+    body += std::to_string(session.duration_ms);
+    body += '}';
+  }
+  body += ']';
+  encoded.body = std::move(body);
+  return encoded;
+}
+
+auth::Parsed<PlaySessionIngest> ParseIngestResponse(const json::Value& value,
+                                                    std::string_view context) {
+  auth::Parsed<PlaySessionIngest> parsed;
+  PlaySessionIngest ingest;
+
+  json::Reader reader(value, context);
+  reader.Required("created_count", &ingest.created_count);
+  reader.Required("skipped_count", &ingest.skipped_count);
+  if (!reader.ok()) {
+    parsed.error = reader.error();
+    return parsed;
+  }
+
+  const json::Value* results = value.Find("results");
+  if (results == nullptr || !results->is_array()) {
+    parsed.error = Fail("results", "is missing or not an array");
+    return parsed;
+  }
+  ingest.results.reserve(results->elements().size());
+  for (std::size_t at = 0; at < results->elements().size(); ++at) {
+    PlaySessionIngestResult result;
+    std::string status;
+    json::Reader row(results->elements()[at], "play session ingest result");
+    row.Required("index", &result.index);
+    row.Required("status", &status);
+    row.RequiredNullable("id", &result.id);
+    row.RequiredNullable("detail", &result.detail);
+    if (!row.ok()) {
+      parsed.error = row.error();
+      parsed.error.field = "results[" + std::to_string(at) + "]." + parsed.error.field;
+      return parsed;
+    }
+    if (status == "created") {
+      result.status = IngestStatus::kCreated;
+    } else if (status == "duplicate") {
+      result.status = IngestStatus::kDuplicate;
+    } else if (status == "error") {
+      result.status = IngestStatus::kError;
+    } else {
+      // Not downgraded to `kError`, which is what a plan's unknown `action`
+      // does, because the two defaults cost opposite things. An unknown action
+      // must not overwrite a save, so the safe default is "do nothing"; an
+      // unknown *status* would decide whether a recorded session may be
+      // dropped, and the safe default there is to refuse the answer and keep
+      // the session, which is one duplicate on the next flush.
+      parsed.error = Fail("results[" + std::to_string(at) + "].status",
+                          "is not created, duplicate or error");
+      return parsed;
+    }
+    if (result.index < 0) {
+      parsed.error = Fail("results[" + std::to_string(at) + "].index", "is negative");
+      return parsed;
+    }
+    ingest.results.push_back(std::move(result));
+  }
+
+  parsed.value = std::move(ingest);
+  return parsed;
+}
+
+Encoded EncodeCompleteRequest(const CompletionCounts& counts,
+                              const std::vector<PlaySession>& play_sessions) {
   Encoded encoded;
   if (counts.operations_completed < 0) {
     encoded.error = Fail("operations_completed", "is negative");
@@ -244,9 +398,14 @@ Encoded EncodeCompleteRequest(const CompletionCounts& counts) {
     encoded.error = Fail("operations_failed", "is negative");
     return encoded;
   }
+  const Encoded sessions = EncodePlaySessions(play_sessions);
+  if (!sessions.ok()) {
+    encoded.error = sessions.error;
+    return encoded;
+  }
   encoded.body = "{\"operations_completed\":" + std::to_string(counts.operations_completed) +
                  ",\"operations_failed\":" + std::to_string(counts.operations_failed) +
-                 ",\"play_sessions\":[]}";
+                 ",\"play_sessions\":" + sessions.body + "}";
   return encoded;
 }
 
@@ -273,13 +432,45 @@ auth::Parsed<SyncCompletion> ParseCompleteResponse(std::string_view body) {
   }
 
   // Present-and-null is the ordinary answer and the schema does not require the
-  // key at all, so only a non-null object is worth a word.
-  const json::Value* ingest = document.value.Find("play_session_ingest");
-  completion.play_session_ingest = ingest != nullptr && !ingest->is_null();
-  if (completion.play_session_ingest) {
-    completion.warnings.push_back(
-        "the server answered a play_session_ingest for a completion that sent no play sessions; "
-        "play sessions are M6's and nothing here reads it");
+  // key at all, so only a non-null object is read.
+  //
+  // **An ingest this build cannot read is a warning, never an error**, and that
+  // is the whole feature's rule applied to the answer half: a play session may
+  // not cost a sync tick. Failing here would make `CompleteError::kMalformed`
+  // out of a completion the server performed, which `sync_tick.hpp` turns into a
+  // failed `TickOutcome` and a scheduler backoff -- over play time, on a tick
+  // whose saves are already synced.
+  //
+  // Leaving `play_session_ingest` absent is exactly the right fallback because
+  // absent already means "the server said nothing about them": `play::Reconcile`
+  // is never reached, nothing is released, and the sessions go out again on the
+  // next tick to be answered `duplicate`. The cost of a RomM that changed this
+  // shape is therefore one duplicate per tick, not a console that stops syncing.
+  if (const json::Value* ingest = document.value.Find("play_session_ingest");
+      ingest != nullptr && !ingest->is_null()) {
+    auth::Parsed<PlaySessionIngest> parsed_ingest =
+        ParseIngestResponse(*ingest, "play session ingest");
+    if (parsed_ingest.ok()) {
+      for (const PlaySessionIngestResult& result : parsed_ingest.value.results) {
+        if (result.status == IngestStatus::kError) {
+          // RomM's own sentence, carried rather than classified: nothing here
+          // can act on it, and a caller that logs one list must still be able to
+          // see that a session was refused rather than recorded.
+          completion.warnings.push_back(
+              "the server refused play session " + std::to_string(result.index) + ": " +
+              (result.detail.has_value() ? *result.detail : std::string("no reason given")));
+        }
+      }
+      completion.play_session_ingest = std::move(parsed_ingest.value);
+    } else {
+      // `play_session_ingest` is deliberately left absent, and the completion
+      // carries on -- the two checks below still run, because a session that
+      // came back CANCELLED is news whatever became of the play time.
+      completion.warnings.push_back(
+          "the server's play_session_ingest could not be read, so the play sessions this tick "
+          "sent stay buffered and are sent again: " +
+          parsed_ingest.error.Describe());
+    }
   }
 
   if (completion.session.status != kCompletedStatus) {
@@ -301,6 +492,7 @@ auth::Parsed<SyncCompletion> ParseCompleteResponse(std::string_view body) {
 
 Completion CompleteSession(http::HttpClient& client, const auth::StoredToken& token,
                            std::int64_t session_id, const CompletionCounts& counts,
+                           const std::vector<PlaySession>& play_sessions,
                            const CompleteOptions& options) {
   if (token.server_url.empty() || token.access_token.empty()) {
     return Refuse(CompleteError::kNotRegistered, "this console is not paired");
@@ -311,7 +503,7 @@ Completion CompleteSession(http::HttpClient& client, const auth::StoredToken& to
     return Refuse(CompleteError::kNoSession,
                   "there is no sync session to complete; the negotiation produced no plan");
   }
-  const Encoded encoded = EncodeCompleteRequest(counts);
+  const Encoded encoded = EncodeCompleteRequest(counts, play_sessions);
   if (!encoded.ok()) {
     return Refuse(CompleteError::kUnusablePayload,
                   "the completion body could not be built: " + encoded.error.Describe());

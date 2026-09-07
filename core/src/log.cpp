@@ -310,6 +310,8 @@ const char* ToString(Event event) {
       return "sync.tick";
     case Event::kSaveFailed:
       return "save.failed";
+    case Event::kPlayFailed:
+      return "play.failed";
   }
   return "unknown";
 }

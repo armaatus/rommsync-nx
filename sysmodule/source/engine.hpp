@@ -68,6 +68,7 @@
 #include "rommsync/ipc.hpp"
 #include "rommsync/list_service.hpp"
 #include "rommsync/pairing.hpp"
+#include "rommsync/play_sessions.hpp"
 #include "rommsync/scheduler.hpp"
 #include "rommsync/sync_tick.hpp"
 #include "rommsync/token_store.hpp"
@@ -572,6 +573,28 @@ class SdEngine : public ipc::Engine {
   /// from inside the tick would be a cycle.
   void RunOneTick();
 
+  /// Move M7-4's play-session window forward, recording nothing (#39).
+  ///
+  /// Called from every path `RunOneTick` gives up on -- blocked credentials, no
+  /// transport, an unreachable library, `[sync] enabled = false` -- because a
+  /// tick that gave up still *looked*, and a window whose start only advanced on
+  /// successful ticks would stretch by one interval for every one that failed. A
+  /// console with no wifi fails the rom-index fetch every half hour; after a week
+  /// the next save that moved would claim a week of play, which
+  /// `play::kMaxWindowSeconds` then refuses outright -- so not stamping costs the
+  /// play time as well as the exaggeration.
+  void StampPlayWindow();
+
+  /// Say so when the play-session buffer could not be written (M7-4, #39).
+  ///
+  /// Every `play::StoreResult` in this class goes through here, because the
+  /// alternative -- discarding them -- makes a `play.db` that will not write
+  /// completely invisible: the buffer stops draining, the window stops moving,
+  /// and nothing anywhere says why. **It never fails a tick**; no save is at
+  /// risk from it, which is what keeps `log::Event::kPlayFailed` apart from
+  /// `kSaveFailed`.
+  static void LogPlayStore(const play::StoreResult& stored);
+
   /// Record what one exchange said about the credentials, and persist the
   /// verdict the moment it becomes one.
   ///
@@ -700,6 +723,24 @@ class SdEngine : public ipc::Engine {
   /// What has been overwritten on this card, newest first (M7-1, #36). Reloaded
   /// by `Load`, which is also what points it at the right directory.
   conflicts::History history_{std::string(conflicts::kHistorySdPath)};
+
+  /// Play time this console has recorded and not yet handed to RomM (M7-4,
+  /// #39), and the moment the last tick looked at the saves. Reloaded by `Load`
+  /// beside `history_`, and pointed at the right directory by it.
+  ///
+  /// **Guarded by nothing, because there is only one toucher.** `Load` reads it
+  /// before any thread exists, and after that only `RunOneTick` -- on the
+  /// worker, one tick at a time -- derives, records and releases. It is
+  /// deliberately *not* under `save_write_mutex_`: half of what it does happens
+  /// before that lock is taken, and a comment claiming otherwise would be the
+  /// kind of wrong `why` that survives into the next refactor.
+  ///
+  /// A second toucher is what changes this, and there is one obvious candidate:
+  /// an overlay "send my play time now" would reach it from the IPC thread and
+  /// would need a lock of its own, exactly as `history_mutex_` was added the
+  /// moment the scheduler became a second writer of `.backup/`. Nothing on the
+  /// IPC surface reads it today -- play time is not on any screen.
+  play::Buffer play_{std::string(play::kBufferSdPath)};
 
   /// The card, for a restore. The same pointer `UseCard` hands `lists_`, kept
   /// here too because a restore opens two files through it.

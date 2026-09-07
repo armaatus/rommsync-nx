@@ -123,6 +123,13 @@ overlay.
   asks the sysmodule to put bytes back over `RestoreBackup`
   (`core/include/rommsync/conflict_log.hpp`). `[sync] conflict_show` hides the
   *screen* and never the recording.
+- `sdmc:/config/rommsync/play.db` — play time this console recorded and has not
+  yet handed to RomM (M7-4). `conflicts.db`'s format: a header line carrying the
+  next id **and the moment the last tick looked at the saves**, then one JSON
+  object per session, oldest first. Bounded at `play::kMaxSessions`; the oldest
+  fall off the *front*, because this is a queue the server drains rather than a
+  list a person reads. Nothing on the IPC surface exposes it — play time is not
+  on any screen (`core/include/rommsync/play_sessions.hpp`).
 
 - `sdmc:/config/rommsync/rommsync.log` — what went wrong, in the words
   docs/TROUBLESHOOTING.md is written against (M7-3). One line per event:
@@ -165,6 +172,8 @@ scheduler fires
   → update state.db  (sync::FinishTick, and in this order: complete is
                       accounting, so a failed one must not cost the baseline)
   → POST /api/sync/sessions/{session_id}/complete
+    carrying play_sessions[] derived from the mtimes that moved since the last
+    tick (play::DeriveSessions, M7-4) -- optional, and never able to fail a tick
 ```
 
 ## Data flow: a download

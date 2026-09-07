@@ -372,7 +372,28 @@ TickCompletion FinishTick(http::HttpClient& client, fs::FileSystem& files,
                "this tick was cancelled but FinishOptions::complete.cancel is null, so the "
                "completion cannot be stopped; pass the same token ExecuteOptions::cancel had");
   }
-  tick.reported = CompleteSession(client, token, plan.session_id, tick.counts, options.complete);
+  // The play sessions are encoded here rather than left to `CompleteSession`,
+  // for the one reason this feature exists under: it is optional, and the tick
+  // is not. A session the encoder refuses would otherwise take the whole
+  // completion down with it -- `EncodeCompleteRequest` refuses the body whole --
+  // and RomM would be left holding a session nobody closed over play time.
+  std::vector<PlaySession> play_sessions = options.play_sessions;
+  if (!play_sessions.empty()) {
+    if (const Encoded encoded = EncodeCompleteRequest(tick.counts, play_sessions); !encoded.ok()) {
+      AddWarning(&tick.warnings,
+                 "the play sessions this tick recorded could not be sent and were left buffered: " +
+                     encoded.error.Describe());
+      play_sessions.clear();
+    }
+  }
+  tick.reported = CompleteSession(client, token, plan.session_id, tick.counts, play_sessions,
+                                  options.complete);
+  // Set from what actually went out rather than from what was handed over.
+  // `CompleteSession` refuses before it builds a request for an unpaired token,
+  // a session id there is none of, and a caller that cancelled first -- and each
+  // of those leaves `attempts` at zero. A caller reading this field as "the body
+  // carried them" would otherwise release sessions no server ever saw.
+  tick.play_sessions_sent = tick.reported.attempts > 0 ? play_sessions.size() : 0;
   return tick;
 }
 

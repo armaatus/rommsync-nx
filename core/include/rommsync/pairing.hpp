@@ -48,10 +48,17 @@ inline constexpr const char* kClientPlatform = "switch";
 /// itself (M1-3). `platforms.read` is a read this client makes for the overlay's
 /// library browser (M4-3, #25): `GET /api/platforms` declares it and answers
 /// `403` without it, so a console granted every other scope here lists no
-/// platforms at all. `me.write` is in the document and deliberately *not* here --
-/// it exists only for recording play sessions, which this client does not do,
-/// and a scope that is granted and never used is blast radius bought for
-/// nothing (docs/SECURITY.md).
+/// platforms at all.
+///
+/// `me.write` is in the document and deliberately *not* here, and the reason is
+/// **not** the one an earlier build recorded. It is not the play-session scope:
+/// in 5.2.0's snapshot it guards `PUT /api/users/{id}`, the `/api/client-tokens`
+/// family and `/api/auth/device/{approve,deny}`, and this client calls none of
+/// them. M7-4 (#39) records play sessions and asks for nothing new --
+/// `POST /api/play-sessions` declares `roms.user.write` and the completion call
+/// that carries them declares `devices.write`, both already above. A scope that
+/// is granted and never used is blast radius bought for nothing
+/// (docs/SECURITY.md).
 ///
 /// RomM may approve a subset of these, which is why the granted set is read
 /// back off the token response rather than assumed.

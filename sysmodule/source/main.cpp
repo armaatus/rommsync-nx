@@ -42,6 +42,7 @@
 #include "rommsync/ipc.hpp"
 #include "rommsync/list_service.hpp"
 #include "rommsync/log.hpp"
+#include "rommsync/play_sessions.hpp"
 #include "rommsync/state_db.hpp"
 #include "rommsync/version.hpp"
 
@@ -59,8 +60,9 @@ namespace {
 //   | the largest buffered list response        | 0x32000 | 200 KiB |
 //   | two worker thread stacks (M1-6, M7-2)    | 0x10000 |  64 KiB |
 //   | the log's in-memory tail (M7-3)          | 0x1800  |   6 KiB |
+//   | the play-session buffer (M7-4)           | 0x8000  |  32 KiB |
 //   | newlib arena overhead and fragmentation  | 0x8000  |  32 KiB |
-//   | **peak**                                 | 0xA8800 | 674 KiB |
+//   | **peak**                                 | 0xB0800 | 706 KiB |
 //
 // The old 0x80000 does not cover that, and the two terms it is short by are the
 // two that are easiest to miss:
@@ -104,7 +106,12 @@ namespace {
 //     RAM whole;
 //   * the list response is `lists::kMaxPlatforms` times the row estimate below;
 //   * the tail is `log::kTailLines` times `log::kMaxLineBytes`, and
-//     `ipc::kMaxLogLines` is the first of those rather than a second number.
+//     `ipc::kMaxLogLines` is the first of those rather than a second number;
+//   * the play-session buffer is twice `play::kMaxBufferBytes` -- the file's
+//     text and then the rows it becomes -- and it is the one term here that is
+//     *not* held for the life of the process: it is read at `Load` and rewritten
+//     once a tick (`play_sessions.hpp`). It is counted anyway, because a peak is
+//     a peak.
 constexpr size_t kInnerHeapSize = 0xC0000;
 
 // What one platform's JSON weighs on the wire. Measured against the fixture
@@ -130,6 +137,7 @@ static_assert(rommsync::sysmodule::ExpectedBsdTransferMemory({}) +
                       rommsync::sysmodule::kTransferBufferSize +
                       rommsync::lists::kMaxPlatforms * kPlatformJsonBytes +
                       rommsync::log::kTailLines * rommsync::log::kMaxLineBytes +
+                      2 * rommsync::play::kMaxBufferBytes +
                       2 * 0x8000 /* worker thread stacks */ +
                       0x8000 /* newlib arena overhead */ <
                   kInnerHeapSize,

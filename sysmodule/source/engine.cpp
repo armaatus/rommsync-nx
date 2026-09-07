@@ -20,6 +20,7 @@
 #include "rommsync/list_service.hpp"
 #include "rommsync/log.hpp"
 #include "rommsync/pairing.hpp"
+#include "rommsync/play_sessions.hpp"
 #include "rommsync/rom_index.hpp"
 #include "rommsync/save_scan.hpp"
 #include "rommsync/scheduler.hpp"
@@ -267,6 +268,15 @@ void SdEngine::Load(const std::string& config_dir) {
   // screen rather than here.
   history_ = conflicts::History(PathTo(conflicts::kHistoryFileName));
   static_cast<void>(history_.Load());
+
+  // The same treatment for the play-session buffer (M7-4, #39), and for the
+  // same reason: a console that has never recorded any play time has no file,
+  // which is a first boot rather than a failure. The `last_seen` it carries is
+  // what bounds the next tick's sessions -- with no file there is no window and
+  // the first tick after this one derives nothing, which is `DeriveSessions`'s
+  // documented first-boot answer.
+  play_ = play::Buffer(PathTo(play::kBufferFileName));
+  static_cast<void>(play_.Load());
 
   // The two lines a bug report starts with, and the whole reason M7-3 (#38)
   // wired a logger into this class rather than into `core/`: this is the one
@@ -766,6 +776,50 @@ void SdEngine::RunWorker() {
 
 namespace {
 
+/// The saves as the *last* tick left them, for M7-4's derivation.
+///
+/// Two projections rather than one, because the two sides of the comparison come
+/// from different types -- `state.db`'s rows and this tick's scan -- and the one
+/// thing they have to agree about is the slot. **A null slot is an archival
+/// save, which `scan::SaveFile` spells as the empty string.** Spell them
+/// differently and every archival save reads as one the client has never seen,
+/// which `play::DeriveSessions` answers by producing nothing at all -- so the
+/// symptom would be an archival save that never records play time, silently and
+/// forever.
+///
+/// Here rather than in `play_sessions.hpp` because that header takes three plain
+/// fields on purpose: it is drivable from a literal, and one that took a
+/// `state::Baseline` would drag the baseline and the scanner in behind it
+/// (play_sessions.hpp, `SaveObservation`).
+std::vector<play::SaveObservation> ObservationsOf(const state::Baseline& baseline) {
+  std::vector<play::SaveObservation> observations;
+  observations.reserve(baseline.rows().size());
+  for (const std::pair<const state::Baseline::Key, state::SaveRecord>& stored : baseline.rows()) {
+    play::SaveObservation observation;
+    observation.rom_id = stored.second.rom_id;
+    observation.slot = stored.second.slot.value_or(std::string());
+    observation.mtime = stored.second.mtime;
+    observations.push_back(std::move(observation));
+  }
+  return observations;
+}
+
+/// ...and as this tick found them. `scan::SaveFile::slot` is already the empty
+/// string for an archival save, which is the spelling above matches.
+std::vector<play::SaveObservation> ObservationsOf(const std::vector<scan::SaveFile>& saves) {
+  std::vector<play::SaveObservation> observations;
+  observations.reserve(saves.size());
+  for (const scan::SaveFile& save : saves) {
+    play::SaveObservation observation;
+    observation.rom_id = save.rom_id;
+    observation.slot = save.slot;
+    observation.mtime =
+        std::chrono::system_clock::from_time_t(static_cast<std::time_t>(save.modified_unix));
+    observations.push_back(std::move(observation));
+  }
+  return observations;
+}
+
 /// Where a save or a state the console has no local copy of should be written.
 ///
 /// Empty when there is nowhere to put it, which is what `ExecuteOptions::place`
@@ -819,6 +873,41 @@ void SdEngine::RecordFailedTickLocked() {
   failed_ = 0;
 }
 
+void SdEngine::StampPlayWindow() {
+  // Move the play-session window forward without recording anything (M7-4, #39).
+  //
+  // **A tick that gave up still looked**, and that is the whole point. The
+  // window is `[the last time this console looked, the save's mtime]`, and every
+  // tick that returns early without moving the first half stretches the next
+  // session by one interval. A paired console with no wifi fails the rom-index
+  // fetch on every tick for a week and would then report the first save that
+  // moved as a week of play -- which `play::kMaxWindowSeconds` would refuse
+  // outright, so the cost of not doing this is the play time as well as the
+  // exaggeration.
+  //
+  // Moving it can only ever *lose* a session -- a save written before this
+  // stamp and noticed after it is skipped -- and that is the safe direction:
+  // play time nobody played is the failure nobody can correct.
+  LogPlayStore(play_.Record({}, std::chrono::system_clock::now()));
+}
+
+void SdEngine::LogPlayStore(const play::StoreResult& stored) {
+  // The one thing a discarded `StoreResult` costs: a `play.db` that will not
+  // write is a buffer that stops draining and a window that stops moving, and
+  // both are invisible from outside. **Never a reason to fail a tick** -- no
+  // save is at risk here, which is what keeps this apart from `save.failed`.
+  if (!stored.ok()) {
+    log::Error(log::Event::kPlayFailed, stored.message);
+  }
+  if (stored.unusable > 0) {
+    // `play::DeriveSessions` cannot produce one of these, so a non-zero count
+    // means something built a session by hand -- a bug rather than a card.
+    log::Warn(log::Event::kPlayFailed,
+              std::to_string(stored.unusable) +
+                  " derived play session(s) were not storable and were dropped");
+  }
+}
+
 void SdEngine::RunOneTick() {
   const std::shared_ptr<const config::Config> config = ConfigSnapshot();
   http::HttpClient* client = nullptr;
@@ -850,6 +939,7 @@ void SdEngine::RunOneTick() {
     // "Sync now", and there the gate's real guarantee is the one that holds:
     // three rejections and it is blocked, so a user leaning on the button costs
     // three requests and then this branch.
+    StampPlayWindow();
     // Said out loud every tick, and that is the point rather than noise: once
     // the gate blocks, this branch is the *only* thing that happens, so a silent
     // one leaves a console whose log shows a few `auth.rejected` lines from
@@ -872,6 +962,7 @@ void SdEngine::RunOneTick() {
     // the answer -- back off and try again later -- is the same one a console on
     // a train gets. The status screen says which of the four it is; the schedule
     // does not need to know.
+    StampPlayWindow();
     // Which of the four it is, said out loud: the scheduler does not need to
     // know and a user does. `config.no_server` is the one with a fix on the
     // settings screen, so it is its own event rather than a sentence inside
@@ -912,6 +1003,8 @@ void SdEngine::RunOneTick() {
   const roms::FetchResult library = roms::FetchRomIndex(*client, fetch);
   ObserveAnswer(roms::AnswerOf(library));
   if (!library.ok()) {
+    // The common one: a console with no wifi fails this every tick.
+    StampPlayWindow();
     if (StoppedAccepting(library.status)) {
       log::Error(log::Event::kAuthRejected,
                  "GET /api/roms answered " + std::to_string(library.status) + "; " +
@@ -958,6 +1051,35 @@ void SdEngine::RunOneTick() {
     targets.push_back(std::move(target));
   }
 
+  // M7-4 (#39): the play time this tick can infer, derived *before* the buffer's
+  // window is stamped forward and handed to the completion the tick is going to
+  // make anyway. `state.db` as the last tick left it is the previous
+  // observation, the scan is the current one, and the two ticks bound each
+  // session -- see `play::DeriveSessions` for why that is an upper bound rather
+  // than a measurement, and why this console cannot do better.
+  //
+  // Every failure here is swallowed on purpose. A play-session error must never
+  // reach `TickOutcome`: the feature writes no save, and a sync tick lost to it
+  // would be an optional extra taking hard rule 2's machinery down with it.
+  const sync::Timestamp play_now = std::chrono::system_clock::now();
+  std::vector<play::BufferedSession> play_sent;
+  if (config->sync.enabled) {
+    const play::Derivation played =
+        play::DeriveSessions(ObservationsOf(loaded.value), ObservationsOf(scanned.saves),
+                             play_.last_seen(), play_now);
+    LogPlayStore(play_.Record(played.sessions, play_now));
+    // What the completion will carry, captured rather than re-read afterwards:
+    // `play::Reconcile` matches the answer to this list by index, so the two
+    // must be the same list.
+    play_sent = play_.Pending(play::kMaxSessions);
+  } else {
+    // `[sync] enabled = false`: nothing is recorded and nothing is sent, because
+    // a user who switched save sync off did not ask this console to keep
+    // telling a server what they played. The window still moves -- see
+    // `StampPlayWindow`.
+    StampPlayWindow();
+  }
+
   sync::TickOptions options;
   // The switch, passed **into** the tick rather than re-decided here: the gate
   // one level down is what makes "a disabled sysmodule makes no network call"
@@ -974,6 +1096,9 @@ void SdEngine::RunOneTick() {
   // just changed (`sync::RecoverStaging`).
   options.recover_dirs = config->SaveScanDirs();
   options.recover_dirs.push_back(std::string(sync::kBackupDir));
+  for (const play::BufferedSession& buffered : play_sent) {
+    options.finish.play_sessions.push_back(buffered.session);
+  }
   const roms::RomIndex* index = &library.index;
   // One placement rule, applied to the two folder lists. Saves and states are
   // placed the same way -- find the rom, find the platform the user mapped, put
@@ -1004,6 +1129,18 @@ void SdEngine::RunOneTick() {
   const sync::TickResult tick =
       sync::RunTick(*client, *files, token, reported, targets, loaded.value, options);
   ObserveAnswer(tick.answer);
+
+  // The other half of M7-4: drop the sessions RomM accounted for, and keep the
+  // ones it did not. A tick that never reached the server releases nothing, and
+  // the next one re-sends the same sessions -- which RomM answers `duplicate` if
+  // this one secretly landed (`sync::Ingested`). Nothing here can fail the tick
+  // either.
+  if (tick.finished.play_sessions_sent > 0 &&
+      tick.finished.reported.value.play_session_ingest.has_value()) {
+    const play::Reconciliation reconciled =
+        play::Reconcile(play_sent, *tick.finished.reported.value.play_session_ingest);
+    LogPlayStore(play_.Release(reconciled.release));
+  }
 
   // M7-1 (#36)'s call site, which nothing in this build had. It is outside
   // `sync::RunTick` because `conflict_record.hpp` includes `state_sync.hpp`, so

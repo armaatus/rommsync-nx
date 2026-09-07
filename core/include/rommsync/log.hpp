@@ -139,6 +139,13 @@ enum class Event {
   /// match. **A failure here means the save was left exactly as it was**, which
   /// is the whole of hard rule 2 (docs/SYNC_PROTOCOL.md#backups).
   kSaveFailed,
+
+  /// The play-session buffer could not be written (M7-4). **Never a reason to
+  /// fail a tick** -- play time is the most droppable thing in the client -- but
+  /// not silent either: a `play.db` that will not write is a buffer that stops
+  /// draining and a window that stops moving, and both are invisible from
+  /// outside. No save is at risk; that is `kSaveFailed`.
+  kPlayFailed,
 };
 
 /// Every event, in declaration order. The guide and the emitted set are both
@@ -149,6 +156,7 @@ inline constexpr std::array kAllEvents = {
     Event::kConfigDiagnostic, Event::kNoServer, Event::kNoSaveDirs,
     Event::kNetOffline,  Event::kNetTls,      Event::kScanSkipped,
     Event::kSyncRefused, Event::kSyncTick,    Event::kSaveFailed,
+    Event::kPlayFailed,
 };
 
 /// Stable tag -- `net.offline`. Never null.

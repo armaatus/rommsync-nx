@@ -102,6 +102,7 @@ and a log is not worth it. A save is never in that position; see
 | `sync.refused` | the server answered, and the answer will not change | [The server refused the sync](#the-server-refused-the-sync) |
 | `save.failed` | a save could not be written — usually a full card | [The SD card is full](#the-sd-card-is-full) |
 | `sync.tick` | how one sync ended — every tick writes one | [What to attach to a bug report](#what-to-attach-to-a-bug-report) |
+| `play.failed` | play time could not be recorded — no save is at risk | [The SD card is full](#the-sd-card-is-full) |
 
 The overlay does not show the log yet. `sys-rommsync` serves it over IPC —
 `GetLog`, command 16 in [DEVELOPMENT.md](DEVELOPMENT.md#the-command-set) — so a
@@ -381,6 +382,19 @@ part is what *did not* happen as a result:
 - **A leftover `.tmp` is deleted on the next tick, not committed.** It is a
   complete body that may not be the right one, with no backup beside it, and
   nothing after the fact can tell — so it costs one re-fetch to say no.
+
+A full card also stops the client's own records being written, and one of those
+has a line of its own:
+
+```
+9 error play.failed /config/rommsync/play.db: the bytes did not all reach the card
+```
+
+`play.failed` is play time, not save data — **no save is ever at risk from it**
+(that is always `save.failed`). What it costs is the play time this console had
+recorded and not yet sent, and the record of when it last looked at your saves,
+so play time stops being reported until the card can be written again. Your saves
+keep syncing throughout.
 
 **The fix.** Free space on the card. Then look for leftovers:
 

@@ -614,10 +614,132 @@ Negotiation Negotiate(http::HttpClient& client, const auth::StoredToken& token,
 // reported wrong, not a tick undone -- see sync_finish.hpp, which owns the order
 // the baseline and this call happen in.
 
+// --- play sessions, the request half ------------------------------------------
+//
+// M7-4. `SyncCompletePayload.play_sessions[]` and `PlaySessionIngestPayload`
+// carry the *same* entry -- `SyncPlaySessionEntry` and `PlaySessionEntry` are
+// field-for-field identical in the pinned snapshot -- so it is spelled once,
+// here, beside the completion that is its ordinary carrier. What *produces* one
+// and where the unsent ones wait is `play_sessions.hpp`, which includes this.
+
+/// One stretch of time a rom was played, as RomM ingests it.
+///
+/// The three time fields are required by the snapshot; `rom_id` and `save_slot`
+/// are nullable and are genuinely null here more often than not -- see
+/// `play::DeriveSessions` for why a console cannot always say which rom.
+///
+/// `duration_ms` is carried rather than derived from the two timestamps because
+/// it is a different claim: the window is when the play *could* have happened
+/// and the duration is how much of it counts. Nothing this client produces
+/// today claims less than the whole window, but a future foreground detector
+/// would, and a field the server stores separately is not one to re-derive.
+struct PlaySession {
+  /// The rom, when the client could attribute the session to one. Null is a
+  /// documented value, not a failure.
+  std::optional<std::int64_t> rom_id;
+
+  /// The save slot the attribution came from -- `retroarch-srm`. Null when
+  /// there was none, and never `""`: the server stores what it is given.
+  std::optional<std::string> save_slot;
+
+  Timestamp start_time{};
+  Timestamp end_time{};
+  std::int64_t duration_ms = 0;
+};
+
+/// Everything wrong with one session that would make it mean something other
+/// than what the client meant. `error.field` is the JSON field name.
+///
+/// The bar is deliberately higher than the schema's, in the direction that
+/// costs one session rather than a wrong number in a library a user reads:
+///
+///   - both timestamps inside `[kMinTimestampSeconds, kMaxTimestampSeconds]`,
+///     which is what `FormatTimestamp` can spell at all;
+///   - `end_time` at or after `start_time`, because RomM stores the pair and
+///     shows the span;
+///   - `duration_ms` non-negative *and* no longer than the window it sits in.
+///     A duration longer than its own window is arithmetic that went wrong
+///     upstream, and it lands in RomM as play time that never happened.
+///   - `rom_id`, when present, positive; `save_slot`, when present, non-empty.
+json::Error Validate(const PlaySession& session);
+
+/// `[ {...}, {...} ]` -- the array both endpoints carry, or a named error for
+/// the first entry `Validate` refuses. Index-prefixed like
+/// `EncodeNegotiateRequest`'s.
+///
+/// **Refused whole rather than filtered.** A caller that sent the good ones and
+/// dropped the rest would be reconciling an ingest against a list the server
+/// never saw, and the reconciliation is by index (`PlaySessionIngestResult`).
+Encoded EncodePlaySessions(const std::vector<PlaySession>& sessions);
+
+// --- play sessions, the answer half -------------------------------------------
+
+/// What RomM did with one entry, by its index in what was sent.
+enum class IngestStatus {
+  kCreated,    ///< a new row
+  kDuplicate,  ///< it already had this one. **This is success** -- see below
+  kError,      ///< it refused this entry; `detail` says why
+};
+
+/// Stable, log-friendly name. Never null; the spelling RomM uses.
+const char* ToString(IngestStatus status);
+
+/// True for a status that means the session is recorded and must not be sent
+/// again.
+///
+/// **`kDuplicate` is included, and that is the point of the enum.** Ingest is
+/// not all-or-nothing: a flush whose connection died on the way back is retried,
+/// the second attempt is answered `duplicate` for every entry, and a client that
+/// read that as a failure would keep the whole buffer forever and re-send it on
+/// every tick.
+bool Ingested(IngestStatus status);
+
+/// One `PlaySessionIngestResult`.
+struct PlaySessionIngestResult {
+  /// Index into the array that was sent. Not assumed to be the position of this
+  /// result: the snapshot makes it a field, so it is read as one.
+  std::int64_t index = 0;
+
+  IngestStatus status = IngestStatus::kError;
+
+  /// The row RomM wrote. Null for anything but `kCreated`, and null is a
+  /// documented value.
+  std::optional<std::int64_t> id;
+
+  /// RomM's own sentence for a `kError`, carried rather than classified. Null
+  /// otherwise.
+  std::optional<std::string> detail;
+};
+
+/// A whole `PlaySessionIngestResponse` -- the answer to `POST /api/play-sessions`
+/// and the non-null half of `SyncCompleteResponse.play_session_ingest`.
+struct PlaySessionIngest {
+  std::vector<PlaySessionIngestResult> results;
+  std::int64_t created_count = 0;
+  std::int64_t skipped_count = 0;
+};
+
+/// Parse one, strictly. `context` names it in the error.
+///
+/// A status string this client does not recognise is an error rather than a
+/// fourth outcome: the whole question a result answers is "may this session be
+/// dropped", and a word nobody has read cannot answer it. Keeping it buffered
+/// costs one duplicate on the next flush; guessing costs the session.
+///
+/// `id` and `detail` are read as required-and-nullable although the snapshot
+/// lists neither as required -- `ParseNegotiateResponse`'s stance on the five
+/// optional fields of an operation, and its reason: 5.2.0 emits both on every
+/// result, so a server that genuinely stopped is a change worth a named error
+/// rather than a field that silently defaulted.
+auth::Parsed<PlaySessionIngest> ParseIngestResponse(const json::Value& value,
+                                                    std::string_view context);
+
 /// What one finished tick reports about itself -- a `SyncCompletePayload`.
 ///
-/// `play_sessions` is not here: it belongs to M6 and this client sends the empty
-/// array (`EncodeCompleteRequest`).
+/// `play_sessions` is not here: the counts are what the *execution* produced and
+/// a play session is not an operation. `EncodeCompleteRequest` takes the two
+/// separately, so a tick that recorded none sends `[]` and a tick that failed to
+/// build its sessions still reports its counts.
 struct CompletionCounts {
   /// Operations that did what the plan asked, planned `no_op`s included.
   ///
@@ -642,10 +764,19 @@ struct CompletionCounts {
 /// history a user reads -- so a count that went negative upstream would become a
 /// permanent, unexplainable row rather than a bug anyone traces back.
 ///
-/// `play_sessions` is sent as `[]` rather than omitted. The schema declares it
-/// `array | null` with no default, and an explicit empty array is the client
-/// saying it tracked none, which is true; M6 is what makes it non-empty.
-Encoded EncodeCompleteRequest(const CompletionCounts& counts);
+/// `play_sessions` is sent as `[]` rather than omitted when there are none. The
+/// schema declares it `array | null` with no default, and an explicit empty
+/// array is the client saying it tracked none, which is true.
+///
+/// **A session `Validate` refuses fails the whole body**, counts included, and
+/// that is deliberate: the alternative is a `complete` that silently reports the
+/// tick and drops the play time, which is the one failure nobody would ever see.
+/// The caller's answer is to fix or drop the session, not to send it -- and
+/// `sync::FinishTick` does exactly that, reporting the counts on a second
+/// attempt with no sessions at all rather than losing the tick to them
+/// (sync_finish.hpp). Nothing about a play session may cost a sync tick.
+Encoded EncodeCompleteRequest(const CompletionCounts& counts,
+                              const std::vector<PlaySession>& play_sessions = {});
 
 /// The session row RomM keeps for one negotiate -> execute -> complete pass, as
 /// `SyncSessionSchema` sends it.
@@ -693,15 +824,26 @@ struct SyncSession {
 struct SyncCompletion {
   SyncSession session;
 
-  /// True when the server answered a `play_session_ingest` object rather than
-  /// `null`. This client sends no play sessions, so it should always be false;
-  /// M6 owns the case where it is not, and a `true` here is reported in
-  /// `warnings` rather than parsed into a shape nothing yet uses.
-  bool play_session_ingest = false;
+  /// What RomM did with the `play_sessions[]` this completion carried, when it
+  /// carried any. Absent is the ordinary answer to a completion that sent none.
+  ///
+  /// **Absent is not the same as "nothing was ingested"**, and a caller that
+  /// treated it as such would drop the sessions it just had accepted. It is
+  /// "the server said nothing", which is why `play::Reconcile` releases a
+  /// buffered session only against a result that names it.
+  ///
+  /// It is also what an ingest this build *could not read* leaves behind. That
+  /// is a warning rather than a parse error, because a play session may not cost
+  /// a sync tick: an error here would become `CompleteError::kMalformed` for a
+  /// completion the server actually performed. Absent already means "keep them
+  /// buffered", so the cost of a RomM that moved this shape is one duplicate per
+  /// tick.
+  std::optional<PlaySessionIngest> play_session_ingest;
 
   /// One line per thing the client did not expect: a `status` that is not
   /// `COMPLETED`, an `error_message` the server attached, a
-  /// `play_session_ingest` for play sessions that were never sent.
+  /// `play_session_ingest` for play sessions that were never sent, an entry
+  /// RomM refused.
   ///
   /// None of them is an error. The accounting call succeeded; these are things
   /// worth a log line, and they are handed up the way `SyncPlan::warnings` are
@@ -827,8 +969,24 @@ struct Completion {
 /// device's previous `IN_PROGRESS` session, verified against a live 5.2.0
 /// (docs/API_CONTRACT.md), so a tick that gave up on one negotiation and made
 /// another must complete the second id.
+/// `play_sessions` rides along on the request that is already being made, which
+/// is the whole reason this client prefers it to `POST /api/play-sessions`: a
+/// console on battery spends no second request on play time.
+///
+/// **A retry re-sends them, on purpose.** A 5xx or a dropped exchange is retried
+/// with the identical body, and an attempt that reached RomM before the
+/// connection died has already ingested them -- so the second attempt is
+/// answered `duplicate`, which `Ingested` reads as success. That is what makes
+/// the retry safe rather than a source of double-counted play time.
+///
+/// **One signature, not an overload pair.** A second four-argument spelling with
+/// `options` defaulted would make `CompleteSession(c, t, id, counts, {})`
+/// ambiguous -- `{}` is as good a `CompleteOptions` as it is a vector -- and the
+/// next caller would find that out as a compile error rather than reading it
+/// here. A tick with no play time passes `{}` and says so.
 Completion CompleteSession(http::HttpClient& client, const auth::StoredToken& token,
                            std::int64_t session_id, const CompletionCounts& counts,
+                           const std::vector<PlaySession>& play_sessions = {},
                            const CompleteOptions& options = {});
 
 }  // namespace rommsync::sync

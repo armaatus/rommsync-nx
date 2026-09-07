@@ -161,6 +161,19 @@ struct FinishOptions {
 
   /// The completion call's timeout, attempts and backoff.
   CompleteOptions complete;
+
+  /// Play time to carry on the completion that is happening anyway (M7-4, #39).
+  ///
+  /// Empty on every tick that recorded none, which is most of them, and an
+  /// empty vector is sent as `[]` rather than omitted (`EncodeCompleteRequest`).
+  /// `play::Buffer::Pending` is what fills it and `play::Reconcile` is what
+  /// reads the answer back out of `TickCompletion::reported`.
+  ///
+  /// **Nothing here may cost the tick.** A session the encoder refuses is
+  /// dropped and the completion is sent without it, with a line in `warnings` --
+  /// see `TickCompletion::play_sessions_sent`. Play time is the most droppable
+  /// thing in the client; the session RomM is waiting to have closed is not.
+  std::vector<PlaySession> play_sessions;
 };
 
 /// What the end of a tick did. Both halves are reported, because they fail
@@ -180,6 +193,20 @@ struct TickCompletion {
 
   /// The counts that were sent, whether or not the call carrying them landed.
   CompletionCounts counts;
+
+  /// How many of `FinishOptions::play_sessions` the body actually carried.
+  ///
+  /// Less than what was handed over means one of two things, and both are zero
+  /// rather than a smaller number: the encoder refused a session, so the array
+  /// went whole (`play::Reconcile` matches an answer by index, so a filtered one
+  /// would reconcile against a list the server never saw); or `CompleteSession`
+  /// refused before it built a request at all -- an unpaired token, no session
+  /// id, a caller that had already cancelled. A `warnings` line names the first.
+  ///
+  /// **Zero is not "the server rejected them"**: it is "nothing was sent", and
+  /// the sessions are still in the buffer. What RomM did with the ones that
+  /// were sent is `reported.value.play_session_ingest`.
+  std::size_t play_sessions_sent = 0;
 
   /// Rows `AdvanceBaseline` moved forward.
   std::size_t rows_advanced = 0;

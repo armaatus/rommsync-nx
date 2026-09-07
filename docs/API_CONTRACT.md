@@ -94,12 +94,20 @@ Client-token pairing (alternative / management) also exists:
 me.read roms.read roms.user.read roms.user.write
 assets.read assets.write devices.read devices.write collections.read
 platforms.read
-me.write            # only if recording play sessions
+me.write            # guards PUT /api/users/{id}, /api/client-tokens and device approve/deny
 ```
 
 This block is not prose: the `auth.scopes` test parses it and compares it to
 `MinimumScopes()`, so editing one without the other goes red. Anything qualified
 with a `#` comment is documented and *not* requested.
+
+`me.write` is the one that is documented and deliberately not requested, and the
+reason it is written down at all is that an obvious guess gets it wrong: it is
+**not** the scope for recording play sessions. In 5.2.0's snapshot it guards
+`PUT /api/users/{id}`, the `/api/client-tokens` family and
+`/api/auth/device/{approve,deny}` — none of which this client calls.
+`POST /api/play-sessions` is guarded by `roms.user.write`, which is on the
+unconditional list already, so M7-4 (#39) needed no new scope at all.
 
 `platforms.read` is the one that is not obvious, and it was found by being
 refused. `GET /api/platforms` declares it in 5.2.0's OpenAPI and answers
@@ -377,7 +385,10 @@ already in sync with, so an empty request from a fully-synced device returns an
 empty `operations` array.
 
 `SyncCompletePayload`: `operations_completed, operations_failed, play_sessions[]`
-→ `SyncCompleteResponse { session, play_session_ingest }`
+→ `SyncCompleteResponse { session, play_session_ingest }`. The capture below is
+a completion that carried **no** play sessions, which is why the ingest is
+`null`; what a non-null one looks like is under
+[Play sessions](#play-sessions) below.
 (`captures/sync-complete.json`):
 ```json
 {
@@ -447,6 +458,68 @@ in `saves[]` — so "it does not report saves the device is already in sync with
 above is about an *empty* request, not about a save that was reported. A client
 committing a baseline can therefore rely on every reported save carrying an
 operation.
+
+## Play sessions
+
+How long a rom was played, so a library's play time reflects the console and not
+just the desktop (M7-4, #39). Optional in the strongest sense: nothing depends on
+it and a failure here must never fail a sync tick.
+
+| Method | Path | Scope | Notes |
+|---|---|---|---|
+| POST | `/api/play-sessions` | `roms.user.write` | ingest; `PlaySessionIngestPayload` → **201** `PlaySessionIngestResponse` |
+| GET | `/api/play-sessions` | `roms.user.read` | read back; query `rom_id, device_id, start_after, end_before, limit, offset` |
+| DELETE | `/api/play-sessions/{session_id}` | — | not used by this client |
+
+**`roms.user.write`, not `me.write`.** Both scopes are already covered above; the
+mistake is worth stating twice because the wrong one is a plausible guess and is
+a scope this client refuses to request.
+
+`PlaySessionEntry` (the ingest) and `SyncPlaySessionEntry` (the completion) are
+**field-for-field identical** in the snapshot, which is why the client spells the
+entry once (`sync::PlaySession`):
+
+```jsonc
+{ "rom_id": 4, "save_slot": "retroarch-srm",   // both nullable
+  "start_time": "2026-09-04T11:12:27Z",        // required, date-time
+  "end_time":   "2026-09-04T11:36:27Z",        // required, date-time
+  "duration_ms": 1440000 }                     // required, >= 0
+```
+
+So there are two routes and the client prefers the cheaper one: the sync tick is
+already making a request, and `SyncCompletePayload.play_sessions[]` rides on it.
+`POST /api/play-sessions` is for flushing without a sync.
+
+The answer is the same shape either way — `play_session_ingest` on a completion is
+a whole `PlaySessionIngestResponse` or `null`:
+
+```json
+{
+  "results": [
+    { "index": 0, "status": "created", "id": 9, "detail": null },
+    { "index": 1, "status": "duplicate", "id": null, "detail": null }
+  ],
+  "created_count": 1,
+  "skipped_count": 1
+}
+```
+
+**Verified — a session that ends in the future is answered `error`, not `422`.**
+The snapshot bounds nothing but `duration_ms >= 0`; the live 5.2.0 also refuses a
+future `end_time`, per entry, with
+`{"index":0,"status":"error","id":null,"detail":"end_time is too far in the future"}`
+while the request as a whole is still a **201**. So a console whose clock runs
+ahead of the server loses those sessions rather than the request — which is why
+`play::DeriveSessions` refuses an mtime later than the tick's own clock before it
+ever gets here, and why the rig scenarios anchor their windows to the clock
+rather than to a fixed instant.
+
+**Ingest is not all-or-nothing, and `duplicate` is success.** `status` is one of
+`created`, `duplicate`, `error`, per entry, indexed by position in what was sent.
+That is what makes a retried flush safe: an attempt that reached RomM before the
+connection died has already written the rows, and the retry is answered
+`duplicate` for every one of them. A client that read that as a failure would
+re-send its whole buffer forever.
 
 ## Save & state I/O (used while executing a plan)
 
