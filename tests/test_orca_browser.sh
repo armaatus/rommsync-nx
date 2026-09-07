@@ -325,7 +325,11 @@ run_fleet_fn() {
   # rather than being written here: the first is how the snippets find
   # issue_refs at all, the second is what ready_issues filters on, and a wrong
   # value in either would otherwise stay green through every phase below.
+  # `gave_up_issues` is a one-liner, and count_startable calls it: an issue this
+  # dispatcher gave up on has to come out of the count, and a snippet without the
+  # function counted every issue anyway on the strength of `command not found`.
   src="$(sed -n '/^ISSUE_REFS=/p; /^HUMAN_STEP_LABEL=/p;
+                 /^gave_up_issues()/p;
                  /^has_open_pr()/,/^}/p; /^in_flight()/,/^}/p;
                  /^ready_issues()/,/^}/p; /^issue_is_done()/,/^}/p;
                  /^count_startable()/,/^}/p' \
@@ -335,6 +339,7 @@ run_fleet_fn() {
     export FLEET_ISSUES FLEET_OPEN_PRS FLEET_MERGED_PRS FLEET_ISSUE_STATE
     export FLEET_GH_FAIL
     REPO_ROOT="$TMPDIR_FIXTURE"
+    STATE_DIR="$TMPDIR_FIXTURE/fleet-state"; mkdir -p "$STATE_DIR"
     # count_startable reads the live worktree list from Orca, which is not what
     # these assert; $FLEET_LIVE stands in for it.
     live_worktrees() { printf '%s' "$FLEET_LIVE"; }
@@ -1065,7 +1070,18 @@ STUB
                     notify() { echo "NOTIFY: $*"; }
                     orca_json() { local o; o="$(mktemp)"; orca_run_with_deadline 10 "$o" "$ORCA_CLI" "$@" --json; cat "$o"; rm -f "$o"; }
                     card() { echo "CARD: $*"; }
-                    '"$(sed -n '/^notice_stalled()/,/^}/p' "$TMPDIR_FIXTURE/scripts/orca/fleet.sh")"'
+                    POLL_CACHE="'"$state"'/poll-cache"; mkdir -p "$POLL_CACHE"
+                    '"$(sed -n '/^HUMAN_STEP_LABEL=/p; /^ANSWER_SEP=/p;
+                                /^has_label()/p;
+                                /^issue_state_in()/p; /^issue_labels_in()/p;
+                                /^poll_issue()/,/^}/p;
+                                # Same omission as the time-box phase below had:
+                                # without it notice_stalled asked a function that
+                                # did not exist, and reported the stall on rc 127
+                                # rather than on an answer.
+                                /^issue_needs_human_step()/,/^}/p;
+                                /^notice_stalled()/,/^}/p' \
+                       "$TMPDIR_FIXTURE/scripts/orca/fleet.sh")"'
                     notice_stalled
                     echo "--- second pass ---"
                     notice_stalled' 2>&1)"
@@ -2033,15 +2049,33 @@ STUB
                REPO_ROOT="'"$TMPDIR_FIXTURE"'"
                STATE_DIR="'"$state"'"; OWNED_DIR="$STATE_DIR/worktrees"
                STARTED_DIR="$STATE_DIR/started"; TIMEBOX_SECONDS=10800
+               # The answers for one pass. The dispatcher empties it per poll;
+               # here each run_timebox is its own process, so emptying it on the
+               # way in is the same thing.
+               POLL_CACHE="$STATE_DIR/poll-cache"; rm -rf "$POLL_CACHE"; mkdir -p "$POLL_CACHE"
                say() { echo "$*"; }
                notify() { echo "NOTIFY: $*"; }
                card() { echo "CARD: $*"; }
                orca_json() { local o; o="$(mktemp)"; orca_run_with_deadline 10 "$o" "$ORCA_CLI" "$@" --json; cat "$o"; rm -f "$o"; }
-               '"$(sed -n '/^ISSUE_REFS=/p;
+               '"$(sed -n '/^ISSUE_REFS=/p; /^HUMAN_STEP_LABEL=/p; /^ANSWER_SEP=/p;
                              # owned_path is a one-liner; a range would run on
-                             # to the closing brace of whatever follows it.
-                             /^owned_path()/p;
+                             # to the closing brace of whatever follows it. So
+                             # are has_label and the two answer accessors.
+                             /^owned_path()/p; /^has_label()/p;
+                             /^issue_state_in()/p; /^issue_labels_in()/p;
                              /^has_open_pr()/,/^}/p; /^agent_terminal_in()/,/^}/p;
+                             # The exemption enforce_timebox checks before it
+                             # stops anything, and the one call that answers it.
+                             # Left out, issue_needs_human_step was command not
+                             # found, rc 127 matched neither arm of the case, and
+                             # every phase below passed on the strength of a
+                             # function that was not there.
+                             /^poll_issue()/,/^}/p;
+                             /^issue_needs_human_step()/,/^}/p;
+                             # ...and the interrupt itself, for the same reason:
+                             # phase 5 asserts an agent was stopped, which a
+                             # missing function cannot do.
+                             /^interrupt_agent_in()/,/^}/p;
                              # enforce_timebox calls it on both of its exits; a
                              # snippet without it clears no marker at all, and
                              # phase 4 below is exactly that failure.
