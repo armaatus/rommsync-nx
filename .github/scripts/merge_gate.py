@@ -148,8 +148,13 @@ def evaluate(head_sha, pull_request, changed_files):
         # addressed. That is PR #95's bug with the ordering reversed: an empty
         # record standing in for a review, arriving after instead of before.
         # Found in review of this PR.
+        #
+        # Oldest first, so the last write per author wins -- which is what
+        # independent_reviews() already returns and `substantive` preserves,
+        # being a filter over it. Sorting again here would be a second pass over
+        # the same data for the same order.
         latest = {}
-        for r in sorted(substantive, key=lambda r: r.get("submittedAt") or ""):
+        for r in substantive:
             if r.get("state") in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"):
                 latest[(r.get("author") or {}).get("login") or "?"] = r
         blocking = sorted(w for w, r in latest.items()
