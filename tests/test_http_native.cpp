@@ -55,8 +55,12 @@ std::string Scratch(const std::string& name) {
   return rig::ScratchDir() + "/" + name;
 }
 
-/// Remove a destination and any partial file left from an earlier run, so a
-/// scenario's assertions are about what this run did.
+/// Remove a destination and any partial file left from an earlier run of THIS
+/// process, so a scenario's assertions are about what this run did.
+///
+/// It cannot be another process's any more: the scratch directory is per process
+/// since #151, which is what stops a second `ctest` from renaming this one's
+/// `.part` out from under it.
 void Clear(const std::string& path) {
   std::filesystem::remove(path);
   std::filesystem::remove(path + ".part");

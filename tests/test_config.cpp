@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "checks.hpp"
+#include "scratch.hpp"
 #include "rommsync/config.hpp"
 
 namespace config = rommsync::config;
@@ -557,7 +558,7 @@ void TheServerUrlIsAnOriginOrNothing(checks::Checks& c) {
 // --- the file on disk ---------------------------------------------------------------
 
 void LoadingFromDisk(checks::Checks& c) {
-  const std::filesystem::path dir = std::filesystem::path(ROMMSYNC_TEST_SCRATCH) / "config";
+  const std::filesystem::path dir = std::filesystem::path(scratch::Dir()) / "config";
   std::filesystem::create_directories(dir);
   const std::string path = (dir / "config.ini").string();
   std::filesystem::remove(path);

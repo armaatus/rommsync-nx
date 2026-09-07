@@ -18,6 +18,7 @@
 #include <string>
 
 #include "checks.hpp"
+#include "scratch.hpp"
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/auth_gate.hpp"
 #include "rommsync/device_registration.hpp"
@@ -38,7 +39,7 @@ using auth::Answer;
 using auth::Block;
 
 std::filesystem::path ScratchDir() {
-  const std::filesystem::path dir = std::filesystem::path(ROMMSYNC_TEST_SCRATCH) / "auth_gate";
+  const std::filesystem::path dir = std::filesystem::path(scratch::Dir()) / "auth_gate";
   std::filesystem::create_directories(dir);
   return dir;
 }

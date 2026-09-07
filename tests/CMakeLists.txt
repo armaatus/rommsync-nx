@@ -41,6 +41,11 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 # agent's `ctest` beside a review's `ctest` on the same worktree is two of them,
 # which is how #118 was found. Ownership is what makes that safe; serialising
 # could not have, and the comments here used to imply otherwise.
+#
+# The other half of that case was on disk rather than on the wire: one scratch
+# directory, fixed destination names, two processes (#151). It is fixed the same
+# way -- per process, in tests/scratch.hpp -- and held by `scratch.concurrent`,
+# which runs two `ctest`s at once because nothing inside one can see this.
 
 # --- unit tests: no external services ---------------------------------------
 add_executable(test_version test_version.cpp)
@@ -475,7 +480,9 @@ add_executable(test_rig_provisioned test_rig_provisioned.cpp)
 target_link_libraries(test_rig_provisioned PRIVATE rommsync::host)
 target_compile_definitions(test_rig_provisioned PRIVATE
   ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
-  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}"
+  # `scratch`, like every other target: this one never writes there, but the
+  # build tree itself is not a scratch directory and a sweep of it would be.
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
   ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
 
 add_test(NAME rig.provisioned COMMAND test_rig_provisioned)
@@ -487,9 +494,10 @@ set_tests_properties(rig.smoke PROPERTIES TIMEOUT 120)
 
 # --- the native HttpClient against the real rig ------------------------------
 # One CTest entry per scenario, selected by argv[1], so a red run names the
-# behaviour that broke. The scratch directory is per-build-tree, because three
+# behaviour that broke. The scratch directory is per build tree, because three
 # worktrees run these concurrently and a shared /tmp path would have them
-# overwrite each other's downloads.
+# overwrite each other's downloads -- and per process INSIDE that (#151, see
+# tests/scratch.hpp), because one build tree takes more than one `ctest`.
 add_executable(test_http_native test_http_native.cpp)
 target_link_libraries(test_http_native PRIVATE rommsync::host)
 target_compile_definitions(test_http_native PRIVATE
@@ -949,6 +957,14 @@ target_compile_definitions(test_harness PRIVATE
 
 add_test(NAME harness.sandbox COMMAND test_harness sandbox)
 set_tests_properties(harness.sandbox PROPERTIES TIMEOUT 60)
+
+# `harness.scratch` is not skippable either, and for the same reason: the
+# per-process scratch directory (#151) is what keeps two `ctest` invocations off
+# each other's files, and the sweep that keeps it affordable deletes directories.
+# `scratch.concurrent` proves the rule over two real invocations and needs RomM;
+# this one pins which leaves the sweep removes, and needs nothing.
+add_test(NAME harness.scratch COMMAND test_harness scratch)
+set_tests_properties(harness.scratch PROPERTIES TIMEOUT 60)
 
 set(HARNESS_SCENARIOS
   disarms         # an armed fault cannot outlive the scope that armed it
@@ -1930,9 +1946,10 @@ foreach(scenario IN LISTS DOWNLOAD_RIG_SCENARIOS)
     set_tests_properties(download.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
   endif()
   # RUN_SERIAL for the reason every rig test has it (see the top of this file):
-  # these download the shared fixture's roms, and they download them into one
-  # scratch directory under fixed names, so two at once read each other's
-  # half-written files (#151).
+  # these download the shared fixture's roms, and a second one at once reads and
+  # deletes the saves and queue entries this one is asserting on. Not the scratch
+  # directory -- these drive `harness::Sandbox`, which was per process before
+  # #151 and is not what that issue was about.
   set_tests_properties(download.${scenario} PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
 endforeach()
 

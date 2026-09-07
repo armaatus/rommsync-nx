@@ -24,6 +24,7 @@
 #include <unistd.h>  // getpid: the owner tag below is per process
 
 #include "checks.hpp"
+#include "scratch.hpp"
 #include "rommsync/host/curl_http_client.hpp"
 #include "rommsync/http.hpp"
 #include "rommsync/json.hpp"
@@ -66,7 +67,9 @@ inline std::string BaseUrl() {
   return ROMMSYNC_PROXY_BASE_URL;
 }
 
-inline std::string ScratchDir() { return ROMMSYNC_TEST_SCRATCH; }
+/// This process's scratch directory. Per process, not per build tree, because
+/// two `ctest` invocations share one build tree (#151) -- see tests/scratch.hpp.
+inline const std::string& ScratchDir() { return scratch::Dir(); }
 
 // --- assertions ---------------------------------------------------------------
 

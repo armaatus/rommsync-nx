@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "checks.hpp"
+#include "scratch.hpp"
 #include "rommsync/log.hpp"
 
 // Aliased `rlog` and not `log`: at global scope that name is already taken by
@@ -42,7 +43,7 @@ namespace rlog = rommsync::log;
 
 namespace {
 
-std::string ScratchDir() { return ROMMSYNC_TEST_SCRATCH; }
+std::string ScratchDir() { return scratch::Dir(); }
 
 /// A directory of this scenario's own, emptied first: these tests measure file
 /// sizes, and a file a previous run left behind is a rotation that already

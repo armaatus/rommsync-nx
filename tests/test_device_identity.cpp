@@ -23,6 +23,7 @@
 #include <system_error>
 
 #include "checks.hpp"
+#include "scratch.hpp"
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/device_identity.hpp"
 #include "rommsync/sha256.hpp"
@@ -36,7 +37,7 @@ namespace {
 
 std::filesystem::path ScratchDir() {
   const std::filesystem::path dir =
-      std::filesystem::path(ROMMSYNC_TEST_SCRATCH) / "device_identity";
+      std::filesystem::path(scratch::Dir()) / "device_identity";
   std::filesystem::create_directories(dir);
   return dir;
 }
