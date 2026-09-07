@@ -41,8 +41,10 @@
 # ## What it will not do
 #
 # It does not merge -- `merge-gate` and GitHub's auto-merge do that. It does not
-# touch a worktree it did not create. And it removes one only when that
-# worktree's PR is merged and nothing is unpushed.
+# touch a worktree it did not create. And it removes one only when nothing goes
+# with it: either that worktree's PR merged and nothing is unpushed, or its issue
+# can no longer produce a merged PR at all and the worktree is clean and holds no
+# commit that is not already in origin/main.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -85,9 +87,22 @@ TIMEBOX_SECONDS="${ROMMSYNC_FLEET_TIMEBOX:-10800}"
 FOUNDATION_LABEL="${ROMMSYNC_FOUNDATION_LABEL:-foundation}"
 # An issue whose LAST step is outward, irreversible and the maintainer's --
 # tagging a v1, touching a real console. The fleet may not finish one, so it does
-# not start one, does not read an agent waiting on one as a stall, and does not
-# time-box it. See docs/WORKFLOW.md, "an issue whose last step is a person's".
+# not start one, does not read an agent waiting on one as a stall, does not
+# time-box it, and releases its worktree once there is nothing left in one (#139
+# needed a write guard.py refuses from a fleet worktree, so its agent correctly
+# produced no PR and reap_merged would have waited for one forever). See
+# docs/WORKFLOW.md, "an issue whose last step is a person's".
 HUMAN_STEP_LABEL="${ROMMSYNC_HUMAN_STEP_LABEL:-needs-human-step}"
+# unblock.yml's label, derived from the `Blocked by #N` lines below each issue's
+# marker. The fleet only ever READS it (CLAUDE.md), and it reads it for one
+# thing: a worktree open on an issue that has SINCE gone blocked will never
+# produce a merged PR, so it is holding one of three slots for nothing. #148 went
+# blocked with its worktree open and kept #119, #122 and #139 queued behind work
+# that could not start.
+BLOCKED_LABEL="${ROMMSYNC_BLOCKED_LABEL:-blocked}"
+# poll_issue answers two questions in one string; issue_state_in and
+# issue_labels_in split it here.
+ANSWER_SEP="$(printf '\t')"
 
 mkdir -p "$OWNED_DIR" "$STARTED_DIR"
 forget_poll_answers
@@ -162,6 +177,20 @@ for t in json.load(sys.stdin)["result"]["terminals"]:
 ' "$1"
 }
 
+# Interrupt the agent in one worktree, if it has one. Both callers are about to
+# take something away from it -- the time-box the rest of its hours, the release
+# its whole directory -- and an agent that is not told keeps working against a rig
+# that is going or already gone. `cmd_stop` spells this out for itself instead: it
+# reports each interrupt it managed, which needs the exit code this swallows.
+interrupt_agent_in() {
+  local handle
+  handle="$(agent_terminal_in "$1")"
+  [ -n "$handle" ] || return 0
+  orca_run_with_deadline 20 /dev/null "$ORCA_CLI" terminal send \
+    --terminal "$handle" --interrupt --json >/dev/null 2>&1
+  return 0
+}
+
 # --------------------------------------------------------------- the state ---
 own() {
   printf '%s\n' "$2" >"$OWNED_DIR/$1"; date +%s >"$STARTED_DIR/$1"
@@ -183,8 +212,22 @@ owned_path()   { cat "$OWNED_DIR/$1" 2>/dev/null; }
 clear_issue_markers() {
   rm -f "$STATE_DIR/stalled-$1" "$STATE_DIR/stall-labels-$1" \
         "$STATE_DIR/box-labels-$1" "$STATE_DIR/queue-labels-$1" \
-        "$STATE_DIR/unreachable-$1" "$STATE_DIR/human-step-$1"
+        "$STATE_DIR/unreachable-$1" "$STATE_DIR/human-step-$1" \
+        "$STATE_DIR/held-$1" "$STATE_DIR/stuck-$1" \
+        "$STATE_DIR/git-blind-$1" "$STATE_DIR/warned-$1" \
+        "$STATE_DIR/reason-blind-$1"
 }
+
+# `gaveup-` is the one per-issue marker deliberately NOT in that list, and the
+# exception is load-bearing rather than an oversight. It records that this
+# dispatcher stopped an agent at the time-box, and reap_abandoned then RELEASES
+# that worktree -- which calls disown_issue. Clearing the record there would put
+# the issue straight back at the front of a queue that has just spent three hours
+# on it, once per cycle forever. It outlives the worktree on purpose, and only
+# `fleet.sh retry N` clears it -- not a restart, because a crash and a reboot are
+# not decisions about an issue.
+gave_up_on()     { [ -e "$STATE_DIR/gaveup-$1" ]; }
+gave_up_issues() { ls "$STATE_DIR" 2>/dev/null | sed -n 's/^gaveup-//p'; }
 
 # The subset enforce_timebox owns, for its two exits.
 forget_box_markers() {
@@ -308,30 +351,48 @@ in_flight() {
 has_label() { printf '%s' "$1" | tr ',' '\n' | grep -qxF -- "$2"; }
 is_foundation() { has_label "$1" "$FOUNDATION_LABEL"; }
 
-# Is this issue's last step a person's? 0 = yes, 1 = no, 2 = could not tell.
+# Everything the watchers ask GitHub about ONE issue, in one call and one answer
+# per POLL. Prints `<state><TAB><labels>`; 0 = read it, 2 = could not tell.
 #
 # The third answer is the same one has_open_pr gives, for the same reason: the
-# callers below interrupt an agent and comment on an issue, and a label listing
-# that could not be read is no basis for either. Asked live rather than cached at
-# launch, because the label is often what a person adds AFTER seeing the card.
+# callers below interrupt an agent, comment on an issue and delete a worktree,
+# and a listing that could not be read is no basis for any of those. Asked live
+# rather than cached at launch, because a label is often what a person adds AFTER
+# seeing the card.
 #
-# One answer per issue per POLL, though. enforce_timebox and notice_stalled both
-# ask about the same issue in the same pass -- an issue stuck long enough to
-# overrun is often also the one sitting at a prompt -- and two calls for one
-# answer is the pattern count_startable exists to avoid. The cache lives for one
+# One answer per issue per POLL, though. reap_abandoned, enforce_timebox and
+# notice_stalled all ask about the same issue in the same pass -- an issue stuck
+# long enough to overrun is often also the one sitting at a prompt, and the one a
+# maintainer has just blocked -- and three calls for one answer is the pattern
+# count_startable exists to avoid. State and labels come back together for that
+# same reason: they are one `gh issue view`, not two. The cache lives for one
 # pass, so a label a person adds is still seen on the next one.
-issue_needs_human_step() {
-  local cached="$POLL_CACHE/human-step-$1" labels rc
-  [ -s "$cached" ] && return "$(cat "$cached")"
-  if labels="$(GH_PAGER=cat gh issue view "$1" --json labels \
-                 --jq '[.labels[].name]|join(",")' 2>/dev/null)"; then
-    has_label "$labels" "$HUMAN_STEP_LABEL"; rc=$?
-  else
-    rc=2
-  fi
+poll_issue() {
+  local cached="$POLL_CACHE/issue-$1" answer
   mkdir -p "$POLL_CACHE" 2>/dev/null
-  printf '%s' "$rc" >"$cached" 2>/dev/null || true
-  return "$rc"
+  [ -e "$cached.unreadable" ] && return 2
+  [ -e "$cached" ] && { cat "$cached"; return 0; }
+  if answer="$(GH_PAGER=cat gh issue view "$1" --json state,labels \
+                 --jq '.state + "\t" + ([.labels[].name]|join(","))' 2>/dev/null)"; then
+    printf '%s' "$answer" >"$cached" 2>/dev/null || true
+    printf '%s' "$answer"
+    return 0
+  fi
+  : >"$cached.unreadable" 2>/dev/null || true
+  return 2
+}
+
+# The two halves of what poll_issue prints. Split here rather than at each call
+# site so a `gh` that ever answers without the separator cannot be read as a
+# state that is also a label list: both print nothing at all instead.
+issue_state_in()  { case "$1" in *"$ANSWER_SEP"*) printf '%s' "${1%%"$ANSWER_SEP"*}" ;; esac; }
+issue_labels_in() { case "$1" in *"$ANSWER_SEP"*) printf '%s' "${1#*"$ANSWER_SEP"}" ;; esac; }
+
+# Is this issue's last step a person's? 0 = yes, 1 = no, 2 = could not tell.
+issue_needs_human_step() {
+  local answer
+  answer="$(poll_issue "$1")" || return 2
+  has_label "$(issue_labels_in "$answer")" "$HUMAN_STEP_LABEL"
 }
 
 # Landed: the issue is closed, or a PR that closes it has merged. `ready` does
@@ -364,14 +425,18 @@ for p in prs:
 # PR list. Zero also means "nothing to wait for" to the run loop, so it must not
 # silently answer zero when a lookup failed -- it returns non-zero instead.
 count_startable() {
-  local live prs ready
+  local live prs ready gaveup
   live="$(live_worktrees)" || return 1
   prs="$(GH_PAGER=cat gh pr list --state open --json body --limit 100 2>/dev/null)" || return 1
   ready="$(ready_issues)" || return 1
+  # An issue the fleet gave up on is one it will decline every pass, so counting
+  # it is the run loop polling forever for work that never starts.
+  gaveup="$(gave_up_issues)"
   printf '%s\n' "$ready" | PYTHONPATH="$ISSUE_REFS" python3 -c '
 import json, sys
 from issue_refs import closes
 running = {line.split("\t")[0] for line in sys.argv[1].splitlines() if line.strip()}
+gave_up = {n for n in sys.argv[3].split() if n}
 # One parse per BODY, not one over all of them joined: a keyword may be the last
 # word of one body and `#12` the first token of the next, and `\s+` would span
 # the join -- claiming an issue nobody is working on and hiding it from the
@@ -384,11 +449,11 @@ for line in sys.stdin:
     if not line.strip():
         continue
     issue = line.split("\t")[0]
-    if issue in running or int(issue) in claimed:
+    if issue in running or issue in gave_up or int(issue) in claimed:
         continue
     n += 1
 print(n)
-' "$live" "$prs"
+' "$live" "$prs" "$gaveup"
 }
 
 # --------------------------------------------------------------- the launch ---
@@ -530,6 +595,215 @@ reap_merged() {
   done
 }
 
+# ------------------------------------------------------ the other releases ---
+# `reap_merged` above is the only thing that ever removed a worktree, and it
+# removes one only when a PR for that branch has MERGED. Every other way an issue
+# can stop being worked left the worktree standing, owned, and counted against
+# the cap of three -- forever. Two were cleared by hand on 2026-09-07, each
+# holding four containers, two ports and four volumes: #44, which the time-box
+# stopped at three hours for correctly producing nothing, and #148, which the
+# maintainer blocked with its worktree open, keeping #119, #122 and #139 queued
+# behind work that could never start.
+#
+# The guard has to be its own, because "the issue went blocked" carries none of
+# the guarantee "the PR merged and nothing is unpushed" does: a worktree
+# abandoned mid-change may hold the only copy of real work. So this refuses
+# rather than guesses, on exactly the pair verified by hand before each of those
+# removals -- `git status --porcelain` empty AND nothing absent from origin/main.
+#
+# The pair answers "is anything here worth keeping". It does not answer "is
+# anyone using this", and every by-hand check behind it was made on a worktree
+# that was already finished -- so it was never once evaluated against a live
+# agent mid-change. CLAUDE.md is where the two come apart: an agent plans before
+# it edits, so a worktree forty minutes into real work is legitimately EMPTY. And `blocked` is not a label a person types --
+# unblock.yml re-derives it on every merge, so it can arrive under an agent that
+# is mid-plan, as `needs-human-step` can arrive from the agent's own hand.
+#
+# So the first pass that finds a reason WARNS: it interrupts the agent, says on
+# the board that the worktree goes next pass, and leaves it. The pass after that
+# re-asks the pair -- a minute is long enough to commit, or to write a plan down
+# -- and only then removes it. That is the whole guard against deleting an
+# afternoon, and it needs no lookup of agent state: an agent that has nothing on
+# disk after being told is one that had nothing to lose but a prompt.
+
+# What removing this worktree would destroy. Prints one phrase naming it, or
+# nothing at all when there is nothing. Non-zero means it could not tell, which
+# is NOT the same answer: a git that cannot speak is no basis for deleting
+# somebody's afternoon.
+#
+# origin/main is read as it stands and never fetched. A stale one only ever makes
+# commits look ABSENT that are in fact merged, so every error it can cause is in
+# the direction of KEEPING a worktree -- and a fetch per worktree per poll is a
+# network call this loop does not need.
+worktree_holdings() {
+  local path="$1" dirty ahead out parts=""
+  git -C "$path" rev-parse --verify --quiet HEAD >/dev/null 2>&1 || return 1
+  git -C "$path" rev-parse --verify --quiet origin/main >/dev/null 2>&1 || return 1
+  out="$(git -C "$path" status --porcelain 2>/dev/null)" || return 1
+  dirty="$(printf '%s' "$out" | grep -c .)"
+  out="$(git -C "$path" log --oneline origin/main..HEAD 2>/dev/null)" || return 1
+  ahead="$(printf '%s' "$out" | grep -c .)"
+  [ "${dirty:-0}" != 0 ] && parts="$dirty uncommitted change(s)"
+  if [ "${ahead:-0}" != 0 ]; then
+    [ -n "$parts" ] && parts="$parts and "
+    parts="$parts$ahead commit(s) that are not in origin/main"
+  fi
+  printf '%s' "$parts"
+}
+
+# Runs AFTER reap_merged in every pass, and the order is not decoration: a
+# worktree whose PR merged is reap_merged's, and by the time this runs it has
+# already been disowned. What is left here is what will never merge.
+reap_abandoned() {
+  local f num path answer reason holds asked
+  for f in "$OWNED_DIR"/*; do
+    [ -e "$f" ] || continue
+    num="$(basename "$f")"; path="$(cat "$f")"
+    [ -d "$path" ] || { disown_issue "$num"; continue; }
+    # Already tried once, and the removal refused. Not retried, because
+    # `orca worktree rm --run-hooks` takes the RomM stack down BEFORE the removal
+    # is known to succeed (#163) -- so a retry loop is a stack torn down once a
+    # minute under whoever is still working in there.
+    [ -e "$STATE_DIR/stuck-$num" ] && continue
+
+    reason=""; asked=1
+    if answer="$(poll_issue "$num")"; then
+      rm -f "$STATE_DIR/reason-blind-$num"
+      # "Closed", and not "closed with no merged PR": reap_merged asks that
+      # question and this one does not, so the two ways it leaves a closed issue
+      # owned -- unpushed commits, and a `gh pr list --head` that could not
+      # answer -- would make the fuller sentence a false one in the line a person
+      # reads. The release itself is unaffected: both of those leave something in
+      # the worktree, or leave everything already in origin/main.
+      if [ "$(issue_state_in "$answer")" = CLOSED ]; then
+        reason="its issue is closed"
+      elif has_label "$(issue_labels_in "$answer")" "$BLOCKED_LABEL"; then
+        reason="its issue went $BLOCKED_LABEL"
+      elif has_label "$(issue_labels_in "$answer")" "$HUMAN_STEP_LABEL"; then
+        reason="its last step is yours ($HUMAN_STEP_LABEL)"
+      fi
+    else
+      asked=0
+    fi
+    # enforce_timebox's own record, so this one still answers through a GitHub
+    # outage -- and so a lookup that failed above cannot be read as "no reason".
+    [ -n "$reason" ] || ! gave_up_on "$num" || reason="the time-box stopped its agent with no PR"
+    # No reason today, so everything a previous poll decided goes with it. The
+    # reason is re-derived from a live lookup every pass and can genuinely come
+    # and go: unblock.yml re-writes `blocked` on every merged PR, so an issue can
+    # go blocked, be warned, come off `blocked` when the dependency lands, and go
+    # blocked again on the next one. A `warned-` left standing across that is a
+    # worktree removed on the second occurrence with no notice at all -- which is
+    # the one thing the warning pass exists to prevent. `stuck-` is not in this
+    # list: it means a removal was attempted and refused, and it is checked above
+    # this point precisely so that it is never retried.
+    # A lookup that could not answer is the THIRD answer, not "no reason", and
+    # the difference is the whole discipline this function is built on --
+    # worktree_holdings failing gets `git-blind-` rather than being read as
+    # "holds nothing". Folded into the branch below, one `gh` hiccup looks
+    # exactly like the issue coming off `blocked`: the warning still owed to a
+    # reason nobody could read is discarded, the next poll starts the notice
+    # over, and under a flaky GitHub the release never arrives with nothing
+    # anywhere saying why. So every marker stays exactly where it was, and it is
+    # said once per outage rather than once per poll.
+    if [ -z "$reason" ] && [ "$asked" = 0 ]; then
+      [ -e "$STATE_DIR/reason-blind-$num" ] && continue
+      : >"$STATE_DIR/reason-blind-$num"
+      say "#$num: could not read its issue -- leaving it, and every marker on it, until GitHub answers"
+      continue
+    fi
+    if [ -z "$reason" ]; then
+      rm -f "$STATE_DIR/warned-$num" "$STATE_DIR/held-$num" "$STATE_DIR/git-blind-$num"
+      continue
+    fi
+
+    # Two keeps, two markers, and each clears the other. One marker for both
+    # would mean whichever fired first silenced the other for good: a transient
+    # git failure on one poll, then three uncommitted files on the next, and the
+    # board still saying git could not be read -- the opposite of the promise
+    # that it says WHAT is in there.
+    #
+    # Either way it is said once per worktree, not once per poll: the dispatcher
+    # polls every minute, and a worktree it decided to keep is one it will decide
+    # to keep again in sixty seconds. `warned-` goes too, so a worktree that
+    # becomes empty again is offered the same pass of notice as any other.
+    if ! holds="$(worktree_holdings "$path")"; then
+      rm -f "$STATE_DIR/held-$num" "$STATE_DIR/warned-$num"
+      [ -e "$STATE_DIR/git-blind-$num" ] && continue
+      : >"$STATE_DIR/git-blind-$num"
+      say "#$num: $reason, but its git state could not be read -- leaving it"
+      card "$path" --comment "#$num: $reason; kept -- git could not say what is in it"
+      continue
+    fi
+    if [ -n "$holds" ]; then
+      # It says WHAT is in there, the way reap_merged already reports unpushed
+      # commits rather than removing them.
+      rm -f "$STATE_DIR/git-blind-$num" "$STATE_DIR/warned-$num"
+      [ -e "$STATE_DIR/held-$num" ] && continue
+      : >"$STATE_DIR/held-$num"
+      say "#$num: $reason, but the worktree holds $holds -- leaving it"
+      card "$path" --comment "#$num: $reason; kept -- it holds $holds"
+      continue
+    fi
+    rm -f "$STATE_DIR/held-$num" "$STATE_DIR/git-blind-$num"
+
+    # The warning pass. One poll of notice, then the pair is asked again above --
+    # so an agent that commits, or writes its plan to a file, keeps its worktree.
+    if [ ! -e "$STATE_DIR/warned-$num" ]; then
+      : >"$STATE_DIR/warned-$num"
+      say "#$num: $reason, and the worktree holds nothing -- releasing it next pass unless something lands in it"
+      # ...unless the time-box, earlier in this same pass, already interrupted it
+      # and said so on the board. Scoped to the poll: this is about not saying one
+      # thing twice in one minute, not about never saying it again.
+      if [ ! -e "$POLL_CACHE/interrupted-$num" ]; then
+        interrupt_agent_in "$path"
+        card "$path" --comment "#$num: $reason; this worktree is released next pass unless something lands in it"
+      fi
+      continue
+    fi
+
+    say "#$num: $reason, and the worktree still holds nothing -- releasing the slot"
+    # Interrupted again before the removal: `--run-hooks` archives this worktree's
+    # RomM stack, and an agent that ignored the warning would lose its rig
+    # mid-suite and then keep writing into a directory being deleted (#163).
+    interrupt_agent_in "$path"
+    # The comment and no status. `completed` is reap_merged's word for work that
+    # landed, and this worktree is being released precisely because it did not.
+    # Phrased as what it is about to do, not as done: if the removal refuses, this
+    # card is still on the board and still the line a person reads.
+    card "$path" --comment "#$num: $reason; nothing is in it, removing the worktree"
+    if remove_worktree "$path"; then
+      disown_issue "$num"
+    else
+      # NOT disowned. reap_merged iterates OWNED issues only, so an issue dropped
+      # on a failed removal is a worktree nothing ever looks at again -- #122's
+      # stood from 16:49 until it was removed by hand. Kept owned and not retried,
+      # so it is a slot this dispatcher will go on counting until a person takes
+      # it -- which is why both lines below say so.
+      : >"$STATE_DIR/stuck-$num"
+      say "  could not remove it; it keeps its slot until you do: git worktree remove --force '$path'"
+      card "$path" --comment "#$num: the removal refused -- still here, still counted; git worktree remove --force '$path'"
+    fi
+  done
+}
+
+# A give-up record for an issue that has since landed is a line in `fleet.sh
+# status` about work that is done, and a file that never goes away -- the same
+# leak `stalled-` had before own() started clearing it. The release path disowns
+# the issue, so nothing else will ever look at it again; this is what does.
+#
+# One `gh issue view` per record per poll, shared with the watchers through
+# $POLL_CACHE, and self-limiting: the records it can find are the ones it removes.
+prune_gaveup() {
+  local n answer
+  for n in $(gave_up_issues); do
+    answer="$(poll_issue "$n")" || continue
+    [ "$(issue_state_in "$answer")" = CLOSED ] || continue
+    rm -f "$STATE_DIR/gaveup-$n"
+    say "#$n: closed since the fleet gave up on it -- dropping the record"
+  done
+}
+
 # ---------------------------------------------------------- stalled agents ---
 # An agent sitting at a confirmation prompt is not working, and nothing said so.
 # #23 stopped inside two minutes on a `git submodule add` the auto-mode
@@ -610,12 +884,22 @@ except Exception:
 }
 
 # ------------------------------------------------------------- the time-box ---
-# An agent that cannot get green will grind. On expiry it is interrupted, the
-# issue gets a comment saying so, and the worktree is LEFT STANDING: a stuck task
-# is exactly the one worth looking at, and its fixture and build state are the
-# evidence. It keeps its slot, and the notification is how you find out.
+# An agent that cannot get green will grind. On expiry it is interrupted and the
+# issue gets a comment saying so.
+#
+# What becomes of the worktree is reap_abandoned's call on the next pass, and it
+# turns on what is IN it. One holding uncommitted work, or commits that are not
+# on main, is left standing: a stuck task is exactly the one worth looking at and
+# its diff is the evidence. One holding nothing is released, because there is
+# nothing to look at and a slot is one of three -- #44 ground for three hours,
+# produced nothing hard rule 1 allows, and then held its slot until it was
+# removed by hand.
+#
+# Either way the fleet does not start that issue again: `gaveup-` outlives the
+# worktree deliberately, since releasing the slot would otherwise hand it straight
+# back to the same three hours. `fleet.sh retry N` is how it comes back.
 enforce_timebox() {
-  local f num path started now agent
+  local f num path started now
   now="$(date +%s)"
   for f in "$STARTED_DIR"/*; do
     [ -e "$f" ] || continue
@@ -680,13 +964,19 @@ enforce_timebox() {
     # the same issue to inherit and be silenced by.
     forget_box_markers "$num"
 
-    say "#$num: $((TIMEBOX_SECONDS / 3600))h with no PR -- stopping it and leaving the worktree for you"
-    agent="$(agent_terminal_in "$path")"
-    [ -n "$agent" ] && orca_run_with_deadline 20 /dev/null "$ORCA_CLI" terminal send \
-      --terminal "$agent" --interrupt --json >/dev/null 2>&1
+    say "#$num: $((TIMEBOX_SECONDS / 3600))h with no PR -- stopping it; the worktree goes if it holds nothing"
+    interrupt_agent_in "$path"
+    # For reap_abandoned, which runs later in THIS pass and would otherwise
+    # interrupt the same agent and card the same worktree a second time. Scoped
+    # to the poll, like `carded-`: it still gets its own warning next pass.
+    : >"$POLL_CACHE/interrupted-$num"
     card "$path" --comment "#$num: timed out after $((TIMEBOX_SECONDS / 3600))h -- needs you"
-    GH_PAGER=cat gh issue comment "$num" --body "The fleet stopped work on this after $((TIMEBOX_SECONDS / 3600)) hours with no pull request opened. Its worktree is left standing at \`$path\` so the build state and the RomM fixture are still there to look at." >/dev/null 2>&1 || true
-    notify "#$num gave up" "$((TIMEBOX_SECONDS / 3600))h with no PR. Worktree left standing."
+    GH_PAGER=cat gh issue comment "$num" --body "The fleet stopped work on this after $((TIMEBOX_SECONDS / 3600)) hours with no pull request opened. Its worktree at \`$path\` is kept if it holds uncommitted work or commits that are not on \`main\`, and released otherwise so the slot is free. The fleet will not start this issue again on its own; \`./scripts/orca/fleet.sh retry $num\` hands it back." >/dev/null 2>&1 || true
+    notify "#$num gave up" "$((TIMEBOX_SECONDS / 3600))h with no PR. Not starting it again."
+    # Read by reap_abandoned on the next pass, and by the queue for as long as it
+    # stands. Outlives the worktree on purpose -- see clear_issue_markers, which
+    # deliberately does not clear it, and cmd_retry, which does.
+    : >"$STATE_DIR/gaveup-$num"
     rm -f "$f"
   done
 }
@@ -712,8 +1002,18 @@ cmd_status() {
   printf '  %-6s %-9s %s\n' "issue" "unblocks" "title"
   ready_issues | while IFS="$(printf '\t')" read -r num unblocks labels title; do
     in_flight "$num" && continue
+    gave_up_on "$num" && continue
     printf '  #%-5s %-9s %s\n' "$num" "$unblocks" "$title"
   done | head -12
+
+  # ...and where the ones missing from that list went, since a `ready` issue the
+  # dispatcher silently declines forever is the confusing half of this.
+  local gaveup; gaveup="$(gave_up_issues)"
+  if [ -n "$gaveup" ]; then
+    echo
+    echo "gave up on (hand one back with: ./scripts/orca/fleet.sh retry N):"
+    printf '%s\n' "$gaveup" | while read -r num; do printf '  #%s\n' "$num"; done
+  fi
 }
 
 cmd_stop() {
@@ -776,6 +1076,27 @@ cmd_resume() {
   echo "stop cleared. Start again with: ./scripts/orca/fleet.sh run --auto"
 }
 
+# The counterpart to the time-box, and the ONLY way back onto the queue. By name
+# and on purpose: the box fired because three hours produced no PR, and an issue
+# handed back unchanged spends the next three the same way. Restarting the
+# dispatcher deliberately does not clear these -- a crash and a reboot are not
+# decisions about an issue.
+cmd_retry() {
+  [ "$#" -gt 0 ] || die "usage: fleet.sh retry ISSUE [ISSUE...]"
+  local n
+  for n in "$@"; do
+    case "$n" in ''|*[!0-9]*) die "not an issue number: $n" ;; esac
+  done
+  for n in "$@"; do
+    if [ -e "$STATE_DIR/gaveup-$n" ]; then
+      rm -f "$STATE_DIR/gaveup-$n"
+      echo "#$n is startable again."
+    else
+      echo "#$n was not one this dispatcher gave up on; nothing to clear."
+    fi
+  done
+}
+
 # Accepts 08:00 (the next such time), 6h, 90m, or an epoch.
 deadline_from() {
   python3 -c '
@@ -819,6 +1140,9 @@ cmd_run() {
 
   local opened=0 reason="the queue is empty"
   local draining=false
+  # An issue dropped from `wanted` did not land, and saying it did is a lie the
+  # run's last line would tell every time the fleet declines one.
+  local declined=false
   while true; do
     # A stop means "launch nothing more", not "abandon what is running". The
     # dispatcher is what reaps a worktree once its PR merges, so killing it here
@@ -835,13 +1159,20 @@ cmd_run() {
     fi
 
     forget_poll_answers
+    # The order is load-bearing in three places. reap_merged first, because a
+    # worktree whose PR merged is its business and reap_abandoned only ever looks
+    # at what is left owned. enforce_timebox before notice_stalled, because the
+    # first writes `$POLL_CACHE/carded-` and the second reads it to avoid
+    # repeating a board comment it has already made. And reap_abandoned LAST of
+    # the four: it is the one that removes a worktree, and running it earlier
+    # took the "waiting for you, as expected" notification away from the very
+    # worktrees it exists to release -- the watchers would have found nothing
+    # there to speak about.
     reap_merged
-    # enforce_timebox BEFORE notice_stalled: the first writes
-    # `$POLL_CACHE/carded-`, the second reads it to avoid repeating a board
-    # comment it has already made. Swapping these two lines silently restores
-    # the duplicate.
     enforce_timebox
     notice_stalled
+    reap_abandoned
+    prune_gaveup
 
     local live
     if ! live="$(live_count)"; then
@@ -868,6 +1199,14 @@ cmd_run() {
             say "#$n has landed"
             continue
           fi
+          # DROPPED, not skipped, for the same reason the label decline below
+          # drops one: an issue kept in `wanted` that can never be launched is a
+          # run loop that never ends.
+          if gave_up_on "$n"; then
+            say "#$n: the fleet gave up on it -- hand it back with: fleet.sh retry $n"
+            declined=true
+            continue
+          fi
           in_flight "$n"; rc=$?
           if [ -z "$picked" ] && [ "$rc" = 1 ]; then
             # Asked only of the one issue this pass would actually launch, not
@@ -881,7 +1220,7 @@ cmd_run() {
             # expensive direction and the next pass asks again.
             issue_needs_human_step "$n"; case $? in
               0) say "#$n is labelled $HUMAN_STEP_LABEL -- it is yours to take; remove the label to hand it to an agent"
-                 rm -f "$STATE_DIR/queue-labels-$n"; continue ;;
+                 rm -f "$STATE_DIR/queue-labels-$n"; declined=true; continue ;;
               2) if [ ! -e "$STATE_DIR/queue-labels-$n" ]; then
                    : >"$STATE_DIR/queue-labels-$n"
                    say "#$n: could not read its labels -- not starting it this pass"
@@ -901,6 +1240,9 @@ cmd_run() {
         $auto || break
         while IFS="$(printf '\t')" read -r n _unblocks l t; do
           in_flight "$n"; [ "$?" = 1 ] || continue
+          # Said once, when the box fired -- not once per poll for the rest of
+          # the run.
+          gave_up_on "$n" && continue
           # A foundation issue defines an interface later issues include, so it
           # lands alone: three worktrees each inventing their own version of a
           # shared header is the one merge conflict worth serialising to avoid.
@@ -945,8 +1287,12 @@ cmd_run() {
     if [ "$queued" -eq 0 ] && [ "${owned:-0}" -eq 0 ]; then
       if $draining; then
         reason="${reason:-you stopped it}; everything in flight has landed"
+      elif $auto && $declined; then
+        reason="the backlog has nothing startable left, and what it was given was declined"
       elif $auto; then
         reason="the backlog has nothing startable left"
+      elif $declined; then
+        reason="every issue it was given has landed or was declined"
       else
         reason="every issue it was given has landed"
       fi
@@ -968,6 +1314,7 @@ case "${1:-}" in
   status) cmd_status ;;
   stop)   shift; cmd_stop "${1:-}" ;;
   resume) cmd_resume ;;
+  retry)  shift; cmd_retry "$@" ;;
   *)
     cat >&2 <<USAGE
 usage: fleet.sh <command>
@@ -979,6 +1326,7 @@ usage: fleet.sh <command>
   status                             what is running, and what is next
   stop [--now]                       drain (or interrupt the agents too)
   resume                             clear the stop
+  retry 44                           hand back an issue the time-box gave up on
 
 Run it in an Orca terminal so it is as visible as the work it starts:
   orca terminal create --worktree active --title fleet --command "./scripts/orca/fleet.sh run --auto"

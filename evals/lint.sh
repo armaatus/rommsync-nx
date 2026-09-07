@@ -282,48 +282,73 @@ done
 ok "the brief still names the review loop"
 
 echo "== every test phase actually runs"
-# A phase defined in test_orca_browser.sh and missing from the foreach() list in
-# tests/CMakeLists.txt never runs -- not in ctest, not in CI -- and is
-# indistinguishable from a phase that passes. It happened: the assertions for a
-# whole behaviour shipped green by never being executed. The script and the list
-# are two files, so only something reading both can say they agree.
+# A phase defined in one of the phase-dispatching test scripts and missing from
+# its foreach() list in tests/CMakeLists.txt never runs -- not in ctest, not in
+# CI -- and is indistinguishable from a phase that passes. It happened: the
+# assertions for a whole behaviour shipped green by never being executed. The
+# script and the list are two files, so only something reading both can say they
+# agree.
+#
+# Every such script, not one named here: this check used to cover
+# test_orca_browser.sh alone, and the file that then grew ten phases in one
+# change was test_orca_fleet.sh. The pairing comes out of the CMake itself --
+# each `foreach(phase ...)` names a `*_TEST` variable, and each of those is
+# `set()` to a script -- so a new phase-dispatching suite is covered the day it
+# is registered, with nothing here to remember to update.
 if python3 - <<'PHASES'
 import re, sys
 
-# Heredoc bodies are dropped first. The phases write stub `orca` and `gh`
-# scripts, and those carry their own two-space `case` arms -- `worktree)`,
-# `terminal)` -- which are shell being generated, not phases of this file.
-lines, kept, delim = open("tests/test_orca_browser.sh").read().splitlines(), [], None
-for line in lines:
-    if delim is not None:
-        if line.strip() == delim:
-            delim = None
-        continue
-    here = re.search(r"<<-?\s*[\'\"]?([A-Za-z_][A-Za-z0-9_]*)[\'\"]?\s*$", line)
-    if here:
-        delim = here.group(1)
-    kept.append(line)
-body = "\n".join(kept).split('case "${1:-}" in', 1)[1]
-# What is left: the phase labels are the only ones at exactly two spaces, and
-# `*)` is the usage fallback.
-defined = set(re.findall(r"^  ([a-z0-9_]+)\)$", body, re.M))
-
 cml = open("tests/CMakeLists.txt").read()
-listed = set(re.search(r"foreach\(phase\b(.*?)\)", cml, re.S).group(1).split())
+scripts = dict(re.findall(r'set\((\w+_TEST)\s+"[^"]*/([\w.]+)"\)', cml))
 
-bad = False
-for name in sorted(defined - listed):
-    print(f"{name}: defined in test_orca_browser.sh, never registered in tests/CMakeLists.txt")
-    bad = True
-for name in sorted(listed - defined):
-    print(f"{name}: registered in tests/CMakeLists.txt, but the script has no such phase")
-    bad = True
-sys.exit(1 if bad else 0)
+def phases_in(path):
+    # Heredoc bodies are dropped first. The phases write stub `orca` and `gh`
+    # scripts, and those carry their own two-space `case` arms -- `worktree)`,
+    # `terminal)` -- which are shell being generated, not phases of this file.
+    kept, delim = [], None
+    for line in open(path).read().splitlines():
+        if delim is not None:
+            if line.strip() == delim:
+                delim = None
+            continue
+        here = re.search(r"<<-?\s*[\'\"]?([A-Za-z_][A-Za-z0-9_]*)[\'\"]?\s*$", line)
+        if here:
+            delim = here.group(1)
+        kept.append(line)
+    body = "\n".join(kept).split('case "${1:-}" in', 1)[1]
+    # What is left: the phase labels are the only ones at exactly two spaces, and
+    # `*)` is the usage fallback.
+    return set(re.findall(r"^  ([a-z0-9_]+)\)$", body, re.M))
+
+bad = covered = 0
+for names, body in re.findall(r"foreach\(phase\b(.*?)\)(.*?)endforeach\(\)", cml, re.S):
+    used = set(re.findall(r"\$\{(\w+_TEST)\}", body))
+    if len(used) != 1:
+        print(f"a foreach(phase ...) block names {len(used)} test scripts; this check cannot pair it")
+        bad = 1
+        continue
+    script = scripts.get(used.pop())
+    if script is None:
+        print("a foreach(phase ...) block runs a test variable that is never set()")
+        bad = 1
+        continue
+    listed, defined = set(names.split()), phases_in(f"tests/{script}")
+    for name in sorted(defined - listed):
+        print(f"{name}: defined in {script}, never registered in tests/CMakeLists.txt")
+        bad = 1
+    for name in sorted(listed - defined):
+        print(f"{name}: registered in tests/CMakeLists.txt, but {script} has no such phase")
+        bad = 1
+    covered += 1
+if covered == 0:
+    print("no foreach(phase ...) block was paired with a script; this check now asserts nothing")
+    bad = 1
+sys.exit(bad)
 PHASES
 then
-  ok "every test_orca_browser.sh phase is registered, and every registration exists"
+  ok "every phase-dispatching suite agrees with tests/CMakeLists.txt"
 else
-  fail "test_orca_browser.sh and tests/CMakeLists.txt disagree about which phases exist; the ones above never run"
+  fail "a phase test script and tests/CMakeLists.txt disagree about which phases exist; the ones above never run"
 fi
 
 echo "== the workflows parse as GitHub reads them"
