@@ -104,6 +104,59 @@ Three things read it, so it holds even when nothing cooperates:
 
 Nothing removes that file except `fleet.sh resume`.
 
+## Restart it
+
+`fleet.sh run` is a long-lived bash process. It parses its functions **once**, at
+start, and never re-reads the file. So a fix merged to `main` is live in your
+worktree and *not* live in the dispatcher that is running — and it fails in
+halves, which is what makes it confusing: anything the poll re-derives through
+`gh` (the queue filter, the labels) keeps working, while everything living in an
+already-parsed shell function does not. On 2026-09-07 a dispatcher ran for 27
+hours across four merged PRs that changed `fleet.sh`, none of them running
+(#173).
+
+`fleet.sh status` now says so. It records what it parsed at start, and reports
+the difference:
+
+```
+running   (pid 59280)
+  up since 2026-09-06 16:57:58, running fleet.sh @ 6d610ca
+
+  STALE -- scripts/orca/fleet.sh has changed since it started, and it parses
+  the file once. These are NOT live in the dispatcher that is running:
+    3994f12 harness.partial's flake is RomM retiring a gunicorn worker
+    7bdb8ec A worktree whose issue can no longer merge is released
+```
+
+To make a change live:
+
+```bash
+./scripts/orca/stop.sh          # drain: running agents finish, the dispatcher
+                                # stays up to reap their worktrees, then exits
+./scripts/orca/fleet.sh status  # until it says `idle`
+./scripts/orca/fleet.sh resume  # clear the stop
+./scripts/orca/fleet.sh run --auto
+```
+
+A drain is the polite version and it can take hours — the dispatcher is what
+reaps a worktree once its PR merges, so killing it strands the stacks under
+`restart: unless-stopped`. `./scripts/orca/stop.sh --now` interrupts the fleet's
+agents and stops the dispatcher immediately; anything it had not reaped is then
+yours, with `./scripts/orca/reap.sh --yes`.
+
+**The settings work the same way.** `ROMMSYNC_FLEET_MAX` (how many worktrees run
+at once, default 3), `ROMMSYNC_FLEET_POLL` and `ROMMSYNC_FLEET_TIMEBOX` are read
+once at start, so putting one in front of `fleet.sh status` changes nothing. The
+cap changes across a restart and only there:
+
+```bash
+ROMMSYNC_FLEET_MAX=2 ./scripts/orca/fleet.sh run --auto
+```
+
+Restarting deliberately does *not* clear what the dispatcher gave up on — a
+crash and a reboot are not decisions about an issue. `fleet.sh retry N` is
+still the only way one comes back onto the queue.
+
 ---
 
 ## The loop
