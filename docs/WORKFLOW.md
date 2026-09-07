@@ -69,7 +69,10 @@ after `--max-prs`, and says which.
 
 `ready` on its own is not enough, incidentally: the label stays until the PR
 merges, so `fleet.sh` also excludes any issue that already has an open PR
-carrying `Closes #N`.
+closing it. It reads that line the way GitHub does — any of the nine closing
+keywords, in any case — from
+[`.github/scripts/issue_refs.py`](../.github/scripts/issue_refs.py), which is
+also where the `Blocked by #N` pattern lives, spelled to match `unblock.yml`.
 
 **What it will not do:** it does not merge, and it never touches a worktree it did
 not create.
@@ -302,14 +305,18 @@ merge — it asks GitHub to merge once the required checks pass. Then it stops.
 ### The merge gate
 
 [`merge_gate.py`](../.github/scripts/merge_gate.py) is the required check
-`--auto` waits on. It passes only when all five hold:
+`--auto` waits on. It passes only when all six hold:
 
 1. the PR body shows a local `/code-review` pass;
 2. …and a local `/mattpocock-skills:code-review` pass;
 3. an independent review exists on the **current head SHA** — pushing a fix
    invalidates it, so a re-review is required;
 4. the **latest** review from each author is not `CHANGES_REQUESTED`;
-5. no review thread is unresolved.
+5. no review thread is unresolved;
+6. the body says which issue it closes. Any keyword GitHub acts on counts, so
+   `Fixes #12` is as good as `Closes #12` — but a body with none merges without
+   closing anything, `unblock.yml` relabels nothing, and the fleet then reports
+   "nothing startable" with the work available.
 
 Point 4 is the whole trick. GitHub's `reviewDecision` is sticky: once a reviewer
 requests changes it stays `CHANGES_REQUESTED` until dismissed or until that
@@ -487,6 +494,6 @@ does. Sweep anything left behind with `./scripts/orca/reap.sh --yes`.
 | `await-review.sh` times out | the review job never ran. Any other reason the wait had — records the gate discounts, a review already handed back, an unpushed worktree — it printed the moment it found it | `gh run list`; check `CLAUDE_CODE_OAUTH_TOKEN` is a repo secret |
 | `await-review.sh` exits 2, naming `merge_gate.py` | that file is what decides which reviews count, and it does not import | fix the syntax or the missing name; nothing in the loop can answer until it does |
 | `await-review.sh` exits 8, "GitHub says DIRTY" | something merged underneath the branch | rebase, re-run `record-review.sh`, `git push --force-with-lease` |
-| `merge-gate` red on a PR that looks fine | usually the body is missing a review section, or the review predates the last push | read the check's output; it says which of the five |
+| `merge-gate` red on a PR that looks fine | usually the body is missing a review section, or the review predates the last push | read the check's output; it says which of the six |
 | A PR sits queued and never merges | a required check never reported | `gh pr checks <n>` |
 | `ctest` reports `rig.smoke` **Skipped** | RomM is not running for this worktree | `./scripts/orca/compose.sh up -d` |

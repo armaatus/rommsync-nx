@@ -133,11 +133,9 @@ def evaluate(head_sha, pull_request, changed_files):
     # counts, because any of them is what GitHub itself acts on.
     if not closes(body):
         problems.append(
-            "the PR body names no issue it closes. Add a closing line -- "
-            + "/".join(k.capitalize() for k in ("closes", "fixes", "resolves"))
-            + " #N -- so merging it unblocks whatever was waiting on that issue. "
-            "GitHub accepts any of " + ", ".join(CLOSING_KEYWORDS) + ", in any "
-            "case."
+            "the PR body names no issue it closes. Add `Closes #N` -- so "
+            "merging it unblocks whatever was waiting on that issue. GitHub "
+            "accepts any of " + ", ".join(CLOSING_KEYWORDS) + ", in any case."
         )
 
     # Who counts, and what counts as a review -- both from the functions above,

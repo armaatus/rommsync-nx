@@ -150,8 +150,8 @@ and say so in the PR body. Never edit them as a side effect of rewording a body.
    Important rather than a Nit, and what not to report at all.
 3. Any issue your findings invalidated is edited, and the PR body says which and
    why.
-4. Open a PR with `Closes #N` for your issue — any keyword GitHub closes on
-   works, `merge-gate` requires one, and a workflow reads it to unblock.
+4. Open a PR with `Closes #N` for your issue. `merge-gate` requires a closing
+   line and a workflow reads it to unblock dependants, so it is not optional.
 5. `gh pr merge --auto --squash` — that asks GitHub to merge once the required
    checks pass, and `merge-gate` is one of them, so the rules decide. Never merge
    directly. A PR touching `.claude/`, `.github/workflows/` or `.github/scripts/`

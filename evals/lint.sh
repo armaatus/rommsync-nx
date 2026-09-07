@@ -401,14 +401,29 @@ sys.exit(0 if m.BLOCKED_BY.pattern == r"blocked\s+by\s+#(\d+)" else 1)
 ' || fail "issue_refs.BLOCKED_BY no longer spells unblock.yml's pattern character for character"
 ok "the fleet and unblock.yml read the same blockers"
 
-# ...and the fleet reads the shared module rather than a pattern of its own. A
-# hand-rolled `Closes #` here is exactly the drift this file exists to catch.
-grep -q 'issue_refs' scripts/orca/fleet.sh \
-  || fail "fleet.sh no longer imports issue_refs; its parsers can drift from GitHub's again"
-if grep -nE 'r"(Closes|Blocked by) #' scripts/orca/fleet.sh; then
-  fail "fleet.sh has grown its own closing/blocker pattern again; there is one, in .github/scripts/issue_refs.py"
-fi
-ok "fleet.sh reads the shared patterns, not its own"
+# ...and EVERY function in the fleet that reads one of the two conventions gets
+# it from the module. A `grep -q issue_refs` over the whole file would be
+# satisfied by one surviving import while the other three regrew patterns of
+# their own, which is precisely the drift this section exists to catch -- so
+# each function is checked on its own, by name.
+fleet_reads_shared=1
+for fn in ready_issues has_open_pr issue_is_done count_startable; do
+  body="$(sed -n "/^$fn()/,/^}/p" scripts/orca/fleet.sh)"
+  [ -n "$body" ] \
+    || { fail "scripts/orca/fleet.sh has no $fn(); this check no longer covers what it names"
+         fleet_reads_shared=0; continue; }
+  grep -q 'from issue_refs import' <<<"$body" \
+    || { fail "fleet.sh's $fn() no longer imports issue_refs; it can drift from GitHub and unblock.yml again"
+         fleet_reads_shared=0; }
+  # Any regex of its own over either convention, in any spelling and either
+  # language -- not just the two capitalisations it used to carry.
+  if grep -inE '(close[sd]?|fix(e[sd])?|resolve[sd]?|blocked[^"]*by)[^"]*#' <<<"$body" \
+     | grep -vi '^ *[0-9]*: *#' | grep -q .; then
+    fail "fleet.sh's $fn() spells out a closing or blocker reference again; there is one place for those, .github/scripts/issue_refs.py"
+    fleet_reads_shared=0
+  fi
+done
+[ "$fleet_reads_shared" = 1 ] && ok "every fleet function reading a body reads the shared patterns"
 
 echo "== the merge gate"
 # The one required check `gh pr merge --auto` waits on. Its decision lives in a
@@ -429,9 +444,14 @@ grep -q 'merge_gate.py' .github/workflows/merge-gate.yml \
 if ! grep -q 'sparse-checkout: .github/scripts' .github/workflows/merge-gate.yml; then
   fail "merge-gate.yml no longer sparse-checks-out .github/scripts; the paths merge_gate.py imports from are no longer the ones it gets"
 fi
-( cd .github/scripts && python3 -c 'import merge_gate' ) \
-  || fail "merge_gate.py does not import with only .github/scripts on disk, which is all the gate job checks out"
-ok "the gate still imports from the only directory it is given"
+sparse_tmp="$(mktemp -d)"
+cp -R .github/scripts "$sparse_tmp/scripts"
+if ( cd "$sparse_tmp/scripts" && python3 -c 'import merge_gate' ) 2>"$sparse_tmp/err"; then
+  ok "the gate still imports from the only directory it is given"
+else
+  fail "merge_gate.py does not import with only .github/scripts on disk, which is all the gate job checks out: $(tr '\n' ' ' <"$sparse_tmp/err")"
+fi
+rm -rf "$sparse_tmp"
 
 echo "== orca.yaml"
 if [ ! -f orca.yaml ]; then

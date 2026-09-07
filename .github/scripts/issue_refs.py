@@ -72,8 +72,19 @@ def closes(body):
 
 
 def closes_issue(body, number):
-    """Does `body` carry a closing line for this one issue?"""
-    return int(number) in closes(body)
+    """Does `body` carry a closing line for this one issue?
+
+    `number` arrives from the shell -- a directory name under the fleet's
+    owned-worktree registry, or an argument off the command line -- so it is a
+    string, and not necessarily a number. Anything that is not an issue number
+    is closed by nothing, which is the honest answer and a quieter one than a
+    traceback out of a `python3 -c` inside a pipeline.
+    """
+    try:
+        number = int(number)
+    except (TypeError, ValueError):
+        return False
+    return number in closes(body)
 
 
 def blocked_by(body):
@@ -133,6 +144,10 @@ def selftest():
             print(f"  ok: {shown}")
     if not closes_issue("Fixes #12", 12) or closes_issue("Fixes #120", 12):
         print("FAIL: closes_issue does not agree with closes()", file=sys.stderr)
+        failures += 1
+    if not closes_issue("Fixes #12", "12") or closes_issue("Fixes #12", ".DS_Store"):
+        print("FAIL: closes_issue does not take an issue number off the shell",
+              file=sys.stderr)
         failures += 1
     if failures:
         print(f"{failures} issue-reference assertion(s) failed", file=sys.stderr)

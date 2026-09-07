@@ -94,9 +94,10 @@ that you did it.
 
 The body must carry `## Plan`, BOTH sets of findings
 and what you did about them, any issue you edited and why, and `Closes #__ISSUE__`.
-The `merge-gate` check reads that body: it looks for the words `/code-review` and
-`mattpocock-skills:code-review`, and without them the PR cannot merge. Then tell
-the Orca board where the work is:
+The `merge-gate` check reads that body: it looks for the words `/code-review`,
+`mattpocock-skills:code-review` and a closing line, and without any one of them
+the PR cannot merge. The closing line is the one the PR template leaves as a
+placeholder -- fill it in. Then tell the Orca board where the work is:
 
     orca worktree set --worktree active --workspace-status in-review \
       --comment "#__ISSUE__: PR #<n>, waiting on review"

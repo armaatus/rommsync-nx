@@ -288,23 +288,19 @@ make_fleet_parse_fixture() {
   FLEET_OPEN_PRS="$TMPDIR_FIXTURE/open-prs.json"
   FLEET_MERGED_PRS="$TMPDIR_FIXTURE/merged-prs.json"
   FLEET_ISSUE_STATE=OPEN
+  FLEET_GH_FAIL=""
   FLEET_LIVE=""
   printf '[]\n' >"$FLEET_ISSUES"
   printf '[]\n' >"$FLEET_OPEN_PRS"
   printf '[]\n' >"$FLEET_MERGED_PRS"
   cat >"$TMPDIR_FIXTURE/stub-bin/gh" <<'GHSTUB'
 #!/usr/bin/env bash
-# The four reads fleet.sh makes of GitHub, and nothing else. The `--jq` form is
-# matched first: count_startable asks for the same open PRs already flattened to
-# bodies, and the plain pattern would swallow it.
+# The four reads fleet.sh makes of GitHub, and nothing else.
+[ -n "${FLEET_GH_FAIL:-}" ] && exit 1
 case "$*" in
   *"issue list"*)               cat "$FLEET_ISSUES" ;;
   *"issue view"*)               printf '%s\n' "${FLEET_ISSUE_STATE:-OPEN}" ;;
   *"pr list"*"--state merged"*) cat "$FLEET_MERGED_PRS" ;;
-  *"pr list"*"--jq"*)
-    python3 -c 'import json, sys
-for p in json.load(open(sys.argv[1])):
-    print(p.get("body") or "")' "$FLEET_OPEN_PRS" ;;
   *"pr list"*)                  cat "$FLEET_OPEN_PRS" ;;
   *)                            printf '[]\n' ;;
 esac
@@ -319,19 +315,23 @@ GHSTUB
 run_fleet_fn() {
   local fn="$1"; shift
   local src
-  src="$(sed -n '/^has_open_pr()/,/^}/p; /^ready_issues()/,/^}/p;
-                 /^issue_is_done()/,/^}/p; /^count_startable()/,/^}/p' \
+  # The `ISSUE_REFS=` line comes out of fleet.sh too, rather than being written
+  # here: it is how the snippets find issue_refs at all, and a wrong path in it
+  # would otherwise stay green through every phase below.
+  src="$(sed -n '/^ISSUE_REFS=/p; /^has_open_pr()/,/^}/p; /^in_flight()/,/^}/p;
+                 /^ready_issues()/,/^}/p; /^issue_is_done()/,/^}/p;
+                 /^count_startable()/,/^}/p' \
          "$TMPDIR_FIXTURE/scripts/orca/fleet.sh")"
   ( cd "$TMPDIR_FIXTURE" || exit 99
     export PATH="$TMPDIR_FIXTURE/stub-bin:$PATH"
     export FLEET_ISSUES FLEET_OPEN_PRS FLEET_MERGED_PRS FLEET_ISSUE_STATE
+    export FLEET_GH_FAIL
     REPO_ROOT="$TMPDIR_FIXTURE"
-    ISSUE_REFS="$REPO_ROOT/.github/scripts"
     # count_startable reads the live worktree list from Orca, which is not what
     # these assert; $FLEET_LIVE stands in for it.
     live_worktrees() { printf '%s' "$FLEET_LIVE"; }
     eval "$src"
-    "$fn" ${1+"$@"} )
+    "$fn" "$@" )
 }
 
 case "${1:-}" in
@@ -1872,6 +1872,21 @@ PY
     n="$(run_fleet_fn count_startable)"
     [ "$n" = "1" ] \
       || fail "counted $n startable; #7 has an open PR saying Fixes, so only #6 is"
+
+    # ...and each body is read on its own. Flattened into one string, a body
+    # ending in the word "fixes" ahead of one opening `#6` matches across the
+    # join -- the count then hides an issue nobody is working on, and the
+    # dispatcher waits for a slot that is already free.
+    python3 - "$FLEET_OPEN_PRS" <<'PRS'
+import json, sys
+json.dump([
+    {"number": 302, "body": "nothing here closes anything, but it ends in fixes"},
+    {"number": 303, "body": "#6 is mentioned first thing, and closed by nobody"},
+], open(sys.argv[1], "w"))
+PRS
+    n="$(run_fleet_fn count_startable)"
+    [ "$n" = "2" ] \
+      || fail "counted $n startable; neither PR closes anything, so both #6 and #7 are"
     echo "PASS: an open PR hides its issue from the startable count whatever it says"
     ;;
 
@@ -1892,6 +1907,30 @@ PY
     run_fleet_fn issue_is_done 23 \
       && fail "#23 is neither closed nor merged, and was reported landed anyway"
     echo "PASS: a merged PR is read the way GitHub read it"
+    ;;
+
+  fleet_cannot_tell_when_the_pr_lookup_fails)
+    # "Nothing printed" is what no-PR looks like, and it is also what a failed
+    # `gh` call or a broken import looks like. Read as "free" they are the same
+    # answer, and the fleet opens a second worktree for work already in flight
+    # -- the exact failure the shared pattern exists to prevent, arriving by a
+    # different door. `in_flight` has always documented a third answer; until
+    # now `has_open_pr` could not produce it.
+    make_fleet_parse_fixture
+    FLEET_GH_FAIL=1
+    run_fleet_fn has_open_pr 12; rc=$?
+    [ "$rc" = 2 ] \
+      || fail "has_open_pr answered $rc when the lookup failed; 1 means 'free', which is a guess"
+    run_fleet_fn in_flight 12; rc=$?
+    [ "$rc" = 2 ] \
+      || fail "in_flight answered $rc; its own contract reserves 2 for 'could not tell'"
+    # ...and a healthy lookup still answers plainly, so the guard above cannot
+    # be satisfied by returning 2 for everything.
+    FLEET_GH_FAIL=""
+    run_fleet_fn has_open_pr 12; rc=$?
+    [ "$rc" = 1 ] \
+      || fail "has_open_pr answered $rc for an issue with no PR; that must stay a plain 'free'"
+    echo "PASS: a failed PR lookup is 'could not tell', never 'free'"
     ;;
 
   *)
@@ -1919,6 +1958,7 @@ PY
     echo "       fleet_reads_blocked_by_case_insensitively" >&2
     echo "       fleet_counts_startable_by_the_same_rule" >&2
     echo "       fleet_sees_a_merged_pr_that_says_fixes" >&2
+    echo "       fleet_cannot_tell_when_the_pr_lookup_fails" >&2
     exit 2
     ;;
 esac
