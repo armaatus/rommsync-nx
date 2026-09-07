@@ -19,8 +19,16 @@ on:
   # There is NO trigger for thread resolution itself: `pull_request_review_thread`
   # is a webhook event, not a workflow trigger, and putting it here makes the
   # whole file invalid -- which shows up as a failed run with no jobs, named
-  # after the file. So resolving the last thread does not re-run this on its own;
-  # the push or the re-request that follows it does.
+  # after the file. actionlint rejects it too, so the check in evals/lint.sh
+  # catches a re-attempt before CI does.
+  #
+  # So resolving the last thread does not re-run this on its own, and for a long
+  # while nothing else did either: the gate stayed red on a thread that was
+  # already closed and auto-merge never fired. `scripts/orca/resolve-thread.sh`
+  # is what closes that -- it resolves the threads and then re-runs this
+  # workflow's own failed run on the head, which updates that check run IN
+  # PLACE, the same mechanism `clear-stale` below relies on. A dispatch could
+  # not: its check runs attach to the ref dispatched, not to a PR head.
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review, edited, review_requested]
   pull_request_review:
@@ -80,22 +88,12 @@ jobs:
           set -euo pipefail
           owner="${NWO%%/*}"; name="${NWO##*/}"
           gh api --paginate "repos/$NWO/pulls/$PR/files" --jq '.[].filename' >files.txt
-          # The query is single-quoted on purpose: $owner, $name and $pr are
-          # GraphQL variables bound by the -F flags above, and must reach the
-          # server unexpanded.
-          # shellcheck disable=SC2016
-          gh api graphql -F owner="$owner" -F name="$name" -F pr="$PR" -f query='
-            query($owner:String!,$name:String!,$pr:Int!){
-              repository(owner:$owner,name:$name){
-                pullRequest(number:$pr){
-                  body
-                  author{login}
-                  reviews(last:50){ nodes{ state submittedAt commit{oid} author{login}
-                                          body comments(first:1){ totalCount } } }
-                  reviewThreads(first:100){ nodes{ isResolved path line } }
-                }
-              }
-            }' >pr.json
+          # The query itself is in .github/scripts/pr_payload.sh, next to the
+          # script that judges what it returns and checked out with it. It PAGES
+          # the review threads: `reviewThreads(first:100)` inline here was the
+          # first hundred, so a PR past that lost its newest threads and this
+          # step handed the gate a partial list to call clean.
+          bash .github/scripts/pr_payload.sh "$owner" "$name" "$PR" >pr.json
 
       - name: Decide
         run: |

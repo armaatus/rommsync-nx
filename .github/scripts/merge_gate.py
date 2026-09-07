@@ -11,7 +11,8 @@ produced it:
   2. an independent review exists on the CURRENT head, so pushing a fix
      invalidates it and a re-review is required;
   3. that review's latest word is not "changes requested";
-  4. no review thread is still open;
+  4. no review thread is still open -- and the thread list it read was
+     complete, rather than the first page of one;
   5. it says which issue it closes, in a form GitHub will act on;
   6. it does not touch the enforcement layer, which never merges itself.
 
@@ -113,6 +114,30 @@ def is_substantive(review):
             or ((review.get("comments") or {}).get("totalCount") or 0) > 0)
 
 
+def thread_list_is_complete(pull_request):
+    """Whether this payload's review threads are ALL of the PR's review threads.
+
+    A page is not the list. Both readers ask for `reviewThreads(first:100)`, so
+    on a longer PR the newest threads -- the ones most likely to still be open --
+    fall off the end, and every thread that did come back can be resolved while
+    an open one sits on page two. `.github/scripts/pr_payload.sh` pages through
+    them so this is normally true; it is false when the paging ran out.
+
+    Here rather than in each caller for the same reason the query is:
+    `resolve-thread.sh` also has to decide whether "no thread is left" is a
+    thing it may say, and a second copy of that judgement is a second place for
+    it to drift.
+    """
+    threads = pull_request.get("reviewThreads") or {}
+    return not (threads.get("pageInfo") or {}).get("hasNextPage")
+
+
+def unresolved_threads(pull_request):
+    """The open review threads. Only meaningful if the list is complete."""
+    return [t for t in ((pull_request.get("reviewThreads") or {}).get("nodes") or [])
+            if not t.get("isResolved")]
+
+
 def evaluate(head_sha, pull_request, changed_files):
     """Returns (ok, [lines to print])."""
     problems = []
@@ -183,8 +208,14 @@ def evaluate(head_sha, pull_request, changed_files):
                 "supersedes it."
             )
 
-    threads = (pull_request.get("reviewThreads") or {}).get("nodes") or []
-    unresolved = [t for t in threads if not t.get("isResolved")]
+    if not thread_list_is_complete(pull_request):
+        problems.append(
+            "the review threads came back truncated, so whether any are still "
+            "open cannot be answered from them. This is a refusal, not a "
+            "failure: re-run this check, and if it persists the PR has more "
+            "threads than the gather pages through."
+        )
+    unresolved = unresolved_threads(pull_request)
     if unresolved:
         problems.append(f"{len(unresolved)} review thread(s) are unresolved:")
         for t in unresolved[:10]:
@@ -457,6 +488,40 @@ SELFTEST = [
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
             "reviewThreads": {"nodes": []},
+        },
+        ["core/src/sync.cpp"],
+        True,
+    ),
+    (
+        # The gate asked for the FIRST hundred threads and there are more. Every
+        # thread it did get back is resolved, so without this it prints "no open
+        # threads" from a page it knows is partial -- a verdict about a state it
+        # never established.
+        "a truncated thread page is not an answer",
+        "abc123",
+        {
+            "body": "Closes #1\n/code-review\nmattpocock-skills:code-review",
+            "reviews": {"nodes": [
+                {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
+            ]},
+            "reviewThreads": {"pageInfo": {"hasNextPage": True},
+                              "nodes": [{"isResolved": True, "path": "a.cpp", "line": 1}]},
+        },
+        ["core/src/sync.cpp"],
+        False,
+    ),
+    (
+        "...and a complete one still is",
+        "abc123",
+        {
+            "body": "Closes #1\n/code-review\nmattpocock-skills:code-review",
+            "reviews": {"nodes": [
+                {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
+            ]},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False},
+                              "nodes": [{"isResolved": True, "path": "a.cpp", "line": 1}]},
         },
         ["core/src/sync.cpp"],
         True,
