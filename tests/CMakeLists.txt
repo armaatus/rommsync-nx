@@ -1440,7 +1440,7 @@ set(ORCA_FLEET_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_orca_fleet.sh")
 foreach(phase card_says card_quiet remove_forces remove_advice
               stall_expected stall_reports timebox_waits timebox_stops queue_skips
               list_declines timebox_rearms labels_unknown outage_once one_lookup
-              box_marker_go one_card)
+              timebox_clears stop_clears own_clears one_card)
   add_test(NAME orca.fleet_${phase}
            COMMAND "${BASH_PROGRAM}" "${ORCA_FLEET_TEST}" ${phase})
   set_tests_properties(orca.fleet_${phase} PROPERTIES TIMEOUT 60)

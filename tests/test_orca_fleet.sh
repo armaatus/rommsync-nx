@@ -59,11 +59,15 @@
 #                                     is the line-a-minute the markers prevent.
 #   test_orca_fleet.sh one_lookup     both watchers in one poll -> one `gh` call
 #                                     for one issue's labels, not two.
-#   test_orca_fleet.sh box_marker_go  the exemption ends (a PR opened) -> every
-#                                     marker enforce_timebox owns is cleared,
-#                                     not only the ones it set on the way in. A
-#                                     stale one swallows the NEXT worktree's
-#                                     first outage report.
+#   test_orca_fleet.sh own_clears     a fresh worktree for an issue that had one
+#                                     before starts with NO markers. They only
+#                                     ever throttle a message to once, so an
+#                                     inherited one silences the new worktree --
+#                                     a `stalled-42` left behind makes
+#                                     notice_stalled say nothing at all.
+#   test_orca_fleet.sh timebox_clears both exits from enforce_timebox clear
+#   test_orca_fleet.sh stop_clears    every marker it owns, not only the ones it
+#                                     set on the way in.
 #   test_orca_fleet.sh one_card       exempt, waiting and past the box -> ONE
 #                                     board comment in the poll, not two, and it
 #                                     still says both things a person needs.
@@ -213,6 +217,37 @@ issue_labels() { printf '%s' "$1" >"$GH_LABELS"; }
 # the PR listing is empty.
 make_overdue() { mkdir -p "$ROMMSYNC_FLEET_DIR/started"; echo 0 >"$ROMMSYNC_FLEET_DIR/started/42"; }
 
+# All three markers enforce_timebox owns, set the way the dispatcher sets them
+# -- by driving it through the polls that write each one. Setting them by hand
+# would assert against a state the code may never produce.
+BOX_MARKERS="unreachable box-labels human-step"
+# The order is forced: the exemption branch clears `unreachable-` and
+# `box-labels-` on its way past, so `human-step-` has to be armed before them.
+arm_box_markers() {
+  # No PR, and the label says the last step is a person's -> `human-step-`.
+  echo '[]' >"$GH_PRS"; issue_labels "ready,needs-human-step"
+  in_fleet enforce_timebox >/dev/null 2>&1
+  # A PR lookup that cannot answer -> `unreachable-`.
+  echo 'not json' >"$GH_PRS"
+  in_fleet enforce_timebox >/dev/null 2>&1
+  # It answers again, and now the LABEL lookup cannot -> `box-labels-`.
+  echo '[]' >"$GH_PRS"; issue_labels FAIL
+  in_fleet enforce_timebox >/dev/null 2>&1
+  local m
+  for m in $BOX_MARKERS; do
+    [ -e "$ROMMSYNC_FLEET_DIR/$m-42" ] \
+      || fail "could not arm $m-42, so the assertion that follows would be vacuous"
+  done
+}
+assert_no_box_markers() {
+  local m
+  for m in $BOX_MARKERS; do
+    [ -e "$ROMMSYNC_FLEET_DIR/$m-42" ] \
+      && fail "$m-42 survives $1, and it silences the next worktree for this issue"
+  done
+  return 0
+}
+
 # fleet.sh returns instead of dispatching when it is sourced, so one function can
 # be exercised without starting a dispatcher.
 in_fleet() { (cd "$WORK/repo" && . ./scripts/orca/fleet.sh && "$@"); }
@@ -320,13 +355,7 @@ case "${1:-}" in
       || fail "an ordinary overrun was not stopped: $out"
     grep -q "issue comment" "$GH_CALLS" \
       || fail "an ordinary overrun left nothing on the issue: $out"
-    # The other exit from enforce_timebox, and it owes the same tidiness: a
-    # marker left here is inherited by the next worktree for this issue.
-    for m in unreachable box-labels human-step; do
-      [ -e "$ROMMSYNC_FLEET_DIR/$m-42" ] \
-        && fail "$m-42 survives the stop, and it silences the next worktree first report"
-    done
-    echo "ok: an ordinary overrun is still stopped, and leaves no marker behind"
+    echo "ok: an ordinary overrun is still stopped"
     ;;
   queue_skips)
     make_fixture ok
@@ -421,22 +450,47 @@ JSON
       || fail "asked GitHub $n times for one issue labels in one poll"
     echo "ok: one poll asks for an issue labels once"
     ;;
-  box_marker_go)
+  timebox_clears)
     make_fixture ok
     make_worktree
     make_overdue
     agent_state working
-    # Past the box with the label lookup failing: the outage marker goes down.
-    issue_labels FAIL
-    in_fleet enforce_timebox >/dev/null 2>&1
-    [ -e "$ROMMSYNC_FLEET_DIR/box-labels-42" ] \
-      || fail "the outage marker was never set, so this asserts nothing"
-    # Then a PR opens, which ends the time-box for this worktree entirely.
+    arm_box_markers
+    # A PR opens: the time-box is done with this worktree.
     echo '[{"number":9,"body":"Closes #42"}]' >"$GH_PRS"
     in_fleet enforce_timebox >/dev/null 2>&1
-    [ -e "$ROMMSYNC_FLEET_DIR/box-labels-42" ] \
-      && fail "a stale outage marker survives, and it swallows the next worktree first report"
-    echo "ok: the time-box clears every marker it owns when it lets an issue go"
+    assert_no_box_markers "the PR-opened exit"
+    echo "ok: the time-box leaves nothing behind when it lets an issue go"
+    ;;
+  stop_clears)
+    make_fixture ok
+    make_worktree
+    make_overdue
+    agent_state working
+    arm_box_markers
+    # Nothing exempts it any more, so this pass takes the stop.
+    echo '[]' >"$GH_PRS"; issue_labels "ready"
+    out="$(in_fleet enforce_timebox 2>&1)"
+    grep -q -- "--interrupt" "$ORCA_CALLS" \
+      || fail "it did not reach the stop, so this asserts nothing: $out"
+    assert_no_box_markers "the stop"
+    echo "ok: the stop leaves nothing behind either"
+    ;;
+  own_clears)
+    make_fixture ok
+    make_worktree
+    # What a previous worktree for this same issue would have left standing.
+    # `live_worktrees` skips an ARCHIVED worktree, so `in_flight` reads free and
+    # the dispatcher opens a second one for an issue whose markers are all set.
+    for m in stalled stall-labels box-labels queue-labels unreachable human-step; do
+      : >"$ROMMSYNC_FLEET_DIR/$m-42"
+    done
+    in_fleet own 42 "$WORK/wt" >/dev/null 2>&1
+    for m in stalled stall-labels box-labels queue-labels unreachable human-step; do
+      [ -e "$ROMMSYNC_FLEET_DIR/$m-42" ] \
+        && fail "$m-42 survived into a fresh worktree, which is silenced by it"
+    done
+    echo "ok: a fresh worktree starts with nothing already said on its behalf"
     ;;
   one_card)
     make_fixture ok
@@ -450,9 +504,11 @@ JSON
       || fail "put $n near-duplicate comments on the board in one poll"
     grep -q "past the time-box" "$ORCA_CALLS" \
       || fail "the comment that survived does not say it is past the box: $(cat "$ORCA_CALLS")"
+    grep -q "not a stall" "$ORCA_CALLS" \
+      || fail "the comment that survived does not say it is not a stall: $(cat "$ORCA_CALLS")"
     echo "ok: one poll leaves one board comment, and it says both things"
     ;;
   *)
-    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|box_marker_go|one_card" >&2
+    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card" >&2
     exit 2 ;;
 esac
