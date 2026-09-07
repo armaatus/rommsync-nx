@@ -281,6 +281,51 @@ for named in record-review.sh await-review.sh review-status.sh; do
 done
 ok "the brief still names the review loop"
 
+echo "== every test phase actually runs"
+# A phase defined in test_orca_browser.sh and missing from the foreach() list in
+# tests/CMakeLists.txt never runs -- not in ctest, not in CI -- and is
+# indistinguishable from a phase that passes. It happened: the assertions for a
+# whole behaviour shipped green by never being executed. The script and the list
+# are two files, so only something reading both can say they agree.
+if python3 - <<'PHASES'
+import re, sys
+
+# Heredoc bodies are dropped first. The phases write stub `orca` and `gh`
+# scripts, and those carry their own two-space `case` arms -- `worktree)`,
+# `terminal)` -- which are shell being generated, not phases of this file.
+lines, kept, delim = open("tests/test_orca_browser.sh").read().splitlines(), [], None
+for line in lines:
+    if delim is not None:
+        if line.strip() == delim:
+            delim = None
+        continue
+    here = re.search(r"<<-?\s*[\'\"]?([A-Za-z_][A-Za-z0-9_]*)[\'\"]?\s*$", line)
+    if here:
+        delim = here.group(1)
+    kept.append(line)
+body = "\n".join(kept).split('case "${1:-}" in', 1)[1]
+# What is left: the phase labels are the only ones at exactly two spaces, and
+# `*)` is the usage fallback.
+defined = set(re.findall(r"^  ([a-z0-9_]+)\)$", body, re.M))
+
+cml = open("tests/CMakeLists.txt").read()
+listed = set(re.search(r"foreach\(phase\b(.*?)\)", cml, re.S).group(1).split())
+
+bad = False
+for name in sorted(defined - listed):
+    print(f"{name}: defined in test_orca_browser.sh, never registered in tests/CMakeLists.txt")
+    bad = True
+for name in sorted(listed - defined):
+    print(f"{name}: registered in tests/CMakeLists.txt, but the script has no such phase")
+    bad = True
+sys.exit(1 if bad else 0)
+PHASES
+then
+  ok "every test_orca_browser.sh phase is registered, and every registration exists"
+else
+  fail "test_orca_browser.sh and tests/CMakeLists.txt disagree about which phases exist; the ones above never run"
+fi
+
 echo "== the workflows parse as GitHub reads them"
 # An invalid workflow file does not fail loudly: GitHub creates a run with no
 # jobs, named after the file, and the check it was meant to report simply never

@@ -1316,7 +1316,8 @@ foreach(phase opens reuses foreign no_romm submits no_draft unstable
               fleet_reads_every_closing_keyword
               fleet_reads_blocked_by_case_insensitively
               fleet_counts_startable_by_the_same_rule
-              fleet_sees_a_merged_pr_that_says_fixes)
+              fleet_sees_a_merged_pr_that_says_fixes
+              fleet_cannot_tell_when_the_pr_lookup_fails)
   add_test(NAME orca.browser_${phase}
            COMMAND "${BASH_PROGRAM}" "${ORCA_BROWSER_TEST}" ${phase})
   set_tests_properties(orca.browser_${phase} PROPERTIES TIMEOUT 60)
