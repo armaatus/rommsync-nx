@@ -137,7 +137,10 @@ own()          { printf '%s\n' "$2" >"$OWNED_DIR/$1"; date +%s >"$STARTED_DIR/$1
 owned_path()   { cat "$OWNED_DIR/$1" 2>/dev/null; }
 # ...including the stall marker, which notice_stalled writes once per stall and
 # nothing else removed -- one small file leaked per issue that ever stalled.
-disown_issue() { rm -f "$OWNED_DIR/$1" "$STARTED_DIR/$1" "$STATE_DIR/stalled-$1"; }
+disown_issue() {
+  rm -f "$OWNED_DIR/$1" "$STARTED_DIR/$1" "$STATE_DIR/stalled-$1" \
+        "$STATE_DIR/unreachable-$1"
+}
 
 # Non-zero when the answer could not be read, which is NOT the same as "nothing
 # is running". Reading a failed CLI call as zero live worktrees is how one
@@ -458,13 +461,20 @@ enforce_timebox() {
     # A PR being up means it got where it was going; the review loop has its own
     # cap and is not this timer's business. "Could not tell" is not "no PR":
     # this branch interrupts an agent and comments on its issue, and a lookup
-    # that failed is no basis for either. The marker stays, so the next pass
-    # asks again -- an agent is only ever stopped on an answer.
+    # that failed is no basis for either. The started marker stays, so the next
+    # pass asks again -- an agent is only ever stopped on an answer.
     has_open_pr "$num"; case $? in
-      0) rm -f "$f"; continue ;;
-      2) say "#$num: timed out, but could not tell whether a PR is open -- leaving it alone"
+      0) rm -f "$f" "$STATE_DIR/unreachable-$num"; continue ;;
+      # Once per outage, not once per poll, the same way notice_stalled does it:
+      # the dispatcher polls every POLL_SECONDS, and an hour of GitHub being
+      # unreachable would otherwise bury the log a person scans overnight under
+      # a line a minute for every issue past its box.
+      2) [ -e "$STATE_DIR/unreachable-$num" ] && continue
+         : >"$STATE_DIR/unreachable-$num"
+         say "#$num: timed out, but could not tell whether a PR is open -- leaving it for the next pass"
          continue ;;
     esac
+    rm -f "$STATE_DIR/unreachable-$num"
 
     say "#$num: $((TIMEBOX_SECONDS / 3600))h with no PR -- stopping it and leaving the worktree for you"
     agent="$(agent_terminal_in "$path")"

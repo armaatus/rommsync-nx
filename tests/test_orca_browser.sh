@@ -1045,7 +1045,10 @@ esac
 STUB
     chmod +x "$stub/orca"
     : >"$TMPDIR_FIXTURE/orca-calls.log"
+    # ORCA_CLI/ORCA_CLI_COMMAND cleared for the reason the time-box phase below
+    # spells out: orca_cli_resolve honours either over the stub on PATH.
     out="$(PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$state" \
+           ORCA_CLI="" ORCA_CLI_COMMAND="" \
            bash -c '. '"$TMPDIR_FIXTURE"'/scripts/orca/lib.sh
                     orca_cli_resolve
                     STATE_DIR="'"$state"'"; OWNED_DIR="$STATE_DIR/worktrees"
@@ -1948,7 +1951,11 @@ PY
     printf '%s\n' "$TMPDIR_FIXTURE" >"$state/worktrees/29"
     # Started at the epoch: expired under any time-box the fleet could be given.
     printf '0\n' >"$state/started/29"
-    printf '[]\n' >"$TMPDIR_FIXTURE/open-prs.json"
+    # The PR the acceptance describes: open, waiting on review, and invisible
+    # while `gh` is down. Seeded from the start so the two halves of that
+    # sentence are on screen together -- an agent stopped here loses a finished
+    # round, which is the whole cost the third answer exists to avoid.
+    printf '[{"number":401,"body":"Closes #29\\n"}]\n' >"$TMPDIR_FIXTURE/open-prs.json"
     cat >"$stub/gh" <<GHSTUB
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >>"$TMPDIR_FIXTURE/gh-calls.log"
@@ -1971,12 +1978,19 @@ esac
 STUB
     chmod +x "$stub/orca"
 
-    # One expired issue through the real enforce_timebox, with $1 deciding
-    # whether `gh` answers at all. Only the surfaces that reach outside the
-    # function are stood in for; the decision itself is the code under test.
+    # One expired issue through the real enforce_timebox, with $1 -- `up` or
+    # `down` -- deciding whether `gh` answers at all. Only the surfaces that
+    # reach outside the function are stood in for; the decision itself is the
+    # code under test.
     run_timebox() {
       : >"$TMPDIR_FIXTURE/orca-calls.log"; : >"$TMPDIR_FIXTURE/gh-calls.log"
-      PATH="$stub:$PATH" FLEET_GH_FAIL="$1" \
+      local fail=""; [ "$1" = down ] && fail=1
+      # ORCA_CLI and ORCA_CLI_COMMAND are cleared, not merely unset in this
+      # shell: orca_cli_resolve honours either over anything on PATH, so an
+      # inherited one would send `terminal list` to the real Orca -- which
+      # knows nothing of this fixture, and would fail step 5 saying the
+      # time-box did not fire when what happened is that the stub was skipped.
+      PATH="$stub:$PATH" FLEET_GH_FAIL="$fail" ORCA_CLI="" ORCA_CLI_COMMAND="" \
       bash -c '. '"$TMPDIR_FIXTURE"'/scripts/orca/lib.sh
                orca_cli_resolve
                REPO_ROOT="'"$TMPDIR_FIXTURE"'"
@@ -1986,17 +2000,20 @@ STUB
                notify() { echo "NOTIFY: $*"; }
                card() { echo "CARD: $*"; }
                orca_json() { local o; o="$(mktemp)"; orca_run_with_deadline 10 "$o" "$ORCA_CLI" "$@" --json; cat "$o"; rm -f "$o"; }
-               '"$(sed -n '/^ISSUE_REFS=/p; /^owned_path()/p;
+               '"$(sed -n '/^ISSUE_REFS=/p;
+                             # owned_path is a one-liner; a range would run on
+                             # to the closing brace of whatever follows it.
+                             /^owned_path()/p;
                              /^has_open_pr()/,/^}/p; /^agent_terminal_in()/,/^}/p;
                              /^enforce_timebox()/,/^}/p' \
                     "$TMPDIR_FIXTURE/scripts/orca/fleet.sh")"'
                enforce_timebox' 2>&1
     }
 
-    # 1. `gh` is down. The agent may well have a PR up; nothing here knows.
-    out="$(run_timebox 1)"
+    # 1. `gh` is down. A PR IS up; nothing here can see it.
+    out="$(run_timebox down)"
     grep -q "could not tell" <<<"$out" \
-      || fail "the log does not say it could not tell; a silent skip reads as 'nothing expired': $out"
+      || fail "the log names no unanswered lookup; whoever reads it cannot tell this issue from an idle one: $out"
     grep -q -- "--interrupt" "$TMPDIR_FIXTURE/orca-calls.log" \
       && fail "interrupted an agent on a lookup that never answered: $(cat "$TMPDIR_FIXTURE/orca-calls.log")"
     grep -q "issue comment" "$TMPDIR_FIXTURE/gh-calls.log" \
@@ -2004,25 +2021,37 @@ STUB
     [ -e "$state/started/29" ] \
       || fail "dropped the started marker, so the next pass can never time this issue out at all"
 
-    # 2. ...and `gh` answering plainly still ends a genuinely stuck agent. Without
-    # this the guard above is satisfied by a time-box that never fires.
-    out="$(run_timebox "")"
+    # 2. The outage lasts. An hour of it is 60 polls, and the fleet log is what a
+    # person scans in the morning for the two lines that matter.
+    out="$(run_timebox down)"
+    grep -q "could not tell" <<<"$out" \
+      && fail "said it again on the very next poll; it is once per outage, not once per poll: $out"
+
+    # 3. It ends. A PR that is up is not a time-out, however long it took to open.
+    out="$(run_timebox up)"
+    grep -q -- "--interrupt" "$TMPDIR_FIXTURE/orca-calls.log" \
+      && fail "interrupted an agent whose PR is open and waiting on review: $out"
+    [ -e "$state/started/29" ] \
+      && fail "an issue that got where it was going should stop being timed"
+
+    # 4. ...and the next outage is reported, rather than silenced by a marker the
+    # answer in between should have cleared.
+    printf '0\n' >"$state/started/29"
+    out="$(run_timebox down)"
+    grep -q "could not tell" <<<"$out" \
+      || fail "a second outage went unlogged; the first one's marker outlived the answer that ended it: $out"
+
+    # 5. And a working lookup with no PR still ends a genuinely stuck agent.
+    # Without this every guard above is satisfied by a time-box that never fires.
+    printf '[]\n' >"$TMPDIR_FIXTURE/open-prs.json"
+    out="$(run_timebox up)"
     grep -q -- "--interrupt" "$TMPDIR_FIXTURE/orca-calls.log" \
       || fail "3h with a working lookup and no PR is exactly what the time-box is for: $out"
     grep -q "issue comment" "$TMPDIR_FIXTURE/gh-calls.log" \
       || fail "stopped the agent without saying so on the issue: $out"
     [ -e "$state/started/29" ] \
       && fail "kept the started marker after stopping the agent; it would be stopped again every poll"
-
-    # 3. A PR that is up is not a time-out, however long it took to open.
-    printf '0\n' >"$state/started/29"
-    printf '[{"number":401,"body":"Closes #29\\n"}]\n' >"$TMPDIR_FIXTURE/open-prs.json"
-    out="$(run_timebox "")"
-    grep -q -- "--interrupt" "$TMPDIR_FIXTURE/orca-calls.log" \
-      && fail "interrupted an agent whose PR is open and waiting on review: $out"
-    [ -e "$state/started/29" ] \
-      && fail "an issue that got where it was going should stop being timed"
-    echo "PASS: a failed lookup leaves the time-boxed agent alone, and says so"
+    echo "PASS: a failed lookup leaves the time-boxed agent alone, and says so once"
     ;;
 
   *)
