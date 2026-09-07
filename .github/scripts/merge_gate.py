@@ -354,6 +354,18 @@ def evaluate(head_sha, pull_request, changed_files):
         for who, review in sorted(latest.items()):
             if review.get("state") == "CHANGES_REQUESTED":
                 continue  # said above, with the remedy that belongs to it
+            if review.get("state") == "APPROVED":
+                # An approval asks for nothing, so there is nothing to answer.
+                #
+                # It is also the one verdict here that only a PERSON can give:
+                # `claude-review.yml` tells the reviewer never to `--approve`,
+                # and GitHub refuses a self-approval. Nothing asks a human for a
+                # findings trailer, so without this a maintainer's written
+                # approval reads as "did not say what it found" and holds the PR
+                # -- trapping the one action that moves such a PR forward, on a
+                # repository where `enforce_admins` is off precisely so it can.
+                # Found by the independent review of this PR.
+                continue
             found = declared_findings(review)
             if found == 0:
                 # #90's property: a review that reports nothing needs no answer,
@@ -912,6 +924,25 @@ SELFTEST = [
         },
         ["core/src/sync.cpp"],
         False,
+    ),
+    (
+        # The one verdict a person can give here and the reviewer cannot, and
+        # nothing asks a person for a trailer. Held for an answer, it would be
+        # the approval itself that could not get the PR merged.
+        "an approval asks for nothing, so there is nothing to answer",
+        "abc123",
+        {
+            "author": {"login": "armaatus"},
+            "body": "Closes #7\n/code-review\nmattpocock-skills:code-review",
+            "reviews": {"nodes": [
+                {"state": "APPROVED", "submittedAt": "2026-09-06T02:00:00Z",
+                 "commit": {"oid": "abc123"}, "author": {"login": "joris"},
+                 "body": "Looks right, and the retry matches the pinned contract."},
+            ]},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+        },
+        ["core/src/sync.cpp"],
+        True,
     ),
     (
         # A review of THIS repository quotes fixtures carrying the trailer --

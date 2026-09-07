@@ -433,10 +433,12 @@ Two consequences of failing closed, both deliberate and neither free:
 
 - **a human leaving a `COMMENTED` review holds the PR too**, since a human does
   not write the trailer. Add `<!-- review-findings: 0 -->` to the body if you
-  meant "nothing here", or merge it by hand — `enforce_admins` is off, so that
-  works with the check red. The alternative, exempting human reviewers, would
-  make "who reviewed" decide whether findings can be outrun, and the reviewer's
-  identity is not what the race is about;
+  meant "nothing here", **approve it** — an approval asks for nothing, so it is
+  never held, and it is the one verdict the review job cannot give — or merge by
+  hand, since `enforce_admins` is off and that works with the check red. What
+  the gate deliberately does *not* do is exempt human reviewers as such: that
+  would make *who* reviewed decide whether findings can be outrun, and the
+  reviewer's identity is not what the race is about;
 - **a review whose findings were all inline** cannot carry a trailer if its body
   is empty, so it is held until answered even once every thread is resolved.
   That is the right way round: resolving a thread says the finding was handled,
