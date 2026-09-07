@@ -30,13 +30,25 @@
 # ## Stopping
 #
 # The stop is a FILE, not a signal, and it lives outside every worktree
-# ($HOME/.rommsync-fleet/STOP). That is deliberate: a signal only reaches a
-# process that is still healthy, and the case you most need a stop in is the one
-# where something is not. Everything checks it -- this dispatcher before every
-# action, `await-review.sh` between polls, and `.claude/hooks/guard.py`, which
-# refuses to push, open a PR or comment while it exists. So a stopped fleet
-# cannot produce outward effects even if an agent is mid-thought and never reads
-# the news.
+# ($HOME/.rommsync-fleet). That is deliberate: a signal only reaches a process
+# that is still healthy, and the case you most need a stop in is the one where
+# something is not.
+#
+# There are TWO of them, because "start nothing new" and "let nothing out" are
+# two instructions and only one of them is the agents' (#183):
+#
+#   DRAIN   no new worktrees. Every stop sets it, and only this dispatcher reads
+#           it. An agent mid-work carries on, pushes, opens its PR and comments
+#           -- which is the point: a drain WAITS for those PRs to merge, because
+#           a merged PR is what releases the worktree it is waiting on. A drain
+#           that also froze them waited for what it had itself forbidden, and
+#           ended only when the time-box gave each worktree up, three hours at a
+#           time.
+#   STOP    nothing goes out: no push, no PR, no comment, from any agent,
+#           whether or not it has read the news. `stop --now` and `stop --all`
+#           set it, and `.claude/hooks/guard.py`, `await-review.sh`,
+#           `review-status.sh` and `resolve-thread.sh` are what make it hold
+#           without cooperation.
 #
 # ## What it will not do
 #
@@ -58,6 +70,7 @@ cd "$REPO_ROOT"
 # some of them can see is not a stop.
 STATE_DIR="$ORCA_FLEET_DIR"
 STOP_FILE="$ORCA_FLEET_STOP"
+DRAIN_FILE="$ORCA_FLEET_DRAIN"
 OWNED_DIR="$ORCA_FLEET_OWNED"
 STARTED_DIR="$STATE_DIR/started"
 # The `Closes #N` and `Blocked by #N` patterns, shared with merge_gate.py so the
@@ -119,10 +132,30 @@ notify() {
   osascript -e "display notification \"$(printf '%s' "$2" | sed 's/"/\\"/g')\" with title \"rommsync fleet\" subtitle \"$1\"" >/dev/null 2>&1 || true
 }
 
-stopped() { orca_fleet_stopped; }
-check_stop() {
-  stopped || return 1
-  say "stop file present ($STOP_FILE) -- not starting anything new"
+# What every LAUNCH decision asks, and it is the drain rather than the stop: a
+# hard stop sets both files, so this is true in both states and the dispatcher
+# opens nothing new in either.
+draining() { orca_fleet_draining; }
+# ...and what only the SCREEN asks, because the two states need different words
+# on it. Nothing in here gates on this: refusing to launch under one and not the
+# other is how the two would drift apart.
+hard_stopped() { orca_fleet_stopped; }
+# The word for the state in force, and the file carrying it, for the two screens
+# that need nothing more than the word: this one and `run`'s refusal. `status`
+# and the notification say a sentence per state rather than a word, so they
+# branch on `hard_stopped` themselves.
+#
+# Only meaningful once `draining` is true: with neither file set the state is
+# empty, and the file named is the one a drain WOULD write.
+stop_state() { hard_stopped && { echo stopped; return 0; }; draining && echo draining; }
+stop_state_file() { hard_stopped && { printf '%s\n' "$STOP_FILE"; return 0; }; printf '%s\n' "$DRAIN_FILE"; }
+
+# Named for what it gates rather than for the file it used to read: since the
+# split it is the DRAIN that stops a launch, and `check_stop` at the call site
+# read as the opposite of what it does.
+check_drain() {
+  draining || return 1
+  say "$(stop_state) ($(stop_state_file)) -- not starting anything new"
   return 0
 }
 
@@ -1254,6 +1287,13 @@ record_dispatcher() {
     printf 'started=%s\n' "$(date +%s)"
     printf 'commit=%s\n'  "$(fleet_code_commit "$REPO_ROOT")"
     printf 'hash=%s\n'    "$(fleet_code_hash "$REPO_ROOT")"
+    # Not derivable from the outside, and that is why it is written: a drain
+    # sets a file only a dispatcher that parsed THIS fleet.sh reads, and one
+    # that started before #183 would poll straight through it, launching
+    # worktrees under a stop that looked set. A running process saying what it
+    # understands is the only honest answer -- the bytes on disk are the ones a
+    # RESTART would parse, which is a different question.
+    printf 'drain=1\n'
   } >"$DISPATCHER_FILE"
 }
 dispatcher_field() { sed -n "s/^$1=//p" "$DISPATCHER_FILE" 2>/dev/null | head -1; }
@@ -1310,7 +1350,7 @@ dispatcher_alive() {
 restart_advice() {
   local root="${1:-}" pull="${2:-}"
   echo "  Restart it -- it is the only way a change to fleet.sh takes effect:"
-  echo "    ./scripts/orca/stop.sh          # drains; --now interrupts the agents"
+  echo "    ./scripts/orca/stop.sh          # drains: the agents in flight finish"
   echo "    ./scripts/orca/fleet.sh status  # until it says idle"
   [ -n "$pull" ] && echo "    $pull"
   echo "    ./scripts/orca/fleet.sh resume"
@@ -1340,12 +1380,12 @@ restart_advice() {
 # there starts a dispatcher in a directory the fleet removes when that
 # worktree's PR merges (status_names_root is the test for it).
 #
-# BOTH restarts, because only one of them is in WORKFLOW.md and the documented
-# one is unusable with worktrees mid-work: the stop file a drain writes is what
-# guard.py reads before it lets an agent push, open a PR or comment, so the PRs
-# the drain is waiting on cannot land while it waits for them. A bare `kill` is
-# what a person actually does then, and saying so is the difference between a
-# refusal somebody can act on and one they work around by ignoring it.
+# BOTH restarts, because they cost different things and both are in
+# docs/WORKFLOW.md. A drain is safe with agents mid-work -- since #183 it sets
+# DRAIN and not STOP, so the agents finish and their PRs land -- but it WAITS
+# for those PRs, and that is hours. A bare `kill` takes the dispatcher over now
+# and leaves the agents running; what it gives up is the reaping, so anything
+# in flight is then yours with `reap.sh --yes` once it lands.
 refuse_second_dispatcher() {
   local holder="$1" root
   # The dispatcher's OWN checkout, not this caller's -- the same asymmetry the
@@ -1365,7 +1405,8 @@ between them, and two of every reap, board comment and time-box interrupt.
       restart without that one starts the same bytes over.
 
 To take over -- the usual reason to start a second one is that the first is
-running stale code. With nothing in flight, drain it:
+running stale code. Drain it, which is safe with agents mid-work but waits for
+the PRs in flight to merge:
 
 REFUSED
     # No pull argument, deliberately, and this is the one caller that omits it.
@@ -1378,13 +1419,14 @@ REFUSED
     restart_advice "$root"
     cat <<REFUSED
 
-With agents mid-work, do NOT drain: the stop file it writes is what guard.py
-reads before it lets an agent push, open a PR or comment, so the PRs the drain
-is waiting for cannot land while it waits for them. Take this dispatcher over
-and leave the agents alone:
+That drain is safe with agents mid-work -- it sets DRAIN, not STOP, so they
+finish and their PRs land -- but it WAITS for those PRs, which is hours. To
+take this dispatcher over NOW without interrupting anybody, kill it instead
+and reap what it does not get to yourself:
 
   kill $holder
   ./scripts/orca/fleet.sh status  # until it says idle
+  ./scripts/orca/reap.sh --yes    # the stacks it did not live to reap
 REFUSED
     if [ -n "$root" ]; then
       echo "  cd $root && ./scripts/orca/fleet.sh run --auto"
@@ -1459,14 +1501,64 @@ report_dispatcher_code() {
   restart_advice "$root"
 }
 
+# The one case a drain can fail in silently: a dispatcher older than the file it
+# writes. DRAIN is read by this dispatcher and by nothing else, so a process
+# that parsed a fleet.sh from before #183 polls straight through it, launching
+# worktrees while the screen says the fleet is stopping.
+#
+# record_dispatcher writes `drain=1` and a running process is the only thing
+# that can say what it parsed -- the bytes on disk are what a RESTART would
+# parse, which is a different question and the one report_dispatcher_code asks.
+# So a live dispatcher without that field either predates this or recorded
+# nothing at all, and both mean the same thing here: it cannot be confirmed to
+# see the drain.
+#
+# It WARNS. It does not refuse -- `stop.sh` always doing something is the
+# promise docs/WORKFLOW.md makes of it -- and it does not quietly fall back to
+# writing the STOP file, which would re-arm the freeze this whole change exists
+# to remove and would freeze three agents to work around one old process.
+warn_blind_dispatcher() {
+  local held; held="$(cat "$PIDFILE" 2>/dev/null)"
+  dispatcher_alive "$held"; local held_is=$?
+  # 1 is "nothing is running", and there is nothing to be blind to the file.
+  # 2 -- alive, and ps would not say what it is -- warns with the rest: what
+  # cannot be established is exactly what this is about.
+  [ "$held_is" = 1 ] && return 0
+  [ -n "$(dispatcher_field drain)" ] && return 0
+  local root; root="$(dispatcher_field root)"
+  echo
+  echo "  WARNING: pid $held is running and did not record that it reads"
+  echo "           $DRAIN_FILE."
+  echo "           A dispatcher that predates that file cannot see this drain:"
+  echo "           it goes on launching worktrees while this screen says the"
+  echo "           fleet is stopping. Take it over instead, which leaves the"
+  echo "           agents alone:"
+  echo "             kill $held"
+  echo "             ./scripts/orca/fleet.sh status  # until it says idle"
+  if [ -n "$root" ]; then
+    echo "             cd $root && ./scripts/orca/fleet.sh run --auto"
+  else
+    echo "             ./scripts/orca/fleet.sh run --auto   # from the MAIN worktree"
+  fi
+  echo "           Or ./scripts/orca/stop.sh --now, which stops it and freezes"
+  echo "           every agent with it."
+}
+
 # --------------------------------------------------------------- commands ---
 cmd_status() {
   echo "fleet state: $STATE_DIR"
   # A stop and a running dispatcher are not alternatives: a drain leaves the
   # dispatcher up on purpose, because it is what reaps a worktree once its PR
   # merges -- and that draining dispatcher is running whatever code it parsed.
-  if stopped; then
-    echo "STOPPED  ($STOP_FILE -- clear with: ./scripts/orca/fleet.sh resume)"
+  # Which of the two, in the word the rest of the fleet uses for it. They are
+  # not the same state and the person reading this is deciding whether to wait:
+  # under a drain the agents are finishing and their PRs will land, under a stop
+  # nothing they do can reach GitHub at all.
+  if hard_stopped; then
+    echo "STOPPED  ($STOP_FILE -- nothing goes out; clear with: ./scripts/orca/fleet.sh resume)"
+  elif draining; then
+    echo "DRAINING ($DRAIN_FILE -- no new worktrees; the agents in flight finish"
+    echo "          and their PRs land. Clear with: ./scripts/orca/fleet.sh resume)"
   fi
   # dispatcher_alive, not `kill -0` alone: a pidfile a `kill -9` left behind,
   # whose pid the OS has since handed to somebody else, would otherwise be
@@ -1523,12 +1615,14 @@ cmd_stop() {
     *) die "usage: fleet.sh stop [--now|--all]" ;;
   esac
   mkdir -p "$STATE_DIR"
-  date '+stopped at %Y-%m-%d %H:%M:%S' >"$STOP_FILE"
-  echo "stop set: $STOP_FILE"
-  echo "  no new worktrees, and no agent can push, open a PR or comment."
-
+  # The drain, in every mode: it is the half that means "start nothing new", and
+  # a hard stop is that plus a freeze.
+  date '+draining since %Y-%m-%d %H:%M:%S' >"$DRAIN_FILE"
   case "$mode" in
     --now|--all)
+      date '+stopped at %Y-%m-%d %H:%M:%S' >"$STOP_FILE"
+      echo "stop set: $STOP_FILE (and the drain, $DRAIN_FILE)"
+      echo "  no new worktrees, and no agent can push, open a PR or comment."
       # --now reaches the agents the fleet started. --all reaches every agent
       # Orca knows about, including sessions a person opened by hand -- which is
       # a bigger hammer than a fleet stop, so it has to be asked for by name.
@@ -1577,16 +1671,41 @@ for t in json.load(sys.stdin)["result"]["terminals"]:
         echo "  no dispatcher to stop; $PIDFILE names pid ${held:-nothing}, which is not one."
       fi ;;
     "")
-      echo "  running agents finish what they are on, and the dispatcher stays up to"
-      echo "  reap their worktrees when their PRs land. It exits once nothing is left."
-      echo "  Use --now to interrupt the fleet's agents, --all for every agent." ;;
+      echo "drain set: $DRAIN_FILE"
+      # ...but a drain does not LIFT a stop, and saying "the agents are not
+      # frozen" while $STOP_FILE is still there is the reassurance somebody
+      # would act on: `--now` to freeze, then a plain `stop.sh` later to let the
+      # work land, and the agents stay frozen with the screen saying otherwise.
+      if hard_stopped; then
+        echo "  ...but $STOP_FILE is STILL SET, so the agents stay frozen: no push,"
+        echo "  no PR, no comment. A drain does not lift a stop. To let the work in"
+        echo "  flight land, clear it and drain again:"
+        echo "    ./scripts/orca/fleet.sh resume && ./scripts/orca/stop.sh"
+      else
+        echo "  no new worktrees. The agents in flight are NOT frozen: they finish,"
+        echo "  push, open their PRs and comment, because a merged PR is what releases"
+        echo "  the worktree this drain is waiting on."
+        echo "  The dispatcher stays up to reap those worktrees as their PRs land, and"
+        echo "  exits once nothing is left. Watch it with: fleet.sh status."
+        echo "  Use --now to interrupt the fleet's agents and freeze every outward"
+        echo "  effect, --all to interrupt every agent Orca knows about."
+      fi
+      # Last, because it is the line that changes what you do next.
+      warn_blind_dispatcher ;;
   esac
-  notify "stopped" "No new work will start."
+  if hard_stopped; then
+    notify "stopped" "No new work will start, and nothing goes out."
+  else
+    notify "draining" "No new work will start; the agents in flight finish."
+  fi
 }
 
 cmd_resume() {
-  rm -f "$STOP_FILE"
-  echo "stop cleared. Start again with: ./scripts/orca/fleet.sh run --auto"
+  # Both, always. Clearing one of the two leaves a fleet that either refuses
+  # every `run` with the stop apparently lifted, or lets the agents out while
+  # nothing may start -- neither is a state anybody asked for.
+  rm -f "$STOP_FILE" "$DRAIN_FILE"
+  echo "drain and stop cleared. Start again with: ./scripts/orca/fleet.sh run --auto"
 }
 
 # The counterpart to the time-box, and the ONLY way back onto the queue. By name
@@ -1647,13 +1766,15 @@ cmd_run() {
   # throughout, and somebody who reads "stopped" as "down" runs `resume` and
   # `run --auto`. The refusal below would then catch them, but a message that
   # sends them there in the first place is a worse place to be caught.
-  if stopped; then
-    # `held`, not `draining`: cmd_run declares a `local draining=false` further
-    # down and RUNS it as a command (`! $draining`). Both branches here die, so
-    # the collision is harmless today and would not stay that way.
+  if draining; then
+    # `held`, not `drain_mode`: cmd_run declares a `local drain_mode=false`
+    # further down and RUNS it as a command (`! $drain_mode`). Both branches
+    # here die, so the collision is harmless today and would not stay that way.
     local held; held="$(cat "$PIDFILE" 2>/dev/null)"
+    local state; state="$(stop_state)"
+    local which_file; which_file="$(stop_state_file)"
     if dispatcher_alive "$held"; then
-      die "the fleet is stopped ($STOP_FILE), and pid $held is still DRAINING:
+      die "the fleet is $state ($which_file), and pid $held is still DRAINING:
 launching nothing new, and reaping what is in flight until nothing it owns is
 left, which is what a drain is. It exits on its own; watch it with
 \`fleet.sh status\`, and only then start one.
@@ -1662,7 +1783,7 @@ left, which is what a drain is. It exits on its own; watch it with
 dispatcher -- MAX_WORKTREES is enforced per process, so \`run\` would refuse
 while that one is up."
     fi
-    die "the fleet is stopped ($STOP_FILE). Clear it with: fleet.sh resume"
+    die "the fleet is $state ($which_file). Clear it with: fleet.sh resume"
   fi
 
   # One dispatcher per machine, checked before the pidfile is claimed rather
@@ -1699,10 +1820,16 @@ while that one is up."
        say "           ps -p $holder" ;;
   esac
 
-  echo $$ >"$PIDFILE"
-  # Written next to the pidfile and removed with it: a record of a dispatcher
-  # that is not running would report staleness about nothing.
+  # The record BEFORE the pidfile, and the order is the whole of it: every
+  # reader of the record reaches it through the pidfile -- `status` and
+  # `warn_blind_dispatcher` both ask `dispatcher_alive` first -- so a pid
+  # claimed before the record exists is a window in which this dispatcher is
+  # live, current, and has recorded nothing. `stop.sh` landing in it would
+  # announce that a dispatcher which reads the drain file perfectly well cannot
+  # see it. A record with no pidfile is inert the other way round: nothing looks
+  # at it, and the next dispatcher overwrites it.
   record_dispatcher
+  echo $$ >"$PIDFILE"
   # ...but removed only while they still name THIS process. Nothing stops a
   # second dispatcher from starting and claiming both files, and an unconditional
   # `rm` would then have the first one's exit delete the second one's record --
@@ -1716,7 +1843,10 @@ while that one is up."
   [ -n "$max_prs" ] && say "stopping after $max_prs worktree(s) opened"
 
   local opened=0 reason="the queue is empty"
-  local draining=false
+  # Not `draining` -- that is the FUNCTION above, which asks the filesystem.
+  # This is the run's own latch, and it is also set by --until and --max-prs,
+  # neither of which writes a file.
+  local drain_mode=false
   # An issue dropped from `wanted` did not land, and saying it did is a lie the
   # run's last line would tell every time the fleet declines one.
   local declined=false
@@ -1725,12 +1855,13 @@ while that one is up."
     # dispatcher is what reaps a worktree once its PR merges, so killing it here
     # would strand every in-flight stack under `restart: unless-stopped`. It
     # keeps reaping and exits when nothing it owns is left.
-    if stopped && ! $draining; then
-      draining=true
-      say "stopped -- launching nothing more, still reaping what is in flight"
+    if draining && ! $drain_mode; then
+      drain_mode=true
+      reason="you stopped it"
+      say "draining -- launching nothing more, still reaping what is in flight"
     fi
-    if [ -n "$deadline" ] && [ "$(date +%s)" -ge "$deadline" ] && ! $draining; then
-      draining=true
+    if [ -n "$deadline" ] && [ "$(date +%s)" -ge "$deadline" ] && ! $drain_mode; then
+      drain_mode=true
       say "deadline passed -- launching nothing more, still reaping what is in flight"
       reason="the deadline passed"
     fi
@@ -1758,8 +1889,16 @@ while that one is up."
       continue
     fi
 
-    while ! $draining && [ "$live" -lt "$MAX_WORKTREES" ]; do
-      check_stop && { reason="you stopped it"; break 2; }
+    while ! $drain_mode && [ "$live" -lt "$MAX_WORKTREES" ]; do
+      # `break`, not `break 2`: this is the drain arriving MID-PASS, after the
+      # check at the top of the loop and while worktrees are still owned, which
+      # is what `stop.sh` against a running fleet actually looks like. Leaving
+      # the whole loop here ended the dispatcher on the spot -- nothing reaped
+      # the worktrees it was holding, and their stacks stayed up under
+      # `restart: unless-stopped` with nothing left to take them down. It stops
+      # LAUNCHING here and keeps reaping, which is the same thing the top of the
+      # loop does one pass later.
+      if check_drain; then drain_mode=true; reason="you stopped it"; break; fi
       [ -n "$max_prs" ] && [ "$opened" -ge "$max_prs" ] && { reason="it opened $opened worktree(s)"; break 2; }
 
       local picked="" title="" labels=""
@@ -1855,14 +1994,14 @@ while that one is up."
     local queued=0
     if [ "${#wanted[@]}" -gt 0 ]; then
       queued="${#wanted[@]}"
-    elif $auto && ! $draining; then
+    elif $auto && ! $drain_mode; then
       # Counted from the lists already in hand rather than by asking `in_flight`
       # per issue: that made two API calls each, and a 200-issue backlog on a
       # 60-second poll is how you meet gh's secondary rate limit.
       queued="$(count_startable)"
     fi
     if [ "$queued" -eq 0 ] && [ "${owned:-0}" -eq 0 ]; then
-      if $draining; then
+      if $drain_mode; then
         reason="${reason:-you stopped it}; everything in flight has landed"
       elif $auto && $declined; then
         reason="the backlog has nothing startable left, and what it was given was declined"

@@ -80,29 +80,46 @@ not create.
 ## Stop it
 
 ```bash
-./scripts/orca/stop.sh          # drain: no new worktrees, running agents finish
-./scripts/orca/stop.sh --now    # ...and interrupt the fleet's agents too
+./scripts/orca/stop.sh          # drain: no new worktrees, the agents in flight finish
+./scripts/orca/stop.sh --now    # ...and interrupt the fleet's agents, and freeze
+                                #    every outward effect while it is set
 ./scripts/orca/stop.sh --all    # ...and every other agent Orca knows about
 ./scripts/orca/fleet.sh resume  # carry on
 ```
 
-The stop is a **file** — `~/.rommsync-fleet/STOP` — not a signal, and it lives
-outside every worktree. That is deliberate: a signal only reaches a process that
-is still healthy, and the moment you most need a stop is the one where something
-is not.
+The stop is a **file**, not a signal, and it lives outside every worktree. That
+is deliberate: a signal only reaches a process that is still healthy, and the
+moment you most need a stop is the one where something is not.
 
-Three things read it, so it holds even when nothing cooperates:
+There are **two** of them, in `~/.rommsync-fleet/`, because "start nothing new"
+and "let nothing out" are two instructions and only one of them is the agents'
+(#183):
+
+| file | means | set by | read by |
+|---|---|---|---|
+| `DRAIN` | no new worktrees | every stop | `fleet.sh` alone |
+| `STOP` | nothing goes out | `--now`, `--all` | `guard.py`, `await-review.sh`, `review-status.sh`, `resolve-thread.sh`, `fleet.sh` |
+
+Under a **drain**, the dispatcher launches nothing and keeps reaping, and the
+agents in flight are *not* frozen: they finish, push, open their PRs and
+comment. That is the point rather than a leak — a merged PR is what releases the
+worktree the drain is waiting on, so a drain that also froze them would wait for
+what it had itself forbidden, and end only when the time-box gave each worktree
+up three hours at a time. That is exactly what it used to do.
+
+Under a **stop**, nothing reaches GitHub from any agent, whether or not it has
+read the news:
 
 - `fleet.sh` checks it before every decision and opens nothing new.
 - `await-review.sh` checks it between polls and returns exit 3.
 - **`guard.py` refuses `git push`, `gh pr create`, every `gh … comment/edit`
-  and any `gh api` with a write method while it exists.** Reads stay open, so a
-  stopped agent can still find out what it was in the middle of. So a stopped fleet produces no outward effects even from an
-  agent that is mid-thought and has not read the news. Reading, building and
-  testing stay open — the point is to stop work reaching anyone, not to freeze
-  the machine.
+  and any `gh api` with a write method while it exists.**
 
-Nothing removes that file except `fleet.sh resume`.
+Reading, building and testing stay open in both — the point is to stop work
+reaching anyone, not to freeze the machine.
+
+`fleet.sh status` says which of the two it is in, and nothing removes either
+file except `fleet.sh resume`, which removes both.
 
 ## Restart it
 
@@ -153,12 +170,13 @@ staleness report that fails open is the same silence.
 To make a change live:
 
 ```bash
-./scripts/orca/stop.sh          # drain: running agents finish, the dispatcher
-                                # stays up to reap their worktrees, then exits
+./scripts/orca/stop.sh          # drain: the agents in flight finish and their
+                                # PRs land, the dispatcher stays up to reap
+                                # their worktrees, then exits
 ./scripts/orca/fleet.sh status  # until it says `idle` (it says that while
-                                # stopped too — that is how a drain ends)
+                                # draining too — that is how a drain ends)
 git -C /path/to/rommsync-nx pull --ff-only   # if it said BEHIND
-./scripts/orca/fleet.sh resume  # clear the stop
+./scripts/orca/fleet.sh resume  # clear the drain
 cd /path/to/rommsync-nx && ./scripts/orca/fleet.sh run --auto
 ```
 
@@ -167,17 +185,17 @@ names that path rather than printing a relative command. A dispatcher started
 inside a fleet worktree has its cwd and its own `fleet.sh` under a directory the
 fleet removes as soon as that worktree's PR merges.
 
-A drain is the polite version and it can take hours — the dispatcher is what
-reaps a worktree once its PR merges, so killing it strands the stacks under
-`restart: unless-stopped`. `./scripts/orca/stop.sh --now` interrupts the fleet's
-agents and stops the dispatcher immediately; anything it had not reaped is then
-yours, with `./scripts/orca/reap.sh --yes`.
+A drain is the polite version and it can take hours — it waits for the PRs in
+flight to merge, because the dispatcher is what reaps a worktree once one does,
+and killing it strands the stacks under `restart: unless-stopped`.
+`./scripts/orca/stop.sh --now` interrupts the fleet's agents and stops the
+dispatcher immediately; anything it had not reaped is then yours, with
+`./scripts/orca/reap.sh --yes`.
 
-**With agents mid-work, a drain is the wrong tool.** The stop file it writes is
-also what `guard.py` reads before it lets an agent push, open a PR or comment —
-so the PRs the drain is waiting on cannot land while it waits for them, and it
-ends only when the time-box gives each worktree up, three hours at a time. To
-restart the dispatcher and leave the agents alone, take it over directly:
+A drain is safe with agents mid-work — it sets `DRAIN` and not `STOP`, so they
+finish and their PRs land. What it costs is the wait. When you want the
+dispatcher restarted *now* and the agents left alone, take it over directly
+instead:
 
 ```bash
 ./scripts/orca/fleet.sh status  # names the pid, and verifies it is a dispatcher
@@ -705,11 +723,14 @@ fails if that entry disappears, because the agent brief names those skills.
 | editing `.claude/hooks/` and `settings.json` **in a fleet worktree** | an agent rewriting its own guards while nobody is watching has none |
 | `gh api` with `-X POST/PUT/PATCH/DELETE` while stopped | a write is outward; a read is not |
 | pushing or opening a PR from a fleet worktree with no `.orca/reviewed-<sha>` | a PR arrives reviewed or it does not arrive |
-| anything outward while `~/.rommsync-fleet/STOP` exists | a stop that depends on cooperation is not a stop |
+| anything outward while `~/.rommsync-fleet/STOP` exists (a drain sets `DRAIN`, which this does not read) | a stop that depends on cooperation is not a stop |
 
-The last three apply **only in a worktree the fleet opened**. In your own
-worktree you are the control, and a guard that argues with a person doing manual
-work is a guard people route around. It is also why the guards can still be
+Two of those apply **only in a worktree the fleet opened**: editing
+`.claude/hooks/` and `settings.json`, and pushing with no recorded review. In
+your own worktree you are the control, and a guard that argues with a person
+doing manual work is a guard people route around. The two stop rows apply
+everywhere — a stop that reached only the fleet's own worktrees would not be
+one. It is also why the guards can still be
 improved: the first version protected itself everywhere, and made its own bug
 unfixable.
 

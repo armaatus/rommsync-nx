@@ -92,16 +92,33 @@ orca_project_remnants() {
   docker network ls --filter "$filter" --format "network${tab}{{.Name}}"    2>/dev/null || true
 }
 
-# Where the fleet keeps its state, and the file that stops it.
+# Where the fleet keeps its state, and the two files that stop it.
 #
-# Here rather than in each script because three of them need the same two paths
+# Here rather than in each script because several of them need the same paths
 # and a stop that only some of them can see is not a stop. See
-# scripts/orca/fleet.sh for what a stop actually does.
+# scripts/orca/fleet.sh for what each of the two actually does.
+#
+# They are two files because "start nothing new" and "let nothing out" are two
+# different instructions and only one of them belongs to the agents (#183):
+#
+#   DRAIN  no new worktrees. Every stop sets it. NOTHING outside fleet.sh reads
+#          it -- an agent mid-work carries on, pushes, opens its PR and comments,
+#          because a PR that merges is what RELEASES the worktree the drain is
+#          waiting on.
+#   STOP   nothing goes out: no push, no PR, no comment, from any agent, whether
+#          or not it has read the news. Only `stop --now` and `stop --all` set
+#          it, and guard.py, await-review.sh, review-status.sh and
+#          resolve-thread.sh are the ones that read it.
 ORCA_FLEET_DIR="${ROMMSYNC_FLEET_DIR:-$HOME/.rommsync-fleet}"
 ORCA_FLEET_STOP="$ORCA_FLEET_DIR/STOP"
+ORCA_FLEET_DRAIN="$ORCA_FLEET_DIR/DRAIN"
 ORCA_FLEET_OWNED="$ORCA_FLEET_DIR/worktrees"
 
 orca_fleet_stopped() { [ -e "$ORCA_FLEET_STOP" ]; }
+# A hard stop implies the drain, so this asks about both: a STOP left by a fleet
+# that predates DRAIN still means "start nothing new" to the dispatcher reading
+# it.
+orca_fleet_draining() { [ -e "$ORCA_FLEET_DRAIN" ] || [ -e "$ORCA_FLEET_STOP" ]; }
 
 # The open PR for a branch, or nothing. Also here rather than in each script:
 # two of them resolved it slightly differently, which is how "no PR for this

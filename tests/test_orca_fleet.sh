@@ -293,6 +293,54 @@
 #                                         because it promises the dispatcher is
 #                                         down when it returns.
 #
+# ...and the two states a stop can be in, which used to be one (#183). A drain
+# waits for the PRs in flight to merge, and the file it wrote was the same file
+# guard.py reads before it lets an agent push -- so it waited for PRs it had
+# itself forbidden, and ended only when the time-box gave three worktrees up.
+# `DRAIN` and `STOP` are now different files with different readers.
+#
+#   test_orca_fleet.sh drain_ends_on_merge
+#                                         the acceptance, end to end and against
+#                                         a real dispatcher: one worktree past
+#                                         its time-box, kept because its PR is
+#                                         open, a drain set WHILE it runs, and
+#                                         then that PR merges -> the run ends on
+#                                         the work landing, nothing is given up,
+#                                         and no agent is interrupted. It used to
+#                                         `break 2` out of the whole loop the
+#                                         moment the file appeared mid-pass,
+#                                         leaving the worktrees it held unreaped.
+#   test_orca_fleet.sh drain_after_stop   a drain asked for while STOP is still
+#                                         set changes nothing about the agents,
+#                                         and says so. It used to print the full
+#                                         "they are NOT frozen" reassurance over
+#                                         a stop that had them frozen.
+#   test_orca_fleet.sh stop_writes_drain  a drain writes DRAIN and NOT STOP.
+#   test_orca_fleet.sh stop_now_writes_both
+#                                         `--now` writes both: a hard stop is a
+#                                         drain plus a freeze.
+#   test_orca_fleet.sh drain_lets_agents_finish
+#                                         THE issue, asserted against the real
+#                                         .claude/hooks/guard.py: after a drain
+#                                         that hook allows `git push` and
+#                                         `gh pr create`, so the PRs the drain is
+#                                         waiting on can actually land.
+#   test_orca_fleet.sh stop_freezes_agents
+#                                         ...and after `--now` it still refuses
+#                                         both. The escape hatch is unchanged.
+#   test_orca_fleet.sh drain_launches_nothing
+#                                         the half a drain must KEEP: `run`
+#                                         refuses with only DRAIN set.
+#   test_orca_fleet.sh status_stopped     a hard stop says STOPPED, and does not
+#                                         call itself a drain.
+#   test_orca_fleet.sh resume_clears_both a resume that cleared one of the two
+#                                         would leave a fleet nothing can start.
+#   test_orca_fleet.sh stop_drain_blind_dispatcher
+#                                         a dispatcher that predates DRAIN cannot
+#                                         see one -> the drain WARNS and names
+#                                         the pid, rather than looking set while
+#                                         that dispatcher keeps launching.
+#
 # The Orca CLI and gh are stubbed on PATH; the fleet state dir is a temp dir.
 # Nothing here touches a real worktree, docker, or GitHub.
 set -uo pipefail
@@ -550,6 +598,27 @@ assert_no_box_markers() {
 # be exercised without starting a dispatcher.
 in_fleet() { (cd "$WORK/repo" && . ./scripts/orca/fleet.sh && "$@"); }
 
+# What .claude/hooks/guard.py answers about one command, against THIS phase's
+# fleet dir: 0 allowed, 2 blocked.
+#
+# The real hook, not a copy of its rule. The whole of #183 is what TWO programs
+# do with the same directory -- fleet.sh writes, guard.py reads -- and a test
+# that restated guard.py's rule here would have gone on passing through the
+# entire bug. Run from $WORK, which is not a git repo and so is not a worktree
+# the fleet owns: the review-marker gate is a different rule and would otherwise
+# answer for this one.
+guard_says() {
+  local payload
+  payload="$(python3 -c '
+import json, sys
+print(json.dumps({"tool_name": "Bash", "tool_input": {"command": sys.argv[1]}}))
+' "$1")"
+  ( cd "$WORK" && printf '%s' "$payload" \
+      | ROMMSYNC_FLEET_DIR="$ROMMSYNC_FLEET_DIR" \
+        python3 "$REPO_ROOT/.claude/hooks/guard.py" >/dev/null 2>&1 )
+  printf '%s' "$?"
+}
+
 # Both watchers in ONE process, which is what a real poll is: they share the
 # per-poll answer cache and the state dir, and only there can one of them undo
 # what the other just wrote.
@@ -645,6 +714,29 @@ blind_ps() { printf '1\n' >"$PS_BLIND"; }
 pid_gone() {
   local i=0
   while [ "$i" -lt 50 ]; do
+    kill -0 "$1" 2>/dev/null || return 0
+    sleep 0.1; i=$((i + 1))
+  done
+  return 1
+}
+
+# A line the running dispatcher has printed, waited for rather than raced. Ten
+# seconds against a one-second poll: the phases that use it drive a real
+# dispatcher through two passes, and a fixed sleep would either be flaky or be
+# most of the suite's runtime.
+wait_for_log() {
+  local i=0
+  while [ "$i" -lt 100 ]; do
+    grep -q "$1" "$WORK/run.log" 2>/dev/null && return 0
+    sleep 0.1; i=$((i + 1))
+  done
+  fail "the dispatcher never said '$1': $(cat "$WORK/run.log" 2>/dev/null)"
+}
+
+# ...and its exit, which is the thing a drain is supposed to reach on its own.
+run_ended() {
+  local i=0
+  while [ "$i" -lt 200 ]; do
     kill -0 "$1" 2>/dev/null || return 0
     sleep 0.1; i=$((i + 1))
   done
@@ -1423,12 +1515,25 @@ JSON
     dispatcher_running
     in_fleet record_dispatcher
     merge_fleet_fix "a fix the running dispatcher never parsed"
-    : >"$ROMMSYNC_FLEET_DIR/STOP"
+    : >"$ROMMSYNC_FLEET_DIR/DRAIN"
     out="$(in_fleet cmd_status 2>&1)"
-    grep -q "STOPPED" <<<"$out" || fail "a stop stopped being reported: $out"
+    grep -q "DRAINING" <<<"$out" || fail "a drain stopped being reported: $out"
     grep -qi "not live" <<<"$out" \
       || fail "a draining dispatcher hid its staleness behind the stop, and a drain is exactly when it keeps running: $out"
-    echo "ok: stopped and still up says both"
+    echo "ok: draining and still up says both"
+    ;;
+  status_stopped)
+    make_fixture ok
+    make_repo_git
+    mkdir -p "$ROMMSYNC_FLEET_DIR"; : >"$ROMMSYNC_FLEET_DIR/STOP"
+    out="$(in_fleet cmd_status 2>&1)"
+    grep -q "STOPPED" <<<"$out" || fail "a hard stop stopped being reported: $out"
+    # The two are not the same state and the screen may not blur them: a drain
+    # lets agents finish and a stop freezes them, and the person reading this is
+    # deciding whether to wait.
+    grep -q "DRAINING" <<<"$out" \
+      && fail "it called a hard stop a drain, so nothing on the screen says whether the agents are frozen: $out"
+    echo "ok: status keeps the two states apart"
     ;;
   status_drained)
     make_fixture ok
@@ -1597,10 +1702,10 @@ JSON
       || fail "it refused without naming the pid that holds it, which is the one thing you need: $out"
     grep -q "kill $HELD_PID" <<<"$out" \
       || fail "it did not say how to take over; a person restarting a stale dispatcher is doing the right thing: $out"
-    # The takeover a person actually performs is a bare kill. `stop.sh` writes
-    # the STOP file, and while that is set no agent can push, open a PR or
-    # comment -- with three worktrees mid-work that is a worse cure than the
-    # disease, so the refusal has to say which is which.
+    # Both takeovers, because they cost different things: a drain is safe with
+    # agents mid-work (#183) but waits hours for their PRs, and a bare kill is
+    # immediate and gives up the reaping. A refusal that named only one sends
+    # somebody to the wrong one.
     grep -q "stop.sh" <<<"$out" \
       || fail "it never mentions the stop, so nothing warns that a restart via stop.sh freezes every agent: $out"
     [ "$(cat "$ROMMSYNC_FLEET_DIR/fleet.pid")" = "$HELD_PID" ] \
@@ -1629,7 +1734,151 @@ JSON
       || fail "it never started: $out"
     echo "ok: a pidfile whose process is gone does not refuse"
     ;;
+  drain_ends_on_merge)
+    make_fixture ok
+    make_worktree
+    add_origin
+    # Past its time-box, and kept only because its PR is open -- which is the
+    # state every worktree in a real drain is in.
+    make_overdue
+    agent_state working
+    issue_state OPEN; issue_labels "ready"
+    echo '[{"number":9,"body":"Closes #42"}]' >"$GH_PRS"
+    : >"$GH_MERGED"
+    ( in_fleet cmd_run --auto >"$WORK/run.log" 2>&1 ) &
+    HELD_PID=$!
+    wait_for_log "fleet up"
+    in_fleet cmd_stop >/dev/null 2>&1
+    # Either line will do: the drain is noticed at the top of a pass, or in the
+    # launch loop when it appears mid-pass, and which one a real `stop.sh` hits
+    # is a race this phase must not depend on.
+    wait_for_log "draining"
+    # ...and now the PR the drain is waiting on merges, which is what a drain
+    # that also froze the agents made impossible.
+    echo 7 >"$GH_MERGED"
+    run_ended "$HELD_PID" \
+      || fail "the drain never ended; it is waiting for something only the time-box will now resolve: $(cat "$WORK/run.log")"
+    HELD_PID=""
+    grep -q "everything in flight has landed" "$WORK/run.log" \
+      || fail "it exited for some other reason than the work landing: $(cat "$WORK/run.log")"
+    [ -e "$ROMMSYNC_FLEET_DIR/gaveup-42" ] \
+      && fail "the time-box gave the worktree up; that is the three-hours-each ending #183 is about: $(cat "$WORK/run.log")"
+    grep -q -- "--interrupt" "$ORCA_CALLS" \
+      && fail "a drain interrupted an agent, which is --now's job and not this one"
+    echo "ok: a drain ends when the work in flight lands, not at the time-box"
+    ;;
+  drain_after_stop)
+    make_fixture ok
+    in_fleet cmd_stop --now >/dev/null 2>&1
+    out="$(in_fleet cmd_stop 2>&1)"
+    grep -q "STILL SET" <<<"$out" \
+      || fail "a drain over a stop said nothing about the stop, and the agents it promises are finishing are frozen: $out"
+    grep -q "NOT frozen" <<<"$out" \
+      && fail "it told you the agents were free to push while $ROMMSYNC_FLEET_DIR/STOP was still there: $out"
+    [ -e "$ROMMSYNC_FLEET_DIR/STOP" ] \
+      || fail "the drain cleared the stop; lifting one is resume's job and nothing here asked for it: $out"
+    echo "ok: a drain does not lift a stop, and does not pretend it did"
+    ;;
+  stop_writes_drain)
+    make_fixture ok
+    out="$(in_fleet cmd_stop 2>&1)"
+    [ -e "$ROMMSYNC_FLEET_DIR/DRAIN" ] \
+      || fail "a drain wrote no DRAIN file, so nothing tells the dispatcher to stop launching: $out"
+    [ -e "$ROMMSYNC_FLEET_DIR/STOP" ] \
+      && fail "a drain wrote the STOP file, which is what guard.py reads -- the PRs it now waits for cannot be opened (#183): $out"
+    grep -q "finish" <<<"$out" \
+      || fail "it never says the agents may finish, which is the whole difference from --now: $out"
+    echo "ok: a drain sets the drain and nothing else"
+    ;;
+  stop_now_writes_both)
+    make_fixture ok
+    out="$(in_fleet cmd_stop --now 2>&1)"
+    [ -e "$ROMMSYNC_FLEET_DIR/STOP" ] \
+      || fail "--now let the agents keep pushing; it is the escape hatch and #183 must not have widened it: $out"
+    [ -e "$ROMMSYNC_FLEET_DIR/DRAIN" ] \
+      || fail "--now froze the agents and left the dispatcher free to launch more: $out"
+    echo "ok: a hard stop is a drain plus a freeze"
+    ;;
+  drain_lets_agents_finish)
+    make_fixture ok
+    mkdir -p "$ROMMSYNC_FLEET_DIR"
+    # The control first, so the allow below is not the guard failing to see this
+    # fleet dir at all: with the STOP file set it must refuse.
+    : >"$ROMMSYNC_FLEET_DIR/STOP"
+    [ "$(guard_says 'git push')" = 2 ] \
+      || fail "guard.py did not refuse a push under STOP, so this phase cannot tell an allow from a hook it never reached"
+    rm -f "$ROMMSYNC_FLEET_DIR/STOP"
+    out="$(in_fleet cmd_stop 2>&1)"
+    [ "$(guard_says 'git push')" = 0 ] \
+      || fail "a drain still blocks the push, so it waits for PRs it has itself forbidden and ends only at the time-box (#183): $out"
+    [ "$(guard_says 'gh pr create --fill')" = 0 ] \
+      || fail "a drain still blocks opening the PR, and a merged PR is what releases the worktree it is waiting on: $out"
+    echo "ok: a drain lets the work in flight finish"
+    ;;
+  stop_freezes_agents)
+    make_fixture ok
+    out="$(in_fleet cmd_stop --now 2>&1)"
+    [ "$(guard_says 'git push')" = 2 ] \
+      || fail "a hard stop no longer stops a push: $out"
+    [ "$(guard_says 'gh pr create --fill')" = 2 ] \
+      || fail "a hard stop no longer stops a PR: $out"
+    [ "$(guard_says 'ctest --test-dir build')" = 0 ] \
+      || fail "it froze the machine rather than what leaves it; reading, building and testing stay open: $out"
+    echo "ok: --now still stops every outward effect"
+    ;;
+  drain_launches_nothing)
+    make_fixture ok
+    in_fleet cmd_stop >/dev/null 2>&1
+    out="$(run_one_pass)"; rc=$?
+    [ "$rc" = 0 ] \
+      && fail "a drain let a new dispatcher start, so the half a drain must keep is gone: $out"
+    grep -qi "drain" <<<"$out" \
+      || fail "it refused without saying which of the two states it is in: $out"
+    echo "ok: a drain still starts nothing new"
+    ;;
+  resume_clears_both)
+    make_fixture ok
+    in_fleet cmd_stop --now >/dev/null 2>&1
+    # Both, before: a `resume` asserted against files that were never there
+    # passes on a fleet that writes neither.
+    for f in STOP DRAIN; do
+      [ -e "$ROMMSYNC_FLEET_DIR/$f" ] \
+        || fail "--now did not set $f, so the resume below clears nothing and asserts nothing"
+    done
+    out="$(in_fleet cmd_resume 2>&1)"
+    [ -e "$ROMMSYNC_FLEET_DIR/STOP" ] \
+      && fail "resume left the STOP file, so no agent can push and nothing says why: $out"
+    [ -e "$ROMMSYNC_FLEET_DIR/DRAIN" ] \
+      && fail "resume left the DRAIN file, so run goes on refusing with the stop apparently cleared: $out"
+    echo "ok: resume clears both files"
+    ;;
+  stop_drain_blind_dispatcher)
+    make_fixture ok
+    make_repo_git
+    dispatcher_running
+    # A dispatcher that recorded what it parsed, and knows the drain file.
+    in_fleet record_dispatcher
+    out="$(in_fleet cmd_stop 2>&1)"
+    grep -q "WARNING" <<<"$out" \
+      && fail "it warned about a dispatcher that reads the drain file perfectly well: $out"
+    # ...and one from before #183. It leaves a FULL record that simply lacks the
+    # drain= line -- record_dispatcher has written root, started, commit and
+    # hash since #173 -- so removing the file instead would also empty `root`
+    # and only ever exercise the warning's fallback half.
+    grep -v '^drain=' "$ROMMSYNC_FLEET_DIR/dispatcher" >"$WORK/old-record"
+    mv "$WORK/old-record" "$ROMMSYNC_FLEET_DIR/dispatcher"
+    out="$(in_fleet cmd_stop 2>&1)"
+    grep -q "WARNING" <<<"$out" \
+      || fail "a drain that pid $HELD_PID cannot see looked exactly like one it can, while it kept launching worktrees: $out"
+    grep -q "kill $HELD_PID" <<<"$out" \
+      || fail "the warning does not say how to take that dispatcher over: $out"
+    # Its OWN checkout, the way every other restart this file prints does: a
+    # relative `run --auto` starts a dispatcher in whatever worktree you typed it.
+    grep -q "cd $WORK/repo && ./scripts/orca/fleet.sh run --auto" <<<"$out" \
+      || fail "the takeover does not name the dispatcher's own checkout: $out"
+    echo "ok: a dispatcher too old to see the drain is not drained in silence"
+    ;;
   *)
-    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind|status_stale|status_current|status_unrecorded|status_from_worktree|status_draining|status_drained|status_behind|status_behind_revert|status_unreadable|status_names_root|run_refuses|run_stale_recycled|run_stale_gone|status_recycled|stop_spares_stranger|stop_stops_dispatcher|run_blind_ps|status_blind_ps|stop_blind_ps" >&2
+    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind|status_stale|status_current|status_unrecorded|status_from_worktree|status_draining|status_stopped|status_drained|status_behind|status_behind_revert|status_unreadable|status_names_root|run_refuses|run_stale_recycled|run_stale_gone|status_recycled|stop_spares_stranger|stop_stops_dispatcher|run_blind_ps|status_blind_ps|stop_blind_ps|drain_ends_on_merge|drain_after_stop|stop_writes_drain|stop_now_writes_both|drain_lets_agents_finish|stop_freezes_agents|drain_launches_nothing|resume_clears_both|stop_drain_blind_dispatcher" >&2
     exit 2 ;;
 esac
