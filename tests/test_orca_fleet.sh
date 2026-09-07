@@ -59,6 +59,14 @@
 #                                     is the line-a-minute the markers prevent.
 #   test_orca_fleet.sh one_lookup     both watchers in one poll -> one `gh` call
 #                                     for one issue's labels, not two.
+#   test_orca_fleet.sh box_marker_go  the exemption ends (a PR opened) -> every
+#                                     marker enforce_timebox owns is cleared,
+#                                     not only the ones it set on the way in. A
+#                                     stale one swallows the NEXT worktree's
+#                                     first outage report.
+#   test_orca_fleet.sh one_card       exempt, waiting and past the box -> ONE
+#                                     board comment in the poll, not two, and it
+#                                     still says both things a person needs.
 #
 # The Orca CLI and gh are stubbed on PATH; the fleet state dir is a temp dir.
 # Nothing here touches a real worktree, docker, or GitHub.
@@ -407,7 +415,39 @@ JSON
       || fail "asked GitHub $n times for one issue labels in one poll"
     echo "ok: one poll asks for an issue labels once"
     ;;
+  box_marker_go)
+    make_fixture ok
+    make_worktree
+    make_overdue
+    agent_state working
+    # Past the box with the label lookup failing: the outage marker goes down.
+    issue_labels FAIL
+    in_fleet enforce_timebox >/dev/null 2>&1
+    [ -e "$ROMMSYNC_FLEET_DIR/box-labels-42" ] \
+      || fail "the outage marker was never set, so this asserts nothing"
+    # Then a PR opens, which ends the time-box for this worktree entirely.
+    echo '[{"number":9,"body":"Closes #42"}]' >"$GH_PRS"
+    make_overdue
+    in_fleet enforce_timebox >/dev/null 2>&1
+    [ -e "$ROMMSYNC_FLEET_DIR/box-labels-42" ] \
+      && fail "a stale outage marker survives, and it swallows the next worktree first report"
+    echo "ok: the time-box clears every marker it owns when it lets an issue go"
+    ;;
+  one_card)
+    make_fixture ok
+    make_worktree
+    make_overdue
+    agent_state waiting
+    issue_labels "ready,needs-human-step"
+    in_poll enforce_timebox notice_stalled >/dev/null 2>&1
+    n="$(grep -c "waiting for you" "$ORCA_CALLS")"
+    [ "$n" = 1 ] \
+      || fail "put $n near-duplicate comments on the board in one poll"
+    grep -q "past the time-box" "$ORCA_CALLS" \
+      || fail "the comment that survived does not say it is past the box: $(cat "$ORCA_CALLS")"
+    echo "ok: one poll leaves one board comment, and it says both things"
+    ;;
   *)
-    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup" >&2
+    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|box_marker_go|one_card" >&2
     exit 2 ;;
 esac
