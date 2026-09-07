@@ -1263,6 +1263,41 @@ release_dispatcher_files() {
   rm -f "$PIDFILE" "$DISPATCHER_FILE"
 }
 
+# Is $1 a pid this machine can still see running a DISPATCHER? THREE answers,
+# because "ps would not say" is not "no" -- the same shape report_dispatcher_code
+# already uses for a fleet.sh it cannot hash.
+#
+#   0  yes: alive, and its command line names a `fleet.sh run`.
+#   1  no:  the process is gone, or ps named something that is not a dispatcher.
+#   2  cannot say: it is alive, and ps produced no line to judge it by.
+#
+# The middle answer is the point. A `kill -9`'d dispatcher leaves its pidfile
+# behind, the OS wraps round and hands that number to somebody else, and a check
+# that asked `kill -0` alone would from then on refuse to start the fleet at all
+# -- forever, on the strength of a stranger's process. lib.sh's
+# orca_stop_autostart_watcher takes the same precaution for the same reason,
+# before it SIGNALS a pid it did not watch die.
+#
+# `run` as well as the file name, because only `fleet.sh run` is a dispatcher.
+# `fleet.sh status` is run constantly and from every worktree; a recycled pid
+# landing on one of those would be a refusal with nothing behind it to stop.
+#
+# The third answer exists because the callers want opposite things from it. A
+# `ps` that cannot answer -- a container without procps, a launch shape whose
+# argv does not carry the script path -- must not let `run` hold the fleet down,
+# and must not stop `stop --now` SIGNALLING the dispatcher it promises to stop.
+# Collapsing it into "no" would do both: `--now` would interrupt every agent,
+# announce that there was no dispatcher, leave it polling, and let the next `run`
+# start a second one -- #179 rebuilt inside the check for it.
+dispatcher_alive() {
+  local pid="${1:-}" line
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  line="$(ps -o command= -p "$pid" 2>/dev/null)"
+  [ -n "$line" ] || return 2
+  printf '%s\n' "$line" | grep -Eq 'fleet\.sh[[:space:]]+run([[:space:]]|$)'
+}
+
 # How to make a change live, said wherever the change is not. The cap is here
 # because it has the same shape and is asked about far more often: MAX_WORKTREES
 # is read once at start, so `ROMMSYNC_FLEET_MAX=4` in front of `status` changes
@@ -1289,6 +1324,80 @@ restart_advice() {
   fi
   echo "  ROMMSYNC_FLEET_MAX, _POLL and _TIMEBOX are read at start too, so they"
   echo "  change only across a restart. docs/WORKFLOW.md, 'Restart it'."
+}
+
+# The refusal `fleet.sh run` prints when a dispatcher is already up, and how to
+# get past it. A person starting a second one is usually doing the right thing
+# for the wrong reason -- the first is running stale code and a restart is the
+# remedy `status` names -- so this ends with a takeover they can follow rather
+# than just a no.
+#
+# It calls restart_advice() for the drain rather than restating it. That
+# sequence is docs/WORKFLOW.md's, restart_advice's comment says it has to stay
+# in that order, and a second copy here is a second place to forget -- it also
+# gets the `cd $root` for free, which matters most in exactly this message: the
+# refusal is read from wherever you typed `run`, and a relative `run --auto`
+# there starts a dispatcher in a directory the fleet removes when that
+# worktree's PR merges (status_names_root is the test for it).
+#
+# BOTH restarts, because only one of them is in WORKFLOW.md and the documented
+# one is unusable with worktrees mid-work: the stop file a drain writes is what
+# guard.py reads before it lets an agent push, open a PR or comment, so the PRs
+# the drain is waiting on cannot land while it waits for them. A bare `kill` is
+# what a person actually does then, and saying so is the difference between a
+# refusal somebody can act on and one they work around by ignoring it.
+refuse_second_dispatcher() {
+  local holder="$1" root
+  # The dispatcher's OWN checkout, not this caller's -- the same asymmetry the
+  # staleness report is built on.
+  root="$(dispatcher_field root)"
+  {
+    cat <<REFUSED
+a dispatcher is already running (pid $holder).
+
+MAX_WORKTREES is enforced per process, so a second one would count the same
+worktrees this one is counting and launch on top of them -- twice the cap
+between them, and two of every reap, board comment and time-box interrupt.
+
+  ./scripts/orca/fleet.sh status
+      what it is running, whether the fleet.sh it parsed is still current, and
+      the \`git pull --ff-only\` when its checkout never pulled the fix -- a
+      restart without that one starts the same bytes over.
+
+To take over -- the usual reason to start a second one is that the first is
+running stale code. With nothing in flight, drain it:
+
+REFUSED
+    # No pull argument, deliberately, and this is the one caller that omits it.
+    # Whether the dispatcher's checkout is BEHIND is report_dispatcher_code's
+    # answer, off an `origin/main` this function has not looked at -- and
+    # re-deriving it here would be a second implementation of the one thing #173
+    # exists to get right. The text above sends the reader to `status` first for
+    # exactly that: it prints the `git pull --ff-only` in its place in the
+    # sequence when there is one to print.
+    restart_advice "$root"
+    cat <<REFUSED
+
+With agents mid-work, do NOT drain: the stop file it writes is what guard.py
+reads before it lets an agent push, open a PR or comment, so the PRs the drain
+is waiting for cannot land while it waits for them. Take this dispatcher over
+and leave the agents alone:
+
+  kill $holder
+  ./scripts/orca/fleet.sh status  # until it says idle
+REFUSED
+    if [ -n "$root" ]; then
+      echo "  cd $root && ./scripts/orca/fleet.sh run --auto"
+    else
+      echo "  ./scripts/orca/fleet.sh run --auto   # from the MAIN worktree"
+    fi
+    cat <<REFUSED
+
+Both are docs/WORKFLOW.md, "Restart it". The pid above came from
+$PIDFILE, and nothing here removed it: it is the running dispatcher's.
+REFUSED
+  } >&2
+  exit 1
 }
 
 # What `status` says about the dispatcher's own code. Three answers, because
@@ -1359,8 +1468,21 @@ cmd_status() {
   if stopped; then
     echo "STOPPED  ($STOP_FILE -- clear with: ./scripts/orca/fleet.sh resume)"
   fi
-  if [ -e "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-    echo "running   (pid $(cat "$PIDFILE"))"
+  # dispatcher_alive, not `kill -0` alone: a pidfile a `kill -9` left behind,
+  # whose pid the OS has since handed to somebody else, would otherwise be
+  # reported as a dispatcher that is running -- and `run` would start one
+  # anyway, because it asks the stricter question. Two screens disagreeing about
+  # whether the fleet is up is worse than either answer.
+  local pid; pid="$(cat "$PIDFILE" 2>/dev/null)"
+  dispatcher_alive "$pid"; local live=$?
+  if [ "$live" != 1 ]; then
+    if [ "$live" = 2 ]; then
+      # Alive, unidentifiable. Not `idle` -- a report that fails open here sends
+      # somebody to start a second dispatcher, which is the whole of #179.
+      echo "running?  (pid $pid -- alive, but ps would not say whether it is a dispatcher)"
+    else
+      echo "running   (pid $pid)"
+    fi
     report_dispatcher_code
   else
     # Printed while stopped too. A drain ends when the dispatcher exits, and
@@ -1436,8 +1558,23 @@ for t in json.load(sys.stdin)["result"]["terminals"]:
       fi
       # Only here. A drain has to leave the dispatcher alive: it is what reaps a
       # worktree once its PR merges, and killing it strands them.
-      if [ -e "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-        kill "$(cat "$PIDFILE")" 2>/dev/null && echo "  dispatcher stopped."
+      #
+      # dispatcher_alive before the signal, which is the whole of lib.sh's
+      # orca_stop_autostart_watcher in one line: this is the only place the
+      # fleet SIGNALS a pid it read out of a file, and a pidfile a `kill -9`
+      # left behind names whoever the OS has since given that number to.
+      local held; held="$(cat "$PIDFILE" 2>/dev/null)"
+      dispatcher_alive "$held"; local held_is=$?
+      # Signalled on "yes" AND on "cannot say". `--now` promises the dispatcher
+      # is down when it returns, and a ps that would not answer is not a reason
+      # to break that promise and leave it polling -- it is exactly the state
+      # where a false "nothing to stop" produces the second dispatcher.
+      if [ "$held_is" != 1 ]; then
+        kill "$held" 2>/dev/null && echo "  dispatcher stopped."
+        [ "$held_is" = 2 ] \
+          && echo "  (ps would not say what pid $held was; signalled it because --now promises it is down.)"
+      elif [ -e "$PIDFILE" ]; then
+        echo "  no dispatcher to stop; $PIDFILE names pid ${held:-nothing}, which is not one."
       fi ;;
     "")
       echo "  running agents finish what they are on, and the dispatcher stays up to"
@@ -1504,7 +1641,63 @@ cmd_run() {
     esac
   done
   $auto || [ "${#wanted[@]}" -gt 0 ] || die "give issue numbers, or --auto"
-  stopped && die "the fleet is stopped ($STOP_FILE). Clear it with: fleet.sh resume"
+  # The stop is checked first, and it has to say more than "stopped" when a
+  # dispatcher is still draining behind it. That sentence IS the way in: a drain
+  # leaves the dispatcher up on purpose, `status` says `running (pid N)`
+  # throughout, and somebody who reads "stopped" as "down" runs `resume` and
+  # `run --auto`. The refusal below would then catch them, but a message that
+  # sends them there in the first place is a worse place to be caught.
+  if stopped; then
+    # `held`, not `draining`: cmd_run declares a `local draining=false` further
+    # down and RUNS it as a command (`! $draining`). Both branches here die, so
+    # the collision is harmless today and would not stay that way.
+    local held; held="$(cat "$PIDFILE" 2>/dev/null)"
+    if dispatcher_alive "$held"; then
+      die "the fleet is stopped ($STOP_FILE), and pid $held is still DRAINING:
+launching nothing new, and reaping what is in flight until nothing it owns is
+left, which is what a drain is. It exits on its own; watch it with
+\`fleet.sh status\`, and only then start one.
+
+\`fleet.sh resume\` clears the stop. It does NOT make room for a second
+dispatcher -- MAX_WORKTREES is enforced per process, so \`run\` would refuse
+while that one is up."
+    fi
+    die "the fleet is stopped ($STOP_FILE). Clear it with: fleet.sh resume"
+  fi
+
+  # One dispatcher per machine, checked before the pidfile is claimed rather
+  # than trusted from it: `fleet.pid` names whoever started LAST, so before this
+  # the second dispatcher simply became the recorded one and the first kept
+  # polling unrecorded (#179).
+  #
+  # The way in is ordinary rather than exotic. A drain leaves the dispatcher up
+  # on purpose -- it is what reaps a worktree once its PR merges -- and `status`
+  # says `running (pid N)` for as long as that lasts. And #173's staleness
+  # report answers "a dispatcher older than its own fleet.sh" with "restart it",
+  # so making staleness visible is also what multiplies the restarts this has to
+  # catch.
+  #
+  # Read-then-claim, and the window between them is not closed: two dispatchers
+  # started inside the same millisecond would both get past this. That is not
+  # the way in -- the drain leaves the first one up for HOURS and somebody
+  # resumes on top of it -- and an atomic claim wants a temp file or an
+  # O_EXCL dance whose leftovers are their own failure mode in a state dir a
+  # `kill -9` already litters.
+  local holder; holder="$(cat "$PIDFILE" 2>/dev/null)"
+  dispatcher_alive "$holder"
+  case $? in
+    0) refuse_second_dispatcher "$holder" ;;
+    # Alive, and ps had nothing to judge it by. It starts -- a fleet one stale
+    # file can hold down forever is the failure this check exists to avoid, and
+    # the acceptance for #179 says so outright. But it does not start SILENTLY:
+    # if that pid really is a dispatcher, this is the two-of-them case and the
+    # only warning anybody gets.
+    2) say "WARNING: $PIDFILE names pid $holder, which is alive, and ps would not say what it is."
+       say "         Starting anyway -- one unreadable pidfile may not hold the fleet down."
+       say "         But if pid $holder IS a dispatcher there are now two, each enforcing"
+       say "         MAX_WORKTREES on its own. Find out before you leave this running:"
+       say "           ps -p $holder" ;;
+  esac
 
   echo $$ >"$PIDFILE"
   # Written next to the pidfile and removed with it: a record of a dispatcher

@@ -173,6 +173,45 @@ reaps a worktree once its PR merges, so killing it strands the stacks under
 agents and stops the dispatcher immediately; anything it had not reaped is then
 yours, with `./scripts/orca/reap.sh --yes`.
 
+**With agents mid-work, a drain is the wrong tool.** The stop file it writes is
+also what `guard.py` reads before it lets an agent push, open a PR or comment —
+so the PRs the drain is waiting on cannot land while it waits for them, and it
+ends only when the time-box gives each worktree up, three hours at a time. To
+restart the dispatcher and leave the agents alone, take it over directly:
+
+```bash
+./scripts/orca/fleet.sh status  # names the pid, and verifies it is a dispatcher
+kill <that pid>
+./scripts/orca/fleet.sh status  # until it says `idle`
+cd /path/to/rommsync-nx && ./scripts/orca/fleet.sh run --auto
+```
+
+`status` first, and take the pid from it rather than from `cat fleet.pid`. The
+pidfile alone names whoever wrote it last; if a `kill -9` left it behind and the
+OS has since recycled that number, `kill $(cat …)` signals a stranger — plausibly
+one of the agents. `status` is what checks.
+
+**Only one dispatcher runs at a time**, and `fleet.sh run` refuses to be the
+second: `MAX_WORKTREES` is enforced per process, so two of them count the same
+worktrees and open twice the cap between them, then reap, card and interrupt
+each other's (#179). The refusal names the pid that holds
+`~/.rommsync-fleet/fleet.pid` and prints both restarts above.
+
+It refuses only to a dispatcher this machine can still see running one: `kill
+-0` *and* `ps` still naming a `fleet.sh run`. A pidfile a `kill -9` left behind,
+or whose pid the OS has since handed to an unrelated process, is taken over
+rather than obeyed — otherwise one stale file would hold the fleet down for
+good. `status` and `stop --now` ask the same question, so they cannot disagree
+about whether the fleet is up, and `--now` will not signal a pid that is no
+longer a dispatcher.
+
+There is a third answer, and the two commands want opposite things from it: a
+pid that is alive while `ps` says nothing at all about it. `status` reports
+`running?` rather than `idle`, because `idle` is the line that sends somebody to
+start a second dispatcher. `run` starts anyway — one unreadable pidfile may not
+hold the fleet down — but warns and names the pid. `stop --now` signals it
+anyway, because it promises the dispatcher is down when it returns.
+
 **The settings work the same way.** `ROMMSYNC_FLEET_MAX` (how many worktrees run
 at once, default 3), `ROMMSYNC_FLEET_POLL` and `ROMMSYNC_FLEET_TIMEBOX` are read
 once at start, so putting one in front of `fleet.sh status` changes nothing. The
