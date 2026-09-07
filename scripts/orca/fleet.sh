@@ -1195,14 +1195,176 @@ enforce_timebox() {
   done
 }
 
+# ------------------------------------------------------- the running code ---
+# `fleet.sh run` parses this file ONCE, at start, and never re-reads it. So a fix
+# merged to `main` is live in the worktree and not live in the dispatcher that is
+# running -- and the confusing half is that a change is only HALF dead: the queue
+# filter kept working across four PRs because that path re-reads labels through
+# `gh` every poll, while the half living in already-parsed shell functions did
+# not run for 27 hours (#173).
+#
+# Nothing can fix that from in here; a dispatcher cannot re-read itself mid-pass
+# without a claim about resumable state that is not tested. What it CAN do is
+# stop being silent about it: record what it parsed, and let `status` compare.
+DISPATCHER_FILE="$STATE_DIR/dispatcher"
+
+# The content of the file that was parsed, not the commit that last touched it.
+# The commit is only how the report NAMES what changed: a fix that is committed
+# but not checked out, and a checkout somebody edited, are both "not what is
+# running", and only the bytes say so.
+#
+# cksum rather than shasum: this is a change detector, not a security boundary,
+# and cksum is the one that is everywhere.
+#
+# Both take the root to look in, and the report passes the one the DISPATCHER
+# recorded rather than $REPO_ROOT. The dispatcher runs in the main worktree and
+# `fleet.sh status` is run from wherever you are -- CLAUDE.md points agents in a
+# fleet worktree at it. Hashing the caller's own copy compares a worktree
+# branched before the fix against a dispatcher that predates it too, matches,
+# and answers "current": #173's silence, rebuilt inside the check for it.
+fleet_hash_stdin() { cksum | awk '{print $1 "-" $2}'; }
+fleet_code_hash() {
+  [ -r "$1/scripts/orca/fleet.sh" ] || return 0
+  fleet_hash_stdin <"$1/scripts/orca/fleet.sh"
+}
+fleet_code_commit() {
+  git -C "$1" log -1 --format=%H -- scripts/orca/fleet.sh 2>/dev/null
+}
+
+# The fleet.sh commits in $2..$3, in the repo at $1, or nothing. A ref that does
+# not resolve -- no `origin`, a checkout with no history in common -- is nothing
+# to name rather than an error on the screen.
+fleet_commits_between() {
+  [ -n "$2" ] || return 0
+  git -C "$1" rev-parse --verify --quiet "$3" >/dev/null 2>&1 || return 0
+  git -C "$1" log --oneline "$2..$3" -- scripts/orca/fleet.sh 2>/dev/null
+}
+
+# BSD date and GNU date spell "format this epoch" differently, and this runs on
+# both -- macOS here, Linux in CI.
+fmt_epoch() {
+  date -r "$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+    || date -d "@$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+    || printf 'an unreadable time (%s)\n' "$1"
+}
+
+record_dispatcher() {
+  mkdir -p "$STATE_DIR"
+  { printf 'root=%s\n'    "$REPO_ROOT"
+    printf 'started=%s\n' "$(date +%s)"
+    printf 'commit=%s\n'  "$(fleet_code_commit "$REPO_ROOT")"
+    printf 'hash=%s\n'    "$(fleet_code_hash "$REPO_ROOT")"
+  } >"$DISPATCHER_FILE"
+}
+dispatcher_field() { sed -n "s/^$1=//p" "$DISPATCHER_FILE" 2>/dev/null | head -1; }
+
+release_dispatcher_files() {
+  [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ] || return 0
+  rm -f "$PIDFILE" "$DISPATCHER_FILE"
+}
+
+# How to make a change live, said wherever the change is not. The cap is here
+# because it has the same shape and is asked about far more often: MAX_WORKTREES
+# is read once at start, so `ROMMSYNC_FLEET_MAX=4` in front of `status` changes
+# nothing at all.
+# $2 is the pull a BEHIND checkout needs, printed in its place in the sequence
+# rather than ahead of it. The steps are in the order docs/WORKFLOW.md gives
+# them, and they have to stay in it: this output points the reader at that
+# section, and a screen that contradicts the page it cites is worse than either
+# alone.
+restart_advice() {
+  local root="${1:-}" pull="${2:-}"
+  echo "  Restart it -- it is the only way a change to fleet.sh takes effect:"
+  echo "    ./scripts/orca/stop.sh          # drains; --now interrupts the agents"
+  echo "    ./scripts/orca/fleet.sh status  # until it says idle"
+  [ -n "$pull" ] && echo "    $pull"
+  echo "    ./scripts/orca/fleet.sh resume"
+  # Named, not relative. This report is meant to be read from a fleet worktree,
+  # and `./scripts/orca/fleet.sh run --auto` there starts a dispatcher whose cwd
+  # and checkout the fleet removes as soon as that worktree's PR merges.
+  if [ -n "$root" ]; then
+    echo "    cd $root && ./scripts/orca/fleet.sh run --auto"
+  else
+    echo "    ./scripts/orca/fleet.sh run --auto   # from the MAIN worktree"
+  fi
+  echo "  ROMMSYNC_FLEET_MAX, _POLL and _TIMEBOX are read at start too, so they"
+  echo "  change only across a restart. docs/WORKFLOW.md, 'Restart it'."
+}
+
+# What `status` says about the dispatcher's own code. Three answers, because
+# "could not tell" is not "current": a staleness report that fails open is the
+# same silence #173 was.
+report_dispatcher_code() {
+  local root started commit hash now log remote
+  root="$(dispatcher_field root)"
+  started="$(dispatcher_field started)"
+  hash="$(dispatcher_field hash)"
+  commit="$(dispatcher_field commit)"
+  # -r, not -e: fleet_code_hash answers nothing for a file it cannot READ, and
+  # nothing compares unequal to the recorded hash -- which would report a
+  # dispatcher as STALE on the strength of a permission error. "Cannot say" is
+  # the honest answer to every question this cannot ask.
+  if [ -z "$hash" ] || [ -z "$root" ] || [ ! -r "$root/scripts/orca/fleet.sh" ]; then
+    echo "  it recorded no fleet.sh at start -- it predates this check, or the"
+    echo "  checkout it started from is gone -- so this cannot say whether a"
+    echo "  recent fix is live in it."
+    restart_advice
+    return 0
+  fi
+  [ -n "$started" ] && echo "  up since $(fmt_epoch "$started")${commit:+, running fleet.sh @ ${commit:0:7}}"
+  now="$(fleet_code_hash "$root")"
+  if [ -n "$now" ] && [ "$now" = "$hash" ]; then
+    # The bytes it parsed are still the bytes on disk, which is not the end of
+    # it: nothing in the fleet pulls that checkout, so a fix MERGED while it ran
+    # -- #173's own case -- leaves the file untouched and the hashes equal. The
+    # remote-tracking ref is shared by every worktree of this repo, so asking it
+    # costs nothing and needs no network; a checkout that has genuinely never
+    # fetched simply has nothing to name.
+    log="$(fleet_commits_between "$root" "$commit" origin/main)"
+    [ -n "$log" ] || return 0
+    # ...and those commits have to leave the file actually different. A change
+    # and its revert are two commits that name each other out, and telling
+    # somebody to pull and restart for bytes already running is the report
+    # crying wolf on its own first outing.
+    remote="$(git -C "$root" show origin/main:scripts/orca/fleet.sh 2>/dev/null | fleet_hash_stdin)"
+    [ -n "$remote" ] && [ "$remote" = "$hash" ] && return 0
+    echo
+    echo "  BEHIND -- $root has not pulled these, so they are NOT live in the"
+    echo "  dispatcher running, and a restart alone will not make them live:"
+    printf '%s\n' "$log" | sed 's/^/    /'
+    restart_advice "$root" "git -C $root pull --ff-only"
+    return 0
+  fi
+
+  echo
+  echo "  STALE -- $root/scripts/orca/fleet.sh has changed since it started, and"
+  echo "  it parses the file once. These are NOT live in the dispatcher running:"
+  log="$(fleet_commits_between "$root" "$commit" HEAD)"
+  if [ -n "$log" ]; then
+    printf '%s\n' "$log" | sed 's/^/    /'
+  else
+    # The bytes differ and git cannot name the difference -- an uncommitted edit,
+    # or a checkout that never had that commit. Still stale.
+    echo "    (git cannot name them from ${commit:-nothing recorded}; the file on disk differs)"
+  fi
+  restart_advice "$root"
+}
+
 # --------------------------------------------------------------- commands ---
 cmd_status() {
   echo "fleet state: $STATE_DIR"
+  # A stop and a running dispatcher are not alternatives: a drain leaves the
+  # dispatcher up on purpose, because it is what reaps a worktree once its PR
+  # merges -- and that draining dispatcher is running whatever code it parsed.
   if stopped; then
     echo "STOPPED  ($STOP_FILE -- clear with: ./scripts/orca/fleet.sh resume)"
-  elif [ -e "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  fi
+  if [ -e "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
     echo "running   (pid $(cat "$PIDFILE"))"
+    report_dispatcher_code
   else
+    # Printed while stopped too. A drain ends when the dispatcher exits, and
+    # this is the line that says it has -- WORKFLOW.md's restart waits for it.
     echo "idle      (no dispatcher running)"
   fi
   echo
@@ -1345,7 +1507,15 @@ cmd_run() {
   stopped && die "the fleet is stopped ($STOP_FILE). Clear it with: fleet.sh resume"
 
   echo $$ >"$PIDFILE"
-  trap 'rm -f "$PIDFILE"' EXIT
+  # Written next to the pidfile and removed with it: a record of a dispatcher
+  # that is not running would report staleness about nothing.
+  record_dispatcher
+  # ...but removed only while they still name THIS process. Nothing stops a
+  # second dispatcher from starting and claiming both files, and an unconditional
+  # `rm` would then have the first one's exit delete the second one's record --
+  # leaving a live dispatcher reported as idle, with nothing to check its code
+  # against. That is the silence this whole file's staleness report exists to end.
+  trap 'release_dispatcher_files' EXIT
   say "fleet up: max $MAX_WORKTREES worktrees, polling every ${POLL_SECONDS}s, ${TIMEBOX_SECONDS}s per issue"
   $auto && say "mode: auto -- most-unblocking first, until the backlog is empty or you stop it" \
         || say "mode: list -- ${wanted[*]}"

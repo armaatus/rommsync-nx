@@ -104,6 +104,88 @@ Three things read it, so it holds even when nothing cooperates:
 
 Nothing removes that file except `fleet.sh resume`.
 
+## Restart it
+
+`fleet.sh run` is a long-lived bash process. It parses its functions **once**, at
+start, and never re-reads the file. So a fix merged to `main` is live in your
+worktree and *not* live in the dispatcher that is running — and it fails in
+halves, which is what makes it confusing: anything the poll re-derives through
+`gh` (the queue filter, the labels) keeps working, while everything living in an
+already-parsed shell function does not. On 2026-09-07 a dispatcher ran for 27
+hours across four merged PRs that changed `fleet.sh`, none of them running
+(#173).
+
+`fleet.sh status` now says so. It records what it parsed at start, and reports
+the difference:
+
+```
+running   (pid 59280)
+  up since 2026-09-06 16:57:58, running fleet.sh @ 6d610ca
+
+  STALE -- /path/to/rommsync-nx/scripts/orca/fleet.sh has changed since it
+  started, and it parses the file once. These are NOT live in the dispatcher
+  running:
+    3994f12 harness.partial's flake is RomM retiring a gunicorn worker
+    7bdb8ec A worktree whose issue can no longer merge is released
+```
+
+It answers about the **dispatcher's** checkout — the main worktree it was
+started in, recorded at start — not about the one you are standing in. So
+running it from a fleet worktree branched before the fix still says the
+dispatcher is stale, which is the case that actually comes up.
+
+There are two ways to be behind, and it distinguishes them, because they need
+different things done:
+
+- **STALE** — the checkout has the fix and the dispatcher is running the file as
+  it was. A restart is enough.
+- **BEHIND** — the fix merged and *nothing pulled that checkout*. Nothing in the
+  fleet does: an agent rebases its own worktree, never the main one. So the
+  bytes on disk are still the bytes the dispatcher parsed, and a restart alone
+  would start the same old code again. It says so, and prints the `git pull`
+  first. (This is read from the shared `origin/main`, so it costs no network and
+  is as fresh as the last fetch any worktree of this repo made.)
+
+A dispatcher that recorded nothing — one started before this existed, or whose
+checkout has since gone — says "cannot say" and prints the restart anyway. A
+staleness report that fails open is the same silence.
+
+To make a change live:
+
+```bash
+./scripts/orca/stop.sh          # drain: running agents finish, the dispatcher
+                                # stays up to reap their worktrees, then exits
+./scripts/orca/fleet.sh status  # until it says `idle` (it says that while
+                                # stopped too — that is how a drain ends)
+git -C /path/to/rommsync-nx pull --ff-only   # if it said BEHIND
+./scripts/orca/fleet.sh resume  # clear the stop
+cd /path/to/rommsync-nx && ./scripts/orca/fleet.sh run --auto
+```
+
+Start it from the **main worktree**, and only there — which is why `status`
+names that path rather than printing a relative command. A dispatcher started
+inside a fleet worktree has its cwd and its own `fleet.sh` under a directory the
+fleet removes as soon as that worktree's PR merges.
+
+A drain is the polite version and it can take hours — the dispatcher is what
+reaps a worktree once its PR merges, so killing it strands the stacks under
+`restart: unless-stopped`. `./scripts/orca/stop.sh --now` interrupts the fleet's
+agents and stops the dispatcher immediately; anything it had not reaped is then
+yours, with `./scripts/orca/reap.sh --yes`.
+
+**The settings work the same way.** `ROMMSYNC_FLEET_MAX` (how many worktrees run
+at once, default 3), `ROMMSYNC_FLEET_POLL` and `ROMMSYNC_FLEET_TIMEBOX` are read
+once at start, so putting one in front of `fleet.sh status` changes nothing. The
+cap changes across a restart and only there:
+
+```bash
+ROMMSYNC_FLEET_MAX=2 ./scripts/orca/fleet.sh run --auto
+```
+
+Restarting deliberately does *not* clear what the dispatcher gave up on — a
+crash and a reboot are not decisions about an issue. `fleet.sh retry N` is
+still the only way one comes back onto the queue.
+
 ---
 
 ## The loop

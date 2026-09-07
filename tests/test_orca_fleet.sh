@@ -179,6 +179,70 @@
 #                                           could read, and the notice starts over
 #                                           every time GitHub hiccups -- silently.
 #
+# ...and the one thing the dispatcher cannot re-read: itself. `fleet.sh run`
+# parses its functions once, at start, so a fix merged to `main` is live in the
+# worktree and NOT live in the dispatcher that is running -- for 27 hours, over
+# four PRs, with nothing anywhere saying so (#173).
+#
+#   test_orca_fleet.sh status_stale       fleet.sh moved on since the dispatcher
+#                                         started -> status says when it started,
+#                                         NAMES the commits that are not live in
+#                                         it, and says a restart is what fixes
+#                                         it, the cap included.
+#   test_orca_fleet.sh status_current     it is running the file on disk ->
+#                                         still says when it started, and does
+#                                         not cry stale. A warning every poll on
+#                                         a current dispatcher teaches you to
+#                                         ignore the one that matters.
+#   test_orca_fleet.sh status_unrecorded  a dispatcher from before this check ->
+#                                         "cannot say", not "current". A staleness
+#                                         report that fails open is the silence
+#                                         #173 already was.
+#   test_orca_fleet.sh status_from_worktree
+#                                         `status` run from a FLEET worktree,
+#                                         branched before the fix, about the
+#                                         dispatcher in the main one -> still
+#                                         stale. This is the case that actually
+#                                         happens: CLAUDE.md points agents in a
+#                                         worktree at `fleet.sh status`, and
+#                                         comparing the caller's own copy makes
+#                                         two old files agree and reports
+#                                         "current" -- #173 rebuilt inside the
+#                                         check for it.
+#   test_orca_fleet.sh status_draining    stopped but still up -> BOTH lines. A
+#                                         drain leaves the dispatcher running on
+#                                         purpose, and the code it is draining
+#                                         with is the stale code.
+#   test_orca_fleet.sh status_drained     ...and once it exits, `idle` prints
+#                                         WHILE stopped. That line is what the
+#                                         documented restart waits for, and the
+#                                         stop file used to swallow it.
+#   test_orca_fleet.sh status_behind      the checkout it started from never
+#                                         pulled the fix -> BEHIND, naming it and
+#                                         the pull. Nothing in the fleet updates
+#                                         that checkout, so "the bytes on disk
+#                                         are the bytes it parsed" is true of the
+#                                         exact 27 hours #173 is about.
+#   test_orca_fleet.sh status_behind_revert
+#                                         ...but a commit and its revert leave
+#                                         `origin/main` byte-identical to what
+#                                         the dispatcher parsed -> NOT behind.
+#                                         The commits are how the report names
+#                                         what changed; the bytes are what
+#                                         decides that anything did.
+#   test_orca_fleet.sh status_unreadable  the dispatcher's own fleet.sh cannot be
+#                                         READ -> "cannot say", not STALE. A hash
+#                                         nobody could take compares unequal to
+#                                         every recorded one, so a permission
+#                                         error would otherwise be reported as a
+#                                         change.
+#   test_orca_fleet.sh status_names_root  the restart it prints names the
+#                                         dispatcher's OWN checkout. This report
+#                                         is read from a fleet worktree, and a
+#                                         relative `run --auto` there starts a
+#                                         dispatcher in a directory the fleet
+#                                         removes when that PR merges.
+#
 # The Orca CLI and gh are stubbed on PATH; the fleet state dir is a temp dir.
 # Nothing here touches a real worktree, docker, or GitHub.
 set -uo pipefail
@@ -418,6 +482,56 @@ in_fleet() { (cd "$WORK/repo" && . ./scripts/orca/fleet.sh && "$@"); }
 # per-poll answer cache and the state dir, and only there can one of them undo
 # what the other just wrote.
 in_poll() { (cd "$WORK/repo" && . ./scripts/orca/fleet.sh; for fn in "$@"; do "$fn"; done); }
+
+# The fixture repo under git, because "which fixes are not live in the running
+# dispatcher" is answered in commits and cannot be faked with a hash alone.
+make_repo_git() {
+  git -C "$WORK/repo" init -q -b main
+  git -C "$WORK/repo" -c user.email=t@t -c user.name=t add -A
+  git -C "$WORK/repo" -c user.email=t@t -c user.name=t commit -q -m "the fleet as the dispatcher parsed it"
+}
+
+# A commit that changes fleet.sh under a dispatcher that is already up. A
+# trailing comment, so the file the test itself sources still behaves.
+merge_fleet_fix() {
+  printf '# %s\n' "$1" >>"$WORK/repo/scripts/orca/fleet.sh"
+  git -C "$WORK/repo" -c user.email=t@t -c user.name=t commit -q -am "$1"
+}
+
+# A dispatcher this shell can answer `kill -0` for.
+dispatcher_running() { mkdir -p "$ROMMSYNC_FLEET_DIR"; echo $$ >"$ROMMSYNC_FLEET_DIR/fleet.pid"; }
+
+# fleet.sh sourced from somewhere OTHER than the dispatcher's own checkout --
+# what an agent in a fleet worktree runs.
+in_fleet_at() { local at="$1"; shift; (cd "$at" && . ./scripts/orca/fleet.sh && "$@"); }
+
+# A second checkout of the fixture repo, pinned to the commit the dispatcher
+# started from: a worktree branched before the fix landed.
+older_checkout() {
+  git -C "$WORK/repo" worktree add -q --detach "$WORK/wt2" "$1"
+}
+
+# The fix merged and pushed, with the dispatcher's own checkout left exactly
+# where it was: `origin/main` moves, the file on disk does not. Nothing in the
+# fleet pulls it, so this is what a merge during a run actually looks like.
+merged_but_not_pulled() {
+  local parked; parked="$(git -C "$WORK/repo" rev-parse HEAD)"
+  git -C "$WORK/repo" init -q --bare "$WORK/repo-origin.git" 2>/dev/null
+  git -C "$WORK/repo" remote add origin "$WORK/repo-origin.git" 2>/dev/null
+  git -C "$WORK/repo" push -q origin HEAD:main
+  merge_fleet_fix "$1"
+  git -C "$WORK/repo" push -q origin HEAD:main
+  git -C "$WORK/repo" reset -q --hard "$parked"
+}
+
+# ...and then taken back out again, so `origin/main` holds two commits and the
+# same bytes the dispatcher parsed.
+revert_on_origin() {
+  git -C "$WORK/repo" reset -q --hard origin/main
+  git -C "$WORK/repo" -c user.email=t@t -c user.name=t revert --no-edit HEAD >/dev/null
+  git -C "$WORK/repo" push -q origin HEAD:main
+  git -C "$WORK/repo" reset -q --hard "$1"
+}
 
 case "${1:-}" in
   card_says)
@@ -1091,7 +1205,162 @@ JSON
       && fail "the outage restarted the notice; under a flaky gh the release never happens: $out"
     echo "ok: a lookup that failed leaves the markers, and the notice, where they were"
     ;;
+  status_stale)
+    make_fixture ok
+    make_repo_git
+    dispatcher_running
+    # What a real dispatcher records at start: the fleet.sh it actually parsed.
+    in_fleet record_dispatcher
+    merge_fleet_fix "a fix the running dispatcher never parsed"
+    out="$(in_fleet cmd_status 2>&1)"
+    grep -q "up since" <<<"$out" \
+      || fail "status does not say when the dispatcher started: $out"
+    grep -qi "not live" <<<"$out" \
+      || fail "a dispatcher older than fleet.sh was not reported as stale: $out"
+    grep -q "a fix the running dispatcher never parsed" <<<"$out" \
+      || fail "it did not name the commit that is missing from it: $out"
+    grep -qi "restart" <<<"$out" \
+      || fail "it did not say a restart is what makes the fix live: $out"
+    grep -q "ROMMSYNC_FLEET_MAX" <<<"$out" \
+      || fail "it did not say the cap is read at start too, so it changes only across a restart: $out"
+    echo "ok: a dispatcher older than fleet.sh is reported stale, by commit"
+    ;;
+  status_current)
+    make_fixture ok
+    make_repo_git
+    dispatcher_running
+    in_fleet record_dispatcher
+    out="$(in_fleet cmd_status 2>&1)"
+    grep -q "up since" <<<"$out" \
+      || fail "status does not say when the dispatcher started: $out"
+    grep -qi "not live" <<<"$out" \
+      && fail "a dispatcher running the file on disk was reported stale: $out"
+    echo "ok: a current dispatcher says when it started and nothing more"
+    ;;
+  status_unrecorded)
+    make_fixture ok
+    make_repo_git
+    dispatcher_running
+    # No record at all -- a dispatcher started before this check existed.
+    out="$(in_fleet cmd_status 2>&1)"
+    grep -qi "cannot say" <<<"$out" \
+      || fail "a dispatcher whose fleet.sh nothing recorded was not reported as unknown: $out"
+    grep -qi "restart" <<<"$out" \
+      || fail "it did not say what to do about it: $out"
+    echo "ok: a dispatcher that recorded nothing is 'cannot say', not 'current'"
+    ;;
+  status_from_worktree)
+    make_fixture ok
+    make_repo_git
+    dispatcher_running
+    in_fleet record_dispatcher
+    parked="$(git -C "$WORK/repo" rev-parse HEAD)"
+    merge_fleet_fix "a fix the running dispatcher never parsed"
+    # The agent's worktree still holds exactly the bytes the dispatcher parsed,
+    # so a check that hashed the CALLER's copy would find them equal and say the
+    # dispatcher is current.
+    older_checkout "$parked"
+    out="$(in_fleet_at "$WORK/wt2" cmd_status 2>&1)"
+    grep -qi "not live" <<<"$out" \
+      || fail "asked from a worktree branched before the fix, it called a stale dispatcher current: $out"
+    grep -q "a fix the running dispatcher never parsed" <<<"$out" \
+      || fail "it did not name the commit that is missing from the dispatcher: $out"
+    echo "ok: staleness is about the dispatcher's checkout, not the caller's"
+    ;;
+  status_draining)
+    make_fixture ok
+    make_repo_git
+    dispatcher_running
+    in_fleet record_dispatcher
+    merge_fleet_fix "a fix the running dispatcher never parsed"
+    : >"$ROMMSYNC_FLEET_DIR/STOP"
+    out="$(in_fleet cmd_status 2>&1)"
+    grep -q "STOPPED" <<<"$out" || fail "a stop stopped being reported: $out"
+    grep -qi "not live" <<<"$out" \
+      || fail "a draining dispatcher hid its staleness behind the stop, and a drain is exactly when it keeps running: $out"
+    echo "ok: stopped and still up says both"
+    ;;
+  status_drained)
+    make_fixture ok
+    make_repo_git
+    mkdir -p "$ROMMSYNC_FLEET_DIR"; : >"$ROMMSYNC_FLEET_DIR/STOP"
+    out="$(in_fleet cmd_status 2>&1)"
+    grep -q "STOPPED" <<<"$out" || fail "a stop stopped being reported: $out"
+    grep -q "idle" <<<"$out" \
+      || fail "the stop swallowed the line the documented restart waits for: $out"
+    echo "ok: a drained fleet says idle while stopped"
+    ;;
+  status_behind)
+    make_fixture ok
+    make_repo_git
+    dispatcher_running
+    in_fleet record_dispatcher
+    merged_but_not_pulled "a fix that merged while the dispatcher ran"
+    out="$(in_fleet cmd_status 2>&1)"
+    grep -qi "not live" <<<"$out" \
+      || fail "a fix merged under a dispatcher whose checkout never pulled was reported as live: $out"
+    grep -q "a fix that merged while the dispatcher ran" <<<"$out" \
+      || fail "it did not name the merged commit: $out"
+    grep -q "pull --ff-only" <<<"$out" \
+      || fail "it advised a restart that on its own would change nothing: $out"
+    # The steps in docs/WORKFLOW.md's order, which is the section this output
+    # tells the reader to go and read. A screen that contradicts the page it
+    # cites is worse than either alone.
+    order="$(printf '%s\n' "$out" \
+      | sed -n 's/.*stop\.sh.*/stop/p; s/.*pull --ff-only.*/pull/p; s/.*fleet\.sh resume.*/resume/p' \
+      | tr '\n' ' ')"
+    [ "$order" = "stop pull resume " ] \
+      || fail "the steps are not in the order WORKFLOW.md gives them ($order): $out"
+    echo "ok: merged-but-not-pulled is reported, and the pull sits where the doc puts it"
+    ;;
+  status_behind_revert)
+    make_fixture ok
+    make_repo_git
+    dispatcher_running
+    in_fleet record_dispatcher
+    parked="$(git -C "$WORK/repo" rev-parse HEAD)"
+    merged_but_not_pulled "a fix that merged while the dispatcher ran"
+    revert_on_origin "$parked"
+    out="$(in_fleet cmd_status 2>&1)"
+    grep -qi "not live" <<<"$out" \
+      && fail "it asked for a pull and a restart for bytes already running: $out"
+    grep -q "up since" <<<"$out" \
+      || fail "it stopped saying when the dispatcher started: $out"
+    echo "ok: commits that cancel out are not something to pull for"
+    ;;
+  status_unreadable)
+    make_fixture ok
+    make_repo_git
+    dispatcher_running
+    in_fleet record_dispatcher
+    # Asked from a second checkout, because a fleet.sh nothing can read is also
+    # a fleet.sh nothing can source.
+    older_checkout "$(git -C "$WORK/repo" rev-parse HEAD)"
+    chmod 000 "$WORK/repo/scripts/orca/fleet.sh"
+    out="$(in_fleet_at "$WORK/wt2" cmd_status 2>&1)"
+    chmod 644 "$WORK/repo/scripts/orca/fleet.sh"
+    grep -qi "cannot say" <<<"$out" \
+      || fail "a file it could not read was reported as an answer: $out"
+    grep -qi "STALE" <<<"$out" \
+      && fail "it read a permission error as a change to the file: $out"
+    echo "ok: a hash nobody could take is 'cannot say', not 'stale'"
+    ;;
+  status_names_root)
+    make_fixture ok
+    make_repo_git
+    dispatcher_running
+    in_fleet record_dispatcher
+    parked="$(git -C "$WORK/repo" rev-parse HEAD)"
+    merge_fleet_fix "a fix the running dispatcher never parsed"
+    older_checkout "$parked"
+    out="$(in_fleet_at "$WORK/wt2" cmd_status 2>&1)"
+    grep -q "cd $WORK/repo && ./scripts/orca/fleet.sh run --auto" <<<"$out" \
+      || fail "read from a worktree, it told you to start a dispatcher in that worktree: $out"
+    grep -q "cd $WORK/wt2" <<<"$out" \
+      && fail "it named the caller's worktree, which the fleet removes when its PR merges: $out"
+    echo "ok: the restart it prints names the dispatcher's own checkout"
+    ;;
   *)
-    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind" >&2
+    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind|status_stale|status_current|status_unrecorded|status_from_worktree|status_draining|status_drained|status_behind|status_behind_revert|status_unreadable|status_names_root" >&2
     exit 2 ;;
 esac
