@@ -1312,7 +1312,11 @@ foreach(phase opens reuses foreign no_romm submits no_draft unstable
               review_status_says_a_human_merges_this_one
               review_status_names_the_wedge
               review_status_waits_for_the_run_in_flight
-              review_status_reports_a_conflict_before_the_human_merge)
+              review_status_reports_a_conflict_before_the_human_merge
+              fleet_reads_every_closing_keyword
+              fleet_reads_blocked_by_case_insensitively
+              fleet_counts_startable_by_the_same_rule
+              fleet_sees_a_merged_pr_that_says_fixes)
   add_test(NAME orca.browser_${phase}
            COMMAND "${BASH_PROGRAM}" "${ORCA_BROWSER_TEST}" ${phase})
   set_tests_properties(orca.browser_${phase} PROPERTIES TIMEOUT 60)

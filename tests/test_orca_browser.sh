@@ -271,6 +271,68 @@ run_await_review() {
     bash "$TMPDIR_FIXTURE/scripts/orca/await-review.sh" "$AW_PR" 2>&1 )
 }
 
+# ---------------------------------------------------------------------------
+# The fleet's queue parsing: `Closes #N` and `Blocked by #N`, read out of issue
+# and PR bodies. A worktree holding fleet.sh, lib.sh and the shared reference
+# patterns, plus a `gh` that answers from files instead of GitHub -- so a phase
+# describes a backlog rather than a protocol.
+make_fleet_parse_fixture() {
+  TMPDIR_FIXTURE="$(mktemp -d)"
+  TMPDIR_FIXTURE="$(cd "$TMPDIR_FIXTURE" && pwd -P)"
+  mkdir -p "$TMPDIR_FIXTURE/scripts/orca" "$TMPDIR_FIXTURE/.github/scripts" \
+           "$TMPDIR_FIXTURE/stub-bin"
+  cp "$REPO_ROOT"/scripts/orca/{fleet.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
+  cp "$REPO_ROOT"/.github/scripts/*.py "$TMPDIR_FIXTURE/.github/scripts/"
+  FLEET_ISSUES="$TMPDIR_FIXTURE/issues.json"
+  FLEET_OPEN_PRS="$TMPDIR_FIXTURE/open-prs.json"
+  FLEET_MERGED_PRS="$TMPDIR_FIXTURE/merged-prs.json"
+  FLEET_ISSUE_STATE=OPEN
+  FLEET_LIVE=""
+  printf '[]\n' >"$FLEET_ISSUES"
+  printf '[]\n' >"$FLEET_OPEN_PRS"
+  printf '[]\n' >"$FLEET_MERGED_PRS"
+  cat >"$TMPDIR_FIXTURE/stub-bin/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+# The four reads fleet.sh makes of GitHub, and nothing else. The `--jq` form is
+# matched first: count_startable asks for the same open PRs already flattened to
+# bodies, and the plain pattern would swallow it.
+case "$*" in
+  *"issue list"*)               cat "$FLEET_ISSUES" ;;
+  *"issue view"*)               printf '%s\n' "${FLEET_ISSUE_STATE:-OPEN}" ;;
+  *"pr list"*"--state merged"*) cat "$FLEET_MERGED_PRS" ;;
+  *"pr list"*"--jq"*)
+    python3 -c 'import json, sys
+for p in json.load(open(sys.argv[1])):
+    print(p.get("body") or "")' "$FLEET_OPEN_PRS" ;;
+  *"pr list"*)                  cat "$FLEET_OPEN_PRS" ;;
+  *)                            printf '[]\n' ;;
+esac
+GHSTUB
+  chmod +x "$TMPDIR_FIXTURE/stub-bin/gh"
+}
+
+# Run ONE of fleet.sh's queue functions against that fixture. The functions are
+# lifted out rather than the dispatcher run, the same way
+# fleet_notices_a_stalled_agent does it: what is under test is how a body is
+# read, not the loop around it.
+run_fleet_fn() {
+  local fn="$1"; shift
+  local src
+  src="$(sed -n '/^has_open_pr()/,/^}/p; /^ready_issues()/,/^}/p;
+                 /^issue_is_done()/,/^}/p; /^count_startable()/,/^}/p' \
+         "$TMPDIR_FIXTURE/scripts/orca/fleet.sh")"
+  ( cd "$TMPDIR_FIXTURE" || exit 99
+    export PATH="$TMPDIR_FIXTURE/stub-bin:$PATH"
+    export FLEET_ISSUES FLEET_OPEN_PRS FLEET_MERGED_PRS FLEET_ISSUE_STATE
+    REPO_ROOT="$TMPDIR_FIXTURE"
+    ISSUE_REFS="$REPO_ROOT/.github/scripts"
+    # count_startable reads the live worktree list from Orca, which is not what
+    # these assert; $FLEET_LIVE stands in for it.
+    live_worktrees() { printf '%s' "$FLEET_LIVE"; }
+    eval "$src"
+    "$fn" ${1+"$@"} )
+}
+
 case "${1:-}" in
   opens)
     make_fixture
@@ -1729,6 +1791,108 @@ PYCHECK
     echo "PASS: every human-merge-path claim names the full set merge-gate refuses"
     ;;
 
+  fleet_reads_every_closing_keyword)
+    # GitHub links a PR to an issue on any of NINE keywords, case-insensitively
+    # and with any run of whitespace between. The fleet used to match one exact
+    # spelling, `Closes #N`, so a PR saying `Fixes #12` closed the issue and
+    # unblocked its dependants while `has_open_pr` still reported #12 free --
+    # and the dispatcher opened a second worktree for work already in flight,
+    # burning one of only three slots.
+    make_fleet_parse_fixture
+    python3 - "$FLEET_OPEN_PRS" <<'PY'
+import json, sys
+json.dump([
+    {"number": 201, "body": "Fixes #12\n"},
+    {"number": 202, "body": "closes #13\n"},
+    {"number": 203, "body": "Closes  #14\n"},
+    {"number": 204, "body": "RESOLVED #15\n"},
+    {"number": 205, "body": "Closes #160\n"},
+    {"number": 206, "body": "prose that merely mentions #17, closing nothing\n"},
+], open(sys.argv[1], "w"))
+PY
+    for n in 12 13 14 15; do
+      run_fleet_fn has_open_pr "$n" \
+        || fail "a PR closing #$n was not seen; GitHub accepts that spelling and so must the fleet"
+    done
+    # `Closes #160` is not a PR for #16. The old pattern ended in \b, which the
+    # digits themselves satisfy, so this has to stay asserted.
+    run_fleet_fn has_open_pr 16 \
+      && fail "#160 answered for #16; a wider keyword set must not widen the NUMBER"
+    run_fleet_fn has_open_pr 17 \
+      && fail "a bare mention of #17 was read as a closing line; the fleet would then never start it"
+    echo "PASS: every spelling GitHub closes on is a PR the fleet can see"
+    ;;
+
+  fleet_reads_blocked_by_case_insensitively)
+    # unblock.yml matches /blocked\s+by\s+#(\d+)/gi; the fleet matched
+    # `Blocked by #` exactly. A body written `blocked by #7` was a blocker to
+    # the workflow and invisible here, so #7 -- the issue that frees two others
+    # -- scored zero and lost the ordering to a lower-numbered issue that frees
+    # nothing. Most-unblocking-first is the whole point of the queue.
+    make_fleet_parse_fixture
+    python3 - "$FLEET_ISSUES" <<'PY'
+import json, sys
+json.dump([
+    {"number": 6, "title": "frees nothing", "body": "",
+     "labels": [{"name": "ready"}]},
+    {"number": 7, "title": "the foundation", "body": "",
+     "labels": [{"name": "ready"}]},
+    {"number": 9, "title": "lowercase", "body": "blocked by #7",
+     "labels": [{"name": "blocked"}]},
+    {"number": 10, "title": "odd spacing", "body": "Blocked  By  #7",
+     "labels": [{"name": "blocked"}]},
+], open(sys.argv[1], "w"))
+PY
+    out="$(run_fleet_fn ready_issues)"
+    first="$(printf '%s\n' "$out" | head -1)"
+    [ "$(printf '%s' "$first" | cut -f1)" = "7" ] \
+      || fail "the most-unblocking issue did not sort first; got: $out"
+    [ "$(printf '%s' "$first" | cut -f2)" = "2" ] \
+      || fail "#7 was not credited with both issues naming it; got: $out"
+    echo "PASS: the fleet counts the same blockers unblock.yml does"
+    ;;
+
+  fleet_counts_startable_by_the_same_rule)
+    # `count_startable` is what the run loop calls "nothing to wait for". Read
+    # with the narrow pattern it counts an issue whose PR is already open, and
+    # the loop keeps a slot warm for work that is finished.
+    make_fleet_parse_fixture
+    python3 - "$FLEET_ISSUES" <<'PY'
+import json, sys
+json.dump([
+    {"number": 6, "title": "genuinely free", "body": "", "labels": [{"name": "ready"}]},
+    {"number": 7, "title": "already in flight", "body": "", "labels": [{"name": "ready"}]},
+], open(sys.argv[1], "w"))
+PY
+    python3 - "$FLEET_OPEN_PRS" <<'PY'
+import json, sys
+json.dump([{"number": 301, "body": "Fixes #7\n"}], open(sys.argv[1], "w"))
+PY
+    n="$(run_fleet_fn count_startable)"
+    [ "$n" = "1" ] \
+      || fail "counted $n startable; #7 has an open PR saying Fixes, so only #6 is"
+    echo "PASS: an open PR hides its issue from the startable count whatever it says"
+    ;;
+
+  fleet_sees_a_merged_pr_that_says_fixes)
+    # `issue_is_done` is what takes an issue off `fleet.sh run 11 12 13`. Miss
+    # the closing line and the list never empties: the dispatcher relaunches a
+    # worktree for work that merged hours ago.
+    make_fleet_parse_fixture
+    python3 - "$FLEET_MERGED_PRS" <<'PY'
+import json, sys
+json.dump([{"body": "Fixes #21\n"}, {"body": "resolve #22\n"}],
+          open(sys.argv[1], "w"))
+PY
+    run_fleet_fn issue_is_done 21 \
+      || fail "a merged PR saying 'Fixes #21' did not mark #21 landed"
+    run_fleet_fn issue_is_done 22 \
+      || fail "a merged PR saying 'resolve #22' did not mark #22 landed"
+    run_fleet_fn issue_is_done 23 \
+      && fail "#23 is neither closed nor merged, and was reported landed anyway"
+    echo "PASS: a merged PR is read the way GitHub read it"
+    ;;
+
   *)
     echo "usage: $0 opens|reuses|foreign|no_romm|submits|no_draft|unstable" >&2
     echo "       watch_needs_issue|watch_late_draft|watch_grace|watch_submits|watch_single" >&2
@@ -1750,6 +1914,10 @@ PYCHECK
     echo "       review_status_names_the_wedge" >&2
     echo "       review_status_waits_for_the_run_in_flight" >&2
     echo "       review_status_reports_a_conflict_before_the_human_merge" >&2
+    echo "       fleet_reads_every_closing_keyword" >&2
+    echo "       fleet_reads_blocked_by_case_insensitively" >&2
+    echo "       fleet_counts_startable_by_the_same_rule" >&2
+    echo "       fleet_sees_a_merged_pr_that_says_fixes" >&2
     exit 2
     ;;
 esac
