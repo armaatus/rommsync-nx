@@ -492,6 +492,36 @@ endif()
 set_tests_properties(rig.provisioned PROPERTIES TIMEOUT 120)
 set_tests_properties(rig.smoke PROPERTIES TIMEOUT 120)
 
+# --- the fixture is configured, not just provisioned -------------------------
+# rig.smoke asks "is RomM up?", rig.provisioned asks "is it usable?"; this asks
+# "will it answer the same way for the ten-thousandth call as for the first?".
+#
+# It will not by default. RomM launches gunicorn with `--max-requests 1000
+# --max-requests-jitter 100`, so each worker is retired after roughly a thousand
+# requests -- and a request nginx has already handed to the worker that is on its
+# way out comes back as a 502 the client never asked for. Nothing about the call
+# is wrong and nothing retries it, so it surfaces as one test in a few hundred
+# failing on whatever it happened to be doing. That is #155, and it is why
+# harness.partial carried a quarantine.
+#
+# `recycling` reads the compose file, so the setting stays checkable with docker
+# stopped. `recycling_live` asks the daemon, because a stack started before the
+# setting existed still recycles until it is recreated -- and the machine it
+# would flake on next is the one running this.
+# The first shell-driven test in this file, so the interpreter is found here.
+find_program(BASH_PROGRAM bash REQUIRED)
+set(RIG_FIXTURE_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_rig_fixture.sh")
+
+add_test(NAME rig.recycling COMMAND "${BASH_PROGRAM}" "${RIG_FIXTURE_TEST}" recycling)
+set_tests_properties(rig.recycling PROPERTIES TIMEOUT 60)
+
+add_test(NAME rig.recycling_live
+         COMMAND "${BASH_PROGRAM}" "${RIG_FIXTURE_TEST}" recycling_live)
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(rig.recycling_live PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+set_tests_properties(rig.recycling_live PROPERTIES TIMEOUT 60)
+
 # --- the native HttpClient against the real rig ------------------------------
 # One CTest entry per scenario, selected by argv[1], so a red run names the
 # behaviour that broke. The scratch directory is per build tree, because three
@@ -550,7 +580,6 @@ endforeach()
 #
 # It runs `ctest` recursively, which is the case itself rather than a model of
 # it. The anchored regex is what keeps that from including this test.
-find_program(BASH_PROGRAM bash REQUIRED)
 set(SCRATCH_CONCURRENT_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_scratch_concurrent.sh")
 # Which scenarios, and why these: each writes a fixed name into the scratch
 # directory, which is the mechanism, and each is READ-ONLY against RomM -- a GET
