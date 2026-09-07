@@ -214,7 +214,8 @@ clear_issue_markers() {
         "$STATE_DIR/box-labels-$1" "$STATE_DIR/queue-labels-$1" \
         "$STATE_DIR/unreachable-$1" "$STATE_DIR/human-step-$1" \
         "$STATE_DIR/held-$1" "$STATE_DIR/stuck-$1" \
-        "$STATE_DIR/git-blind-$1" "$STATE_DIR/warned-$1"
+        "$STATE_DIR/git-blind-$1" "$STATE_DIR/warned-$1" \
+        "$STATE_DIR/reason-blind-$1"
 }
 
 # `gaveup-` is the one per-issue marker deliberately NOT in that list, and the
@@ -654,7 +655,7 @@ worktree_holdings() {
 # worktree whose PR merged is reap_merged's, and by the time this runs it has
 # already been disowned. What is left here is what will never merge.
 reap_abandoned() {
-  local f num path answer reason holds
+  local f num path answer reason holds asked
   for f in "$OWNED_DIR"/*; do
     [ -e "$f" ] || continue
     num="$(basename "$f")"; path="$(cat "$f")"
@@ -665,8 +666,9 @@ reap_abandoned() {
     # minute under whoever is still working in there.
     [ -e "$STATE_DIR/stuck-$num" ] && continue
 
-    reason=""
+    reason=""; asked=1
     if answer="$(poll_issue "$num")"; then
+      rm -f "$STATE_DIR/reason-blind-$num"
       # "Closed", and not "closed with no merged PR": reap_merged asks that
       # question and this one does not, so the two ways it leaves a closed issue
       # owned -- unpushed commits, and a `gh pr list --head` that could not
@@ -680,6 +682,8 @@ reap_abandoned() {
       elif has_label "$(issue_labels_in "$answer")" "$HUMAN_STEP_LABEL"; then
         reason="its last step is yours ($HUMAN_STEP_LABEL)"
       fi
+    else
+      asked=0
     fi
     # enforce_timebox's own record, so this one still answers through a GitHub
     # outage -- and so a lookup that failed above cannot be read as "no reason".
@@ -693,6 +697,21 @@ reap_abandoned() {
     # the one thing the warning pass exists to prevent. `stuck-` is not in this
     # list: it means a removal was attempted and refused, and it is checked above
     # this point precisely so that it is never retried.
+    # A lookup that could not answer is the THIRD answer, not "no reason", and
+    # the difference is the whole discipline this function is built on --
+    # worktree_holdings failing gets `git-blind-` rather than being read as
+    # "holds nothing". Folded into the branch below, one `gh` hiccup looks
+    # exactly like the issue coming off `blocked`: the warning still owed to a
+    # reason nobody could read is discarded, the next poll starts the notice
+    # over, and under a flaky GitHub the release never arrives with nothing
+    # anywhere saying why. So every marker stays exactly where it was, and it is
+    # said once per outage rather than once per poll.
+    if [ -z "$reason" ] && [ "$asked" = 0 ]; then
+      [ -e "$STATE_DIR/reason-blind-$num" ] && continue
+      : >"$STATE_DIR/reason-blind-$num"
+      say "#$num: could not read its issue -- leaving it, and every marker on it, until GitHub answers"
+      continue
+    fi
     if [ -z "$reason" ]; then
       rm -f "$STATE_DIR/warned-$num" "$STATE_DIR/held-$num" "$STATE_DIR/git-blind-$num"
       continue
@@ -1268,6 +1287,8 @@ cmd_run() {
     if [ "$queued" -eq 0 ] && [ "${owned:-0}" -eq 0 ]; then
       if $draining; then
         reason="${reason:-you stopped it}; everything in flight has landed"
+      elif $auto && $declined; then
+        reason="the backlog has nothing startable left, and what it was given was declined"
       elif $auto; then
         reason="the backlog has nothing startable left"
       elif $declined; then
