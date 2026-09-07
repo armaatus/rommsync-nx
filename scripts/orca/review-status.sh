@@ -62,6 +62,8 @@ trap 'rm -f "$payload" "$checks" "$files"' EXIT
 # carry its own copy, and a copy of a query is a copy of its bugs -- both asked
 # for `reviewThreads(first:100)` and both reported a clean thread list from the
 # first page of a longer one.
+# No 2>/dev/null here either: pr_payload.sh has already said which failure it
+# was, on stderr, and this line adds what that means rather than replacing it.
 orca_pr_payload "$pr" "$payload" \
   || { echo "could not read the PR's reviews" >&2; exit 2; }
 

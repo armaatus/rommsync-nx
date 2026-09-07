@@ -116,10 +116,15 @@ orca_owner_repo() {
 # `review-status.sh` and `resolve-thread.sh` both want exactly this, and "resolve
 # the repo, then run the gather" written twice is two places for it to drift --
 # which is how the local answer and the gate's answer came apart in #114.
+# stderr is NOT swallowed. pr_payload.sh distinguishes "could not read PR #N"
+# from "came back in a shape this cannot read", and a caller that turns both
+# into its own one-line "could not read the PR's reviews" has thrown away the
+# half that says which. That is the same silent-failure shape fleet.sh's card()
+# and remove_worktree() are being fixed for in this very change; it reached one
+# more place than the issue listed.
 orca_pr_payload() {
   local pr="$1" out="$2"
-  bash .github/scripts/pr_payload.sh "$orca_owner" "$orca_repo_name" "$pr" \
-    >"$out" 2>/dev/null
+  bash .github/scripts/pr_payload.sh "$orca_owner" "$orca_repo_name" "$pr" >"$out"
 }
 
 # The Orca CLI this machine can actually run, in $ORCA_CLI.

@@ -129,7 +129,16 @@ def thread_list_is_complete(pull_request):
     it to drift.
     """
     threads = pull_request.get("reviewThreads") or {}
-    return not (threads.get("pageInfo") or {}).get("hasNextPage")
+    page = threads.get("pageInfo")
+    # A MISSING pageInfo is "cannot tell", not "complete". Defaulting the other
+    # way is fail-open on the one property this exists to make fail closed: a
+    # caller that fetched the threads without asking whether there were more
+    # would be told its half-list was whole. Nothing reaches this today --
+    # pr_payload.sh always sets it -- and that is exactly when a default is
+    # cheap to get right.
+    if not page:
+        return False
+    return not page.get("hasNextPage")
 
 
 def unresolved_threads(pull_request):
@@ -253,7 +262,7 @@ SELFTEST = [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
-            "reviewThreads": {"nodes": []},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
         },
         ["core/src/sync.cpp"],
         True,
@@ -267,7 +276,7 @@ SELFTEST = [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
-            "reviewThreads": {"nodes": []},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
         },
         ["core/src/sync.cpp"],
         False,
@@ -281,7 +290,7 @@ SELFTEST = [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
-            "reviewThreads": {"nodes": []},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
         },
         ["core/src/sync.cpp"],
         False,
@@ -295,7 +304,7 @@ SELFTEST = [
                 {"state": "CHANGES_REQUESTED", "submittedAt": "2026-09-05T10:00:00Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
-            "reviewThreads": {"nodes": []},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
         },
         ["core/src/sync.cpp"],
         False,
@@ -313,7 +322,7 @@ SELFTEST = [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T11:00:00Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
-            "reviewThreads": {"nodes": []},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
         },
         ["core/src/sync.cpp"],
         True,
@@ -327,7 +336,7 @@ SELFTEST = [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
-            "reviewThreads": {"nodes": [
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": [
                 {"isResolved": False, "path": "core/src/sync.cpp", "line": 42},
             ]},
         },
@@ -344,7 +353,7 @@ SELFTEST = [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "armaatus"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
-            "reviewThreads": {"nodes": []},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
         },
         ["core/src/sync.cpp"],
         False,
@@ -359,7 +368,7 @@ SELFTEST = [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
-            "reviewThreads": {"nodes": []},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
         },
         ["core/src/sync.cpp"],
         True,
@@ -373,7 +382,7 @@ SELFTEST = [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
-            "reviewThreads": {"nodes": []},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
         },
         [".claude/hooks/guard.py"],
         False,
@@ -387,7 +396,7 @@ SELFTEST = [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
-            "reviewThreads": {"nodes": []},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
         },
         [".github/scripts/merge_gate.py"],
         False,
@@ -401,7 +410,7 @@ SELFTEST = [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
-            "reviewThreads": {"nodes": []},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
         },
         [".github/workflows/ci.yml"],
         False,
@@ -417,7 +426,7 @@ SELFTEST = [
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"},
                  "body": "test"},
             ]},
-            "reviewThreads": {"nodes": []},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
         },
         ["core/src/sync.cpp"],
         False,
@@ -432,7 +441,7 @@ SELFTEST = [
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"},
                  "body": "", "comments": {"totalCount": 1}},
             ]},
-            "reviewThreads": {"nodes": []},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
         },
         ["core/src/sync.cpp"],
         True,
@@ -453,7 +462,7 @@ SELFTEST = [
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"},
                  "body": ""},
             ]},
-            "reviewThreads": {"nodes": []},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
         },
         ["core/src/sync.cpp"],
         False,
@@ -470,7 +479,7 @@ SELFTEST = [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
-            "reviewThreads": {"nodes": []},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
         },
         ["core/src/sync.cpp"],
         False,
@@ -487,7 +496,7 @@ SELFTEST = [
                 {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
                  "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
             ]},
-            "reviewThreads": {"nodes": []},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
         },
         ["core/src/sync.cpp"],
         True,
@@ -525,6 +534,25 @@ SELFTEST = [
         },
         ["core/src/sync.cpp"],
         True,
+    ),
+    (
+        # A payload that never said whether there were more threads. Nothing in
+        # this repo produces one -- pr_payload.sh always sets pageInfo -- which
+        # is why the old default read it as "complete" for sixteen fixtures
+        # without anyone noticing. Fail closed: not knowing is not the same as
+        # knowing there are none.
+        "a thread list that does not say whether it is complete is not an answer",
+        "abc123",
+        {
+            "body": "Closes #1\n/code-review\nmattpocock-skills:code-review",
+            "reviews": {"nodes": [
+                {"state": "COMMENTED", "submittedAt": "2026-09-05T10:00:00Z",
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"}, "body": "A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY."},
+            ]},
+            "reviewThreads": {"nodes": []},
+        },
+        ["core/src/sync.cpp"],
+        False,
     ),
 ]
 
