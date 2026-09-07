@@ -352,14 +352,22 @@ head — `claude-review.yml` fires on `review_requested` as well as on
 `.orca/review-rounds` beside the round count, and waits for a *newer* one rather
 than spending a second round on findings already in hand.
 
-Then it fixes what is real, replies with a reason where it disagrees, resolves
-every thread, pushes, re-requests review, says what it did, and checks:
+Then it fixes what is real, replies with a reason where it disagrees, and
+resolves every thread. If it changed anything it pushes and comes back for the
+next round; when a review arrives it is not going to change anything for, it says
+so and checks:
 
 ```bash
 ./scripts/orca/resolve-thread.sh <thread-id> ...   # close them, and re-ask the gate
 ./scripts/orca/answer-review.sh "<what you did, or why you did not>"
 ./scripts/orca/review-status.sh    # exit 0 = every thread resolved, every check green
 ```
+
+The order matters: an answer has to come *after* the review it answers, and a
+push invalidates that review. So answering a review you have just pushed over
+would be discarded by the review of the new head — `answer-review.sh` refuses
+when no review has been submitted against the current head, rather than posting
+one that nothing will count.
 
 Resolving goes through that script rather than the `resolveReviewThread` mutation
 because **no GitHub event re-runs `merge-gate` when a thread is resolved**.
@@ -420,6 +428,26 @@ So the review declares what it left, and the author answers it:
 
 Missing the trailer fails *closed*: the PR is held as though findings were left.
 Guessing "clean" re-opens the race; guessing "found something" costs one command.
+
+Two consequences of failing closed, both deliberate and neither free:
+
+- **a human leaving a `COMMENTED` review holds the PR too**, since a human does
+  not write the trailer. Add `<!-- review-findings: 0 -->` to the body if you
+  meant "nothing here", or merge it by hand — `enforce_admins` is off, so that
+  works with the check red. The alternative, exempting human reviewers, would
+  make "who reviewed" decide whether findings can be outrun, and the reviewer's
+  identity is not what the race is about;
+- **a review whose findings were all inline** cannot carry a trailer if its body
+  is empty, so it is held until answered even once every thread is resolved.
+  That is the right way round: resolving a thread says the finding was handled,
+  and the answer says the review was.
+
+One thing the answer does *not* close: `merge_gate.py` reads the **latest**
+substantive review per author, so a second review on the same head declaring `0`
+supersedes an earlier unanswered one. That is the same property that lets a clean
+re-review clear a standing `CHANGES_REQUESTED` without a dismissal step, and it
+is older than this condition; taking it away here would wedge the PRs it exists
+to unwedge.
 
 Exit 4 is the same verdict on a PR that touches `.claude/`, `.github/workflows/`
 or `.github/scripts/`: nothing left to fix, and a person merges it. Exit 1 prints

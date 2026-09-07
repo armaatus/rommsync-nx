@@ -155,8 +155,14 @@ def declared_findings(review):
     without one has NOT said it is clean, and `answered()`'s caller reads it
     that way -- see the asymmetry there.
     """
-    match = REVIEW_FINDINGS_RE.search(review.get("body") or "")
-    return int(match.group(1)) if match else None
+    # The LAST one, not the first. REVIEW.md and the review prompt both put the
+    # trailer at the END of the body, and a review of THIS repository quotes
+    # fixtures full of the thing -- `merge_gate.py`'s own selftest carries five
+    # of them. Reading the first match would let a quoted `0` stand in for a
+    # real count of 3, which fails OPEN: straight back into the race this
+    # condition exists to close. Found in review of this PR.
+    matches = REVIEW_FINDINGS_RE.findall(review.get("body") or "")
+    return int(matches[-1]) if matches else None
 
 
 def answer_marker(head_sha):
@@ -167,6 +173,17 @@ def answer_marker(head_sha):
     would be silent in the direction that matters: answers that satisfy nothing.
     """
     return f"<!-- review-answered {head_sha} -->"
+
+
+def answer_substance(body):
+    """What is left of an answer once its marker is stripped.
+
+    `MIN_ANSWER_BODY` measures THIS, and `scripts/orca/answer-review.sh` calls it
+    rather than trimming its own way -- it used to count non-whitespace
+    characters, which is a different number, so the writer could refuse an
+    answer the reader would have taken. Found in review of this PR.
+    """
+    return ANSWER_RE.sub("", body or "").strip()
 
 
 def answered(pull_request, head_sha, review):
@@ -215,7 +232,7 @@ def answered(pull_request, head_sha, review):
             continue
         if (comment.get("createdAt") or "") <= since:
             continue
-        if len(ANSWER_RE.sub("", body).strip()) < MIN_ANSWER_BODY:
+        if len(answer_substance(body)) < MIN_ANSWER_BODY:
             continue
         return True
     return False
@@ -890,6 +907,28 @@ SELFTEST = [
                  "createdAt": "2026-09-06T02:06:00Z",
                  "body": "<!-- review-answered abc123 -->\n"
                          "Marking my own findings as dealt with."},
+            ]},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+        },
+        ["core/src/sync.cpp"],
+        False,
+    ),
+    (
+        # A review of THIS repository quotes fixtures carrying the trailer --
+        # every case in this list has one. Read from the front, a quoted `0`
+        # stands in for the real count at the end, and the PR merges unanswered:
+        # the race, reintroduced through the parser. Found in review of #170.
+        "a trailer quoted inside a review body does not become its verdict",
+        "abc123",
+        {
+            "author": {"login": "armaatus"},
+            "body": "Closes #7\n/code-review\nmattpocock-skills:code-review",
+            "reviews": {"nodes": [
+                {"state": "COMMENTED", "submittedAt": "2026-09-06T02:00:00Z",
+                 "commit": {"oid": "abc123"}, "author": {"login": "claude[bot]"},
+                 "body": "The new fixture says `<!-- review-findings: 0 -->`, which "
+                         "is right for what it stands for.\nImportant: the retry has "
+                         "no backoff.\n<!-- review-findings: 1 -->"},
             ]},
             "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
         },

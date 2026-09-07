@@ -147,11 +147,17 @@ Use that, not the `resolveReviewThread` mutation by hand. NOTHING on GitHub
 re-runs `merge-gate` when a thread is resolved -- `pull_request_review_thread`
 is a webhook event, not a workflow trigger -- so the gate stays red on a thread
 you already closed, and auto-merge never fires. That script resolves the
-threads and, once the last one is shut, asks the gate again. Push if you changed
-anything.
+threads and, once the last one is shut, asks the gate again.
 
-Then ANSWER THE REVIEW, whether or not you pushed and whether or not it left a
-single thread:
+IF YOU CHANGED ANYTHING, PUSH IT and go back to `await-review.sh`. The push
+re-runs the reviewer, and the review of what you actually sent is the next
+round's. Do NOT answer a review you have just pushed over: there is no review on
+the new head yet, an answer written before one arrives is discarded by it, and
+`answer-review.sh` refuses for exactly that reason.
+
+When a review arrives that you are NOT going to change anything for -- because
+nothing needed changing, or because you disagree and said so on the thread --
+ANSWER IT:
 
     ./scripts/orca/answer-review.sh "<what you did, or why you did not>"
 

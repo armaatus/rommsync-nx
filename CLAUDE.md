@@ -142,7 +142,7 @@ and say so in the PR body. Never edit them as a side effect of rewording a body.
 
 1. `ctest --test-dir build --output-on-failure` is green, and your change has a
    test that would have failed before it — run it and read the output before
-   reporting anything complete. For a bug fix, write the failing test first.
+   reporting complete. For a bug fix, commit the failing test before the fix.
 2. **Run `/code-review` on your own branch** and put the findings in the PR body.
    Required, not optional — it is what makes a human review tractable, and
    [REVIEW.md](REVIEW.md) is the policy it follows.

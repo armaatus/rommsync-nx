@@ -1274,7 +1274,10 @@ core/src/sync.cpp'
     write_pr_checks \
       '{"name":"merge-gate","status":"COMPLETED","conclusion":"SUCCESS",
         "startedAt":"2026-09-06T11:00:00Z","completedAt":"2026-09-06T11:00:10Z"}' \
-      BLOCKED core/src/sync.cpp
+      CLEAN core/src/sync.cpp
+    # CLEAN, and every check green, so the ONLY thing between this fixture and
+    # its answered sibling below is the answer. A phase that also flipped
+    # mergeStateStatus would pass on a tree without this change.
     out="$(run_review_status)"; rc=$?
     [ "$rc" = 1 ] || fail "a review reporting findings was reported as ready to merge; got $rc: $out"
     grep -q "answer-review.sh" <<<"$out" \

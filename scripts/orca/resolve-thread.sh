@@ -106,4 +106,4 @@ head="$(GH_PAGER=cat gh pr view "$pr" --json headRefOid --jq .headRefOid 2>/dev/
 # `answer-review.sh` for the reason the payload query is shared: the rule about
 # WHICH run may be re-asked -- the newest on the head, and only if it failed --
 # is the part that goes wrong quietly, and one copy of it is enough.
-orca_reask_gate "$pr" "$head" "every thread is resolved"
+orca_reask_gate "$head" "every thread is resolved"

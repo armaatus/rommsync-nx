@@ -1489,7 +1489,7 @@ endforeach()
 # ACCEPTS, which is the pairing that would otherwise fail silently -- answers
 # that satisfy nothing. `gh` is stubbed here too.
 set(ORCA_ANSWER_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_orca_answer_review.sh")
-foreach(phase posts thin unpushed stopped gate)
+foreach(phase posts thin unpushed behind no_review flight stopped gate)
   add_test(NAME orca.answer_${phase}
            COMMAND "${BASH_PROGRAM}" "${ORCA_ANSWER_TEST}" ${phase})
   set_tests_properties(orca.answer_${phase} PROPERTIES TIMEOUT 60)
