@@ -1570,6 +1570,19 @@ add_test(NAME release.history
          COMMAND "${BASH_PROGRAM}" "${RELEASE_TEST}" history)
 set_tests_properties(release.history PROPERTIES TIMEOUT 120)
 
+# The one compatibility statement a release makes, and the fact that there is
+# only one of it. `ATMOSPHERE_TARGET` is restated in docs/INSTALL.md's "Before
+# you start" -- the guide and the release page have to say the same thing to a
+# user who reads both -- and INSTALL.md asked for this check in prose long
+# before anything ran it. The Horizon half is derived from the highest
+# `hosversionAtLeast` gate in sysmodule/ and overlay/ rather than declared, so a
+# call added against a newer firmware turns this red instead of quietly widening
+# what a release claims. It asserts no particular version: which versions those
+# are is a target M8-2 (#44) settles on a console.
+add_test(NAME release.compatibility
+         COMMAND "${BASH_PROGRAM}" "${RELEASE_TEST}" compatibility)
+set_tests_properties(release.compatibility PROPERTIES TIMEOUT 60)
+
 # --- M8-1: the v1 gate itself -------------------------------------------------
 # scripts/v1-gate.sh owns the eight rows of the gate that stands between this
 # repository and a console (#43). These entries check its MACHINERY -- that
