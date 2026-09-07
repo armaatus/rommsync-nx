@@ -1932,6 +1932,99 @@ PY
     echo "PASS: a failed PR lookup is 'could not tell', never 'free'"
     ;;
 
+  fleet_leaves_a_timed_out_agent_when_it_cannot_tell)
+    # The time-box is the one branch that ENDS an agent: it interrupts the
+    # terminal, comments on the issue and drops the started marker. Reading a
+    # failed `gh` call as "no PR" there costs three hours of finished work,
+    # because the agent it stops is as likely to be the one waiting on a review
+    # as the one grinding. `has_open_pr` answers 2 for "could not tell";
+    # enforce_timebox has to spend that answer on doing nothing, and say so.
+    make_fixture
+    mkdir -p "$TMPDIR_FIXTURE/.github/scripts"
+    cp "$REPO_ROOT"/scripts/orca/fleet.sh "$TMPDIR_FIXTURE/scripts/orca/"
+    cp "$REPO_ROOT"/.github/scripts/*.py "$TMPDIR_FIXTURE/.github/scripts/"
+    stub="$TMPDIR_FIXTURE/stub-bin"; mkdir -p "$stub"
+    state="$TMPDIR_FIXTURE/fleet"; mkdir -p "$state/worktrees" "$state/started"
+    printf '%s\n' "$TMPDIR_FIXTURE" >"$state/worktrees/29"
+    # Started at the epoch: expired under any time-box the fleet could be given.
+    printf '0\n' >"$state/started/29"
+    printf '[]\n' >"$TMPDIR_FIXTURE/open-prs.json"
+    cat >"$stub/gh" <<GHSTUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$TMPDIR_FIXTURE/gh-calls.log"
+[ -n "\${FLEET_GH_FAIL:-}" ] && exit 1
+case "\$*" in
+  *"pr list"*) cat "$TMPDIR_FIXTURE/open-prs.json" ;;
+  *)           printf '\n' ;;
+esac
+GHSTUB
+    chmod +x "$stub/gh"
+    cat >"$stub/orca" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$TMPDIR_FIXTURE/orca-calls.log"
+case "\$*" in
+  --version) exit 0 ;;
+  *"terminal list"*)
+    printf '{"ok":true,"result":{"terminals":[{"handle":"t-29","worktreePath":"$TMPDIR_FIXTURE","agentIdentity":"claude"}]}}\n' ;;
+  *) printf '{"ok":true,"result":{}}\n' ;;
+esac
+STUB
+    chmod +x "$stub/orca"
+
+    # One expired issue through the real enforce_timebox, with $1 deciding
+    # whether `gh` answers at all. Only the surfaces that reach outside the
+    # function are stood in for; the decision itself is the code under test.
+    run_timebox() {
+      : >"$TMPDIR_FIXTURE/orca-calls.log"; : >"$TMPDIR_FIXTURE/gh-calls.log"
+      PATH="$stub:$PATH" FLEET_GH_FAIL="$1" \
+      bash -c '. '"$TMPDIR_FIXTURE"'/scripts/orca/lib.sh
+               orca_cli_resolve
+               REPO_ROOT="'"$TMPDIR_FIXTURE"'"
+               STATE_DIR="'"$state"'"; OWNED_DIR="$STATE_DIR/worktrees"
+               STARTED_DIR="$STATE_DIR/started"; TIMEBOX_SECONDS=10800
+               say() { echo "$*"; }
+               notify() { echo "NOTIFY: $*"; }
+               card() { echo "CARD: $*"; }
+               orca_json() { local o; o="$(mktemp)"; orca_run_with_deadline 10 "$o" "$ORCA_CLI" "$@" --json; cat "$o"; rm -f "$o"; }
+               '"$(sed -n '/^ISSUE_REFS=/p; /^owned_path()/p;
+                             /^has_open_pr()/,/^}/p; /^agent_terminal_in()/,/^}/p;
+                             /^enforce_timebox()/,/^}/p' \
+                    "$TMPDIR_FIXTURE/scripts/orca/fleet.sh")"'
+               enforce_timebox' 2>&1
+    }
+
+    # 1. `gh` is down. The agent may well have a PR up; nothing here knows.
+    out="$(run_timebox 1)"
+    grep -q "could not tell" <<<"$out" \
+      || fail "the log does not say it could not tell; a silent skip reads as 'nothing expired': $out"
+    grep -q -- "--interrupt" "$TMPDIR_FIXTURE/orca-calls.log" \
+      && fail "interrupted an agent on a lookup that never answered: $(cat "$TMPDIR_FIXTURE/orca-calls.log")"
+    grep -q "issue comment" "$TMPDIR_FIXTURE/gh-calls.log" \
+      && fail "told the issue the fleet gave up, on the strength of a failed lookup"
+    [ -e "$state/started/29" ] \
+      || fail "dropped the started marker, so the next pass can never time this issue out at all"
+
+    # 2. ...and `gh` answering plainly still ends a genuinely stuck agent. Without
+    # this the guard above is satisfied by a time-box that never fires.
+    out="$(run_timebox "")"
+    grep -q -- "--interrupt" "$TMPDIR_FIXTURE/orca-calls.log" \
+      || fail "3h with a working lookup and no PR is exactly what the time-box is for: $out"
+    grep -q "issue comment" "$TMPDIR_FIXTURE/gh-calls.log" \
+      || fail "stopped the agent without saying so on the issue: $out"
+    [ -e "$state/started/29" ] \
+      && fail "kept the started marker after stopping the agent; it would be stopped again every poll"
+
+    # 3. A PR that is up is not a time-out, however long it took to open.
+    printf '0\n' >"$state/started/29"
+    printf '[{"number":401,"body":"Closes #29\\n"}]\n' >"$TMPDIR_FIXTURE/open-prs.json"
+    out="$(run_timebox "")"
+    grep -q -- "--interrupt" "$TMPDIR_FIXTURE/orca-calls.log" \
+      && fail "interrupted an agent whose PR is open and waiting on review: $out"
+    [ -e "$state/started/29" ] \
+      && fail "an issue that got where it was going should stop being timed"
+    echo "PASS: a failed lookup leaves the time-boxed agent alone, and says so"
+    ;;
+
   *)
     echo "usage: $0 opens|reuses|foreign|no_romm|submits|no_draft|unstable" >&2
     echo "       watch_needs_issue|watch_late_draft|watch_grace|watch_submits|watch_single" >&2
@@ -1958,6 +2051,7 @@ PY
     echo "       fleet_counts_startable_by_the_same_rule" >&2
     echo "       fleet_sees_a_merged_pr_that_says_fixes" >&2
     echo "       fleet_cannot_tell_when_the_pr_lookup_fails" >&2
+    echo "       fleet_leaves_a_timed_out_agent_when_it_cannot_tell" >&2
     exit 2
     ;;
 esac
