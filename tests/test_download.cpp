@@ -2505,7 +2505,7 @@ int main(int argc, char** argv) {
     return checks.failures() == 0 ? 0 : 1;
   }
 
-  const std::unique_ptr<http::HttpClient> client = rommsync::host::MakeCurlHttpClient();
+  const std::unique_ptr<http::HttpClient> client = rig::MakeClient();
   if (!rig::Reachable(*client, base)) {
     std::cerr << "rig unreachable at " << base
               << "\n  start it with: ./scripts/orca/compose.sh up -d\n";

@@ -550,8 +550,9 @@ int RejectionStreak(http::HttpClient& client, const std::string& base) {
   auth::PairingSession session(client, config);
   const std::string user_code = BeginAndShow(session, checks, base);
 
-  // The proxy holds one armed scenario at a time, so the sequence 401, 503, 401
-  // is staged a step at a time as each poll consumes the last one.
+  // A client holds one armed scenario at a time (#118 made it one per client
+  // rather than one for the whole proxy), so the sequence 401, 503, 401 is
+  // staged a step at a time as each poll consumes the last one.
   ExpectSucceeded(checks, ArmStatus(client, base, 401), "arming the first 401");
   int staged = 0;
   const auth::PairingState state =
@@ -780,7 +781,7 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  const std::unique_ptr<http::HttpClient> client = rommsync::host::MakeCurlHttpClient();
+  const std::unique_ptr<http::HttpClient> client = rig::MakeClient();
   if (!rig::Reachable(*client, base)) {
     std::cerr << "rig unreachable at " << base
               << "\n  start it with: ./scripts/orca/compose.sh up -d\n";

@@ -696,7 +696,7 @@ void QueueList(checks::Checks& c) {
 /// `sdmc:` (`native_file_system.hpp`).
 struct Rig {
   explicit Rig(checks::Checks& checks, std::string_view name)
-      : console(checks, name), client(rommsync::host::MakeCurlHttpClient()) {}
+      : console(checks, name), client(rig::MakeClient()) {}
 
   bool Start(checks::Checks& c) {
     if (!harness::LoadFixture(&fixture)) {

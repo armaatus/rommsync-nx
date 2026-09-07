@@ -38,7 +38,7 @@ http::Result GetAuthed(http::HttpClient& client, const std::string& url,
 }  // namespace
 
 int main() {
-  const std::unique_ptr<http::HttpClient> owned = rommsync::host::MakeCurlHttpClient();
+  const std::unique_ptr<http::HttpClient> owned = rig::MakeClient();
   http::HttpClient& client = *owned;
   const std::string base = rig::BaseUrl();
 

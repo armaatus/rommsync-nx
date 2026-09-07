@@ -907,11 +907,12 @@ void StallDropped(rig::Checks& checks, http::HttpClient& client, const std::stri
   checks.ExpectEq(rows_for_slot(&in_slot), 0,
                   "the slot starts empty, so a row in it can only be this upload");
 
-  // The fault is armed with `count:1` on a path prefix, and the proxy holds one
-  // armed scenario for every client -- so this scenario, like every other rig
-  // scenario, depends on running alone (RUN_SERIAL). The listings are
-  // deliberately outside the fault scope: `/api/saves` is a prefix of this
-  // fault's path, and a listing inside it would spend the stall on itself.
+  // The fault is armed with `count:1` on a path prefix, and one client holds one
+  // armed scenario at a time -- so the listings are deliberately outside the
+  // fault scope: `/api/saves` is a prefix of this fault's path, and a listing
+  // inside it would spend the stall on itself. Another client's traffic cannot
+  // spend it (#118); this scenario still runs alone (RUN_SERIAL) because it
+  // uploads to the shared fixture.
   const auto upload_started = std::chrono::steady_clock::now();
   {
     harness::Fault fault(checks, client, base,

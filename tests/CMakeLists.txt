@@ -18,6 +18,24 @@ else()
 endif()
 message(STATUS "rig: ${PROXY_BASE_URL}")
 
+# --- what RUN_SERIAL is for, and what it is not -------------------------------
+#
+# Every rig test below carries RUN_SERIAL, and the reason is the SHARED FIXTURE:
+# one RomM, one library, one fixture device with ONE active sync session on it
+# (#76), and a ten-inits-a-minute rate limit that is per IP and so per suite. Two
+# rig tests at once read, upload and delete each other's saves.
+#
+# It is no longer the fault proxy. Until #118 the proxy held ONE armed scenario
+# for every client, so two tests really could inject each other's faults; it now
+# keys the armed scenario by the `X-Fault-Owner` tag tests/rig.hpp puts on every
+# request, and a fault is claimed only by the client that armed it.
+#
+# What RUN_SERIAL never covered is the case that was actually breaking. It orders
+# tests within ONE ctest invocation and says nothing about a second one -- and an
+# agent's `ctest` beside a review's `ctest` on the same worktree is two of them,
+# which is how #118 was found. Ownership is what makes that safe; serialising
+# could not have, and the comments here used to imply otherwise.
+
 # --- unit tests: no external services ---------------------------------------
 add_executable(test_version test_version.cpp)
 target_link_libraries(test_version PRIVATE rommsync::core)
@@ -275,8 +293,8 @@ add_test(NAME ipc.engine COMMAND test_ipc engine)
 if(NOT ROMMSYNC_REQUIRE_RIG)
   set_tests_properties(ipc.engine PROPERTIES SKIP_RETURN_CODE 77)
 endif()
-# RUN_SERIAL for the reasons pair.* has it: one armed fault proxy for every
-# client, and RomM's ten-inits-a-minute limit is per IP, which is the whole suite.
+# RUN_SERIAL for the reasons pair.* has it (see the top of this file): RomM's
+# ten-inits-a-minute limit is per IP, which is the whole suite.
 set_tests_properties(ipc.engine PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 
 # --- the three lists the overlay browses -------------------------------------
@@ -315,8 +333,8 @@ foreach(scenario IN LISTS LIST_UNIT_SCENARIOS)
 endforeach()
 
 # The two that need this worktree's RomM: paging the seeded library, and the
-# three ways a page fails. RUN_SERIAL for the reason every fault test has it --
-# one armed proxy for every client in the suite.
+# three ways a page fails. RUN_SERIAL for the reason every rig test has it --
+# the shared fixture library they page (see the top of this file).
 set(LIST_RIG_SCENARIOS
   library  # every rom exactly once, in a stable order, with the count RomM reports
   faults   # stall, drop and truncate: a failed page, and a cursor that survives it
@@ -502,8 +520,9 @@ foreach(scenario IN LISTS HTTP_SCENARIOS)
   if(NOT ROMMSYNC_REQUIRE_RIG)
     set_tests_properties(http.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
   endif()
-  # The fault proxy is a single armed scenario shared by every client, so two of
-  # these running at once would inject each other's faults.
+  # RUN_SERIAL for the shared fixture these all dial (see the top of this file).
+  # It used to be the fault proxy as well, and since #118 is not: a fault belongs
+  # to the client that armed it.
   set_tests_properties(http.${scenario} PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 endforeach()
 
@@ -576,9 +595,8 @@ foreach(scenario IN LISTS PAIR_SCENARIOS)
   if(NOT ROMMSYNC_REQUIRE_RIG)
     set_tests_properties(pair.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
   endif()
-  # RUN_SERIAL for the same reason as http.*: the fault proxy holds one armed
-  # scenario for every client. These also wait out real poll intervals, so the
-  # timeout has to cover a few of them.
+  # RUN_SERIAL for the same reason as http.* (see the top of this file). These
+  # also wait out real poll intervals, so the timeout has to cover a few of them.
   set_tests_properties(pair.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 endforeach()
 
@@ -613,10 +631,10 @@ foreach(scenario IN LISTS DEVICE_SCENARIOS)
   if(NOT ROMMSYNC_REQUIRE_RIG)
     set_tests_properties(device.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
   endif()
-  # RUN_SERIAL for the same reasons as pair.*: one armed fault proxy for every
-  # client, and RomM's ten-inits-a-minute limit is per IP, which is the whole
-  # suite. These also mutate the fixture's device list, so two at once would
-  # count each other's rows.
+  # RUN_SERIAL for the same reasons as pair.* (see the top of this file): RomM's
+  # ten-inits-a-minute limit is per IP, which is the whole suite. These also
+  # mutate the fixture's device list, so two at once would count each other's
+  # rows.
   set_tests_properties(device.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 endforeach()
 
@@ -651,9 +669,8 @@ foreach(scenario IN LISTS SYNC_SCENARIOS)
     set_tests_properties(sync.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
   endif()
   # `understood` uploads a throwaway save and deletes it again, so it must not
-  # interleave with another test reading the same library -- and every scenario
-  # here goes through the fault proxy, which holds one armed scenario for all
-  # clients.
+  # interleave with another test reading the same library. That library, not the
+  # fault proxy, is what RUN_SERIAL is for here -- see the top of this file.
   set_tests_properties(sync.${scenario} PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 endforeach()
 
@@ -702,9 +719,8 @@ foreach(scenario IN LISTS EXECUTE_RIG_SCENARIOS)
   if(NOT ROMMSYNC_REQUIRE_RIG)
     set_tests_properties(execute.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
   endif()
-  # RUN_SERIAL for the reason every rig test needs it: the fault proxy holds one
-  # armed scenario for all clients, and these upload and delete saves on the
-  # shared fixture device.
+  # RUN_SERIAL for the reason every rig test needs it (see the top of this file):
+  # these upload and delete saves on the shared fixture device.
   set_tests_properties(execute.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 endforeach()
 # execute.occupied is intermittently red and the cause is NOT understood (#85).
@@ -763,8 +779,8 @@ foreach(scenario IN LISTS SCAN_RIG_SCENARIOS)
   if(NOT ROMMSYNC_REQUIRE_RIG)
     set_tests_properties(scan.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
   endif()
-  # Every rig test goes through the fault proxy, which holds one armed scenario
-  # for all clients.
+  # RUN_SERIAL for the shared fixture library these read (see the top of this
+  # file).
   set_tests_properties(scan.${scenario} PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 endforeach()
 
@@ -801,8 +817,8 @@ add_test(NAME rom.library COMMAND test_rom_path library)
 if(NOT ROMMSYNC_REQUIRE_RIG)
   set_tests_properties(rom.library PROPERTIES SKIP_RETURN_CODE 77)
 endif()
-# Read-only against the shared library, but it goes through the fault proxy,
-# which holds one armed scenario for all clients.
+# Read-only, but against the shared fixture library another test may be
+# uploading into (see the top of this file).
 set_tests_properties(rom.library PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 
 # --- the conflict history, the restore, and the screen over them -------------
@@ -867,9 +883,8 @@ add_test(NAME conflicts.recorded COMMAND test_conflicts recorded)
 if(NOT ROMMSYNC_REQUIRE_RIG)
   set_tests_properties(conflicts.recorded PROPERTIES SKIP_RETURN_CODE 77)
 endif()
-# RUN_SERIAL for the reason every rig test needs it: the fault proxy holds one
-# armed scenario for all clients, and this uploads and deletes saves on the
-# shared fixture device.
+# RUN_SERIAL for the reason every rig test needs it (see the top of this file):
+# this uploads and deletes saves on the shared fixture device.
 set_tests_properties(conflicts.recorded PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 
 # --- the host harness, and the edge cases only the fault proxy can force -----
@@ -917,9 +932,11 @@ foreach(scenario IN LISTS HARNESS_SCENARIOS)
   if(NOT ROMMSYNC_REQUIRE_RIG)
     set_tests_properties(harness.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
   endif()
-  # RUN_SERIAL for the same reason as http.* and pair.*: the fault proxy holds
-  # one armed scenario for every client. These also upload and delete saves on
-  # the shared fixture, so two at once would read each other's library.
+  # RUN_SERIAL for the same reason as http.* and pair.* (see the top of this
+  # file): these upload and delete saves on the shared fixture, so two at once
+  # would read each other's library. `fault_owner` is the scenario that pins the
+  # half RUN_SERIAL was wrongly credited with -- one proxy, two clients, neither
+  # spending the other's fault.
   set_tests_properties(harness.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 endforeach()
 
@@ -977,10 +994,10 @@ foreach(scenario IN LISTS STATES_RIG_SCENARIOS)
   if(NOT ROMMSYNC_REQUIRE_RIG)
     set_tests_properties(states.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
   endif()
-  # RUN_SERIAL for the reason every rig test has it: the fault proxy holds one
-  # armed scenario for every client, and these upload and delete states on the
-  # shared fixture, so two at once would read each other's listing -- which for
-  # states is the whole input to the decision.
+  # RUN_SERIAL for the reason every rig test has it (see the top of this file):
+  # these upload and delete states on the shared fixture, so two at once would
+  # read each other's listing -- which for states is the whole input to the
+  # decision.
   set_tests_properties(states.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 endforeach()
 
@@ -1027,9 +1044,9 @@ foreach(scenario IN LISTS COMPLETE_RIG_SCENARIOS)
   if(NOT ROMMSYNC_REQUIRE_RIG)
     set_tests_properties(complete.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
   endif()
-  # RUN_SERIAL for the reasons every rig test here has: one armed fault proxy for
-  # every client, and RomM keeps ONE active sync session per device -- two of
-  # these at once would cancel each other's sessions (#76).
+  # RUN_SERIAL for the reason every rig test here has (see the top of this file):
+  # RomM keeps ONE active sync session per device, so two of these at once would
+  # cancel each other's sessions (#76).
   set_tests_properties(complete.${scenario} PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
 endforeach()
 
@@ -1075,8 +1092,8 @@ foreach(scenario IN LISTS PLAY_RIG_SCENARIOS)
   if(NOT ROMMSYNC_REQUIRE_RIG)
     set_tests_properties(play.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
   endif()
-  # RUN_SERIAL for the reasons every rig test here has: one armed fault proxy for
-  # every client, and RomM keeps ONE active sync session per device (#76).
+  # RUN_SERIAL for the reason every rig test here has (see the top of this file):
+  # RomM keeps ONE active sync session per device (#76).
   set_tests_properties(play.${scenario} PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
 endforeach()
 
@@ -1201,10 +1218,9 @@ foreach(scenario IN LISTS TICK_RIG_SCENARIOS)
   if(NOT ROMMSYNC_REQUIRE_RIG)
     set_tests_properties(tick.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
   endif()
-  # RUN_SERIAL for the two reasons every rig scenario here has: the fault proxy
-  # holds ONE armed scenario for all clients, and RomM keeps ONE active sync
-  # session per device -- two of these at once would cancel each other's
-  # sessions (#76).
+  # RUN_SERIAL for the reason every rig scenario here has (see the top of this
+  # file): RomM keeps ONE active sync session per device, so two of these at once
+  # would cancel each other's sessions (#76).
   set_tests_properties(tick.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 endforeach()
 
@@ -1813,8 +1829,9 @@ foreach(scenario IN LISTS DOWNLOAD_RIG_SCENARIOS)
   if(NOT ROMMSYNC_REQUIRE_RIG)
     set_tests_properties(download.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
   endif()
-  # RUN_SERIAL for the reason every rig test has it: the fault proxy holds one
-  # armed scenario for every client, so two of these at once damage each other.
+  # RUN_SERIAL for the reason every rig test has it (see the top of this file):
+  # these move the shared fixture's roms, and two at once would compete for the
+  # rig's bandwidth as well as its library.
   set_tests_properties(download.${scenario} PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
 endforeach()
 
@@ -1909,9 +1926,9 @@ set_tests_properties(engine.server PROPERTIES TIMEOUT 120)
 # M1-6's three, which drive a real device-code attempt through the engine: the
 # codes are RomM's, the approval goes through RomM's own
 # `/api/auth/device/approve`, and the interruptions are the fault proxy's. Serial
-# for the same reason `pair.*` is -- the proxy holds one armed scenario for every
-# client, and RomM paces the token endpoint -- and generous on time because two
-# of them wait out real poll intervals.
+# for the same reason `pair.*` is -- RomM paces the token endpoint per IP, which
+# is the whole suite -- and generous on time because two of them wait out real
+# poll intervals.
 set(ENGINE_RIG_SCENARIOS
   pairs        # start to committed token, and the token works against the server
   nonblocking  # `StartPair` returns while the init is stalled: `ipc.hpp`'s contract

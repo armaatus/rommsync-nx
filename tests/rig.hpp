@@ -291,11 +291,18 @@ class OwnedHttpClient : public http::HttpClient {
   std::string owner_;
 };
 
+/// Sign an existing client's proxy traffic. `MakeClient` is this over a fresh
+/// libcurl client; a test that needs a different backend -- the sysmodule's wire
+/// client in tests/test_http_native.cpp -- wraps that one instead.
+inline std::unique_ptr<http::HttpClient> Own(std::unique_ptr<http::HttpClient> inner,
+                                             std::string owner = FaultOwner()) {
+  return std::make_unique<OwnedHttpClient>(std::move(inner), std::move(owner));
+}
+
 /// A client whose faults are its own. What every rig test builds.
 inline std::unique_ptr<http::HttpClient> MakeClientAs(std::string owner,
                                                       const http::ClientOptions& options = {}) {
-  return std::make_unique<OwnedHttpClient>(rommsync::host::MakeCurlHttpClient(options),
-                                           std::move(owner));
+  return Own(rommsync::host::MakeCurlHttpClient(options), std::move(owner));
 }
 
 inline std::unique_ptr<http::HttpClient> MakeClient(const http::ClientOptions& options = {}) {

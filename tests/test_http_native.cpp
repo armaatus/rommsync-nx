@@ -870,9 +870,9 @@ int main(int argc, char** argv) {
   // The connector outlives the client: `MakeWireHttpClient` borrows it.
   rig::TcpConnector connector;
   const std::unique_ptr<http::HttpClient> client =
-      rommsync::sysmodule::MakeWireHttpClient(connector);
+      rig::Own(rommsync::sysmodule::MakeWireHttpClient(connector));
 #else
-  const std::unique_ptr<http::HttpClient> client = rommsync::host::MakeCurlHttpClient();
+  const std::unique_ptr<http::HttpClient> client = rig::MakeClient();
 #endif
   if (!rig::Reachable(*client, base)) {
     std::cerr << "rig unreachable at " << base

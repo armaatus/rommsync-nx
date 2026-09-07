@@ -80,9 +80,9 @@ curl -XPOST "$PROXY_BASE_URL/__fault" \
   -d '{"mode":"status","status":401,"path":"/api/sync/negotiate","after":2}'
 ```
 
-Modes are `status`, `truncate`, `drop` (real TCP reset), `stall`. Faults
-auto-disarm after `count` uses (default 1). Full reference: the module docstring
-in [server/testing/fault_proxy.py](server/testing/fault_proxy.py).
+Modes are `status`, `truncate`, `drop` (real TCP reset), `stall`. Faults auto-disarm
+after `count` uses (default 1) and belong to whoever armed them -- untagged, like the
+one above, means everybody (#118). Reference: [fault_proxy.py](server/testing/fault_proxy.py).
 
 Never add a commercial ROM to `server/testing/roms.manifest` — it is fetched in
 public CI. Homebrew and freely redistributable only.

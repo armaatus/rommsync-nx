@@ -18,9 +18,27 @@ server that never produced one.
 
 Control API (not forwarded upstream)::
 
-    GET    /__fault          -> the armed scenario, or null
+    GET    /__fault          -> the scenario armed for you, or null
     POST   /__fault          -> arm a scenario (JSON body)
     DELETE /__fault          -> disarm
+
+**A fault belongs to the client that armed it** (issue #118). Send an
+``X-Fault-Owner: <tag>`` header on the arm and on every request that scenario is
+meant to damage, and only requests carrying the same tag can claim it: ``after``
+and ``count`` then count that client's traffic rather than everything moving
+through the proxy. Without that, a second ``ctest`` against the same rig spends
+another test's positional budget, the fault fires on a stranger's request, and
+the test that armed it fails with an off-by-one -- or a timeout, on the side that
+was waiting for a fault already consumed -- in a file nobody touched.
+
+``RUN_SERIAL`` does not help with this and never could: it orders tests within
+one ``ctest`` invocation and says nothing about a second one.
+
+A scenario armed with no tag stays global, and applies to every client -- that is
+the one-line ``curl`` in CLAUDE.md and docs/TESTING.md, which arms a fault for
+whichever request comes next. A tagged client falls back to it only when it has
+none of its own. ``DELETE`` clears the caller's scenario and the untagged one, so
+"leave the proxy disarmed" still means what it says.
 
 Scenario fields::
 
@@ -49,6 +67,11 @@ Example -- make the 3rd call to /api/sync/negotiate fail with 401, once::
       "mode": "status", "status": 401,
       "path": "/api/sync/negotiate", "after": 2
     }'
+
+The same thing scoped to one client, which is what tests/rig.hpp does::
+
+    curl -XPOST $PROXY_BASE_URL/__fault -H 'X-Fault-Owner: my-tag' -d '{...}'
+    curl "$PROXY_BASE_URL/api/sync/negotiate" -H 'X-Fault-Owner: my-tag'
 """
 
 from __future__ import annotations
@@ -68,6 +91,16 @@ UPSTREAM = os.environ.get("UPSTREAM", "http://127.0.0.1:8080").rstrip("/")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8080"))
 CONTROL_PATH = "/__fault"
 CHUNK = 64 * 1024
+
+# Whose fault a request may claim. An empty tag is the untagged, global scenario.
+OWNER_HEADER = "X-Fault-Owner"
+ANONYMOUS = ""
+
+# A tagged client is a process, and a process can die between arming a scenario
+# and firing it -- a killed `ctest` is the ordinary way. The registry would then
+# hold that tag forever, which matters only because it is unbounded: nothing
+# else claims a dead client's scenario. Pruned on the next arm.
+OWNER_TTL_SECONDS = 3600
 
 # Hop-by-hop headers must not be forwarded (RFC 9110 s7.6.1). Content-Length and
 # Transfer-Encoding are dropped separately because we re-frame the body.
@@ -105,55 +138,98 @@ def _reset(connection) -> None:
 
 
 class Fault:
-    """The armed scenario, shared across worker threads."""
+    """One client's armed scenario, and how much of it is left."""
+
+    def __init__(self, spec: dict, armed_at: float) -> None:
+        self.spec = spec
+        self.seen = 0
+        self.armed_at = armed_at
+
+
+class Registry:
+    """The armed scenarios, one per owner, shared across worker threads.
+
+    There was one scenario here for every client until #118. The dict is the
+    whole fix: an ``after`` of 2 means "the third matching request *I* make",
+    which is what every caller already believed it meant.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._spec: dict | None = None
-        self._seen = 0
+        self._faults: dict[str, Fault] = {}
 
-    def arm(self, spec: dict) -> None:
+    def arm(self, owner: str, spec: dict) -> None:
         with self._lock:
-            self._spec = spec
-            self._seen = 0
+            self._prune()
+            self._faults[owner] = Fault(spec, time.monotonic())
 
-    def disarm(self) -> None:
-        with self._lock:
-            self._spec = None
-            self._seen = 0
+    def disarm(self, owner: str) -> None:
+        """Clear the caller's scenario, and the untagged one it falls back to.
 
-    def peek(self) -> dict | None:
-        with self._lock:
-            return dict(self._spec) if self._spec else None
-
-    def claim(self, path: str) -> dict | None:
-        """Return the scenario if this request should be damaged, else None.
-
-        Counts only requests that match ``path``, so an ``after`` of 2 means
-        "the third matching request" regardless of unrelated traffic.
+        Both, because a test's "leave the proxy disarmed" has to hold for the
+        next test whatever armed what: an untagged scenario left behind damages
+        everybody's next request, which is the failure this guarantee exists to
+        prevent.
         """
         with self._lock:
-            spec = self._spec
-            if not spec:
+            self._faults.pop(owner, None)
+            self._faults.pop(ANONYMOUS, None)
+
+    def peek(self, owner: str) -> dict | None:
+        """The scenario that would apply to `owner`, the way `claim` resolves it."""
+        with self._lock:
+            fault = self._resolve(owner)
+            return dict(fault.spec) if fault else None
+
+    def claim(self, path: str, owner: str) -> dict | None:
+        """Return the scenario if this request should be damaged, else None.
+
+        Counts only requests that match ``path`` AND belong to the owner that
+        armed it, so an ``after`` of 2 means "the third matching request from
+        this client" regardless of unrelated traffic -- from this client or from
+        any other.
+        """
+        with self._lock:
+            fault = self._resolve(owner)
+            if fault is None:
                 return None
+            spec = fault.spec
             prefix = spec.get("path")
             if prefix and not path.startswith(prefix):
                 return None
 
-            self._seen += 1
-            index = self._seen - 1
+            fault.seen += 1
+            index = fault.seen - 1
             after = int(spec.get("after", 0))
             if index < after:
                 return None
 
             applied = index - after + 1
             if applied >= int(spec.get("count", 1)):
-                self._spec = None
-                self._seen = 0
+                # Auto-disarm removes the entry rather than emptying it: an owner
+                # with nothing armed must fall back to the untagged scenario, the
+                # same as one that never armed anything.
+                self._drop(fault)
             return dict(spec)
 
+    # -- internals, all called under the lock ---------------------------------
+    def _resolve(self, owner: str) -> Fault | None:
+        """Your own scenario, or the untagged one when you have none."""
+        return self._faults.get(owner) or self._faults.get(ANONYMOUS)
 
-FAULT = Fault()
+    def _drop(self, fault: Fault) -> None:
+        for key, value in list(self._faults.items()):
+            if value is fault:
+                del self._faults[key]
+
+    def _prune(self) -> None:
+        cutoff = time.monotonic() - OWNER_TTL_SECONDS
+        for key, value in list(self._faults.items()):
+            if key != ANONYMOUS and value.armed_at < cutoff:
+                del self._faults[key]
+
+
+FAULT = Registry()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -169,11 +245,16 @@ class Handler(BaseHTTPRequestHandler):
         return self.rfile.read(length) if length else b""
 
     # -- control API -------------------------------------------------------
+    def _owner(self) -> str:
+        """Who this request belongs to. Untagged is the global scenario (#118)."""
+        return self.headers.get(OWNER_HEADER) or ANONYMOUS
+
     def _control(self, method: str) -> None:
+        owner = self._owner()
         if method == "GET":
-            payload = json.dumps(FAULT.peek()).encode()
+            payload = json.dumps(FAULT.peek(owner)).encode()
         elif method == "DELETE":
-            FAULT.disarm()
+            FAULT.disarm(owner)
             payload = b'{"armed": null}'
         else:
             try:
@@ -191,8 +272,8 @@ class Handler(BaseHTTPRequestHandler):
             if mode in {"truncate", "drop"} and not isinstance(spec.get("bytes"), int):
                 self._respond(400, b'{"error": "truncate and drop require an integer \'bytes\'"}')
                 return
-            FAULT.arm(spec)
-            payload = json.dumps({"armed": spec}).encode()
+            FAULT.arm(owner, spec)
+            payload = json.dumps({"armed": spec, "owner": owner}).encode()
         self._respond(200, payload, "application/json")
 
     def _respond(self, status: int, body: bytes, ctype: str = "application/json",
@@ -217,7 +298,7 @@ class Handler(BaseHTTPRequestHandler):
         # (/api/sync/negotiate, /api/auth/device/token) is a POST.
         body = self._read_body()
 
-        fault = FAULT.claim(self.path)
+        fault = FAULT.claim(self.path, self._owner())
 
         if fault and fault["mode"] == "stall":
             # Hold the connection, then drop it -- and never forward. This is
@@ -251,9 +332,12 @@ class Handler(BaseHTTPRequestHandler):
                           write_body=method != "HEAD")
             return
 
+        # The owner tag is this proxy's business and nobody else's: RomM would
+        # log a header it has never heard of, on every request the suite makes.
         headers = {
             k: v for k, v in self.headers.items()
-            if k.lower() not in {"host", "content-length", "accept-encoding"}
+            if k.lower() not in {"host", "content-length", "accept-encoding",
+                                 OWNER_HEADER.lower()}
         }
         request = urllib.request.Request(
             UPSTREAM + self.path, data=body or None, headers=headers, method=method
