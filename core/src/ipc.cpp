@@ -504,6 +504,8 @@ const char* ToString(Command command) {
       return "ListConflicts";
     case Command::kRestoreBackup:
       return "RestoreBackup";
+    case Command::kGetLog:
+      return "GetLog";
   }
   return "Unknown";
 }
@@ -1313,6 +1315,83 @@ bool AppendIfItFits(ConflictPage* page, ConflictRow row) {
     return true;
   }
   page->entries.pop_back();
+  return false;
+}
+
+// --- the log tail -------------------------------------------------------------
+
+std::string EncodeLogRequest(std::int32_t lines) {
+  std::string out("{");
+  AppendInteger(&out, "lines", lines, /*first=*/true);
+  out += '}';
+  return out;
+}
+
+Decoded<std::int32_t> DecodeLogRequest(std::string_view text) {
+  return DecodeObject<std::int32_t>(
+      text, "log request", [](const json::Value& object, std::int32_t* out, json::Error* error) {
+        std::int64_t lines = 0;
+        // The same wide bound `DecodeConflictQuery` uses, and clamped rather
+        // than refused by `ServiceCore::GetLog`: what a client *wanted* is a
+        // legitimate thing to say, and a command documented never to fail may
+        // not be made to fail by an over-large ask. Zero is the one value with
+        // no meaning -- a caller that wants no lines does not call this.
+        if (!ReadInteger(object, "lines", &lines, 1, kMaxRequestedPageSize, error)) {
+          return;
+        }
+        *out = static_cast<std::int32_t>(lines);
+      });
+}
+
+std::string EncodeLogTail(const LogTail& tail) {
+  std::string out("{");
+  AppendKey(&out, "lines", /*first=*/true);
+  out += json::QuoteArray(tail.lines);
+  AppendInteger(&out, "total", tail.total);
+  out += '}';
+  return out;
+}
+
+Decoded<LogTail> DecodeLogTail(std::string_view text) {
+  return DecodeObject<LogTail>(
+      text, "log tail", [](const json::Value& object, LogTail* out, json::Error* error) {
+        const json::Value* lines =
+            ReadArray(object, "lines", static_cast<std::size_t>(kMaxLogLines), error);
+        if (lines == nullptr) {
+          return;
+        }
+        for (const json::Value& element : lines->elements()) {
+          if (!element.is_string()) {
+            Fail(error, "lines", "holds something that is not a line");
+            return;
+          }
+          if (element.string().size() > log::kMaxLineBytes) {
+            // The writer bounds every line at `kMaxLineBytes` (log.hpp), so one
+            // over it did not come from this client's log -- and a screen that
+            // drew it would be drawing whatever the other side felt like
+            // sending.
+            Fail(error, "lines", "holds a line longer than the log ever writes");
+            return;
+          }
+          out->lines.push_back(element.string());
+        }
+        // The total is what the process has written, not what it kept, so it is
+        // bounded only by how long a console has been up.
+        if (!ReadInteger(object, "total", &out->total, 0, kMaxId, error)) {
+          return;
+        }
+      });
+}
+
+bool AppendIfItFits(LogTail* tail, std::string line) {
+  if (tail->lines.size() >= static_cast<std::size_t>(kMaxLogLines)) {
+    return false;
+  }
+  tail->lines.push_back(std::move(line));
+  if (Fits(EncodeLogTail(*tail))) {
+    return true;
+  }
+  tail->lines.pop_back();
   return false;
 }
 

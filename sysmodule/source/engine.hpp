@@ -80,6 +80,16 @@ namespace rommsync::sysmodule {
 /// rule 4, and the `sdmc:` prefix is libnx's).
 inline constexpr const char* kConfigDir = "sdmc:/config/rommsync/";
 
+/// The same directory as an **SD-root** path, for the one caller that has to
+/// make it rather than open something in it: `fs::FileSystem::CreateDirectory`
+/// takes SD-root paths, the `sdmc:` prefix being the backend's (file_system.hpp).
+///
+/// It exists because of the log (M7-3, #38). `log::FileSink` cannot create its
+/// own directory -- `core/` has only standard headers -- so on a card where
+/// `/config/rommsync/` has never existed the first boot's lines would be dropped
+/// silently, which is exactly the boot a user is most likely to be asked for.
+inline constexpr const char* kConfigSdDir = "/config/rommsync";
+
 /// What an SD-root path from `core/` is prefixed with to open it here.
 ///
 /// The mapping `fs::FileSystem::Resolve` performs, spelled once for the callers
@@ -574,6 +584,16 @@ class SdEngine : public ipc::Engine {
   /// `play::kMaxWindowSeconds` then refuses outright -- so not stamping costs the
   /// play time as well as the exaggeration.
   void StampPlayWindow();
+
+  /// Say so when the play-session buffer could not be written (M7-4, #39).
+  ///
+  /// Every `play::StoreResult` in this class goes through here, because the
+  /// alternative -- discarding them -- makes a `play.db` that will not write
+  /// completely invisible: the buffer stops draining, the window stops moving,
+  /// and nothing anywhere says why. **It never fails a tick**; no save is at
+  /// risk from it, which is what keeps `log::Event::kPlayFailed` apart from
+  /// `kSaveFailed`.
+  static void LogPlayStore(const play::StoreResult& stored);
 
   /// Record what one exchange said about the credentials, and persist the
   /// verdict the moment it becomes one.

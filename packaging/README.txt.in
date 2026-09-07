@@ -43,9 +43,9 @@ UPGRADING
 ---------
 
 Unzip a newer release over the top. The only files replaced are the six
-listed above. config.ini, token.dat, device.dat, state.db and queue.json are
-not in the archive, so your settings, your pairing and your sync state
-survive.
+listed above. config.ini, token.dat, device.dat, state.db, queue.json and
+rommsync.log are not in the archive, so your settings, your pairing, your
+sync state and your log survive.
 
 
 THE FULL GUIDE
@@ -59,6 +59,12 @@ Install and pairing, step by step, and the configuration reference:
 
   https://github.com/armaatus/rommsync-nx/blob/main/docs/INSTALL.md
   https://github.com/armaatus/rommsync-nx/blob/main/docs/CONFIG.md
+
+When a sync does not happen. sys-rommsync writes what went wrong to
+config/rommsync/rommsync.log on this card; this page is what every line in
+it means, and what to do about it:
+
+  https://github.com/armaatus/rommsync-nx/blob/main/docs/TROUBLESHOOTING.md
 
 
 LICENSE

@@ -405,9 +405,10 @@ struct SyncPlan {
   /// `action` (downgraded to `no_op`), an unknown `reason`, or a `file_name`
   /// that is not a single path component.
   ///
-  /// `core/` has no logger -- logging is the sysmodule's, behind an interface
-  /// (docs/ARCHITECTURE.md) -- so the parse hands the lines up rather than
-  /// swallowing them. A silent downgrade is exactly the thing that must not be
+  /// The parse hands the lines up rather than swallowing them, and rather than
+  /// writing them: a pure function of a response body may not depend on a
+  /// process-wide sink, and the caller is the half that knows which tick this
+  /// was. A silent downgrade is exactly the thing that must not be
   /// silent: it is the client quietly declining to sync a save it no longer
   /// understands, on every tick, with nothing to say why.
   ///
@@ -845,8 +846,8 @@ struct SyncCompletion {
   /// RomM refused.
   ///
   /// None of them is an error. The accounting call succeeded; these are things
-  /// worth a log line, and `core/` has no logger (docs/ARCHITECTURE.md), so they
-  /// are handed up the way `SyncPlan::warnings` are.
+  /// worth a log line, and they are handed up the way `SyncPlan::warnings` are
+  /// so that the caller decides which one.
   std::vector<std::string> warnings;
 };
 

@@ -23,6 +23,27 @@ add_executable(test_version test_version.cpp)
 target_link_libraries(test_version PRIVATE rommsync::core)
 add_test(NAME core.version COMMAND test_version)
 
+# The log: the one file this client writes on the card. What these hold it to is
+# the two promises docs/TROUBLESHOOTING.md makes on its behalf -- that it is
+# bounded (one file at the cap, one `.old`, nothing older) and that it holds no
+# bearer token, no `device_code` and no URL credential. Pure file I/O and string
+# work, so nothing here skips.
+add_executable(test_log test_log.cpp)
+target_link_libraries(test_log PRIVATE rommsync::core)
+target_include_directories(test_log PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_log PRIVATE
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+foreach(scenario
+        renders   # the line shape, the ordinal, the bound and the levels
+        redacts   # a token, a device_code and a user:password@ URL never reach the file
+        rotates   # the cap, the single `.old`, and the ceiling on the pair
+        tail      # the in-memory ring GetLog is answered from
+        sink      # a null sink writes nowhere; an installed one gets everything
+        events)   # every tag is unique and IsEvent round-trips kAllEvents
+  add_test(NAME log.${scenario} COMMAND test_log ${scenario})
+  set_tests_properties(log.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
 # The JSON reader every response shape is read through. Pure parsing, so this
 # never skips -- a body that should have been refused is a bug with or without
 # a server to have sent it.
@@ -1464,6 +1485,30 @@ foreach(scenario
   set_tests_properties(docs.install_${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
 
+# --- the troubleshooting guide: docs/TROUBLESHOOTING.md ----------------------
+# The other page nobody may verify by following it (M8-2 does that), and the one
+# with a way to rot that INSTALL.md does not have: it quotes the log line each
+# failure produces, and a line the code stopped writing is a page that sends a
+# user looking for something that is not there.
+#
+# What makes it checkable is that the log's events are a closed set -- an enum
+# with `kAllEvents` as its extent -- so the guide's table and the code can be
+# compared in both directions, and every tag can be held to having a call site.
+# Reads files only, so none of these ever skips.
+set(DOCS_TROUBLESHOOTING_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_docs_troubleshooting.py")
+
+foreach(scenario
+        events     # the event table is exactly log::kAllEvents, and every tag is shown
+        emitted    # every documented tag has a call site outside the log module
+        links      # every relative link and anchor resolves
+        safety     # no step weakens TLS; the bug-report section names what not to send
+        structure) # #38's sections, the hardware note, the cap, the README/INSTALL links
+  add_test(NAME docs.troubleshooting_${scenario}
+           COMMAND ${Python3_EXECUTABLE} "${DOCS_TROUBLESHOOTING_TEST}" ${scenario}
+                   --repo "${CMAKE_SOURCE_DIR}")
+  set_tests_properties(docs.troubleshooting_${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
 # --- M6-3: turning a tag into a release --------------------------------------
 # Three files decide whether a `v*` tag publishes something a user can install:
 # VERSION, the release job in .github/workflows/ci.yml, and the notes generator.
@@ -1744,6 +1789,7 @@ set(ENGINE_SCENARIOS
   unreachable  # M1-6: a server that answers nothing refuses the attempt, and writes nothing
   syncnow   # M7-2: Sync now starts a tick and says so, instead of "one is already running"
   restore_race  # M7-2: a restore pressed while a tick is writing saves is refused, not interleaved
+  log       # M7-3: the misconfigurations docs/TROUBLESHOOTING.md answers, on the record
 )
 foreach(scenario IN LISTS ENGINE_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
@@ -1784,6 +1830,7 @@ set(ENGINE_RIG_SCENARIOS
   pairs        # start to committed token, and the token works against the server
   nonblocking  # `StartPair` returns while the init is stalled: `ipc.hpp`'s contract
   repairs      # `StartPair` then `Unpair`, with neither instant leaving nothing
+  log_faults   # M7-3: the four transport failures the guide documents, as the proxy makes them
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})

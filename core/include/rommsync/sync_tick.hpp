@@ -69,9 +69,11 @@ inline constexpr std::size_t kMaxRecoveryWarnings = 16;
 /// What a sweep found, and what it did about it.
 ///
 /// Counts rather than paths: a card that comes back from a bad week can hold a
-/// leftover per save, and `core/` has no logger to spend a line each on
-/// (docs/ARCHITECTURE.md). `warnings` names the ones that could *not* be dealt
-/// with, which is the short list worth reading.
+/// leftover per save, and there is no budget for a line each -- the log keeps
+/// its last `log::kTailLines` and a card that comes back from a bad week would
+/// push everything else out of it. `warnings` names the ones that could *not*
+/// be dealt with, which is the short list worth reading and the one
+/// `SdEngine::RunOneTick` writes.
 struct RecoveryReport {
   /// `<save>.tmp.part` -- an interrupted body, removed.
   std::size_t partials_removed = 0;
