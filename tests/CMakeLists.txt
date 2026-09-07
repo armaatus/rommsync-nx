@@ -1491,6 +1491,11 @@ endforeach()
 # a live worktree with no rig -- #122's, mid-ctest. The `remove_` pair fixes the
 # order without leaking the stack; the `merged_` pair is reap_merged catching up
 # with what reap_abandoned already does, on a dirty tree and on a refusal.
+#
+# ...and the `run_` three, which are the same lesson one step further on: the
+# staleness report's remedy is a restart, so making staleness visible multiplies
+# restarts, and nothing stopped a restart from landing beside a dispatcher that
+# was still up. `MAX_WORKTREES` is per process (#179).
 set(ORCA_FLEET_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_orca_fleet.sh")
 foreach(phase card_says card_quiet remove_forces remove_advice
               remove_keeps_stack remove_sweeps_stack
@@ -1509,7 +1514,8 @@ foreach(phase card_says card_quiet remove_forces remove_advice
               status_stale status_current status_unrecorded
               status_from_worktree status_draining status_drained
               status_behind status_behind_revert status_unreadable
-              status_names_root)
+              status_names_root
+              run_refuses run_stale_recycled run_stale_gone)
   add_test(NAME orca.fleet_${phase}
            COMMAND "${BASH_PROGRAM}" "${ORCA_FLEET_TEST}" ${phase})
   set_tests_properties(orca.fleet_${phase} PROPERTIES TIMEOUT 60)
