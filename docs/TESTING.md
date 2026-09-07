@@ -878,6 +878,12 @@ Only the Orca UI runs that hook by itself. `orca worktree rm` **skips**
 from the CLI without it leaves the whole stack running with no worktree left to
 find it from. Pass the flag, or sweep afterwards with `reap.sh --yes`.
 
+`fleet.sh` takes the second route deliberately. Orca runs the hook *before* it
+decides whether the removal succeeds, so a removal it then refuses has already
+torn the stack down under a worktree that is still there and still being worked
+in (#163). The dispatcher removes with no hooks and sweeps once the directory is
+confirmed gone.
+
 Stacks can still outlive their worktree — one deleted with `rm -rf`, removed with
 `orca worktree rm` and no `--run-hooks`, or removed while Docker was stopped. The fixture restarts `unless-stopped`, so those come
 back on every docker start and hold two ports each. Sweep them up with:

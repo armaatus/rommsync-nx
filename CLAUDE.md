@@ -58,10 +58,11 @@ There is a browser tab on this worktree's RomM, logged in as the fixture admin.
 Use it — a scan result, a platform slug or a rom's real metadata is one glance
 away there and several API calls away otherwise. `romm-browser.sh` reopens it.
 
-Removing a worktree from the **Orca UI** runs the teardown hook. Removing it with
-`orca worktree rm` does **not** unless you pass `--run-hooks`, and the stack it
-leaves behind restarts `unless-stopped` and holds two ports forever. Either pass
-the flag or sweep afterwards with `./scripts/orca/reap.sh --yes`.
+Removing a worktree from the **Orca UI** runs the teardown hook; `orca worktree
+rm` needs `--run-hooks`, and a stack left behind restarts `unless-stopped`,
+holding two ports forever. Prefer sweeping with `./scripts/orca/reap.sh --yes`:
+Orca runs the hook *before* it knows the removal succeeded, so a refusal has
+already taken that worktree's RomM down under whoever is in it (#163).
 
 If `ctest` reports `rig.smoke` as **Skipped**, RomM is not running — start it
 rather than working around it.

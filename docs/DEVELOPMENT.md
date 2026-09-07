@@ -816,7 +816,9 @@ volumes, leaving the shared caches alone. Note that only the Orca UI runs that
 hook by itself — `orca worktree rm` skips `orca.yaml` hooks unless `--run-hooks`
 is passed. For stacks orphaned that way, or by a worktree deleted with `rm -rf`,
 `scripts/orca/reap.sh` lists them and `--yes` removes them; it errs towards
-keeping anything it cannot prove stale. See [TESTING.md](TESTING.md#worktree-isolation).
+keeping anything it cannot prove stale. `fleet.sh` takes that second route on
+purpose — the hook runs before Orca commits to the removal, so a refused one
+would tear down a live worktree's rig (#163). See [TESTING.md](TESTING.md#worktree-isolation).
 
 The **server contract** is testable off-console: `server/probe_contract.py`
 exercises auth + negotiate + saves against a RomM and prints the real response

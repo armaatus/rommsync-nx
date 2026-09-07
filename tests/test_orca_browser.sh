@@ -1771,10 +1771,18 @@ esac
 STUB
     chmod +x "$stub/orca"
     : >"$TMPDIR_FIXTURE/orca-calls.log"
+    # remove_worktree alone, with the two things it calls out to stubbed: `say` is
+    # the dispatcher's logger, and `finish_removal` is the teardown that runs only
+    # once the directory is confirmed gone. This phase is about the VERDICT --
+    # which the stubs cannot influence -- and without them the extraction fills
+    # the output with "command not found" for functions it deliberately left
+    # behind.
     run_remove() {
       PATH="$stub:$PATH" ROMMSYNC_FLEET_DIR="$TMPDIR_FIXTURE/fleet" \
       bash -c '. '"$TMPDIR_FIXTURE"'/scripts/orca/lib.sh
                orca_cli_resolve
+               say() { printf "%s\n" "$*"; }
+               finish_removal() { :; }
                '"$(sed -n '/^remove_worktree()/,/^}/p' "$TMPDIR_FIXTURE/scripts/orca/fleet.sh")"'
                remove_worktree "'"$1"'"'
     }

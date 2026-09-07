@@ -22,15 +22,13 @@ cd "$REPO_ROOT"
 # project name can be derived, which is exactly when a watcher would be left
 # polling the Orca runtime from a directory Orca is deleting.
 #
-# `|| true` because this runs under `set -e` and a missing pidfile, the normal
-# case, would otherwise abort teardown before it removed anything. The identity
-# check because a pidfile outlives a `kill -9` and a reboot, and signalling a
-# recycled pid means signalling an unrelated process of the user's.
-watcher="$(cat .orca/agent-autostart.pid 2>/dev/null || true)"
-if [ -n "$watcher" ] && kill -0 "$watcher" 2>/dev/null \
-   && ps -o command= -p "$watcher" 2>/dev/null | grep -q 'agent-autostart'; then
+# Through lib.sh, because fleet.sh has to do the same thing at a different moment
+# and the pid identity check behind it should exist once. Guarded by `if` rather
+# than `|| true` for `set -e`: a missing pidfile is the normal case, and it must
+# not abort teardown before it has removed anything.
+watcher="$(orca_read_autostart_watcher .)"
+if orca_stop_autostart_watcher "$watcher"; then
   echo "==> stopping the agent autostart watcher (pid $watcher)"
-  kill "$watcher" 2>/dev/null || true
 fi
 
 env_project=""
