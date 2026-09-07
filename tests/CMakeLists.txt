@@ -897,6 +897,7 @@ set_tests_properties(harness.sandbox PROPERTIES TIMEOUT 60)
 
 set(HARNESS_SCENARIOS
   disarms         # an armed fault cannot outlive the scope that armed it
+  fault_owner     # ...and belongs to the client that armed it, not to the proxy (#118)
   expired         # 401 mid-flow: a response, not a transport error, and not a verdict
   conflict        # both sides moved past the last sync
   same_timestamp  # ...and the no-history conflict a switch on one reason drops

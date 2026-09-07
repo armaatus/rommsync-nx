@@ -19,7 +19,8 @@
 // plus the harness's own two guarantees, which are the ones that keep the rest
 // honest: `sandbox` (the per-test SD card, and the backup rule it enforces
 // whether or not a test remembers to look) and `disarms` (a fault cannot
-// outlive the scope that armed it).
+// outlive the scope that armed it), and `fault_owner` (a fault belongs to the
+// client that armed it, so a second `ctest` cannot spend it -- #118).
 //
 // **What is deliberately not here.** The issue's wording asks for the client's
 // *behaviour* on a conflict and on a partial plan -- resolve by policy, count
@@ -1445,6 +1446,79 @@ void Backup(rig::Checks& checks, http::HttpClient& client, const std::string& ba
   harness::DeleteSave(client, base, fixture, server.id);
 }
 
+// --- fault_owner --------------------------------------------------------------
+//
+// Two clients, one proxy (#118). Everything above arms a fault and then counts
+// its own requests, and until this scenario existed nothing checked that the
+// requests being counted were its own: the proxy held ONE armed scenario, so a
+// second `ctest` against the same rig spent this test's `after`/`count` budget
+// and the fault fired on a stranger. What that looks like from here is an
+// off-by-one in an assertion about something else, or a wait that times out
+// because the fault it was waiting for was already gone -- in a test file
+// nobody touched, which is why it cost four runs to attribute.
+//
+// The two clients here stand in for the two `ctest` processes. They are the
+// same code with different owner tags, and the tags are what the proxy sorts
+// them by.
+
+void FaultOwnerScenario(rig::Checks& checks, const std::string& base) {
+  const std::unique_ptr<http::HttpClient> mine = rig::MakeClientAs("harness-fault-owner-mine");
+  const std::unique_ptr<http::HttpClient> stranger =
+      rig::MakeClientAs("harness-fault-owner-stranger");
+
+  const auto heartbeat = [&base](http::HttpClient& client) {
+    http::Request request;
+    request.url = base + "/api/heartbeat";
+    return client.Send(request).response.status;
+  };
+
+  {
+    // "The third heartbeat I send fails." Positional, which is exactly the
+    // shape a stranger's traffic used to break.
+    harness::Fault fault(
+        checks, *mine, base,
+        R"({"mode":"status","status":418,"path":"/api/heartbeat","after":2,"count":1})");
+
+    for (int i = 0; i < 5; ++i) {
+      checks.ExpectEq(heartbeat(*stranger), 200,
+                      "a stranger's heartbeat is untouched by a fault it did not arm");
+    }
+
+    checks.ExpectEq(heartbeat(*mine), 200, "my first heartbeat passes through");
+    checks.ExpectEq(heartbeat(*mine), 200, "my second heartbeat passes through");
+    checks.ExpectEq(heartbeat(*mine), 418, "and my third is the one that fails");
+  }
+  harness::ExpectDisarmed(checks, *mine, base, "the scope disarmed it");
+
+  {
+    // Arming used to overwrite whatever was there, so the stranger arming its
+    // own scenario silently threw mine away. Both are live now, and each fires
+    // for its owner only.
+    harness::Fault theirs(checks, *stranger, base,
+                          R"({"mode":"status","status":429,"path":"/api/heartbeat","count":1})");
+    harness::Fault ours(checks, *mine, base,
+                        R"({"mode":"status","status":418,"path":"/api/heartbeat","count":1})");
+
+    checks.ExpectEq(heartbeat(*stranger), 429, "the stranger's own fault still fires for it");
+    checks.ExpectEq(heartbeat(*mine), 418, "and mine survived it being armed");
+  }
+  harness::ExpectDisarmed(checks, *mine, base, "both scopes disarmed");
+
+  {
+    // The documented manual workflow (CLAUDE.md, docs/TESTING.md): a `curl`
+    // that arms without a tag is asking for the next request through the
+    // proxy, whoever makes it. That has to keep working, or the one-liner in
+    // the docs quietly does nothing.
+    const std::unique_ptr<http::HttpClient> anonymous = rommsync::host::MakeCurlHttpClient();
+    const http::Result armed = rig::ArmFault(
+        *anonymous, base, R"({"mode":"status","status":503,"path":"/api/heartbeat","count":1})");
+    checks.Expect(armed.successful(), "an untagged client may still arm: " + armed.response.body);
+    checks.ExpectEq(heartbeat(*mine), 503, "an untagged fault applies to everybody");
+    rig::DisarmFault(*mine, base);
+  }
+  harness::ExpectDisarmed(checks, *mine, base, "and a disarm clears the untagged one too");
+}
+
 
 }  // namespace
 
@@ -1478,7 +1552,7 @@ int main(int argc, char** argv) {
     return checks.failures() == 0 ? 0 : 1;
   }
 
-  const std::unique_ptr<http::HttpClient> client = rommsync::host::MakeCurlHttpClient();
+  const std::unique_ptr<http::HttpClient> client = rig::MakeClient();
   if (!rig::Reachable(*client, base)) {
     std::cerr << "rig unreachable at " << base
               << "\n  start it with: ./scripts/orca/compose.sh up -d\n";
@@ -1499,6 +1573,8 @@ int main(int argc, char** argv) {
 
   if (scenario == "disarms") {
     Disarms(checks, *client, base);
+  } else if (scenario == "fault_owner") {
+    FaultOwnerScenario(checks, base);
   } else if (scenario == "expired") {
     Expired(checks, *client, base, fixture);
   } else if (scenario == "stall") {
