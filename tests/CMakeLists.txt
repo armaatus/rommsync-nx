@@ -1421,6 +1421,8 @@ foreach(phase opens reuses foreign no_romm submits no_draft unstable
               await_never_hands_back_the_same_review_twice
               await_stops_when_the_gate_will_not_import
               review_status_says_a_human_merges_this_one
+              review_status_holds_an_unanswered_review
+              review_status_lets_an_answered_review_through
               review_status_names_the_wedge
               review_status_waits_for_the_run_in_flight
               review_status_reports_a_conflict_before_the_human_merge

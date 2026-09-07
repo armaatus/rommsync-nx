@@ -96,11 +96,14 @@ print(merge_gate.answer_marker(sys.argv[1]))' "$head" 2>/dev/null)" || marker=""
   echo "could not build the answer marker from .github/scripts/merge_gate.py" >&2
   exit 2; }
 
+# The marker and NOTHING ELSE in front of the answer. The gate measures what is
+# left after stripping the marker, so a preamble written here -- "answering the
+# review on abc1234", which the marker already says -- would be substance the
+# author did not supply, and the length check would be measuring this script.
 body="$(mktemp)"
 trap 'rm -f "$body"' EXIT
 {
-  printf '%s\n\n' "$marker"
-  printf '**Answering the review on `%s`.**\n\n' "${head:0:8}"
+  printf '%s\n' "$marker"
   printf '%s\n' "$text"
 } >"$body"
 
