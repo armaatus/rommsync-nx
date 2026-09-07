@@ -122,11 +122,20 @@ the difference:
 running   (pid 59280)
   up since 2026-09-06 16:57:58, running fleet.sh @ 6d610ca
 
-  STALE -- scripts/orca/fleet.sh has changed since it started, and it parses
-  the file once. These are NOT live in the dispatcher that is running:
+  STALE -- /path/to/rommsync-nx/scripts/orca/fleet.sh has changed since it
+  started, and it parses the file once. These are NOT live in the dispatcher
+  running:
     3994f12 harness.partial's flake is RomM retiring a gunicorn worker
     7bdb8ec A worktree whose issue can no longer merge is released
 ```
+
+It answers about the **dispatcher's** checkout — the main worktree it was
+started in, recorded at start — not about the one you are standing in. So
+running it from a fleet worktree branched before the fix still says the
+dispatcher is stale, which is the case that actually comes up. A dispatcher that
+recorded nothing (one started before this existed, or whose checkout has since
+gone) says "cannot say" and prints the restart anyway: a staleness report that
+fails open is the same silence.
 
 To make a change live:
 

@@ -1215,25 +1215,34 @@ DISPATCHER_FILE="$STATE_DIR/dispatcher"
 #
 # cksum rather than shasum: this is a change detector, not a security boundary,
 # and cksum is the one that is everywhere.
+#
+# Both take the root to look in, and the report passes the one the DISPATCHER
+# recorded rather than $REPO_ROOT. The dispatcher runs in the main worktree and
+# `fleet.sh status` is run from wherever you are -- CLAUDE.md points agents in a
+# fleet worktree at it. Hashing the caller's own copy compares a worktree
+# branched before the fix against a dispatcher that predates it too, matches,
+# and answers "current": #173's silence, rebuilt inside the check for it.
 fleet_code_hash() {
-  cksum <"$REPO_ROOT/scripts/orca/fleet.sh" 2>/dev/null | awk '{print $1 "-" $2}'
+  cksum <"$1/scripts/orca/fleet.sh" 2>/dev/null | awk '{print $1 "-" $2}'
 }
 fleet_code_commit() {
-  git -C "$REPO_ROOT" log -1 --format=%H -- scripts/orca/fleet.sh 2>/dev/null
+  git -C "$1" log -1 --format=%H -- scripts/orca/fleet.sh 2>/dev/null
 }
 
 # BSD date and GNU date spell "format this epoch" differently, and this runs on
 # both -- macOS here, Linux in CI.
 fmt_epoch() {
   date -r "$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
-    || date -d "@$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null
+    || date -d "@$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+    || printf 'an unreadable time (%s)\n' "$1"
 }
 
 record_dispatcher() {
   mkdir -p "$STATE_DIR"
-  { printf 'started=%s\n' "$(date +%s)"
-    printf 'commit=%s\n'  "$(fleet_code_commit)"
-    printf 'hash=%s\n'    "$(fleet_code_hash)"
+  { printf 'root=%s\n'    "$REPO_ROOT"
+    printf 'started=%s\n' "$(date +%s)"
+    printf 'commit=%s\n'  "$(fleet_code_commit "$REPO_ROOT")"
+    printf 'hash=%s\n'    "$(fleet_code_hash "$REPO_ROOT")"
   } >"$DISPATCHER_FILE"
 }
 dispatcher_field() { sed -n "s/^$1=//p" "$DISPATCHER_FILE" 2>/dev/null | head -1; }
@@ -1255,24 +1264,26 @@ restart_advice() {
 # "could not tell" is not "current": a staleness report that fails open is the
 # same silence #173 was.
 report_dispatcher_code() {
-  local started commit hash now log
+  local root started commit hash now log
+  root="$(dispatcher_field root)"
   started="$(dispatcher_field started)"
   hash="$(dispatcher_field hash)"
   commit="$(dispatcher_field commit)"
-  if [ -z "$hash" ]; then
-    echo "  it recorded no fleet.sh at start -- it predates this check, so this"
-    echo "  cannot say whether a recent fix is live in it."
+  if [ -z "$hash" ] || [ -z "$root" ] || [ ! -e "$root/scripts/orca/fleet.sh" ]; then
+    echo "  it recorded no fleet.sh at start -- it predates this check, or the"
+    echo "  checkout it started from is gone -- so this cannot say whether a"
+    echo "  recent fix is live in it."
     restart_advice
     return 0
   fi
   [ -n "$started" ] && echo "  up since $(fmt_epoch "$started")${commit:+, running fleet.sh @ ${commit:0:7}}"
-  now="$(fleet_code_hash)"
+  now="$(fleet_code_hash "$root")"
   [ -n "$now" ] && [ "$now" = "$hash" ] && return 0
 
   echo
-  echo "  STALE -- scripts/orca/fleet.sh has changed since it started, and it parses"
-  echo "  the file once. These are NOT live in the dispatcher that is running:"
-  [ -n "$commit" ] && log="$(git -C "$REPO_ROOT" log --oneline "$commit..HEAD" -- scripts/orca/fleet.sh 2>/dev/null)"
+  echo "  STALE -- $root/scripts/orca/fleet.sh has changed since it started, and"
+  echo "  it parses the file once. These are NOT live in the dispatcher running:"
+  [ -n "$commit" ] && log="$(git -C "$root" log --oneline "$commit..HEAD" -- scripts/orca/fleet.sh 2>/dev/null)"
   if [ -n "${log:-}" ]; then
     printf '%s\n' "$log" | sed 's/^/    /'
   else
@@ -1286,12 +1297,16 @@ report_dispatcher_code() {
 # --------------------------------------------------------------- commands ---
 cmd_status() {
   echo "fleet state: $STATE_DIR"
+  # A stop and a running dispatcher are not alternatives: a drain leaves the
+  # dispatcher up on purpose, because it is what reaps a worktree once its PR
+  # merges -- and that draining dispatcher is running whatever code it parsed.
   if stopped; then
     echo "STOPPED  ($STOP_FILE -- clear with: ./scripts/orca/fleet.sh resume)"
-  elif [ -e "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  fi
+  if [ -e "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
     echo "running   (pid $(cat "$PIDFILE"))"
     report_dispatcher_code
-  else
+  elif ! stopped; then
     echo "idle      (no dispatcher running)"
   fi
   echo

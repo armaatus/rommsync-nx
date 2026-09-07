@@ -198,6 +198,21 @@
 #                                         "cannot say", not "current". A staleness
 #                                         report that fails open is the silence
 #                                         #173 already was.
+#   test_orca_fleet.sh status_from_worktree
+#                                         `status` run from a FLEET worktree,
+#                                         branched before the fix, about the
+#                                         dispatcher in the main one -> still
+#                                         stale. This is the case that actually
+#                                         happens: CLAUDE.md points agents in a
+#                                         worktree at `fleet.sh status`, and
+#                                         comparing the caller's own copy makes
+#                                         two old files agree and reports
+#                                         "current" -- #173 rebuilt inside the
+#                                         check for it.
+#   test_orca_fleet.sh status_draining    stopped but still up -> BOTH lines. A
+#                                         drain leaves the dispatcher running on
+#                                         purpose, and the code it is draining
+#                                         with is the stale code.
 #
 # The Orca CLI and gh are stubbed on PATH; the fleet state dir is a temp dir.
 # Nothing here touches a real worktree, docker, or GitHub.
@@ -456,6 +471,16 @@ merge_fleet_fix() {
 
 # A dispatcher this shell can answer `kill -0` for.
 dispatcher_running() { mkdir -p "$ROMMSYNC_FLEET_DIR"; echo $$ >"$ROMMSYNC_FLEET_DIR/fleet.pid"; }
+
+# fleet.sh sourced from somewhere OTHER than the dispatcher's own checkout --
+# what an agent in a fleet worktree runs.
+in_fleet_at() { local at="$1"; shift; (cd "$at" && . ./scripts/orca/fleet.sh && "$@"); }
+
+# A second checkout of the fixture repo, pinned to the commit the dispatcher
+# started from: a worktree branched before the fix landed.
+older_checkout() {
+  git -C "$WORK/repo" worktree add -q --detach "$WORK/wt2" "$1"
+}
 
 case "${1:-}" in
   card_says)
@@ -1173,7 +1198,38 @@ JSON
       || fail "it did not say what to do about it: $out"
     echo "ok: a dispatcher that recorded nothing is 'cannot say', not 'current'"
     ;;
+  status_from_worktree)
+    make_fixture ok
+    make_repo_git
+    dispatcher_running
+    in_fleet record_dispatcher
+    parked="$(git -C "$WORK/repo" rev-parse HEAD)"
+    merge_fleet_fix "a fix the running dispatcher never parsed"
+    # The agent's worktree still holds exactly the bytes the dispatcher parsed,
+    # so a check that hashed the CALLER's copy would find them equal and say the
+    # dispatcher is current.
+    older_checkout "$parked"
+    out="$(in_fleet_at "$WORK/wt2" cmd_status 2>&1)"
+    grep -qi "not live" <<<"$out" \
+      || fail "asked from a worktree branched before the fix, it called a stale dispatcher current: $out"
+    grep -q "a fix the running dispatcher never parsed" <<<"$out" \
+      || fail "it did not name the commit that is missing from the dispatcher: $out"
+    echo "ok: staleness is about the dispatcher's checkout, not the caller's"
+    ;;
+  status_draining)
+    make_fixture ok
+    make_repo_git
+    dispatcher_running
+    in_fleet record_dispatcher
+    merge_fleet_fix "a fix the running dispatcher never parsed"
+    : >"$ROMMSYNC_FLEET_DIR/STOP"
+    out="$(in_fleet cmd_status 2>&1)"
+    grep -q "STOPPED" <<<"$out" || fail "a stop stopped being reported: $out"
+    grep -qi "not live" <<<"$out" \
+      || fail "a draining dispatcher hid its staleness behind the stop, and a drain is exactly when it keeps running: $out"
+    echo "ok: stopped and still up says both"
+    ;;
   *)
-    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind|status_stale|status_current|status_unrecorded" >&2
+    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind|status_stale|status_current|status_unrecorded|status_from_worktree|status_draining" >&2
     exit 2 ;;
 esac
