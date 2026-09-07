@@ -1663,10 +1663,10 @@ JSON
       || fail "it refused without naming the pid that holds it, which is the one thing you need: $out"
     grep -q "kill $HELD_PID" <<<"$out" \
       || fail "it did not say how to take over; a person restarting a stale dispatcher is doing the right thing: $out"
-    # The takeover a person actually performs is a bare kill. `stop.sh` writes
-    # the STOP file, and while that is set no agent can push, open a PR or
-    # comment -- with three worktrees mid-work that is a worse cure than the
-    # disease, so the refusal has to say which is which.
+    # Both takeovers, because they cost different things: a drain is safe with
+    # agents mid-work (#183) but waits hours for their PRs, and a bare kill is
+    # immediate and gives up the reaping. A refusal that named only one sends
+    # somebody to the wrong one.
     grep -q "stop.sh" <<<"$out" \
       || fail "it never mentions the stop, so nothing warns that a restart via stop.sh freezes every agent: $out"
     [ "$(cat "$ROMMSYNC_FLEET_DIR/fleet.pid")" = "$HELD_PID" ] \
