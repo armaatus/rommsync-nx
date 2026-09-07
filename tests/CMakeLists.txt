@@ -24,9 +24,9 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 # --- what RUN_SERIAL is for, and what it is not -------------------------------
 #
-# Nearly every rig test below carries RUN_SERIAL (`rig.smoke`, `rig.provisioned`
-# and `engine.server` are the exceptions, being read-only against the fixture),
-# and the reason is the SHARED FIXTURE:
+# Nearly every rig test below carries RUN_SERIAL (`rig.smoke`, `rig.provisioned`,
+# `rig.recycling_live` and `engine.server` are the exceptions, being read-only
+# against the fixture), and the reason is the SHARED FIXTURE:
 # one RomM, one library, one fixture device with ONE active sync session on it
 # (#76), and a ten-inits-a-minute rate limit that is per IP and so per suite. Two
 # rig tests at once read, upload and delete each other's saves.
@@ -492,6 +492,35 @@ endif()
 set_tests_properties(rig.provisioned PROPERTIES TIMEOUT 120)
 set_tests_properties(rig.smoke PROPERTIES TIMEOUT 120)
 
+# --- the fixture is configured, not just provisioned -------------------------
+# rig.smoke asks "is RomM up?", rig.provisioned asks "is it usable?"; this asks
+# "will it answer the same way for the ten-thousandth call as for the first?".
+#
+# It will not by default: RomM retires each gunicorn worker after a thousand-odd
+# requests, and whatever nginx had already handed it comes back as a 502 the
+# client never asked for -- one test in a few hundred, failing or SKIPPING on
+# whatever it happened to be doing. server/testing/docker-compose.yml is where
+# the setting and the whole argument live; #155 is the issue, and that flake is
+# what harness.partial's quarantine was catching.
+#
+# `recycling` reads the compose file, so the setting stays checkable with docker
+# stopped. `recycling_live` asks the daemon, because a stack started before the
+# setting existed still recycles until it is recreated -- and the machine it
+# would flake on next is the one running this.
+# The first shell-driven test in this file, so the interpreter is found here.
+find_program(BASH_PROGRAM bash REQUIRED)
+set(RIG_FIXTURE_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_rig_fixture.sh")
+
+add_test(NAME rig.recycling COMMAND "${BASH_PROGRAM}" "${RIG_FIXTURE_TEST}" recycling)
+set_tests_properties(rig.recycling PROPERTIES TIMEOUT 60)
+
+add_test(NAME rig.recycling_live
+         COMMAND "${BASH_PROGRAM}" "${RIG_FIXTURE_TEST}" recycling_live)
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(rig.recycling_live PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+set_tests_properties(rig.recycling_live PROPERTIES TIMEOUT 60)
+
 # --- the native HttpClient against the real rig ------------------------------
 # One CTest entry per scenario, selected by argv[1], so a red run names the
 # behaviour that broke. The scratch directory is per build tree, because three
@@ -550,7 +579,6 @@ endforeach()
 #
 # It runs `ctest` recursively, which is the case itself rather than a model of
 # it. The anchored regex is what keeps that from including this test.
-find_program(BASH_PROGRAM bash REQUIRED)
 set(SCRATCH_CONCURRENT_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_scratch_concurrent.sh")
 # Which scenarios, and why these: each writes a fixed name into the scratch
 # directory, which is the mechanism, and each is READ-ONLY against RomM -- a GET
@@ -776,8 +804,8 @@ endforeach()
 # consecutive passes afterwards, alone and in groups, so it is a race rather
 # than a regression, and it is currently what makes `main` red.
 #
-# Same QUARANTINE, same terms, as harness.partial below: retried, named, and
-# with the issue on it.
+# Same QUARANTINE, same terms, as the one harness.partial carried below until
+# #155: retried, named, and with the issue on it. This one is still here.
 #
 # #119 ran the experiment this comment used to ask for: quarantine off, alone on
 # the stack, 450 repetitions with the fault proxy as it stands and 300 more with
@@ -797,6 +825,13 @@ endforeach()
 # or a loop carrying the rest of the suite with it -- or when someone names the
 # mechanism. Not when an issue closes: #85 is closed and this is still here.
 # Green with the retry is not evidence the race is gone -- green WITHOUT it is.
+#
+# #155 is a candidate mechanism that did not exist when this was written, and it
+# has NOT been re-measured against it. A 502 from a retired worker landing on
+# `POST /api/saves/delete` leaves a save row nobody deleted -- the harness ignores
+# that call's result by design -- and a stray row is close to what #85 reports
+# seeing. The fixture no longer recycles, so the loop above is worth running
+# again; until someone does, this is a lead and not a finding.
 set_tests_properties(execute.occupied PROPERTIES REPEAT UNTIL_PASS:3)
 
 # --- step 0: the local scan and its rom matching -----------------------------
@@ -1298,46 +1333,6 @@ foreach(scenario IN LISTS TICK_RIG_SCENARIOS)
   # would cancel each other's sessions (#76).
   set_tests_properties(tick.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 endforeach()
-
-# harness.partial is intermittently red, and #119 measured how often instead of
-# sampling it: quarantine off, alone on the stack, `--repeat until-fail`. It
-# failed twice in 489 repetitions -- at 84 and again at 243 -- so roughly one run
-# in 250. It is not fixed, and the retry stays.
-#
-# What those 489 repetitions did NOT produce is the failure this comment used to
-# describe. #76's second sync session, and the `Session is already CANCELLED`
-# that comes of it, never appeared once. BOTH failures were `harness::ServerMd5`
-# reading back a save row RomM had answered with an empty `content_hash` -- a
-# third mode, nothing to do with the session, and now filed as #155. All the test
-# said about it was `FAIL: the MD5 of partial-2.srm`, which is why ServerMd5 now
-# names the row and what came back in place of the digest (tests/harness.hpp,
-# and harness.md5_diagnosis holds it to that).
-#
-# 489 repetitions of not seeing #76's mechanism -- a SECOND session appearing
-# mid-scenario, RomM cancelling the one the test opened, planned 3 and completed
-# 0 -- is not proof it is gone, only that it is rarer than this. So the
-# diagnostics `Partial` prints for it, every session the device has, stay.
-#
-# The comparison #119 and #109 both proposed -- this loop again with the fault
-# proxy's #109 fix reverted -- cannot settle anything here, and that needs no
-# experiment to see: neither this test nor execute.occupied ever arms a `stall`,
-# so the replayed-request path #109 fixed is not on either side of the
-# comparison. It was run both ways regardless -- 196 repetitions unfixed and 293
-# fixed, one failure in each -- and those two numbers are consistent with each
-# other and with no difference at all. They are not evidence OF no difference:
-# one failure per arm cannot measure a rate, which is this issue's own complaint
-# turned on its own experiment. The argument above is what carries the point.
-#
-# So this is still a QUARANTINE, not a fix: retry it rather than leave `main` red
-# on a race nobody has explained. It is deliberately narrow -- one test, named,
-# with the issue on it -- because a repo that retries tests by default has
-# stopped being able to tell flaky from broken.
-#
-# It comes out when #155 is fixed and 500 repetitions are clean WITHOUT it -- not
-# when an issue closes. #76 is closed and this is still here, because closing it
-# measured nothing. Green with the retry is not evidence the race is gone --
-# green WITHOUT it is.
-set_tests_properties(harness.partial PROPERTIES REPEAT UNTIL_PASS:3)
 
 # --- the committed API captures still match a live RomM ----------------------
 # server/contract/captures/ is what the docs quote and what M1/M2 will be coded

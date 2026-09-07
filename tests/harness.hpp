@@ -751,13 +751,19 @@ inline void DeleteState(http::HttpClient& client, const std::string& base, const
 /// `ListStates` do -- so a caller checks the bool and gives up, and does not
 /// assert a second time over the top.
 ///
-/// That is not house style for its own sake. This fails intermittently, about
-/// one call in 250 (#155), and all it used to say was "the MD5 of
-/// partial-2.srm". Two entirely different events produce that line -- an upload
-/// that never landed, and an upload that landed on a row RomM handed back with
-/// an empty `content_hash` -- and telling them apart cost #119 a 489-repetition
-/// experiment. It says which now: the file it was asked about, the row it got,
-/// and what came back in place of the digest.
+/// That is not house style for its own sake. This used to fail about one call in
+/// 250, saying only "the MD5 of partial-2.srm". Two entirely different events
+/// produce that line -- an upload that never landed, and an upload that landed
+/// on a row RomM handed back with an empty `content_hash` -- and because the
+/// message could not separate them, #119 spent 489 repetitions and filed the
+/// rate against the second. #155 reproduced the FIRST at that rate, with RomM's
+/// log to match: a 502 its own nginx synthesised when gunicorn retired the
+/// worker holding the request. The fixture no longer recycles workers
+/// (server/testing/docker-compose.yml), and nothing has yet seen 5.2.0 answer a
+/// save row with no digest on it. The diagnostics stay: they are what made it
+/// answerable, and the empty-`content_hash` shape is still one RomM's schema
+/// allows -- `content_hash` is nullable, and `compute_content_hash` returns None
+/// for any file it cannot read.
 inline bool ServerMd5(::checks::Checks& checks, http::HttpClient& client, const std::string& base,
                       const Fixture& fixture, std::int64_t rom_id, const std::string& local_path,
                       std::string* out) {

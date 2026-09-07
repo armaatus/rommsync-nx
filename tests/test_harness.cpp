@@ -601,6 +601,19 @@ void SameTimestamp(rig::Checks& checks, http::HttpClient& client, const std::str
 // A plan whose Nth operation fails. The client owes the server an accurate
 // `operations_failed` at `complete` and owes the next tick the files it did not
 // manage -- never a half-written one.
+//
+// This scenario carried a `REPEAT UNTIL_PASS:3` quarantine in tests/CMakeLists.txt
+// until #155, which found what it was catching: RomM retiring a gunicorn worker
+// under a request in flight, answered as a 502 by its own nginx. The fixture no
+// longer recycles, and 2000 repetitions without the retry are clean.
+//
+// The diagnostics below are the other half of that history, and they stay. #119
+// ran 489 repetitions looking for #76 -- a SECOND sync session appearing
+// mid-scenario, RomM cancelling the one this test opened, planned 3 and completed
+// 0 -- and never saw it once. That is not proof it is gone, only that it is rarer
+// than that, and this is still the only scenario that completes its session and
+// so the only one that could notice. So every session the device has is printed
+// on the way out rather than left for the next person to go and ask CI about.
 
 void Partial(rig::Checks& checks, http::HttpClient& client, const std::string& base,
              const Fixture& fixture, const harness::Rom& rom) {
@@ -1459,18 +1472,26 @@ void ContentHash(rig::Checks& checks, http::HttpClient& client, const std::strin
 // --- md5_diagnosis ------------------------------------------------------------
 //
 // `harness::ServerMd5` is the oracle every save-shaped scenario is measured
-// against, and it fails intermittently: #119 measured `harness.partial` at
-// roughly one repetition in 250, with the fault proxy fixed and unfixed alike.
+// against, and it used to fail intermittently: #119 measured `harness.partial`
+// at roughly one repetition in 250, with the fault proxy fixed and unfixed
+// alike.
 //
 // All the failure said was `FAIL: the MD5 of partial-2.srm`. That one line is
 // true of two entirely different events -- an upload that never landed, and an
 // upload that landed on a row RomM handed back with no `content_hash` on it --
-// and telling them apart cost 489 repetitions. It is the same complaint
-// `Partial` records above about `Session is already CANCELLED`: an assertion
-// that cannot say what it saw sends the next person back to CI to guess.
+// and the 489 repetitions spent on them still landed on the wrong one. #155
+// reproduced the FIRST at that rate, with RomM's log to match -- a 502 from its
+// own nginx when gunicorn retired the worker mid-request -- and the fixture no
+// longer recycles. It is the same complaint `Partial` records above about
+// `Session is already CANCELLED`: an assertion that cannot say what it saw sends
+// the next person back to CI to guess, and a whole issue was written from that
+// guess.
 //
 // So both failures are forced here with the proxy, and what is asserted is the
-// TEXT. A message that names the file and nothing else is the defect.
+// TEXT. A message that names the file and nothing else is the defect. Neither
+// shape is invented: an upload can still fail for its own reasons, and
+// `content_hash` is nullable in RomM's schema -- `compute_content_hash` returns
+// None for a file it cannot read, and serialises as `null`.
 
 void Md5Diagnosis(rig::Checks& checks, http::HttpClient& client, const std::string& base,
                   const harness::Fixture& fixture, const harness::Rom& rom) {

@@ -919,7 +919,8 @@ GHSTUB
   await_reports_a_red_build)
     # #88 sat in await-review.sh while host-tests failed on its own new test.
     # A review cannot fix a red build, and waiting for one costs 45 minutes and
-    # then reports the wrong thing.
+    # then reports the wrong thing. Nor can a re-run: see #155, which is why the
+    # advice this asserts on changed.
     make_fixture
     cp "$REPO_ROOT"/scripts/orca/{await-review.sh,lib.sh} "$TMPDIR_FIXTURE/scripts/orca/"
     # The gate comes too: await-review.sh imports it to decide what counts as a
@@ -949,8 +950,16 @@ GHSTUB
     grep -q "host-tests" <<<"$out" || fail "did not name the failing check: $out"
     grep -q "two consecutive checks" <<<"$out" \
       || fail "acted on a single sighting; a known flake would send an agent chasing it: $out"
-    grep -q "#76" <<<"$out" \
-      || fail "did not point at the known flake as the first thing to rule out: $out"
+    # This used to require the message to name #76 as a known flake to rule out
+    # before investigating. #155 removed the flake it was pointing at -- RomM
+    # retiring a gunicorn worker under a request in flight -- so what has to be
+    # said now is the opposite: the failure is the agent's until shown otherwise.
+    # Asserted as the WORDS, because the whole cost of the old advice was that an
+    # agent believed it and ran `gh run rerun` instead of reading the failure.
+    grep -q "yours until you have shown otherwise" <<<"$out" \
+      || fail "did not say a red build is the agent's to investigate: $out"
+    grep -q "rerun" <<<"$out" \
+      && fail "still offers a re-run as a way past a red build: $out"
     grep -q "merge-gate" <<<"$out" \
       && fail "reported merge-gate, which is red by design until a review exists: $out"
     [ "$rc" = 7 ] || fail "expected exit 7 for a red build, got $rc: $out"
