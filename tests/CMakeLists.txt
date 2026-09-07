@@ -46,6 +46,14 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 # directory, fixed destination names, two processes (#151). It is fixed the same
 # way -- per process, in tests/scratch.hpp -- and held by `scratch.concurrent`,
 # which runs two `ctest`s at once because nothing inside one can see this.
+#
+# Ownership had to cover a third thing before two invocations were really safe:
+# the sync session a rig test opens. Every rig `main()` clears the sessions left
+# on the fixture device, and until #174 that meant another run's LIVE one --
+# the same "an earlier run's leftovers must not damage this one" that #118 fixed
+# for faults, and the same second `ctest`. `rig::sessions` attributes them by
+# process, `harness.session_owner` holds it, and RUN_SERIAL is again beside the
+# point.
 
 # --- unit tests: no external services ---------------------------------------
 add_executable(test_version test_version.cpp)

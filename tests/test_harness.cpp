@@ -1797,7 +1797,25 @@ void SessionOwnerScenario(rig::Checks& checks, http::HttpClient& client, const s
   checks.ExpectEq(status_of(session), std::string("IN_PROGRESS"),
                   "a stranger's startup leaves a session it does not own alone");
 
-  harness::CloseSession(client, base, fixture, negotiated.response.body);
+  // The other half, and the one a fix that simply stopped cleaning up would
+  // fail: a session nobody is holding is still closed, because that is what the
+  // cleanup is for (#76). A claim lapses with the process that took it, and
+  // dropping it by hand is that without waiting for a process to exit.
+  rig::sessions::Release(session);
+  std::string swept;
+  for (int attempt = 0; attempt < 5 && swept != "COMPLETED"; ++attempt) {
+    if (attempt > 0) {
+      // A stranger with a negotiate in flight defers cleanup by design, since
+      // while it is inside that window an unclaimed session cannot be told from
+      // one about to be claimed. That is milliseconds, not a verdict -- and this
+      // suite is built to be run twice at once, so it can genuinely happen here.
+      std::this_thread::sleep_for(std::chrono::milliseconds{250});
+    }
+    harness::CloseOpenSessions(client, base, fixture);
+    swept = status_of(session);
+  }
+  checks.ExpectEq(swept, std::string("COMPLETED"),
+                  "and still closes a leftover no run is holding");
 }
 
 

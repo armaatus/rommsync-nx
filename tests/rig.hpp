@@ -9,15 +9,21 @@
 #pragma once
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
+#include <mutex>
 #include <random>
+#include <set>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -258,17 +264,289 @@ inline const std::string& FaultOwner() {
   return owner;
 }
 
-/// An `HttpClient` that signs its proxy-bound requests with an owner tag.
+// --- the sync sessions a run has open -----------------------------------------
+
+/// Which sync sessions belong to a `ctest` that is still going.
+///
+/// A fault carries its owner in a header the proxy reads (`kFaultOwnerHeader`).
+/// A sync session cannot carry one at all: `SyncSessionSchema` in the pinned
+/// snapshot (server/contract/romm-openapi-5.2.0.json) is an id, a device, a
+/// user, a status, three counters and timestamps -- there is no field a client
+/// may write -- and every rig process negotiates as the ONE fixture device. So
+/// the attribution lives on this side of the wire, in the scratch root the build
+/// tree already shares between invocations (tests/scratch.hpp, #151).
+///
+/// A claim is a file whose NAME carries both numbers -- `session-815-pid-4213`
+/// -- so it is created and removed in one step and can never be read
+/// half-written. It lapses when its process does, by the same `kill(pid, 0)`
+/// rule the scratch sweep retires a leaf by: a run that was killed on TIMEOUT,
+/// or that crashed, leaves nothing that has to be cleaned up before its sessions
+/// can be.
+///
+/// `harness::CloseOpenSessions` is the reader, and #174 is what it is for: that
+/// cleanup used to complete every IN_PROGRESS session on the fixture device,
+/// which is another run's LIVE session as readily as an earlier run's leftover.
+namespace sessions {
+
+namespace detail {
+
+inline constexpr const char* kSessionPrefix = "session-";
+inline constexpr const char* kPidInfix = "-pid-";
+inline constexpr const char* kNegotiatingPrefix = "negotiating-pid-";
+
+inline std::filesystem::path ClaimsDir() { return scratch::Root() / "sessions"; }
+
+inline long long Self() { return static_cast<long long>(::getpid()); }
+
+/// `"4213"` -> 4213, and 0 for anything that is not a plain number this platform
+/// can hold. The bound is `scratch::LeafOwner`'s and for its reason: a value
+/// `kill` would read as a process group answers "running" for everybody.
+inline long long Digits(const std::string& text, long long limit) {
+  if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos) {
+    return 0;
+  }
+  errno = 0;
+  const long long value = std::strtoll(text.c_str(), nullptr, 10);
+  if (errno == ERANGE || value > limit) {
+    return 0;
+  }
+  return value;
+}
+
+inline long long Pid(const std::string& text) {
+  return Digits(text, static_cast<long long>(std::numeric_limits<pid_t>::max()));
+}
+
+inline std::string ClaimName(std::int64_t id) {
+  return kSessionPrefix + std::to_string(id) + kPidInfix + std::to_string(Self());
+}
+
+inline std::string NegotiatingName() { return kNegotiatingPrefix + std::to_string(Self()); }
+
+/// `session-815-pid-4213` -> 815 and 4213. False for any other name, including
+/// one of ours whose numbers do not read as numbers.
+inline bool ReadClaim(const std::string& name, std::int64_t* id, long long* owner) {
+  const std::string prefix = kSessionPrefix;
+  if (name.compare(0, prefix.size(), prefix) != 0) {
+    return false;
+  }
+  const std::string::size_type infix = name.find(kPidInfix, prefix.size());
+  if (infix == std::string::npos) {
+    return false;
+  }
+  *id = Digits(name.substr(prefix.size(), infix - prefix.size()),
+               std::numeric_limits<std::int64_t>::max());
+  *owner = Pid(name.substr(infix + std::string(kPidInfix).size()));
+  return *id != 0 && *owner != 0;
+}
+
+/// `negotiating-pid-4213` -> 4213.
+inline bool ReadNegotiating(const std::string& name, long long* owner) {
+  const std::string prefix = kNegotiatingPrefix;
+  if (name.compare(0, prefix.size(), prefix) != 0) {
+    return false;
+  }
+  *owner = Pid(name.substr(prefix.size()));
+  return *owner != 0;
+}
+
+inline void Write(const std::filesystem::path& file) {
+  std::error_code error;
+  std::filesystem::create_directories(file.parent_path(), error);
+  const std::ofstream created(file);
+}
+
+inline void Erase(const std::filesystem::path& file) {
+  std::error_code error;
+  std::filesystem::remove(file, error);
+}
+
+/// Remove every file in the claims directory this pid's name is on -- both
+/// kinds, since `negotiating-pid-4213` ends the same way a claim does.
+///
+/// Called at both ends of the process, for the two different reasons a leftover
+/// of one's own is wrong: a pid is reused, so what is there when this run starts
+/// belongs to a run that is over (`scratch::Dir` removes a leaf of its own pid
+/// for exactly this), and what is there when it ends would have every later
+/// reader skip a session nobody is holding until the pid comes round again.
+inline void ForgetMine() {
+  const std::string mine = std::string(kPidInfix) + std::to_string(Self());
+  std::error_code error;
+  std::filesystem::directory_iterator entry(ClaimsDir(), error);
+  const std::filesystem::directory_iterator end;
+  while (!error && entry != end) {
+    const std::filesystem::path file = entry->path();
+    // Stepped before the body, and reporting rather than throwing, for
+    // `scratch::Sweep`'s reason: this removes entries from the directory it is
+    // walking, and a second process removes more.
+    entry.increment(error);
+
+    const std::string name = file.filename().string();
+    if (name.size() > mine.size() &&
+        name.compare(name.size() - mine.size(), mine.size(), mine) == 0) {
+      Erase(file);
+    }
+  }
+}
+
+/// Owns this process's claims for as long as the process lives. The sibling of
+/// `scratch::detail::Leaf`, and there so that neither end has to be remembered
+/// at a call site.
+class Claims {
+ public:
+  Claims() { ForgetMine(); }
+  ~Claims() { ForgetMine(); }
+
+  Claims(const Claims&) = delete;
+  Claims& operator=(const Claims&) = delete;
+};
+
+/// Constructed on the first claim or the first read, whichever this process
+/// reaches first.
+inline void Registered() {
+  static const Claims claims;
+  (void)claims;
+}
+
+inline std::mutex& Lock() {
+  static std::mutex lock;
+  return lock;
+}
+
+/// How many negotiates this process has in flight. A count rather than a flag
+/// because two threads may be negotiating, and the second one leaving must not
+/// clear the marker the first still needs.
+inline int& InFlight() {
+  static int count = 0;
+  return count;
+}
+
+}  // namespace detail
+
+/// Record that this process holds session `id`. A no-op for 0, which is what a
+/// negotiate whose response could not be read reports.
+inline void Claim(std::int64_t id) {
+  if (id <= 0) {
+    return;
+  }
+  detail::Registered();
+  detail::Write(detail::ClaimsDir() / detail::ClaimName(id));
+}
+
+/// Give it up: the session is closed, or this run is done with it.
+inline void Release(std::int64_t id) {
+  if (id <= 0) {
+    return;
+  }
+  detail::Registered();
+  detail::Erase(detail::ClaimsDir() / detail::ClaimName(id));
+}
+
+/// A negotiate in flight, for as long as this object lives.
+///
+/// RomM's session row exists from the moment it creates one, and its claim can
+/// only be written once the response naming it comes back. Between those two
+/// moments the session is nobody's by the files alone, and this is what says so:
+/// a reader that sees a live process mid-negotiate leaves every unattributed
+/// session alone rather than closing one somebody is about to own.
+class Negotiating {
+ public:
+  Negotiating() {
+    detail::Registered();
+    const std::lock_guard<std::mutex> held(detail::Lock());
+    if (detail::InFlight()++ == 0) {
+      detail::Write(detail::ClaimsDir() / detail::NegotiatingName());
+    }
+  }
+
+  ~Negotiating() {
+    const std::lock_guard<std::mutex> held(detail::Lock());
+    if (--detail::InFlight() == 0) {
+      detail::Erase(detail::ClaimsDir() / detail::NegotiatingName());
+    }
+  }
+
+  Negotiating(const Negotiating&) = delete;
+  Negotiating& operator=(const Negotiating&) = delete;
+};
+
+/// What the runs that are still going are holding.
+struct LiveClaims {
+  /// The sessions they have claimed.
+  std::set<std::int64_t> ids;
+
+  /// True while one of them is between creating a session and claiming it, so
+  /// that an unclaimed session cannot be told from one about to be claimed.
+  bool negotiating = false;
+
+  bool Holds(std::int64_t id) const { return ids.find(id) != ids.end(); }
+};
+
+/// Read them, retiring what the runs that are gone left behind.
+///
+/// Call this AFTER listing sessions, never before. A row exists before its claim
+/// does, so a snapshot taken first can miss a claim taken in between -- and the
+/// session it then fails to attribute is a live one (#174).
+inline LiveClaims Live() {
+  detail::Registered();
+  LiveClaims live;
+  std::error_code error;
+  std::filesystem::directory_iterator entry(detail::ClaimsDir(), error);
+  const std::filesystem::directory_iterator end;
+  while (!error && entry != end) {
+    const std::filesystem::path file = entry->path();
+    entry.increment(error);  // see detail::ForgetMine
+
+    const std::string name = file.filename().string();
+    std::int64_t id = 0;
+    long long owner = 0;
+    if (detail::ReadClaim(name, &id, &owner)) {
+      if (scratch::Running(owner)) {
+        live.ids.insert(id);
+      } else {
+        detail::Erase(file);
+      }
+    } else if (detail::ReadNegotiating(name, &owner)) {
+      if (scratch::Running(owner)) {
+        live.negotiating = true;
+      } else {
+        detail::Erase(file);
+      }
+    }
+  }
+  return live;
+}
+
+}  // namespace sessions
+
+/// An `HttpClient` that signs its proxy-bound requests with an owner tag, and
+/// keeps this process's claim on the sync sessions they open.
 ///
 /// A decorator rather than a change to the curl backend: `core/` and `host/`
-/// know nothing about the fault proxy, and this is a property of the test rig.
+/// know nothing about the fault proxy or about which `ctest` is running, and
+/// both are properties of the test rig. It is also the only choke point that
+/// sees EVERY negotiate -- the harness's own and the engine's, since a rig test
+/// drives `sync::Tick` through a client from here -- so a scenario cannot forget
+/// to claim what it opened.
 class OwnedHttpClient : public http::HttpClient {
  public:
   OwnedHttpClient(std::unique_ptr<http::HttpClient> inner, std::string owner)
       : inner_(std::move(inner)), owner_(std::move(owner)) {}
 
   http::Result Send(const http::Request& request) override {
-    return inner_->Send(Signed(request));
+    if (ProxyPath(request.url) == "/api/sync/negotiate" &&
+        request.method == http::Method::kPost) {
+      const sessions::Negotiating in_flight;
+      const http::Result result = inner_->Send(Signed(request));
+      sessions::Claim(NegotiatedSession(result));
+      return result;
+    }
+    const std::int64_t completing = CompletingSession(request);
+    const http::Result result = inner_->Send(Signed(request));
+    if (completing != 0 && result.successful()) {
+      sessions::Release(completing);
+    }
+    return result;
   }
 
   http::Result Download(const http::Request& request,
@@ -277,6 +555,50 @@ class OwnedHttpClient : public http::HttpClient {
   }
 
  private:
+  /// The part of `url` addressed to this rig, or empty for one that is not.
+  static std::string ProxyPath(const std::string& url) {
+    const std::string base = BaseUrl();
+    if (url.rfind(base, 0) != 0) {
+      return {};
+    }
+    return url.substr(base.size());
+  }
+
+  /// The session id in `POST /api/sync/sessions/815/complete`, or 0 for any
+  /// other request. Closing a session is what ends this process's claim on it.
+  static std::int64_t CompletingSession(const http::Request& request) {
+    if (request.method != http::Method::kPost) {
+      return 0;
+    }
+    const std::string path = ProxyPath(request.url);
+    const std::string prefix = "/api/sync/sessions/";
+    const std::string suffix = "/complete";
+    if (path.size() <= prefix.size() + suffix.size() ||
+        path.compare(0, prefix.size(), prefix) != 0 ||
+        path.compare(path.size() - suffix.size(), suffix.size(), suffix) != 0) {
+      return 0;
+    }
+    return sessions::detail::Digits(
+        path.substr(prefix.size(), path.size() - prefix.size() - suffix.size()),
+        std::numeric_limits<std::int64_t>::max());
+  }
+
+  /// The `session_id` a negotiate answered with, or 0 when it did not answer one
+  /// -- a fault that never forwarded, or a body cut short. Nothing is claimed
+  /// then, which leaves a session RomM may have opened for the next run's
+  /// cleanup rather than pretending to own it.
+  static std::int64_t NegotiatedSession(const http::Result& result) {
+    if (!result.successful()) {
+      return 0;
+    }
+    const rommsync::json::ParseResult parsed = rommsync::json::Parse(result.response.body);
+    if (!parsed.ok() || !parsed.value.is_object()) {
+      return 0;
+    }
+    const rommsync::json::Value* id = parsed.value.Find("session_id");
+    return id != nullptr && id->is_integer() ? id->integer() : 0;
+  }
+
   /// Only what goes through the proxy is signed. The suite also drives a
   /// loopback server of its own (tests/loopback_server.hpp) and asserts on the
   /// headers that reach it, and a rig concern has no business appearing there.

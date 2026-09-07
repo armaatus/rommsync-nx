@@ -30,18 +30,21 @@ namespace scratch {
 /// The `pid-` in `<build>/tests/scratch/pid-4213`.
 inline constexpr const char* kLeafPrefix = "pid-";
 
-/// The name of the leaf a process of this pid owns: `pid-4213`.
-///
-/// Assembled here rather than at each site, because `LeafOwner` below has to
-/// take it apart again and test_harness.cpp has to recognise one.
-inline std::string LeafName(long long pid) { return kLeafPrefix + std::to_string(pid); }
-
-namespace detail {
+/// The directory the leaves sit in: one per build tree, and therefore one
+/// shared by every `ctest` invocation against that tree. That sharing is the
+/// hazard this file exists for (#151) and, read the other way, the only place
+/// two runs against one worktree can see each other at all -- which is what
+/// `rig::sessions` attributes a live sync session through (#174).
+inline std::filesystem::path Root() { return ROMMSYNC_TEST_SCRATCH; }
 
 /// Is `pid` a process that still exists?
 ///
 /// `ESRCH` is the only answer that means gone. `EPERM` is a live process this
-/// user does not own, which is still a reason to leave its leaf alone.
+/// user does not own, which is still a reason to leave what it owns alone.
+///
+/// `Sweep` retires a leaf by this, and `rig::sessions` retires a claim on a sync
+/// session by it: in both, what a run holds lapses when the run does, so nothing
+/// has to survive a crash in order to clean up after it.
 inline bool Running(long long pid) {
   if (pid <= 0) {
     return false;
@@ -49,6 +52,14 @@ inline bool Running(long long pid) {
   errno = 0;
   return ::kill(static_cast<pid_t>(pid), 0) == 0 || errno != ESRCH;
 }
+
+/// The name of the leaf a process of this pid owns: `pid-4213`.
+///
+/// Assembled here rather than at each site, because `LeafOwner` below has to
+/// take it apart again and test_harness.cpp has to recognise one.
+inline std::string LeafName(long long pid) { return kLeafPrefix + std::to_string(pid); }
+
+namespace detail {
 
 /// The pid a leaf is named for, or 0 for a name that is not one of ours.
 inline long long LeafOwner(const std::string& name) {
@@ -158,7 +169,7 @@ inline void Sweep(const std::filesystem::path& root, const std::filesystem::path
       continue;
     }
     const long long owner = detail::LeafOwner(leaf.filename().string());
-    if (owner == 0 || detail::Running(owner)) {
+    if (owner == 0 || Running(owner)) {
       continue;
     }
     std::error_code ignored;
@@ -179,7 +190,7 @@ inline void Sweep(const std::filesystem::path& root, const std::filesystem::path
 /// run of *this* process.
 inline const std::string& Dir() {
   static const std::string dir = [] {
-    const std::filesystem::path root = ROMMSYNC_TEST_SCRATCH;
+    const std::filesystem::path root = Root();
     const std::filesystem::path mine = root / LeafName(static_cast<long long>(::getpid()));
 
     std::error_code error;

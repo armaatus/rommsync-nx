@@ -76,11 +76,40 @@ tick rather than as a stranger at the proxy. `harness.fault_owner` pins both
 halves, and it is the canonical account — the two comments at the scenes point
 here rather than repeating it.
 
-The fault is the half that was fixed. A rig test's *other* opening act,
-`harness::CloseOpenSessions`, is still global — it closes every `IN_PROGRESS`
-session belonging to the fixture device, and every rig process shares that
-device, so a second `ctest` starting up still ends this one's live session. That
-is #174, and it is the second half of what #156 turned out to be.
+A rig test's *other* opening act was global for longer, and it is the second
+half of what #156 turned out to be. `harness::CloseOpenSessions` completes every
+`IN_PROGRESS` session belonging to the fixture device, and every rig process
+negotiates as that one device — so a second `ctest` starting up ended this one's
+*live* session (#174). What that looks like from the far side is one FAIL about
+an outcome, in a test that arms nothing: the owner's own `complete` is answered
+*already completed*, which reads as a bug in the accounting.
+
+A session cannot carry its owner the way a fault does. `SyncSessionSchema` in
+the pinned snapshot is an id, a device, a user, a status, three counters and
+timestamps — there is no field a client may write, and the device is the
+fixture's for everybody. So the attribution is kept on this side of the wire, in
+the scratch root the build tree already shares between runs: `rig::sessions`
+writes a file named `session-815-pid-4213` when a negotiate comes back, and
+removes it when that session is completed. Both happen in `rig::OwnedHttpClient`
+— the same decorator that signs the owner tag — because that is the one place
+that sees every negotiate, the harness's own and the engine's alike.
+
+`CloseOpenSessions` reads those claims *after* it lists the sessions, never
+before: a row exists from the moment RomM creates it and its claim is written
+when the response naming it arrives, so a snapshot taken first can miss a claim
+taken in between. It then skips every session a running process claims. A claim
+lapses when its process does, by the same `kill(pid, 0)` the scratch sweep
+retires a leaf by, so a run CTest killed on `TIMEOUT` leaves leftovers that are
+still collectable and nothing that has to clean up after it.
+
+The window between the row and the claim is covered by a second marker,
+`negotiating-pid-4213`. While a running process is inside it, nothing
+unattributed can be told from what that process is about to own, so the cleanup
+defers entirely — it is best effort by design, and the next process to start
+does it instead. `harness.session_owner` pins both halves: a live session a
+stranger may not end, and a leftover the cleanup still collects. It runs a real
+second process to do it, for the reason `RUN_SERIAL` cannot help either — nothing
+inside one invocation can see the other.
 
 Two `ctest`s at once broke a second thing, on disk rather than on the wire, and
 for the same reason (#151). `ROMMSYNC_TEST_SCRATCH` is per build tree, so it kept
