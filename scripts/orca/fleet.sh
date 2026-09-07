@@ -684,7 +684,19 @@ reap_abandoned() {
     # enforce_timebox's own record, so this one still answers through a GitHub
     # outage -- and so a lookup that failed above cannot be read as "no reason".
     [ -n "$reason" ] || ! gave_up_on "$num" || reason="the time-box stopped its agent with no PR"
-    [ -n "$reason" ] || continue
+    # No reason today, so everything a previous poll decided goes with it. The
+    # reason is re-derived from a live lookup every pass and can genuinely come
+    # and go: unblock.yml re-writes `blocked` on every merged PR, so an issue can
+    # go blocked, be warned, come off `blocked` when the dependency lands, and go
+    # blocked again on the next one. A `warned-` left standing across that is a
+    # worktree removed on the second occurrence with no notice at all -- which is
+    # the one thing the warning pass exists to prevent. `stuck-` is not in this
+    # list: it means a removal was attempted and refused, and it is checked above
+    # this point precisely so that it is never retried.
+    if [ -z "$reason" ]; then
+      rm -f "$STATE_DIR/warned-$num" "$STATE_DIR/held-$num" "$STATE_DIR/git-blind-$num"
+      continue
+    fi
 
     # Two keeps, two markers, and each clears the other. One marker for both
     # would mean whichever fired first silenced the other for good: a transient
