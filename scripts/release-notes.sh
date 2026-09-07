@@ -27,9 +27,12 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# The compatibility statement a release makes, and the ONLY place it is written
-# down -- the notes are the only artifact that carries it, so a second copy
-# would have nothing keeping it honest.
+# The compatibility statement a release makes, and the one place its two version
+# numbers are written down. They are quoted in one other place -- the first line
+# of "Before you start" in docs/INSTALL.md, because a user reading the guide and
+# a user reading the release page have to meet the same sentence -- and `ctest
+# -R release.compatibility` holds the two together and refuses a third copy. A
+# correction here is red until it is made there too.
 #
 # Read it as a target, not as a result. Nothing in this repo has run on a
 # console: the M8-1 gate is what turns this line into a verified claim, and
@@ -37,7 +40,29 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # what the sysmodule is built against -- libnx's service bindings and an
 # Atmosphère new enough to load an ExeFS sysmodule out of
 # atmosphere/contents/ -- not a set of versions anybody has booted it on.
-readonly ATMOSPHERE_TARGET="Atmosphère 1.7.0 or newer (Horizon 18.0.0 and up)"
+#
+# Where the two numbers come from. M6-4 (#142) reviewed them against libnx
+# 4.12.0-1 and the Atmosphère release list, and corrected both:
+#
+#   1.7.1    the first release of that series a user can install. There is no
+#            stable 1.7.0 -- the tag is `1.7.0-prerelease` (2024-03-29) and
+#            1.7.1 (2024-06-11) is the release behind it -- so the line as
+#            written asked for something nobody can download.
+#   16.0.0   the highest firmware version anything in this tree checks for:
+#            `hosversionAtLeast(16, 0, 0)` around `sslConnectionSetIoTimeout`
+#            in sysmodule/source/http/ssl_http_client.cpp, which is the only
+#            firmware-gated call there is. It is a target and not a floor --
+#            the call is guarded because the build works below it, where the
+#            `ssl` service's own I/O ceiling stays five minutes and `SslStream`
+#            bounds the wait on its own. The line said 18.0.0, which was never
+#            a floor either: it was the newest firmware that Atmosphère release
+#            added support for, and that series runs on every firmware from
+#            1.0.0 up, so the parenthetical told a console one version behind
+#            it that it was out of range for a reason that does not exist.
+#
+# Both halves are still targets. Neither has been observed on hardware, and
+# M8-2 (#44) -- the `media` row of scripts/v1-gate.sh -- is what settles them.
+readonly ATMOSPHERE_TARGET="Atmosphère 1.7.1 or newer on Horizon 16.0.0 or newer"
 
 die() { echo "release-notes.sh: $*" >&2; exit 1; }
 
