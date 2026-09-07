@@ -1368,6 +1368,13 @@ To take over -- the usual reason to start a second one is that the first is
 running stale code. With nothing in flight, drain it:
 
 REFUSED
+    # No pull argument, deliberately, and this is the one caller that omits it.
+    # Whether the dispatcher's checkout is BEHIND is report_dispatcher_code's
+    # answer, off an `origin/main` this function has not looked at -- and
+    # re-deriving it here would be a second implementation of the one thing #173
+    # exists to get right. The text above sends the reader to `status` first for
+    # exactly that: it prints the `git pull --ff-only` in its place in the
+    # sequence when there is one to print.
     restart_advice "$root"
     cat <<REFUSED
 
