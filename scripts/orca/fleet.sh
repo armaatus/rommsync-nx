@@ -572,15 +572,18 @@ except Exception:
     # The third answer, and it must not be frozen behind the stall marker: a
     # single `gh` blip would otherwise record a #142-style false stall and never
     # re-evaluate it, which is the exact noise this change exists to remove.
-    # `stall-labels-` throttles it instead. Each watcher owns its own
-    # once-per-outage marker and clears only that one -- the single exception
-    # being `$POLL_CACHE/carded-`, which enforce_timebox writes and this
-    # function only reads, and which the next pass empties anyway: this branch above drops
-    # `stall-labels-` whenever the agent stops being `waiting`, which is the
-    # ordinary state of a grinding overrun, and a marker shared with
-    # enforce_timebox would be deleted seconds after that function set it --
-    # restoring the line-a-minute the split exists to prevent. Distinct from
-    # `unreachable-` for the same reason: that one means the PR lookup failed.
+    # `stall-labels-` throttles it instead.
+    #
+    # Each watcher owns its own once-per-outage marker and clears only that one.
+    # The branch above drops `stall-labels-` whenever the agent stops being
+    # `waiting`, which is the ordinary state of a grinding overrun -- so a marker
+    # shared with enforce_timebox would be deleted seconds after that function
+    # set it, restoring the line-a-minute the split exists to prevent. Distinct
+    # from `unreachable-` for the same reason: that one means the PR lookup
+    # failed, not this one.
+    #
+    # The single exception is `$POLL_CACHE/carded-`, which enforce_timebox writes
+    # and this function only reads, and which the next pass empties anyway.
     issue_needs_human_step "$num"; rc=$?
     if [ "$rc" = 2 ]; then
       [ -e "$STATE_DIR/stall-labels-$num" ] && continue
