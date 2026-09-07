@@ -162,43 +162,20 @@ if [ -x .claude/hooks/guard.py ]; then
     || fail "the guard selftest depends on where it is run: it fails inside a fleet worktree"
   ok "the guard selftest holds from inside a fleet worktree too"
 
-  # ...and the fleet gate has to cover every path in SELF_PROTECTED, not just
-  # the hook. `_stateful_checks` drives `.claude/hooks/` and stops there, so
-  # dropping `.claude/settings.json` from SELF_PROTECTED leaves every one of its
-  # assertions green. settings.local.json is the sharper half -- it is
-  # gitignored, so a permission rule written into it appears in no diff, which
-  # is exactly why the guard covers it.
+  # ...and every path in SELF_PROTECTED is asserted, absolutely and through a
+  # `cd`-shortened relative path, by `_stateful_checks` inside guard.py itself
+  # (#139). #98 had to park those here because a fleet-opened worktree cannot
+  # write `.claude/hooks/` -- but that left them outside merge_gate.py's
+  # HUMAN_ONLY_PREFIXES, so a PR deleting them auto-merged with nobody
+  # watching. In guard.py they are the enforcement layer, and a person merges
+  # any PR that touches it.
   #
-  # Nothing stops `_stateful_checks` from asserting this; what stops it is the
-  # workflow constraint at the top of this section -- a fleet-opened worktree
-  # cannot write `.claude/hooks/`, so the table cannot grow the assertion. Here
-  # it can.
-  #
-  # Absolute and root-relative paths only. The `cd`-relative form is a real hole
-  # in the guard rather than a gap in these assertions -- see #139.
-  tool_call() {
-    python3 -c 'import json, sys; print(json.dumps({"tool_name": sys.argv[1], "tool_input": {sys.argv[2]: sys.argv[3]}}))' \
-      "$1" "$2" "$3"
-  }
-  assert_fleet_blocks() {
-    local why
-    why="$(printf '%s' "$1" \
-      | ROMMSYNC_FLEET_DIR="$guard_tmp" python3 .claude/hooks/guard.py 2>&1 >/dev/null)"
-    local got=$?
-    # Exit 2 on its own is not proof: the guard also exits 2 for a payload it
-    # cannot read (asserted below), so a malformed tool call would report ok for
-    # a check that never reached the self-protection branch. Match the reason.
-    case "$got:$why" in
-      2:*"enforcement layer"*) ok "$2" ;;
-      2:*) fail "$2: blocked, but not as the enforcement layer: $why" ;;
-      *)   fail "$2: the fleet gate let it through (exit $got)" ;;
-    esac
-  }
-
+  # One thing guard.py still cannot check about itself: that SELF_PROTECTED has
+  # not grown a fourth entry that no assertion covers. That pin stays here.
   # The list below is literal on purpose: derived from SELF_PROTECTED, removing
   # an entry would remove its own check. That catches a removal but not an
-  # ADDITION -- a fourth marker would get no assertion and the claim above would
-  # quietly narrow -- so pin the set as well.
+  # ADDITION -- a fourth marker would get no assertion in guard.py's
+  # _stateful_checks and the coverage would quietly narrow -- so pin the set.
   if sp_drift="$(python3 -c '
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("g", ".claude/hooks/guard.py")
@@ -209,9 +186,9 @@ if set(g.SELF_PROTECTED) != want:
     print(repr(sorted(g.SELF_PROTECTED)))
     sys.exit(1)
 ')"; then
-    ok "SELF_PROTECTED still names exactly the paths asserted below"
+    ok "SELF_PROTECTED still names exactly the paths _stateful_checks asserts"
   else
-    fail "SELF_PROTECTED is now $sp_drift; give each entry an assertion below and update this list"
+    fail "SELF_PROTECTED is now $sp_drift; give each entry an assertion in guard.py's _stateful_checks and update this list"
   fi
 
   # guard.py decides ownership from `git rev-parse --show-toplevel`, and with no
