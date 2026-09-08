@@ -47,6 +47,7 @@
 #include <vector>
 
 #include "rig.hpp"
+#include "scratch.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/sync.hpp"
 #include "rommsync/state_sync.hpp"

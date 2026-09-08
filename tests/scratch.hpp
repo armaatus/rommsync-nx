@@ -123,8 +123,19 @@ inline constexpr const char* kKeepMarker = ".keep";
 inline void Discard(const std::filesystem::path& path) {
   std::error_code error;
   if (Keeping()) {
+    // The marker is the whole of the request -- without it the next process's
+    // sweep takes the leaf. Announcing a path that was not marked would be a
+    // lie told in exactly the debugging session this exists for.
     std::ofstream marker(path / kKeepMarker);
-    std::cerr << "  scratch kept at " << path.string() << "\n";
+    if (marker) {
+      std::cerr << "  scratch kept at " << path.string() << "\n";
+    } else {
+      // Deliberately not naming a cause. The leaf being gone is the likely one,
+      // but a full disk or a permission answers here identically, and a keep
+      // that says the wrong reason is worse than one that says none.
+      std::cerr << "  could not mark " << path.string()
+                << " to be kept; it will be swept\n";
+    }
     return;
   }
   std::filesystem::remove_all(path, error);
@@ -203,18 +214,49 @@ inline void Sweep(const std::filesystem::path& root, const std::filesystem::path
 /// this process is about to write into is no longer the one that was kept --
 /// which is what makes "a partial file left from an earlier run" mean an earlier
 /// run of *this* process.
+///
+/// If that leaf cannot be removed, this process **stops**, with `exit(2)` and the
+/// reason. There is nothing else honest to do: a binary that could not get a
+/// scratch directory of its own cannot produce a result anyone should read, and
+/// carrying on means running the assertions against another run's leftovers.
+/// 2 is what the test mains already return for a setup they cannot complete.
 inline const std::string& Dir() {
   static const std::string dir = [] {
     const std::filesystem::path root = Root();
     const std::filesystem::path mine = root / LeafName(static_cast<long long>(::getpid()));
 
-    std::error_code error;
-    std::filesystem::create_directories(root, error);
+    std::error_code made_root;
+    std::filesystem::create_directories(root, made_root);
+    if (made_root) {
+      // Checked rather than discarded, for the reason the rest of this function
+      // exists: an ignored `error_code` here is the same shape as the one that
+      // let a dead run's leaf be adopted. `create_directories` on a directory
+      // that is already there is not an error, so this fires only on a real one.
+      std::cerr << "could not create " << root.string() << ": " << made_root.message()
+                << "\n  the test scratch directory is not usable\n";
+      std::exit(2);
+    }
     Sweep(root, mine);
-    std::filesystem::remove_all(mine, error);
-    std::filesystem::create_directories(mine, error);
-    if (error) {
-      std::cerr << "could not create " << mine.string() << ": " << error.message() << "\n";
+
+    // An `error_code` each, because the next call clears the last one's -- and
+    // the failure is acted on rather than only announced. A `remove_all` that
+    // failed, followed by a `create_directories` that returns cleanly for "it is
+    // already there", is how this process would ADOPT a dead run's leaf: the one
+    // case in which a `.part` from another run can still be sitting in what a
+    // scenario believes is a fresh scratch directory.
+    std::error_code removed;
+    std::filesystem::remove_all(mine, removed);
+    if (removed) {
+      std::cerr << "could not clear " << mine.string() << ": " << removed.message()
+                << "\n  it belongs to a run that is over, and this one will not write"
+                   " into it\n  remove it by hand and run again\n";
+      std::exit(2);
+    }
+    std::error_code made;
+    std::filesystem::create_directories(mine, made);
+    if (made) {
+      std::cerr << "could not create " << mine.string() << ": " << made.message() << "\n";
+      std::exit(2);
     }
 
     static const detail::Leaf leaf(mine);

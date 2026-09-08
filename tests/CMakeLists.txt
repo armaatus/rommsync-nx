@@ -581,6 +581,21 @@ foreach(scenario IN LISTS HTTP_SCENARIOS)
   set_tests_properties(http.${scenario} PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 endforeach()
 
+# --- refusing a leaf rather than adopting one --------------------------------
+# #169. `scratch::Dir()` memoizes in a function-local static, so the fork this
+# needs -- plant a leaf under the CHILD's pid that the child cannot empty, and
+# watch it stop -- has to happen in a process that has not called `Dir()` yet.
+# `test_harness` has, from its own `main`, so this is a binary of its own rather
+# than one more `harness.` scenario. Needs no server and no root, so it never
+# skips: it is the half of the per-process leaf that no green suite proves.
+add_executable(test_scratch test_scratch.cpp)
+target_link_libraries(test_scratch PRIVATE rommsync::core)
+target_include_directories(test_scratch PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_scratch PRIVATE
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+add_test(NAME scratch.refuses COMMAND test_scratch)
+set_tests_properties(scratch.refuses PROPERTIES TIMEOUT 60)
+
 # --- and the same build tree under two `ctest`s at once ----------------------
 # M0-2 (#151). `http.download` is the shape that broke: a fixed destination name
 # in a directory every process shares, so the local loop's `ctest` and the
@@ -610,6 +625,29 @@ endif()
 # RUN_SERIAL because the two invocations it starts are already two rig clients,
 # and nothing else may be a third.
 set_tests_properties(scratch.concurrent PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+
+# ...and what that script leaves behind when CTest ends it on TIMEOUT (#169).
+# `ctest` does NOT forward a signal to the test it is running -- measured, for
+# TERM and for KILL alike -- so killing the two inner `ctest`s leaves their
+# `test_http_native` alive and reparented to init, on the fixture the rest of the
+# run needs. The group kill in that script's trap is the fix, and this is the
+# test of it: red against a copy with the fix removed, green with it.
+#
+# `http.stall` for the pattern because the sample has to land while the scenario
+# is still running, and stall is the one that lasts seconds; the script's control
+# phase checks that rather than trusting it. It is read-only against RomM, which
+# is what makes two at once safe.
+set(SCRATCH_ORPHANS_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_scratch_orphans.sh")
+add_test(NAME scratch.orphans
+         COMMAND "${BASH_PROGRAM}" "${SCRATCH_ORPHANS_TEST}"
+                 "${CMAKE_CTEST_COMMAND}" "${CMAKE_BINARY_DIR}"
+                 "${SCRATCH_CONCURRENT_TEST}" "^http\\.stall$")
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(scratch.orphans PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+# RUN_SERIAL for the same reason, and more so: it kills rig clients mid-request
+# on purpose, so nothing else may be talking to the fixture while it does.
+set_tests_properties(scratch.orphans PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 
 # --- the console's HttpClient against the same rig ---------------------------
 # M1-7 (#126). The Horizon backend is split so that the half that can be got

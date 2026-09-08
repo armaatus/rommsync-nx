@@ -639,6 +639,15 @@ ctest --test-dir build --output-on-failure
   `scratch::Keep()` spares one. `scratch.concurrent` is its rig-side other half
   — two real `ctest` invocations at once, because nothing inside one can see the
   case at all.
+- Two more sit beside those, and both are about what happens when the scratch
+  directory goes wrong rather than when it works. `scratch.refuses` needs no
+  server: it forks, hands the child a leaf it cannot empty, and holds the child
+  to stopping with 2 rather than adopting a dead run's files — a binary that
+  could not get a directory of its own cannot produce a result worth reading.
+  `scratch.orphans` needs the rig: it terminates `scratch.concurrent`'s script
+  the way a CTest `TIMEOUT` would and checks that nothing was left behind on the
+  fixture, because `ctest` does not pass a signal on to the test it is running
+  and an orphaned client fails whichever rig test runs next instead of this one.
 - `harness.backup` is where "back up **first**" is separated from "back up
   eventually", and the only way to tell them apart is to interrupt the
   overwrite: the download is cut mid-body, the save is untouched because
