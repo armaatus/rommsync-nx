@@ -454,9 +454,31 @@ repo_release() {
   # be the thing that reports it.
   [ -n "$eligible" ] || eligible="$tags"
   tag="$(printf '%s\n' "$eligible" | sort -V | tail -1)"
-  if ! git -C "$REPO_ROOT" merge-base --is-ancestor "$tag" origin/main 2>/dev/null \
-     && ! git -C "$REPO_ROOT" merge-base --is-ancestor "$tag" main 2>/dev/null; then
-    echo "    $tag is not reachable from main -- ci.yml refuses to publish it"
+  # "Not reachable" and "nothing here to reach" are different answers, and only
+  # one of them is the repository's fault. A tag-ref checkout has no branches at
+  # all -- `actions/checkout` fetches the one ref it was asked for -- so asking
+  # `is-ancestor` against a `main` that is not present answered "not reachable"
+  # about a tag sitting on main's tip. That is what skipped the release job on
+  # the first v1.0.0-rc1 push: the gate could not see main, said the tag was
+  # unreachable, and `gate.release` failed the run that was meant to publish.
+  #
+  # Unknown stays unknown, the way it does everywhere else here. The row still
+  # does not pass -- it cannot, without checking -- but it says which question
+  # it could not answer, and names the fetch depth that would let it.
+  local main_ref=""
+  for candidate in origin/main main; do
+    if git -C "$REPO_ROOT" rev-parse --verify --quiet "$candidate" >/dev/null 2>&1; then
+      main_ref="$candidate"
+      break
+    fi
+  done
+  if [ -z "$main_ref" ]; then
+    echo "    no main to compare against, so whether $tag is reachable from it is"
+    echo "    unknown -- a tag-ref checkout has no branches (actions/checkout"
+    echo "    defaults to fetch-depth 1; 0 fetches main too)"
+    ok=1
+  elif ! git -C "$REPO_ROOT" merge-base --is-ancestor "$tag" "$main_ref" 2>/dev/null; then
+    echo "    $tag is not reachable from $main_ref -- ci.yml refuses to publish it"
     ok=1
   fi
   if [ "$tag" != "v$version" ]; then
