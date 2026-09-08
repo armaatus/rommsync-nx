@@ -341,35 +341,60 @@ def _after_cd(prefix, words):
     if "$" in target or "`" in target or target == "-":
         return None
     if target.startswith("/"):
-        return target.rstrip("/") + "/"
+        collapsed = _collapse(target)
+        if collapsed is None:
+            return None
+        return collapsed + "/" if collapsed != "/" else "/"
     if prefix is None:
         return None
-    parts = [p for p in (prefix + target).split("/") if p and p != "."]
+    collapsed = _collapse(prefix + target)
+    if collapsed is None:
+        return None
+    return collapsed + "/" if collapsed else ""
+
+
+def _collapse(path):
+    """`a/./b`, `a//b` and `a/c/../b` all as the one path they name.
+
+    `None` for a walk that climbs past the top: the same "unknown has to stay
+    unknown" rule `_after_cd` follows, for the same reason.
+
+    Both the prefix a `cd` leaves and the path written after it go through
+    this. Normalising only the prefix is what left `cd .claude && cat >
+    ./hooks/guard.py` writable -- the marker is matched literally, and `./`
+    in the tail is enough to stop it matching.
+    """
+    rooted = path.startswith("/")
     out = []
-    for part in parts:
+    for part in path.split("/"):
+        if not part or part == ".":
+            continue
         if part == "..":
             if not out:
                 return None
             out.pop()
         else:
             out.append(part)
-    return "/".join(out) + "/" if out else ""
+    joined = "/".join(out)
+    return ("/" + joined) if rooted else joined
 
 
-def check_bash(command):
+def check_bash(command, cwd=""):
     branch = None
     # What a `cd` earlier on this line has already consumed. Everything below
     # matches a path by its tail, which is what survives a relative path -- but
     # a marker whose own prefix is the thing the `cd` ate has no tail left to
     # match: once `cd .claude` has run, `hooks/guard.py` shares nothing with
     # `/.claude/hooks/`. Putting the prefix back is what makes it a path again.
-    cwd = ""
     for segment in _segments(command):
         words = _words(segment)
         if not words:
             continue
 
         if _verb(words) == "cd":
+            # Before the prefix moves: a redirection on the `cd` line happens
+            # where the shell already stands, not where it is going.
+            _judge_writes(words, cwd)
             cwd = _after_cd(cwd, words)
             continue
 
@@ -377,7 +402,7 @@ def check_bash(command):
         if _verb(words) in ("bash", "sh", "zsh", "dash") and "-c" in words:
             idx = words.index("-c")
             if idx + 1 < len(words):
-                check_bash(words[idx + 1])
+                check_bash(words[idx + 1], cwd)
             continue
 
         # A stopped fleet produces no outward effects, even from an agent that
@@ -522,23 +547,38 @@ def check_bash(command):
 
         # Every path this segment writes goes through the same rules an Edit
         # would. A write is a write whichever verb performs it.
-        for path in _written_paths(words):
-            if cwd and not path.startswith("/"):
-                path = cwd + path
-            if _touches_captures(path):
-                deny(
-                    f"Blocked: {CAPTURES} is the pinned RomM 5.2.0 contract, and "
-                    "contract.captures\n"
-                    "diffs a live probe against it. Rewriting a capture to match a "
-                    "failing run silences\n"
-                    "the only test that notices RomM changing.\n"
-                    "Re-capture with server/contract/probe_contract.py and say in the "
-                    "PR body what changed and why.\n"
-                    "Reading a capture is fine -- this blocks writing one."
-                )
-            check_path(path)
+        _judge_writes(words, cwd)
 
     return 0
+
+
+def _judge_writes(words, cwd):
+    """Judge every path one segment writes, from where the shell stands now.
+
+    A function rather than a loop in place because `cd` needs it too: a
+    redirection attached to the `cd` itself -- `cd tmp > .claude/settings.json`
+    -- is performed before the directory changes, so it is judged against the
+    prefix in hand, and skipping it lost the secrets, captures and
+    self-protection rules for that shape.
+    """
+    for path in _written_paths(words):
+        if cwd and not path.startswith("/"):
+            path = cwd + path
+        collapsed = _collapse(path)
+        if collapsed is not None:
+            path = collapsed
+        if _touches_captures(path):
+            deny(
+                f"Blocked: {CAPTURES} is the pinned RomM 5.2.0 contract, and "
+                "contract.captures\n"
+                "diffs a live probe against it. Rewriting a capture to match a "
+                "failing run silences\n"
+                "the only test that notices RomM changing.\n"
+                "Re-capture with server/contract/probe_contract.py and say in the "
+                "PR body what changed and why.\n"
+                "Reading a capture is fine -- this blocks writing one."
+            )
+        check_path(path)
 
 
 def check_path(path):
@@ -820,6 +860,24 @@ def _stateful_checks():
                        "...while an ordinary file under the same cd stays writable")
                 expect(0, {"command": "cd $SOMEWHERE && cat > guard.py"},
                        "...and an unresolvable cd does not invent a path to blame")
+
+                # The prefix was normalised and the written path was not, so a
+                # dot-segment in the tail was enough to stop the marker matching
+                # -- `./` is one keystroke from the case asserted above.
+                expect(2, {"command": "cd .claude && cp /tmp/x ./hooks/guard.py"},
+                       "...nor with a ./ in the path the cd left")
+                expect(2, {"command": "cd .claude && cp /tmp/x .//hooks/guard.py"},
+                       "...nor with a doubled slash")
+                expect(2, {"command": "cd .claude/skills && cp /tmp/x ../hooks/guard.py"},
+                       "...nor climbing back out of a deeper cd")
+                # `bash -c` is a shape the guard already models; it started its
+                # own prefix from scratch and so forgot the cd in front of it.
+                expect(2, {"command": "cd .claude && bash -c 'cp /tmp/x hooks/guard.py'"},
+                       "...nor when bash -c runs the write, inheriting the cd")
+                # A redirection on the `cd` line writes before the directory
+                # changes. Judging it needs the prefix in hand, not the new one.
+                expect(2, {"command": "cd tmp > .claude/hooks/guard.py"},
+                       "...nor a redirection attached to the cd itself")
             finally:
                 if os.path.exists(marker):
                     os.remove(marker)
