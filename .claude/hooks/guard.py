@@ -654,18 +654,22 @@ def _payload_cwd(payload):
     ours to judge.
     """
     cwd = payload.get("cwd")
+    # Absolute, or it is not the answer this claims to be: a relative or
+    # foreign-looking cwd resolves against wherever the hook happens to run,
+    # which is a guessed prefix wearing a real one's clothes.
+    if not isinstance(cwd, str) or not os.path.isabs(cwd):
+        return ""
+    # After the cheap checks: every Bash call reaches here, and this shells out.
     root = _repo_root()
-    if not isinstance(cwd, str) or not cwd or not root:
+    if not root:
         return ""
     try:
         rel = os.path.relpath(os.path.realpath(cwd), os.path.realpath(root))
     except (OSError, ValueError):
         return ""
-    if rel == os.curdir:
+    if rel == os.curdir or rel.startswith(os.pardir):
         return ""
-    if rel.startswith(os.pardir):
-        return ""
-    return rel.rstrip("/") + "/"
+    return rel + "/"
 
 
 def main(payload):
@@ -808,6 +812,9 @@ def _stateful_checks():
         nonlocal failures
         global _stateful_ran
         _stateful_ran += 1
+        # An allowed call writes no reason, so a `because` on one could never
+        # hold. Catching it here rather than letting it fail every run.
+        assert not (because and want == 0), "because= needs a refusal to read"
         payload = {"tool_name": tool, "tool_input": tool_input}
         if cwd is not None:
             payload["cwd"] = cwd
@@ -820,7 +827,13 @@ def _stateful_checks():
             got = exc.code
         why = said.getvalue()
         if got != want:
-            print(f"FAIL: {what} (expected exit {want}, got {got})", file=sys.stderr)
+            # With the reason, because that is what a false block looks like
+            # from here: capturing stderr to match it must not also swallow it.
+            detail = f" -- {why.strip()}" if why.strip() else ""
+            print(
+                f"FAIL: {what} (expected exit {want}, got {got}){detail}",
+                file=sys.stderr,
+            )
             failures += 1
         elif because and because not in why:
             print(
@@ -879,7 +892,8 @@ def _stateful_checks():
                 expect(0, {"command": "git push origin HEAD"},
                        "...and lifts once the review is recorded")
                 expect(2, {"file_path": os.path.join(root, HOOK_REL)},
-                       "a fleet worktree cannot rewrite its own guards", tool="Edit")
+                       "a fleet worktree cannot rewrite its own guards", tool="Edit",
+                       because="enforcement layer")
                 expect(0, {"file_path": os.path.join(root, ".claude/skills/x/SKILL.md")},
                        "...but skills stay advisory even there", tool="Edit")
 
@@ -891,11 +905,17 @@ def _stateful_checks():
                 # them is itself a change to the enforcement layer, which never
                 # auto-merges -- parked in lint.sh they could be removed by a
                 # PR that merged itself.
+                # `because` on each, because exit 2 alone would also be
+                # satisfied by the secrets branch: settings.local.json is
+                # gitignored and holds permission rules, so it is one plausible
+                # edit away from being denied as a secret instead. That would
+                # keep these green while making the file unwritable in a
+                # hand-opened worktree too, where it has to stay editable.
                 for rel in (SETTINGS_REL, LOCAL_SETTINGS_REL):
                     expect(2, {"file_path": os.path.join(root, rel)},
-                           f"...nor {rel}", tool="Edit")
+                           f"...nor {rel}", tool="Edit", because="enforcement layer")
                     expect(2, {"command": "echo x > " + rel},
-                           f"...nor {rel} from the shell")
+                           f"...nor {rel} from the shell", because="enforcement layer")
 
                 # ...and the same three through a path a `cd` has shortened,
                 # which is the whole of #139: the marker's own prefix is what
