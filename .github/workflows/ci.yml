@@ -261,6 +261,20 @@ jobs:
     needs: [static, host-tests, switch-build]
     runs-on: ubuntu-latest
     container: devkitpro/devkita64:latest
+    # Every other job runs on the runner, where a `run:` step is bash. This one
+    # runs in a container, where the default is `sh -e` -- and dash has no
+    # `pipefail`, so seven of this job's twelve run steps died on `set: Illegal
+    # option -o pipefail` before running a word of what followed. The first step
+    # is not one of them and passed under dash, which is why the failure landed
+    # on the second: `git`, the checkout and the version check already worked in
+    # this container.
+    #
+    # Nothing had ever reached this job to find out: it needs a `v*` tag whose
+    # static, host-tests and switch-build all pass, and the first tag this
+    # project cut was v1.0.0-rc1.
+    defaults:
+      run:
+        shell: bash
     # The default token is read-only. Creating a release and attaching assets to
     # it is the only write this workflow does, and it is scoped to this job.
     permissions:
