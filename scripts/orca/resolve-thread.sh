@@ -43,7 +43,6 @@ cd "$REPO_ROOT"
 orca_fleet_stopped && { echo "STOPPED: $ORCA_FLEET_STOP exists."; exit 3; }
 
 orca_owner_repo || { echo "could not read this repository's name from gh" >&2; exit 2; }
-owner="$orca_owner"; name="$orca_repo_name"
 
 pr="$(orca_pr_for_branch)" || {
   echo "no open PR for branch $(git rev-parse --abbrev-ref HEAD)" >&2; exit 2; }
@@ -103,51 +102,8 @@ fi
 head="$(GH_PAGER=cat gh pr view "$pr" --json headRefOid --jq .headRefOid 2>/dev/null)"
 [ -n "$head" ] || { echo "resolved, but could not read PR #$pr's head" >&2; exit 2; }
 
-# By FILE NAME, not by display name: `name:` is prose and gets reworded, and a
-# lookup that stops resolving would degrade this to "could not tell" silently.
-listing="$(GH_PAGER=cat gh run list --repo "$owner/$name" --workflow merge-gate.yml \
-             --limit 40 --json databaseId,conclusion,headSha 2>/dev/null)" || {
-  echo "resolved, but could not list merge-gate runs; ask for the gate again with a push" >&2
-  exit 2; }
-
-# The NEWEST gate run on this head, and only if it is one that needs re-asking.
-#
-# `gh run list` returns newest first. If that newest run passed, the check is
-# already green and there is nothing to ask; if it is still in flight, it will
-# evaluate with the thread now resolved and asking again would only cancel it --
-# both are the no-op below. An older failure under a newer success is #84's
-# stale-check wedge, and merge-gate.yml's own `clear-stale` job is what clears
-# that; re-running it from here would race that job in the gate's
-# cancel-in-progress group.
-run="$(printf '%s' "$listing" | python3 -c '
-import json, sys
-head = sys.argv[1]
-on_head = [r for r in json.load(sys.stdin) if r.get("headSha") == head]
-newest = on_head[0] if on_head else None
-print(newest["databaseId"]
-      if newest and newest.get("conclusion") in ("failure", "cancelled") else "")
-' "$head" 2>/dev/null)"
-
-if [ -z "$run" ]; then
-  echo "every thread is resolved; the newest merge-gate run on ${head:0:8} is not one to re-ask"
-  exit 0
-fi
-
-job="$(GH_PAGER=cat gh api "repos/$owner/$name/actions/runs/$run/jobs" \
-         --jq '[.jobs[] | select(.name == "merge-gate") | .id][0]' 2>/dev/null || echo "")"
-if [ -z "$job" ] || [ "$job" = "null" ]; then
-  # The gate JOB, never the whole run: `clear-stale` is `needs: gate` and would
-  # run a second copy of its own rerun loop, which is the wedge it exists to
-  # clear reproduced one level down (merge-gate.yml says the same).
-  echo "every thread is resolved, but the gate job of run $run could not be found." >&2
-  echo "Ask the gate again with: gh run rerun --job <gate job id of run $run>" >&2
-  exit 2
-fi
-
-if GH_PAGER=cat gh run rerun --job "$job" --repo "$owner/$name" >/dev/null 2>&1; then
-  echo "every thread is resolved; re-ran the gate job ($job) so merge-gate is asked again"
-else
-  echo "every thread is resolved, but re-running the gate job failed." >&2
-  echo "Ask it again with: gh run rerun --job $job" >&2
-  exit 2
-fi
+# `orca_reask_gate` is the half no GitHub event does, and it is shared with
+# `answer-review.sh` for the reason the payload query is shared: the rule about
+# WHICH run may be re-asked -- the newest on the head, and only if it failed --
+# is the part that goes wrong quietly, and one copy of it is enough.
+orca_reask_gate "$head" "every thread is resolved"

@@ -1433,6 +1433,8 @@ foreach(phase opens reuses foreign no_romm submits no_draft unstable
               await_never_hands_back_the_same_review_twice
               await_stops_when_the_gate_will_not_import
               review_status_says_a_human_merges_this_one
+              review_status_holds_an_unanswered_review
+              review_status_lets_an_answered_review_through
               review_status_names_the_wedge
               review_status_waits_for_the_run_in_flight
               review_status_reports_a_conflict_before_the_human_merge
@@ -1482,6 +1484,27 @@ foreach(phase last more partial green stopped)
   add_test(NAME orca.resolve_${phase}
            COMMAND "${BASH_PROGRAM}" "${ORCA_RESOLVE_TEST}" ${phase})
   set_tests_properties(orca.resolve_${phase} PROPERTIES TIMEOUT 60)
+endforeach()
+
+# --- ...and answering the review is what keeps it from merging underneath you --
+# `gh pr merge --auto` is armed when the PR is opened -- deliberately, so a
+# finished PR does not sit green with nobody left to merge it (#90) -- and the
+# independent review only runs afterwards. A standing CHANGES_REQUESTED is caught
+# by the gate and an inline finding is caught by the thread list, but nits in the
+# BODY of a COMMENTED review are caught by neither: the gate goes green and the
+# branch merges while its author is still editing. Four PRs went in that way
+# (#146, #154, #159, #168), and #154's carried a real defect to main (#170).
+#
+# scripts/orca/answer-review.sh writes the author's answer, which merge_gate.py
+# now requires from any review that reports findings. The `gate` phase is the one
+# that matters most: it checks what the script WRITES against what the gate
+# ACCEPTS, which is the pairing that would otherwise fail silently -- answers
+# that satisfy nothing. `gh` is stubbed here too.
+set(ORCA_ANSWER_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_orca_answer_review.sh")
+foreach(phase posts thin unpushed behind no_review flight stopped gate)
+  add_test(NAME orca.answer_${phase}
+           COMMAND "${BASH_PROGRAM}" "${ORCA_ANSWER_TEST}" ${phase})
+  set_tests_properties(orca.answer_${phase} PROPERTIES TIMEOUT 60)
 endforeach()
 
 # --- the dispatcher says when it did not do what it said ---------------------

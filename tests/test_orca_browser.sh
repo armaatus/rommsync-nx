@@ -190,11 +190,15 @@ GHSTUB
 write_pr_reviews() {
   local page_info="${4:-}"
   [ -n "$page_info" ] || page_info='{"hasNextPage":false,"endCursor":null}'
+  # $5 is the PR's own conversation, which the gate reads for the author's
+  # answer to a review that reported findings. Empty for every phase that is
+  # about something else.
   cat >"$TMPDIR_FIXTURE/graphql.json" <<JSON
 {"data":{"repository":{"pullRequest":{
   "body": $3,
   "author":{"login":"armaatus"},
   "reviews":{"nodes":[$1]},
+  "comments":{"nodes":[${5:-}]},
   "reviewThreads":{"pageInfo":$page_info,"nodes":[$2]}
 }}}}
 JSON
@@ -1126,7 +1130,7 @@ GHSTUB
     write_pr_reviews \
       '{"state":"COMMENTED","submittedAt":"2026-09-06T00:00:00Z",
         "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
-        "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.",
+        "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.\n<!-- review-findings: 0 -->",
         "comments":{"totalCount":0}}' \
       '{"id":"T_settled","isResolved":true,"isOutdated":false,
         "path":"core/src/old.cpp","line":10,
@@ -1167,7 +1171,7 @@ GHSTUB
     write_pr_reviews \
       '{"state":"COMMENTED","submittedAt":"2026-09-06T10:00:00Z",
         "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
-        "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.",
+        "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.\n<!-- review-findings: 0 -->",
         "comments":{"totalCount":0}}' \
       '' '"## Plan\nCloses #84\n/code-review high\nmattpocock-skills:code-review\n"'
     write_pr_checks \
@@ -1225,7 +1229,7 @@ GHSTUB
     write_pr_reviews \
       '{"state":"COMMENTED","submittedAt":"2026-09-06T10:00:00Z",
         "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
-        "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.",
+        "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.\n<!-- review-findings: 0 -->",
         "comments":{"totalCount":0}}' \
       '' '"## Plan\nCloses #84\n/code-review high\nmattpocock-skills:code-review\n"'
     write_pr_checks \
@@ -1261,6 +1265,58 @@ core/src/sync.cpp'
     echo "PASS: an enforcement-layer PR is reported as human-merge, not as a failure to fix"
     ;;
 
+  review_status_holds_an_unanswered_review)
+    # #170. Auto-merge is armed when the PR is opened and the review runs after
+    # it, so a review that reports nits in its BODY -- no CHANGES_REQUESTED, no
+    # inline thread -- used to satisfy every gate there is and the branch merged
+    # while the agent was still editing. Four PRs went in that way.
+    #
+    # This is the surface the agent actually reads: nothing else tells it that
+    # the PR is being held, or what closes the hold.
+    make_review_status_fixture
+    write_pr_reviews \
+      '{"state":"COMMENTED","submittedAt":"2026-09-06T10:00:00Z",
+        "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
+        "body":"Nit: the comment above sync_tick() says what, not why.\n<!-- review-findings: 1 -->",
+        "comments":{"totalCount":0}}' \
+      '' '"## Plan\nCloses #170\n/code-review high\nmattpocock-skills:code-review\n"'
+    write_pr_checks \
+      '{"name":"merge-gate","status":"COMPLETED","conclusion":"SUCCESS",
+        "startedAt":"2026-09-06T11:00:00Z","completedAt":"2026-09-06T11:00:10Z"}' \
+      CLEAN core/src/sync.cpp
+    # CLEAN, and every check green, so the ONLY thing between this fixture and
+    # its answered sibling below is the answer. A phase that also flipped
+    # mergeStateStatus would pass on a tree without this change.
+    out="$(run_review_status)"; rc=$?
+    [ "$rc" = 1 ] || fail "a review reporting findings was reported as ready to merge; got $rc: $out"
+    grep -q "answer-review.sh" <<<"$out" \
+      || fail "it held the PR without naming what closes the hold: $out"
+    echo "PASS: a review whose findings are unanswered holds the PR, and says what closes it"
+    ;;
+
+  review_status_lets_an_answered_review_through)
+    # The other half, and the reason the hold is not simply "the agent declares
+    # done": an answered review stops holding, and a review that reported
+    # NOTHING never held at all -- so a finished PR still merges with nobody
+    # watching, which is what arming --auto early exists to keep (#90).
+    make_review_status_fixture
+    write_pr_reviews \
+      '{"state":"COMMENTED","submittedAt":"2026-09-06T10:00:00Z",
+        "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
+        "body":"Nit: the comment above sync_tick() says what, not why.\n<!-- review-findings: 1 -->",
+        "comments":{"totalCount":0}}' \
+      '' '"## Plan\nCloses #170\n/code-review high\nmattpocock-skills:code-review\n"' \
+      '' '{"author":{"login":"armaatus"},"createdAt":"2026-09-06T10:30:00Z",
+           "body":"<!-- review-answered '"$RS_HEAD"' -->\nReworded it to say why."}'
+    write_pr_checks \
+      '{"name":"merge-gate","status":"COMPLETED","conclusion":"SUCCESS",
+        "startedAt":"2026-09-06T11:00:00Z","completedAt":"2026-09-06T11:00:10Z"}' \
+      CLEAN core/src/sync.cpp
+    out="$(run_review_status)"; rc=$?
+    [ "$rc" = 0 ] || fail "an answered review still held the PR; got $rc: $out"
+    echo "PASS: an answered review stops holding the PR"
+    ;;
+
   review_status_names_the_wedge)
     # The #84 wedge itself: every latest check green, every thread resolved, and
     # GitHub still says BLOCKED, because branch protection is still counting a
@@ -1271,7 +1327,7 @@ core/src/sync.cpp'
     write_pr_reviews \
       '{"state":"COMMENTED","submittedAt":"2026-09-06T10:00:00Z",
         "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
-        "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.",
+        "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.\n<!-- review-findings: 0 -->",
         "comments":{"totalCount":0}}' \
       '' '"## Plan\nCloses #84\n/code-review high\nmattpocock-skills:code-review\n"'
     write_pr_checks \
@@ -1305,7 +1361,7 @@ core/src/sync.cpp'
     write_pr_reviews \
       '{"state":"COMMENTED","submittedAt":"2026-09-06T10:00:00Z",
         "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
-        "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.",
+        "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.\n<!-- review-findings: 0 -->",
         "comments":{"totalCount":0}}' \
       '' '"## Plan\nCloses #84\n/code-review high\nmattpocock-skills:code-review\n"'
     write_pr_checks \
@@ -1335,7 +1391,7 @@ core/src/sync.cpp'
     write_pr_reviews \
       '{"state":"COMMENTED","submittedAt":"2026-09-06T00:00:00Z",
         "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
-        "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.",
+        "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.\n<!-- review-findings: 0 -->",
         "comments":{"totalCount":0}}' \
       '{"id":"T_done","isResolved":true,"isOutdated":false,
         "path":"core/src/sync.cpp","line":10,
@@ -1362,7 +1418,7 @@ core/src/sync.cpp'
     write_pr_reviews \
       '{"state":"COMMENTED","submittedAt":"2026-09-06T10:00:00Z",
         "commit":{"oid":"'"$RS_HEAD"'"},"author":{"login":"claude"},
-        "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.",
+        "body":"A real review body, long enough to be worth reading and to clear MIN_REVIEW_BODY.\n<!-- review-findings: 0 -->",
         "comments":{"totalCount":0}}' \
       '' '"## Plan\nCloses #84\n/code-review high\nmattpocock-skills:code-review\n"'
     write_pr_checks \

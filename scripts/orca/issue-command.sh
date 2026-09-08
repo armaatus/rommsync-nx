@@ -147,8 +147,31 @@ Use that, not the `resolveReviewThread` mutation by hand. NOTHING on GitHub
 re-runs `merge-gate` when a thread is resolved -- `pull_request_review_thread`
 is a webhook event, not a workflow trigger -- so the gate stays red on a thread
 you already closed, and auto-merge never fires. That script resolves the
-threads and, once the last one is shut, asks the gate again. Push if you changed
-anything, and run it again:
+threads and, once the last one is shut, asks the gate again.
+
+IF YOU CHANGED ANYTHING, PUSH IT and go back to `await-review.sh`. The push
+re-runs the reviewer, and the review of what you actually sent is the next
+round's. Do NOT answer a review you have just pushed over: there is no review on
+the new head yet, an answer written before one arrives is discarded by it, and
+`answer-review.sh` refuses for exactly that reason.
+
+When a review arrives that you are NOT going to change anything for -- because
+nothing needed changing, or because you disagree and said so on the thread --
+ANSWER IT:
+
+    ./scripts/orca/answer-review.sh "<what you did, or why you did not>"
+
+That is the one thing standing between the review's findings and a merge. You
+armed auto-merge back at step 4 -- correctly, that is what stops a finished PR
+sitting green forever -- so the moment the review lands, every check is
+satisfiable and the branch can go in while you are still editing. It has, four
+times: #146, #154, #159, #168, and #154's took a real defect to main. The window
+is not the life of the PR, it is one `ctest` run, which is exactly what you do
+between reading the findings and pushing them.
+
+"I am not doing this, because" is as good an answer as a fix; silence is not an
+answer. A review that reported nothing needs none, and `merge-gate` will say so
+rather than making you guess. Then run it again:
 
     ./scripts/orca/review-status.sh
 

@@ -70,6 +70,32 @@ formulation of something already correct.
 Report at most **five nits**, and summarise the rest as a count. A review whose
 signal is buried in twenty preferences costs more attention than it saves.
 
+## Say how many findings you left
+
+Every review of a pull request ends its body with this line, and nothing else
+after it:
+
+```
+<!-- review-findings: N -->
+```
+
+`N` is Important plus Nit, across all three passes, inline comments included.
+`0` means the review found nothing.
+
+It is an HTML comment, so it does not show up in the rendered review. It exists
+because `merge-gate` cannot otherwise tell a review that found five nits from
+one that found nothing: REVIEW.md sends anything Important to
+`--request-changes` and everything else to `--comment`, so both of those are a
+COMMENTED verdict and both satisfy every other condition the gate has.
+
+`gh pr merge --auto` is armed when the PR is opened -- deliberately, so a
+finished PR does not sit green with nobody left to merge it -- and this review
+runs afterwards. Get the number wrong in the `0` direction and the branch merges
+while its author is still fixing what you found. Four PRs went in that way.
+
+Leaving the line out is safe: the PR is then held as though findings were left,
+and its author has to answer a review that said nothing. Write the line.
+
 ## Do not report
 
 - Anything CI already enforces: compiler warnings, `core/` include hygiene,
@@ -86,9 +112,17 @@ signal is buried in twenty preferences costs more attention than it saves.
 
 ## What findings do and do not do
 
-Findings inform the human who merges. They do not approve and they do not block:
-a PR still needs a human, and no agent merges its own work (CLAUDE.md,
-"Finishing a task").
+No review here approves, and no agent merges its own work (CLAUDE.md, "Finishing
+a task"). Findings do not decide whether a PR is good enough; a human reading
+them does.
+
+They do hold the branch, though, and that is not the same thing. `merge-gate`
+refuses a PR while a `--request-changes` is standing, while a review thread is
+open, and while a review reporting findings has not been answered by its author
+-- `./scripts/orca/answer-review.sh "<what you did>"` is that answer, and "I am
+not doing this, because" is as good an answer as a fix. What none of that does
+is judge the finding; it only makes sure somebody read it before the code went
+in.
 
 When a review flags the same mistake twice across PRs, the correction goes into
 CLAUDE.md as part of that review. That is how this stops being a review finding

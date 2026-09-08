@@ -16,6 +16,12 @@
 #
 # `reviews(last:50)` needs no paging: it takes the LATEST fifty, which is what
 # the gate reads. Only the thread list is truncated from the wrong end.
+#
+# `comments` is the PR's own conversation, not its review threads, and it is
+# here for one thing: the author's answer to a review that reported findings
+# (`merge_gate.py`, `answered()`). LAST fifty for the same reason as the
+# reviews -- an answer is written after the review it answers, so the newest end
+# is the only end it can be at.
 set -uo pipefail
 
 [ $# -eq 3 ] || { echo "usage: pr_payload.sh <owner> <name> <pr>" >&2; exit 2; }
@@ -36,6 +42,7 @@ query($owner:String!,$name:String!,$pr:Int!,$after:String){
       author{login}
       reviews(last:50){ nodes{ state submittedAt commit{oid} author{login}
                                body comments(first:1){ totalCount } } }
+      comments(last:50){ nodes{ author{login} createdAt body } }
       reviewThreads(first:100, after:$after){
         pageInfo{ hasNextPage endCursor }
         nodes{ id isResolved isOutdated path line

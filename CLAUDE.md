@@ -141,21 +141,21 @@ and say so in the PR body. Never edit them as a side effect of rewording a body.
 ## Finishing a task
 
 1. `ctest --test-dir build --output-on-failure` is green, and your change has a
-   test that would have failed before it. Run it and read the output before
-   reporting anything complete — "it should pass" is not this. For a bug fix,
-   write the failing test first and commit it before the fix.
+   test that would have failed before it — run it and read the output before
+   reporting complete. For a bug fix, commit the failing test before the fix.
 2. **Run `/code-review` on your own branch** and put the findings in the PR body.
-   This is required, not optional — it is what makes a human review tractable.
-   [REVIEW.md](REVIEW.md) is the policy it follows: three passes, what counts as
-   Important rather than a Nit, and what not to report at all.
-3. Any issue your findings invalidated is edited, and the PR body says which and
-   why.
+   Required, not optional — it is what makes a human review tractable, and
+   [REVIEW.md](REVIEW.md) is the policy it follows.
+3. Any issue your findings invalidated is edited; the PR body says which and why.
 4. Open a PR with `Closes #N` for your issue. `merge-gate` requires a closing
    line and a workflow reads it to unblock dependants, so it is not optional.
-5. `gh pr merge --auto --squash` — that asks GitHub to merge once the required
-   checks pass, and `merge-gate` is one of them, so the rules decide. Never merge
-   directly. A PR touching `.claude/`, `.github/workflows/` or `.github/scripts/`
-   never auto-merges; a person merges those.
+5. `gh pr merge --auto --squash` — it asks GitHub to merge once the required
+   checks pass, `merge-gate` among them, so the rules decide. Never merge
+   directly; `.claude/`, `.github/workflows/` and `.github/scripts/` need a person.
+6. **Answer the independent review** — `./scripts/orca/answer-review.sh "<what
+   you did, or why you did not>"`. Step 5 arms the merge before the review has
+   said anything, so without that answer the branch merges while you are still
+   fixing what it found ([WORKFLOW.md](docs/WORKFLOW.md)).
 
 ## What is watching you
 
