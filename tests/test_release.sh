@@ -206,6 +206,17 @@ phase_ci() {
   # --- it builds what it ships ---
   grep -q 'container: devkitpro/devkita64' <<<"$job" ||
     fail "the release job does not run in the devkitPro container"
+
+  # ...and a container's default shell is `sh -e`, not bash. Every `set -euo
+  # pipefail` in this job died on `set: Illegal option -o pipefail` before
+  # running a word of what followed, and nothing found out for as long as the
+  # project had no tag: reaching this job needs a `v*` tag whose three
+  # dependencies all pass, so the first tag ever cut here is what found it.
+  if grep -q 'set -euo pipefail' <<<"$job"; then
+    grep -q 'shell: bash' <<<"$job" ||
+      fail "the release job runs in a container and uses 'set -o pipefail', but never asks for bash -- dash has no pipefail"
+  fi
+
   local target
   for target in sysmodule overlay tlsprobe; do
     grep -q -- "make -C $target" <<<"$job" || fail "the release job does not build $target"
