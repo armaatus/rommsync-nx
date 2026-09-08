@@ -32,6 +32,8 @@ that claims more than this.
     ./.claude/hooks/guard.py --selftest
 """
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -637,6 +639,39 @@ def check_path(path):
     return 0
 
 
+def _payload_cwd(payload):
+    """Where this Bash call starts, as a prefix relative to the repo root.
+
+    A `cd` is tracked within one command string, but Claude Code's shell keeps
+    its directory between tool calls: `cd .claude/hooks` in one call writes
+    nothing and is allowed, and `cat > guard.py` in the next arrived with no
+    prefix at all. The payload carries the directory it will run in, so the
+    second call can be judged the way the first would have been.
+
+    Same rule as everywhere else here: anything that cannot be established is
+    no prefix rather than a guessed one. A cwd outside the repo yields nothing,
+    because every marker is relative to the root and a path outside it is not
+    ours to judge.
+    """
+    cwd = payload.get("cwd")
+    # Absolute, or it is not the answer this claims to be: a relative or
+    # foreign-looking cwd resolves against wherever the hook happens to run,
+    # which is a guessed prefix wearing a real one's clothes.
+    if not isinstance(cwd, str) or not os.path.isabs(cwd):
+        return ""
+    # After the cheap checks: every Bash call reaches here, and this shells out.
+    root = _repo_root()
+    if not root:
+        return ""
+    try:
+        rel = os.path.relpath(os.path.realpath(cwd), os.path.realpath(root))
+    except (OSError, ValueError):
+        return ""
+    if rel == os.curdir or rel.startswith(os.pardir):
+        return ""
+    return rel + "/"
+
+
 def main(payload):
     tool = payload.get("tool_name") or ""
     tool_input = payload.get("tool_input") or {}
@@ -650,7 +685,7 @@ def main(payload):
                 "cannot tell whether it is allowed. Refusing rather than allowing an "
                 "unexamined command."
             )
-        return check_bash(command)
+        return check_bash(command, _payload_cwd(payload))
 
     # NotebookEdit names its target notebook_path, not file_path. Reading only
     # file_path is how a matcher ends up promising coverage it does not have.
@@ -763,17 +798,49 @@ def _stateful_checks():
     saved = (STOP_FILE, OWNED_DIR)
     failures = 0
 
-    def expect(want, tool_input, what, tool="Bash"):
+    def expect(want, tool_input, what, tool="Bash", because=None, cwd=None):
+        """Drive one payload and judge the answer.
+
+        `because` is a substring of the refusal, and the reason it exists is
+        that exit 2 on its own is not proof: the guard also exits 2 for a
+        payload it cannot read. Without it, a refactor that made these payloads
+        unreadable -- or that moved a deny into the wrong branch -- would keep
+        every assertion here green for a reason nobody intended. This carries
+        the check the fleet-gate assertions had in evals/lint.sh before they
+        moved here, which the move had dropped.
+        """
         nonlocal failures
         global _stateful_ran
         _stateful_ran += 1
+        # An allowed call writes no reason, so a `because` on one could never
+        # hold. Catching it here rather than letting it fail every run.
+        assert not (because and want == 0), "because= needs a refusal to read"
+        payload = {"tool_name": tool, "tool_input": tool_input}
+        if cwd is not None:
+            payload["cwd"] = cwd
+        said = io.StringIO()
         try:
-            main({"tool_name": tool, "tool_input": tool_input})
+            with contextlib.redirect_stderr(said):
+                main(payload)
             got = 0
         except SystemExit as exc:
             got = exc.code
+        why = said.getvalue()
         if got != want:
-            print(f"FAIL: {what} (expected exit {want}, got {got})", file=sys.stderr)
+            # With the reason, because that is what a false block looks like
+            # from here: capturing stderr to match it must not also swallow it.
+            detail = f" -- {why.strip()}" if why.strip() else ""
+            print(
+                f"FAIL: {what} (expected exit {want}, got {got}){detail}",
+                file=sys.stderr,
+            )
+            failures += 1
+        elif because and because not in why:
+            print(
+                f"FAIL: {what} (exit {got} for the wrong reason: "
+                f"{because!r} not in {why.strip()!r})",
+                file=sys.stderr,
+            )
             failures += 1
         else:
             print(f"  ok: {what}")
@@ -825,7 +892,8 @@ def _stateful_checks():
                 expect(0, {"command": "git push origin HEAD"},
                        "...and lifts once the review is recorded")
                 expect(2, {"file_path": os.path.join(root, HOOK_REL)},
-                       "a fleet worktree cannot rewrite its own guards", tool="Edit")
+                       "a fleet worktree cannot rewrite its own guards", tool="Edit",
+                       because="enforcement layer")
                 expect(0, {"file_path": os.path.join(root, ".claude/skills/x/SKILL.md")},
                        "...but skills stay advisory even there", tool="Edit")
 
@@ -837,11 +905,17 @@ def _stateful_checks():
                 # them is itself a change to the enforcement layer, which never
                 # auto-merges -- parked in lint.sh they could be removed by a
                 # PR that merged itself.
+                # `because` on each, because exit 2 alone would also be
+                # satisfied by the secrets branch: settings.local.json is
+                # gitignored and holds permission rules, so it is one plausible
+                # edit away from being denied as a secret instead. That would
+                # keep these green while making the file unwritable in a
+                # hand-opened worktree too, where it has to stay editable.
                 for rel in (SETTINGS_REL, LOCAL_SETTINGS_REL):
                     expect(2, {"file_path": os.path.join(root, rel)},
-                           f"...nor {rel}", tool="Edit")
+                           f"...nor {rel}", tool="Edit", because="enforcement layer")
                     expect(2, {"command": "echo x > " + rel},
-                           f"...nor {rel} from the shell")
+                           f"...nor {rel} from the shell", because="enforcement layer")
 
                 # ...and the same three through a path a `cd` has shortened,
                 # which is the whole of #139: the marker's own prefix is what
@@ -878,6 +952,34 @@ def _stateful_checks():
                 # changes. Judging it needs the prefix in hand, not the new one.
                 expect(2, {"command": "cd tmp > .claude/hooks/guard.py"},
                        "...nor a redirection attached to the cd itself")
+
+                # The shell keeps its directory between tool calls, so the
+                # prefix has to come from the payload as well as from the line.
+                # `cd .claude/hooks` writes nothing and is allowed; the write
+                # arrives in the next call with no `cd` in front of it at all.
+                expect(2, {"command": "cat > guard.py"},
+                       "...nor a write from a cwd the previous call left behind",
+                       cwd=os.path.join(root, ".claude", "hooks"))
+                expect(2, {"command": "cp /tmp/x ../settings.json"},
+                       "...nor one that climbs out of that cwd",
+                       cwd=os.path.join(root, ".claude", "hooks"))
+                # ...while a cwd that is not itself protected stays ordinary.
+                # `.claude/hooks/` is the wrong place to ask this: the whole
+                # directory is protected, so a note written beside the guard is
+                # blocked too, and rightly.
+                expect(0, {"command": "cat > notes.md"},
+                       "...while a write from an ordinary cwd is untouched",
+                       cwd=os.path.join(root, "server"))
+                expect(0, {"command": "cat > guard.py"},
+                       "...and a cwd outside the repo is not ours to judge",
+                       cwd="/tmp")
+
+                # Exit 2 is not proof on its own: an unreadable payload exits 2
+                # too. These pin the refusal to the branch that should produce
+                # it -- the check evals/lint.sh had before the move.
+                expect(2, {"command": "cd .claude && cp /tmp/x hooks/guard.py"},
+                       "...and the refusal names the enforcement layer",
+                       because="enforcement layer")
             finally:
                 if os.path.exists(marker):
                     os.remove(marker)
