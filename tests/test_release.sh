@@ -207,13 +207,19 @@ phase_ci() {
   grep -q 'container: devkitpro/devkita64' <<<"$job" ||
     fail "the release job does not run in the devkitPro container"
 
-  # ...and a container's default shell is `sh -e`, not bash. Every `set -euo
-  # pipefail` in this job died on `set: Illegal option -o pipefail` before
-  # running a word of what followed, and nothing found out for as long as the
-  # project had no tag: reaching this job needs a `v*` tag whose three
-  # dependencies all pass, so the first tag ever cut here is what found it.
+  # ...and a container's default shell is `sh -e`, not bash. Seven of this job's
+  # twelve run steps open with `set -euo pipefail`, and each died on `set:
+  # Illegal option -o pipefail` before running a word of what followed. Nothing
+  # found out for as long as the project had no tag: reaching this job needs a
+  # `v*` tag whose three dependencies all pass, so the first tag ever cut here
+  # is what found it.
+  #
+  # Comments are stripped before the match on purpose. Grepping the job's whole
+  # text would be satisfied by a comment mentioning the setting -- including
+  # the one in ci.yml explaining why it is there, which would leave this green
+  # over a job that had lost it.
   if grep -q 'set -euo pipefail' <<<"$job"; then
-    grep -q 'shell: bash' <<<"$job" ||
+    grep -v '^[[:space:]]*#' <<<"$job" | grep -q '^[[:space:]]*shell: bash' ||
       fail "the release job runs in a container and uses 'set -o pipefail', but never asks for bash -- dash has no pipefail"
   fi
 
