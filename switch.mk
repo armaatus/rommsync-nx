@@ -290,7 +290,7 @@ $(BUILD): $(GENERATED)
 # and build nothing.
 $(VERSION_HEADER): $(ROMMSYNC_ROOT)/VERSION $(ROMMSYNC_ROOT)/core/include/rommsync/version.hpp.in
 	@mkdir -p $(dir $@)
-	@sed 's/@PROJECT_VERSION@/$(ROMMSYNC_VERSION)/g' \
+	@sed 's/@ROMMSYNC_VERSION@/$(ROMMSYNC_VERSION)/g' \
 		$(ROMMSYNC_ROOT)/core/include/rommsync/version.hpp.in > $@
 	@echo generated ... $(notdir $@)
 
