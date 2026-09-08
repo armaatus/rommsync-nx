@@ -15,6 +15,13 @@ add_library(rommsync::core ALIAS rommsync_core)
 target_include_directories(rommsync_core PUBLIC include)
 target_compile_features(rommsync_core PUBLIC cxx_std_20)
 
+# The header carries the version the VERSION file holds, suffix and all --
+# `1.0.0-rc1`, not the `1.0.0` that `project()` was given. switch.mk seds the
+# same placeholder with the same full string (switch.mk:293), so a host binary
+# and a Switch one report one version between them. Substituting PROJECT_VERSION
+# here would drop the suffix on the host side only, and nothing tests both sides
+# against each other.
+set(PROJECT_VERSION "${ROMMSYNC_VERSION}")
 configure_file(
   "${CMAKE_CURRENT_SOURCE_DIR}/include/rommsync/version.hpp.in"
   "${CMAKE_CURRENT_BINARY_DIR}/generated/rommsync/version.hpp"

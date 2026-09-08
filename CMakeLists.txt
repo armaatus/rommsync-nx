@@ -24,8 +24,18 @@ string(STRIP "${ROMMSYNC_VERSION}" ROMMSYNC_VERSION)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
 
+# `project(VERSION)` takes numbers and nothing else: `1.0.0-rc1` is rejected
+# outright, which fails configure and so fails every build and every test.
+# docs/DEVELOPMENT.md documents an rc as an ordinary thing to cut, so the suffix
+# is stripped for CMake's own use and kept for ours -- the numbers go to
+# `project()`, and ROMMSYNC_VERSION stays the string the VERSION file holds.
+string(REGEX MATCH "^[0-9]+(\\.[0-9]+)*" ROMMSYNC_VERSION_NUMERIC "${ROMMSYNC_VERSION}")
+if(NOT ROMMSYNC_VERSION_NUMERIC)
+  message(FATAL_ERROR "VERSION must start with a number, got '${ROMMSYNC_VERSION}'")
+endif()
+
 project(rommsync-nx
-  VERSION ${ROMMSYNC_VERSION}
+  VERSION ${ROMMSYNC_VERSION_NUMERIC}
   DESCRIPTION "On-device RomM sync for the modded Nintendo Switch"
   LANGUAGES CXX)
 

@@ -62,6 +62,11 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 # --- unit tests: no external services ---------------------------------------
 add_executable(test_version test_version.cpp)
 target_link_libraries(test_version PRIVATE rommsync::core)
+# From the VERSION file, not from CMake's PROJECT_VERSION: that is the numeric
+# part only, so comparing the generated header against it would have the build
+# agreeing with itself and would miss a dropped `-rc1` entirely.
+target_compile_definitions(test_version PRIVATE
+  ROMMSYNC_VERSION_EXPECTED="${ROMMSYNC_VERSION}")
 add_test(NAME core.version COMMAND test_version)
 
 # The log: the one file this client writes on the card. What these hold it to is
