@@ -502,10 +502,18 @@ phase_release() {
   local dir; dir="$(scratch)"
   local published='{"isDraft":false,"assets":[{"name":"rommsync-nx-1.0.0.zip"},{"name":"SHA256SUMS"}]}'
 
-  # Today's repository: no tag at all. This is the branch that runs in the real
-  # checkout, so it is the one the PR body quotes.
+  # A repository with no tag at all -- in a FIXTURE, not in this checkout. It
+  # used to ask the real one, on the reasoning that that was the branch a
+  # reader would hit. True exactly until a tag existed: cutting v1.0.0-rc1
+  # turned "no v1 tag in this repository" into a claim about a repository that
+  # has one, and this scenario failed the run that was meant to publish it. A
+  # test asserting today's facts about its own checkout expires the moment the
+  # work it guards succeeds.
+  release_repo "$dir/untagged" 1.0.0 "" ""
   local out
-  out="$("$GATE" --dry --build-dir "$build" 2>&1)"
+  out="$(cd "$dir/untagged" && PATH="$dir/untagged/bin:$PATH" \
+         ROMMSYNC_GATE_TRANSCRIPT=/dev/null \
+         "$dir/untagged/scripts/v1-gate.sh" --dry --build-dir "$build" 2>&1)"
   echo "$out" | grep -q "^\[FAIL\] release " \
     || fail "with no v1 tag, the release row is not failing:
 $out"
