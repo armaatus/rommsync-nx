@@ -191,21 +191,17 @@ if set(g.SELF_PROTECTED) != want:
     fail "SELF_PROTECTED is now $sp_drift; give each entry an assertion in guard.py's _stateful_checks and update this list"
   fi
 
-  # guard.py decides ownership from `git rev-parse --show-toplevel`, and with no
-  # repo root it correctly allows the write. Without this the six assertions
-  # below would go red claiming the fleet gate leaked, when the real cause is
-  # git -- dubious-ownership inside a container, a source export with no .git,
-  # no git on PATH. `_stateful_checks` guards the same dependency with `if root:`.
-  if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
-    fail "git cannot resolve this checkout, so the fleet gate cannot be exercised"
-  else
-    for target in .claude/hooks/guard.py .claude/settings.json .claude/settings.local.json; do
-      assert_fleet_blocks "$(tool_call Edit file_path "$REPO_ROOT/$target")" \
-        "a fleet worktree cannot edit $target"
-      assert_fleet_blocks "$(tool_call Bash command "echo x > $target")" \
-        "...nor rewrite $target from the shell"
-    done
-  fi
+  # The six fleet-gate assertions that stood here are in guard.py's own
+  # `_stateful_checks` now (#98, #139): parked here they could be deleted by a
+  # PR that merged itself, and there they are part of the enforcement layer,
+  # which never auto-merges. `--selftest` above is what runs them, and it fails
+  # this script if any of them go red.
+  #
+  # Nothing is left behind on purpose. The first version of this move deleted
+  # the two helpers and kept their call sites, so every run printed twelve
+  # `command not found` lines to stderr, recorded no failure, and still said
+  # "agent configuration is well-formed" -- the silent-success this file's own
+  # header exists to warn about.
 
   rm -rf "$guard_tmp"
 else
