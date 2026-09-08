@@ -416,7 +416,11 @@ bounded() {
 # `main`, and a published release carrying both assets. The second half needs
 # the network, so it degrades to "unknown" rather than to "true".
 repo_release() {
-  local tags tag version ok=0
+  # `unknown` is a question this checkout could not ask, and it holds the row.
+  # `ok=1` is a question asked and answered against the repository, and it fails
+  # it. Keeping them apart is the whole difference between "we could not look"
+  # and "we looked and it is wrong".
+  local tags tag version ok=0 unknown=0
   tags="$(git -C "$REPO_ROOT" tag --list 'v[1-9]*' 2>/dev/null)"
   if [ -z "$tags" ]; then
     echo "    no v1 tag in this repository (git tag --list 'v[1-9]*' is empty)"
@@ -465,20 +469,34 @@ repo_release() {
   # Unknown stays unknown, the way it does everywhere else here. The row still
   # does not pass -- it cannot, without checking -- but it says which question
   # it could not answer, and names the fetch depth that would let it.
-  local main_ref=""
+  # EITHER ref will do, as before: a tag can be on local `main` before it is
+  # pushed, or on `origin/main` in a checkout with no local branch, and both are
+  # reachable from main in the sense ci.yml means. Stopping at the first ref
+  # that merely EXISTS would fail a tag on a local main whose origin/main is one
+  # fetch behind -- a false accusation, which is what this whole row must not
+  # make.
+  local present=0 reachable=0 candidate
   for candidate in origin/main main; do
-    if git -C "$REPO_ROOT" rev-parse --verify --quiet "$candidate" >/dev/null 2>&1; then
-      main_ref="$candidate"
+    git -C "$REPO_ROOT" rev-parse --verify --quiet "$candidate" >/dev/null 2>&1 || continue
+    present=1
+    if git -C "$REPO_ROOT" merge-base --is-ancestor "$tag" "$candidate" 2>/dev/null; then
+      reachable=1
       break
     fi
   done
-  if [ -z "$main_ref" ]; then
-    echo "    no main to compare against, so whether $tag is reachable from it is"
-    echo "    unknown -- a tag-ref checkout has no branches (actions/checkout"
+  if [ "$present" -eq 0 ]; then
+    # Not "unreachable": nothing here to reach it from. A tag-ref checkout has
+    # no branches at all -- actions/checkout fetches the ref it was asked for --
+    # so `is-ancestor` against an absent main used to answer "not reachable"
+    # about a tag sitting on main's own tip. Held rather than failed, the way
+    # every other unknown in this function is held: "we could not ask" and "we
+    # asked and the answer is no" are different answers.
+    echo "    no main in this checkout, so whether $tag is reachable from it was"
+    echo "    not asked -- a tag-ref checkout has no branches (actions/checkout"
     echo "    defaults to fetch-depth 1; 0 fetches main too)"
-    ok=1
-  elif ! git -C "$REPO_ROOT" merge-base --is-ancestor "$tag" "$main_ref" 2>/dev/null; then
-    echo "    $tag is not reachable from $main_ref -- ci.yml refuses to publish it"
+    unknown=1
+  elif [ "$reachable" -eq 0 ]; then
+    echo "    $tag is not reachable from main -- ci.yml refuses to publish it"
     ok=1
   fi
   if [ "$tag" != "v$version" ]; then
@@ -531,6 +549,11 @@ repo_release() {
     esac
   fi
 
+  if [ "$ok" -eq 0 ] && [ "$unknown" -ne 0 ]; then
+    # Nothing is wrong that this checkout could see, and one thing it could not
+    # look at. That is held, not passed and not failed.
+    return 2
+  fi
   [ "$ok" -eq 0 ] && echo "    $tag is published, on main, and agrees with VERSION"
   return "$ok"
 }

@@ -528,6 +528,28 @@ $out" ;;
   release_says "$dir/published" "is published, on main, and agrees with VERSION" PASS \
     "a v1 tag on main with a published release carrying both assets holds" "$build"
 
+  # A tag-ref checkout: the tag is there, no branch is. This is what CI hands
+  # the gate on a tag push, and it is what reported a tag on main's own tip as
+  # unreachable. The question was never asked, so the row holds and names the
+  # depth that would let it be asked -- it does not accuse the repository.
+  release_repo "$dir/branchless" 1.0.0 v1.0.0 \
+    '{"isDraft":false,"assets":[{"name":"rommsync-nx-1.0.0.zip"},{"name":"SHA256SUMS"}]}'
+  git -C "$dir/branchless" checkout --quiet --detach v1.0.0
+  git -C "$dir/branchless" branch -D main >/dev/null 2>&1
+  release_says "$dir/branchless" "no main in this checkout" HELD \
+    "a checkout with no branch holds the row rather than blaming the tag" "$build"
+
+  # ...and a local main that has the tag while origin/main is a fetch behind.
+  # Checking only the first ref that EXISTS would call this unreachable, which
+  # is the false accusation the row must never make.
+  release_repo "$dir/behind" 1.0.0 v1.0.0 \
+    '{"isDraft":false,"assets":[{"name":"rommsync-nx-1.0.0.zip"},{"name":"SHA256SUMS"}]}'
+  git -C "$dir/behind" update-ref refs/remotes/origin/main "$(git -C "$dir/behind" rev-parse v1.0.0^{commit})~0"
+  git -C "$dir/behind" -c user.email=t@example.invalid -c user.name=t \
+      commit --quiet --allow-empty -m "main moves past the tag" >/dev/null 2>&1
+  release_says "$dir/behind" "is published, on main, and agrees with VERSION" PASS \
+    "a tag on a main that origin/main has not caught up with is still on main" "$build"
+
   release_repo "$dir/draft" 1.0.0 v1.0.0 \
     '{"isDraft":true,"assets":[{"name":"rommsync-nx-1.0.0.zip"},{"name":"SHA256SUMS"}]}'
   release_says "$dir/draft" "still a DRAFT" FAIL \
