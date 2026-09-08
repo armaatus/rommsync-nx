@@ -5,10 +5,10 @@
 namespace rommsync {
 
 /// Project version, single-sourced from the VERSION file at the repo root.
-inline constexpr const char* kVersion = "@PROJECT_VERSION@";
+inline constexpr const char* kVersion = "@ROMMSYNC_VERSION@";
 
 /// User agent sent on every request to RomM. RomM records the client string, so
 /// keeping it stable and identifiable matters for server-side debugging.
-inline constexpr const char* kUserAgent = "rommsync-nx/@PROJECT_VERSION@";
+inline constexpr const char* kUserAgent = "rommsync-nx/@ROMMSYNC_VERSION@";
 
 }  // namespace rommsync

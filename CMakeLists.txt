@@ -30,7 +30,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
 # is stripped for CMake's own use and kept for ours -- the numbers go to
 # `project()`, and ROMMSYNC_VERSION stays the string the VERSION file holds.
 string(REGEX MATCH "^[0-9]+(\\.[0-9]+)*" ROMMSYNC_VERSION_NUMERIC "${ROMMSYNC_VERSION}")
-if(NOT ROMMSYNC_VERSION_NUMERIC)
+if(ROMMSYNC_VERSION_NUMERIC STREQUAL "")
   message(FATAL_ERROR "VERSION must start with a number, got '${ROMMSYNC_VERSION}'")
 endif()
 
