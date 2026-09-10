@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include "power.hpp"
@@ -95,6 +96,28 @@ class Scripted final : public power::Module {
   std::deque<power::State> pending_;
   std::vector<power::State> acknowledged_;
   bool stopped_ = false;
+};
+
+/// The watcher on a thread of its own, stopped and joined by the destructor.
+///
+/// What `main.cpp` does with a libnx `Thread` (`power_psc.cpp`) and what a
+/// scenario here needs a `std::thread` for -- `power::Watcher` owns no thread,
+/// deliberately, because the console's stack size is not `std::thread`'s to
+/// choose. Both binaries that drive a watcher want exactly these five lines.
+class Running {
+ public:
+  Running(Scripted& module, power::Sink& sink)
+      : module_(module), watcher_(module, sink), thread_([this] { watcher_.Run(); }) {}
+
+  ~Running() {
+    module_.Stop();
+    thread_.join();
+  }
+
+ private:
+  Scripted& module_;
+  power::Watcher watcher_;
+  std::thread thread_;
 };
 
 }  // namespace power_fake

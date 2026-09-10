@@ -1098,8 +1098,10 @@ void SdEngine::Quiesce() {
   // inside `download::Drain` and not inside `sync::RunTick`, so no save byte and
   // no rom byte is on its way to the card. A worker that was never started has
   // nothing to wait for.
-  const bool parked = quiesced_.wait_until(lock, deadline,
-                                           [this] { return worker_parked_ || !worker_live_; });
+  const bool parked = quiesced_.wait_until(lock, deadline, [this] {
+    return (worker_parked_ || !worker_live_) && !pairing_busy_;
+  });
+  const bool pairing = !pairing_busy_;
   lock.unlock();
 
   // The other writer of a save file: a restore, on the IPC thread, which takes
@@ -1117,18 +1119,27 @@ void SdEngine::Quiesce() {
     save_write_mutex_.unlock();
   }
 
-  if (parked && quiet) {
-    return;
+  if (!parked || !quiet) {
+    // Said out loud, because the acknowledgement goes out anyway and this is the
+    // only way anyone finds out that it went out early. Refusing to acknowledge
+    // is not the alternative: that is a console that never finishes the
+    // transition, with no fatal and no crash report to show for it
+    // (sys-con#155). Before the sink goes, so it reaches the card rather than
+    // only the tail.
+    log::Warn(log::Event::kPower,
+              std::string("the console is sleeping and this client is still busy after ") +
+                  std::to_string(kQuiesceBudget.count()) + "ms" +
+                  (parked ? "" : (pairing ? "; the worker has not come back"
+                                          : "; a pairing request has not come back")) +
+                  (quiet ? "" : "; a save write is still in flight"));
   }
-  // Said out loud, because the acknowledgement goes out anyway and this is the
-  // only way anyone finds out that it went out early. Refusing to acknowledge is
-  // not the alternative: that is a console that never finishes the transition,
-  // with no fatal and no crash report to show for it (sys-con#155).
-  log::Warn(log::Event::kPower,
-            std::string("the console is sleeping and this client is still busy after ") +
-                std::to_string(kQuiesceBudget.count()) + "ms" +
-                (parked ? "" : "; the worker has not come back") +
-                (quiet ? "" : "; a save write is still in flight"));
+
+  // **Last, and it is the piece parking the worker cannot buy.** A `log::Write`
+  // from any thread opens the log file, appends and closes it, so a single line
+  // after this point is `fsp-srv` I/O on a card this process has just told PSC
+  // it is finished with (`log::SetSinkEnabled`). The tail stays, so `GetLog`
+  // still answers everything a sleeping console had to say.
+  log::SetSinkEnabled(false);
 }
 
 void SdEngine::Resume() {
@@ -1138,15 +1149,21 @@ void SdEngine::Resume() {
       return;
     }
     suspended_ = false;
-    // The queue is worth another look immediately: the drain that was cancelled
-    // at `SleepReady` left its entry `kQueued` beside a `.part`, and whatever
-    // backoff the cancellation wrote is about a sleep rather than about a server
-    // (`RunOneDrain` pacing). Not `WakeDownloads()`, which takes `mutex_` this
-    // scope is already holding.
+    // The card is back, so the log file is too -- `MinimumAwake` and not
+    // `EssentialServicesAwake`, which is the state `power::Resumes` picks for
+    // exactly this reason. `erpt` turns its own filesystem access back on at the
+    // same point.
+    log::SetSinkEnabled(true);
+    // Wake the worker, and **nothing else**.
+    //
+    // Not `WakeDownloads`'s clear of `download_due_`/`download_backoff_`, which
+    // is the tempting mistake: a drain cancelled by the suspend already ends
+    // `DrainOutcome::kCanceled` and `RunOneDrain` clears the pacing for it
+    // there, so clearing again here would only ever discard a backoff a *server*
+    // earned -- and a console that woke up straight onto a rom endpoint that has
+    // been answering 500 for an hour is the loop `kDownloadRetryBackoff` exists
+    // to prevent.
     ++wakes_;
-    ++download_wakes_;
-    download_due_ = std::chrono::steady_clock::time_point{};
-    download_backoff_ = std::chrono::milliseconds{0};
     // **Nothing restamps the schedule**, deliberately. `sync::Scheduler` states
     // its interval on the wall clock precisely so that the hours a suspend hid
     // are hours elapsed: an eleven-hour sleep is one interval due, not
@@ -1832,7 +1849,31 @@ bool SdEngine::AwaitNextPoll(const std::shared_ptr<PairingAttempt>& attempt) {
   const std::chrono::steady_clock::time_point due = attempt->session.next_poll_at();
   std::unique_lock<std::mutex> lock(mutex_);
   wake_.wait_until(lock, due, [this, &attempt] { return stopping_ || attempt_ != attempt; });
+  // ...and then, if the console has gone to sleep, until it comes back (M9-4,
+  // #208). This is the *only* thing a suspend can do about this thread: a poll
+  // already in flight cannot be cancelled -- `http::HttpClient` has no way to be
+  // interrupted from outside a call -- so what is left is to refuse to start the
+  // next one. Without it a sleeping console goes on asking RomM for a token over
+  // a socket the transition is about to take away.
+  //
+  // The code the user is looking at may well expire while the console sleeps.
+  // That is `auth::PairingSession`'s answer to give, and it gives the same one
+  // it would have given had the poll gone out and been refused.
+  wake_.wait(lock, [this, &attempt] {
+    return stopping_ || attempt_ != attempt || !suspended_;
+  });
   return !stopping_ && attempt_ == attempt;
+}
+
+void SdEngine::SetPairingBusy(bool busy) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pairing_busy_ = busy;
+  }
+  // Only a `Quiesce` waits on this, and only for the false edge -- but notifying
+  // on both costs one wake-up per pairing poll on a console that is not
+  // sleeping, which is a few over the life of an attempt.
+  quiesced_.notify_all();
 }
 
 void SdEngine::DrivePairing() {
@@ -1855,9 +1896,18 @@ void SdEngine::DrivePairing() {
 
     // The request `StartPairing` refused to wait for. Everything from here down
     // is off the IPC thread, so it may take as long as `request_timeout`.
+    //
+    // Bracketed by `SetPairingBusy` since M9-4 (#208): a `Quiesce` may not
+    // acknowledge a sleep with a request in flight on *any* thread, and this is
+    // the one thread whose request it cannot stop. `AwaitNextPoll` is what stops
+    // the *next* one going out.
+    SetPairingBusy(true);
     auth::PairingState state = attempt->session.Begin();
+    SetPairingBusy(false);
     while (!auth::IsTerminal(state) && AwaitNextPoll(attempt)) {
+      SetPairingBusy(true);
       state = attempt->session.Poll();
+      SetPairingBusy(false);
     }
     if (state != auth::PairingState::kApproved) {
       // Denied, expired, failed -- or superseded, in which case the attempt that
@@ -1867,7 +1917,12 @@ void SdEngine::DrivePairing() {
     }
     const auth::DeviceTokenResponse* granted = attempt->session.token();
     if (granted != nullptr) {
+      // Busy for this too: it is two card writes, and a sleep acknowledged in
+      // the middle of them is the transition taking `fsp-srv` away between
+      // `token.dat` and `auth.json`.
+      SetPairingBusy(true);
       CommitGrant(attempt, *granted);
+      SetPairingBusy(false);
     }
   }
 }

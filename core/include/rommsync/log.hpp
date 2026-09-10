@@ -261,6 +261,35 @@ void SetSink(Sink* sink);
 /// The installed sink, or null. For a test that wants to put its own back.
 Sink* GetSink();
 
+/// Stop and start writing to the sink, keeping the tail either way (M9-4, #208).
+///
+/// **The console going to sleep is what this is for.** A sink writes to the SD
+/// card -- `FileSink` opens the file, appends and closes it, once per line -- and
+/// between `SleepReady` and the next `MinimumAwake` this process may not touch
+/// `fsp-srv` at all: it has told PSC that it is finished with the card, and the
+/// services behind it are going down. A log line written in that window is the
+/// one piece of card I/O that no amount of parking the worker prevents, because
+/// every thread writes through here.
+///
+/// Atmosphere's own `erpt` does exactly this and nothing more elaborate:
+/// `Stream::EnableFsAccess(false)` on the way down and `true` at `MinimumAwake`
+/// (`erpt/srv/erpt_srv_service.cpp`).
+///
+/// **Nothing is lost that `GetLog` could show.** The tail is in memory and is
+/// filled whether a sink is enabled or not, so the overlay reads the lines a
+/// sleeping console wrote exactly as it reads any other. What they miss is the
+/// *file*, which is the trade the card is owed -- and a sleeping console writes
+/// very little, because the whole point of the suspend is that it has stopped.
+///
+/// Idempotent, and safe from any thread. Not the same as `SetSink(nullptr)`: the
+/// sink is remembered, so whoever installed it is still the only caller who has
+/// to know what it is.
+void SetSinkEnabled(bool enabled);
+
+/// Whether the sink is being written to. False between a `SetSinkEnabled(false)`
+/// and the matching `true`, whether or not a sink was ever installed.
+bool SinkEnabled();
+
 /// Write one line: `<ordinal> <level> <event> <detail>`.
 ///
 /// `detail` may be empty, in which case the line is the first three fields. It

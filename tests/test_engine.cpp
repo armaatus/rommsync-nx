@@ -1462,27 +1462,6 @@ void RestoreDuringSync(checks::Checks& c) {
 
 // --- M9-4 (#208): the console goes to sleep ----------------------------------
 
-/// The watcher on a thread of its own, stopped and joined by the destructor.
-///
-/// What `main.cpp` does with a libnx `Thread` and what `test_power` does with a
-/// `std::thread`, in the one place a scenario here needs it (`power.hpp`: the
-/// watcher owns no thread).
-class Asleep {
- public:
-  Asleep(power_fake::Scripted& module, power::Sink& sink)
-      : module_(module), watcher_(module, sink), thread_([this] { watcher_.Run(); }) {}
-
-  ~Asleep() {
-    module_.Stop();
-    thread_.join();
-  }
-
- private:
-  power_fake::Scripted& module_;
-  power::Watcher watcher_;
-  std::thread thread_;
-};
-
 /// M9-4 (#208): hard rule 2 meeting sleep.
 ///
 /// The sysmodule did not know the console had gone to sleep, so a `SleepReady`
@@ -1539,7 +1518,7 @@ void Sleeps(checks::Checks& c) {
            "the worker is inside the tick, holding the lock every save byte is written under");
 
   power_fake::Scripted psc;
-  Asleep asleep(psc, console.engine);
+  power_fake::Running watching(psc, console.engine);
 
   psc.Deliver(power::State::kSleepReady);
   c.Expect(!psc.AwaitAcks(1, std::chrono::milliseconds{300}),
@@ -1601,6 +1580,21 @@ void Sleeps(checks::Checks& c) {
   c.Expect(psc.AwaitAcks(4, std::chrono::seconds{10}),
            "the console can go back to sleep -- a tick cancelled at the first SleepReady did "
            "not take every later tick with it");
+
+  // **And waking does not fire the ticks the console slept through.** Nothing is
+  // due here -- the schedule is parked and the press has been served -- so a
+  // wake that ran anything at all would be one inventing work out of elapsed
+  // time. `sync::Scheduler` states its interval on the wall clock precisely so
+  // that an eleven-hour suspend is one interval due rather than twenty-two
+  // (`scheduler.hpp`), and `Resume` restamps nothing; this is that promise
+  // asserted where PSC meets it rather than one level down.
+  const int before_waking = server.requests();
+  psc.Deliver(power::State::kMinimumAwake);
+  c.Expect(psc.AwaitAcks(5, std::chrono::seconds{10}), "the second wake is answered");
+  std::this_thread::sleep_for(std::chrono::milliseconds{500});
+  c.ExpectEq(server.requests(), before_waking,
+             "and nothing is due, so nothing runs: a wake is not a backlog of the ticks the "
+             "suspend hid");
 }
 
 // --- M7-3: the log docs/TROUBLESHOOTING.md is written against ------------------
@@ -2703,7 +2697,7 @@ int SleepDownload(http::HttpClient& client, const std::string& base) {
            "a transfer is in flight when the console is put to sleep");
 
   power_fake::Scripted psc;
-  Asleep asleep(psc, console.engine);
+  power_fake::Running watching(psc, console.engine);
 
   const std::chrono::steady_clock::time_point slept = std::chrono::steady_clock::now();
   psc.Deliver(power::State::kSleepReady);

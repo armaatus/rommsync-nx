@@ -56,6 +56,7 @@
 #include <utility>
 #include <vector>
 
+#include "power.hpp"
 #include "rommsync/auth.hpp"
 #include "rommsync/auth_gate.hpp"
 #include "rommsync/config.hpp"
@@ -66,7 +67,6 @@
 #include "rommsync/http.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/list_service.hpp"
-#include "power.hpp"
 #include "rommsync/pairing.hpp"
 #include "rommsync/play_sessions.hpp"
 #include "rommsync/scheduler.hpp"
@@ -364,10 +364,15 @@ class SdEngine : public ipc::Engine, public power::Sink {
   ///   * no `download::Drain` is running -- the worker has *returned* from it,
   ///     not merely been asked to stop (M9-5, #197);
   ///   * no `sync::RunTick` is running, and so no save write is in flight;
-  ///   * no restore is writing a save from the IPC thread either.
+  ///   * no restore is writing a save from the IPC thread either;
+  ///   * no pairing poll or commit is in flight on the pairing thread;
+  ///   * nothing more is written to the log **file** until `Resume`.
   ///
   /// The first two are the worker parking, which is what the wait below is for.
-  /// The third is `save_write_mutex_`, which is why that lock is timed.
+  /// The third is `save_write_mutex_`, which is why that lock is timed. The
+  /// fourth is `pairing_busy_`, and the fifth is `log::SetSinkEnabled` -- a
+  /// `log::Write` from any thread opens the log file, so it is the one piece of
+  /// card I/O that parking a thread cannot buy.
   ///
   /// Bounded by `kQuiesceBudget` and never longer, for the reason that constant
   /// gives. Idempotent: PSC sends two sleep states in a row and `power::Watcher`
@@ -677,6 +682,10 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// leaving the entry `kQueued` beside the `.part` it got to, which is what
   /// makes the next attempt a resume rather than a restart.
   void CancelDrainLocked();
+
+  /// Say whether the pairing thread is inside a request or a card write, and
+  /// wake whoever is waiting for it to stop being (`pairing_busy_`).
+  void SetPairingBusy(bool busy);
 
   /// Stop the tick in flight, if there is one. The caller holds `mutex_`.
   ///
@@ -1043,12 +1052,26 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// it waits and cleared when it comes out, both under `mutex_`.
   bool worker_parked_ = false;
 
+  /// Whether the **pairing** thread is inside a request or a card write.
+  ///
+  /// The second thread that talks to a server, and the one no cancel token
+  /// reaches: `http::HttpClient` cannot be interrupted from outside a call and
+  /// `auth::PairingConfig` carries no token to pass in (`DrivePairing` says so
+  /// and says whose job adding one would be). So a sleep cannot *stop* a poll in
+  /// flight -- it can only refuse to start the next one (`AwaitNextPoll`) and
+  /// wait for the one running to come back, which is what this is read for.
+  ///
+  /// Guarded by `mutex_`, set around `Begin`, `Poll` and `CommitGrant`.
+  bool pairing_busy_ = false;
+
   /// How the worker tells `Quiesce` it has parked.
   ///
   /// A condition variable of its own rather than `wake_`, because the two run in
   /// opposite directions: `wake_` is how everything else tells the worker there
   /// is something to do, and this is the worker answering. Sharing one would
   /// wake every parked pairing poll for every state change on this one.
+  ///
+  /// The pairing thread notifies it too, for `pairing_busy_`.
   std::condition_variable quiesced_;
 
   /// The verdict `auth.json` holds, and what a worker consults before calling.

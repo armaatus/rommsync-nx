@@ -53,6 +53,12 @@ SECTIONS = [
     # the code writes, which the `events` phase would refuse without a section
     # to point at.
     "A queued rom never arrives",
+    # M9-4 (#208). Not one of #38's twelve either, and for the same reason: the
+    # sysmodule did not know the console had gone to sleep, so there was no
+    # `power.sleep` to explain. It is the one line of this whole issue a user can
+    # meet, and it needs a section saying that a single one is the client
+    # working rather than a fault to report.
+    "The console slept mid-sync",
     "What to attach to a bug report",
     "What this page cannot tell you yet",
 ]

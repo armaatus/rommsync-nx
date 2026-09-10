@@ -16,7 +16,6 @@
 #include <iostream>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "checks.hpp"
@@ -53,25 +52,6 @@ class Recording final : public power::Sink {
   std::vector<std::string> seen_;
 };
 
-/// The watcher on a thread of its own, stopped and joined by the destructor --
-/// which is what the console does with a libnx `Thread` and what every scenario
-/// here would otherwise repeat (`power.hpp`: the watcher owns no thread).
-class Running {
- public:
-  Running(power_fake::Scripted& module, power::Sink& sink)
-      : module_(module), watcher_(module, sink), thread_([this] { watcher_.Run(); }) {}
-
-  ~Running() {
-    module_.Stop();
-    thread_.join();
-  }
-
- private:
-  power_fake::Scripted& module_;
-  power::Watcher watcher_;
-  std::thread thread_;
-};
-
 /// How long a scenario waits for an acknowledgement that should arrive. Generous
 /// because it is only ever spent on a failing run: a working watcher answers
 /// within the time it takes to wake a thread.
@@ -89,7 +69,7 @@ void States(checks::Checks& c) {
   power_fake::Scripted module;
   Recording sink;
   {
-    Running running(module, sink);
+    power_fake::Running running(module, sink);
     for (const power::State state :
          {power::State::kSleepReady, power::State::kEssentialServicesSleepReady,
           power::State::kEssentialServicesAwake, power::State::kMinimumAwake,
@@ -102,7 +82,8 @@ void States(checks::Checks& c) {
   const std::vector<power::State> acked = module.acknowledged();
   c.ExpectEq(acked.size(), std::size_t{5}, "one acknowledgement per request, and no more");
   if (acked.size() == 5) {
-    c.Expect(acked[0] == power::State::kSleepReady && acked[1] == power::State::kEssentialServicesSleepReady &&
+    c.Expect(acked[0] == power::State::kSleepReady &&
+                 acked[1] == power::State::kEssentialServicesSleepReady &&
                  acked[2] == power::State::kEssentialServicesAwake &&
                  acked[3] == power::State::kMinimumAwake && acked[4] == power::State::kFullAwake,
              "and each one names the state it is for -- `pscPmModuleAcknowledge` carries it "
@@ -181,7 +162,7 @@ void Once(checks::Checks& c) {
   power_fake::Scripted module;
   Held sink;
   {
-    Running running(module, sink);
+    power_fake::Running running(module, sink);
     module.Deliver(power::State::kSleepReady);
     c.Expect(sink.AwaitQuiesce(), "the watcher quiesces the process");
     c.Expect(!module.AwaitAcks(1, std::chrono::milliseconds{200}),

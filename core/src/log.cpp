@@ -22,6 +22,11 @@ namespace {
 struct State {
   std::mutex mutex;
   Sink* sink = nullptr;
+
+  /// Whether the sink is written to at all (M9-4, #208). True until a console
+  /// goes to sleep, when the card is off-limits and the ring is all there is.
+  bool sink_enabled = true;
+
   std::uint64_t written = 0;
   std::deque<Line> ring;
 };
@@ -356,6 +361,18 @@ Sink* GetSink() {
   return state.sink;
 }
 
+void SetSinkEnabled(bool enabled) {
+  State& state = TheLog();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  state.sink_enabled = enabled;
+}
+
+bool SinkEnabled() {
+  State& state = TheLog();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  return state.sink_enabled;
+}
+
 void Write(Level level, Event event, std::string_view detail) {
   std::string line;
   Sink* sink = nullptr;
@@ -387,7 +404,10 @@ void Write(Level level, Event event, std::string_view detail) {
     while (state.ring.size() > kTailLines) {
       state.ring.pop_front();
     }
-    sink = state.sink;
+    // The ring is filled either way; only the *card* is switched off (M9-4,
+    // #208, and `SetSinkEnabled`). Read under the same lock as the sink pointer,
+    // so a suspend landing here cannot let one line through after it.
+    sink = state.sink_enabled ? state.sink : nullptr;
   }
 
   // Outside the lock, deliberately: a sink writes to an SD card, and holding the
