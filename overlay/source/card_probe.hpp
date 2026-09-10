@@ -24,7 +24,7 @@ namespace rommsync::overlay {
 /// The sysmodule's Atmosphère program id, as the directory name under
 /// `atmosphere/contents/`.
 ///
-/// The same value as `title_id` in `sysmodule/sys-rommsync.json`, which is where
+/// The same value as `program_id` in `sysmodule/sys-rommsync.json`, which is where
 /// `scripts/package.sh` reads it from and where it will move from when the id is
 /// confirmed against the installed homebrew set (`sysmodule/README.md`).
 /// `tests/test_package.sh layout` holds the two against each other, because a

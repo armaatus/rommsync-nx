@@ -108,14 +108,19 @@ case "$VERSION" in
   *[[:space:]]*|*/*) die "version '$VERSION' is not usable in a file name" ;;
 esac
 
-# `"title_id"` and not `title_id_range_min`/`_max`, which sit beside it with the
-# same value today and are a different setting. Anchored on the quoted key for
-# that reason.
+# `"program_id"` and not `program_id_range_min`/`_max`, which sit beside it with
+# the same value today and are a different setting. Anchored on the quoted key
+# for that reason. The key was `title_id` until M9-3 (#196): npdmtool accepts
+# both, looks for `program_id` first, and prints a "Failed to get program_id"
+# line into every build when it has to fall back. `TITLE_ID` and the `@TITLE_ID@`
+# the templates under packaging/ carry keep their name -- they are the
+# substitution token and not the config key, and renaming a token means renaming
+# it in every file that holds one.
 CONFIG_JSON="$REPO_ROOT/sysmodule/sys-rommsync.json"
-[ -f "$CONFIG_JSON" ] || die "no $CONFIG_JSON to read the title id from"
-TITLE_ID="$(sed -n 's/.*"title_id"[[:space:]]*:[[:space:]]*"0[xX]\([0-9A-Fa-f]*\)".*/\1/p' \
+[ -f "$CONFIG_JSON" ] || die "no $CONFIG_JSON to read the program id from"
+TITLE_ID="$(sed -n 's/.*"program_id"[[:space:]]*:[[:space:]]*"0[xX]\([0-9A-Fa-f]*\)".*/\1/p' \
             "$CONFIG_JSON" | head -n 1 | tr '[:lower:]' '[:upper:]')"
-[ -n "$TITLE_ID" ] || die "no \"title_id\" in $CONFIG_JSON"
+[ -n "$TITLE_ID" ] || die "no \"program_id\" in $CONFIG_JSON"
 # The name ovl-sysmodules draws in its list, read from the same file rather than
 # typed here for the same reason the title id is: one place to change it.
 MODULE_NAME="$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \

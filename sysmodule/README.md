@@ -19,7 +19,7 @@ for aarch64 — CI runs it on every push (`switch-build` in
 switch` runs the same build locally when the `devkitpro/devkita64` image is
 pulled.
 
-npdmtool prints a dozen `Failed to get <field> (field not present)` lines while
+npdmtool prints a run of `Failed to get <field> (field not present)` lines while
 packaging. That is its normal chatter about optional NPDM fields — devkitPro's
 own template produces the same output — with one line worth reading literally:
 it says that about `process_category`, which `sys-rommsync.json` *does* set.
@@ -27,6 +27,35 @@ This npdmtool ignores the key; the packaged NPDM is byte-identical with it set
 to 0, set to 1, or deleted. The value we want is the default, so nothing is
 wrong today, and the key stays for parity with devkitPro's template — but do not
 read that one line as noise if the process category ever has to change.
+
+Three of those lines used to name `program_id`, `program_id_range_min` and
+`program_id_range_max`. The config spelled them `title_id*`, npdmtool's
+deprecated aliases, and it looks for the new names first and falls back — so the
+build reported a missing field it then found under another name. M9-3 (#196)
+renamed the keys; the packaged NPDM is unchanged.
+
+## What the NPDM may be asked for
+
+`sys-rommsync.json` is npdmtool's *input*. What the kernel enforces is the NPDM
+inside `sys-rommsync.nsp`, and what the process actually does is whatever
+survived `--gc-sections` in `sys-rommsync.elf` — so the interesting question is
+about two built files and not about this tree. An SVC the NPDM does not grant is
+not a soft failure: the kernel refuses it and the process dies.
+
+[`../scripts/npdm-check.py`](../scripts/npdm-check.py) is what asks. It parses
+the NPDM out of the `.nsp`, scans the linked ELF's executable sections for
+`svc` instructions, and fails on any the NPDM does not declare;
+`ctest -R npdm` runs it, and `--print` dumps the declared SVCs and the SAC. It
+found two (#196), both now declared:
+
+| SVC | Reached from | Why it is declared rather than removed |
+|---|---|---|
+| `svcReturnFromException` (0x28) | libnx's exception entry | It is the last thing the handler does. Undeclared, the process dies at the exact moment something else has already gone wrong, and the crash that would have been reported is replaced by one that cannot be. |
+| `svcUnmapTransferMemory` (0x52) | `socketExit` → `bsdExit` → `_bsdCleanup` → `tmemClose` | `NetworkExit` calls `socketExit`, so this path runs. Whether the SVC is *issued* rests on libnx leaving `TransferMemory::map_addr` NULL for the bsd transfer memory — an internal of libnx's bsd client, not ours to guarantee. There is no structural way to drop it either: `_bsdCleanup` also runs on `bsdInitialize`'s own failure path. `svcCreateTransferMemory` (0x15) is already granted for the same object. |
+
+The other direction — 18 SVCs are declared that nothing in the image calls — is
+reported and not failed. Narrowing that set is M9-11's, and the script prints
+the list it starts from.
 
 ## The two switches
 

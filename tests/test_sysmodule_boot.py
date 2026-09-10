@@ -8,10 +8,10 @@ npdm does not grant, and a service acquisition that parks forever in `sm` with
 no log, no crash report and no symptom. Each of them is decidable from the text
 of the two files that disagree, which is what this reads.
 
-It is deliberately NOT the built `.nsp`: M9-3 (#196) lands that parser, and it
-needs devkitPro and a cross-compile, so it skips on every runner this project
-has today (M9-12, #211). The SAC and the source are in the tree, so these run
-everywhere and on every push.
+It is deliberately NOT the built `.nsp`: M9-3 (#196) landed that parser as
+`scripts/npdm-check.py`, and it needs devkitPro and a cross-compile, so it skips
+on every runner this project has today (M9-12, #211). The SAC and the source are
+in the tree, so these run everywhere and on every push.
 
 Four phases, one CTest entry each, so a red run names the promise that broke:
 

@@ -684,6 +684,23 @@ ctest --test-dir build --output-on-failure
   translation unit produced an aarch64 object. It skips when that image is not
   pulled — including under `ROMMSYNC_REQUIRE_RIG`, since the host CI runner does
   not have it and the `switch-build` job is the enforcement there.
+- The `npdm.*` pair asks what the console half is actually *allowed* to do. An
+  SVC the NPDM does not grant is refused by the kernel and kills the process,
+  and the linked sysmodule issued two it never declared (M9-3, #196) —
+  invisible here, because the question is about two built files and every other
+  check reads the tree. `npdm.svcs` cross-compiles the sysmodule, parses the
+  NPDM out of the `.nsp` and diffs it against the `svc` instructions in the
+  linked ELF, and also asserts the program id the config asked for,
+  `is_retail`, pool partition 2, ACI0/ACID coherence and that no
+  `@PLACEHOLDER@` reached the artifact. It needs npdmtool, so it needs the
+  `devkitpro/devkita64` image, so it skips wherever `switch.builds` does — and
+  unlike that one it has *no* equivalent in CI yet: the `switch-build` job
+  builds the module without parsing what it built, which is M9-12's (#211) to
+  fix. `npdm.parser` is the same script's `--self-test` over vectors hand-built
+  from the NPDM and AArch64 formats; it reads no artifact, so it never skips,
+  and it is the only coverage the byte offsets get until #211 lands — the
+  fixtures are chosen so that a parser reading the wrong offset gets a wrong
+  answer rather than a lucky one.
 - The `boot.*` group is the sysmodule's `__appInit`, which nothing off a console
   can execute -- which is how three separate bugs sat in twenty lines through
   every green run (M9-1, #195). Half of it reads: `boot.dns`, `boot.clock`,
@@ -692,9 +709,10 @@ ctest --test-dir build --output-on-failure
   `getaddrinfo`, the declared `TimeServiceType` matches the grant in the SAC,
   every service acquisition has a bound in front of it, and neither of the two
   false comments comes back. It reads the *tree* rather than the built `.nsp` on
-  purpose -- M9-3 (#196) lands that parser and it needs devkitPro, so it can only
-  run where `switch.builds` can. The other half runs: `boot.resolve` drives the
-  shipping connector at a host *name* through `posix_connection.cpp`, and
+  purpose -- M9-3 (#196) landed that parser as `npdm.*` and it needs devkitPro,
+  so it can only run where `switch.builds` can. The other half runs:
+  `boot.resolve` drives the shipping connector at a host *name* through
+  `posix_connection.cpp`, and
   `boot.wait` and `boot.journal` drive the bounded wait against a fake `sm`, so a
   ten-second budget is spent in accounting rather than in wall-clock. None of the
   seven needs Docker, a rig, or a resolver, so none of them ever skips.
