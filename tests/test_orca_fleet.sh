@@ -561,6 +561,30 @@ STUB
 
 # A worktree the fleet would own: a git repo with one commit, and an owned-file
 # naming it.
+# The worktree listing Orca answers, from `issue:path-suffix` pairs -- `-` for a
+# worktree linked to no issue, and a third field for a repo other than the
+# fixture's. Five phases were emitting this JSON inline; the shape belongs in
+# one place, beside make_worktree, which is the same idea for the other half.
+worktree_list() {
+  local spec; spec="$(printf '%s\n' "$@")"
+  WORKTREE_SPEC="$spec" WORKTREE_WORK="$WORK" python3 -c '
+import json, os
+out = []
+for line in os.environ["WORKTREE_SPEC"].splitlines():
+    if not line.strip():
+        continue
+    parts = line.split(":")
+    num, suffix = parts[0], parts[1]
+    repo = parts[2] if len(parts) > 2 else "repo"
+    work = os.environ["WORKTREE_WORK"]
+    out.append({"path": work + "/" + suffix,
+                "linkedIssue": None if num == "-" else int(num),
+                "repoPath": work + "/" + repo,
+                "isMainWorktree": False, "isArchived": False})
+print(json.dumps({"result": {"worktrees": out}}))
+' >"$ORCA_WORKTREES"
+}
+
 make_worktree() {
   mkdir -p "$WORK/wt"
   git -C "$WORK/wt" init -q -b work
@@ -1045,14 +1069,7 @@ case "${1:-}" in
     make_fixture ok
     # One worktree of ours, one belonging to a different repository entirely --
     # which is the ordinary state of a machine running more than one fleet.
-    python3 -c '
-import json, sys
-print(json.dumps({"result": {"worktrees": [
-    {"path": sys.argv[1] + "/wt", "linkedIssue": 42, "repoPath": sys.argv[1] + "/repo",
-     "isMainWorktree": False, "isArchived": False},
-    {"path": sys.argv[1] + "/foreign", "linkedIssue": 7, "repoPath": sys.argv[1] + "/other",
-     "isMainWorktree": False, "isArchived": False}]}}))
-' "$WORK" >"$ORCA_WORKTREES"
+    worktree_list "42:wt" "7:foreign:other"
     n="$(in_fleet live_count 2>&1)"
     [ "$n" = 1 ] \
       || fail "counted $n live worktree(s); another repo's worktree is taking a slot from MAX_WORKTREES"
@@ -1080,12 +1097,7 @@ print(json.dumps({"result": {"worktrees": [
     cat >"$GH_ISSUES" <<'JSON'
 [{"number":196,"title":"the foundation one","body":"","labels":[{"name":"ready"},{"name":"foundation"}]}]
 JSON
-    python3 -c '
-import json, sys
-print(json.dumps({"result": {"worktrees": [
-    {"path": sys.argv[1] + "/foreign", "linkedIssue": 1, "repoPath": sys.argv[1] + "/other",
-     "isMainWorktree": False, "isArchived": False}]}}))
-' "$WORK" >"$ORCA_WORKTREES"
+    worktree_list "1:foreign:other"
     n="$(in_fleet live_count 2>&1)"
     [ "$n" = 0 ] \
       || fail "counted $n live worktree(s) with only another repo's open, so the foundation gate never opens"
@@ -1097,6 +1109,16 @@ print(json.dumps({"result": {"worktrees": [
     labels="$(awk -F'\t' '$1 == 196 { print $3 }' <<<"$out")"
     in_fleet has_label "$labels" foundation \
       || fail "the fixture issue is not labelled foundation, so this phase asserts the wrong gate: [$labels]"
+    # ...and the gate itself, spelled as the dispatcher spells it, rather than
+    # its two inputs and an argument that they compose. `eval`, not `bash -c`:
+    # a fresh shell has none of the sourced functions, so the expression would
+    # exit 127 and the assertion would pass without ever evaluating.
+    # `eval` concatenates its arguments, so the labels are expanded into the
+    # expression here rather than passed as $1.
+    in_fleet eval "is_foundation '$labels' && [ \"\$(live_count)\" -gt 0 ]" \
+      && fail "the gate is still shut with only another repo's worktree open"
+    in_fleet eval "is_foundation '$labels'" \
+      || fail "is_foundation did not fire on the fixture's labels, so the gate above proves nothing: [$labels]"
     echo "ok: another repo's worktree does not hold a foundation issue"
     ;;
   foundation_names_wait)
@@ -1104,15 +1126,8 @@ print(json.dumps({"result": {"worktrees": [
     # Two worktrees of ours, one of them with no linked issue. A count says
     # "2"; this says which two, so a person can see what would end the wait --
     # and #212 was 47 minutes of a line that could not.
-    python3 -c '
-import json, sys
-print(json.dumps({"result": {"worktrees": [
-    {"path": sys.argv[1] + "/wt", "linkedIssue": 42, "repoPath": sys.argv[1] + "/repo",
-     "isMainWorktree": False, "isArchived": False},
-    {"path": sys.argv[1] + "/loose-one", "linkedIssue": None, "repoPath": sys.argv[1] + "/repo",
-     "isMainWorktree": False, "isArchived": False}]}}))
-' "$WORK" >"$ORCA_WORKTREES"
-    out="$(in_fleet foundation_wait_notice 196 2>&1)"
+    worktree_list "42:wt" "-:loose-one"
+    out="$(in_fleet foundation_wait_notice 196 "$(in_fleet live_worktrees)" 2>&1)"
     grep -q "#42" <<<"$out" \
       || fail "it did not name the worktree it is waiting on: $out"
     grep -q "loose-one" <<<"$out" \
@@ -1120,30 +1135,27 @@ print(json.dumps({"result": {"worktrees": [
     grep -qE '\bfor 2 worktree' <<<"$out" \
       && fail "it is still saying a count: $out"
     # ...and it is news, not a heartbeat: the same set says nothing.
-    if out2="$(in_fleet foundation_wait_notice 196 2>&1)"; then
+    if out2="$(in_fleet foundation_wait_notice 196 "$(in_fleet live_worktrees)" 2>&1)"; then
       fail "it said the same thing again for an unchanged set: $out2"
+    fi
+    # The same two, in the other order. Nothing has changed, so nothing is said
+    # -- a marker compared as an ordered list would call this news and print the
+    # line again on a listing the CLI happened to reorder.
+    worktree_list "-:loose-one" "42:wt"
+    if out3="$(in_fleet foundation_wait_notice 196 "$(in_fleet live_worktrees)" 2>&1)"; then
+      fail "a reordered listing read as a changed one: $out3"
     fi
     echo "ok: the wait is named, and said once"
     ;;
   foundation_wait_changes)
     make_fixture ok
-    python3 -c '
-import json, sys
-print(json.dumps({"result": {"worktrees": [
-    {"path": sys.argv[1] + "/wt", "linkedIssue": 42, "repoPath": sys.argv[1] + "/repo",
-     "isMainWorktree": False, "isArchived": False}]}}))
-' "$WORK" >"$ORCA_WORKTREES"
-    in_fleet foundation_wait_notice 196 >/dev/null 2>&1 \
+    worktree_list "42:wt"
+    in_fleet foundation_wait_notice 196 "$(in_fleet live_worktrees)" >/dev/null 2>&1 \
       || fail "the first notice said nothing, so this phase asserts nothing"
     # One of them lands. That is the thing worth hearing about, and a flag
     # rather than the set would have stayed silent through it.
-    python3 -c '
-import json, sys
-print(json.dumps({"result": {"worktrees": [
-    {"path": sys.argv[1] + "/wt2", "linkedIssue": 51, "repoPath": sys.argv[1] + "/repo",
-     "isMainWorktree": False, "isArchived": False}]}}))
-' "$WORK" >"$ORCA_WORKTREES"
-    out="$(in_fleet foundation_wait_notice 196 2>&1)" \
+    worktree_list "51:the-other-one"
+    out="$(in_fleet foundation_wait_notice 196 "$(in_fleet live_worktrees)" 2>&1)" \
       || fail "the set changed and it stayed quiet, so the log never says what it is waiting on now"
     grep -q "#51" <<<"$out" \
       || fail "it repeated the old set rather than the current one: $out"
@@ -1687,12 +1699,7 @@ JSON
     # listing makes `in_flight` answer "could not tell" for every issue, so
     # `status` offers work that is already running (#212).
     printf '%s\n' "$WORK/repo" >"$ORCA_REPO_ROOTS"
-    python3 -c '
-import json, sys
-print(json.dumps({"result": {"worktrees": [
-    {"path": sys.argv[1] + "/wt", "linkedIssue": 42, "repoPath": sys.argv[1] + "/repo",
-     "isMainWorktree": False, "isArchived": False}]}}))
-' "$WORK" >"$ORCA_WORKTREES"
+    worktree_list "42:wt"
     out="$(in_fleet_at "$WORK/wt2" cmd_status 2>&1)"
     grep -q "#42" <<<"$out" \
       || fail "asked from a worktree, it could not list what is running: the repo selector did not resolve: $out"

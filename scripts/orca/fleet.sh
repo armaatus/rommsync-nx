@@ -340,12 +340,20 @@ for w in worktrees:
 # What a foundation issue is actually waiting for, as `#N` where the worktree is
 # linked to an issue and a basename where it is not -- a count alone names
 # nothing a person can go and land.
+#
+# $1 is the listing the caller already has. It is not fetched here: `one_lookup`
+# is the rule this file keeps -- one answer per pass, not one per question --
+# and a second `worktree list` would also let the count that opened the gate and
+# the names printed beside it disagree, which is worse than either alone.
+#
+# Sorted, because the caller stores this string to decide whether anything
+# changed. Unsorted, two unchanged worktrees coming back in the other order read
+# as news and reprint the line every poll -- the thing #212 is about.
 waiting_worktrees() {
-  local list; list="$(live_worktrees)" || { printf 'worktrees it could not list\n'; return 0; }
-  printf '%s\n' "$list" | while IFS="$(printf '\t')" read -r num path; do
+  printf '%s\n' "$1" | while IFS="$(printf '\t')" read -r num path; do
     [ -n "$path" ] || continue
-    if [ "$num" = "-" ]; then printf '%s ' "$(basename "$path")"; else printf '#%s ' "$num"; fi
-  done | sed 's/ $//'
+    if [ "$num" = "-" ]; then printf '%s\n' "$(basename "$path")"; else printf '#%s\n' "$num"; fi
+  done | sort | tr '\n' ' ' | sed 's/ $//'
 }
 
 # The line to say when a foundation issue is held, or nothing (1) when it has
@@ -355,7 +363,10 @@ waiting_worktrees() {
 # marker is the SET, not a flag, so the line comes back when what it is waiting
 # on changes -- which is news -- and stays quiet while it does not.
 foundation_wait_notice() {
-  local waiting_on; waiting_on="$(waiting_worktrees)"
+  local waiting_on; waiting_on="$(waiting_worktrees "$2")"
+  # Nothing to name means nothing is holding it, and the caller should not have
+  # asked -- saying "waiting for" with nothing after it is worse than silence.
+  [ -n "$waiting_on" ] || return 1
   [ "$(cat "$STATE_DIR/foundation-wait-$1" 2>/dev/null)" = "$waiting_on" ] && return 1
   mkdir -p "$STATE_DIR"
   printf '%s\n' "$waiting_on" >"$STATE_DIR/foundation-wait-$1"
@@ -1943,12 +1954,15 @@ while that one is up."
     reap_abandoned
     prune_gaveup
 
-    local live
-    if ! live="$(live_count)"; then
+    # One listing, and the count derived from it, so everything this pass says
+    # about what is running is saying it about the same answer.
+    local live live_list
+    if ! live_list="$(live_worktrees)"; then
       say "could not read the worktree list; skipping this pass rather than guessing"
       sleep "$POLL_SECONDS"
       continue
     fi
+    live="$(printf '%s\n' "$live_list" | grep -c . || true)"
 
     while ! $drain_mode && [ "$live" -lt "$MAX_WORKTREES" ]; do
       # `break`, not `break 2`: this is the drain arriving MID-PASS, after the
@@ -2030,7 +2044,8 @@ while that one is up."
           # notice when the set changes. The marker is cleared when it does, so
           # the next line is news rather than the same line again.
           if is_foundation "$l" && [ "$live" -gt 0 ]; then
-            local notice; notice="$(foundation_wait_notice "$n")" && say "$notice"
+            local notice; notice="$(foundation_wait_notice "$n" "$live_list")" \
+              && say "$notice"
             break
           fi
           picked="$n"; title="$t"; labels="$l"
@@ -2049,7 +2064,8 @@ while that one is up."
         say "  leaving #$picked in the queue to try again"
         break
       fi
-      live="$(live_count)" || break
+      live_list="$(live_worktrees)" || break
+      live="$(printf '%s\n' "$live_list" | grep -c . || true)"
     done
 
     # Nothing left to launch, and nothing left to look after: done. Reaching
