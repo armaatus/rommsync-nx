@@ -1736,42 +1736,55 @@ set_tests_properties(switch.ci_requires_artifacts PROPERTIES TIMEOUT 60)
 # the host job uses.
 add_test(NAME switch.builds
          COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" builds)
-set_tests_properties(switch.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+set_tests_properties(switch.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600
+                     RUN_SERIAL TRUE)
 
 # The M0-1 probe (tlsprobe/README.md). Same image, same reason it may skip as
 # switch.builds above -- and the same enforcement elsewhere: the `switch-build`
 # job builds it on every push and checks the NRO magic there.
 add_test(NAME switch.tlsprobe
          COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" tlsprobe)
-set_tests_properties(switch.tlsprobe PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+set_tests_properties(switch.tlsprobe PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600
+                     RUN_SERIAL TRUE)
 
 # --- M9-3: the capabilities the NPDM grants, against the ones the image uses --
 # An SVC a process was not granted is not a soft failure on Horizon: the kernel
-# refuses the call and the process dies. The linked sysmodule issued two it never
-# declared -- `svcReturnFromException`, which is on libnx's exception path, and
+# refuses the call and the process dies. The linked sysmodule issued two it
+# never declared -- `svcReturnFromException`, on libnx's exception path, and
 # `svcUnmapTransferMemory`, which is on the socket teardown -- and nothing in
 # this repo could have said so, because the question is about two built
 # artifacts and every other check reads the tree (#196).
 set(NPDM_CHECK "${CMAKE_SOURCE_DIR}/scripts/npdm-check.py")
 
 # The parser, against vectors hand-built from the NPDM and AArch64 formats
-# rather than from the artifact. It reads nothing that has to be compiled, so it
-# runs on every push -- which matters more here than usual: the entry below it
-# can run nowhere in CI today, so without this the byte offsets this all rests
-# on would have no coverage at all.
-add_test(NAME npdm.parser COMMAND ${Python3_EXECUTABLE} "${NPDM_CHECK}" --self-test)
+# rather than from the artifact. It reads nothing that has to be compiled, so
+# it runs on every push -- which matters more here than usual: the entry below
+# it can run nowhere in CI today, so without this the byte offsets this all
+# rests on would have no coverage at all. The fixtures are chosen so that a
+# parser reading the wrong offset gets a wrong answer rather than a lucky one;
+# each one of them is a mutation that survived before it was chosen.
+add_test(NAME npdm.parser
+         COMMAND ${Python3_EXECUTABLE} "${NPDM_CHECK}" --self-test)
 set_tests_properties(npdm.parser PROPERTIES TIMEOUT 60)
 
-# The real diff, over a real cross-compile. Its SKIP_RETURN_CODE is unwrapped for
-# the reason the long note above gives -- there is no NPDM without npdmtool, and
-# npdmtool is in the devkitpro image the host runner does not have. Unlike
-# `switch.builds` it has no equivalent elsewhere yet: the `switch-build` job
-# builds the module but does not parse what it built. M9-12 (#211) is where that
-# is fixed; this entry is written so that fixing it is a CI change and not a
-# rewrite here.
+# The real diff, over a real cross-compile. Its SKIP_RETURN_CODE is unwrapped
+# for the reason the long note above gives -- there is no NPDM without
+# npdmtool, and npdmtool is in the devkitpro image the host runner does not
+# have. Unlike `switch.builds` it has no equivalent elsewhere yet: the
+# `switch-build` job builds the module but does not parse what it built. M9-12
+# (#211) is where that is fixed; this entry is written so that fixing it is a
+# CI change and not a rewrite here.
 set(NPDM_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_npdm.sh")
 add_test(NAME npdm.svcs COMMAND "${BASH_PROGRAM}" "${NPDM_TEST}" svcs)
+#
+# RUN_SERIAL, which the three container builds beside it also carry: each runs
+# `make -j$(nproc)` inside devkitpro/devkita64, and two of those at once on one
+# machine is how a `ctest -j` run turns a memory ceiling into a red
+# cross-compile in whichever of them lost. The failure is at least honest --
+# the build failing and the NPDM being wrong are two different messages here --
+# but it is a red build about nothing.
 set_tests_properties(npdm.svcs PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900
+                     RUN_SERIAL TRUE
                      ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
 
 # --- the release zip: scripts/package.sh -------------------------------------
@@ -1809,7 +1822,8 @@ endforeach()
 # says that step is still there.
 add_test(NAME package.builds
          COMMAND "${BASH_PROGRAM}" "${PACKAGE_TEST}" builds)
-set_tests_properties(package.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+set_tests_properties(package.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900
+                     RUN_SERIAL TRUE)
 
 # --- the install guide: docs/INSTALL.md --------------------------------------
 # The one page in this repo nobody may verify by following it -- hard rule 1
@@ -2236,8 +2250,9 @@ endforeach()
 # console's own connector rather than a twin (tests/tcp_connector.hpp).
 #
 # The static half deliberately reads the tree rather than the built `.nsp`: M9-3
-# (#196) landed the npdm parser as `npdm.*` below and it needs devkitPro, so it
-# can only run where a cross-compile can (M9-12, #211). The SAC is in the tree, so these run on
+# (#196) landed the npdm parser as the `npdm.*` entries further up this file,
+# and it needs devkitPro, so it can only run where a cross-compile can
+# (M9-12, #211). The SAC is in the tree, so these run on
 # every push, everywhere.
 add_executable(test_boot_services test_boot_services.cpp
   "${CMAKE_SOURCE_DIR}/sysmodule/source/boot_wait.cpp"

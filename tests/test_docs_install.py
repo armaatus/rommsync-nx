@@ -128,7 +128,7 @@ def manifest(repo: str) -> list:
     return entries
 
 
-def title_id(repo: str) -> str:
+def program_id(repo: str) -> str:
     """Read from the NPDM config by a JSON reader, where package.sh uses a regex."""
     with open(os.path.join(repo, "sysmodule", "sys-rommsync.json"), encoding="utf-8") as f:
         tid = json.load(f)["program_id"]
@@ -204,7 +204,7 @@ def phase_paths(args) -> int:
     repo = args.repo
     text = read(guide_path(repo))
     entries = manifest(repo)
-    tid = title_id(repo)
+    tid = program_id(repo)
 
     allowed_dirs = set()
     for entry in entries:

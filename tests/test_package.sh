@@ -59,7 +59,7 @@ VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION")"
 # uses a regex. A literal here would pass on the day the id moves and the
 # packaging stops matching it, which is the failure sysmodule/README.md says to
 # expect.
-title_id() {
+program_id() {
   command -v python3 >/dev/null 2>&1 || fail "python3 is needed to read the program id"
   python3 -c '
 import json, sys
@@ -88,7 +88,7 @@ phase_layout() {
   SCRATCH="$(mktemp -d)"
   stub_inputs
 
-  local tid; tid="$(title_id)" || exit 1
+  local tid; tid="$(program_id)" || exit 1
   local out="$SCRATCH/dist"
   local manifest="$SCRATCH/manifest.txt"
   run_package --out "$out" > "$manifest" || fail "packaging failed"
@@ -300,7 +300,7 @@ phase_deterministic() {
 phase_upgrade() {
   SCRATCH="$(mktemp -d)"
   stub_inputs
-  local tid; tid="$(title_id)" || exit 1
+  local tid; tid="$(program_id)" || exit 1
 
   run_package --out "$SCRATCH/dist" >/dev/null || fail "packaging failed"
   local zip="$SCRATCH/dist/rommsync-nx-$VERSION.zip"
@@ -425,7 +425,7 @@ phase_builds() {
     fail "the devkitA64 build-and-package failed"
   fi
 
-  local tid; tid="$(title_id)" || exit 1
+  local tid; tid="$(program_id)" || exit 1
   local zip="$SCRATCH/dist/rommsync-nx-$VERSION.zip"
   [ -s "$zip" ] || { cat "$log" >&2; fail "no $zip"; }
 

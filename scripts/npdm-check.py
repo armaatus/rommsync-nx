@@ -302,10 +302,17 @@ class Elf:
     def svc_calls(self):
         """`{svc number: {function name, ...}}` over every executable section.
 
-        Only `SHF_ALLOC | SHF_EXECINSTR` PROGBITS sections are scanned. A debug
-        section holding a copy of the code, or a `.rodata` word that happens to
-        encode an `svc`, would otherwise be reported as a call the process makes
-        -- and this test's whole value is that a failure means something.
+        Only `SHF_ALLOC | SHF_EXECINSTR` PROGBITS sections are scanned, which
+        keeps a debug section holding a copy of the code, and `.rodata`, out of
+        the answer.
+
+        It does **not** keep out AArch64 literal pools, which the assembler
+        emits inside `.text`: a constant whose word happens to match
+        `0xD4xxxxx1` is indistinguishable from an `svc` here and would be
+        reported as a call this process makes. Every one of the 29 found today
+        lands on a libnx `svc*` wrapper, so nothing is being papered over -- but
+        a failure naming a function that plainly issues no SVC is this, and the
+        answer is to look at the address, not to widen the grant.
         """
         calls = {}
         wanted = self.SHF_ALLOC | self.SHF_EXECINSTR
@@ -412,6 +419,32 @@ def check_coherent(npdm):
     return []
 
 
+def check_program_id(npdm, source):
+    """The program id in the artifact is the one the config asked for.
+
+    `scripts/package.sh` reads `program_id` out of the same config to name
+    `atmosphere/contents/<id>/`, and Atmosphere launches a sysmodule by that
+    directory. So a config npdmtool read differently from the way package.sh
+    read it puts the module in a directory nothing launches it from, with no
+    error anywhere -- and M9-3 renamed exactly that key. `check_coherent`
+    cannot see this: npdmtool writes ACI0's id and the ACID's range from one
+    input, so those two agree by construction.
+    """
+    if source is None:
+        return []
+    declared = json.loads(source).get("program_id")
+    if declared is None:
+        return ["sys-rommsync.json has no `program_id`; npdmtool falls back to the "
+                "deprecated `title_id`, and scripts/package.sh reads neither"]
+    if int(str(declared), 0) != npdm.aci0.program_id:
+        return ["the NPDM carries program id 0x%016X and sys-rommsync.json asks for %s; "
+                "scripts/package.sh names atmosphere/contents/<id>/ from the config, so "
+                "the module would install where nothing launches it"
+                % (npdm.aci0.program_id, declared)]
+    print("ok: the NPDM's program id is the one sys-rommsync.json asks for")
+    return []
+
+
 PLACEHOLDER = re.compile(r"@[A-Z][A-Z0-9_]*@")
 
 
@@ -502,19 +535,42 @@ def _syscall_descriptors(numbers):
     return words
 
 
-def _npdm(syscalls, acid_flags=0x9, name=b"fixture", program_id=0x0100000000000001):
-    kc = _syscall_descriptors(syscalls)
-    fs = struct.pack("<IQ", 1, 0xFFFFFFFFFFFFFFFF)
+# The fixture's constants are chosen so that a parser reading the *wrong* offset
+# gets a wrong answer rather than a lucky one. A program id that is not zero and
+# an ACID range pinned to exactly it; different filesystem masks either side, so
+# the subset test cannot pass by comparing a field to itself; a handle table
+# size past 512, so the value's mask has to be the full ten bits; and an SVC
+# immediate past 0xFF in the ELF, so the instruction decoder has to read all
+# sixteen. Each of those was a mutation that kept `npdm.parser` green before.
+FIXTURE_PROGRAM_ID = 0x4200DEADBEEF0042
+FIXTURE_HANDLE_TABLE = 0x2AB      # 683: sets bits the 10-bit field only just holds
+FIXTURE_ACID_FS = 0x800000000000001F
+FIXTURE_ACI0_FS = 0x0000000000000003
+
+
+def _handle_table_descriptor(size):
+    return struct.pack("<I", 0x7FFF | (size << 16))
+
+
+def _npdm(syscalls, acid_flags=0x9, name=b"fixture", program_id=FIXTURE_PROGRAM_ID,
+          aci0_fs=FIXTURE_ACI0_FS, acid_fs=FIXTURE_ACID_FS):
+    kc = _syscall_descriptors(syscalls) + _handle_table_descriptor(FIXTURE_HANDLE_TABLE)
+    aci0_fs_block = struct.pack("<IQ", 1, aci0_fs)
+    acid_fs_block = struct.pack("<IQ", 1, acid_fs)
     sac = b"\x06fsp-srv"
     aci0 = struct.pack("<4s12xQ8x", b"ACI0", program_id)
     body_at = 0x40
+    fs = aci0_fs_block
     aci0 += struct.pack("<IIIIII", body_at, len(fs), body_at + len(fs), len(sac),
                         body_at + len(fs) + len(sac), len(kc)) + b"\0" * 8
     aci0 = aci0.ljust(body_at, b"\0") + fs + sac + kc
+    # The range is pinned to the id rather than left wide open: a program id read
+    # from the wrong offset comes back as zero, and only a pinned range says so.
     acid_body = struct.pack("<4sIIIQQ", b"ACID", 0, 0, acid_flags,
-                            0, 0xFFFFFFFFFFFFFFFF)
+                            program_id, program_id)
     # Offsets from the start of the ACID, signature included -- the 0x200 the
     # real header measures from and the fixture would hide if it did not.
+    fs = acid_fs_block
     signed_at = 0x200 + body_at
     acid_body += struct.pack("<IIIIII", signed_at, len(fs), signed_at + len(fs), len(sac),
                              signed_at + len(fs) + len(sac), len(kc))
@@ -608,20 +664,43 @@ def self_test():
     # it has fourteen, so a mask one bit wide either way reads the wrong one.
     expect(parse_handle_table_size(struct.pack("<II", 0x183FFF, 0x407FFF)) == 64,
            "the handle table size was not read from its descriptor")
+    expect(parse_handle_table_size(_handle_table_descriptor(1023)) == 1023,
+           "the handle table size lost its top bits")
 
     # ...and the whole path, on a synthetic module that calls one SVC it never
     # declared. This is #196 in miniature, and it is what says the diff still
     # reports rather than passing over.
     nsp = _pfs0({"main.npdm": _npdm({0x01, 0x21}), "main": b"stub"})
     npdm = Npdm(read_pfs0(nsp)["main.npdm"])
-    elf = Elf(_elf([0x01, 0x21, 0x52]))
+    # 0x1234 is not a real SVC and is not meant to be: it is the immediate that
+    # says the decoder reads sixteen bits rather than the eight every genuine
+    # number fits in.
+    elf = Elf(_elf([0x01, 0x21, 0x52, 0x1234]))
     expect(npdm.aci0.syscalls == {0x01, 0x21}, "the fixture's declared set did not survive")
-    expect(set(elf.svc_calls()) == {0x01, 0x21, 0x52}, "the fixture's called set did not survive")
+    expect(npdm.aci0.program_id == FIXTURE_PROGRAM_ID, "the ACI0 program id was misread")
+    expect(npdm.aci0.handle_table_size == FIXTURE_HANDLE_TABLE,
+           "the fixture's handle table size was misread")
+    expect(npdm.aci0.filesystem_permissions == FIXTURE_ACI0_FS,
+           "the ACI0 filesystem permissions were misread")
+    expect(npdm.acid.filesystem_permissions == FIXTURE_ACID_FS,
+           "the ACID filesystem permissions were misread")
+    expect(set(elf.svc_calls()) == {0x01, 0x21, 0x52, 0x1234},
+           "the fixture's called set did not survive")
     expect(elf.owner(0x1008) == "svc_82", "the symbol owning an svc was not found")
-    expect(len(quietly(check_syscalls, npdm, elf, {})) == 1,
+    expect(len(quietly(check_syscalls, npdm, elf, {})) == 2,
            "an undeclared SVC was not reported")
     expect(quietly(check_coherent, npdm) == [], "the coherent fixture was reported incoherent")
     expect(quietly(check_flags, npdm) == [], "the fixture's ACID flags were misread")
+    expect(quietly(check_program_id, npdm,
+                   '{"program_id": "0x%016X"}' % FIXTURE_PROGRAM_ID) == [],
+           "the matching program id was reported as a mismatch")
+    expect(len(quietly(check_program_id, npdm, '{"program_id": "0x1"}')) == 1,
+           "a program id the config did not ask for passed")
+    # ACI0 asking for a filesystem right the ACID does not grant: `fs` ANDs the
+    # two, so this is a permission the module looks granted and does not have.
+    expect(len(quietly(check_coherent,
+                       Npdm(_npdm({0x01}, aci0_fs=0xF, acid_fs=0x1)))) == 1,
+           "an ACI0 filesystem mask wider than the ACID's passed")
 
     # The negative half of each of the other two checks.
     expect(len(quietly(check_flags, Npdm(_npdm({0x01}, acid_flags=0x8)))) == 1,
@@ -670,8 +749,13 @@ def main():
         source = _read(args.json).decode("utf-8") if args.json else None
         names = syscall_names(source) if source else {}
         elf = Elf(_read(args.elf)) if args.elf else None
-    except Failure as failure:
-        print("FAIL: " + str(failure), file=sys.stderr)
+    # `Failure` is a file that is the wrong shape; `struct.error` and
+    # `IndexError` are one truncated past an offset this reads; `OSError` is one
+    # that is not there. All three are the same answer to the caller, and a
+    # traceback would be the one error path in this script that does not say
+    # FAIL -- which matters most for `--print`, the interface M9-11 (#210) uses.
+    except (Failure, struct.error, IndexError, OSError, ValueError) as failure:
+        print("FAIL: %s: %s" % (type(failure).__name__, failure), file=sys.stderr)
         return 1
 
     if args.dump:
@@ -691,6 +775,7 @@ def main():
     problems = []
     problems += check_flags(npdm)
     problems += check_coherent(npdm)
+    problems += check_program_id(npdm, source)
     problems += check_placeholders(npdm, source)
     if elf is not None:
         problems += check_syscalls(npdm, elf, names)

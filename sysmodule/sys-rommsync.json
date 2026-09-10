@@ -67,11 +67,11 @@
 				"svcGetInfo": "0x29",
 				"svcWaitForAddress": "0x34",
 				"svcSignalToAddress": "0x35",
-				"svcUnmapTransferMemory": "0x52",
 				"svcCreateSession": "0x40",
 				"svcAcceptSession": "0x41",
 				"svcReplyAndReceive": "0x43",
 				"svcCreateEvent": "0x45",
+				"svcUnmapTransferMemory": "0x52",
 				"svcManageNamedPort": "0x71",
 				"svcConnectToPort": "0x72"
 			}
