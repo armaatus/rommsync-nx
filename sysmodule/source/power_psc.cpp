@@ -14,7 +14,6 @@
 #include <memory>
 
 #include "power.hpp"
-#include "rommsync/log.hpp"
 
 namespace rommsync::sysmodule::power {
 namespace {
@@ -60,6 +59,12 @@ constexpr int kWatcherPriority = 0x2C;
 class PscModule final : public Module {
  public:
   ~PscModule() override {
+    if (!open_) {
+      // Nothing was registered, so there is nothing to unregister. Asking anyway
+      // would be an IPC on a zeroed `Service`, which answers an error nobody
+      // reads -- `pscPmModuleClose` is the one of the two that checks.
+      return;
+    }
     // `Finalize` before `Close`: the first tells PSC this module is gone, the
     // second drops the session. Closing without finalizing leaves PSC with a
     // module it will keep waiting for an acknowledgement from, which is the
@@ -76,10 +81,12 @@ class PscModule final : public Module {
                                       sizeof(kDependencies) / sizeof(kDependencies[0]),
                                       /*autoclear=*/true);
     if (R_FAILED(rc)) {
-      log::Warn(log::Event::kBoot,
-                "rommsync: psc: this console will not be told when it goes to sleep");
+      // Silent here, and said once by the caller: `main.cpp` logs whether there
+      // is a subscription at all, and a second line from in here would be the
+      // same sentence twice in the file a user is asked to attach.
       return false;
     }
+    open_ = true;
     return true;
   }
 
@@ -129,6 +136,7 @@ class PscModule final : public Module {
  private:
   PscPmModule module_{};
   UEvent stop_{};
+  bool open_ = false;
 };
 
 /// The module, the loop and the thread it runs on, kept alive together.
@@ -165,9 +173,6 @@ class PscSubscription final : public Subscription {
       }
     }
     started_ = R_SUCCEEDED(rc);
-    if (!started_) {
-      log::Warn(log::Event::kBoot, "rommsync: psc: no thread to answer sleep requests on");
-    }
     return started_;
   }
 
