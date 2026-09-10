@@ -48,6 +48,8 @@
 //                behind it, and the rom resumes afterwards
 //   discards  -- M9-5: an Unpair mid-transfer stops it, rather than fetching on
 //                credentials the user has just discarded
+//   repoints  -- M9-5: a `[server] url` change never lets one server's token reach
+//                another
 //   shutdown  -- M9-5: the destructor ends a transfer at a boundary, keeping the
 //                `.part` the next boot resumes from
 #include <chrono>
@@ -1794,10 +1796,14 @@ class Throttled : public http::HttpClient {
   Throttled(http::HttpClient& inner, std::chrono::milliseconds per_callback)
       : inner_(inner), delay_(per_callback) {}
 
-  http::Result Send(const http::Request& request) override { return inner_.Send(request); }
+  http::Result Send(const http::Request& request) override {
+    Record(request);
+    return inner_.Send(request);
+  }
 
   http::Result Download(const http::Request& request,
                         const http::DownloadTarget& target) override {
+    Record(request);
     http::DownloadTarget slowed = target;
     slowed.progress = [this, sink = target.progress](std::uint64_t staged, std::uint64_t total) {
       std::this_thread::sleep_for(delay_);
@@ -1810,9 +1816,36 @@ class Throttled : public http::HttpClient {
     return inner_.Download(request, slowed);
   }
 
+  /// Every request that went out, with whether it carried a bearer token.
+  ///
+  /// Recorded here rather than asserted on a response, because what
+  /// `engine.repoints` has to pin is that a request was **never made** -- and a
+  /// request nobody made has no response to look at. Under a lock: the worker
+  /// makes them and the scenario reads them.
+  struct Sent {
+    std::string url;
+    bool authorized = false;
+  };
+
+  std::vector<Sent> sent() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return sent_;
+  }
+
  private:
+  void Record(const http::Request& request) {
+    bool authorized = false;
+    for (const http::Header& header : request.headers) {
+      authorized = authorized || header.name == "Authorization";
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    sent_.push_back({request.url, authorized});
+  }
+
   http::HttpClient& inner_;
   std::chrono::milliseconds delay_;
+  mutable std::mutex mutex_;
+  std::vector<Sent> sent_;
 };
 
 
@@ -2268,6 +2301,91 @@ int DrainDiscarded(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// M9-5 (#197): a drain never carries one server's token to another.
+///
+/// `ApplyConfigEdit` calls this "a bearer token pointed at a stranger" and takes
+/// the credential off the card *before* the write for exactly that reason. It
+/// had two holes, and the drain is what made both reachable.
+///
+/// The card was cleared and **memory was not**: `token_` and `list_token_` still
+/// held the previous server's token, so the next tick -- and, since M9-5, the
+/// next drain -- would have sent it to the new host. And a discard landing in the
+/// window before a starting drain registered its cancel token found nothing to
+/// fire, so the drain ran on credentials that were already gone.
+///
+/// What is asserted is a request that was never made, which is why the client
+/// records rather than the test reading a response: a request nobody made has no
+/// response to look at.
+int DrainRepointed(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+
+  rlog::Reset();
+  Throttled slow(client, std::chrono::milliseconds{1});
+
+  Console console(c, "engine-repoints");
+  if (!Downloadable(console, c, base, fixture)) {
+    return c.failures();
+  }
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseCard(card.get());
+  console.engine.UseServer(&slow, std::string());
+  console.Boot();
+
+  harness::Rom rom;
+  if (!harness::FindRom(client, base, fixture, "synthetic-large.gba", &rom)) {
+    c.Expect(false, "the seeded library holds synthetic-large.gba");
+    return c.failures();
+  }
+
+  std::int32_t position = 0;
+  c.Expect(console.Enqueue(rom.id, &position) == ipc::Error::kOk, "the 120 MiB rom is queued");
+  console.engine.StartWorker();
+
+  const ipc::Status moving = Until(
+      console,
+      [](const ipc::Status& status) {
+        return status.download.state == ipc::DownloadState::kDownloading &&
+               status.download.bytes_done > 0;
+      },
+      std::chrono::seconds{120});
+  c.Expect(moving.download.state == ipc::DownloadState::kDownloading,
+           "a transfer is in flight against the server about to be replaced");
+
+  const std::string elsewhere = "https://elsewhere.example.com";
+  c.Expect(console.Set(Edit("server", "url", elsewhere)).outcome == ipc::WriteOutcome::kApplied,
+           "the console is repointed at another server");
+  c.Expect(console.Status().auth == ipc::AuthState::kNeverPaired,
+           "which discards the pairing, as it always has");
+
+  // The drain is cancelled, and every drain after it is refused by the guard --
+  // the console holds no token to send anywhere now.
+  std::this_thread::sleep_for(std::chrono::seconds{2});
+  const std::vector<Throttled::Sent> sent = slow.sent();
+  int to_the_stranger = 0;
+  int authorized_to_the_stranger = 0;
+  for (const Throttled::Sent& request : sent) {
+    if (request.url.rfind(elsewhere, 0) == 0) {
+      ++to_the_stranger;
+      authorized_to_the_stranger += request.authorized ? 1 : 0;
+    }
+  }
+  c.ExpectEq(authorized_to_the_stranger, 0,
+             "no request carrying this console's bearer token reached the new server");
+  c.ExpectEq(to_the_stranger, 0, "nor any request at all, because there is nothing to send");
+  c.Expect(sent.size() > 0, "and the recording client was actually the one in use");
+
+  c.Expect(!console.sandbox.Exists("/tico/roms/gba/synthetic-large.gba"),
+           "the rom did not arrive on credentials the console no longer holds");
+  c.Expect(console.Status().queue_depth > 0,
+           "and stays queued, for a console that pairs with the new server");
+  return c.failures();
+}
+
 /// M9-5 (#197): a shutdown mid-transfer ends at a boundary, not at the end of a
 /// 4 GB file.
 ///
@@ -2383,6 +2501,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"downloading", DrainProgress},
       {"preempts", DrainPreempted},
       {"discards", DrainDiscarded},
+      {"repoints", DrainRepointed},
       {"shutdown", DrainShutdown},
   };
   for (const RigScenario& scenario : kRigScenarios) {

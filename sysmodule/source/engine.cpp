@@ -590,6 +590,19 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
       // server that has just been replaced, with a token that has just been
       // discarded, for as long as the queue took to empty.
       CancelDrainLocked();
+      // **And the copies in memory, which until now this path did not touch.**
+      // `DiscardToken` above takes the credential off the *card*; `token_` and
+      // `list_token_` are what the worker and the lists actually send, and they
+      // still held the previous server's token. So the next tick -- and, since
+      // M9-5, the next drain -- would send the old server's bearer token to the
+      // new one, which is exactly the "bearer token pointed at a stranger" this
+      // whole ordering exists to prevent, arriving one tick later instead of
+      // never. `Unpair` has always cleared them; this path never did.
+      token_ = auth::StoredToken{};
+      list_token_.clear();
+      if (server_ != nullptr) {
+        lists_.UseServer(server_, list_token_);
+      }
     }
     // Every other write to `attempt_` notifies, and this one has the longest
     // wait to cut short: the thread is parked in `AwaitNextPoll` until the
@@ -846,27 +859,17 @@ void SdEngine::RunWorker() {
 
 SdEngine::DrainStep SdEngine::RunOneDrain() {
   const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
-  http::HttpClient* client = nullptr;
-  fs::FileSystem* files = nullptr;
-  auth::StoredToken token;
-  bool blocked = false;
-  std::uint64_t asked_at = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (stopping_) {
       return {};
     }
-    asked_at = download_wakes_;
     if (now < download_due_) {
       // Backing off from a drain that got nowhere. `WakeDownloads` is what
       // clears it early when a command changes the answer. See
       // `kDownloadRetryBackoff`.
       return {false, std::chrono::duration_cast<std::chrono::milliseconds>(download_due_ - now)};
     }
-    client = server_;
-    files = card_;
-    token = token_;
-    blocked = gate_.blocked();
   }
 
   if (queue_.pending() == 0) {
@@ -874,33 +877,66 @@ SdEngine::DrainStep SdEngine::RunOneDrain() {
     // queue's own lock, no configuration snapshot, no request. It is not free --
     // that lock is held across a `queue.json` write since M9-5 (#197), so an
     // `Enqueue` landing at this instant makes the worker wait out one small
-    // write (`download::Queue::EnqueueAndStore`).
+    // write (`download::Queue::EnqueueAndStore`). Asked outside `mutex_`, which
+    // is never held across a card write.
+    std::lock_guard<std::mutex> lock(mutex_);
+    download_backoff_ = std::chrono::milliseconds{0};
     return {};
   }
 
-  const std::shared_ptr<const config::Config> config = ConfigSnapshot();
-  if (!config->downloads.enabled) {
-    // `Drain` answers `kDisabled` and opens nothing, but it would answer it on
-    // every pass of the loop. Asked here so a console with downloads switched
-    // off costs one bool -- and the queue is *not* dropped, which is what
-    // docs/CONFIG.md promises: switching it back on resumes what was there.
-    return {};
-  }
-  if (blocked || client == nullptr || files == nullptr || token.access_token.empty() ||
-      !config->configured()) {
-    // The same five a tick gives up on, with the same answer -- nothing was
-    // written and nothing reached a server. **Silent**, unlike `RunOneTick`:
-    // that one runs once an interval and says which of them it is, while this
-    // is reached on every pass of the loop, so a line here would be the log
-    // rather than a note in it. Each is lifted by a command, and every command
-    // that lifts one wakes the worker, which is why there is no deadline.
-    return {};
-  }
-
+  http::HttpClient* client = nullptr;
+  fs::FileSystem* files = nullptr;
+  auth::StoredToken token;
+  std::shared_ptr<const config::Config> config;
+  std::uint64_t asked_at = 0;
   const std::shared_ptr<http::CancelToken> cancel = std::make_shared<http::CancelToken>();
   {
+    // **One slice: the credentials, the server they belong to, the gate that
+    // may have blocked them, and the token that cancels the drain about to use
+    // all four.**
+    //
+    // Registering the cancel any later leaves a window nothing covers. An
+    // `Unpair` or a `[server] url` change landing inside it clears `token_` and
+    // calls `CancelDrainLocked` -- which finds nothing to fire, because this
+    // drain has not registered a token yet -- and the drain then starts on the
+    // credentials that were just discarded. Taking the configuration here too
+    // is the other half of it: read after the token, `config->server.url` can
+    // already be the *new* server while `token` is the old one's, and the drain
+    // would send one RomM's bearer token to another. `ApplyConfigEdit` calls
+    // that a security bug rather than a UX one, and it is right.
+    //
+    // In one slice the race has no third outcome: either the discard took
+    // `mutex_` first, and the guard below sees an empty token, or this did, and
+    // the discard's `CancelDrainLocked` finds the token this registered.
+    //
+    // `ConfigSnapshot()` takes `config_mutex_` under `mutex_`, which is the
+    // documented order and the one `AdoptConfigLocked` already uses: that lock
+    // is a leaf and nothing is called while it is held (`config_mutex_`).
     std::lock_guard<std::mutex> lock(mutex_);
     if (stopping_) {
+      return {};
+    }
+    asked_at = download_wakes_;
+    client = server_;
+    files = card_;
+    token = token_;
+    config = ConfigSnapshot();
+    if (!config->downloads.enabled) {
+      // `Drain` answers `kDisabled` and opens nothing, but it would answer it
+      // on every pass of the loop. Asked here so a console with downloads
+      // switched off costs one bool -- and the queue is *not* dropped, which is
+      // what docs/CONFIG.md promises: switching it back on resumes what was
+      // there.
+      return {};
+    }
+    if (gate_.blocked() || client == nullptr || files == nullptr ||
+        token.access_token.empty() || !config->configured()) {
+      // The same five a tick gives up on, with the same answer -- nothing was
+      // written and nothing reached a server. **Silent**, unlike `RunOneTick`:
+      // that one runs once an interval and says which of them it is, while this
+      // is reached on every pass of the loop, so a line here would be the log
+      // rather than a note in it. Each is lifted by a command, and every command
+      // that lifts one wakes the worker, which is why there is no deadline.
       return {};
     }
     download_cancel_ = cancel;

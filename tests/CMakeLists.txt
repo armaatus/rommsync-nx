@@ -2201,7 +2201,7 @@ endforeach()
 # long -- so both slow the transfer down from the test side rather than from the
 # engine (`Throttled`, tests/test_engine.cpp). Serial with the rest of this group
 # for the reason every rig test is: they download the shared fixture's roms.
-foreach(scenario downloading preempts discards shutdown)
+foreach(scenario downloading preempts discards repoints shutdown)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
   if(NOT ROMMSYNC_REQUIRE_RIG)
     set_tests_properties(engine.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
