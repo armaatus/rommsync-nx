@@ -373,6 +373,16 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// gives. Idempotent: PSC sends two sleep states in a row and `power::Watcher`
   /// collapses them, but a second call here costs one comparison rather than a
   /// second tear-down.
+  ///
+  /// **What it does not cover, stated rather than implied.** A *new* IPC command
+  /// that writes the card -- an `Enqueue`, a `SetConfig`, a `RestoreBackup` --
+  /// arriving after this returns is not refused. The commands are not blocked on
+  /// purpose: the only client is the overlay, which is not running with the
+  /// screen off, and a sysmodule that answered `kUnavailable` to a user's button
+  /// because the console had dozed would be a worse bug than the one being
+  /// prevented. What is covered is everything this process starts *by itself* --
+  /// the worker, which is where every tick, every drain and every save write it
+  /// is not asked for comes from.
   void Quiesce() override;
 
   /// ...and the console is back. Lets the worker go again (M9-4, #208).

@@ -156,6 +156,16 @@ enum class Event {
   /// draining and a window that stops moving, and both are invisible from
   /// outside. No save is at risk; that is `kSaveFailed`.
   kPlayFailed,
+
+  /// The console was going to sleep and this client was still busy (M9-4, #208).
+  ///
+  /// **Only ever written when the quiesce ran out of budget**, which is the one
+  /// thing about sleep handling nobody can see from outside: the acknowledgement
+  /// to PSC goes out either way -- a request PSC never gets back is a whole
+  /// console frozen with no fatal and no crash report (sys-con#155) -- so this
+  /// line is what says it went out with a transfer or a save write still in
+  /// flight. Ordinarily a console sleeps and writes nothing here at all.
+  kPower,
 };
 
 /// Every event, in declaration order. The guide and the emitted set are both
@@ -166,7 +176,7 @@ inline constexpr std::array kAllEvents = {
     Event::kConfigDiagnostic, Event::kNoServer, Event::kNoSaveDirs,
     Event::kNetOffline,  Event::kNetTls,      Event::kScanSkipped,
     Event::kSyncRefused, Event::kSyncTick,    Event::kSaveFailed,
-    Event::kDownload,    Event::kPlayFailed,
+    Event::kDownload,    Event::kPlayFailed,  Event::kPower,
 };
 
 /// Stable tag -- `net.offline`. Never null.

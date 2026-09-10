@@ -104,6 +104,7 @@ and a log is not worth it. A save is never in that position; see
 | `sync.tick` | how one sync ended — every tick writes one | [What to attach to a bug report](#what-to-attach-to-a-bug-report) |
 | `download.drain` | how one pass at the download queue ended — how many roms came down, and what stopped it | [A queued rom never arrives](#a-queued-rom-never-arrives) |
 | `play.failed` | play time could not be recorded — no save is at risk | [The SD card is full](#the-sd-card-is-full) |
+| `power.sleep` | the console went to sleep while this client was still busy | [The console slept mid-sync](#the-console-slept-mid-sync) |
 
 The overlay does not show the log yet. `sys-rommsync` serves it over IPC —
 `GetLog`, command 16 in [DEVELOPMENT.md](DEVELOPMENT.md#the-command-set) — so a
@@ -515,6 +516,38 @@ reason for that rom. For 3, the drain is already retrying and nothing needs
 doing. For 1 and 2, the settings and pairing screens are where both are fixed.
 
 ---
+
+## The console slept mid-sync
+
+**Symptom.** One `power.sleep` line, usually beside a sync or a download that
+stopped part way, and a queue entry that is still waiting afterwards.
+
+```
+14 warn power.sleep the console is sleeping and this client is still busy after 3000ms; the worker has not come back
+```
+
+**What it means, and why it is not a bug.** The console tells `sys-rommsync`
+when it is about to sleep, and the client answers by stopping everything it is
+doing to the SD card and to the network *before* it says "done" — a save write
+in flight is finished or rolled back first, and a rom in flight is stopped with
+its partial file kept. That answer has a deadline: a sysmodule that does not
+answer in time is a console that will not go to sleep at all, and there is no
+error message anywhere when that happens. So the client answers after three
+seconds whatever state it is in, and writes this line to say that it did.
+
+**What it costs.** Nothing that is not picked up again. A stopped sync runs at
+the next interval; a stopped download resumes from the bytes already on the card
+when the console wakes; a save is never left half written, because every write
+is atomic and the backup is taken first
+([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#backups)).
+
+**When to report it.** If you see this line *often* — more than the odd one — or
+if a queued rom never finishes across several sleeps, attach the log
+([What to attach to a bug report](#what-to-attach-to-a-bug-report)). A single
+line after putting the console to sleep during a sync is the client working.
+
+**Nothing here needs fixing on the console.** There is no setting for it, and
+there is nothing to turn off.
 
 ## What to attach to a bug report
 

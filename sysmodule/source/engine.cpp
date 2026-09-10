@@ -1107,13 +1107,14 @@ void SdEngine::Quiesce() {
   // and no cancel token reaches it -- one restore is one copy and it ends on its
   // own -- so the only thing to do is wait for it, with what is left of the
   // budget.
-  bool quiet = false;
   const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
-  if (now < deadline) {
-    quiet = save_write_mutex_.try_lock_for(deadline - now);
-    if (quiet) {
-      save_write_mutex_.unlock();
-    }
+  // `try_lock` and not `try_lock_for(0)` when the budget is already gone, so the
+  // line below says what was actually true rather than reporting a save write in
+  // flight because there was no time left to ask.
+  const bool quiet = now < deadline ? save_write_mutex_.try_lock_for(deadline - now)
+                                    : save_write_mutex_.try_lock();
+  if (quiet) {
+    save_write_mutex_.unlock();
   }
 
   if (parked && quiet) {
@@ -1123,7 +1124,7 @@ void SdEngine::Quiesce() {
   // only way anyone finds out that it went out early. Refusing to acknowledge is
   // not the alternative: that is a console that never finishes the transition,
   // with no fatal and no crash report to show for it (sys-con#155).
-  log::Warn(log::Event::kBoot,
+  log::Warn(log::Event::kPower,
             std::string("the console is sleeping and this client is still busy after ") +
                 std::to_string(kQuiesceBudget.count()) + "ms" +
                 (parked ? "" : "; the worker has not come back") +

@@ -314,6 +314,8 @@ const char* ToString(Event event) {
       return "download.drain";
     case Event::kPlayFailed:
       return "play.failed";
+    case Event::kPower:
+      return "power.sleep";
   }
   return "unknown";
 }
