@@ -1117,7 +1117,12 @@ void SdEngine::Quiesce() {
   const bool parked = quiesced_.wait_until(lock, deadline, [this] {
     return (worker_parked_ || !worker_live_) && !pairing_busy_;
   });
-  const bool pairing = !pairing_busy_;
+  // Read apart rather than derived from `parked`, because the two are
+  // independent and the budget can run out with both of them false. Collapsing
+  // them costs the half of the reason that is not reported, in the one line a
+  // user has to go on.
+  const bool worker_back = worker_parked_ || !worker_live_;
+  const bool pairing_idle = !pairing_busy_;
   lock.unlock();
 
   // The other writer of a save file: a restore, on the IPC thread, which takes
@@ -1145,8 +1150,8 @@ void SdEngine::Quiesce() {
     log::Warn(log::Event::kPower,
               std::string("the console is sleeping and this client is still busy after ") +
                   std::to_string(kQuiesceBudget.count()) + "ms" +
-                  (parked ? "" : (pairing ? "; the worker has not come back"
-                                          : "; a pairing request has not come back")) +
+                  (worker_back ? "" : "; the worker has not come back") +
+                  (pairing_idle ? "" : "; a pairing request has not come back") +
                   (quiet ? "" : "; a save write is still in flight"));
   }
 
