@@ -2301,3 +2301,22 @@ foreach(scenario IN ITEMS dns clock bounded comments)
                    --repo "${CMAKE_SOURCE_DIR}")
   set_tests_properties(boot.${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
+
+# --- M9-2: the heap's table, its constants and its prose ---------------------
+# `kInnerHeapSize` is derived from a table of terms in a comment, and nothing
+# added that table up (#207): two thread stacks were budgeted at a quarter of
+# what devkitA64 gives them, an open `DIR` cost 24 KiB that had no term, and
+# both margins the prose quoted were wrong. The `static_assert` was right and
+# passed -- so the check that was missing is not another one in C++, it is one
+# that reads what a human reads.
+#
+# Reads the tree rather than the built `.nsp`, for `boot.*`'s reason: the
+# constants and the comment are in the source, so this runs on every push
+# everywhere, with no devkitPro and no cross-compile.
+set(HEAP_BUDGET_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_heap_budget.py")
+foreach(scenario IN ITEMS rows pinned margin dirs)
+  add_test(NAME heap.${scenario}
+           COMMAND ${Python3_EXECUTABLE} "${HEAP_BUDGET_TEST}" ${scenario}
+                   --repo "${CMAKE_SOURCE_DIR}")
+  set_tests_properties(heap.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
