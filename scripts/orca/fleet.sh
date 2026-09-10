@@ -277,6 +277,25 @@ disown_issue() {
   clear_issue_markers "$1"
 }
 
+# `path:` names a repository ROOT, and this script does not always run from one:
+# `fleet.sh status` is run from wherever you are, which CLAUDE.md means to be a
+# fleet worktree. Handed a worktree path the CLI answers `repo_not_found` and
+# exits 1 -- and a failed listing makes `in_flight` answer "could not tell" for
+# every issue, so `status` would offer work that is already running.
+#
+# `--git-common-dir` is the resolution: in a linked worktree it is the main
+# checkout's `.git`, and in the main checkout it is its own. If git cannot say,
+# fall back to this checkout rather than to an unscoped listing -- unscoped is
+# the bug (#212), and a selector that does not resolve fails loudly.
+repo_selector() {
+  local common
+  common="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute \
+              --git-common-dir 2>/dev/null)" \
+    && [ -n "$common" ] \
+    && { printf 'path:%s\n' "$(dirname "$common")"; return 0; }
+  printf 'path:%s\n' "$REPO_ROOT"
+}
+
 # Non-zero when the answer could not be read, which is NOT the same as "nothing
 # is running". Reading a failed CLI call as zero live worktrees is how one
 # transient hiccup turns into three duplicate worktrees for issues that already
@@ -298,7 +317,7 @@ disown_issue() {
 live_worktrees() {
   local out; out="$(mktemp)"
   orca_run_with_deadline 30 "$out" \
-    "$ORCA_CLI" worktree list --json --repo "path:$REPO_ROOT" || {
+    "$ORCA_CLI" worktree list --json --repo "$(repo_selector)" || {
     rm -f "$out"; return 1; }
   python3 -c '
 import json, sys
@@ -533,7 +552,7 @@ launch() {
   say "opening a worktree for #$num -- $title"
   local out; out="$(mktemp)"
   orca_run_with_deadline 240 "$out" "$ORCA_CLI" worktree create \
-    --repo "path:$REPO_ROOT" \
+    --repo "$(repo_selector)" \
     --name "$name" \
     --issue "$num" \
     --no-parent \
