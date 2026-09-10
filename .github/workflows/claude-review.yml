@@ -141,7 +141,7 @@ jobs:
     steps:
       # The head commit, not refs/pull/N/merge: the review should read what the
       # author actually pushed.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || format('refs/pull/{0}/head', inputs.pr) }}
@@ -486,7 +486,7 @@ jobs:
           echo "num=$num" >>"$GITHUB_OUTPUT"
           echo "sha=$sha" >>"$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: ${{ steps.head.outputs.num && format('refs/pull/{0}/head', steps.head.outputs.num) || github.ref }}
