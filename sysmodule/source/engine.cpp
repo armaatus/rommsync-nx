@@ -1876,6 +1876,12 @@ bool SdEngine::AwaitNextPoll(const std::shared_ptr<PairingAttempt>& attempt) {
   // shutdown, which is what promptness there actually depends on.
   const std::chrono::steady_clock::time_point due = attempt->session.next_poll_at();
   std::unique_lock<std::mutex> lock(mutex_);
+  // Between requests, which is the only moment this thread is not busy: the flag
+  // is claimed by whoever hands this thread an attempt and released here, so a
+  // `Quiesce` sees it clear exactly while there is nothing in flight and nothing
+  // about to be (`pairing_busy_`).
+  pairing_busy_ = false;
+  quiesced_.notify_all();
   wake_.wait_until(lock, due, [this, &attempt] { return stopping_ || attempt_ != attempt; });
   // ...and then, if the console has gone to sleep, until it comes back (M9-4,
   // #208). This is the *only* thing a suspend can do about this thread: a poll
@@ -1893,11 +1899,10 @@ bool SdEngine::AwaitNextPoll(const std::shared_ptr<PairingAttempt>& attempt) {
   if (stopping_ || attempt_ != attempt) {
     return false;
   }
-  // **Busy is claimed here, under the lock that just read `!suspended_`.** Doing
-  // it in `DrivePairing` after this returns leaves a window with the lock
-  // released, and a `Quiesce` landing in it would find `pairing_busy_` false,
-  // acknowledge the sleep, and then watch this thread open a socket. It is a few
-  // instructions wide and it is the exact case this flag exists to close.
+  // **Busy again here, under the lock that just read `!suspended_`.** Claiming it
+  // in `DrivePairing` after this returns would leave a window with the lock
+  // released, and a `Quiesce` landing in it would find the flag clear,
+  // acknowledge the sleep, and then watch this thread open a socket.
   pairing_busy_ = true;
   return true;
 }
@@ -1949,28 +1954,31 @@ void SdEngine::DrivePairing() {
     // `mutex_`, so there is no window between deciding to call and being seen to
     // be calling.
     auth::PairingState state = attempt->session.Begin();
-    SetPairingBusy(false);
-    // `AwaitNextPoll` returns already marked busy -- see it for why the flag
-    // cannot be set out here.
+    // `AwaitNextPoll` releases the flag while it waits and takes it again before
+    // it returns true -- see it for why it cannot be done out here.
     while (!auth::IsTerminal(state) && AwaitNextPoll(attempt)) {
       state = attempt->session.Poll();
-      SetPairingBusy(false);
     }
     if (state != auth::PairingState::kApproved) {
       // Denied, expired, failed -- or superseded, in which case the attempt that
       // replaced this one is what the next turn of this loop picks up. All four
       // leave the card exactly as it was.
+      //
+      // Still marked busy if the flag was reclaimed by the last poll, so it is
+      // released before going round: the outer wait is the other place this
+      // thread is idle.
+      SetPairingBusy(false);
       continue;
     }
     const auth::DeviceTokenResponse* granted = attempt->session.token();
     if (granted != nullptr) {
-      // Busy for this too: it is two card writes, and a sleep acknowledged in
-      // the middle of them is the transition taking `fsp-srv` away between
-      // `token.dat` and `auth.json`.
-      SetPairingBusy(true);
+      // **Still busy, deliberately.** The flag has been held since the poll that
+      // approved this, because these are two card writes and a sleep
+      // acknowledged between `token.dat` and `auth.json` is the transition
+      // taking `fsp-srv` away in the middle of a commit.
       CommitGrant(attempt, *granted);
-      SetPairingBusy(false);
     }
+    SetPairingBusy(false);
   }
 }
 
