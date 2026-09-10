@@ -2122,10 +2122,19 @@ while that one is up."
         # BOTH ways at once: the issue launches beside running work, and it
         # launches without a marker, so nothing is held beside it either, for
         # the whole life of that worktree.
+        # Belt and braces, and it says so: `issue_needs_human_step` read this
+        # same issue in the loop above, THIS pass, and its "could not tell" arm
+        # continues without setting `picked` -- so by here the poll cache is
+        # populated and this cannot fail. Verified by instrumenting the branch:
+        # under a total `gh` outage it is never reached.
+        #
+        # Nothing is re-added to the queue on the way out. The loop above
+        # already put `picked` in `remaining` and `wanted` was rebuilt from it
+        # two lines up, so appending here would leave a second copy -- and
+        # in_flight asks `gh pr list --state open` once per entry per pass.
         local answer
         if ! answer="$(poll_issue "$picked")"; then
           say "#$picked: could not read its labels -- not starting it this pass"
-          remaining+=("$picked"); wanted=("${remaining[@]+"${remaining[@]}"}")
           break
         fi
         labels="$(issue_labels_in "$answer")"
