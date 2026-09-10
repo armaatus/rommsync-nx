@@ -109,25 +109,35 @@ def phase_dns(repo):
     return 0
 
 
+def declared_time_service(repo):
+    """The `TimeServiceType_*` main.cpp declares, or None.
+
+    Read by two phases -- `clock` checks it against the SAC, `bounded` needs it
+    to know which service `timeInitialize()` will ask for -- so it is read once
+    here rather than by two copies of the same regex.
+    """
+    found = re.search(r"__nx_time_service_type\s*=\s*(TimeServiceType_\w+)",
+                      uncommented(read(repo, "sysmodule/source/main.cpp")))
+    return found.group(1) if found else None
+
+
 def phase_clock(repo):
-    source = read(repo, "sysmodule/source/main.cpp")
-    declared = re.search(
-        r"__nx_time_service_type\s*=\s*(TimeServiceType_\w+)", uncommented(source))
+    declared = declared_time_service(repo)
     if declared is None:
         return fail(
             "sysmodule/source/main.cpp does not set __nx_time_service_type; libnx "
             "defaults it to TimeServiceType_User, which asks sm for `time:u` (#195)")
-    wanted = TIME_SERVICE.get(declared.group(1))
+    wanted = TIME_SERVICE.get(declared)
     if wanted is None:
-        return fail("unknown TimeServiceType " + declared.group(1))
+        return fail("unknown TimeServiceType " + declared)
     sac = npdm(repo)["service_access"]
     if wanted not in sac:
         return fail(
             "main.cpp declares %s, which asks sm for `%s`, and sys-rommsync.json grants "
             "%s. sm validates the SAC before the registration check and returns "
             "sm::ResultNotAllowed, so this fails on every boot (#195)"
-            % (declared.group(1), wanted, sac))
-    print("ok: %s asks for `%s`, which the npdm grants" % (declared.group(1), wanted))
+            % (declared, wanted, sac))
+    print("ok: %s asks for `%s`, which the npdm grants" % (declared, wanted))
     return 0
 
 
@@ -141,10 +151,8 @@ def phase_bounded(repo):
         if not re.search(r"\b" + call + r"\s*\(", body):
             continue
         if services is None:
-            declared = re.search(
-                r"__nx_time_service_type\s*=\s*(TimeServiceType_\w+)",
-                uncommented(read(repo, "sysmodule/source/main.cpp")))
-            services = [TIME_SERVICE.get(declared.group(1))] if declared else []
+            declared = declared_time_service(repo)
+            services = [TIME_SERVICE[declared]] if declared in TIME_SERVICE else []
         for service in services:
             if service not in waited:
                 failures += fail(

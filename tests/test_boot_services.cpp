@@ -19,7 +19,6 @@
 //
 // One scenario per CTest entry, selected by argv[1], so a failure names the
 // behaviour.
-#include <netdb.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -40,29 +39,18 @@ namespace http = rommsync::http;
 using rommsync::sysmodule::ConnectTo;
 using rommsync::sysmodule::Origin;
 
-constexpr int kSkip = 77;
-
-/// A name RFC 6761 reserves for "this never resolves". A resolver that answers
-/// it anyway -- a captive portal, an ISP that monetises NXDOMAIN -- makes the
-/// `unresolved` scenario a test of that resolver rather than of this code, so it
-/// skips rather than failing.
-constexpr const char* kNeverResolves = "rommsync-nx-no-such-host.invalid";
-
-bool ResolvesHere(const char* host) {
-  addrinfo hints{};
-  hints.ai_family = AF_INET;
-  hints.ai_socktype = SOCK_STREAM;
-  addrinfo* resolved = nullptr;
-  if (getaddrinfo(host, nullptr, &hints, &resolved) != 0 || resolved == nullptr) return false;
-  freeaddrinfo(resolved);
-  return true;
-}
-
 /// `ConnectTo` reaches a loopback server addressed **by name**.
 ///
 /// The point is the branch, not the connection: `inet_pton` answers a bare IPv4
 /// literal without any name service at all, so `127.0.0.1` would prove nothing
 /// about the path every `romm.local`, NAS name and DDNS name takes.
+///
+/// `localhost` and not some other name, because row 8 of the M0 exit gate says
+/// no test in this suite reaches off this machine (docs/TESTING.md) -- and a
+/// name chosen to *fail* would be the one that leaves: a query for a name that
+/// does not resolve is a query that goes to a resolver. `localhost` is answered
+/// from the host's own table, and it is the name `policy.loopback_only` already
+/// treats as loopback. So the branch is executed and nothing leaves.
 int Resolve(checks::Checks& checks) {
   rig::LoopbackServer server;
   if (!server.Start(1, [](int fd, std::size_t, const std::string&) {
@@ -84,30 +72,6 @@ int Resolve(checks::Checks& checks) {
   checks.Expect(fd >= 0, "connect to `localhost` -- " + message);
   if (fd >= 0) ::close(fd);
   server.Stop();
-  return checks.failures();
-}
-
-/// ...and says so, rather than reporting a connect failure, when the name is the
-/// thing that is wrong. `kUnresolvedHost` is what the overlay turns into "check
-/// the address" rather than "check the server".
-int Unresolved(checks::Checks& checks) {
-  if (ResolvesHere(kNeverResolves)) {
-    std::cerr << "SKIP: this resolver answers " << kNeverResolves << "\n";
-    return kSkip;
-  }
-  Origin origin;
-  origin.host = kNeverResolves;
-  origin.port = 80;
-  origin.tls = false;
-
-  http::Error error = http::Error::kNone;
-  std::string message;
-  const int fd = ConnectTo(origin, std::chrono::milliseconds(2000),
-                           std::chrono::milliseconds(2000), &error, &message);
-  checks.Expect(fd < 0, "a name that does not resolve must not produce a descriptor");
-  if (fd >= 0) ::close(fd);
-  checks.Expect(error == http::Error::kUnresolvedHost,
-                "an unresolvable host is kUnresolvedHost, not a connect failure");
   return checks.failures();
 }
 
@@ -219,10 +183,6 @@ int main(int argc, char** argv) {
   if (scenario == "resolve") return Resolve(checks) == 0 ? 0 : 1;
   if (scenario == "wait") return Wait(checks) == 0 ? 0 : 1;
   if (scenario == "journal") return JournalNotes(checks) == 0 ? 0 : 1;
-  if (scenario == "unresolved") {
-    const int rc = Unresolved(checks);
-    return rc == kSkip ? kSkip : (rc == 0 ? 0 : 1);
-  }
 
   std::cerr << "unknown scenario: " << scenario << "\n";
   return 2;

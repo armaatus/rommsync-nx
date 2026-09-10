@@ -317,12 +317,18 @@ class SmWaiter final : public rommsync::sysmodule::boot::Waiter {
   bool probed_ = true;
 };
 
+/// Whether `timeInitialize()` ran and succeeded. `__appExit` may not unwind what
+/// `__appInit` skipped: libnx's service guard counts, and an exit without an
+/// init takes the count below zero.
+bool g_time_up = false;
+
 /// Whether the "this sm will not answer 65100" note has already been taken. One
 /// note, not one per service: it is the same answer for every question that
 /// follows, and a journal full of it would push out the note that matters.
 bool g_sm_unaskable = false;
 
-/// Wait for `service`, and say so in the journal when it does not come.
+/// Wait for `service`, say so in the journal when it does not come, and answer
+/// whether the acquisition below may go ahead.
 ///
 /// Returns false on a timeout. What the caller does about that is the caller's:
 /// the services this process cannot run without abort, and the ones it can run
@@ -339,9 +345,9 @@ bool g_sm_unaskable = false;
 /// to the debug channel *before* the call that might park, and the acquisition
 /// proceeds exactly as it did before #195. The bound exists wherever the
 /// question can be asked, which is everywhere this ships.
-bool AwaitService(const char* service, rommsync::sysmodule::boot::Waiter& waiter) {
+bool MayProceedWith(const char* service, rommsync::sysmodule::boot::Waiter& waiter) {
   namespace boot = rommsync::sysmodule::boot;
-  const boot::Outcome outcome = boot::WaitFor(service, waiter, {});
+  const boot::Outcome outcome = boot::WaitFor(service, waiter);
   if (outcome.ready) return true;
 
   char line[boot::kMaxNoteBytes] = {};
@@ -367,20 +373,9 @@ bool AwaitService(const char* service, rommsync::sysmodule::boot::Waiter& waiter
 /// line, which is why a bounded wait that ends in an abort is strictly better
 /// than an unbounded one that ends in nothing.
 void RequireService(const char* service, rommsync::sysmodule::boot::Waiter& waiter) {
-  if (!AwaitService(service, waiter)) {
+  if (!MayProceedWith(service, waiter)) {
     diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_Timeout));
   }
-}
-
-/// One boot line at `warn`, to a debugger and to the card.
-///
-/// `warn` rather than `info` because the only lines that come through here are
-/// the journal's, and a journal note exists only when something did not come up
-/// (M9-1, #195). A user scanning the file for the first `warn` should land on
-/// the reason their console is degraded, not on the version line.
-void Warn(const std::string& line) {
-  svcOutputDebugString(line.c_str(), line.size());
-  rommsync::log::Warn(rommsync::log::Event::kBoot, line);
 }
 
 /// One boot line, to a debugger and to the card.
@@ -389,10 +384,18 @@ void Warn(const std::string& line) {
 /// is all this process had before M7-3 (#38); the log is what a *user* can read,
 /// and what docs/TROUBLESHOOTING.md asks them to attach. Both, because they
 /// reach different people and neither is a superset of the other.
-void Log(const std::string& line) {
+///
+/// `level` because the journal's lines are `warn` and everything else here is
+/// `info`: a journal note exists only when something did not come up (M9-1,
+/// #195), and a user scanning the file for the first `warn` should land on the
+/// reason their console is degraded rather than on the version line.
+void Log(rommsync::log::Level level, const std::string& line) {
   svcOutputDebugString(line.c_str(), line.size());
-  rommsync::log::Info(rommsync::log::Event::kBoot, line);
+  rommsync::log::Write(level, rommsync::log::Event::kBoot, line);
 }
+
+/// The `info` one, which is most of them.
+void Log(const std::string& line) { Log(rommsync::log::Level::kInfo, line); }
 
 }  // namespace
 
@@ -450,7 +453,7 @@ void __appInit(void) {
   // and fails on any initialiser without a `WaitForService` above it, so the
   // name in each call below is load-bearing.
   SmWaiter sm;
-  const auto WaitForService = [&sm](const char* service) { return AwaitService(service, sm); };
+  const auto WaitForService = [&sm](const char* service) { return MayProceedWith(service, sm); };
   const auto WaitForServiceOrAbort = [&sm](const char* service) { RequireService(service, sm); };
 
   // hosversionSet before anything version-gated is called; libnx assumes it.
@@ -524,6 +527,7 @@ void __appInit(void) {
     if (R_FAILED(rc)) {
       rommsync::sysmodule::boot::Note(g_boot, "rommsync: timeInitialize", rc);
     }
+    g_time_up = R_SUCCEEDED(rc);
   }
 
   // The transport, here rather than on first use, because a sysmodule does
@@ -540,10 +544,21 @@ void __appInit(void) {
   //
   // Four names, because `NetworkInitialize` opens four sessions: `nifm:u` for
   // the connection probe, `bsd:u` and `sfdnsres` for `socketInitialize`, and
-  // `ssl` for the TLS layer. All four have to be there before it is called at
-  // all -- it acquires them itself, so one missing name is one parked request --
-  // and the `&&` stops at the first that is not, rather than spending the budget
-  // four times over on a console that is plainly broken. The note names it.
+  // `ssl` for the TLS layer. **All four, including the probe**, and the `&&` is
+  // the whole of the reason: `NetworkInitialize` acquires them itself, so one
+  // name that is not registered is one request parked inside a call this
+  // function cannot bound from outside. Short-circuiting also stops a console
+  // that is plainly broken from spending the budget four times over; the note
+  // names whichever one it stopped at.
+  //
+  // A missing `nifm:u` therefore costs the transport as well, which reads like
+  // more than the probe is worth -- until you follow it: `NetworkUp` is the
+  // engine's network probe (`UseNetworkProbe`), and an engine whose probe never
+  // answers true never runs a tick. A console without `nifm:u` does not sync
+  // whether or not sockets came up, so bringing them up would buy nothing and
+  // cost a heap of transfer memory. The `ssl_http_client.cpp` comment about a
+  // nifm failure being survivable is about `nifmInitialize` *returning* an
+  // error, which is a different condition and stays true.
   //
   // It is the only `nifmInitialize` in this build --
   // there was a second one here until #195, and since libnx refcounts it, the
@@ -598,7 +613,7 @@ void __appInit(void) {
 void __appExit(void) {
   // `nifmExit` is `NetworkExit`'s, not ours: this process opens `nifm:u` once,
   // inside `NetworkInitialize` (#195).
-  timeExit();
+  if (g_time_up) timeExit();
   rommsync::sysmodule::NetworkExit();
   fsdevUnmountAll();
   fsExit();
@@ -648,10 +663,11 @@ int main(int, char**) {
   // still shows the reason on screen. Ordinarily there is nothing here and this
   // costs one comparison.
   for (std::size_t i = 0; rommsync::sysmodule::boot::NoteAt(g_boot, i) != nullptr; ++i) {
-    Warn(rommsync::sysmodule::boot::NoteAt(g_boot, i));
+    Log(rommsync::log::Level::kWarn, rommsync::sysmodule::boot::NoteAt(g_boot, i));
   }
   if (g_boot.dropped != 0) {
-    Warn("rommsync: " + std::to_string(g_boot.dropped) + " more boot notes were dropped");
+    Log(rommsync::log::Level::kWarn,
+        "rommsync: " + std::to_string(g_boot.dropped) + " more boot notes were dropped");
   }
 
   // A crash dump or a debug log that cannot say which build produced it costs

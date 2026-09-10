@@ -2212,8 +2212,10 @@ target_link_libraries(test_boot_services PRIVATE rommsync::host Threads::Threads
 target_include_directories(test_boot_services PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/sysmodule/source")
 
-# Needs no RomM and no Docker: the server it dials is the loopback one in
-# tests/loopback_server.hpp, on a port the kernel picks. So it never skips.
+# Needs no RomM, no Docker and no resolver: the server it dials is the loopback
+# one in tests/loopback_server.hpp, on a port the kernel picks, and `localhost`
+# is answered from the host's own table. So it never skips and nothing leaves
+# this machine -- which is row 8 of the M0 exit gate and `policy.*`'s promise.
 add_test(NAME boot.resolve COMMAND test_boot_services resolve)
 
 # Neither does the wait: `boot_wait.cpp` asks a `Waiter`, so the test is the `sm`
@@ -2222,15 +2224,7 @@ add_test(NAME boot.resolve COMMAND test_boot_services resolve)
 add_test(NAME boot.wait COMMAND test_boot_services wait)
 add_test(NAME boot.journal COMMAND test_boot_services journal)
 
-# ...except this one, and only where the resolver itself is the problem: a
-# captive portal or an ISP that answers NXDOMAIN with an address turns it into a
-# test of that resolver. It says so and skips rather than going red on a
-# network's bad manners.
-add_test(NAME boot.unresolved COMMAND test_boot_services unresolved)
-set_tests_properties(boot.unresolved PROPERTIES SKIP_RETURN_CODE 77)
-
-set_tests_properties(boot.resolve boot.unresolved boot.wait boot.journal
-                     PROPERTIES TIMEOUT 60)
+set_tests_properties(boot.resolve boot.wait boot.journal PROPERTIES TIMEOUT 60)
 
 set(SYSMODULE_BOOT_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_sysmodule_boot.py")
 foreach(scenario IN ITEMS dns clock bounded comments)

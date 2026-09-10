@@ -684,6 +684,20 @@ ctest --test-dir build --output-on-failure
   translation unit produced an aarch64 object. It skips when that image is not
   pulled — including under `ROMMSYNC_REQUIRE_RIG`, since the host CI runner does
   not have it and the `switch-build` job is the enforcement there.
+- The `boot.*` group is the sysmodule's `__appInit`, which nothing off a console
+  can execute -- which is how three separate bugs sat in twenty lines through
+  every green run (M9-1, #195). Half of it reads: `boot.dns`, `boot.clock`,
+  `boot.bounded` and `boot.comments` hold `sysmodule/source/main.cpp` against
+  `sysmodule/sys-rommsync.json`, so the `sm` session stays open for
+  `getaddrinfo`, the declared `TimeServiceType` matches the grant in the SAC,
+  every service acquisition has a bound in front of it, and neither of the two
+  false comments comes back. It reads the *tree* rather than the built `.nsp` on
+  purpose -- M9-3 (#196) lands that parser and it needs devkitPro, so it can only
+  run where `switch.builds` can. The other half runs: `boot.resolve` drives the
+  shipping connector at a host *name* through `posix_connection.cpp`, and
+  `boot.wait` and `boot.journal` drive the bounded wait against a fake `sm`, so a
+  ten-second budget is spent in accounting rather than in wall-clock. None of the
+  seven needs Docker, a rig, or a resolver, so none of them ever skips.
 - The `package.*` group covers `scripts/package.sh`, which turns those two build
   outputs into the zip a user unpacks onto their SD card. `package.layout`,
   `package.refuses`, `package.deterministic` and `package.upgrade` stub the two
