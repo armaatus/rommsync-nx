@@ -161,7 +161,7 @@ jobs:
 
       # Pinned to a commit, with the tag in the comment. A mutable tag is a
       # supply-chain hole: whoever can move `v1` can change what runs here.
-      - uses: anthropics/claude-code-action@d75b94d5ad426cb8546e6628b6f5f19b84e5cce1 # v1
+      - uses: anthropics/claude-code-action@9c5ddab2e6d17b83ea679153b31f1d5f023cf636 # v1
         if: steps.token.outputs.have_token == 'true'
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -505,7 +505,7 @@ jobs:
       # No `prompt:` on purpose -- the triggering comment IS the task. The
       # untrusted-input framing goes in through --append-system-prompt so it
       # layers on top of that comment rather than being replaced by it.
-      - uses: anthropics/claude-code-action@d75b94d5ad426cb8546e6628b6f5f19b84e5cce1 # v1
+      - uses: anthropics/claude-code-action@9c5ddab2e6d17b83ea679153b31f1d5f023cf636 # v1
         if: steps.token.outputs.have_token == 'true'
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
