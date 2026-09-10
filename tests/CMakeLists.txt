@@ -2163,7 +2163,8 @@ endforeach()
 # card), which is what makes "it compiles" stop being a description of what the
 # engine does. Needs no server: what it pins is the card.
 add_executable(test_engine test_engine.cpp
-  "${CMAKE_SOURCE_DIR}/sysmodule/source/engine.cpp")
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/engine.cpp"
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/power.cpp")
 target_link_libraries(test_engine PRIVATE rommsync::host)
 target_include_directories(test_engine PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/sysmodule/source")
@@ -2253,6 +2254,28 @@ foreach(scenario downloading preempts discards repoints shutdown)
     set_tests_properties(engine.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
   endif()
   set_tests_properties(engine.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+endforeach()
+
+# --- M9-4: the console going to sleep, and coming back -----------------------
+# `psc:m` is a service, so the console's `power::Module` cannot be reached from a
+# laptop -- but everything the module is FOR can be, and every one of those is a
+# console that hangs, crashes or sleeps with a save half written when it is
+# wrong: one acknowledgement per request, the quiesce BEFORE the acknowledgement,
+# two sleep states in a row being one suspend, and a state this build has never
+# heard of still being answered (#208).
+#
+# `power.cpp` is the portable half and is compiled here; `power_psc.cpp` is the
+# libnx one and is compiled by nothing but devkitPro, which is `card.cpp`'s
+# arrangement for `card.cpp`'s reason.
+add_executable(test_power test_power.cpp
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/power.cpp")
+target_link_libraries(test_power PRIVATE rommsync::host Threads::Threads)
+target_include_directories(test_power PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/sysmodule/source")
+
+foreach(scenario states once)
+  add_test(NAME power.${scenario} COMMAND test_power ${scenario})
+  set_tests_properties(power.${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
 
 # --- M9-1: what `__appInit` does, and what it cannot be asked ----------------
