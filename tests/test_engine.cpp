@@ -42,6 +42,8 @@
 //   drains    -- M9-5: a rom queued over IPC becomes a file on the card
 //   downloading -- M9-5: progress read over IPC mid-transfer, and the Dequeue
 //                  that stops it
+//   preempts  -- M9-5: a Sync now mid-transfer stops the drain rather than queuing
+//                behind it, and the rom resumes afterwards
 //   shutdown  -- M9-5: the destructor ends a transfer at a boundary, keeping the
 //                `.part` the next boot resumes from
 #include <chrono>
@@ -1830,11 +1832,11 @@ std::unique_ptr<fs::FileSystem> Card(const Console& console) {
 /// evidence about the download worker rather than about a tick that happened to
 /// run.
 bool Downloadable(Console& console, checks::Checks& c, const std::string& base,
-                  const harness::Fixture& fixture) {
+                  const harness::Fixture& fixture, bool sync_enabled = false) {
   if (!console.sandbox.Write("/config/rommsync/config.ini",
-                             "[server]\nurl = " + base +
-                                 "\n"
-                                 "\n[sync]\nenabled = false\ninterval_min = 0\non_boot = false\n")) {
+                             "[server]\nurl = " + base + "\n\n[sync]\nenabled = " +
+                                 (sync_enabled ? "true" : "false") +
+                                 "\ninterval_min = 0\non_boot = false\n")) {
     c.Expect(false, "the console is configured for the fixture RomM");
     return false;
   }
@@ -2023,6 +2025,92 @@ int DrainProgress(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// M9-5 (#197): "Sync now" does not wait out a 4 GB rom.
+///
+/// The other half of the interruptibility the issue asks for, and the half
+/// `engine.shutdown` does not cover: a drain and a sync tick are on the same
+/// thread by design, so a press that arrives mid-transfer has to stop the
+/// transfer rather than queue behind it. `RequestSync` fires the drain's cancel
+/// token in the same breath as `Scheduler::RequestNow`.
+///
+/// Asserted on the log rather than on a stopwatch: `download.drain the drain was
+/// stopped` is written on `DrainOutcome::kCanceled` and on nothing else, so its
+/// presence beside a tick that ran is exactly the sequence under test -- and it
+/// does not depend on the transfer still being unfinished when the assertion
+/// runs.
+int DrainPreempted(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+
+  rlog::Reset();
+  Throttled slow(client, std::chrono::milliseconds{1});
+
+  Console console(c, "engine-preempts");
+  // Sync **on** this time, and still parked -- `interval_min = 0` with no boot
+  // tick means the press is the only thing that can ever run one, which is what
+  // makes a tick that ran evidence about the press rather than about a timer.
+  if (!Downloadable(console, c, base, fixture, true)) {
+    return c.failures();
+  }
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseCard(card.get());
+  console.engine.UseServer(&slow, std::string());
+  console.Boot();
+
+  harness::Rom rom;
+  if (!harness::FindRom(client, base, fixture, "synthetic-large.gba", &rom)) {
+    c.Expect(false, "the seeded library holds synthetic-large.gba");
+    return c.failures();
+  }
+
+  std::int32_t position = 0;
+  c.Expect(console.Enqueue(rom.id, &position) == ipc::Error::kOk, "the 120 MiB rom is queued");
+  console.engine.StartWorker();
+
+  const ipc::Status moving = Until(
+      console,
+      [](const ipc::Status& status) {
+        return status.download.state == ipc::DownloadState::kDownloading &&
+               status.download.bytes_done > 0;
+      },
+      std::chrono::seconds{120});
+  c.Expect(moving.download.state == ipc::DownloadState::kDownloading,
+           "a transfer is in flight when the button is pressed");
+  c.Expect(!moving.sync_in_progress, "and no tick is running");
+
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, "Sync now is accepted");
+  const ipc::Status ticked = Until(
+      console,
+      [](const ipc::Status& status) { return status.last_sync_result != ipc::SyncResult::kNever; },
+      std::chrono::seconds{120});
+  c.Expect(ticked.last_sync_result != ipc::SyncResult::kNever,
+           "and the tick actually ran, rather than waiting for the rom to finish");
+
+  const ipc::LogTail tail = console.Log();
+  bool stopped = false;
+  for (const std::string& line : tail.lines) {
+    stopped = stopped || line.find("the drain was stopped") != std::string::npos;
+  }
+  c.Expect(stopped,
+           "because the drain was cancelled to make room for it, rather than run to the end "
+           "of a 120 MiB body:" + Rendered(tail));
+
+  // ...and the rom is not abandoned. The entry stays queued beside its `.part`,
+  // so the next pass of the worker's loop resumes it.
+  const ipc::Status after = Until(
+      console, [](const ipc::Status& status) { return status.queue_depth == 0; },
+      std::chrono::seconds{120});
+  c.ExpectEq(after.queue_depth, std::int64_t{0},
+             "the worker picks the transfer back up once the tick is done, and finishes it");
+  c.Expect(console.sandbox.Exists("/tico/roms/gba/synthetic-large.gba"),
+           "so the rom still arrives");
+  return c.failures();
+}
+
 /// M9-5 (#197): a shutdown mid-transfer ends at a boundary, not at the end of a
 /// 4 GB file.
 ///
@@ -2136,6 +2224,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"log_faults", LogsTransportFailures},
       {"drains", Drains},
       {"downloading", DrainProgress},
+      {"preempts", DrainPreempted},
       {"shutdown", DrainShutdown},
   };
   for (const RigScenario& scenario : kRigScenarios) {

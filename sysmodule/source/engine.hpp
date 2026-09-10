@@ -710,7 +710,7 @@ class SdEngine : public ipc::Engine {
   std::string config_dir_ = kConfigDir;
 
   /// `queue.json` was readable, so writing it back loses nothing. False only
-  /// after a read that failed on a file that is there -- see `Commit`.
+  /// after a read that failed on a file that is there -- see `queue_writable`.
   bool queue_trusted_ = true;
 
   /// The configuration in force, behind a pointer.

@@ -472,13 +472,16 @@ ipc::Error Queue::EnqueueLocked(std::int64_t rom_id, std::int32_t* position) {
 
 ipc::Error Queue::Remove(std::int64_t rom_id) {
   std::lock_guard<std::mutex> held(mutex_);
-  return RemoveLocked(rom_id);
+  return RemoveLocked(rom_id, nullptr);
 }
 
-ipc::Error Queue::RemoveLocked(std::int64_t rom_id) {
+ipc::Error Queue::RemoveLocked(std::int64_t rom_id, QueueEntry* removed) {
   const auto found = FindLocked(rom_id);
   if (found == entries_.end()) {
     return ipc::Error::kNotQueued;
+  }
+  if (removed != nullptr) {
+    *removed = *found;
   }
   entries_.erase(found);
   if (rom_id == last_finished_rom_id_) {

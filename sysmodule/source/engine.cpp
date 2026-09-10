@@ -1755,18 +1755,22 @@ ipc::Error SdEngine::Dequeue(std::int64_t rom_id) {
   if (!queue_writable()) {
     return ipc::Error::kWriteFailed;
   }
-  // Asked before the row goes, because afterwards there is nothing left to ask.
   // `download::Queue::Remove` deliberately does not interrupt the transfer in
   // flight -- the cancel token is the caller's to fire -- and this is the
   // caller: letting a 120 MiB body run to completion for a rom that is no
   // longer queued is the one thing a cancel may not cost (M9-5, #197).
-  const download::QueueEntry entry = queue_.Find(rom_id);
-  const bool in_flight = entry.rom_id == rom_id &&
-                         (entry.state == download::QueueState::kActive ||
-                          entry.state == download::QueueState::kVerifying);
+  //
+  // The row is read back **out of the removal**, not from a `Find` in front of
+  // it. A rom the worker picks up in between those two calls -- `kQueued` one
+  // instant and `kActive` the next -- would look idle to the question and be
+  // mid-transfer by the time it was answered, which is the whole transfer's
+  // worth of bytes this exists to stop.
+  download::QueueEntry removed;
   const ipc::Error answered = queue_.RemoveAndStore(
-      rom_id,
+      rom_id, &removed,
       [this](const std::vector<download::QueueEntry>& entries) { return WriteQueue(entries); });
+  const bool in_flight = removed.state == download::QueueState::kActive ||
+                         removed.state == download::QueueState::kVerifying;
   if (answered == ipc::Error::kOk && in_flight) {
     {
       std::lock_guard<std::mutex> lock(mutex_);

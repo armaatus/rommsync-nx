@@ -393,14 +393,18 @@ class Queue {
   /// Replace the whole queue. Entries past `kMaxQueueEntries` are dropped from
   /// the tail.
   ///
-  /// Two callers, and no third: a **load**, and the **rollback** of a change
-  /// whose write failed (`sysmodule::SdEngine::Commit`). The second is here
-  /// rather than done by reversing the change because reversing is not exact --
-  /// `Enqueue` erases a terminal entry to re-queue a rom, and a `Remove` that
-  /// put the new row back would lose the `failed` row a user is entitled to
-  /// still see. Anything else that replaces the whole queue is a bug: the
-  /// queue is the user's list, and the only things that shorten it are `Remove`
-  /// and `Clear`.
+  /// One caller, and no second: a **load**. The other one it used to have --
+  /// the rollback of a change whose write failed -- is `RestoreLocked`, which
+  /// M9-5 (#197) moved in here beside the change it undoes; a rollback that
+  /// reached this method could not put back `live_rom_id_` and the rest, and
+  /// could not be atomic against the download worker either.
+  ///
+  /// A rollback replaces the whole vector rather than reversing the change,
+  /// because reversing is not exact: `Enqueue` erases a terminal entry to
+  /// re-queue a rom, and a `Remove` that put the new row back would lose the
+  /// `failed` row a user is entitled to still see. Anything else that replaces
+  /// the whole queue is a bug: the queue is the user's list, and the only
+  /// things that shorten it are `Remove` and `Clear`.
   void Reset(std::vector<QueueEntry> entries);
 
   /// Entries the worker still has to do: everything not `Terminal`. This is the
@@ -513,11 +517,20 @@ class Queue {
     return ipc::Error::kWriteFailed;
   }
 
+  /// `removed`, when not null, is the row as it stood the instant before it
+  /// went. It is the only way to ask "was the worker transferring this one?"
+  /// with no window between the question and the answer, and `SdEngine::Dequeue`
+  /// needs exactly that: a rom that turns `kQueued` -> `kActive` between a
+  /// separate `Find` and this call would be taken out of the queue with its
+  /// transfer left running to completion for a rom nobody wants.
+  ///
+  /// Written even when the store then fails and the row comes back, so a caller
+  /// acts on it only after `kOk`.
   template <typename Store>
-  ipc::Error RemoveAndStore(std::int64_t rom_id, Store&& store) {
+  ipc::Error RemoveAndStore(std::int64_t rom_id, QueueEntry* removed, Store&& store) {
     std::lock_guard<std::mutex> held(mutex_);
     const Undo before = TakeUndoLocked();
-    const ipc::Error refused = RemoveLocked(rom_id);
+    const ipc::Error refused = RemoveLocked(rom_id, removed);
     if (refused != ipc::Error::kOk) {
       return refused;
     }
@@ -543,8 +556,9 @@ class Queue {
   }
 
  private:
-  /// Everything a failed write has to put back -- the rows, and the two pieces
-  /// of bookkeeping that are not on them (`live_rom_id_`, `last_finished_rom_id_`).
+  /// Everything a failed write has to put back -- the rows, and the three
+  /// fields of bookkeeping that are not on them (`live_rom_id_`,
+  /// `live_bytes_per_second_`, `last_finished_rom_id_`).
   struct Undo {
     std::vector<QueueEntry> entries;
     std::int64_t live_rom_id = 0;
@@ -563,7 +577,7 @@ class Queue {
   /// held, so the transactional forms above are the same code and cannot drift
   /// from the plain ones.
   ipc::Error EnqueueLocked(std::int64_t rom_id, std::int32_t* position);
-  ipc::Error RemoveLocked(std::int64_t rom_id);
+  ipc::Error RemoveLocked(std::int64_t rom_id, QueueEntry* removed);
   bool UpdateLocked(const QueueEntry& entry);
 
   /// The caller holds `mutex_`.
@@ -636,7 +650,7 @@ struct LoadedQueue {
   /// A card having a bad moment is not: the queue on it is probably intact, and
   /// a caller that wrote an empty one over it would turn "empty for this boot"
   /// into a user's pending downloads gone for good. Such a caller must refuse to
-  /// write instead (`sysmodule::SdEngine::Commit`).
+  /// write instead (`sysmodule::SdEngine::queue_writable`).
   bool trusted = true;
 
   /// Something in the file was lost: it was there and its contents could not be

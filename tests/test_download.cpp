@@ -559,13 +559,23 @@ void Transact(checks::Checks& c) {
              "and the row is exactly as it was, not half a transition ahead of the file");
 
   stored = false;
-  c.Expect(queue.RemoveAndStore(4, refuse) == ipc::Error::kWriteFailed,
+  QueueEntry taken;
+  c.Expect(queue.RemoveAndStore(4, &taken, refuse) == ipc::Error::kWriteFailed,
            "a removal the card refuses is a named failure");
   c.ExpectEq(queue.size(), std::size_t{1}, "and leaves the entry where it was");
-  c.Expect(queue.RemoveAndStore(4, accept) == ipc::Error::kOk, "the retry removes it");
+  c.Expect(queue.RemoveAndStore(4, &taken, accept) == ipc::Error::kOk, "the retry removes it");
   c.ExpectEq(queue.size(), std::size_t{0}, "once");
-  c.Expect(queue.RemoveAndStore(4, accept) == ipc::Error::kNotQueued,
-           "and taking out one that is not there says so");
+  // The row as it stood the instant before it went, which is what
+  // `SdEngine::Dequeue` decides "was the worker on this one?" from -- and it
+  // cannot be got from a `Find` in front of the removal without a window.
+  c.ExpectEq(taken.rom_id, std::int64_t{4}, "and hands back the row it took out");
+  c.Expect(taken.state == QueueState::kDone, "in the state it was in the instant before");
+
+  QueueEntry untouched;
+  untouched.rom_id = 77;
+  c.Expect(queue.RemoveAndStore(4, &untouched, accept) == ipc::Error::kNotQueued,
+           "taking out one that is not there says so");
+  c.ExpectEq(untouched.rom_id, std::int64_t{77}, "and leaves the caller's row alone");
 }
 
 void Corrupt(checks::Checks& c) {
