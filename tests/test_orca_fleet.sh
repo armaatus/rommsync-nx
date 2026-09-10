@@ -1030,10 +1030,16 @@ print(json.dumps({"result": {"worktrees": [
     ;;
   foundation_foreign)
     make_fixture ok
-    # A foundation issue lands alone, so it waits for `live` to reach 0. With
-    # the count unscoped that never happened: a worktree on another repo held
-    # every foundation issue forever, because nothing this fleet does can close
-    # one. This is that stall.
+    # A foundation issue lands alone, so the dispatcher holds it until `live`
+    # reaches 0 (the gate is `is_foundation && [ "$live" -gt 0 ]`). With the
+    # count unscoped that never happened: a worktree on another repo held every
+    # foundation issue forever, because nothing this fleet does can close one.
+    #
+    # This asserts the gate's two inputs rather than driving `cmd_run`. A
+    # dispatcher that HAS launched its foundation issue then polls until the
+    # work lands, by design -- so a phase that ran one would have to kill it,
+    # and an orphan holding the inherited stdout is time ctest spends waiting
+    # for a test that already finished (see hold_pidfile_with_dispatcher).
     cat >"$GH_ISSUES" <<'JSON'
 [{"number":196,"title":"the foundation one","body":"","labels":[{"name":"ready"},{"name":"foundation"}]}]
 JSON
@@ -1043,23 +1049,14 @@ print(json.dumps({"result": {"worktrees": [
     {"path": sys.argv[1] + "/foreign", "linkedIssue": 1, "repoPath": sys.argv[1] + "/other",
      "isMainWorktree": False, "isArchived": False}]}}))
 ' "$WORK" >"$ORCA_WORKTREES"
-    # In the background, and settled on whichever answer comes first: the stall
-    # this phase is about is a dispatcher that polls forever, so waiting for it
-    # to exit would report a CTest timeout instead of the reason. `cleanup`
-    # kills it on the way out either way.
-    ( in_fleet cmd_run --auto --max-prs 1 >"$WORK/run.log" 2>&1 ) &
-    HELD_PID=$!
-    wait_for_log "fleet up"
-    i=0
-    while [ "$i" -lt 100 ]; do
-      grep -q "worktree create" "$ORCA_CALLS" 2>/dev/null && break
-      grep -q "waiting for the other" "$WORK/run.log" 2>/dev/null && break
-      sleep 0.1; i=$((i + 1))
-    done
-    grep -q "waiting for the other" "$WORK/run.log" \
-      && fail "a foundation issue is waiting on a worktree this fleet cannot close: $(cat "$WORK/run.log")"
-    grep -q "worktree create" "$ORCA_CALLS" \
-      || fail "it started nothing at all, so the fleet is stalled: $(cat "$WORK/run.log")"
+    n="$(in_fleet live_count 2>&1)"
+    [ "$n" = 0 ] \
+      || fail "counted $n live worktree(s) with only another repo's open, so the foundation gate never opens"
+    out="$(in_fleet ready_issues 2>&1)"
+    grep -q "^196" <<<"$out" \
+      || fail "the foundation issue stopped being startable for some other reason, so the count above proves nothing: $out"
+    grep -q "foundation" <<<"$out" \
+      || fail "the fixture issue is not labelled foundation, so this phase asserts the wrong gate: $out"
     echo "ok: another repo's worktree does not hold a foundation issue"
     ;;
   queue_skips)
