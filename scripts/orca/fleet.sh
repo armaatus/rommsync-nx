@@ -245,7 +245,8 @@ owned_path()   { cat "$OWNED_DIR/$1" 2>/dev/null; }
 # issue that ever stalled. That is the root fix; the two exits in
 # enforce_timebox tidying up after themselves is the belt.
 clear_issue_markers() {
-  rm -f "$STATE_DIR/stalled-$1" "$STATE_DIR/stall-labels-$1" \
+  rm -f "$STATE_DIR/foundation-wait-$1" \
+        "$STATE_DIR/stalled-$1" "$STATE_DIR/stall-labels-$1" \
         "$STATE_DIR/box-labels-$1" "$STATE_DIR/queue-labels-$1" \
         "$STATE_DIR/unreachable-$1" "$STATE_DIR/human-step-$1" \
         "$STATE_DIR/held-$1" "$STATE_DIR/stuck-$1" \
@@ -286,7 +287,9 @@ disown_issue() {
 # `--git-common-dir` is the resolution: in a linked worktree it is the main
 # checkout's `.git`, and in the main checkout it is its own. If git cannot say,
 # fall back to this checkout rather than to an unscoped listing -- unscoped is
-# the bug (#212), and a selector that does not resolve fails loudly.
+# the bug (#212). That fallback is not itself an error path: it returns a
+# selector like any other, and if it does not name a repo the CLI is what
+# refuses it, which fails the listing rather than widening it.
 repo_selector() {
   local common
   common="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute \
@@ -332,6 +335,31 @@ for w in worktrees:
   local rc=$?
   rm -f "$out"
   return $rc
+}
+
+# What a foundation issue is actually waiting for, as `#N` where the worktree is
+# linked to an issue and a basename where it is not -- a count alone names
+# nothing a person can go and land.
+waiting_worktrees() {
+  local list; list="$(live_worktrees)" || { printf 'worktrees it could not list\n'; return 0; }
+  printf '%s\n' "$list" | while IFS="$(printf '\t')" read -r num path; do
+    [ -n "$path" ] || continue
+    if [ "$num" = "-" ]; then printf '%s ' "$(basename "$path")"; else printf '#%s ' "$num"; fi
+  done | sed 's/ $//'
+}
+
+# The line to say when a foundation issue is held, or nothing (1) when it has
+# already been said about this same set of worktrees. A bare count repeated every
+# poll is what #212 looked like from the outside for 47 minutes: it named nothing
+# to act on, so a wait that could never end read the same as one about to. The
+# marker is the SET, not a flag, so the line comes back when what it is waiting
+# on changes -- which is news -- and stays quiet while it does not.
+foundation_wait_notice() {
+  local waiting_on; waiting_on="$(waiting_worktrees)"
+  [ "$(cat "$STATE_DIR/foundation-wait-$1" 2>/dev/null)" = "$waiting_on" ] && return 1
+  mkdir -p "$STATE_DIR"
+  printf '%s\n' "$waiting_on" >"$STATE_DIR/foundation-wait-$1"
+  printf '#%s is a foundation issue and lands alone; waiting for %s\n' "$1" "$waiting_on"
 }
 
 # Prints the count, or fails. A caller that cannot tell how many are running
@@ -1995,8 +2023,14 @@ while that one is up."
           # A foundation issue defines an interface later issues include, so it
           # lands alone: three worktrees each inventing their own version of a
           # shared header is the one merge conflict worth serialising to avoid.
+          #
+          # Named, and said once. A bare count repeated every poll is what #212
+          # looked like from the outside for 47 minutes -- it does not say what
+          # would end the wait, so there is nothing to act on and nothing to
+          # notice when the set changes. The marker is cleared when it does, so
+          # the next line is news rather than the same line again.
           if is_foundation "$l" && [ "$live" -gt 0 ]; then
-            say "#$n is a foundation issue; waiting for the other $live worktree(s) to land"
+            local notice; notice="$(foundation_wait_notice "$n")" && say "$notice"
             break
           fi
           picked="$n"; title="$t"; labels="$l"

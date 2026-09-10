@@ -75,6 +75,12 @@
 #                                     in the log.
 #   test_orca_fleet.sh timebox_stops  past the box, no PR, unlabelled -> still
 #                                     interrupted and still commented on.
+#   test_orca_fleet.sh foundation_names_wait
+#                                     a held foundation issue names the
+#                                     worktrees it waits on, and says it once.
+#   test_orca_fleet.sh foundation_wait_changes
+#                                     ...and says it again when that set
+#                                     changes, which a flag would not.
 #   test_orca_fleet.sh live_scoped    the live count, and what reads as in
 #                                     flight, are THIS repository's. A worktree
 #                                     open on another repo took a slot and, via
@@ -1093,6 +1099,56 @@ print(json.dumps({"result": {"worktrees": [
       || fail "the fixture issue is not labelled foundation, so this phase asserts the wrong gate: [$labels]"
     echo "ok: another repo's worktree does not hold a foundation issue"
     ;;
+  foundation_names_wait)
+    make_fixture ok
+    # Two worktrees of ours, one of them with no linked issue. A count says
+    # "2"; this says which two, so a person can see what would end the wait --
+    # and #212 was 47 minutes of a line that could not.
+    python3 -c '
+import json, sys
+print(json.dumps({"result": {"worktrees": [
+    {"path": sys.argv[1] + "/wt", "linkedIssue": 42, "repoPath": sys.argv[1] + "/repo",
+     "isMainWorktree": False, "isArchived": False},
+    {"path": sys.argv[1] + "/loose-one", "linkedIssue": None, "repoPath": sys.argv[1] + "/repo",
+     "isMainWorktree": False, "isArchived": False}]}}))
+' "$WORK" >"$ORCA_WORKTREES"
+    out="$(in_fleet foundation_wait_notice 196 2>&1)"
+    grep -q "#42" <<<"$out" \
+      || fail "it did not name the worktree it is waiting on: $out"
+    grep -q "loose-one" <<<"$out" \
+      || fail "a worktree with no linked issue went unnamed, so the count and the names disagree: $out"
+    grep -qE '\bfor 2 worktree' <<<"$out" \
+      && fail "it is still saying a count: $out"
+    # ...and it is news, not a heartbeat: the same set says nothing.
+    if out2="$(in_fleet foundation_wait_notice 196 2>&1)"; then
+      fail "it said the same thing again for an unchanged set: $out2"
+    fi
+    echo "ok: the wait is named, and said once"
+    ;;
+  foundation_wait_changes)
+    make_fixture ok
+    python3 -c '
+import json, sys
+print(json.dumps({"result": {"worktrees": [
+    {"path": sys.argv[1] + "/wt", "linkedIssue": 42, "repoPath": sys.argv[1] + "/repo",
+     "isMainWorktree": False, "isArchived": False}]}}))
+' "$WORK" >"$ORCA_WORKTREES"
+    in_fleet foundation_wait_notice 196 >/dev/null 2>&1 \
+      || fail "the first notice said nothing, so this phase asserts nothing"
+    # One of them lands. That is the thing worth hearing about, and a flag
+    # rather than the set would have stayed silent through it.
+    python3 -c '
+import json, sys
+print(json.dumps({"result": {"worktrees": [
+    {"path": sys.argv[1] + "/wt2", "linkedIssue": 51, "repoPath": sys.argv[1] + "/repo",
+     "isMainWorktree": False, "isArchived": False}]}}))
+' "$WORK" >"$ORCA_WORKTREES"
+    out="$(in_fleet foundation_wait_notice 196 2>&1)" \
+      || fail "the set changed and it stayed quiet, so the log never says what it is waiting on now"
+    grep -q "#51" <<<"$out" \
+      || fail "it repeated the old set rather than the current one: $out"
+    echo "ok: a changed wait is said again"
+    ;;
   queue_skips)
     make_fixture ok
     cat >"$GH_ISSUES" <<'JSON'
@@ -2012,6 +2068,6 @@ print(json.dumps({"result": {"worktrees": [
     echo "ok: a dispatcher too old to see the drain is not drained in silence"
     ;;
   *)
-    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|live_scoped|foundation_foreign|status_worktree_scope|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind|status_stale|status_current|status_unrecorded|status_from_worktree|status_draining|status_stopped|status_drained|status_behind|status_behind_revert|status_unreadable|status_names_root|run_refuses|run_stale_recycled|run_stale_gone|status_recycled|stop_spares_stranger|stop_stops_dispatcher|run_blind_ps|status_blind_ps|stop_blind_ps|drain_ends_on_merge|drain_after_stop|stop_writes_drain|stop_now_writes_both|drain_lets_agents_finish|stop_freezes_agents|drain_launches_nothing|resume_clears_both|stop_drain_blind_dispatcher" >&2
+    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|foundation_names_wait|foundation_wait_changes|live_scoped|foundation_foreign|status_worktree_scope|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind|status_stale|status_current|status_unrecorded|status_from_worktree|status_draining|status_stopped|status_drained|status_behind|status_behind_revert|status_unreadable|status_names_root|run_refuses|run_stale_recycled|run_stale_gone|status_recycled|stop_spares_stranger|stop_stops_dispatcher|run_blind_ps|status_blind_ps|stop_blind_ps|drain_ends_on_merge|drain_after_stop|stop_writes_drain|stop_now_writes_both|drain_lets_agents_finish|stop_freezes_agents|drain_launches_nothing|resume_clears_both|stop_drain_blind_dispatcher" >&2
     exit 2 ;;
 esac

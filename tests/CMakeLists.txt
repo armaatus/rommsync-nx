@@ -1585,6 +1585,7 @@ foreach(phase card_says card_quiet remove_forces remove_advice
               merged_unknown_git merged_cli_silent remove_scoped_sweep
               stall_expected stall_reports timebox_waits timebox_stops queue_skips
               live_scoped foundation_foreign status_worktree_scope
+              foundation_names_wait foundation_wait_changes
               list_declines timebox_rearms labels_unknown outage_once one_lookup
               timebox_clears stop_clears own_clears one_card
               abandon_blocked abandon_closed abandon_human_step
