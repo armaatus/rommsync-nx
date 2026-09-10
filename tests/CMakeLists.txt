@@ -2313,8 +2313,13 @@ endforeach()
 # Reads the tree rather than the built `.nsp`, for `boot.*`'s reason: the
 # constants and the comment are in the source, so this runs on every push
 # everywhere, with no devkitPro and no cross-compile.
+#
+# `prose` is the one that reads the rest of the tree rather than `main.cpp`, and
+# it exists because #207 raised `kInnerHeapSize` twice while it was open and the
+# second raise left seven files quoting the intermediate value -- two of them
+# already corrected once in the same branch.
 set(HEAP_BUDGET_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_heap_budget.py")
-foreach(scenario IN ITEMS rows pinned margin dirs)
+foreach(scenario IN ITEMS rows pinned margin dirs prose)
   add_test(NAME heap.${scenario}
            COMMAND ${Python3_EXECUTABLE} "${HEAP_BUDGET_TEST}" ${scenario}
                    --repo "${CMAKE_SOURCE_DIR}")

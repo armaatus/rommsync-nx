@@ -41,7 +41,7 @@ ROW = re.compile(
 # The one sentence that states what is left over. Written once, on purpose.
 MARGIN = re.compile(r"leaves (?P<bytes>0x[0-9A-Fa-f]+) -- (?P<kib>\d+) KiB")
 
-# `constexpr size_t kInnerHeapSize = 0x100000;`
+# `constexpr size_t kInnerHeapSize = 0x150000;`
 HEAP = re.compile(r"constexpr\s+size_t\s+kInnerHeapSize\s*=\s*(0x[0-9A-Fa-f]+)\s*;")
 
 # `static_assert(kHeapLogTail == 0x1800,`
@@ -200,11 +200,76 @@ def phase_dirs(repo):
     return 0
 
 
+# A line that talks about the heap, and the hex literals on it. The window is
+# deliberately narrow: `kHeapStateBaseline` (0x40000) and `kHeapListResponse`
+# (0x7D000) are legitimately quoted beside the heap and are not it, while every
+# value `kInnerHeapSize` has ever held -- 0x80000, 0xC0000, 0x100000, 0x150000 --
+# sits inside it.
+HEAP_LINE = re.compile(r"inner heap|kInnerHeapSize|[Tt]he heap is")
+HEX = re.compile(r"0x[0-9A-Fa-f]+")
+HEAP_SIZE_MIN = 0x80000
+HEAP_SIZE_MAX = 0x400000
+
+# Where prose about the heap lives. `main.cpp` is excluded because the first
+# three phases are already the authority on it, and vendored trees because their
+# comments are upstream's.
+PROSE_ROOTS = ("core", "sysmodule", "docs", "tests", "host")
+PROSE_SUFFIXES = (".hpp", ".cpp", ".md", ".py", ".sh")
+# This file names every value the constant has ever held, one sentence above.
+PROSE_EXCLUDED = ("sysmodule/source/main.cpp", "tests/test_heap_budget.py",
+                  "overlay/lib", "/lib/", "/build/")
+
+
+def phase_prose(repo):
+    import os
+    source = read(repo, MAIN)
+    heap = HEAP.search(source)
+    if heap is None:
+        return fail("no `constexpr size_t kInnerHeapSize = 0x...;` in %s (#207)" % MAIN)
+    size = int(heap.group(1), 16)
+    failures = 0
+    scanned = 0
+    for root in PROSE_ROOTS:
+        for base, _, names in os.walk(os.path.join(repo, root)):
+            for name in names:
+                path = os.path.join(base, name)
+                relative = os.path.relpath(path, repo)
+                if not relative.endswith(PROSE_SUFFIXES):
+                    continue
+                if any(skip in "/" + relative for skip in PROSE_EXCLUDED):
+                    continue
+                scanned += 1
+                try:
+                    lines = open(path, "r", encoding="utf-8").read().splitlines()
+                except (UnicodeDecodeError, OSError):
+                    continue
+                for number, line in enumerate(lines, 1):
+                    if not HEAP_LINE.search(line):
+                        continue
+                    for token in HEX.findall(line):
+                        value = int(token, 16)
+                        if not HEAP_SIZE_MIN <= value <= HEAP_SIZE_MAX:
+                            continue
+                        if value != size:
+                            failures += fail(
+                                "%s:%d says the heap is %s and %s says it is %s. "
+                                "Nothing but this phase reads that sentence, and a bound "
+                                "sized against it would be off by %d KiB (#207)"
+                                % (relative, number, token, MAIN, hex(size),
+                                   abs(value - size) // 1024))
+    if failures:
+        return 1
+    print("ok: %d files scanned, none quoting a heap size other than %s"
+          % (scanned, hex(size)))
+    return 0
+
+
 PHASES = {
     "rows": phase_rows,
     "pinned": phase_pinned,
     "margin": phase_margin,
     "dirs": phase_dirs,
+    "prose": phase_prose,
 }
 
 

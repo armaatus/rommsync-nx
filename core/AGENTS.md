@@ -27,7 +27,7 @@ break by accident.
   `sysmodule/sys-rommsync.json` sets `main_thread_stack_size` to `0x8000` — 32
   KiB, raised from the template's `0x4000` by M1-7 (#126) because
   `json::kMaxDepth` is 64 and `SdEngine::Load` parses documents off a card on
-  that thread — and the inner heap is `0x100000` (1 MiB). **All** of that 32 KiB
+  that thread — and the inner heap is `0x150000` (1.3 MiB). **All** of that 32 KiB
   is spoken for by the deepest parse, not half of it: 64 levels at 496 bytes a
   level is 31,744, which is #216's to settle. A worker thread does not get this
   number at all — it gets `sysmodule::kThreadStackBytes`, 128 KiB out of the heap

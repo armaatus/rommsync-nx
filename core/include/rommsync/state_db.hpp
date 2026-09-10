@@ -100,11 +100,11 @@ inline constexpr int kFormatVersion = 2;
 /// A bound larger than the heap is not a bound -- it is a `bad_alloc` with a
 /// constant next to it. The arithmetic, from
 /// [docs/DEVELOPMENT.md](../../../docs/DEVELOPMENT.md#tls-in-a-sysmodule):
-/// `kInnerHeapSize` is `0x100000` (1 MiB) since M9-2 (#207) -- M1-7 (#126) made
+/// `kInnerHeapSize` is `0x150000` (1.3 MiB) since M9-2 (#207) -- M1-7 (#126) made
 /// it a number somebody derived rather than devkitPro's template default, and
 /// #207 re-derived it once the two thread stacks and the open-directory cache
 /// had terms -- and the trimmed socket transfer memory takes 116 KiB of it,
-/// leaving **~908 KiB** for everything else
+/// leaving **~1.2 MiB** for everything else
 /// -- which is the download buffer *and* this. Loading a baseline costs the file's
 /// text and then the parsed `Baseline`, whose per-row `std::string`s each
 /// exceed the 15-character small-string buffer and land on the heap, so the map

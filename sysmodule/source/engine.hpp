@@ -255,7 +255,7 @@ class SdEngine : public ipc::Engine {
   /// **It is one thread, not two.** `sync::RunTick` and `lists::Service::Pump`
   /// both want a thread that is not the IPC one and neither wants a thread of
   /// its own: a list page is one request and a tick is a handful, and two
-  /// threads would cost two more stacks out of the 1 MiB inner heap to serialise
+  /// threads would cost two more stacks out of the 1.3 MiB inner heap to serialise
   /// on the same `http::HttpClient` anyway. A stack is `kThreadStackBytes` and
   /// the heap's table has a row for exactly the two this class starts
   /// (`kHeapThreadStacks`, `main.cpp`), so a third is a visible cost rather than
