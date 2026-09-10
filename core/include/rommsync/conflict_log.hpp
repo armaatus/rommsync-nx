@@ -81,7 +81,7 @@ inline constexpr int kFormatVersion = 1;
 ///
 /// Sized against the sysmodule's heap the way `state::kMaxRecords` is, and
 /// deliberately far smaller: `state.db` holds a row per save on the card and
-/// peaks near 240 KiB of the ~390 KiB left after the socket transfer memory
+/// peaks near 240 KiB of the ~1.2 MiB left after the socket transfer memory
 /// (docs/DEVELOPMENT.md#m0-1-the-measurement-and-the-decision), so this has to
 /// fit in what is left over beside it *and* beside a transfer.
 ///

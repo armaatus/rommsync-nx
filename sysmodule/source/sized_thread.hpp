@@ -88,9 +88,17 @@ class SizedThread {
   SizedThread(const SizedThread&) = delete;
   SizedThread& operator=(const SizedThread&) = delete;
 
-  /// Start `Method` on `self`, on a thread with `kThreadStackBytes` of stack.
-  /// False when the thread could not be created, which is the caller's to
-  /// report -- there is nothing to throw and nobody to catch it.
+  /// Start `Method` on `self`, on a thread with `kThreadStackBytes` of stack --
+  /// or, where a host refuses that size, with the platform's default. False when
+  /// the thread could not be created at all, which is the caller's to report:
+  /// there is nothing to throw and nobody to catch it.
+  ///
+  /// **`joinable()` is what tells the two falses apart.** A second `Start` on a
+  /// running thread also answers false rather than replacing the one that is
+  /// there, and a caller that has not checked `joinable()` first would read that
+  /// as a failure. Both callers in `engine.cpp` check, because both are also
+  /// answering "has this already been started" -- so the guard here is the one
+  /// that stops a double call leaking a thread, not the one anybody reads.
   template <auto Method, typename T>
   bool Start(T* self) {
     if (started_) {
@@ -100,17 +108,34 @@ class SizedThread {
     if (::pthread_attr_init(&attributes) != 0) {
       return false;
     }
-    const bool ok = ::pthread_attr_setstacksize(&attributes, kThreadStackBytes) == 0 &&
-                    ::pthread_create(&handle_, &attributes, &Enter<Method, T>, self) == 0;
+    // **A refused size falls back to the platform's default rather than to no
+    // thread at all.** On Horizon it cannot be refused: the only reason
+    // `__syscall_thread_create` returns `EINVAL` for a size is the low twelve
+    // bits, and the `static_assert` above rules that out -- so the fallback is
+    // unreachable there and the console always gets the budgeted stack. Off the
+    // console it is reachable: glibc's floor is `PTHREAD_STACK_MIN`, which on
+    // aarch64 Linux is exactly 128 KiB, and it carves the static TLS block out
+    // of whatever it is given. Degrading a host test run to "the worker never
+    // started, nothing syncs" over that would be a worse failure than the
+    // platform default `std::thread` used to take.
+    const bool sized = ::pthread_attr_setstacksize(&attributes, kThreadStackBytes) == 0;
+    bool ok = sized && ::pthread_create(&handle_, &attributes, &Enter<Method, T>, self) == 0;
+    if (!sized) {
+      ok = ::pthread_create(&handle_, nullptr, &Enter<Method, T>, self) == 0;
+    }
     ::pthread_attr_destroy(&attributes);
     started_ = ok;
     return ok;
   }
 
-  /// Whether there is a thread to join. Named as `std::thread` names it, because
-  /// both call sites read as a guard against starting twice.
+  /// Whether there is a thread to join. `joinable` and `join` are named as
+  /// `std::thread` names them, because both call sites in `engine.cpp` were
+  /// written against that spelling and mean exactly the same thing by it.
   bool joinable() const { return started_; }
 
+  /// Wait for the thread to finish. Safe on one that was never started, and
+  /// leaves this no longer joinable -- so a second `join` is a no-op rather than
+  /// undefined, which is what `std::thread` would have made it.
   void join() {
     if (started_) {
       ::pthread_join(handle_, nullptr);

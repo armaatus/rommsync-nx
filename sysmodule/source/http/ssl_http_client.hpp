@@ -32,7 +32,7 @@ namespace rommsync::sysmodule {
 /// The TCP numbers are the M0-1 probe's (`tlsprobe/source/probe.hpp`); the UDP
 /// ones are **not**, and the difference is deliberate rather than a typo. The
 /// probe kept libnx's default 0xA500 receive buffer, which costs 39 KiB of a
-/// 512 KiB heap for traffic this process never sends: name resolution on Horizon
+/// 1.3 MiB heap for traffic this process never sends: name resolution on Horizon
 /// goes through the `sfdnsres` *service*, not through a UDP socket of ours, so
 /// what is left is the DNS a `getaddrinfo` fallback would do -- 9 KiB is several
 /// times the largest answer either can produce.

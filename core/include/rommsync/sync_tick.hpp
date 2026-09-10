@@ -62,7 +62,7 @@ namespace rommsync::sync {
 ///
 /// The same bound `state::kMaxDiagnostics` draws and for the same reason: a card
 /// that will not delete anything must cost a bounded amount of memory on a
-/// 512 KiB heap, not one string per file (core/AGENTS.md). The counts stay honest
+/// 1.3 MiB heap, not one string per file (core/AGENTS.md). The counts stay honest
 /// past it.
 inline constexpr std::size_t kMaxRecoveryWarnings = 16;
 

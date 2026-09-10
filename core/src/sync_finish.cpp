@@ -222,7 +222,7 @@ BaselineUpdate AdvanceBaseline(state::Baseline previous, const SyncPlan& plan,
   // Moved, not copied. `kMaxStateBytes` of rows costs more parsed than it does
   // as text (state_db.hpp), and holding the old baseline and the new one at once
   // -- on the tick that also holds the plan, the report and a directory listing
-  // -- is a peak the 512 KiB inner heap does not have to spare.
+  // -- is a peak the 1.3 MiB inner heap does not have to spare.
   update.value = std::move(previous);
 
   // What the tick told the server about each local save. Still exactly right

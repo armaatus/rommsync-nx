@@ -152,10 +152,11 @@ guess, and is still wrong to make now.
   narrowed to what the engine actually opens. It is also the capability with the
   most reach in a project whose second hard rule is about not destroying a
   player's save.
-- **Heap and capabilities, settled.** `kInnerHeapSize` is `0xC0000` (768 KiB)
+- **Heap and capabilities, settled.** `kInnerHeapSize` is `0x100000` (1 MiB)
   and is derived term by term in the table above the constant in
   `source/main.cpp`, where a `static_assert` fails the build rather than the
-  console if a term outgrows it. The dominant term is the bsd transfer memory,
+  console if a term outgrows it and `ctest -R heap` fails when the table, the
+  constants and the prose stop agreeing (M9-2, #207). The dominant term is the bsd transfer memory,
   which `socketInitialize` takes out of that heap: the config in
   `source/http/ssl_http_client.hpp` needs **116 KiB**, and libnx's default needs
   **2.25 MiB** and cannot fit at all — so `socketInitializeDefault()` is the one

@@ -15,7 +15,7 @@
 // collision resistance may use this; `crypto::Sha256` is next door.
 //
 // `Sha1Hasher` is incremental because a rom is gigabytes and the sysmodule's
-// inner heap is 512 KiB: `Sha1FileHex` feeds it a chunk at a time rather than
+// inner heap is 1.3 MiB: `Sha1FileHex` feeds it a chunk at a time rather than
 // reading the file whole.
 #pragma once
 
@@ -79,7 +79,7 @@ std::string Sha1Hex(std::string_view data);
 /// Stream `path` through SHA-1 and answer 40 lowercase hex characters.
 ///
 /// Chunked rather than read whole (`crypto::StreamFile`, hash_file.hpp): a rom
-/// is gigabytes and the sysmodule heap is 512 KiB, so a version of this that
+/// is gigabytes and the sysmodule heap is 1.3 MiB, so a version of this that
 /// buffered the file would be a `bad_alloc` on the console and a green test on a
 /// laptop.
 ///

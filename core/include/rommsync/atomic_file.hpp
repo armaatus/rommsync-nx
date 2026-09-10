@@ -10,7 +10,7 @@
 // `WriteAtomically` is not for a *large* file: it takes the contents as a
 // `string_view`, so the whole record is in memory. `CopyAtomically` is the same
 // guarantee for a file that will not fit -- a save state is tens of megabytes
-// and the sysmodule's inner heap is 512 KiB -- and it streams. Downloads stage
+// and the sysmodule's inner heap is 1.3 MiB -- and it streams. Downloads stage
 // through `http::DownloadTarget`'s own `.part` file and land with
 // `CommitStaged`.
 #pragma once
@@ -264,7 +264,7 @@ struct CopyResult {
 ///
 /// Streamed through a 4 KiB stack chunk rather than read whole, which is the
 /// difference between this and `WriteAtomically(to, ReadFile(from).contents)`:
-/// the file being copied is a *save*, the sysmodule's inner heap is 512 KiB,
+/// the file being copied is a *save*, the sysmodule's inner heap is 1.3 MiB,
 /// and buffering a save state would be a `bad_alloc` on the console and a green
 /// test on a laptop (core/AGENTS.md).
 ///

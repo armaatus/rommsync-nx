@@ -176,6 +176,36 @@ phase_builds() {
   grep -q 'rommsync::version()' "$SCRATCH/sysmodule/build/sys-rommsync.lst" ||
     fail "no core/ symbol in the linked sysmodule"
 
+  # M9-2 (#207): the heap is a `.bss` array, so the linked image is the one
+  # place that says how big it really is. Everything else about the budget --
+  # the table, the terms, the margin -- is source checked against source
+  # (`ctest -R heap`); this is the measurement, taken with the toolchain's own
+  # `size` the way #207's design note asks for.
+  #
+  # `.bss` is `kInnerHeapSize` plus every other file-scope object the process
+  # has, so the assertion is that the two are within a slack of each other: a
+  # heap that grew without the constant moving, and a constant that moved
+  # without the heap, both land here. M9-15 (#204) is the CI ceiling on the
+  # absolute number; this is only the tie between the two.
+  local declared bss slack
+  declared="$(sed -n 's/^constexpr size_t kInnerHeapSize = \(0x[0-9A-Fa-f]*\);.*/\1/p' \
+      "$REPO_ROOT/sysmodule/source/main.cpp")"
+  [ -n "$declared" ] || fail "no kInnerHeapSize in sysmodule/source/main.cpp"
+  bss="$(docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work "$IMAGE" \
+        bash -lc '"$DEVKITPRO"/devkitA64/bin/aarch64-none-elf-size -A sysmodule/sys-rommsync.elf' |
+      awk '$1 == ".bss" { print $2 }')"
+  [ -n "$bss" ] || fail "aarch64-none-elf-size reported no .bss for the sysmodule"
+  slack=$(( 64 * 1024 ))
+  if [ "$bss" -lt "$(( declared ))" ]; then
+    fail "the linked sysmodule reserves $bss bytes of .bss and main.cpp declares a \
+$(( declared ))-byte inner heap; the heap is not in .bss"
+  fi
+  if [ "$(( bss - declared ))" -gt "$slack" ]; then
+    fail "the linked sysmodule's .bss is $bss bytes against a declared inner heap of \
+$(( declared )); $(( bss - declared )) bytes of that is something other than the heap, \
+which is more than the $slack this check allows (#207, #204)"
+  fi
+
   # The sysmodule hosts the service the overlay opens (M4-1). Nothing in this
   # repo can run it before the M8-1 gate, so this is the only automated check
   # that the loop is still in the image at all.
@@ -217,7 +247,8 @@ phase_builds() {
     { cat "$log" >&2; fail "the duplicate basename went unreported"; }
   rm -f "$SCRATCH/sysmodule/source/json.cpp"
 
-  echo "ok: .nsp and .ovl built, signed, hosting and drawing, carrying core/ $version"
+  echo "ok: .nsp and .ovl built, signed, hosting and drawing, carrying core/ $version;\
+    .bss $bss against a declared inner heap of $(( declared ))"
 }
 
 

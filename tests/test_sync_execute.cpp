@@ -238,7 +238,7 @@ void Naming(rig::Checks& checks) {
 //
 // The two `io` primitives an overwrite goes through. `CopyAtomically` is how a
 // save is backed up -- streamed, because `WriteAtomically` takes the contents as
-// a `string_view` and a save state does not fit in a 512 KiB heap -- and
+// a `string_view` and a save state does not fit in a 1.3 MiB heap -- and
 // `CommitStaged` is how the downloaded bytes take its place.
 
 void Staging(rig::Checks& checks) {

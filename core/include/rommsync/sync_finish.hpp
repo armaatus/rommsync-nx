@@ -146,7 +146,7 @@ struct BaselineUpdate {
 /// `state::kMaxStateBytes` worth of parsed rows -- more than that, since a row
 /// costs more parsed than as text -- on the same tick that is already holding
 /// the plan, the report, the reported saves and a directory listing, against a
-/// 512 KiB inner heap (state_db.hpp, core/AGENTS.md).
+/// 1.3 MiB inner heap (state_db.hpp, core/AGENTS.md).
 BaselineUpdate AdvanceBaseline(state::Baseline previous, const SyncPlan& plan,
                                const ExecutionReport& report,
                                const std::vector<ClientSaveState>& reported,

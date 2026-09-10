@@ -187,6 +187,14 @@ def phase_dirs(repo):
         return fail("__nx_fsdev_direntry_cache_size is %s, which is libnx's default or worse; "
                     "that is 784 * %s bytes per open DIR out of this heap (#207)"
                     % (value, value))
+    # Zero is the cheapest value and it breaks every directory scan silently:
+    # fsdev asks `fsDirRead` for zero entries, gets zero back, and the first
+    # `readdir` reports end-of-directory. Every save folder then scans as empty
+    # and nothing ever syncs, with no error anywhere (#207).
+    if int(value) < 1:
+        return fail("__nx_fsdev_direntry_cache_size is %s; fsdev then reads zero entries per "
+                    "fsDirRead and every directory scans as empty, which is a console that "
+                    "syncs nothing and says nothing (#207)" % value)
     print("ok: __nx_fsdev_direntry_cache_size is %s rather than libnx's 32, or %d bytes "
           "per open DIR" % (value, 784 * int(value)))
     return 0

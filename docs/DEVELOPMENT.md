@@ -465,9 +465,9 @@ a sysmodule pays for a TLS request is therefore:
    M9-2 (#207), which found the table wrong by more than its own margin — two
    thread stacks budgeted at a quarter of what devkitA64 gives them, and an open
    `DIR` costing ~24 KiB with no term at all. The default socket config does not
-   fit in it and never will; the sysmodule's leaves ~908 KiB. **Never call `socketInitializeDefault()` from
-   the sysmodule** — that single line is the difference between a working engine
-   and one that dies at `socketInitialize`.
+   fit in it and never will; the sysmodule's leaves ~908 KiB. **Never call
+   `socketInitializeDefault()` from the sysmodule** — that single line is the
+   difference between a working engine and one that dies at `socketInitialize`.
 
    The heap was `0x80000` until M1-7, and the two terms it was short by are the
    two easiest to miss. **A list response is buffered whole** — `Send` returns a
