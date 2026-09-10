@@ -382,7 +382,27 @@ esac
 # Matched on the pair, because `list` alone is both `worktree list` and
 # `terminal list` and the dispatcher asks for both.
 case "$1 ${2:-}" in
-  "worktree list")   cat "$ORCA_WORKTREES"; exit 0 ;;
+  "worktree list")
+    # The real CLI takes `--repo <selector>` and answers only that repo's
+    # worktrees; without it the answer is machine-wide (#212). The fixture
+    # carries a `repoPath` per entry so a phase can say "this one belongs to
+    # some other repo", and this reproduces the filter rather than restating
+    # its outcome. An entry with no `repoPath` belongs to whatever was asked
+    # for, so every fixture written before the scope existed still answers.
+    sel=""
+    for arg in "$@"; do
+      case "$arg" in path:*) sel="${arg#path:}" ;; esac
+    done
+    ORCA_REPO_SELECTOR="$sel" python3 -c '
+import json, os, sys
+doc = json.load(open(sys.argv[1]))
+sel = os.environ.get("ORCA_REPO_SELECTOR", "")
+if sel:
+    doc["result"]["worktrees"] = [
+        w for w in doc["result"]["worktrees"] if w.get("repoPath", sel) == sel]
+print(json.dumps(doc))
+' "$ORCA_WORKTREES"
+    exit 0 ;;
   # A create that SUCCEEDS, so the negative case terminates on --max-prs rather
   # than looping on "leaving it in the queue to try again".
   "worktree create") echo "{\"result\":{\"worktree\":{\"path\":\"$WORK_FOR_STUB/created\"}}}"; exit 0 ;;
@@ -983,6 +1003,64 @@ case "${1:-}" in
     grep -q "issue comment" "$GH_CALLS" \
       || fail "an ordinary overrun left nothing on the issue: $out"
     echo "ok: an ordinary overrun is still stopped"
+    ;;
+  live_scoped)
+    make_fixture ok
+    # One worktree of ours, one belonging to a different repository entirely --
+    # which is the ordinary state of a machine running more than one fleet.
+    python3 -c '
+import json, sys
+print(json.dumps({"result": {"worktrees": [
+    {"path": sys.argv[1] + "/wt", "linkedIssue": 42, "repoPath": sys.argv[1] + "/repo",
+     "isMainWorktree": False, "isArchived": False},
+    {"path": sys.argv[1] + "/foreign", "linkedIssue": 7, "repoPath": sys.argv[1] + "/other",
+     "isMainWorktree": False, "isArchived": False}]}}))
+' "$WORK" >"$ORCA_WORKTREES"
+    n="$(in_fleet live_count 2>&1)"
+    [ "$n" = 1 ] \
+      || fail "counted $n live worktree(s); another repo's worktree is taking a slot from MAX_WORKTREES"
+    grep -q -- "--repo path:$WORK/repo" "$ORCA_CALLS" \
+      || fail "it asked for every worktree on the machine, not this repo's: $(cat "$ORCA_CALLS")"
+    # The same list answers `in_flight`, which matches on an issue NUMBER, so an
+    # unrelated repo's #7 must not answer for ours. 0 = in flight, 1 = free.
+    in_fleet in_flight 7; rc=$?
+    [ "$rc" = 1 ] \
+      || fail "another repo's issue 7 reads as in flight here (in_flight said $rc)"
+    echo "ok: the count, and what is in flight, are this repository's"
+    ;;
+  foundation_foreign)
+    make_fixture ok
+    # A foundation issue lands alone, so it waits for `live` to reach 0. With
+    # the count unscoped that never happened: a worktree on another repo held
+    # every foundation issue forever, because nothing this fleet does can close
+    # one. This is that stall.
+    cat >"$GH_ISSUES" <<'JSON'
+[{"number":196,"title":"the foundation one","body":"","labels":[{"name":"ready"},{"name":"foundation"}]}]
+JSON
+    python3 -c '
+import json, sys
+print(json.dumps({"result": {"worktrees": [
+    {"path": sys.argv[1] + "/foreign", "linkedIssue": 1, "repoPath": sys.argv[1] + "/other",
+     "isMainWorktree": False, "isArchived": False}]}}))
+' "$WORK" >"$ORCA_WORKTREES"
+    # In the background, and settled on whichever answer comes first: the stall
+    # this phase is about is a dispatcher that polls forever, so waiting for it
+    # to exit would report a CTest timeout instead of the reason. `cleanup`
+    # kills it on the way out either way.
+    ( in_fleet cmd_run --auto --max-prs 1 >"$WORK/run.log" 2>&1 ) &
+    HELD_PID=$!
+    wait_for_log "fleet up"
+    i=0
+    while [ "$i" -lt 100 ]; do
+      grep -q "worktree create" "$ORCA_CALLS" 2>/dev/null && break
+      grep -q "waiting for the other" "$WORK/run.log" 2>/dev/null && break
+      sleep 0.1; i=$((i + 1))
+    done
+    grep -q "waiting for the other" "$WORK/run.log" \
+      && fail "a foundation issue is waiting on a worktree this fleet cannot close: $(cat "$WORK/run.log")"
+    grep -q "worktree create" "$ORCA_CALLS" \
+      || fail "it started nothing at all, so the fleet is stalled: $(cat "$WORK/run.log")"
+    echo "ok: another repo's worktree does not hold a foundation issue"
     ;;
   queue_skips)
     make_fixture ok

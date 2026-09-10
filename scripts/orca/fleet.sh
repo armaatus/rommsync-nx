@@ -282,9 +282,23 @@ disown_issue() {
 # transient hiccup turns into three duplicate worktrees for issues that already
 # have one: `in_flight` goes blind at the same moment, because it reads the same
 # list.
+#
+# `--repo` is what keeps this THIS repository's count. `orca worktree list` is
+# machine-wide, and without the scope a worktree open on some other repo took a
+# slot from MAX_WORKTREES and -- because a foundation issue waits for the count
+# to reach 0 -- stalled every foundation issue permanently, since nothing this
+# fleet does can close another repo's worktree (#212). The same list feeds
+# `in_flight`, which matches on an issue NUMBER, so an unrelated repo's #1 could
+# also answer for ours.
+#
+# Scope through the CLI rather than by filtering paths: `workspaces/<repo>/...`
+# is a naming convention, and two repos sharing a name prefix would defeat a
+# string match, whereas `path:` is the runtime's own answer to which repo a
+# worktree belongs to.
 live_worktrees() {
   local out; out="$(mktemp)"
-  orca_run_with_deadline 30 "$out" "$ORCA_CLI" worktree list --json || {
+  orca_run_with_deadline 30 "$out" \
+    "$ORCA_CLI" worktree list --json --repo "path:$REPO_ROOT" || {
     rm -f "$out"; return 1; }
   python3 -c '
 import json, sys
