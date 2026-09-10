@@ -347,12 +347,18 @@ bool g_sm_unaskable = false;
 /// question can be asked, which is everywhere this ships.
 bool MayProceedWith(const char* service, rommsync::sysmodule::boot::Waiter& waiter) {
   namespace boot = rommsync::sysmodule::boot;
+
+  // Asked and answered. An `sm` that would not answer 65100 for one service will
+  // not answer it for the next, so every remaining acquisition would otherwise
+  // pay a round trip to learn that again -- `WaitFor` asks once before it looks
+  // at `Probed()`, which is right for the first question and pure cost after it.
+  if (g_sm_unaskable) return true;
+
   const boot::Outcome outcome = boot::WaitFor(service, waiter);
   if (outcome.ready) return true;
 
   char line[boot::kMaxNoteBytes] = {};
   if (!waiter.Probed()) {
-    if (g_sm_unaskable) return true;
     g_sm_unaskable = true;
     std::snprintf(line, sizeof(line),
                   "rommsync: sm does not answer AtmosphereHasService; waits are unbounded");
