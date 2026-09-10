@@ -37,6 +37,14 @@ namespace rommsync::sysmodule::boot {
 /// amount of further waiting fixes either. Nothing outside this process waits on
 /// it -- `svcStartProcess` does not block -- so the cost of the bound is paid by
 /// this sysmodule alone and never by the console's boot (CLAUDE.md).
+///
+/// **What it buys at worst, since it is per service and not per boot**:
+/// `__appInit` waits seven times -- `set:sys`, `fsp-srv`, `time:s`, then
+/// `nifm:u`, `bsd:u`, `sfdnsres` and `ssl` -- so a console where every one of
+/// them registers just before its own deadline spends **~70 seconds** in
+/// `__appInit` and then comes up working. The give-up case is shorter: a name
+/// that never arrives ends the chain where it sits. Whoever changes this
+/// constant is changing that ceiling by seven times the delta.
 inline constexpr std::chrono::milliseconds kServiceBudget{10000};
 
 /// 100 ms, which is a fifth of what sys-clk polls `pmdmnt` at. The whole poll
