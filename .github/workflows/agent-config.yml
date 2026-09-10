@@ -125,7 +125,7 @@ jobs:
             echo "::notice::Mint one with 'claude setup-token' and add it under Settings > Secrets > Actions."
           fi
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         if: steps.token.outputs.have_token == 'true'
         with:
           node-version: '22'
