@@ -1018,6 +1018,21 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// one flag instead of a rule every call site has to remember.
   bool suspended_ = false;
 
+  /// Whether the worker thread exists and has not left `RunWorker` yet.
+  ///
+  /// `Quiesce` waits for the worker to park, and a console whose worker was
+  /// never started -- `StartWorker` is called by `main` and by most scenarios,
+  /// and by no means all of them -- has nothing to wait for. Without this that
+  /// case would spend the whole `kQuiesceBudget` on every sleep, which is three
+  /// seconds added to a transition for nothing.
+  bool worker_live_ = false;
+
+  /// Whether the worker is parked in the sleep wait, with nothing in flight.
+  ///
+  /// The one fact `Quiesce` is really waiting for. Set by the worker just before
+  /// it waits and cleared when it comes out, both under `mutex_`.
+  bool worker_parked_ = false;
+
   /// How the worker tells `Quiesce` it has parked.
   ///
   /// A condition variable of its own rather than `wake_`, because the two run in
