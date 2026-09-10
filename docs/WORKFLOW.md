@@ -280,8 +280,20 @@ the PR body.
 
 One rule the labels cannot express: **a foundation issue lands alone.** An issue
 that defines an interface later issues include (M0-2's `HttpClient` is the
-standing example) merges before anything depending on it starts. Label it
-`foundation` and `fleet.sh` holds the fan-out for it.
+standing example) merges before anything else starts. Label it `foundation` and
+`fleet.sh` holds the fan-out for it.
+
+*Alone* runs both ways, and `foundation_hold` is the one place that decides it:
+a `foundation` issue does not start while anything else is running, and nothing
+else starts while one is. Until #215 only the first half was checked, and since
+a foundation issue is the most-unblocking work by construction it is picked
+*first* — so it launched into an empty fleet and everything else launched beside
+it, which is the arrangement the rule exists to prevent.
+
+The dispatcher says which it is waiting on, once, and again when that changes.
+It does not narrow the rule to the issues that declare a dependency: those
+`Blocked by` lines are exactly what has not been written yet for the work this
+guards against.
 
 And one the labels express badly: **an issue no agent can close.** Label it
 **`needs-human-step`**. That happens two ways, and the label means either:

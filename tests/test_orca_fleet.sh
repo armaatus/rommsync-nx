@@ -75,6 +75,15 @@
 #                                     in the log.
 #   test_orca_fleet.sh timebox_stops  past the box, no PR, unlabelled -> still
 #                                     interrupted and still commented on.
+#   test_orca_fleet.sh foundation_alone
+#                                     a foundation issue lands alone in BOTH
+#                                     directions -- it does not start beside
+#                                     other work, and other work does not start
+#                                     beside it (#215).
+#   test_orca_fleet.sh foundation_marker_cleared
+#                                     ...and the marker that answers "is one
+#                                     running?" dies with its worktree, or
+#                                     nothing may ever start again.
 #   test_orca_fleet.sh foundation_names_wait
 #                                     a held foundation issue names the
 #                                     worktrees it waits on, and says it once.
@@ -1127,7 +1136,7 @@ JSON
     # "2"; this says which two, so a person can see what would end the wait --
     # and #212 was 47 minutes of a line that could not.
     worktree_list "42:wt" "-:loose-one"
-    out="$(in_fleet foundation_wait_notice 196 "$(in_fleet live_worktrees)" 2>&1)"
+    out="$(in_fleet eval 'foundation_wait_notice 196 "$(foundation_hold 196 ready,foundation "$(live_worktrees)")"' 2>&1)"
     grep -q "#42" <<<"$out" \
       || fail "it did not name the worktree it is waiting on: $out"
     grep -q "loose-one" <<<"$out" \
@@ -1138,21 +1147,22 @@ JSON
     # before `#7`, which is the wrong answer to "which one is still out there".
     worktree_list "42:wt" "7:other-wt"
     rm -f "$ROMMSYNC_FLEET_DIR/foundation-wait-196"
-    ordered="$(in_fleet foundation_wait_notice 196 "$(in_fleet live_worktrees)" 2>&1)"
+    ordered="$(in_fleet eval 'foundation_wait_notice 196 "$(foundation_hold 196 ready,foundation "$(live_worktrees)")"' 2>&1)"
     grep -q "#7 #42" <<<"$ordered" \
       || fail "it named them in lexical order, so the numbers read out of sequence: $ordered"
     worktree_list "42:wt" "-:loose-one"
     rm -f "$ROMMSYNC_FLEET_DIR/foundation-wait-196"
-    out="$(in_fleet foundation_wait_notice 196 "$(in_fleet live_worktrees)" 2>&1)"
+    out="$(in_fleet eval 'foundation_wait_notice 196 "$(foundation_hold 196 ready,foundation "$(live_worktrees)")"' 2>&1)"
+    [ -n "$out" ] || fail "the notice said nothing, so the silence asserted below proves nothing"
     # ...and it is news, not a heartbeat: the same set says nothing.
-    if out2="$(in_fleet foundation_wait_notice 196 "$(in_fleet live_worktrees)" 2>&1)"; then
+    if out2="$(in_fleet eval 'foundation_wait_notice 196 "$(foundation_hold 196 ready,foundation "$(live_worktrees)")"' 2>&1)"; then
       fail "it said the same thing again for an unchanged set: $out2"
     fi
     # The same two, in the other order. Nothing has changed, so nothing is said
     # -- a marker compared as an ordered list would call this news and print the
     # line again on a listing the CLI happened to reorder.
     worktree_list "-:loose-one" "42:wt"
-    if out3="$(in_fleet foundation_wait_notice 196 "$(in_fleet live_worktrees)" 2>&1)"; then
+    if out3="$(in_fleet eval 'foundation_wait_notice 196 "$(foundation_hold 196 ready,foundation "$(live_worktrees)")"' 2>&1)"; then
       fail "a reordered listing read as a changed one: $out3"
     fi
     echo "ok: the wait is named, and said once"
@@ -1160,16 +1170,63 @@ JSON
   foundation_wait_changes)
     make_fixture ok
     worktree_list "42:wt"
-    in_fleet foundation_wait_notice 196 "$(in_fleet live_worktrees)" >/dev/null 2>&1 \
+    in_fleet eval 'foundation_wait_notice 196 "$(foundation_hold 196 ready,foundation "$(live_worktrees)")"' >/dev/null 2>&1 \
       || fail "the first notice said nothing, so this phase asserts nothing"
     # One of them lands. That is the thing worth hearing about, and a flag
     # rather than the set would have stayed silent through it.
     worktree_list "51:the-other-one"
-    out="$(in_fleet foundation_wait_notice 196 "$(in_fleet live_worktrees)" 2>&1)" \
+    out="$(in_fleet eval 'foundation_wait_notice 196 "$(foundation_hold 196 ready,foundation "$(live_worktrees)")"' 2>&1)" \
       || fail "the set changed and it stayed quiet, so the log never says what it is waiting on now"
     grep -q "#51" <<<"$out" \
       || fail "it repeated the old set rather than the current one: $out"
     echo "ok: a changed wait is said again"
+    ;;
+  foundation_alone)
+    make_fixture ok
+    # The direction #215 was: the gate only ever asked whether the CANDIDATE is
+    # a foundation issue. A foundation issue is the most-unblocking work by
+    # construction, so it is picked FIRST, launches into an empty fleet -- and
+    # then everything else launches beside it, which is the arrangement the rule
+    # exists to prevent.
+    mkdir -p "$ROMMSYNC_FLEET_DIR"
+    : >"$ROMMSYNC_FLEET_DIR/foundation-196"
+    worktree_list "196:wt"
+    hold="$(in_fleet foundation_hold 197 ready "$(in_fleet live_worktrees)")" \
+      || fail "an ordinary issue was cleared to start beside a running foundation issue"
+    grep -q "#196" <<<"$hold" \
+      || fail "the hold does not name the foundation issue holding it: $hold"
+    # ...and the direction it always had, from the same predicate.
+    : >"$ROMMSYNC_FLEET_DIR/foundation-42"
+    [ -e "$ROMMSYNC_FLEET_DIR/foundation-42" ] \
+      || fail "could not arm the marker, so the hold below would prove nothing"
+    worktree_list "42:wt"
+    in_fleet foundation_hold 196 ready,foundation "$(in_fleet live_worktrees)" >/dev/null \
+      || fail "a foundation issue was cleared to start while something else was running"
+    # An empty fleet holds nothing, in either direction.
+    worktree_list
+    in_fleet foundation_hold 196 ready,foundation "$(in_fleet live_worktrees)" >/dev/null \
+      && fail "it held a foundation issue with nothing running"
+    in_fleet foundation_hold 197 ready "$(in_fleet live_worktrees)" >/dev/null \
+      && fail "it held an ordinary issue with nothing running"
+    echo "ok: a foundation issue lands alone, in both directions"
+    ;;
+  foundation_marker_cleared)
+    make_fixture ok
+    # The marker is what foundation_hold reads instead of asking GitHub for
+    # every live issue's labels each pass. If it outlived the worktree, the
+    # fleet would refuse to start anything, forever, for a foundation issue that
+    # landed hours ago -- a worse stall than the one #212 was.
+    mkdir -p "$ROMMSYNC_FLEET_DIR"
+    : >"$ROMMSYNC_FLEET_DIR/foundation-196"
+    [ -e "$ROMMSYNC_FLEET_DIR/foundation-196" ] \
+      || fail "could not arm the marker, so its removal below would prove nothing"
+    in_fleet disown_issue 196
+    [ -e "$ROMMSYNC_FLEET_DIR/foundation-196" ] \
+      && fail "the marker outlived the worktree, so nothing may ever start again"
+    worktree_list "196:wt"
+    in_fleet foundation_hold 197 ready "$(in_fleet live_worktrees)" >/dev/null \
+      && fail "a stale-free fleet still held an ordinary issue"
+    echo "ok: the foundation marker does not outlive its worktree"
     ;;
   queue_skips)
     make_fixture ok
@@ -2085,6 +2142,6 @@ JSON
     echo "ok: a dispatcher too old to see the drain is not drained in silence"
     ;;
   *)
-    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|foundation_names_wait|foundation_wait_changes|live_scoped|foundation_foreign|status_worktree_scope|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind|status_stale|status_current|status_unrecorded|status_from_worktree|status_draining|status_stopped|status_drained|status_behind|status_behind_revert|status_unreadable|status_names_root|run_refuses|run_stale_recycled|run_stale_gone|status_recycled|stop_spares_stranger|stop_stops_dispatcher|run_blind_ps|status_blind_ps|stop_blind_ps|drain_ends_on_merge|drain_after_stop|stop_writes_drain|stop_now_writes_both|drain_lets_agents_finish|stop_freezes_agents|drain_launches_nothing|resume_clears_both|stop_drain_blind_dispatcher" >&2
+    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|foundation_alone|foundation_marker_cleared|foundation_names_wait|foundation_wait_changes|live_scoped|foundation_foreign|status_worktree_scope|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind|status_stale|status_current|status_unrecorded|status_from_worktree|status_draining|status_stopped|status_drained|status_behind|status_behind_revert|status_unreadable|status_names_root|run_refuses|run_stale_recycled|run_stale_gone|status_recycled|stop_spares_stranger|stop_stops_dispatcher|run_blind_ps|status_blind_ps|stop_blind_ps|drain_ends_on_merge|drain_after_stop|stop_writes_drain|stop_now_writes_both|drain_lets_agents_finish|stop_freezes_agents|drain_launches_nothing|resume_clears_both|stop_drain_blind_dispatcher" >&2
     exit 2 ;;
 esac
