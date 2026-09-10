@@ -2181,8 +2181,22 @@ set(ENGINE_RIG_SCENARIOS
   nonblocking  # `StartPair` returns while the init is stalled: `ipc.hpp`'s contract
   repairs      # `StartPair` then `Unpair`, with neither instant leaving nothing
   log_faults   # M7-3: the four transport failures the guide documents, as the proxy makes them
+  drains       # M9-5: a rom queued over IPC becomes a file on the card
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
+  add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(engine.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  set_tests_properties(engine.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+endforeach()
+
+# M9-5 (#197)'s two. Both move the 120 MiB fixture and both have to catch the
+# worker *while it is still moving it*, which off a loopback RomM it is not for
+# long -- so both slow the transfer down from the test side rather than from the
+# engine (`Throttled`, tests/test_engine.cpp). Serial with the rest of this group
+# for the reason every rig test is: they download the shared fixture's roms.
+foreach(scenario downloading shutdown)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
   if(NOT ROMMSYNC_REQUIRE_RIG)
     set_tests_properties(engine.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
