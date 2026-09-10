@@ -20,6 +20,7 @@
 //   rotates    the cap, the single `.old`, and the ceiling on the pair
 //   tail       the in-memory ring `GetLog` is answered from
 //   sink       a null sink writes nowhere, and an installed one gets everything
+//   suspended  M9-4: the card switched off for a sleep, with the ring still filling
 //   events     every tag is unique, and `IsEvent` round-trips `kAllEvents`
 #include <cstdint>
 #include <cstdio>
@@ -406,6 +407,58 @@ void SinkInstall(checks::Checks& c) {
              "a sink sees exactly the lines written while it was installed");
 }
 
+/// M9-4 (#208): the card switched off, with the tail still filling.
+///
+/// This is the mechanism that makes "no `fsp-srv` I/O between `SleepReady` and
+/// the next `MinimumAwake`" true of the *log*, which is the one writer parking
+/// every thread cannot stop: every thread writes through `log::Write`, and
+/// `FileSink` opens the file, appends and closes it once per line. Atmosphere's
+/// `erpt` does the same thing with `Stream::EnableFsAccess`.
+///
+/// **Both halves matter and they pull opposite ways.** A switch that also
+/// stopped the ring would make `GetLog` blind about the sleep a user is asking
+/// why the console spent — the overlay reads the ring, not the file
+/// (`ipc.hpp`) — and a switch that did not stop the sink would not be a switch.
+/// So the scenario asserts one line reaching the ring and not the sink, in the
+/// same call.
+///
+/// `Reset()` is the third half: it is what a test scenario expects of a fresh
+/// process, and a suspended sink surviving it would leave the next scenario in
+/// the same binary silently writing nothing.
+void SinkSuspended(checks::Checks& c) {
+  rlog::Reset();
+  Recorder recorder;
+  Installed installed(&recorder);
+  c.Expect(rlog::SinkEnabled(), "a fresh log writes to its sink");
+
+  rlog::Info(rlog::Event::kBoot, "before the console sleeps");
+  c.ExpectEq(recorder.lines.size(), std::size_t{1}, "and the line reaches it");
+
+  rlog::SetSinkEnabled(false);
+  c.Expect(!rlog::SinkEnabled(), "the card is off-limits while the console sleeps");
+  rlog::Warn(rlog::Event::kPower, "while it is asleep");
+  c.ExpectEq(recorder.lines.size(), std::size_t{1},
+             "and nothing more reaches the sink -- a line written here is fsp-srv I/O on a "
+             "card this process has just told PSC it is finished with (#208)");
+
+  std::vector<rlog::Line> tail;
+  c.ExpectEq(rlog::Tail(rlog::kTailLines, &tail), std::uint64_t{2},
+             "but the line was still written");
+  c.ExpectEq(tail.size(), std::size_t{2},
+             "and it is in the ring, so GetLog answers what a sleeping console had to say");
+
+  rlog::SetSinkEnabled(true);
+  rlog::Info(rlog::Event::kBoot, "and it wakes up");
+  c.ExpectEq(recorder.lines.size(), std::size_t{2}, "the card comes back with the console");
+
+  // A suspended sink surviving `Reset()` would leave every scenario after this
+  // one in the same binary writing to nothing, with no assertion anywhere
+  // failing about it.
+  rlog::SetSinkEnabled(false);
+  rlog::Reset();
+  c.Expect(rlog::SinkEnabled(), "and a reset log is one a fresh process would recognise");
+}
+
 void Events(checks::Checks& c) {
   c.Expect(rlog::kAllEvents.size() >= 12,
            "every failure mode docs/TROUBLESHOOTING.md documents has a tag");
@@ -447,6 +500,8 @@ int main(int argc, char** argv) {
     TailRing(checks);
   } else if (scenario == "sink") {
     SinkInstall(checks);
+  } else if (scenario == "suspended") {
+    SinkSuspended(checks);
   } else if (scenario == "events") {
     Events(checks);
   } else {

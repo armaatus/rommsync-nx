@@ -84,6 +84,7 @@ foreach(scenario
         rotates   # the cap, the single `.old`, and the ceiling on the pair
         tail      # the in-memory ring GetLog is answered from
         sink      # a null sink writes nowhere; an installed one gets everything
+        suspended # M9-4: the card off for a sleep, with the ring still filling
         events)   # every tag is unique and IsEvent round-trips kAllEvents
   add_test(NAME log.${scenario} COMMAND test_log ${scenario})
   set_tests_properties(log.${scenario} PROPERTIES TIMEOUT 60)
