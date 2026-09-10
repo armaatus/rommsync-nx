@@ -73,7 +73,7 @@ jobs:
       # `gh pr merge --auto` would land it. Listing .github/scripts/ as
       # human-merge-only cannot help there, because the modified script is the
       # one evaluating that list.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           sparse-checkout: .github/scripts
