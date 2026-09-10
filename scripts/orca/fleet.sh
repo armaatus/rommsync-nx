@@ -245,7 +245,8 @@ owned_path()   { cat "$OWNED_DIR/$1" 2>/dev/null; }
 # issue that ever stalled. That is the root fix; the two exits in
 # enforce_timebox tidying up after themselves is the belt.
 clear_issue_markers() {
-  rm -f "$STATE_DIR/stalled-$1" "$STATE_DIR/stall-labels-$1" \
+  rm -f "$STATE_DIR/foundation-wait-$1" \
+        "$STATE_DIR/stalled-$1" "$STATE_DIR/stall-labels-$1" \
         "$STATE_DIR/box-labels-$1" "$STATE_DIR/queue-labels-$1" \
         "$STATE_DIR/unreachable-$1" "$STATE_DIR/human-step-$1" \
         "$STATE_DIR/held-$1" "$STATE_DIR/stuck-$1" \
@@ -277,14 +278,49 @@ disown_issue() {
   clear_issue_markers "$1"
 }
 
+# `path:` names a repository ROOT, and this script does not always run from one:
+# `fleet.sh status` is run from wherever you are, which CLAUDE.md means to be a
+# fleet worktree. Handed a worktree path the CLI answers `repo_not_found` and
+# exits 1 -- and a failed listing makes `in_flight` answer "could not tell" for
+# every issue, so `status` would offer work that is already running.
+#
+# `--git-common-dir` is the resolution: in a linked worktree it is the main
+# checkout's `.git`, and in the main checkout it is its own. If git cannot say,
+# fall back to this checkout rather than to an unscoped listing -- unscoped is
+# the bug (#212). That fallback is not itself an error path: it returns a
+# selector like any other, and if it does not name a repo the CLI is what
+# refuses it, which fails the listing rather than widening it.
+repo_selector() {
+  local common
+  common="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute \
+              --git-common-dir 2>/dev/null)" \
+    && [ -n "$common" ] \
+    && { printf 'path:%s\n' "$(dirname "$common")"; return 0; }
+  printf 'path:%s\n' "$REPO_ROOT"
+}
+
 # Non-zero when the answer could not be read, which is NOT the same as "nothing
 # is running". Reading a failed CLI call as zero live worktrees is how one
 # transient hiccup turns into three duplicate worktrees for issues that already
 # have one: `in_flight` goes blind at the same moment, because it reads the same
 # list.
+#
+# `--repo` is what keeps this THIS repository's count. `orca worktree list` is
+# machine-wide, and without the scope a worktree open on some other repo took a
+# slot from MAX_WORKTREES and -- because a foundation issue waits for the count
+# to reach 0 -- stalled every foundation issue permanently, since nothing this
+# fleet does can close another repo's worktree (#212). The same list feeds
+# `in_flight`, which matches on an issue NUMBER, so an unrelated repo's #1 could
+# also answer for ours.
+#
+# Scope through the CLI rather than by filtering paths: `workspaces/<repo>/...`
+# is a naming convention, and two repos sharing a name prefix would defeat a
+# string match, whereas `path:` is the runtime's own answer to which repo a
+# worktree belongs to.
 live_worktrees() {
   local out; out="$(mktemp)"
-  orca_run_with_deadline 30 "$out" "$ORCA_CLI" worktree list --json || {
+  orca_run_with_deadline 30 "$out" \
+    "$ORCA_CLI" worktree list --json --repo "$(repo_selector)" || {
     rm -f "$out"; return 1; }
   python3 -c '
 import json, sys
@@ -299,6 +335,46 @@ for w in worktrees:
   local rc=$?
   rm -f "$out"
   return $rc
+}
+
+# What a foundation issue is actually waiting for, as `#N` where the worktree is
+# linked to an issue and a basename where it is not -- a count alone names
+# nothing a person can go and land.
+#
+# $1 is the listing the caller already has. It is not fetched here: `one_lookup`
+# is the rule this file keeps -- one answer per pass, not one per question --
+# and a second `worktree list` would also let the count that opened the gate and
+# the names printed beside it disagree, which is worse than either alone.
+#
+# Sorted, because the caller stores this string to decide whether anything
+# changed. Unsorted, two unchanged worktrees coming back in the other order read
+# as news and reprint the line every poll -- the thing #212 is about.
+#
+# `-V` rather than a plain sort: this line exists to be read, and lexically `#42`
+# comes before `#7`, which is the wrong order for the one question a person asks
+# of it -- which issue is still out there.
+waiting_worktrees() {
+  printf '%s\n' "$1" | while IFS="$(printf '\t')" read -r num path; do
+    [ -n "$path" ] || continue
+    if [ "$num" = "-" ]; then printf '%s\n' "$(basename "$path")"; else printf '#%s\n' "$num"; fi
+  done | sort -V | tr '\n' ' ' | sed 's/ $//'
+}
+
+# The line to say when a foundation issue is held, or nothing (1) when it has
+# already been said about this same set of worktrees. A bare count repeated every
+# poll is what #212 looked like from the outside for 47 minutes: it named nothing
+# to act on, so a wait that could never end read the same as one about to. The
+# marker is the SET, not a flag, so the line comes back when what it is waiting
+# on changes -- which is news -- and stays quiet while it does not.
+foundation_wait_notice() {
+  local waiting_on; waiting_on="$(waiting_worktrees "$2")"
+  # Nothing to name means nothing is holding it, and the caller should not have
+  # asked -- saying "waiting for" with nothing after it is worse than silence.
+  [ -n "$waiting_on" ] || return 1
+  [ "$(cat "$STATE_DIR/foundation-wait-$1" 2>/dev/null)" = "$waiting_on" ] && return 1
+  mkdir -p "$STATE_DIR"
+  printf '%s\n' "$waiting_on" >"$STATE_DIR/foundation-wait-$1"
+  printf '#%s is a foundation issue and lands alone; waiting for %s\n' "$1" "$waiting_on"
 }
 
 # Prints the count, or fails. A caller that cannot tell how many are running
@@ -519,7 +595,7 @@ launch() {
   say "opening a worktree for #$num -- $title"
   local out; out="$(mktemp)"
   orca_run_with_deadline 240 "$out" "$ORCA_CLI" worktree create \
-    --repo "path:$REPO_ROOT" \
+    --repo "$(repo_selector)" \
     --name "$name" \
     --issue "$num" \
     --no-parent \
@@ -1882,12 +1958,15 @@ while that one is up."
     reap_abandoned
     prune_gaveup
 
-    local live
-    if ! live="$(live_count)"; then
+    # One listing, and the count derived from it, so everything this pass says
+    # about what is running is saying it about the same answer.
+    local live live_list
+    if ! live_list="$(live_worktrees)"; then
       say "could not read the worktree list; skipping this pass rather than guessing"
       sleep "$POLL_SECONDS"
       continue
     fi
+    live="$(printf '%s\n' "$live_list" | grep -c . || true)"
 
     while ! $drain_mode && [ "$live" -lt "$MAX_WORKTREES" ]; do
       # `break`, not `break 2`: this is the drain arriving MID-PASS, after the
@@ -1962,8 +2041,15 @@ while that one is up."
           # A foundation issue defines an interface later issues include, so it
           # lands alone: three worktrees each inventing their own version of a
           # shared header is the one merge conflict worth serialising to avoid.
+          #
+          # Named, and said once. A bare count repeated every poll is what #212
+          # looked like from the outside for 47 minutes -- it does not say what
+          # would end the wait, so there is nothing to act on and nothing to
+          # notice when the set changes. The marker is cleared when it does, so
+          # the next line is news rather than the same line again.
           if is_foundation "$l" && [ "$live" -gt 0 ]; then
-            say "#$n is a foundation issue; waiting for the other $live worktree(s) to land"
+            local notice; notice="$(foundation_wait_notice "$n" "$live_list")" \
+              && say "$notice"
             break
           fi
           picked="$n"; title="$t"; labels="$l"
@@ -1982,7 +2068,8 @@ while that one is up."
         say "  leaving #$picked in the queue to try again"
         break
       fi
-      live="$(live_count)" || break
+      live_list="$(live_worktrees)" || break
+      live="$(printf '%s\n' "$live_list" | grep -c . || true)"
     done
 
     # Nothing left to launch, and nothing left to look after: done. Reaching

@@ -75,6 +75,30 @@
 #                                     in the log.
 #   test_orca_fleet.sh timebox_stops  past the box, no PR, unlabelled -> still
 #                                     interrupted and still commented on.
+#   test_orca_fleet.sh foundation_names_wait
+#                                     a held foundation issue names the
+#                                     worktrees it waits on, and says it once.
+#   test_orca_fleet.sh foundation_wait_changes
+#                                     ...and says it again when that set
+#                                     changes, which a flag would not.
+#   test_orca_fleet.sh live_scoped    the live count, and what reads as in
+#                                     flight, are THIS repository's. A worktree
+#                                     open on another repo took a slot and, via
+#                                     matching issue NUMBERS, could answer for
+#                                     an issue of ours (#212).
+#   test_orca_fleet.sh foundation_foreign
+#                                     ...and the gate that waits for the count
+#                                     to reach 0 opens: a foundation issue held
+#                                     by a worktree this fleet cannot close
+#                                     waits forever.
+#   test_orca_fleet.sh status_worktree_scope
+#                                     `--repo path:` names a repository ROOT,
+#                                     and `status` is run from a worktree -- so
+#                                     the selector is resolved through
+#                                     --git-common-dir. Built from the caller's
+#                                     checkout it is refused, the listing fails,
+#                                     and `status` then offers work already in
+#                                     flight.
 #   test_orca_fleet.sh queue_skips    a labelled issue is not startable: the
 #                                     dispatcher must not open a worktree for
 #                                     work no agent may finish, or it opens one
@@ -382,7 +406,37 @@ esac
 # Matched on the pair, because `list` alone is both `worktree list` and
 # `terminal list` and the dispatcher asks for both.
 case "$1 ${2:-}" in
-  "worktree list")   cat "$ORCA_WORKTREES"; exit 0 ;;
+  "worktree list")
+    # The real CLI takes `--repo <selector>` and answers only that repo's
+    # worktrees; without it the answer is machine-wide (#212). The fixture
+    # carries a `repoPath` per entry so a phase can say "this one belongs to
+    # some other repo", and this reproduces the filter rather than restating
+    # its outcome. An entry with no `repoPath` belongs to whatever was asked
+    # for, so every fixture written before the scope existed still answers.
+    sel=""
+    for arg in "$@"; do
+      case "$arg" in path:*) sel="${arg#path:}" ;; esac
+    done
+    # A `path:` that is not a repo ROOT -- a worktree of it, say -- is what the
+    # real CLI refuses, and refusing it here is what lets a phase catch a caller
+    # that passes the wrong one. $ORCA_REPO_ROOTS lists the paths that resolve;
+    # empty means every selector does, which is what fixtures written before
+    # this arm existed assume.
+    if [ -n "$sel" ] && [ -s "${ORCA_REPO_ROOTS:-/dev/null}" ] \
+       && ! grep -qxF "$sel" "$ORCA_REPO_ROOTS"; then
+      echo '{"ok": false, "error": {"code": "repo_not_found", "message": "repo_not_found"}}'
+      exit 1
+    fi
+    ORCA_REPO_SELECTOR="$sel" python3 -c '
+import json, os, sys
+doc = json.load(open(sys.argv[1]))
+sel = os.environ.get("ORCA_REPO_SELECTOR", "")
+if sel:
+    doc["result"]["worktrees"] = [
+        w for w in doc["result"]["worktrees"] if w.get("repoPath", sel) == sel]
+print(json.dumps(doc))
+' "$ORCA_WORKTREES"
+    exit 0 ;;
   # A create that SUCCEEDS, so the negative case terminates on --max-prs rather
   # than looping on "leaving it in the queue to try again".
   "worktree create") echo "{\"result\":{\"worktree\":{\"path\":\"$WORK_FOR_STUB/created\"}}}"; exit 0 ;;
@@ -481,6 +535,8 @@ STUB
   # PR, no labels. Each test overrides only the one it is about.
   ORCA_PS="$WORK/ps";               echo '{"result":{"worktrees":[]}}' >"$ORCA_PS"
   ORCA_WORKTREES="$WORK/wtlist";    echo '{"result":{"worktrees":[]}}' >"$ORCA_WORKTREES"
+  # Which `--repo path:` selectors resolve. Only the phases that care write it.
+  ORCA_REPO_ROOTS="$WORK/repo-roots"; : >"$ORCA_REPO_ROOTS"
   ORCA_TERMINALS="$WORK/terminals"; echo '{"result":{"terminals":[]}}' >"$ORCA_TERMINALS"
   GH_PRS="$WORK/prs";               echo '[]' >"$GH_PRS"
   GH_ISSUES="$WORK/issues";         echo '[]' >"$GH_ISSUES"
@@ -492,6 +548,7 @@ STUB
   GH_MERGED="$WORK/merged";         echo 7 >"$GH_MERGED"
   WORK_FOR_STUB="$WORK"; mkdir -p "$WORK/created"
   export ORCA_CALLS ORCA_MODE GH_CALLS ORCA_PS ORCA_WORKTREES ORCA_TERMINALS \
+         ORCA_REPO_ROOTS \
          GH_PRS GH_ISSUES GH_LABELS GH_STATE GH_MERGED WORK_FOR_STUB REAP_CALLS
   # cmd_run sleeps between passes; a test that reached one would otherwise sit
   # for a minute before failing.
@@ -504,6 +561,30 @@ STUB
 
 # A worktree the fleet would own: a git repo with one commit, and an owned-file
 # naming it.
+# The worktree listing Orca answers, from `issue:path-suffix` pairs -- `-` for a
+# worktree linked to no issue, and a third field for a repo other than the
+# fixture's. Five phases were emitting this JSON inline; the shape belongs in
+# one place, beside make_worktree, which is the same idea for the other half.
+worktree_list() {
+  local spec; spec="$(printf '%s\n' "$@")"
+  WORKTREE_SPEC="$spec" WORKTREE_WORK="$WORK" python3 -c '
+import json, os
+out = []
+for line in os.environ["WORKTREE_SPEC"].splitlines():
+    if not line.strip():
+        continue
+    parts = line.split(":")
+    num, suffix = parts[0], parts[1]
+    repo = parts[2] if len(parts) > 2 else "repo"
+    work = os.environ["WORKTREE_WORK"]
+    out.append({"path": work + "/" + suffix,
+                "linkedIssue": None if num == "-" else int(num),
+                "repoPath": work + "/" + repo,
+                "isMainWorktree": False, "isArchived": False})
+print(json.dumps({"result": {"worktrees": out}}))
+' >"$ORCA_WORKTREES"
+}
+
 make_worktree() {
   mkdir -p "$WORK/wt"
   git -C "$WORK/wt" init -q -b work
@@ -983,6 +1064,112 @@ case "${1:-}" in
     grep -q "issue comment" "$GH_CALLS" \
       || fail "an ordinary overrun left nothing on the issue: $out"
     echo "ok: an ordinary overrun is still stopped"
+    ;;
+  live_scoped)
+    make_fixture ok
+    # One worktree of ours, one belonging to a different repository entirely --
+    # which is the ordinary state of a machine running more than one fleet.
+    worktree_list "42:wt" "7:foreign:other"
+    n="$(in_fleet live_count 2>&1)"
+    [ "$n" = 1 ] \
+      || fail "counted $n live worktree(s); another repo's worktree is taking a slot from MAX_WORKTREES"
+    grep -q -- "--repo path:$WORK/repo" "$ORCA_CALLS" \
+      || fail "it asked for every worktree on the machine, not this repo's: $(cat "$ORCA_CALLS")"
+    # The same list answers `in_flight`, which matches on an issue NUMBER, so an
+    # unrelated repo's #7 must not answer for ours. 0 = in flight, 1 = free.
+    in_fleet in_flight 7; rc=$?
+    [ "$rc" = 1 ] \
+      || fail "another repo's issue 7 reads as in flight here (in_flight said $rc)"
+    echo "ok: the count, and what is in flight, are this repository's"
+    ;;
+  foundation_foreign)
+    make_fixture ok
+    # A foundation issue lands alone, so the dispatcher holds it until `live`
+    # reaches 0 (the gate is `is_foundation && [ "$live" -gt 0 ]`). With the
+    # count unscoped that never happened: a worktree on another repo held every
+    # foundation issue forever, because nothing this fleet does can close one.
+    #
+    # This asserts the gate's two inputs rather than driving `cmd_run`. A
+    # dispatcher that HAS launched its foundation issue then polls until the
+    # work lands, by design -- so a phase that ran one would have to kill it,
+    # and an orphan holding the inherited stdout is time ctest spends waiting
+    # for a test that already finished (see hold_pidfile_with_dispatcher).
+    cat >"$GH_ISSUES" <<'JSON'
+[{"number":196,"title":"the foundation one","body":"","labels":[{"name":"ready"},{"name":"foundation"}]}]
+JSON
+    worktree_list "1:foreign:other"
+    n="$(in_fleet live_count 2>&1)"
+    [ "$n" = 0 ] \
+      || fail "counted $n live worktree(s) with only another repo's open, so the foundation gate never opens"
+    out="$(in_fleet ready_issues 2>&1)"
+    grep -q "^196" <<<"$out" \
+      || fail "the foundation issue stopped being startable for some other reason, so the count above proves nothing: $out"
+    # The LABELS column, not the line: the fixture's own title carries the word,
+    # so a whole-line grep passes with the label deleted and asserts nothing.
+    labels="$(awk -F'\t' '$1 == 196 { print $3 }' <<<"$out")"
+    in_fleet has_label "$labels" foundation \
+      || fail "the fixture issue is not labelled foundation, so this phase asserts the wrong gate: [$labels]"
+    # ...and the gate itself, spelled as the dispatcher spells it, rather than
+    # its two inputs and an argument that they compose. `eval`, not `bash -c`:
+    # a fresh shell has none of the sourced functions, so the expression would
+    # exit 127 and the assertion would pass without ever evaluating.
+    # `eval` concatenates its arguments, so the labels are expanded into the
+    # expression here rather than passed as $1.
+    in_fleet eval "is_foundation '$labels' && [ \"\$(live_count)\" -gt 0 ]" \
+      && fail "the gate is still shut with only another repo's worktree open"
+    in_fleet eval "is_foundation '$labels'" \
+      || fail "is_foundation did not fire on the fixture's labels, so the gate above proves nothing: [$labels]"
+    echo "ok: another repo's worktree does not hold a foundation issue"
+    ;;
+  foundation_names_wait)
+    make_fixture ok
+    # Two worktrees of ours, one of them with no linked issue. A count says
+    # "2"; this says which two, so a person can see what would end the wait --
+    # and #212 was 47 minutes of a line that could not.
+    worktree_list "42:wt" "-:loose-one"
+    out="$(in_fleet foundation_wait_notice 196 "$(in_fleet live_worktrees)" 2>&1)"
+    grep -q "#42" <<<"$out" \
+      || fail "it did not name the worktree it is waiting on: $out"
+    grep -q "loose-one" <<<"$out" \
+      || fail "a worktree with no linked issue went unnamed, so the count and the names disagree: $out"
+    grep -qE '\bfor 2 worktree' <<<"$out" \
+      && fail "it is still saying a count: $out"
+    # Read in the order a person asks the question in. Lexically `#42` sorts
+    # before `#7`, which is the wrong answer to "which one is still out there".
+    worktree_list "42:wt" "7:other-wt"
+    rm -f "$ROMMSYNC_FLEET_DIR/foundation-wait-196"
+    ordered="$(in_fleet foundation_wait_notice 196 "$(in_fleet live_worktrees)" 2>&1)"
+    grep -q "#7 #42" <<<"$ordered" \
+      || fail "it named them in lexical order, so the numbers read out of sequence: $ordered"
+    worktree_list "42:wt" "-:loose-one"
+    rm -f "$ROMMSYNC_FLEET_DIR/foundation-wait-196"
+    out="$(in_fleet foundation_wait_notice 196 "$(in_fleet live_worktrees)" 2>&1)"
+    # ...and it is news, not a heartbeat: the same set says nothing.
+    if out2="$(in_fleet foundation_wait_notice 196 "$(in_fleet live_worktrees)" 2>&1)"; then
+      fail "it said the same thing again for an unchanged set: $out2"
+    fi
+    # The same two, in the other order. Nothing has changed, so nothing is said
+    # -- a marker compared as an ordered list would call this news and print the
+    # line again on a listing the CLI happened to reorder.
+    worktree_list "-:loose-one" "42:wt"
+    if out3="$(in_fleet foundation_wait_notice 196 "$(in_fleet live_worktrees)" 2>&1)"; then
+      fail "a reordered listing read as a changed one: $out3"
+    fi
+    echo "ok: the wait is named, and said once"
+    ;;
+  foundation_wait_changes)
+    make_fixture ok
+    worktree_list "42:wt"
+    in_fleet foundation_wait_notice 196 "$(in_fleet live_worktrees)" >/dev/null 2>&1 \
+      || fail "the first notice said nothing, so this phase asserts nothing"
+    # One of them lands. That is the thing worth hearing about, and a flag
+    # rather than the set would have stayed silent through it.
+    worktree_list "51:the-other-one"
+    out="$(in_fleet foundation_wait_notice 196 "$(in_fleet live_worktrees)" 2>&1)" \
+      || fail "the set changed and it stayed quiet, so the log never says what it is waiting on now"
+    grep -q "#51" <<<"$out" \
+      || fail "it repeated the old set rather than the current one: $out"
+    echo "ok: a changed wait is said again"
     ;;
   queue_skips)
     make_fixture ok
@@ -1509,6 +1696,25 @@ JSON
       || fail "it did not name the commit that is missing from the dispatcher: $out"
     echo "ok: staleness is about the dispatcher's checkout, not the caller's"
     ;;
+  status_worktree_scope)
+    make_fixture ok
+    make_repo_git
+    dispatcher_running
+    in_fleet record_dispatcher
+    older_checkout "$(git -C "$WORK/repo" rev-parse HEAD)"
+    # `--repo path:` names a repository ROOT. `fleet.sh status` is run from
+    # wherever you are -- CLAUDE.md points agents in a fleet worktree at it --
+    # so a selector built from the CALLER's checkout is a worktree path, which
+    # the CLI refuses with repo_not_found. The listing then fails, and a failed
+    # listing makes `in_flight` answer "could not tell" for every issue, so
+    # `status` offers work that is already running (#212).
+    printf '%s\n' "$WORK/repo" >"$ORCA_REPO_ROOTS"
+    worktree_list "42:wt"
+    out="$(in_fleet_at "$WORK/wt2" cmd_status 2>&1)"
+    grep -q "#42" <<<"$out" \
+      || fail "asked from a worktree, it could not list what is running: the repo selector did not resolve: $out"
+    echo "ok: status asked from a worktree still scopes to the repository"
+    ;;
   status_draining)
     make_fixture ok
     make_repo_git
@@ -1879,6 +2085,6 @@ JSON
     echo "ok: a dispatcher too old to see the drain is not drained in silence"
     ;;
   *)
-    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind|status_stale|status_current|status_unrecorded|status_from_worktree|status_draining|status_stopped|status_drained|status_behind|status_behind_revert|status_unreadable|status_names_root|run_refuses|run_stale_recycled|run_stale_gone|status_recycled|stop_spares_stranger|stop_stops_dispatcher|run_blind_ps|status_blind_ps|stop_blind_ps|drain_ends_on_merge|drain_after_stop|stop_writes_drain|stop_now_writes_both|drain_lets_agents_finish|stop_freezes_agents|drain_launches_nothing|resume_clears_both|stop_drain_blind_dispatcher" >&2
+    echo "usage: test_orca_fleet.sh card_says|card_quiet|remove_forces|remove_advice|remove_keeps_stack|remove_sweeps_stack|merged_keeps_dirty|merged_keeps_owned|merged_unknown_git|merged_cli_silent|remove_scoped_sweep|stall_expected|stall_reports|timebox_waits|timebox_stops|queue_skips|foundation_names_wait|foundation_wait_changes|live_scoped|foundation_foreign|status_worktree_scope|list_declines|timebox_rearms|labels_unknown|outage_once|one_lookup|timebox_clears|stop_clears|own_clears|one_card|abandon_blocked|abandon_closed|abandon_human_step|abandon_keeps_dirty|abandon_keeps_commits|abandon_unknown_git|abandon_leaves_working|abandon_timebox|gaveup_not_restarted|gaveup_retry|abandon_warns_first|abandon_warned_saved|abandon_two_keeps|gaveup_pruned|list_says_declined|abandon_reason_flickers|abandon_lookup_blind|status_stale|status_current|status_unrecorded|status_from_worktree|status_draining|status_stopped|status_drained|status_behind|status_behind_revert|status_unreadable|status_names_root|run_refuses|run_stale_recycled|run_stale_gone|status_recycled|stop_spares_stranger|stop_stops_dispatcher|run_blind_ps|status_blind_ps|stop_blind_ps|drain_ends_on_merge|drain_after_stop|stop_writes_drain|stop_now_writes_both|drain_lets_agents_finish|stop_freezes_agents|drain_launches_nothing|resume_clears_both|stop_drain_blind_dispatcher" >&2
     exit 2 ;;
 esac
