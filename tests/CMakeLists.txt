@@ -2187,3 +2187,47 @@ foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
   endif()
   set_tests_properties(engine.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 endforeach()
+
+# --- M9-1: what `__appInit` does, and what it cannot be asked ----------------
+# Nothing in `sysmodule/source/main.cpp` runs off a console, which is how three
+# boot bugs sat in twenty lines through every green `ctest` (#195): a `smExit()`
+# that closes the session libnx re-opens `sfdnsres` off, a `timeInitialize()`
+# asking for a service the npdm does not grant, and a service acquisition that
+# parks in `sm` forever with no log, no crash report and no symptom.
+#
+# Two halves, because two different things can be checked. What the source SAYS
+# is read out of the source and the npdm (`boot.dns`, `boot.clock`,
+# `boot.bounded`, `boot.comments`); what the boot path DOES is run, through the
+# shipping code -- name resolution through `posix_connection.cpp`, which is the
+# console's own connector rather than a twin (tests/tcp_connector.hpp).
+#
+# The static half deliberately reads the tree rather than the built `.nsp`: M9-3
+# (#196) lands the npdm parser and it needs devkitPro, so it can only run where
+# a cross-compile can (M9-12, #211). The SAC is in the tree, so these run on
+# every push, everywhere.
+add_executable(test_boot_services test_boot_services.cpp
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/http/posix_connection.cpp")
+target_link_libraries(test_boot_services PRIVATE rommsync::host Threads::Threads)
+target_include_directories(test_boot_services PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/sysmodule/source")
+
+# Needs no RomM and no Docker: the server it dials is the loopback one in
+# tests/loopback_server.hpp, on a port the kernel picks. So it never skips.
+add_test(NAME boot.resolve COMMAND test_boot_services resolve)
+
+# ...except this one, and only where the resolver itself is the problem: a
+# captive portal or an ISP that answers NXDOMAIN with an address turns it into a
+# test of that resolver. It says so and skips rather than going red on a
+# network's bad manners.
+add_test(NAME boot.unresolved COMMAND test_boot_services unresolved)
+set_tests_properties(boot.unresolved PROPERTIES SKIP_RETURN_CODE 77)
+
+set_tests_properties(boot.resolve boot.unresolved PROPERTIES TIMEOUT 60)
+
+set(SYSMODULE_BOOT_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_sysmodule_boot.py")
+foreach(scenario IN ITEMS dns clock bounded comments)
+  add_test(NAME boot.${scenario}
+           COMMAND ${Python3_EXECUTABLE} "${SYSMODULE_BOOT_TEST}" ${scenario}
+                   --repo "${CMAKE_SOURCE_DIR}")
+  set_tests_properties(boot.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
