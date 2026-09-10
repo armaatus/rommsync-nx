@@ -66,6 +66,7 @@
 #include "rommsync/http.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/list_service.hpp"
+#include "power.hpp"
 #include "rommsync/pairing.hpp"
 #include "rommsync/play_sessions.hpp"
 #include "rommsync/scheduler.hpp"
@@ -127,6 +128,25 @@ inline constexpr std::chrono::milliseconds kMaxDownloadRetryBackoff{900'000};
 /// switched off, or a console a command rather than a timer has to change.
 inline constexpr std::chrono::milliseconds kNoDownloadDeadline =
     std::chrono::milliseconds::max();
+
+/// How long `Quiesce` will wait for this process to stop touching the card
+/// before it acknowledges the sleep anyway (M9-4, #208).
+///
+/// **A budget and not a wait**, and the reason is the whole of what goes wrong
+/// when a sysmodule gets this wrong. A module that does not answer PSC is a
+/// console that freezes with no fatal and no crash report -- sys-con#155, where
+/// the maintainer traced a whole system hanging to one module waiting
+/// indefinitely on services that were already asleep -- and sys-clk#85 is the
+/// same thing on the way back up, a console that never wakes.
+///
+/// So the wait ends, whatever happened. Three seconds is long enough for a
+/// cancelled `download::Drain` or `sync::RunTick` to come back from whatever
+/// request it was in the middle of -- both check the token at every operation
+/// boundary -- and short enough that a console whose worker is genuinely wedged
+/// sleeps three seconds late rather than not at all. Running out is not silent:
+/// it is a `warn` in the log with the reason, which is the only way a user could
+/// ever find out.
+inline constexpr std::chrono::milliseconds kQuiesceBudget{3'000};
 
 /// What a pairing attempt needs that neither `core/` nor this file can supply.
 ///
@@ -191,7 +211,7 @@ struct PairingBackend {
 /// theirs at a tick boundary, never mid-sync and never mid-download. The
 /// download worker is not started here yet; when it is, this is already the
 /// object it drains.
-class SdEngine : public ipc::Engine {
+class SdEngine : public ipc::Engine, public power::Sink {
  public:
   SdEngine();
 
@@ -330,6 +350,40 @@ class SdEngine : public ipc::Engine {
   /// worker loop pays one function call.
   bool PumpLists();
 
+  /// The console is going to sleep: stop everything and do not come back until
+  /// `Resume()` (M9-4, #208).
+  ///
+  /// `power::Sink`'s half of the PSC contract, and the reason this class knows
+  /// what a power transition is at all. Called from the watcher's thread, and
+  /// from nowhere else.
+  ///
+  /// **What it has to be true of when it returns**, because the acknowledgement
+  /// goes out the instant it does and the acknowledgement is this process
+  /// telling PSC that the card and the sockets are free of it:
+  ///
+  ///   * no `download::Drain` is running -- the worker has *returned* from it,
+  ///     not merely been asked to stop (M9-5, #197);
+  ///   * no `sync::RunTick` is running, and so no save write is in flight;
+  ///   * no restore is writing a save from the IPC thread either.
+  ///
+  /// The first two are the worker parking, which is what the wait below is for.
+  /// The third is `save_write_mutex_`, which is why that lock is timed.
+  ///
+  /// Bounded by `kQuiesceBudget` and never longer, for the reason that constant
+  /// gives. Idempotent: PSC sends two sleep states in a row and `power::Watcher`
+  /// collapses them, but a second call here costs one comparison rather than a
+  /// second tear-down.
+  void Quiesce() override;
+
+  /// ...and the console is back. Lets the worker go again (M9-4, #208).
+  ///
+  /// **The elapsed time is a suspension and not a backlog.** `sync::Scheduler`
+  /// states its interval on the *wall* clock precisely so an eleven-hour sleep
+  /// is one interval elapsed rather than twenty-two (scheduler.hpp), so what
+  /// this has to do is let the worker poll it again -- and not, for instance,
+  /// restamp anything or fire the ticks the console was asleep for.
+  void Resume() override;
+
   const config::Config& config() const override;
   const std::vector<config::Diagnostic>& config_diagnostics() const override;
   ipc::EngineSnapshot Snapshot() const override;
@@ -460,7 +514,14 @@ class SdEngine : public ipc::Engine {
   /// the user presses again.
   ///
   /// Order is this one, then `history_mutex_`, on both sides.
-  mutable std::mutex save_write_mutex_;
+  ///
+  /// **Timed rather than plain since M9-4 (#208)**, for a third caller that can
+  /// neither wait forever nor skip the wait: `Quiesce` has to know that no save
+  /// write is in flight before it acknowledges a sleep, and a plain `lock()`
+  /// behind a restore copying tens of megabytes is a console that does not go to
+  /// sleep at all (sys-con#155). `try_lock_for` is both halves of that -- the
+  /// wait, and the end of it.
+  mutable std::timed_mutex save_write_mutex_;
 
   /// The conflict history, for the tick that writes it.
   ///
@@ -606,6 +667,15 @@ class SdEngine : public ipc::Engine {
   /// leaving the entry `kQueued` beside the `.part` it got to, which is what
   /// makes the next attempt a resume rather than a restart.
   void CancelDrainLocked();
+
+  /// Stop the tick in flight, if there is one. The caller holds `mutex_`.
+  ///
+  /// `CancelDrainLocked`'s twin, and new with M9-4 (#208) because a tick now has
+  /// a token per run rather than one per process -- see `tick_cancel_`. Firing
+  /// it is all it does: the tick ends at its next operation boundary, with
+  /// whatever it had already written committed or rolled back by
+  /// `io::WriteAtomically` rather than left half done.
+  void CancelTickLocked();
 
   /// One line for a drain that is over. Nothing for one that did nothing.
   static void LogDrain(const download::DrainResult& result);
@@ -850,19 +920,25 @@ class SdEngine : public ipc::Engine {
   /// wake it, both under `mutex_`.
   sync::Scheduler scheduler_;
 
-  /// Fired by the destructor, and passed to every stage of a tick, so a shutdown
-  /// ends the tick at an operation boundary rather than mid-write
+  /// The tick in flight, or null. Passed to every stage of one, so a shutdown or
+  /// a sleep ends it at an operation boundary rather than mid-write
   /// (`sync::TickOptions::cancel`).
   ///
-  /// **One per process rather than one per tick**, and the difference does not
-  /// arise: cancellation is one-way and the only thing that fires it is the
-  /// process going away, which happens once. A second owner would need a second
-  /// token -- an overlay "stop this sync" is the obvious one -- and there is no
-  /// such command on the wire (`ipc::Command`), so there is nothing to give one
-  /// to. `sync::RunTick` still gets exactly one token across its three stages,
-  /// which is the rule that matters: a tick stops at a boundary rather than
-  /// half way through the accounting call.
-  http::CancelToken tick_cancel_;
+  /// **One per tick, and it was one per process until M9-4 (#208).** The old
+  /// arrangement was right while the only thing that ever fired it was the
+  /// process going away: cancellation is one-way, and a process goes away once.
+  /// PSC is the second firer and it is not one-way -- a console that suspends
+  /// and wakes up has to be able to run a tick afterwards, and a single token
+  /// fired at `SleepReady` would leave every tick for the rest of that boot
+  /// cancelled before it started, on a console that looks perfectly healthy.
+  ///
+  /// So it is `download_cancel_`'s arrangement now, for `download_cancel_`'s
+  /// reason: a `shared_ptr` the worker holds its own copy of for the length of
+  /// the tick, so replacing this pointer frees nothing under it, and
+  /// `sync::RunTick` still gets exactly one token across its three stages.
+  ///
+  /// Guarded by `mutex_`. Two things fire it: the destructor and `Quiesce`.
+  std::shared_ptr<http::CancelToken> tick_cancel_;
 
   /// The drain in flight, or null.
   ///
@@ -933,6 +1009,22 @@ class SdEngine : public ipc::Engine {
   /// The worker, with the stack `kThreadStackBytes` names and the heap term
   /// `kHeapThreadStacks` pays for (`sized_thread.hpp`, `main.cpp`).
   SizedThread worker_thread_;
+
+  /// The console is asleep, or on its way there (M9-4, #208).
+  ///
+  /// Guarded by `mutex_`, set by `Quiesce` and cleared by `Resume`. The worker
+  /// parks on it rather than deciding anything, which is what makes "no network
+  /// or card I/O between `SleepReady` and the next `MinimumAwake`" a property of
+  /// one flag instead of a rule every call site has to remember.
+  bool suspended_ = false;
+
+  /// How the worker tells `Quiesce` it has parked.
+  ///
+  /// A condition variable of its own rather than `wake_`, because the two run in
+  /// opposite directions: `wake_` is how everything else tells the worker there
+  /// is something to do, and this is the worker answering. Sharing one would
+  /// wake every parked pairing poll for every state change on this one.
+  std::condition_variable quiesced_;
 
   /// The verdict `auth.json` holds, and what a worker consults before calling.
   ///

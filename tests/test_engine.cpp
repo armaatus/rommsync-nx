@@ -52,6 +52,9 @@
 //                another
 //   shutdown  -- M9-5: the destructor ends a transfer at a boundary, keeping the
 //                `.part` the next boot resumes from
+//   sleeps    -- M9-4: a save write in flight at SleepReady is finished before the
+//                acknowledgement, and nothing goes out until MinimumAwake
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -68,6 +71,8 @@
 
 #include "engine.hpp"
 #include "harness.hpp"
+#include "power.hpp"
+#include "power_fake.hpp"
 #include "rig.hpp"
 #include "rommsync/auth.hpp"
 #include "rommsync/auth_gate.hpp"
@@ -92,6 +97,7 @@ namespace ipc = rommsync::ipc;
 // redeclares it (clang accepts it, which is how this reached CI once).
 namespace crypto = rommsync::crypto;
 namespace rlog = rommsync::log;
+namespace power = rommsync::sysmodule::power;
 namespace sysmodule = rommsync::sysmodule;
 
 namespace {
@@ -1303,6 +1309,77 @@ void SyncNowStarts(checks::Checks& c) {
            "and the next press is accepted too, because nothing is running");
 }
 
+/// A server that answers an empty library and then stops answering.
+///
+/// Enough for the worker to get past step 0 and into `sync::RunTick`, and no
+/// further: the negotiation blocks until a scenario lets it go. That window is
+/// **inside `save_write_mutex_`** -- `RunOneTick` takes it before it calls
+/// `sync::RunTick` -- which is what makes it the window a save write is in
+/// flight in, whether the thing being refused is a restore (M7-2, #37) or a
+/// sleep (M9-4, #208).
+///
+/// Shared by both, and at namespace scope for that reason.
+class HeldServer final : public http::HttpClient {
+ public:
+  http::Result Send(const http::Request& request) override {
+    ++requests_;
+    if (request.url.find("/api/roms") != std::string::npos) {
+      http::Result result;
+      result.response.status = 200;
+      // The envelope `rom_index.cpp` reads, whole: `total`, `limit` and
+      // `offset` are all `Required`, and an empty library is what keeps this
+      // scenario about the lock rather than about a save.
+      result.response.body = R"({"total":0,"limit":64,"offset":0,"items":[]})";
+      return result;
+    }
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      in_negotiate_ = true;
+      arrived_.notify_all();
+      released_.wait(lock, [this] { return release_; });
+    }
+    http::Result result;
+    result.error = http::Error::kConnectFailed;
+    result.message = "held by the test";
+    return result;
+  }
+
+  http::Result Download(const http::Request&, const http::DownloadTarget&) override {
+    return Send({});
+  }
+
+  /// How many requests this server has been asked for.
+  ///
+  /// What `engine.sleeps` reads to say that nothing was asked of the network
+  /// while the console was asleep -- a request nobody made has no response to
+  /// assert on, which is `Throttled::sent()`'s reason for existing too.
+  int requests() const { return requests_.load(); }
+
+  /// Block until the worker is inside the negotiation. False if it never got
+  /// there, which is a scenario that proved nothing rather than one that
+  /// passed.
+  bool AwaitNegotiate() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return arrived_.wait_for(lock, std::chrono::seconds{10}, [this] { return in_negotiate_; });
+  }
+
+  void Release() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      release_ = true;
+    }
+    released_.notify_all();
+  }
+
+ private:
+  std::atomic<int> requests_{0};
+  std::mutex mutex_;
+  std::condition_variable arrived_;
+  std::condition_variable released_;
+  bool in_negotiate_ = false;
+  bool release_ = false;
+};
+
 /// M7-2 (#37): a restore and a running tick both write saves, and only one of
 /// them may.
 ///
@@ -1322,63 +1399,6 @@ void SyncNowStarts(checks::Checks& c) {
 /// server that blocks on the negotiation -- and presses restore while it is
 /// there.
 void RestoreDuringSync(checks::Checks& c) {
-  /// A server that answers an empty library and then stops answering.
-  ///
-  /// Enough for the worker to get past step 0 and into `sync::RunTick`, and no
-  /// further: the negotiation blocks until this scenario lets it go, which is
-  /// the window the restore has to be refused in.
-  class HeldServer final : public http::HttpClient {
-   public:
-    http::Result Send(const http::Request& request) override {
-      if (request.url.find("/api/roms") != std::string::npos) {
-        http::Result result;
-        result.response.status = 200;
-        // The envelope `rom_index.cpp` reads, whole: `total`, `limit` and
-        // `offset` are all `Required`, and an empty library is what keeps this
-        // scenario about the lock rather than about a save.
-        result.response.body = R"({"total":0,"limit":64,"offset":0,"items":[]})";
-        return result;
-      }
-      {
-        std::unique_lock<std::mutex> lock(mutex_);
-        in_negotiate_ = true;
-        arrived_.notify_all();
-        released_.wait(lock, [this] { return release_; });
-      }
-      http::Result result;
-      result.error = http::Error::kConnectFailed;
-      result.message = "held by the test";
-      return result;
-    }
-
-    http::Result Download(const http::Request&, const http::DownloadTarget&) override {
-      return Send({});
-    }
-
-    /// Block until the worker is inside the negotiation. False if it never got
-    /// there, which is a scenario that proved nothing rather than one that
-    /// passed.
-    bool AwaitNegotiate() {
-      std::unique_lock<std::mutex> lock(mutex_);
-      return arrived_.wait_for(lock, std::chrono::seconds{10}, [this] { return in_negotiate_; });
-    }
-
-    void Release() {
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        release_ = true;
-      }
-      released_.notify_all();
-    }
-
-   private:
-    std::mutex mutex_;
-    std::condition_variable arrived_;
-    std::condition_variable released_;
-    bool in_negotiate_ = false;
-    bool release_ = false;
-  };
-
   Console console(c, "engine-restore-during-sync");
   c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
                                  "[server]\n"
@@ -1436,6 +1456,149 @@ void RestoreDuringSync(checks::Checks& c) {
   }
   c.Expect(after.outcome == conflicts::RestoreOutcome::kNoSuchEntry,
            "and the restore is available again the moment the tick is done");
+}
+
+// --- M9-4 (#208): the console goes to sleep ----------------------------------
+
+/// The watcher on a thread of its own, stopped and joined by the destructor.
+///
+/// What `main.cpp` does with a libnx `Thread` and what `test_power` does with a
+/// `std::thread`, in the one place a scenario here needs it (`power.hpp`: the
+/// watcher owns no thread).
+class Asleep {
+ public:
+  Asleep(power_fake::Scripted& module, power::Sink& sink)
+      : module_(module), watcher_(module, sink), thread_([this] { watcher_.Run(); }) {}
+
+  ~Asleep() {
+    module_.Stop();
+    thread_.join();
+  }
+
+ private:
+  power_fake::Scripted& module_;
+  power::Watcher watcher_;
+  std::thread thread_;
+};
+
+/// M9-4 (#208): hard rule 2 meeting sleep.
+///
+/// The sysmodule did not know the console had gone to sleep, so a `SleepReady`
+/// arriving mid-tick was answered by nobody and the transition happened around a
+/// save write in flight -- the card going away under `sync::Execute`, which is
+/// the one thing hard rule 2 exists to prevent (CLAUDE.md).
+///
+/// Three promises, and each of them is a different failure when it is broken:
+///
+///   * **the acknowledgement waits for the save write**, because it is this
+///     process telling PSC the card is free of it. Held open the way
+///     `engine.restore_race` holds one -- a stub server blocked inside
+///     `sync::RunTick`, which `RunOneTick` runs under `save_write_mutex_`;
+///   * **nothing is asked of the network between `SleepReady` and
+///     `MinimumAwake`**, including a "Sync now" pressed while the lid is shut.
+///     Sockets do not survive sleep -- SysDVR's `sockets.c` says so in as many
+///     words -- so a request issued here is one that fails, or worse, one that
+///     is still in flight when `bsdsocket` goes down;
+///   * **the console comes back**. A suspend that left the worker parked
+///     forever would be a client that stops syncing until the next reboot, with
+///     nothing on any screen saying why.
+///
+/// Needs no server and no rig: the transport is the stub above.
+void Sleeps(checks::Checks& c) {
+  Console console(c, "engine-sleeps");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\n"
+                                 "url = https://romm.example.com\n"
+                                 "\n"
+                                 "[sync]\n"
+                                 "enabled = true\n"
+                                 // No interval, so the boot tick is the only one
+                                 // that runs on its own and everything after it
+                                 // is a press. That is what makes the requests
+                                 // counted below attributable.
+                                 "interval_min = 0\n"),
+           "a configured card");
+  auth::StoredToken token;
+  token.server_url = "https://romm.example.com";
+  token.access_token = "not-a-real-token";
+  token.device_id = "console-sleeps";
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+           "and a paired one, so the tick gets as far as negotiating");
+
+  HeldServer server;
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&server, "not-a-real-token");
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+
+  c.Expect(server.AwaitNegotiate(),
+           "the worker is inside the tick, holding the lock every save byte is written under");
+
+  power_fake::Scripted psc;
+  Asleep asleep(psc, console.engine);
+
+  psc.Deliver(power::State::kSleepReady);
+  c.Expect(!psc.AwaitAcks(1, std::chrono::milliseconds{300}),
+           "the acknowledgement waits: sending it here is this process telling PSC the card "
+           "is free of it with a save still being written to it (hard rule 2)");
+
+  const int asked = server.requests();
+  server.Release();
+  c.Expect(psc.AwaitAcks(1, std::chrono::seconds{10}),
+           "and goes out once the tick has let go -- a request PSC never gets back is a "
+           "console that freezes with no fatal and no crash report (sys-con#155)");
+  c.ExpectEq(psc.acknowledged().size(), std::size_t{1},
+             "exactly one acknowledgement for one request");
+
+  // Asleep. A press that would ordinarily start a tick starts nothing, which is
+  // the only way "no network I/O while sleeping" can be checked against a
+  // console nobody is touching -- an idle worker proves nothing.
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted,
+           "Sync now is still accepted while the console sleeps, rather than refused");
+  std::this_thread::sleep_for(std::chrono::milliseconds{400});
+  c.ExpectEq(server.requests(), asked,
+             "but nothing goes out: sockets do not survive sleep, and a request issued "
+             "between SleepReady and MinimumAwake is one that fails or one that is still in "
+             "flight when bsdsocket goes down (SysDVR sockets.c)");
+  c.Expect(!console.Status().sync_in_progress, "and no tick is left marked as running");
+
+  // ...and the console comes back. `EssentialServicesAwake` is deliberately not
+  // enough -- it says the critical services are up and nothing about `fsp-srv`
+  // -- so the press is still held after it and only `MinimumAwake` releases it.
+  psc.Deliver(power::State::kEssentialServicesAwake);
+  c.Expect(psc.AwaitAcks(2, std::chrono::seconds{10}), "the first wake state is answered");
+  std::this_thread::sleep_for(std::chrono::milliseconds{200});
+  c.ExpectEq(server.requests(), asked,
+             "and changes nothing: EssentialServicesAwake is not the card coming back "
+             "(erpt_srv_service.cpp turns its filesystem access on at MinimumAwake)");
+
+  psc.Deliver(power::State::kMinimumAwake);
+  c.Expect(psc.AwaitAcks(3, std::chrono::seconds{10}), "and so is the one that is");
+
+  const std::chrono::steady_clock::time_point deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{10};
+  while (server.requests() == asked && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  c.Expect(server.requests() > asked,
+           "the press the console slept through is served once it is awake, rather than "
+           "leaving a client that stops syncing until the next reboot");
+
+  // **A second sleep, and it is not decoration.** A cancel token is one-way, so
+  // a suspend that fired one shared by every tick would leave this console
+  // unable to run another for the rest of the boot -- and a console that woke up
+  // and never synced again would look perfectly healthy. This is the assertion
+  // that would catch it: the tick the wake started is stopped, and the
+  // acknowledgement goes out, exactly as the first one did.
+  //
+  // It is also what leaves the worker parked with nothing in flight while the
+  // stub server and the card below are still alive to be parked against.
+  psc.Deliver(power::State::kSleepReady);
+  c.Expect(psc.AwaitAcks(4, std::chrono::seconds{10}),
+           "the console can go back to sleep -- a tick cancelled at the first SleepReady did "
+           "not take every later tick with it");
 }
 
 // --- M7-3: the log docs/TROUBLESHOOTING.md is written against ------------------
@@ -2542,6 +2705,8 @@ int main(int argc, char** argv) {
     Relaunch(checks);
   } else if (scenario == "reenable") {
     Reenable(checks);
+  } else if (scenario == "sleeps") {
+    Sleeps(checks);
   } else if (scenario == "restore_race") {
     RestoreDuringSync(checks);
   } else if (scenario == "syncnow") {

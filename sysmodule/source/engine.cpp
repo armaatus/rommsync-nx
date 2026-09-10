@@ -102,12 +102,14 @@ SdEngine::~SdEngine() {
     // dynamic sysmodule from ovl-sysmodules is not something a user can be asked
     // to wait out (M9-5, #197).
     CancelDrainLocked();
+    // Before the join, not after it: a tick already in flight ends at its next
+    // operation boundary rather than being waited out in full, which on the link
+    // whose loss is usually why the process is going away is three timeouts and
+    // two backoffs saved (`sync::TickOptions::cancel`). Under the lock since
+    // M9-4 (#208), because the token is now the tick's rather than the
+    // process's (`tick_cancel_`).
+    CancelTickLocked();
   }
-  // Before the join, not after it: a tick already in flight ends at its next
-  // operation boundary rather than being waited out in full, which on the link
-  // whose loss is usually why the process is going away is three timeouts and
-  // two backoffs saved (`sync::TickOptions::cancel`).
-  tick_cancel_.Cancel();
   wake_.notify_all();
   if (worker_thread_.joinable()) {
     worker_thread_.join();
@@ -1028,6 +1030,19 @@ void SdEngine::CancelDrainLocked() {
   }
 }
 
+void SdEngine::CancelTickLocked() {
+  if (tick_cancel_ != nullptr) {
+    tick_cancel_->Cancel();
+  }
+}
+
+void SdEngine::Quiesce() {
+  // STUB, step 3 of the plan: the console goes to sleep and this process carries
+  // on regardless, which is what `engine.sleeps` is about.
+}
+
+void SdEngine::Resume() {}
+
 void SdEngine::LogDrain(const download::DrainResult& result) {
   switch (result.outcome) {
     case download::DrainOutcome::kIdle:
@@ -1204,8 +1219,24 @@ void SdEngine::RunOneTick() {
   fs::FileSystem* files = nullptr;
   auth::StoredToken token;
   bool blocked = false;
+  // This tick's cancel token, registered before anything is read so that a
+  // shutdown or a sleep landing an instant later finds something to fire. Held
+  // as a local for the length of the tick as well: `Resume` replaces the member
+  // and the copy here is what keeps this tick's token alive under it
+  // (`tick_cancel_`, and `download_cancel_` before it).
+  const std::shared_ptr<http::CancelToken> cancel = std::make_shared<http::CancelToken>();
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    tick_cancel_ = cancel;
+    if (stopping_ || suspended_) {
+      // The window the worker's own check cannot cover: it decided a tick was
+      // due, released `mutex_`, and a shutdown or a `SleepReady` landed before
+      // this line. Cancelling the token rather than returning is what keeps the
+      // scheduler's accounting straight -- every stage answers `kCanceled` at
+      // once and `Finished` is still called with it, where an early return would
+      // leave a tick the scheduler handed out and never heard back about.
+      cancel->Cancel();
+    }
     client = server_;
     files = card_;
     token = token_;
@@ -1378,7 +1409,7 @@ void SdEngine::RunOneTick() {
   options.enabled = config->sync.enabled;
   options.execute.backup_dir = sync::kBackupDir;
   options.finish.state_sd_path = sync::kStateSdPath;
-  options.cancel = &tick_cancel_;
+  options.cancel = cancel.get();
   // The save folders and `.backup/`, and deliberately **not** `/config/rommsync`
   // itself: those records recover from their own `.old` when they are read, and
   // the overlay writes `config.ini` from another thread, where a sweep removing
@@ -1414,7 +1445,7 @@ void SdEngine::RunOneTick() {
   // arriving from the overlay is refused rather than interleaved
   // (`save_write_mutex_`). Held across the transfers and the states half, and
   // released before the counters go under `mutex_`.
-  std::unique_lock<std::mutex> writing(save_write_mutex_);
+  std::unique_lock<std::timed_mutex> writing(save_write_mutex_);
 
   const sync::TickResult tick =
       sync::RunTick(*client, *files, token, reported, targets, loaded.value, options);
@@ -1459,7 +1490,7 @@ void SdEngine::RunOneTick() {
     state::Baseline baseline = state::LoadBaseline(baseline_path).value;
     sync::StateSyncOptions state_options;
     state_options.backup_dir = sync::kBackupDir;
-    state_options.cancel = &tick_cancel_;
+    state_options.cancel = cancel.get();
     state_options.place = [place = placer(&config::PlatformFolders::states)](
                               const sync::ServerState& server) {
       return place(server.rom_id, server.file_name);
@@ -2000,7 +2031,7 @@ ipc::Error SdEngine::RestoreBackup(std::int64_t entry_id, conflicts::RestoreRepo
   // `kBackupFailed` is the outcome whose promise is exactly what holds here --
   // nothing was written -- and the sentence beside it is what the screen draws,
   // so the user is told to press again rather than told their backup is gone.
-  std::unique_lock<std::mutex> writing(save_write_mutex_, std::try_to_lock);
+  std::unique_lock<std::timed_mutex> writing(save_write_mutex_, std::try_to_lock);
   if (!writing.owns_lock()) {
     report->outcome = conflicts::RestoreOutcome::kBackupFailed;
     report->message = "a sync is running; try the restore again when it finishes";
