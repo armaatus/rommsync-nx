@@ -1744,10 +1744,14 @@ cmd_status() {
   done
   echo
   # Otherwise the queue below reads as ready to go while nothing in it can
-  # start, which is the "nothing to act on" shape #212 was.
-  local holder; holder="$(live_foundation "$(live_worktrees 2>/dev/null)" 2>/dev/null)" \
-    && echo "held: #$holder is a foundation issue and lands alone -- nothing below starts until it does"
-  echo
+  # start, which is the "nothing to act on" shape #212 was. The blank line
+  # belongs to the line it separates, not to the section: printed only when
+  # there is something to separate.
+  local holder
+  if holder="$(live_foundation "$(live_worktrees 2>/dev/null)" 2>/dev/null)"; then
+    echo "held: #$holder is a foundation issue and lands alone -- nothing below starts until it does"
+    echo
+  fi
   echo "next up (ready, not in flight, not labelled $HUMAN_STEP_LABEL;"
   echo "         'unblocks' is how many issues it frees):"
   printf '  %-6s %-9s %s\n' "issue" "unblocks" "title"
