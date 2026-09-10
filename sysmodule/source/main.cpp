@@ -950,8 +950,17 @@ int main(int, char**) {
   // first it would be torn out from under a quiesce in flight. Reverse
   // declaration order is what makes this go first; `SdEngine::Quiesce` records
   // the requirement.
-  const std::unique_ptr<rommsync::sysmodule::power::Subscription> psc =
-      rommsync::sysmodule::power::Subscribe(engine);
+  //
+  // **Gated on `g_psc_up`**, which is this file's pattern rather than a
+  // precaution about this call: `timeExit` is gated the same way and
+  // `NetworkInitialize` runs only behind the four `WaitForService`s that
+  // precede it. Without the gate `pscmGetPmModule` would go out on a session
+  // `pscmInitialize` never opened -- which `Open()` handles, and which is
+  // exactly the kind of "handled" a reader has to go and check.
+  std::unique_ptr<rommsync::sysmodule::power::Subscription> psc;
+  if (g_psc_up) {
+    psc = rommsync::sysmodule::power::Subscribe(engine);
+  }
   Log(psc != nullptr ? "rommsync: subscribed to psc:m; sleep will be handled"
                      : "rommsync: no psc:m subscription; this console will not be told when "
                        "it sleeps");
