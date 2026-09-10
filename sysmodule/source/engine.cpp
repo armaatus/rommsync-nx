@@ -788,7 +788,7 @@ void SdEngine::ObserveAnswer(auth::Answer answer) {
   auth::SaveBlock(PathTo(auth::kAuthStateFileName), block);
 }
 
-void SdEngine::AwaitNetwork() {
+bool SdEngine::AwaitNetwork() {
   // The wait for the network happens **here**, on this thread, and never in
   // `main`: a console that comes up with no Wi-Fi must not hold boot
   // (CLAUDE.md, docs/ARCHITECTURE.md §1). A null probe is "the network is up",
@@ -799,7 +799,7 @@ void SdEngine::AwaitNetwork() {
     probe = network_probe_;
   }
   if (!probe) {
-    return;
+    return true;
   }
 
   const std::chrono::steady_clock::time_point deadline =
@@ -816,16 +816,20 @@ void SdEngine::AwaitNetwork() {
     const bool up = probe();
     lock.lock();
     if (up) {
-      return;
+      return true;
     }
     // `wait_for` rather than a sleep, so a shutdown cuts this short instead of
     // costing the destructor the rest of the poll interval.
     wake_.wait_for(lock, kNetworkPollInterval, [this] { return stopping_ || suspended_; });
   }
+  // False when the budget ran out, the process is going away, or the console
+  // went to sleep. Only the last of those is worth another go, and `RunWorker`
+  // is what decides that.
+  return false;
 }
 
 void SdEngine::RunWorker() {
-  AwaitNetwork();
+  bool network_seen = AwaitNetwork();
 
   std::unique_lock<std::mutex> lock(mutex_);
   while (!stopping_) {
@@ -839,6 +843,18 @@ void SdEngine::RunWorker() {
       quiesced_.notify_all();
       wake_.wait(lock, [this] { return stopping_ || !suspended_; });
       worker_parked_ = false;
+      if (!stopping_ && !network_seen) {
+        // The boot wait was cut short by the sleep rather than satisfied
+        // (`AwaitNetwork` returns which). A console that came up with Wi-Fi not
+        // yet associated and was shut a few seconds later would otherwise wake
+        // straight into its boot tick and its first drain at `MinimumAwake`,
+        // with `nifm` not reassociated -- both failing, and the boot tick spent.
+        // The grace `kNetworkWaitBudget` exists for is given again, and it still
+        // ends the moment the probe says yes.
+        lock.unlock();
+        network_seen = AwaitNetwork();
+        lock.lock();
+      }
       continue;
     }
 
@@ -1874,7 +1890,16 @@ bool SdEngine::AwaitNextPoll(const std::shared_ptr<PairingAttempt>& attempt) {
   wake_.wait(lock, [this, &attempt] {
     return stopping_ || attempt_ != attempt || !suspended_;
   });
-  return !stopping_ && attempt_ == attempt;
+  if (stopping_ || attempt_ != attempt) {
+    return false;
+  }
+  // **Busy is claimed here, under the lock that just read `!suspended_`.** Doing
+  // it in `DrivePairing` after this returns leaves a window with the lock
+  // released, and a `Quiesce` landing in it would find `pairing_busy_` false,
+  // acknowledge the sleep, and then watch this thread open a socket. It is a few
+  // instructions wide and it is the exact case this flag exists to close.
+  pairing_busy_ = true;
+  return true;
 }
 
 void SdEngine::SetPairingBusy(bool busy) {
@@ -1893,7 +1918,12 @@ void SdEngine::DrivePairing() {
     std::shared_ptr<PairingAttempt> attempt;
     {
       std::unique_lock<std::mutex> lock(mutex_);
-      wake_.wait(lock, [this] { return stopping_ || attempt_ != driven_; });
+      // `!suspended_` as well (M9-4, #208): `Begin()` below is a network
+      // request, and a `StartPair` that arrives while the console is asleep must
+      // not send one over a socket the transition is taking away. The command
+      // itself is still answered -- `StartPairing` returns `kStarting` and the
+      // screen draws it -- and this thread picks the attempt up on the wake.
+      wake_.wait(lock, [this] { return stopping_ || (attempt_ != driven_ && !suspended_); });
       if (stopping_) {
         return;
       }
@@ -1904,20 +1934,25 @@ void SdEngine::DrivePairing() {
         // picked it up. There is nothing to drive.
         continue;
       }
+      // Claimed here rather than after the lock is released, for the reason
+      // `AwaitNextPoll` gives about the same window.
+      pairing_busy_ = true;
     }
 
     // The request `StartPairing` refused to wait for. Everything from here down
     // is off the IPC thread, so it may take as long as `request_timeout`.
     //
-    // Bracketed by `SetPairingBusy` since M9-4 (#208): a `Quiesce` may not
+    // Bracketed by `pairing_busy_` since M9-4 (#208): a `Quiesce` may not
     // acknowledge a sleep with a request in flight on *any* thread, and this is
-    // the one thread whose request it cannot stop. `AwaitNextPoll` is what stops
-    // the *next* one going out.
-    SetPairingBusy(true);
+    // the one thread whose request it cannot stop. The two waits above are what
+    // stop the *next* one going out; both claim the flag before they let go of
+    // `mutex_`, so there is no window between deciding to call and being seen to
+    // be calling.
     auth::PairingState state = attempt->session.Begin();
     SetPairingBusy(false);
+    // `AwaitNextPoll` returns already marked busy -- see it for why the flag
+    // cannot be set out here.
     while (!auth::IsTerminal(state) && AwaitNextPoll(attempt)) {
-      SetPairingBusy(true);
       state = attempt->session.Poll();
       SetPairingBusy(false);
     }

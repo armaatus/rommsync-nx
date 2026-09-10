@@ -37,6 +37,22 @@ void Watcher::Run() {
     // nothing anywhere saying why.
     module_.Acknowledge(state);
   }
+
+  // **Never leave the process suspended.** The loop above ends for two reasons:
+  // `Module::Stop()`, which is a caller going away, and a subscription that has
+  // failed and unregistered (`power_psc.cpp`). The second is the dangerous one:
+  // if it happened between a `SleepReady` and the wake, nothing is ever going to
+  // deliver that wake, and a sink left quiesced is a client that has stopped
+  // working for the rest of the boot with nothing on any screen saying why.
+  //
+  // Resuming is the right way to fail. The console is either awake already or
+  // about to be -- PSC does not stop at `SleepReady` -- so the worst this costs
+  // is a tick issued a moment early, against the alternative of a sysmodule that
+  // is silently inert until the next reboot.
+  if (quiesced_) {
+    quiesced_ = false;
+    sink_.Resume();
+  }
 }
 
 }  // namespace rommsync::sysmodule::power

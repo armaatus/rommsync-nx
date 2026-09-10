@@ -405,8 +405,18 @@ void Write(Level level, Event event, std::string_view detail) {
       state.ring.pop_front();
     }
     // The ring is filled either way; only the *card* is switched off (M9-4,
-    // #208, and `SetSinkEnabled`). Read under the same lock as the sink pointer,
-    // so a suspend landing here cannot let one line through after it.
+    // #208, and `SetSinkEnabled`).
+    //
+    // **It is read here and the sink is called below, outside the lock**, so a
+    // `SetSinkEnabled(false)` landing in between still lets this one line reach
+    // the card. That is not closed here, and it is not a hole: the callers this
+    // could be are the ones `SdEngine::Quiesce` already waits for -- the worker
+    // has parked and the pairing thread is between requests before the switch is
+    // thrown, and neither can be part-way through a `log::Write` once it has --
+    // plus the IPC thread, which `Quiesce` documents as not covered either way.
+    // Closing it would mean either calling the sink under this lock, which is
+    // the one thing the comment below forbids, or making a suspend wait on a
+    // card write it cannot bound.
     sink = state.sink_enabled ? state.sink : nullptr;
   }
 

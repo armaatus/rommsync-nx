@@ -177,9 +177,16 @@ void Once(checks::Checks& c) {
     c.Expect(module.AwaitAcks(2, kAckBudget),
              "a state this build has never heard of is acknowledged anyway -- an unanswered "
              "request is a console that never finishes the transition (sys-con#155)");
+    c.ExpectEq(sink.resumes(), 0, "and it is not mistaken for a wake");
   }
 
-  c.ExpectEq(sink.resumes(), 0, "and it is not mistaken for a wake");
+  // The scope above ends by stopping the module, which is what a subscription
+  // that has failed and unregistered looks like from in here. It must not leave
+  // the process quiesced: nothing would ever deliver the wake, and the client
+  // would be inert until the next reboot with nothing anywhere saying so.
+  c.ExpectEq(sink.resumes(), 1,
+             "a watcher that stops while the console is suspended resumes on the way out, "
+             "rather than stranding the process asleep");
   const std::vector<power::State> acked = module.acknowledged();
   c.ExpectEq(acked.size(), std::size_t{2}, "two requests, two acknowledgements");
 }

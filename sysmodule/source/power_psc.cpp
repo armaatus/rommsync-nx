@@ -12,8 +12,10 @@
 #include <switch.h>
 
 #include <memory>
+#include <string>
 
 #include "power.hpp"
+#include "rommsync/log.hpp"
 
 namespace rommsync::sysmodule::power {
 namespace {
@@ -102,16 +104,26 @@ class PscModule final : public Module {
       // with no way out is a destructor that cannot run, and this class has one.
       const Result rc = waitMulti(&signalled, UINT64_MAX, waiterForEvent(&module_.event),
                                   waiterForUEvent(&stop_));
-      if (R_FAILED(rc) || signalled != 0) {
+      if (signalled == 1) {
+        // `Stop()`. Nothing failed; the caller is going away.
+        return false;
+      }
+      if (R_FAILED(rc)) {
+        Surrender("the sleep watcher's wait failed", rc);
         return false;
       }
       PscPmState raw = PscPmState_Awake;
       u32 flags = 0;
-      if (R_FAILED(pscPmModuleGetRequest(&module_, &raw, &flags))) {
-        // The event fired and PSC had nothing to hand over. Nothing to
-        // acknowledge either -- an acknowledgement for a request that was never
-        // made is worse than none -- so go back to waiting.
-        continue;
+      const Result got = pscPmModuleGetRequest(&module_, &raw, &flags);
+      if (R_FAILED(got)) {
+        // The event fired and the request would not come out of PSC. **Not a
+        // `continue`**, which is what this was until the review: the event is
+        // auto-clear, so the request is gone and PSC is waiting for an
+        // acknowledgement this thread can no longer produce -- and a module that
+        // never answers is the whole console frozen with no fatal and no crash
+        // report (sys-con#155).
+        Surrender("a sleep request could not be read", got);
+        return false;
       }
       // The values are libnx's `PscPmState` and the names on this side are
       // Nintendo's; `power::State` carries the mapping and why libnx's is wrong
@@ -134,6 +146,25 @@ class PscModule final : public Module {
   void Stop() override { ueventSignal(&stop_); }
 
  private:
+  /// Give up being a PSC module, out loud, and **unregister** on the way.
+  ///
+  /// The one thing worse than a console that does not know it is sleeping is a
+  /// console that cannot sleep at all. Once this thread cannot answer, staying
+  /// registered means PSC waits for an acknowledgement that will never come --
+  /// so the module is finalized here rather than in a destructor that never runs
+  /// (`main` does not return). What is left is the client as it was before this
+  /// issue, degraded and saying so, instead of a system freeze.
+  void Surrender(const char* what, Result rc) {
+    log::Error(log::Event::kPower, std::string(what) + "; this console will sleep without "
+                                   "waiting for rommsync from now on (rc=" +
+                                       std::to_string(rc) + ")");
+    if (open_) {
+      pscPmModuleFinalize(&module_);
+      pscPmModuleClose(&module_);
+      open_ = false;
+    }
+  }
+
   PscPmModule module_{};
   UEvent stop_{};
   bool open_ = false;

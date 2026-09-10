@@ -284,6 +284,13 @@ Sink* GetSink();
 /// Idempotent, and safe from any thread. Not the same as `SetSink(nullptr)`: the
 /// sink is remembered, so whoever installed it is still the only caller who has
 /// to know what it is.
+///
+/// **It does not wait for a write already past the check.** `Write` reads the
+/// switch under the lock and calls the sink outside it, so a thread inside that
+/// gap finishes its line. Making this wait would mean a suspend blocking on a
+/// card write it cannot bound, which is the console that will not sleep; the
+/// caller's answer is instead to have parked every thread it owns first
+/// (`SdEngine::Quiesce`), which leaves no writer to be in the gap.
 void SetSinkEnabled(bool enabled);
 
 /// Whether the sink is being written to. False between a `SetSinkEnabled(false)`

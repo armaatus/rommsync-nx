@@ -179,6 +179,12 @@ class Watcher {
   /// including for a state this build does not recognise, which is acknowledged
   /// and otherwise ignored -- and a `Sink` call only where the console actually
   /// changed direction.
+  ///
+  /// **It never returns leaving the sink quiesced.** A subscription that fails
+  /// mid-sleep would otherwise strand the process: nothing is left to deliver
+  /// the wake, so the sink stays suspended for the rest of the boot. Coming out
+  /// of this loop resumes it, which is the difference between a client that is
+  /// degraded and one that is silently inert.
   void Run();
 
  private:

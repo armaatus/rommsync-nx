@@ -549,6 +549,8 @@ line after putting the console to sleep during a sync is the client working.
 **Nothing here needs fixing on the console.** There is no setting for it, and
 there is nothing to turn off.
 
+---
+
 ## What to attach to a bug report
 
 Four things, and the log has three of them:

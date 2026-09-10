@@ -931,6 +931,12 @@ int main(int, char**) {
   // Held for the life of the process. It is never destroyed, because `main`
   // never returns; the destructor exists for the tests, which is where the
   // watcher's thread is actually joined.
+  //
+  // **Declared after `engine`, and it has to be.** `Quiesce` runs on the thread
+  // this owns and reads the engine's members, so were the engine to be destroyed
+  // first it would be torn out from under a quiesce in flight. Reverse
+  // declaration order is what makes this go first; `SdEngine::Quiesce` records
+  // the requirement.
   const std::unique_ptr<rommsync::sysmodule::power::Subscription> psc =
       rommsync::sysmodule::power::Subscribe(engine);
   Log(psc != nullptr ? "rommsync: subscribed to psc:m; sleep will be handled"

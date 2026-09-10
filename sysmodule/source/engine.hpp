@@ -386,8 +386,17 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// screen off, and a sysmodule that answered `kUnavailable` to a user's button
   /// because the console had dozed would be a worse bug than the one being
   /// prevented. What is covered is everything this process starts *by itself* --
-  /// the worker, which is where every tick, every drain and every save write it
-  /// is not asked for comes from.
+  /// the worker and the pairing thread, which between them are where every tick,
+  /// every drain, every poll and every save write this console was not asked for
+  /// comes from.
+  ///
+  /// **The subscription must not outlive this object.** This runs on the PSC
+  /// watcher's thread, which `power::Subscription` owns and this class does not,
+  /// so a destructor running while a quiesce is in flight would tear the members
+  /// it is waiting on out from under it. `main.cpp` declares the subscription
+  /// after the engine, so it is destroyed first, and the tests declare their
+  /// `power_fake::Running` after the `Console`. Nothing here can enforce it;
+  /// this sentence is the record that it is required.
   void Quiesce() override;
 
   /// ...and the console is back. Lets the worker go again (M9-4, #208).
@@ -685,6 +694,12 @@ class SdEngine : public ipc::Engine, public power::Sink {
 
   /// Say whether the pairing thread is inside a request or a card write, and
   /// wake whoever is waiting for it to stop being (`pairing_busy_`).
+  ///
+  /// **Only ever called with `false`.** Claiming it is done inside whichever wait
+  /// last read `!suspended_`, still holding `mutex_`, because a claim made after
+  /// that lock is released is a window a `Quiesce` fits through -- it would find
+  /// the flag clear, acknowledge the sleep, and then watch this thread open a
+  /// socket.
   void SetPairingBusy(bool busy);
 
   /// Stop the tick in flight, if there is one. The caller holds `mutex_`.
@@ -706,7 +721,14 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// range. Giving up costs one tick, which fails `TickOutcome::kOffline` and is
   /// rescheduled on the same backoff every other offline console is on. It also
   /// gives up at once when the process is going away.
-  void AwaitNetwork();
+  ///
+  /// **True when the probe said yes, or when there is no probe.** False is the
+  /// budget running out, a shutdown, or a sleep -- and the last of those is why
+  /// there is a return value at all (M9-4, #208): a console suspended during the
+  /// boot wait has not *spent* its grace, it has been interrupted, and
+  /// `RunWorker` gives it again on the wake rather than running the boot tick
+  /// against a `nifm` that has not reassociated.
+  bool AwaitNetwork();
 
   /// Tell the worker there is something to do. Safe from any thread; takes
   /// `mutex_` for the counter and notifies outside it.
