@@ -72,7 +72,13 @@ def app_init(source):
 
     A `smExit()` in `__appExit` is correct and a `smExit()` in `__appInit` is
     the bug, so the two cannot be told apart by searching the file.
+
+    Comments come out **first**, not after. `__appInit`'s own comments quote sm
+    internals -- `R_UNLESS(service_info != nullptr, ...)` and friends -- and one
+    brace in one of them would end the extracted body early, after which every
+    phase below passes on whatever was left rather than on the function.
     """
+    source = uncommented(source)
     at = source.find("void __appInit(void)")
     if at < 0:
         raise SystemExit(fail("no __appInit in sysmodule/source/main.cpp"))
@@ -99,7 +105,7 @@ def uncommented(body):
 
 
 def phase_dns(repo):
-    body = uncommented(app_init(read(repo, "sysmodule/source/main.cpp")))
+    body = app_init(read(repo, "sysmodule/source/main.cpp"))
     if re.search(r"\bsmExit\s*\(", body):
         return fail(
             "__appInit calls smExit(); libnx re-opens `sfdnsres` off the sm session on "
@@ -142,7 +148,7 @@ def phase_clock(repo):
 
 
 def phase_bounded(repo):
-    body = uncommented(app_init(read(repo, "sysmodule/source/main.cpp")))
+    body = app_init(read(repo, "sysmodule/source/main.cpp"))
     # `WaitForService` and `WaitForServiceOrAbort`: what differs is what the
     # caller does about a timeout, not whether it waited.
     waited = set(re.findall(r"WaitForService\w*\s*\(\s*\"([^\"]+)\"", body))
@@ -160,9 +166,13 @@ def phase_bounded(repo):
                     "the SAC but not yet registered makes sm defer the request and never "
                     "answer it: the console boots, the sysmodule is inert, and there is "
                     "no crash report (#195)" % (call, service))
-    # `NetworkInitialize()` is the socket and ssl half, called through a wrapper.
+    # `NetworkInitialize()` acquires four sessions behind one call, and `nifm:u`
+    # is one of them: since #195 moved the only `nifmInitialize` in the build in
+    # there, the literal-call rule above no longer sees it, and a deleted
+    # `WaitForService("nifm:u")` would leave this phase green over exactly the
+    # unbounded `smGetService` it exists to catch.
     if re.search(r"\bNetworkInitialize\s*\(", body):
-        for service in ("bsd:u", "sfdnsres", "ssl"):
+        for service in ("nifm:u", "bsd:u", "sfdnsres", "ssl"):
             if service not in waited:
                 failures += fail(
                     "__appInit calls NetworkInitialize() without waiting for `%s` first "

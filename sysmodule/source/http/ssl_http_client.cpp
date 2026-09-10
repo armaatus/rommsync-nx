@@ -38,25 +38,6 @@ bool g_socket_up = false;
 bool g_ssl_up = false;
 bool g_nifm_up = false;
 
-/// Whether the console has an internet connection, asked before a connect
-/// rather than after a ten-second timeout.
-///
-/// This is what "offline-safe" costs on a console (CLAUDE.md): a sync tick on a
-/// Switch in a bag would otherwise spend `connect_timeout` per request finding
-/// out what nifm can answer in one IPC call. A nifm that will not answer is not
-/// treated as offline -- the transport is bsd and ssl, and refusing to try
-/// because a diagnostic service was busy would be the worse mistake.
-bool ConsoleIsOnline() {
-  if (!g_nifm_up) return true;
-  NifmInternetConnectionType type{};
-  u32 strength = 0;
-  NifmInternetConnectionStatus status{};
-  if (R_FAILED(nifmGetInternetConnectionStatus(&type, &strength, &status))) {
-    return true;
-  }
-  return status == NifmInternetConnectionStatus_Connected;
-}
-
 /// One `SslConnection`, and the socket it was handed.
 ///
 /// The teardown order is the API's, not a preference: the descriptor
@@ -388,8 +369,9 @@ Result NetworkInitialize(const SocketBudget& budget) {
   // also the only `nifmInitialize` in this build -- `main.cpp` had a second one,
   // whose `NifmServiceType` libnx silently ignored because the call refcounts.
   // Bringing it up after `socketInitialize` would mean a console whose transfer
-  // memory did not fit lost `NetworkUp()` as well as its transport, and the
-  // connection probe is exactly what such a console still wants to answer.
+  // memory did not fit lost `ConsoleIsOnline()`'s real answer as well as its
+  // transport, and a connection probe is exactly what such a console still wants
+  // to be able to give.
   if (!g_nifm_up) {
     g_nifm_up = R_SUCCEEDED(nifmInitialize(NifmServiceType_User));
   }
@@ -435,6 +417,17 @@ void NetworkExit() {
 }
 
 bool NetworkReady() { return g_socket_up && g_ssl_up; }
+
+bool ConsoleIsOnline() {
+  if (!g_nifm_up) return true;
+  NifmInternetConnectionType type{};
+  u32 strength = 0;
+  NifmInternetConnectionStatus status{};
+  if (R_FAILED(nifmGetInternetConnectionStatus(&type, &strength, &status))) {
+    return true;
+  }
+  return status == NifmInternetConnectionStatus_Connected;
+}
 
 std::unique_ptr<http::HttpClient> MakeHorizonHttpClient(const http::ClientOptions& options) {
   return std::unique_ptr<http::HttpClient>(new HorizonHttpClient(options));

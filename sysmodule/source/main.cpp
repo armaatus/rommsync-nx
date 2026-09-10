@@ -196,26 +196,6 @@ std::unique_ptr<rommsync::fs::FileSystem> g_card;
 /// `GetLog` answers them and only the *file* starts where the sink does.
 std::unique_ptr<rommsync::log::FileSink> g_log;
 
-/// Whether this console has an internet connection, right now.
-///
-/// The whole of the libnx half of "boot, after the network is up"
-/// (docs/ARCHITECTURE.md §1). The waiting -- the budget, the poll interval, and
-/// noticing that the process is going away -- is `SdEngine::AwaitNetwork`'s,
-/// where `stopping_` is visible and where a host test can drive it; a wait that
-/// slept in here would make a shutdown during boot take the whole budget.
-///
-/// **Called on the worker thread, never on the main one.** `main` registers the
-/// service and enters its loop with no network call in front of it, which is
-/// CLAUDE.md's "never block boot" -- a console with no Wi-Fi still has an
-/// overlay that opens, settings that read and a queue that draws.
-bool NetworkUp() {
-  NifmInternetConnectionType type = static_cast<NifmInternetConnectionType>(0);
-  u32 strength = 0;
-  NifmInternetConnectionStatus status = static_cast<NifmInternetConnectionStatus>(0);
-  return R_SUCCEEDED(nifmGetInternetConnectionStatus(&type, &strength, &status)) &&
-         status == NifmInternetConnectionStatus_Connected;
-}
-
 /// The Horizon half of `io::FileSync` (#16): make what was just written
 /// durable, before the rename that publishes it.
 ///
@@ -297,6 +277,26 @@ rommsync::sysmodule::boot::Journal g_boot{};
 /// `/atmosphere/contents` sysmodule has no other host. An `sm` that will not
 /// answer it reports `Probed() == false` and the caller stops rather than
 /// waiting out a budget for an answer that is not coming.
+///
+/// **What it does not cover, stated rather than implied.** `GetServiceHandle`
+/// defers on four conditions and `HasService` reflects only the first:
+///
+///   * `service_info == nullptr` -- not registered. **This one**, and it is the
+///     failure #195 is about: a name in the SAC that nothing ever registers.
+///   * `ShouldDeferForInit(service)` -- `fsp-srv` alone, until `sm:m` is told
+///     the initial defers are over. `pm` does that at its own startup, before
+///     boot2 reaches `/atmosphere/contents`, so it is closed by the time this
+///     runs.
+///   * `HasFutureMitmDeclaration(service)` -- a mitm module has called
+///     `AtmosphereDeclareFutureMitm` and not yet installed. `HasService` says
+///     yes and the acquisition still parks.
+///   * `mitm_info->waiting_ack` -- a mitm session mid-acknowledgement.
+///
+/// The last two are windows another module opens and closes within its own
+/// startup, and nothing sm exposes can be polled for either. So the bound this
+/// class buys is a bound on *registration*, not a proof that the next call
+/// returns -- which is the difference between the failure mode that has no
+/// symptom and one that lasts as long as another sysmodule's init.
 class SmWaiter final : public rommsync::sysmodule::boot::Waiter {
  public:
   bool Ready(const char* service) override {
@@ -452,6 +452,11 @@ void __appInit(void) {
   // `boot.bounded` is the check that keeps it that way -- it reads this function
   // and fails on any initialiser without a `WaitForService` above it, so the
   // name in each call below is load-bearing.
+  //
+  // The bound is on **registration**, which is the condition with no symptom.
+  // `SmWaiter` lists the three other things sm defers on and why none of them
+  // can be polled for; each is a window another module closes inside its own
+  // startup rather than one that lasts for the life of the console.
   SmWaiter sm;
   const auto WaitForService = [&sm](const char* service) { return MayProceedWith(service, sm); };
   const auto WaitForServiceOrAbort = [&sm](const char* service) { RequireService(service, sm); };
@@ -551,14 +556,17 @@ void __appInit(void) {
   // that is plainly broken from spending the budget four times over; the note
   // names whichever one it stopped at.
   //
-  // A missing `nifm:u` therefore costs the transport as well, which reads like
-  // more than the probe is worth -- until you follow it: `NetworkUp` is the
-  // engine's network probe (`UseNetworkProbe`), and an engine whose probe never
-  // answers true never runs a tick. A console without `nifm:u` does not sync
-  // whether or not sockets came up, so bringing them up would buy nothing and
-  // cost a heap of transfer memory. The `ssl_http_client.cpp` comment about a
-  // nifm failure being survivable is about `nifmInitialize` *returning* an
-  // error, which is a different condition and stays true.
+  // A missing `nifm:u` therefore costs the transport as well, which is more than
+  // the probe alone is worth -- and it is the honest price of not being able to
+  // bound a call from outside it. `NetworkInitialize` would have to take a
+  // parameter to skip the probe, and the guards it would then need are plain
+  // `bool`s that the worker and the pairing thread both read. A console missing
+  // a service Nintendo's own boot registers is not the case to add a lock for.
+  //
+  // `ConsoleIsOnline` is not the thing that suffers: it answers **true** when
+  // nifm was never opened, deliberately, so the worker still ticks and every
+  // request logs the transport error a user can act on rather than waiting
+  // silently on a probe that will never say yes (`ssl_http_client.hpp`).
   //
   // It is the only `nifmInitialize` in this build --
   // there was a second one here until #195, and since libnx refcounts it, the
@@ -726,7 +734,7 @@ int main(int, char**) {
   // it when a pairing commits (`SdEngine::UseServer`).
   engine.UseServer(g_http.get(), "");
   engine.UseCard(g_card.get());
-  engine.UseNetworkProbe(&NetworkUp);
+  engine.UseNetworkProbe(&rommsync::sysmodule::ConsoleIsOnline);
   engine.StartWorker();
 
   rommsync::ipc::ServiceCore core(engine);
