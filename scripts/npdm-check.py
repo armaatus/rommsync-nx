@@ -114,6 +114,7 @@ class Aci0:
         self.service_access = parse_sac(blob[sac_offset : sac_offset + sac_size])
         self.kernel_capabilities = blob[kc_offset : kc_offset + kc_size]
         self.syscalls = parse_syscalls(self.kernel_capabilities)
+        self.handle_table_size = parse_handle_table_size(self.kernel_capabilities)
 
 
 class Acid:
@@ -199,6 +200,20 @@ def parse_syscalls(blob):
             if mask >> bit & 1:
                 granted.add(index * 24 + bit)
     return granted
+
+
+def parse_handle_table_size(blob):
+    """The `HandleTableSize` descriptor's value, or None if there is none.
+
+    Fifteen set low bits identify it and the size is the ten above them. M9-11
+    (#210) has to re-derive this number from a count of what the process holds
+    open at once; `--print` is where it reads today's.
+    """
+    for i in range(0, len(blob) - 3, 4):
+        word = struct.unpack_from("<I", blob, i)[0]
+        if word & 0xFFFF == 0x7FFF:
+            return (word >> 16) & 0x3FF
+    return None
 
 
 # --- what the ELF does -------------------------------------------------------
@@ -588,6 +603,11 @@ def self_test():
            "the syscall mask did not round-trip across a 24-bit block boundary")
     expect(parse_syscalls(struct.pack("<I", 0x3FFF)) == set(),
            "a min-kernel-version descriptor was read as a syscall mask")
+    # 0x407FFF is the descriptor npdmtool writes for `handle_table_size: 64`:
+    # fifteen low ones, then the size. The min-kernel-version descriptor beside
+    # it has fourteen, so a mask one bit wide either way reads the wrong one.
+    expect(parse_handle_table_size(struct.pack("<II", 0x183FFF, 0x407FFF)) == 64,
+           "the handle table size was not read from its descriptor")
 
     # ...and the whole path, on a synthetic module that calls one SVC it never
     # declared. This is #196 in miniature, and it is what says the diff still
@@ -658,6 +678,13 @@ def main():
         print("name: %s" % npdm.name)
         print("program_id: 0x%016X" % npdm.aci0.program_id)
         print("service_access: %s" % " ".join(npdm.aci0.service_access))
+        # The three fields M9-11 (#210) narrows, printed beside the SAC because
+        # that issue's whole job is replacing each of them with a derived number
+        # and it should not have to re-implement this parser to read the one it
+        # is replacing.
+        print("filesystem_permissions: 0x%016X" % npdm.aci0.filesystem_permissions)
+        print("handle_table_size: %s" % npdm.aci0.handle_table_size)
+        print("address_space_type: %d" % npdm.address_space_type)
         print("syscalls: %s" % " ".join(_named(n, names) for n in sorted(npdm.aci0.syscalls)))
         return 0
 

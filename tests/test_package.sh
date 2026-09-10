@@ -60,11 +60,11 @@ VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION")"
 # packaging stops matching it, which is the failure sysmodule/README.md says to
 # expect.
 title_id() {
-  command -v python3 >/dev/null 2>&1 || fail "python3 is needed to read the title id"
+  command -v python3 >/dev/null 2>&1 || fail "python3 is needed to read the program id"
   python3 -c '
 import json, sys
 with open(sys.argv[1]) as f:
-    tid = json.load(f)["title_id"]
+    tid = json.load(f)["program_id"]
 print(tid[2:].upper() if tid[:2].lower() == "0x" else tid.upper())
 ' "$REPO_ROOT/sysmodule/sys-rommsync.json"
 }

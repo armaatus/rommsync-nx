@@ -2236,8 +2236,8 @@ endforeach()
 # console's own connector rather than a twin (tests/tcp_connector.hpp).
 #
 # The static half deliberately reads the tree rather than the built `.nsp`: M9-3
-# (#196) lands the npdm parser and it needs devkitPro, so it can only run where
-# a cross-compile can (M9-12, #211). The SAC is in the tree, so these run on
+# (#196) landed the npdm parser as `npdm.*` below and it needs devkitPro, so it
+# can only run where a cross-compile can (M9-12, #211). The SAC is in the tree, so these run on
 # every push, everywhere.
 add_executable(test_boot_services test_boot_services.cpp
   "${CMAKE_SOURCE_DIR}/sysmodule/source/boot_wait.cpp"

@@ -131,7 +131,7 @@ def manifest(repo: str) -> list:
 def title_id(repo: str) -> str:
     """Read from the NPDM config by a JSON reader, where package.sh uses a regex."""
     with open(os.path.join(repo, "sysmodule", "sys-rommsync.json"), encoding="utf-8") as f:
-        tid = json.load(f)["title_id"]
+        tid = json.load(f)["program_id"]
     return (tid[2:] if tid[:2].lower() == "0x" else tid).upper()
 
 
