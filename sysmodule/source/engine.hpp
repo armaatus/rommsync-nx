@@ -53,7 +53,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -72,6 +71,7 @@
 #include "rommsync/scheduler.hpp"
 #include "rommsync/sync_tick.hpp"
 #include "rommsync/token_store.hpp"
+#include "sized_thread.hpp"
 
 namespace rommsync::sysmodule {
 
@@ -218,15 +218,19 @@ class SdEngine : public ipc::Engine {
   /// the thread that will drive attempts. Call it before the service starts
   /// answering; it is not meant to change under a running attempt.
   ///
-  /// **The thread is started here rather than on the first `StartPairing`, and
-  /// that is about `-fno-exceptions`** (`switch.mk`): `std::thread`'s
-  /// constructor throws when the thread or its stack cannot be created, and a
-  /// throw on the console calls `std::terminate`. Failing at start is what the
-  /// rest of `main.cpp` already does with `sm` and `fs` -- a sysmodule that
-  /// cannot build what it needs should not come up half-working -- whereas
-  /// failing on a button press would kill the process under the user's hands and
-  /// leave a pairing screen that never moves. A backend with no transport starts
-  /// nothing, which is every console today.
+  /// **The thread is started here rather than on the first `StartPairing`.**
+  /// Failing at start is what the rest of `main.cpp` already does with `sm` and
+  /// `fs` -- a sysmodule that cannot build what it needs should not come up
+  /// half-working -- whereas failing on a button press would leave a pairing
+  /// screen that never moves under the user's thumb. A backend with no transport
+  /// starts nothing, which is every console today.
+  ///
+  /// Until M9-2 (#207) this was also *the one throwing call in the class*:
+  /// `std::thread`'s constructor throws when the thread or its stack cannot be
+  /// created, and a throw under `-fno-exceptions` (`switch.mk`) is
+  /// `std::terminate` on a console with no crash report. `SizedThread::Start`
+  /// returns false instead, and a console that could not start the thread logs
+  /// it and pairs no worse than one with no transport at all.
   ///
   /// Separate from `UseServer` below, and it stays that way. Both hand this
   /// class an `http::HttpClient*`, and while that started as an accident -- M5-4
@@ -251,19 +255,20 @@ class SdEngine : public ipc::Engine {
   /// **It is one thread, not two.** `sync::RunTick` and `lists::Service::Pump`
   /// both want a thread that is not the IPC one and neither wants a thread of
   /// its own: a list page is one request and a tick is a handful, and two
-  /// threads would cost two stacks out of the 768 KiB inner heap to serialise on
-  /// the same `http::HttpClient` anyway -- and that heap's table already budgets
-  /// for exactly two worker stacks (`kInnerHeapSize`, `main.cpp`). The loop pumps the
-  /// lists first, because a human is waiting at a screen for one of those and
-  /// nobody is waiting for a tick.
+  /// threads would cost two more stacks out of the 1 MiB inner heap to serialise
+  /// on the same `http::HttpClient` anyway. A stack is `kThreadStackBytes` and
+  /// the heap's table has a row for exactly the two this class starts
+  /// (`kHeapThreadStacks`, `main.cpp`), so a third is a visible cost rather than
+  /// a silent one (M9-2, #207). The loop pumps the lists first, because a human
+  /// is waiting at a screen for one of those and nobody is waiting for a tick.
   ///
   /// **Nothing here blocks boot.** The thread is started and `main` returns; the
   /// wait for the network happens on this thread (`WaitForNetwork`), not before
   /// the service comes up.
   ///
-  /// Like `UsePairingBackend`, the `std::thread` constructor is the one throwing
-  /// call and it happens at start rather than under a user's thumb
-  /// (`-fno-exceptions`, `switch.mk`).
+  /// Like `UsePairingBackend`, the thread is created at start rather than under
+  /// a user's thumb, and a creation that fails is reported rather than thrown
+  /// (`-fno-exceptions`, `switch.mk`; `sized_thread.hpp`).
   void StartWorker();
 
   /// Whether the console has an internet connection right now.
@@ -925,7 +930,9 @@ class SdEngine : public ipc::Engine {
   /// miss.
   std::uint64_t wakes_ = 0;
 
-  std::thread worker_thread_;
+  /// The worker, with the stack `kThreadStackBytes` names and the heap term
+  /// `kHeapThreadStacks` pays for (`sized_thread.hpp`, `main.cpp`).
+  SizedThread worker_thread_;
 
   /// The verdict `auth.json` holds, and what a worker consults before calling.
   ///
@@ -976,17 +983,15 @@ class SdEngine : public ipc::Engine {
   /// Created by `UsePairingBackend`, and only when it is handed a transport, so
   /// a console with no `HttpClient` -- which is every console today -- creates no
   /// thread at all. Not on the first `StartPairing`: see `UsePairingBackend` for
-  /// why the one throwing call in this class happens at start rather than under
-  /// a user's finger.
+  /// why a thread this process may fail to create is created at start rather
+  /// than under a user's finger.
   ///
-  /// **Its stack is not sized here, and on Horizon that is a number somebody
-  /// has to derive.** devkitA64's default comes out of the 512 KiB inner heap
-  /// (`kInnerHeapSize`, `main.cpp`), which sysmodule/AGENTS.md budgets for one
-  /// in-flight download buffer plus a TLS context and nothing else. It costs
-  /// nothing today, because no console reaches this line; it is #126's to settle
-  /// along with the rest of the heap, since that is the issue that gives a
-  /// console a transport and so the first attempt that ever runs.
-  std::thread pairing_thread_;
+  /// **Its stack is `kThreadStackBytes`, and that is the number M9-2 (#207)
+  /// derived.** It used to be devkitA64's undeclared 128 KiB default, taken out
+  /// of the inner heap against a table that budgeted 32 KiB for it -- see
+  /// `sized_thread.hpp` for what the size is measured against and `main.cpp` for
+  /// the row that now pays for it.
+  SizedThread pairing_thread_;
   bool stopping_ = false;
 
   /// The attempt in flight, or null. A `shared_ptr` because the pairing thread

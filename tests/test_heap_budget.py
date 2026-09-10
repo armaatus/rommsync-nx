@@ -168,14 +168,27 @@ def phase_margin(repo):
 
 def phase_dirs(repo):
     source = read(repo, MAIN)
-    found = re.search(r"__nx_fsdev_direntry_cache_size\s*=\s*(\d+)\s*;", source)
+    found = re.search(r"__nx_fsdev_direntry_cache_size\s*=\s*(\w+)\s*;", source)
     if found is None:
         return fail("%s does not set __nx_fsdev_direntry_cache_size; libnx defaults it to "
                     "32 and fs_dev.c allocates sizeof(FsDirectoryEntry) -- 784 bytes -- "
                     "times that per open DIR, so every ::opendir in card.cpp takes ~24 KiB "
                     "off this heap for its lifetime (#207)" % MAIN)
-    print("ok: __nx_fsdev_direntry_cache_size is set to %s rather than libnx's 32"
-          % found.group(1))
+    # Written as a named constant rather than a bare number, so the table's
+    # open-directory term and the override cannot say different things.
+    value = found.group(1)
+    if not value.isdigit():
+        named = re.search(r"constexpr\s+u32\s+" + value + r"\s*=\s*(\d+)\s*;", source)
+        if named is None:
+            return fail("__nx_fsdev_direntry_cache_size is set to `%s`, which is not a "
+                        "`constexpr u32` in %s (#207)" % (value, MAIN))
+        value = named.group(1)
+    if int(value) >= 32:
+        return fail("__nx_fsdev_direntry_cache_size is %s, which is libnx's default or worse; "
+                    "that is 784 * %s bytes per open DIR out of this heap (#207)"
+                    % (value, value))
+    print("ok: __nx_fsdev_direntry_cache_size is %s rather than libnx's 32, or %d bytes "
+          "per open DIR" % (value, 784 * int(value)))
     return 0
 
 
