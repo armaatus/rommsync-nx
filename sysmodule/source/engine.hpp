@@ -881,6 +881,17 @@ class SdEngine : public ipc::Engine {
   std::chrono::steady_clock::time_point download_due_{};
   std::chrono::milliseconds download_backoff_{0};
 
+  /// Bumped by `WakeDownloads` alone, under `mutex_`, and compared by
+  /// `RunOneDrain` across the drain it just ran.
+  ///
+  /// It closes the window `wakes_` cannot: a command landing between a drain
+  /// ending `kRetryable` and the pacing being written for it would have its
+  /// clear overwritten a microsecond later, and the healthy rom the user had
+  /// just queued would wait out the backoff the failing one earned after all.
+  /// A counter of its own rather than `wakes_`, for `WakeDownloads`' reason --
+  /// a library page must not clear a download backoff.
+  std::uint64_t download_wakes_ = 0;
+
   /// What `Status::sync_in_progress` draws, and the same fact `RequestSync`
   /// answers false on.
   bool sync_in_progress_ = false;

@@ -150,6 +150,7 @@ void SdEngine::WakeDownloads() {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     ++wakes_;
+    ++download_wakes_;
     // Whatever the last drain earned. See the header for why this is not on
     // every `Wake()`.
     download_due_ = std::chrono::steady_clock::time_point{};
@@ -849,11 +850,13 @@ SdEngine::DrainStep SdEngine::RunOneDrain() {
   fs::FileSystem* files = nullptr;
   auth::StoredToken token;
   bool blocked = false;
+  std::uint64_t asked_at = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (stopping_) {
       return {};
     }
+    asked_at = download_wakes_;
     if (now < download_due_) {
       // Backing off from a drain that got nowhere. `WakeDownloads` is what
       // clears it early when a command changes the answer. See
@@ -930,6 +933,14 @@ SdEngine::DrainStep SdEngine::RunOneDrain() {
   LogDrain(result);
 
   std::lock_guard<std::mutex> lock(mutex_);
+  if (download_wakes_ != asked_at) {
+    // A command that changes what a drain would decide landed while this one
+    // was running, and cleared the pacing on the way past. Writing this drain's
+    // outcome over the top would put the backoff back on a queue the user has
+    // just changed -- which is the whole of what `WakeDownloads` exists to
+    // prevent, arriving a microsecond later.
+    return {true, download_backoff_};
+  }
   switch (result.outcome) {
     case download::DrainOutcome::kCompleted:
     case download::DrainOutcome::kIdle:
