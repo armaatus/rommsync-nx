@@ -2249,7 +2249,10 @@ endforeach()
 # long -- so both slow the transfer down from the test side rather than from the
 # engine (`Throttled`, tests/test_engine.cpp). Serial with the rest of this group
 # for the reason every rig test is: they download the shared fixture's roms.
-foreach(scenario downloading preempts discards repoints shutdown)
+# `sleep_download` joins them for M9-4 (#208): the other thing the worker can be
+# doing at a `SleepReady` is a rom, and the assertion is that it had come back
+# from `download::Drain` before the acknowledgement rather than after it.
+foreach(scenario downloading preempts discards repoints shutdown sleep_download)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
   if(NOT ROMMSYNC_REQUIRE_RIG)
     set_tests_properties(engine.${scenario} PROPERTIES SKIP_RETURN_CODE 77)

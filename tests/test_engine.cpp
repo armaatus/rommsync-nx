@@ -54,6 +54,8 @@
 //                `.part` the next boot resumes from
 //   sleeps    -- M9-4: a save write in flight at SleepReady is finished before the
 //                acknowledgement, and nothing goes out until MinimumAwake
+//   sleep_download -- M9-4: a rom in flight at SleepReady is stopped, and the worker
+//                is back from download::Drain before the acknowledgement
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -2646,6 +2648,105 @@ int DrainShutdown(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// M9-4 (#208): a rom in flight when the console goes to sleep.
+///
+/// `engine.sleeps` pins the save write; this is the other thing the worker can
+/// be doing when `SleepReady` lands, and it is the one that can take an hour.
+/// M9-5 (#197) put `download::Drain` on the worker thread, so at a sleep there
+/// may be a transfer with a socket open and a `.part` being appended to on the
+/// card -- and the acknowledgement is this process telling PSC that both are
+/// free of it.
+///
+/// **What PSC adds over the three cancels that already existed** is the *wait*.
+/// `CancelDrainLocked` returns immediately; it fires a token the drain reads at
+/// its next operation boundary. So the assertion here is not that the drain was
+/// asked to stop, it is that it had actually stopped -- the `.part` does not
+/// grow by a byte after the acknowledgement.
+int SleepDownload(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+
+  rlog::Reset();
+  Throttled slow(client, std::chrono::milliseconds{1});
+
+  Console console(c, "engine-sleep-download");
+  if (!Downloadable(console, c, base, fixture)) {
+    return c.failures();
+  }
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseCard(card.get());
+  console.engine.UseServer(&slow, std::string());
+  console.Boot();
+
+  harness::Rom rom;
+  if (!harness::FindRom(client, base, fixture, "synthetic-large.gba", &rom)) {
+    c.Expect(false, "the seeded library holds synthetic-large.gba");
+    return c.failures();
+  }
+
+  std::int32_t position = 0;
+  c.Expect(console.Enqueue(rom.id, &position) == ipc::Error::kOk, "the 120 MiB rom is queued");
+  console.engine.StartWorker();
+
+  const ipc::Status moving = Until(
+      console,
+      [](const ipc::Status& status) {
+        return status.download.state == ipc::DownloadState::kDownloading &&
+               status.download.bytes_done > 0;
+      },
+      std::chrono::seconds{120});
+  c.Expect(moving.download.state == ipc::DownloadState::kDownloading,
+           "a transfer is in flight when the console is put to sleep");
+
+  power_fake::Scripted psc;
+  Asleep asleep(psc, console.engine);
+
+  const std::chrono::steady_clock::time_point slept = std::chrono::steady_clock::now();
+  psc.Deliver(power::State::kSleepReady);
+  c.Expect(psc.AwaitAcks(1, std::chrono::seconds{30}), "the sleep is acknowledged");
+  const std::chrono::milliseconds took = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - slept);
+  c.Expect(took < std::chrono::seconds{15},
+           std::string("at an operation boundary rather than at the end of the body -- a "
+                       "transition PSC waits out is a console that freezes (sys-con#155); took ") +
+               std::to_string(took.count()) + "ms");
+
+  // The assertion this scenario exists for: the drain is *over*, not merely
+  // asked to stop. A `.part` that is still growing after the acknowledgement is
+  // this process writing to a card it has just told PSC it is finished with.
+  const std::string part = console.sandbox.Host("/tico/roms/gba/synthetic-large.gba.tmp.part");
+  std::error_code failed;
+  const std::uintmax_t at_ack = std::filesystem::file_size(part, failed);
+  c.Expect(!failed, "the partial file is on the card, so there is something to measure");
+  std::this_thread::sleep_for(std::chrono::milliseconds{500});
+  c.ExpectEq(std::filesystem::file_size(part, failed), at_ack,
+             "and it has not grown since: the worker had come back from download::Drain "
+             "before the acknowledgement went out, rather than after it");
+
+  const download::LoadedQueue on_card = console.OnCard();
+  c.ExpectEq(on_card.entries.size(), std::size_t{1}, "the entry is still on the card");
+  if (on_card.entries.size() == 1) {
+    c.Expect(!download::Terminal(on_card.entries.front().state),
+             "and still something to do, so the wake resumes it rather than losing it");
+  }
+
+  psc.Deliver(power::State::kMinimumAwake);
+  c.Expect(psc.AwaitAcks(2, std::chrono::seconds{10}), "the wake is acknowledged");
+
+  const ipc::Status after = Until(
+      console, [](const ipc::Status& status) { return status.queue_depth == 0; },
+      std::chrono::seconds{300});
+  c.ExpectEq(after.queue_depth, std::int64_t{0},
+             "and the worker picks the transfer back up on its own");
+  c.Expect(console.sandbox.Exists("/tico/roms/gba/synthetic-large.gba"),
+           "so the rom still arrives, resumed from the bytes the sleep kept");
+  return c.failures();
+}
+
 /// The scenarios that need the docker RomM, by name. A table rather than a
 /// second `if` chain, so the list of them is written down once.
 struct RigScenario {
@@ -2666,6 +2767,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"discards", DrainDiscarded},
       {"repoints", DrainRepointed},
       {"shutdown", DrainShutdown},
+      {"sleep_download", SleepDownload},
   };
   for (const RigScenario& scenario : kRigScenarios) {
     if (name == scenario.name) {
