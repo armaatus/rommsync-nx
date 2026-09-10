@@ -16,6 +16,7 @@
 
 #include "power.hpp"
 #include "rommsync/log.hpp"
+#include "sized_thread.hpp"
 
 namespace rommsync::sysmodule::power {
 namespace {
@@ -42,20 +43,6 @@ constexpr PscPmModuleId kModuleId = static_cast<PscPmModuleId>(0x524D);
 /// registers the same way for the same reason
 /// (`erpt/srv/erpt_srv_service.cpp`).
 constexpr u32 kDependencies[] = {PscPmModuleId_Fs};
-
-/// The watcher's stack, out of the 768 KiB inner heap (`kInnerHeapSize`,
-/// main.cpp), and sized here rather than left to devkitA64's default -- which is
-/// the whole reason `power::Watcher` owns no thread.
-///
-/// 16 KiB for a thread that waits on an event and calls `SdEngine::Quiesce`,
-/// which itself only takes a lock and waits on a condition variable. It is the
-/// smallest term in that heap's table and it is in the table.
-constexpr size_t kWatcherStackSize = 0x4000;
-
-/// The main thread's priority (`sys-rommsync.json`), which is what this wants
-/// too: a module that answers PSC late is a console that sleeps late, and one
-/// that outranks the worker would still have to wait for it to park.
-constexpr int kWatcherPriority = 0x2C;
 
 /// `psc:m`, behind the interface `power::Watcher` drives.
 class PscModule final : public Module {
@@ -176,44 +163,31 @@ class PscSubscription final : public Subscription {
   explicit PscSubscription(Sink& sink) : watcher_(module_, sink) {}
 
   ~PscSubscription() override {
-    if (!started_) {
+    if (!thread_.joinable()) {
       return;
     }
     module_.Stop();
-    threadWaitForExit(&thread_);
-    threadClose(&thread_);
+    thread_.join();
   }
 
   bool Start() {
     if (!module_.Open()) {
       return false;
     }
-    // A stack of this file's choosing, which is the one thing `std::thread`
-    // cannot be asked for and the reason the watcher is a plain object rather
-    // than a thread that owns itself (`kWatcherStackSize`).
-    //
-    // `cpuid` is -2, the process default, because the npdm pins this process to
-    // core 3 anyway (`sys-rommsync.json`) and naming the core in two places is
-    // one place for them to disagree.
-    Result rc = threadCreate(&thread_, &PscSubscription::Entry, this, nullptr,
-                             kWatcherStackSize, kWatcherPriority, -2);
-    if (R_SUCCEEDED(rc)) {
-      rc = threadStart(&thread_);
-      if (R_FAILED(rc)) {
-        threadClose(&thread_);
-      }
-    }
-    started_ = R_SUCCEEDED(rc);
-    return started_;
+    // `SizedThread` rather than a raw `threadCreate`, because M9-2 (#207) made
+    // every thread this process starts one whose stack it chose -- and made that
+    // choice a row in `main.cpp`'s table. `kWatcherStackBytes` is this thread's,
+    // and it is a quarter of the engine's for the reason stated where it is
+    // declared.
+    return thread_.Start<&PscSubscription::Run>(this, kWatcherStackBytes);
   }
 
  private:
-  static void Entry(void* self) { static_cast<PscSubscription*>(self)->watcher_.Run(); }
+  void Run() { watcher_.Run(); }
 
   PscModule module_;
   Watcher watcher_;
-  Thread thread_{};
-  bool started_ = false;
+  SizedThread thread_;
 };
 
 }  // namespace

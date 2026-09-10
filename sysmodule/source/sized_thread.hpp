@@ -23,8 +23,9 @@
 //
 // It is deliberately not a `std::thread` drop-in. `std::thread`'s constructor
 // *throws* when a thread cannot be created, which under `-fno-exceptions` is
-// `std::terminate`; `Start` returns false instead, and the two callers in
-// `engine.cpp` say what a console that could not start a thread does.
+// `std::terminate`; `Start` returns false instead, and each caller says what a
+// console that could not start that thread does -- two in `engine.cpp`, and the
+// PSC watcher's in `power_psc.cpp` (M9-4, #208).
 #pragma once
 
 #include <pthread.h>
@@ -76,26 +77,54 @@ inline constexpr std::size_t kThreadStackBytes = 0x20000;
 /// and the two chunk headers.
 inline constexpr std::size_t kThreadHeapOverheadBytes = 0x2000;
 
+/// The PSC watcher's stack (M9-4, #208), and the reason it is not the number
+/// above.
+///
+/// That one is measured against `RunWorker` and `DrivePairing`, whose deepest
+/// chains reach ~59 KiB and ~39 KiB. This thread's whole call graph is
+/// `power::Watcher::Run` -> `SdEngine::Quiesce`/`Resume` -> a lock, two
+/// condition-variable waits, a `timed_mutex`, and -- only when the quiesce ran
+/// out of budget -- one `log::Warn`, which is where the deepest frame under it
+/// lives (`log::Redact`, and newlib's `fopen`/`fwrite` under `FileSink`). None
+/// of it recurses and none of it parses JSON, which is what makes the worker's
+/// number what it is.
+///
+/// 32 KiB is ~8x the deepest single frame the whole build compiles -- 4,288
+/// bytes, in `io::CopyAtomically`, which this thread does not reach -- and it is
+/// 96 KiB the inner heap does not have to find for a thread that spends its life
+/// blocked on an event.
+inline constexpr std::size_t kWatcherStackBytes = 0x8000;
+
 static_assert(kThreadStackBytes % 0x1000 == 0,
+              "a thread stack must be page-aligned or __syscall_thread_create returns EINVAL");
+static_assert(kWatcherStackBytes % 0x1000 == 0,
               "a thread stack must be page-aligned or __syscall_thread_create returns EINVAL");
 
 /// One thread, started with an explicit stack and joined by its owner.
 ///
-/// Not copyable and not movable: the two that exist are members of `SdEngine`
-/// and are joined in its destructor, which is the whole of the lifetime this
-/// needs to model. **A `SizedThread` that is started and never joined leaves a
-/// thread running against a destroyed owner** -- the same hazard `std::thread`
-/// answers by calling `std::terminate`, which is not an answer available here.
+/// Not copyable and not movable: two are members of `SdEngine` and are joined in
+/// its destructor, and the third is the PSC watcher's, joined by the
+/// subscription that owns it (`power_psc.cpp`) -- which is the whole of the
+/// lifetime this needs to model. **A `SizedThread` that is started and never
+/// joined leaves a thread running against a destroyed owner** -- the same hazard
+/// `std::thread` answers by calling `std::terminate`, which is not an answer
+/// available here.
 class SizedThread {
  public:
   SizedThread() = default;
   SizedThread(const SizedThread&) = delete;
   SizedThread& operator=(const SizedThread&) = delete;
 
-  /// Start `Method` on `self`, on a thread with `kThreadStackBytes` of stack --
-  /// or, where a host refuses that size, with the platform's default. False when
+  /// Start `Method` on `self`, on a thread with `stack_bytes` of stack -- or,
+  /// where a host refuses that size, with the platform's default. False when
   /// the thread could not be created at all, which is the caller's to report:
   /// there is nothing to throw and nobody to catch it.
+  ///
+  /// `stack_bytes` is a parameter rather than the constant because the three
+  /// threads this process starts are not the same size of job: two run the
+  /// engine and one waits on a PSC event (`kWatcherStackBytes`). It must be
+  /// page-aligned, which each constant asserts at its own declaration -- there
+  /// is nothing here that can check a value handed in.
   ///
   /// **`joinable()` is what tells the two falses apart.** A second `Start` on a
   /// running thread also answers false rather than replacing the one that is
@@ -104,7 +133,7 @@ class SizedThread {
   /// answering "has this already been started" -- so the guard here is the one
   /// that stops a double call leaking a thread, not the one anybody reads.
   template <auto Method, typename T>
-  bool Start(T* self) {
+  bool Start(T* self, std::size_t stack_bytes = kThreadStackBytes) {
     if (started_) {
       return false;
     }
@@ -122,7 +151,7 @@ class SizedThread {
     // of whatever it is given. Degrading a host test run to "the worker never
     // started, nothing syncs" over that would be a worse failure than the
     // platform default `std::thread` used to take.
-    const bool sized = ::pthread_attr_setstacksize(&attributes, kThreadStackBytes) == 0;
+    const bool sized = ::pthread_attr_setstacksize(&attributes, stack_bytes) == 0;
     bool ok = sized && ::pthread_create(&handle_, &attributes, &Enter<Method, T>, self) == 0;
     if (!sized) {
       ok = ::pthread_create(&handle_, nullptr, &Enter<Method, T>, self) == 0;

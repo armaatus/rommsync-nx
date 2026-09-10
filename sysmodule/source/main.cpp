@@ -74,11 +74,12 @@ namespace {
 //   | one in-flight transfer buffer            | `kHeapTransferBuffer`   | 0x4000  |  16 KiB |
 //   | the largest buffered response            | `kHeapListResponse`     | 0x7D000 | 500 KiB |
 //   | two thread stacks (M1-6, M7-2)           | `kHeapThreadStacks`     | 0x44000 | 272 KiB |
+//   | the PSC watcher's stack (M9-4)           | `kHeapWatcherStack`     | 0xA000  |  40 KiB |
 //   | the log's in-memory tail (M7-3)          | `kHeapLogTail`          | 0x1800  |   6 KiB |
 //   | the play-session buffer (M7-4)           | `kHeapPlaySessions`     | 0x8000  |  32 KiB |
 //   | the directories open at once (M9-2)      | `kHeapOpenDirectories`  | 0x2000  |   8 KiB |
 //   | newlib arena overhead and fragmentation  | `kHeapNewlibOverhead`   | 0x8000  |  32 KiB |
-//   | **peak**                                 | `kHeapPeak`             | 0x135800 | 1238 KiB |
+//   | **peak**                                 | `kHeapPeak`             | 0x13F800 | 1278 KiB |
 //
 // The table is written this way so that something other than a reader adds it
 // up. `tests/test_heap_budget.py` totals these rows and compares each against
@@ -117,6 +118,13 @@ namespace {
 //     than devkitA64's undeclared 128 KiB (`sized_thread.hpp`), and the term is
 //     the stack plus what libnx allocates beside it -- thread-local storage, a
 //     `struct _reent`, and the page a `memalign` wastes at the front.
+//   * **Three threads since M9-4 (#208)**, and the third is a quarter of the
+//     size, which is why it is its own row rather than a bigger multiplier on
+//     the one above. The PSC watcher waits on an event and calls
+//     `SdEngine::Quiesce`; it reaches no JSON, no save write and no recursion,
+//     so `kWatcherStackBytes` is 32 KiB where the engine's threads take 128
+//     (`sized_thread.hpp` measures both). Its overhead beside the stack is the
+//     same `kThreadHeapOverheadBytes` the other two pay.
 //   * **The log keeps its last lines in RAM**, so `GetLog` can answer without
 //     going near the card (log.hpp). It is `kTailLines * kMaxLineBytes` at
 //     worst, and it is a term here rather than a cost nobody added up. That is
@@ -227,14 +235,17 @@ constexpr size_t kHeapListResponse = kHeapPlatformsResponse > kHeapRomIndexRespo
                                          : kHeapRomIndexResponse;
 constexpr size_t kHeapThreadStacks =
     2 * (rommsync::sysmodule::kThreadStackBytes + rommsync::sysmodule::kThreadHeapOverheadBytes);
+constexpr size_t kHeapWatcherStack =
+    rommsync::sysmodule::kWatcherStackBytes + rommsync::sysmodule::kThreadHeapOverheadBytes;
 constexpr size_t kHeapLogTail = rommsync::log::kTailLines * rommsync::log::kMaxLineBytes;
 constexpr size_t kHeapPlaySessions = 2 * rommsync::play::kMaxBufferBytes;
 constexpr size_t kHeapOpenDirectories = kMaxOpenDirectories * kOpenDirectoryBytes;
 constexpr size_t kHeapNewlibOverhead = 0x8000;
 
 constexpr size_t kHeapPeak = kHeapSocketMemory + kHeapStateBaseline + kHeapTransferBuffer +
-                             kHeapListResponse + kHeapThreadStacks + kHeapLogTail +
-                             kHeapPlaySessions + kHeapOpenDirectories + kHeapNewlibOverhead;
+                             kHeapListResponse + kHeapThreadStacks + kHeapWatcherStack +
+                             kHeapLogTail + kHeapPlaySessions + kHeapOpenDirectories +
+                             kHeapNewlibOverhead;
 
 // The arithmetic above, checked by the compiler rather than by a reader. It is
 // the transfer memory that this is really about: the trimmed socket config is
@@ -249,6 +260,7 @@ static_assert(kHeapTransferBuffer == 0x4000, "kTransferBufferSize moved; retotal
 static_assert(kHeapListResponse == 0x7D000,
               "roms::kDefaultPageSize or lists::kMaxPlatforms moved; retotal the table");
 static_assert(kHeapThreadStacks == 0x44000, "kThreadStackBytes moved; retotal the table");
+static_assert(kHeapWatcherStack == 0xA000, "kWatcherStackBytes moved; retotal the table");
 static_assert(kHeapLogTail == 0x1800, "log::kTailLines moved; retotal the table");
 static_assert(kHeapPlaySessions == 0x8000, "play::kMaxBufferBytes moved; retotal the table");
 static_assert(kHeapOpenDirectories == 0x2000,
@@ -257,12 +269,13 @@ static_assert(kHeapOpenDirectories == 0x2000,
 // to its row rather than a second reader of a bound. Changing the term is a red
 // build here, which is the point: it is the term a reader is likeliest to nudge.
 static_assert(kHeapNewlibOverhead == 0x8000, "the newlib arena term moved; retotal the table");
-static_assert(kHeapPeak == 0x135800, "the table above no longer sums to its peak row");
+static_assert(kHeapPeak == 0x13F800, "the table above no longer sums to its peak row");
 
-// 0x150000 leaves 0x1A800 -- 106 KiB -- over that peak, which is the margin a
+// 0x150000 leaves 0x10800 -- 66 KiB -- over that peak, which is the margin a
 // process nobody can attach a debugger to needs. It is the only margin stated
 // here on purpose: #207's prose quoted two, 94 KiB and 78 KiB, and the
-// arithmetic gave neither.
+// arithmetic gave neither. M9-4 (#208) took 40 KiB of it for the PSC watcher's
+// thread, which is the row above.
 //
 // **It grew by 0x90000 in M9-2**, from 0xC0000: 576 KiB more `.bss` in a
 // resident image that was ~2.00 MiB, against an Atmosphere third-party sysmodule
@@ -289,7 +302,7 @@ constexpr size_t kInnerHeapSize = 0x150000;
 constexpr size_t kHeapMargin = kInnerHeapSize - kHeapPeak;
 
 static_assert(kHeapPeak < kInnerHeapSize, "the heap no longer covers the peak in the table above");
-static_assert(kHeapMargin == 0x1A800,
+static_assert(kHeapMargin == 0x10800,
               "the margin in the sentence above is no longer the one left");
 
 alignas(16) u8 g_inner_heap[kInnerHeapSize];
