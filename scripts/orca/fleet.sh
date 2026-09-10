@@ -349,11 +349,15 @@ for w in worktrees:
 # Sorted, because the caller stores this string to decide whether anything
 # changed. Unsorted, two unchanged worktrees coming back in the other order read
 # as news and reprint the line every poll -- the thing #212 is about.
+#
+# `-V` rather than a plain sort: this line exists to be read, and lexically `#42`
+# comes before `#7`, which is the wrong order for the one question a person asks
+# of it -- which issue is still out there.
 waiting_worktrees() {
   printf '%s\n' "$1" | while IFS="$(printf '\t')" read -r num path; do
     [ -n "$path" ] || continue
     if [ "$num" = "-" ]; then printf '%s\n' "$(basename "$path")"; else printf '#%s\n' "$num"; fi
-  done | sort | tr '\n' ' ' | sed 's/ $//'
+  done | sort -V | tr '\n' ' ' | sed 's/ $//'
 }
 
 # The line to say when a foundation issue is held, or nothing (1) when it has

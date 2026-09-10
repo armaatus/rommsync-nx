@@ -1134,6 +1134,16 @@ JSON
       || fail "a worktree with no linked issue went unnamed, so the count and the names disagree: $out"
     grep -qE '\bfor 2 worktree' <<<"$out" \
       && fail "it is still saying a count: $out"
+    # Read in the order a person asks the question in. Lexically `#42` sorts
+    # before `#7`, which is the wrong answer to "which one is still out there".
+    worktree_list "42:wt" "7:other-wt"
+    rm -f "$ROMMSYNC_FLEET_DIR/foundation-wait-196"
+    ordered="$(in_fleet foundation_wait_notice 196 "$(in_fleet live_worktrees)" 2>&1)"
+    grep -q "#7 #42" <<<"$ordered" \
+      || fail "it named them in lexical order, so the numbers read out of sequence: $ordered"
+    worktree_list "42:wt" "-:loose-one"
+    rm -f "$ROMMSYNC_FLEET_DIR/foundation-wait-196"
+    out="$(in_fleet foundation_wait_notice 196 "$(in_fleet live_worktrees)" 2>&1)"
     # ...and it is news, not a heartbeat: the same set says nothing.
     if out2="$(in_fleet foundation_wait_notice 196 "$(in_fleet live_worktrees)" 2>&1)"; then
       fail "it said the same thing again for an unchanged set: $out2"
