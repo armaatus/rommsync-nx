@@ -1721,12 +1721,15 @@ set_tests_properties(switch.ci_requires_artifacts PROPERTIES TIMEOUT 60)
 # wrapped in if(NOT ROMMSYNC_REQUIRE_RIG). Every other skippable test flips to a
 # failure under that option precisely so CI cannot go green on a skip -- and
 # that is the right default, so each exception needs its reason recorded rather
-# than inferred. There are three, and only two of them have this one's reason:
+# than inferred. There are four, and only two of them have this one's reason:
 # `switch.builds` and `switch.tlsprobe` are enforced by a different CI job --
 # `switch-build` in .github/workflows/ci.yml runs the same builds, in the same
 # image, on every push, and fails there -- so these entries are its local
 # equivalent, not its enforcement. `package.builds` is the third and does NOT
-# have that reason; see the note on it below.
+# have that reason; see the note on it below. `npdm.svcs` is the fourth and does
+# not have it either: nothing in CI parses the built NPDM today, so it runs
+# where a cross-compile can and nowhere else until M9-12 (#211) makes the
+# `switch.*` job able to host it. Its parser half, `npdm.parser`, never skips.
 #
 # So do not "fix" it by wrapping it like the others. That would fail the
 # host-tests job on a runner that has no devkitpro image -- which is every runner
@@ -1741,6 +1744,35 @@ set_tests_properties(switch.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 add_test(NAME switch.tlsprobe
          COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" tlsprobe)
 set_tests_properties(switch.tlsprobe PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+# --- M9-3: the capabilities the NPDM grants, against the ones the image uses --
+# An SVC a process was not granted is not a soft failure on Horizon: the kernel
+# refuses the call and the process dies. The linked sysmodule issued two it never
+# declared -- `svcReturnFromException`, which is on libnx's exception path, and
+# `svcUnmapTransferMemory`, which is on the socket teardown -- and nothing in
+# this repo could have said so, because the question is about two built
+# artifacts and every other check reads the tree (#196).
+set(NPDM_CHECK "${CMAKE_SOURCE_DIR}/scripts/npdm-check.py")
+
+# The parser, against vectors hand-built from the NPDM and AArch64 formats
+# rather than from the artifact. It reads nothing that has to be compiled, so it
+# runs on every push -- which matters more here than usual: the entry below it
+# can run nowhere in CI today, so without this the byte offsets this all rests
+# on would have no coverage at all.
+add_test(NAME npdm.parser COMMAND ${Python3_EXECUTABLE} "${NPDM_CHECK}" --self-test)
+set_tests_properties(npdm.parser PROPERTIES TIMEOUT 60)
+
+# The real diff, over a real cross-compile. Its SKIP_RETURN_CODE is unwrapped for
+# the reason the long note above gives -- there is no NPDM without npdmtool, and
+# npdmtool is in the devkitpro image the host runner does not have. Unlike
+# `switch.builds` it has no equivalent elsewhere yet: the `switch-build` job
+# builds the module but does not parse what it built. M9-12 (#211) is where that
+# is fixed; this entry is written so that fixing it is a CI change and not a
+# rewrite here.
+set(NPDM_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_npdm.sh")
+add_test(NAME npdm.svcs COMMAND "${BASH_PROGRAM}" "${NPDM_TEST}" svcs)
+set_tests_properties(npdm.svcs PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900
+                     ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
 
 # --- the release zip: scripts/package.sh -------------------------------------
 # The install layout is the one thing about this project a user meets before
