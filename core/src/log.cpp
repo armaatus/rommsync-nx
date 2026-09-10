@@ -462,6 +462,10 @@ void Reset() {
   std::lock_guard<std::mutex> lock(state.mutex);
   state.ring.clear();
   state.written = 0;
+  // Back on, because "reset" has to mean the log as a fresh process finds it. A
+  // scenario that put a console to sleep (M9-4, #208) and reset afterwards would
+  // otherwise leave the next one silently writing nothing to its sink.
+  state.sink_enabled = true;
 }
 
 std::string PreviousLogPathFor(std::string_view path) { return std::string(path) + ".old"; }

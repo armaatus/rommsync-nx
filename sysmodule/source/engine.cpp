@@ -1134,6 +1134,18 @@ void SdEngine::Quiesce() {
                   (quiet ? "" : "; a save write is still in flight"));
   }
 
+  // **What is deliberately not done here: sockets and transfer memory.** #208's
+  // scope asks for both, and the answer to each is a fact about this client's
+  // transport. There is no socket to close -- one is opened per request inside
+  // `ssl_http_client.cpp` and closed when the request ends, and there is no
+  // listening socket in this process at all, so the waits above are what make it
+  // true that none is open. And releasing the bsd transfer memory means
+  // `socketExit()`, which cannot be undone: `socketInitialize` is not refcounted
+  // and answers `0xF59 AlreadyInitialized` forever afterwards (`main.cpp`
+  // argues the same point about not retrying the transport). Doing it would buy
+  // 116 KiB the kernel keeps mapped either way and cost the network for the rest
+  // of the boot.
+  //
   // **Last, and it is the piece parking the worker cannot buy.** A `log::Write`
   // from any thread opens the log file, appends and closes it, so a single line
   // after this point is `fsp-srv` I/O on a card this process has just told PSC

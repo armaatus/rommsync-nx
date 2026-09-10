@@ -346,8 +346,10 @@ struct Line {
 /// written, which is what tells a reader the tail is a tail.
 std::uint64_t Tail(std::size_t count, std::vector<Line>* out);
 
-/// Forget every line and reset the ordinal. **For tests**, which run several
-/// scenarios in one process and would otherwise read each other's lines.
+/// Forget every line, reset the ordinal, and switch the sink back on. **For
+/// tests**, which run several scenarios in one process and would otherwise read
+/// each other's lines -- or, since M9-4 (#208), inherit a sink one of them
+/// disabled by putting a console to sleep.
 void Reset();
 
 /// `text` with the three things that may never be written down taken out.
