@@ -98,6 +98,28 @@ void NetworkExit();
 /// than leaving a silently transportless console.
 bool NetworkReady();
 
+/// Whether the console has an internet connection, asked before a connect
+/// rather than after a ten-second timeout.
+///
+/// This is what "offline-safe" costs on a console (CLAUDE.md): a sync tick on a
+/// Switch in a bag would otherwise spend `connect_timeout` per request finding
+/// out what nifm can answer in one IPC call. **A nifm that will not answer is
+/// not treated as offline** -- the transport is bsd and ssl, and refusing to try
+/// because a diagnostic service was busy would be the worse mistake. That is
+/// also why it is safe to call when `NetworkInitialize` was skipped entirely:
+/// since M9-1 (#195) it can be, and an unguarded `nifmGetInternetConnectionStatus`
+/// on a session that was never opened is one wasted `svcSendSyncRequest` per
+/// probe rather than an answer.
+///
+/// It is the engine's network probe as well as this file's own gate
+/// (`SdEngine::UseNetworkProbe`), and one function rather than two because a
+/// second copy drifted on exactly the guard above. The **waiting** is not here:
+/// the budget, the poll interval and noticing that the process is going away are
+/// `SdEngine::AwaitNetwork`'s, where `stopping_` is visible and a host test can
+/// drive it. Called from the worker thread, never from `main` before its service
+/// loop -- CLAUDE.md's "never block boot".
+bool ConsoleIsOnline();
+
 /// The console's `http::HttpClient`: `http_wire.cpp`'s framing over the `ssl`
 /// transport. Never null -- a build whose network did not come up still answers,
 /// with `Error::kConnectFailed`, which is the offline answer every caller

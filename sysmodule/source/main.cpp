@@ -12,10 +12,15 @@
 // on a console, and `auth.json` a file this build writes rather than only reads
 // (see `engine.hpp`).
 //
-// The service is registered inside `__appInit`, while `sm` is still up, because
-// a registered port outlives the session that registered it: a resident process
-// should not hold an `sm` handle for the life of the console just to keep its
-// own name (`ipc/server.hpp`).
+// The service is registered inside `__appInit`, while `sm` is up, because a
+// registered port outlives the session that registered it (`ipc/server.hpp`).
+// The **session** is a separate question, and since M9-1 (#195) it is held for
+// the life of the process: libnx re-opens `sfdnsres` off it on every
+// `getaddrinfo`, so closing it made every `server.url` naming a host
+// unresolvable. `__appInit` is also where every service acquisition is now
+// *bounded* -- an unregistered service makes `sm` defer a request forever, which
+// left this process inert with no log and no crash report. Both are argued where
+// they happen, at the bottom of `__appInit`.
 //
 // What this also proves, every CI run, is that core/ still builds for aarch64:
 // every translation unit under core/src is compiled into this target
@@ -27,10 +32,13 @@
 
 #include <switch.h>
 
+#include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <string>
 
+#include "boot_wait.hpp"
 #include "card.hpp"
 #include "engine.hpp"
 #include "http/http_wire.hpp"
@@ -188,34 +196,19 @@ std::unique_ptr<rommsync::fs::FileSystem> g_card;
 /// `GetLog` answers them and only the *file* starts where the sink does.
 std::unique_ptr<rommsync::log::FileSink> g_log;
 
-/// Whether this console has an internet connection, right now.
-///
-/// The whole of the libnx half of "boot, after the network is up"
-/// (docs/ARCHITECTURE.md §1). The waiting -- the budget, the poll interval, and
-/// noticing that the process is going away -- is `SdEngine::AwaitNetwork`'s,
-/// where `stopping_` is visible and where a host test can drive it; a wait that
-/// slept in here would make a shutdown during boot take the whole budget.
-///
-/// **Called on the worker thread, never on the main one.** `main` registers the
-/// service and enters its loop with no network call in front of it, which is
-/// CLAUDE.md's "never block boot" -- a console with no Wi-Fi still has an
-/// overlay that opens, settings that read and a queue that draws.
-bool NetworkUp() {
-  NifmInternetConnectionType type = static_cast<NifmInternetConnectionType>(0);
-  u32 strength = 0;
-  NifmInternetConnectionStatus status = static_cast<NifmInternetConnectionStatus>(0);
-  return R_SUCCEEDED(nifmGetInternetConnectionStatus(&type, &strength, &status)) &&
-         status == NifmInternetConnectionStatus_Connected;
-}
-
 /// The Horizon half of `io::FileSync` (#16): make what was just written
 /// durable, before the rename that publishes it.
 ///
-/// `fsdevCommitDevice` rather than a per-file sync, because devkitA64's newlib
-/// exports no `fsync` and libnx offers no way to reach the `FsFile` behind a
-/// `FILE*`. `fsFsCommit` on `sdmc:` is the primitive Horizon does have, and it
-/// covers the staged file the way the contract in `atomic_file.hpp` allows: the
-/// path is ignored because everything on this card is committed together.
+/// `fsdevCommitDevice` rather than a per-file sync, and **not** because there is
+/// no per-file one: `fsync(fileno(fp))` compiles and links against libnx --
+/// devkitA64's newlib routes it through `fsdev_fsync` to `fsFileFlush` (#195
+/// corrected the claim that it does not). It is the wrong call anyway.
+/// `fsFileFlush` pushes one file's buffered writes at the `fs` service; what
+/// hard rule 2 needs is the *commit* that makes a journalled write survive a
+/// power cut, and on Horizon that is `fsFsCommit`, which `fsdevCommitDevice`
+/// reaches. It covers the staged file the way the contract in `atomic_file.hpp`
+/// allows: the path is ignored because everything on this card is committed
+/// together.
 ///
 /// **What it buys is hard rule 2 on a console that loses power**: without it a
 /// save's backup can be renamed into place while the copied bytes are still only
@@ -253,16 +246,162 @@ rommsync::auth::IdentitySeed ConsoleIdentitySeed() {
   return seed;
 }
 
+/// What `__appInit` could not say at the time (M9-1, #195).
+///
+/// **Constant-initialised, and it has to be.** `__libnx_init` calls `__appInit`
+/// *before* `__libc_init_array`, so a file-scope object `__appInit` touches is
+/// used before its constructor would have run. Everything at this scope today is
+/// clean -- `g_inner_heap` and `g_serial` are arrays, `g_service_port` is a
+/// `Handle`, and the three `std::unique_ptr`s have `constexpr` default
+/// constructors and are touched only from `main` -- and the rule that keeps it
+/// clean is this: **nothing `__appInit` reads or writes may have a runtime
+/// constructor.** `boot::Journal` is fixed character storage for exactly that
+/// reason and static_asserts it (boot_wait.hpp).
+///
+/// It is flushed in `main`, once there is a log to flush it to.
+rommsync::sysmodule::boot::Journal g_boot{};
+
+/// `sm`, asked whether a service is registered rather than for the service.
+///
+/// `smGetService` is the call that hangs: Atmosphere's sm **defers** a request
+/// for a service that is in this process's SAC but not yet registered, and a
+/// deferred request is never answered (`sm_service_manager.cpp`). Its
+/// `AtmosphereHasService` -- command **65100** -- answers instead, which is what
+/// makes a bounded wait possible at all. libnx does not export it, so the
+/// dispatch is here; it is ten lines and Atmosphere's own signature
+/// (`sm_user_interface.hpp`).
+///
+/// **tipc, not cmif**, because that interface is `AMS_TIPC_DEFINE_INTERFACE` and
+/// the extension commands exist nowhere else. That also makes the probe
+/// Atmosphere-only, which is not a limitation worth working around: a
+/// `/atmosphere/contents` sysmodule has no other host. An `sm` that will not
+/// answer it reports `Probed() == false` and the caller stops rather than
+/// waiting out a budget for an answer that is not coming.
+///
+/// **What it does not cover, stated rather than implied.** `GetServiceHandle`
+/// defers on four conditions and `HasService` reflects only the first:
+///
+///   * `service_info == nullptr` -- not registered. **This one**, and it is the
+///     failure #195 is about: a name in the SAC that nothing ever registers.
+///   * `ShouldDeferForInit(service)` -- `fsp-srv` alone, until `sm:m` is told
+///     the initial defers are over. `pm` does that at its own startup, before
+///     boot2 reaches `/atmosphere/contents`, so it is closed by the time this
+///     runs.
+///   * `HasFutureMitmDeclaration(service)` -- a mitm module has called
+///     `AtmosphereDeclareFutureMitm` and not yet installed. `HasService` says
+///     yes and the acquisition still parks.
+///   * `mitm_info->waiting_ack` -- a mitm session mid-acknowledgement.
+///
+/// The last two are windows another module opens and closes within its own
+/// startup, and nothing sm exposes can be polled for either. So the bound this
+/// class buys is a bound on *registration*, not a proof that the next call
+/// returns -- which is the difference between the failure mode that has no
+/// symptom and one that lasts as long as another sysmodule's init.
+class SmWaiter final : public rommsync::sysmodule::boot::Waiter {
+ public:
+  bool Ready(const char* service) override {
+    bool present = false;
+    const SmServiceName name = smEncodeName(service);
+    const Result rc = tipcDispatchInOut(smGetServiceSessionTipc(), 65100, name, present);
+    probed_ = R_SUCCEEDED(rc);
+    return probed_ && present;
+  }
+
+  bool Probed() const override { return probed_; }
+
+  void Sleep(std::chrono::milliseconds slice) override {
+    svcSleepThread(static_cast<u64>(slice.count()) * 1000000ULL);
+  }
+
+ private:
+  bool probed_ = true;
+};
+
+/// Whether `timeInitialize()` ran and succeeded. `__appExit` may not unwind what
+/// `__appInit` skipped: libnx's service guard counts, and an exit without an
+/// init takes the count below zero.
+bool g_time_up = false;
+
+/// Whether the "this sm will not answer 65100" note has already been taken. One
+/// note, not one per service: it is the same answer for every question that
+/// follows, and a journal full of it would push out the note that matters.
+bool g_sm_unaskable = false;
+
+/// Wait for `service`, say so in the journal when it does not come, and answer
+/// whether the acquisition below may go ahead.
+///
+/// Returns false on a timeout. What the caller does about that is the caller's:
+/// the services this process cannot run without abort, and the ones it can run
+/// degraded without are skipped. Either way the reason is written down here,
+/// which is the whole difference from before -- a `__appInit` that parked in
+/// `sm` left no log, no crash report and no symptom beyond an overlay saying
+/// "not running".
+///
+/// **An `sm` that cannot be asked returns true**, and that is the conservative
+/// direction rather than the convenient one. `AtmosphereHasService` exists only
+/// on Atmosphere's sm, which is the only host a `/atmosphere/contents`
+/// sysmodule has -- but if the question ever cannot be put, refusing to start
+/// would trade a rare hang for a certain failure. So the note is taken, it goes
+/// to the debug channel *before* the call that might park, and the acquisition
+/// proceeds exactly as it did before #195. The bound exists wherever the
+/// question can be asked, which is everywhere this ships.
+bool MayProceedWith(const char* service, rommsync::sysmodule::boot::Waiter& waiter) {
+  namespace boot = rommsync::sysmodule::boot;
+
+  // Asked and answered. An `sm` that would not answer 65100 for one service will
+  // not answer it for the next, so every remaining acquisition would otherwise
+  // pay a round trip to learn that again -- `WaitFor` asks once before it looks
+  // at `Probed()`, which is right for the first question and pure cost after it.
+  if (g_sm_unaskable) return true;
+
+  const boot::Outcome outcome = boot::WaitFor(service, waiter);
+  if (outcome.ready) return true;
+
+  char line[boot::kMaxNoteBytes] = {};
+  if (!waiter.Probed()) {
+    g_sm_unaskable = true;
+    std::snprintf(line, sizeof(line),
+                  "rommsync: sm does not answer AtmosphereHasService; waits are unbounded");
+  } else {
+    std::snprintf(line, sizeof(line), "rommsync: %s never registered after %lldms", service,
+                  static_cast<long long>(outcome.waited.count()));
+  }
+  boot::Note(g_boot, line);
+  svcOutputDebugString(line, std::strlen(line));
+  return !waiter.Probed();
+}
+
+/// ...and abort when this process cannot do its job without it.
+///
+/// A `diagAbortWithResult` is not silence: Atmosphere writes
+/// `/atmosphere/crash_reports/`, which is a file a user can find and attach
+/// (docs/TROUBLESHOOTING.md). Parking in `sm` produces neither that nor a log
+/// line, which is why a bounded wait that ends in an abort is strictly better
+/// than an unbounded one that ends in nothing.
+void RequireService(const char* service, rommsync::sysmodule::boot::Waiter& waiter) {
+  if (!MayProceedWith(service, waiter)) {
+    diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_Timeout));
+  }
+}
+
 /// One boot line, to a debugger and to the card.
 ///
 /// `svcOutputDebugString` is what a Ryujinx run and an attached debugger see and
 /// is all this process had before M7-3 (#38); the log is what a *user* can read,
 /// and what docs/TROUBLESHOOTING.md asks them to attach. Both, because they
 /// reach different people and neither is a superset of the other.
-void Log(const std::string& line) {
+///
+/// `level` because the journal's lines are `warn` and everything else here is
+/// `info`: a journal note exists only when something did not come up (M9-1,
+/// #195), and a user scanning the file for the first `warn` should land on the
+/// reason their console is degraded rather than on the version line.
+void Log(rommsync::log::Level level, const std::string& line) {
   svcOutputDebugString(line.c_str(), line.size());
-  rommsync::log::Info(rommsync::log::Event::kBoot, line);
+  rommsync::log::Write(level, rommsync::log::Event::kBoot, line);
 }
+
+/// The `info` one, which is most of them.
+void Log(const std::string& line) { Log(rommsync::log::Level::kInfo, line); }
 
 }  // namespace
 
@@ -281,17 +420,59 @@ void __libnx_initheap(void) {
   fake_heap_end = g_inner_heap + sizeof(g_inner_heap);
 }
 
+// The clock this process reads, and the one grant that makes it readable.
+//
+// libnx defaults `__nx_time_service_type` to `TimeServiceType_User`, so
+// `timeInitialize()` asks sm for **`time:u`** -- and `sys-rommsync.json` grants
+// `time:s`. sm validates the SAC before it looks at whether the service is
+// registered and returns `sm::ResultNotAllowed` (0x1015) straight away
+// (`sm_service_manager.cpp`), so that is a clean failure on every boot rather
+// than a race: the clock never comes up, `core/`'s
+// `std::chrono::system_clock::now()` answers the epoch, and every save this
+// client would stamp is one docs/SYNC_PROTOCOL.md refuses (M7-2, #37). TLS
+// wants a sane clock too -- `SslVerifyOption_DateCheck` fails a handshake with
+// `0x25E7B` on a skewed one.
+//
+// **This line, not an SAC edit**, and the difference is a race. `time:u` and
+// `time:a` are registered by **glue**, near the end of Atmosphere's
+// `AdditionalLaunchPrograms`; `time:s` comes from **psc**, which boot2 launches
+// first. Adding `time:u` to the SAC would trade a failure that always happens
+// for one that sometimes does. `boot.clock` is what holds the declaration and
+// the grant together (M9-1, #195).
+TimeServiceType __nx_time_service_type = TimeServiceType_System;
+
 void __appInit(void) {
   Result rc = smInitialize();
   if (R_FAILED(rc)) {
     diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_InitFail_SM));
   }
 
+  // **Nothing below asks sm for a service it has not waited for first.** A
+  // service in this process's SAC but not yet registered is not an error sm
+  // returns -- it is a request sm *defers*, and never answers. `svcStartProcess`
+  // is asynchronous, so boot2 does not wait on us: the console boots normally,
+  // `sys-rommsync` is an inert process, and there is no crash report and no log,
+  // because the log sink does not exist until `main`. That was this sysmodule's
+  // worst realistic failure mode and it had no symptom at all (M9-1, #195).
+  //
+  // `boot.bounded` is the check that keeps it that way -- it reads this function
+  // and fails on any initialiser without a `WaitForService` above it, so the
+  // name in each call below is load-bearing.
+  //
+  // The bound is on **registration**, which is the condition with no symptom.
+  // `SmWaiter` lists the three other things sm defers on and why none of them
+  // can be polled for; each is a window another module closes inside its own
+  // startup rather than one that lasts for the life of the console.
+  SmWaiter sm;
+  const auto WaitForService = [&sm](const char* service) { return MayProceedWith(service, sm); };
+  const auto WaitForServiceOrAbort = [&sm](const char* service) { RequireService(service, sm); };
+
   // hosversionSet before anything version-gated is called; libnx assumes it.
   // Aborting rather than carrying on is the point: an unset host version reads
   // as 0, so every hosversionAtLeast() gate after this -- including the ones
   // inside fsInitialize() below -- silently takes the pre-1.0.0 path. A wrong
   // answer everywhere is worse than a refusal to start.
+  WaitForServiceOrAbort("set:sys");
   rc = setsysInitialize();
   if (R_FAILED(rc)) {
     diagAbortWithResult(rc);
@@ -323,6 +504,13 @@ void __appInit(void) {
 
   // config.ini, token.dat, save staging and the download destinations all live
   // on the SD card, so fs is not optional for this process.
+  //
+  // `fsp-srv` is also the one name Atmosphere's sm defers even once registered,
+  // until `sm:m` is told the initial defers are over -- but `pm` does that at
+  // its own startup, long before boot2 launches anything out of
+  // `/atmosphere/contents`, so by the time this runs the wait below is a
+  // question about registration and nothing else.
+  WaitForServiceOrAbort("fsp-srv");
   rc = fsInitialize();
   if (R_FAILED(rc)) {
     diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_InitFail_FS));
@@ -341,15 +529,21 @@ void __appInit(void) {
   // cannot be stamped, and every path that needs a stamp already refuses an
   // epoch one -- where refusing to *start* would take the overlay, the settings
   // and the queue down with it.
-  timeInitialize();
+  //
+  // The result is read rather than discarded, and it goes in the journal: this
+  // is the call #195 found asking for a service the npdm does not grant, and it
+  // failed the same way on every boot with nobody able to see it.
+  if (WaitForService("time:s")) {
+    rc = timeInitialize();
+    if (R_FAILED(rc)) {
+      rommsync::sysmodule::boot::Note(g_boot, "rommsync: timeInitialize", rc);
+    }
+    g_time_up = R_SUCCEEDED(rc);
+  }
 
-  // What the worker waits on before its first tick. `nifm:u` was already in the
-  // NPDM; this is the session that uses it (docs/ARCHITECTURE.md §1: boot, after
-  // the network is up).
-  nifmInitialize(NifmServiceType_User);
-
-  // The transport, here rather than on first use, because `socketInitialize`
-  // and `sslInitialize` are `sm` lookups and `sm` is about to close. Its
+  // The transport, here rather than on first use, because a sysmodule does
+  // everything at start: a failure here is a line in a boot log, and the same
+  // failure under a user's thumb is a pairing screen that never moves. Its
   // failure is deliberately *not* fatal: a console with no network is one the
   // overlay still has to be able to open, read its settings on and see its
   // queue on, so the engine gets a client that answers `kConnectFailed` rather
@@ -358,9 +552,51 @@ void __appInit(void) {
   // It is also not a boot-time wait: nothing here talks to a network. The bsd
   // transfer memory this allocates out of `g_inner_heap` is the dominant term
   // in the budget above.
-  rommsync::sysmodule::NetworkInitialize();
+  //
+  // Four names, because `NetworkInitialize` opens four sessions: `nifm:u` for
+  // the connection probe, `bsd:u` and `sfdnsres` for `socketInitialize`, and
+  // `ssl` for the TLS layer. **All four, including the probe**, and the `&&` is
+  // the whole of the reason: `NetworkInitialize` acquires them itself, so one
+  // name that is not registered is one request parked inside a call this
+  // function cannot bound from outside. Short-circuiting also stops a console
+  // that is plainly broken from spending the budget four times over; the note
+  // names whichever one it stopped at.
+  //
+  // A missing `nifm:u` therefore costs the transport as well, which is more than
+  // the probe alone is worth -- and it is the honest price of not being able to
+  // bound a call from outside it. `NetworkInitialize` would have to take a
+  // parameter to skip the probe, and the guards it would then need are plain
+  // `bool`s that the worker and the pairing thread both read. A console missing
+  // a service Nintendo's own boot registers is not the case to add a lock for.
+  //
+  // `ConsoleIsOnline` is not the thing that suffers: it answers **true** when
+  // nifm was never opened, deliberately, so the worker still ticks and every
+  // request logs the transport error a user can act on rather than waiting
+  // silently on a probe that will never say yes (`ssl_http_client.hpp`).
+  //
+  // It is the only `nifmInitialize` in this build --
+  // there was a second one here until #195, and since libnx refcounts it, the
+  // second call's `NifmServiceType` was silently ignored, which is a trap and
+  // not a redundancy.
+  //
+  // **The transport is not retried later, and that is now a decision rather
+  // than an oversight.** `socketInitialize` is not refcounted -- a second call
+  // answers `0xF59 AlreadyInitialized` forever -- so a lazy retry would have to
+  // be guarded, and the guards in `NetworkInitialize` are plain `bool`s read
+  // from the worker and the pairing thread both. What made a retry worth that
+  // was the transient failure: `bsd:u` or `ssl` not registered *yet*. The wait
+  // above is what removes it. What is left is a transfer memory that would not
+  // fit, which is a heap failure a reboot does not fix either.
+  const bool network = WaitForService("nifm:u") && WaitForService("bsd:u") &&
+                       WaitForService("sfdnsres") && WaitForService("ssl");
+  if (network) {
+    rc = rommsync::sysmodule::NetworkInitialize();
+    if (R_FAILED(rc)) {
+      rommsync::sysmodule::boot::Note(g_boot, "rommsync: NetworkInitialize", rc);
+    }
+  }
 
-  // Claimed before `sm` goes away, and aborting rather than carrying on: a
+  // Last, and aborting rather than carrying on: a
   // sysmodule that runs without its service is a process nothing can reach and
   // nothing can diagnose -- the overlay would report it as not running, which
   // is the one thing it would not be.
@@ -369,15 +605,33 @@ void __appInit(void) {
     diagAbortWithResult(rc);
   }
 
-  smExit();
+  // **No `smExit()` here, and that is the fix rather than an omission (#195).**
+  //
+  // The argument that used to be at the top of this file is right about the
+  // registered *port*: it outlives the session that registered it, so a resident
+  // process need not hold `sm` open to keep its own name. It does not extend to
+  // DNS. libnx re-opens `sfdnsres` off the `sm` session on **every**
+  // `getaddrinfo` -- `_sfdnsresDispatchImpl` begins with
+  // `smGetServiceOriginal(&h, smEncodeName("sfdnsres"))` -- and
+  // `posix_connection.cpp` falls back to `getaddrinfo` for anything that is not
+  // a bare IPv4 literal. With the session closed, every `server.url` naming a
+  // host -- `romm.local`, a NAS name, a DDNS name -- answered
+  // `http::Error::kUnresolvedHost` on the console and nowhere else, which is why
+  // no test caught it.
+  //
+  // The cost of holding it is one of sm's 87 user sessions, for the life of the
+  // process. sys-clk holds one for the same reason. `boot.dns` is what keeps
+  // this decision from quietly reverting to a comment.
 }
 
 void __appExit(void) {
-  nifmExit();
-  timeExit();
+  // `nifmExit` is `NetworkExit`'s, not ours: this process opens `nifm:u` once,
+  // inside `NetworkInitialize` (#195).
+  if (g_time_up) timeExit();
   rommsync::sysmodule::NetworkExit();
   fsdevUnmountAll();
   fsExit();
+  smExit();
 }
 
 }  // extern "C"
@@ -414,6 +668,21 @@ int main(int, char**) {
   g_log = std::make_unique<rommsync::log::FileSink>(
       std::string(rommsync::sysmodule::kConfigDir) + rommsync::log::kLogFileName);
   rommsync::log::SetSink(g_log.get());
+
+  // What `__appInit` could not say at the time, now that there is somewhere to
+  // say it (M9-1, #195). It is first, before even the version line, because a
+  // boot that went wrong went wrong before this point -- and it is in the log
+  // file docs/TROUBLESHOOTING.md asks a user to attach *and* in the in-memory
+  // tail the overlay's `GetLog` reads, so a console whose card cannot be written
+  // still shows the reason on screen. Ordinarily there is nothing here and this
+  // costs one comparison.
+  for (std::size_t i = 0; rommsync::sysmodule::boot::NoteAt(g_boot, i) != nullptr; ++i) {
+    Log(rommsync::log::Level::kWarn, rommsync::sysmodule::boot::NoteAt(g_boot, i));
+  }
+  if (g_boot.dropped != 0) {
+    Log(rommsync::log::Level::kWarn,
+        "rommsync: " + std::to_string(g_boot.dropped) + " more boot notes were dropped");
+  }
 
   // A crash dump or a debug log that cannot say which build produced it costs
   // an afternoon, and this is the cheapest possible answer. It goes to the
@@ -471,7 +740,7 @@ int main(int, char**) {
   // it when a pairing commits (`SdEngine::UseServer`).
   engine.UseServer(g_http.get(), "");
   engine.UseCard(g_card.get());
-  engine.UseNetworkProbe(&NetworkUp);
+  engine.UseNetworkProbe(&rommsync::sysmodule::ConsoleIsOnline);
   engine.StartWorker();
 
   rommsync::ipc::ServiceCore core(engine);

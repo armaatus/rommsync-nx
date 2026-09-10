@@ -508,6 +508,25 @@ Four things, and the log has three of them:
    `sdmc:/config/rommsync/rommsync.log`, and `rommsync.log.old` beside it if the
    failure is older than the current file.
 
+**If the log's first lines are warnings**, paste those too, and paste them
+first. `sys-rommsync` writes down anything that did not come up while it was
+starting and repeats it at the top of the file as soon as there is a file:
+
+```
+2 warn boot rommsync: ssl never registered after 10000ms
+```
+
+That is a system service the sysmodule waited for and did not get. It keeps
+running without it — the overlay opens, settings read, the queue draws — and the
+line says which one, which is the whole reason it is there.
+
+**If the overlay says the sysmodule is not running at all**, there is a fifth
+thing: `sdmc:/atmosphere/crash_reports/`. The newest file in it is this
+process's, and it is written by Atmosphere rather than by us, so it exists even
+when nothing of ours got far enough to log. An empty directory is itself an
+answer: the module was never launched, which is an install problem
+([INSTALL.md](INSTALL.md)) rather than a runtime one.
+
 Paste them as they are. Nothing in the log is a credential — see [Reading the
 log](#reading-the-log) — so it does not need editing first, and editing it is
 how the line that explains the failure gets lost.

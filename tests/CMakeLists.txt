@@ -2187,3 +2187,49 @@ foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
   endif()
   set_tests_properties(engine.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 endforeach()
+
+# --- M9-1: what `__appInit` does, and what it cannot be asked ----------------
+# Nothing in `sysmodule/source/main.cpp` runs off a console, which is how three
+# boot bugs sat in twenty lines through every green `ctest` (#195): a `smExit()`
+# that closes the session libnx re-opens `sfdnsres` off, a `timeInitialize()`
+# asking for a service the npdm does not grant, and a service acquisition that
+# parks in `sm` forever with no log, no crash report and no symptom.
+#
+# Two halves, because two different things can be checked. What the source SAYS
+# is read out of the source and the npdm (`boot.dns`, `boot.clock`,
+# `boot.bounded`, `boot.comments`); what the boot path DOES is run, through the
+# shipping code -- name resolution through `posix_connection.cpp`, which is the
+# console's own connector rather than a twin (tests/tcp_connector.hpp).
+#
+# The static half deliberately reads the tree rather than the built `.nsp`: M9-3
+# (#196) lands the npdm parser and it needs devkitPro, so it can only run where
+# a cross-compile can (M9-12, #211). The SAC is in the tree, so these run on
+# every push, everywhere.
+add_executable(test_boot_services test_boot_services.cpp
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/boot_wait.cpp"
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/http/posix_connection.cpp")
+target_link_libraries(test_boot_services PRIVATE rommsync::host Threads::Threads)
+target_include_directories(test_boot_services PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/sysmodule/source")
+
+# Needs no RomM, no Docker and no resolver: the server it dials is the loopback
+# one in tests/loopback_server.hpp, on a port the kernel picks, and `localhost`
+# is answered from the host's own table. So it never skips and nothing leaves
+# this machine -- which is row 8 of the M0 exit gate and `policy.*`'s promise.
+add_test(NAME boot.resolve COMMAND test_boot_services resolve)
+
+# Neither does the wait: `boot_wait.cpp` asks a `Waiter`, so the test is the `sm`
+# that never answers and a ten-second bound is spent in accounting rather than in
+# wall-clock.
+add_test(NAME boot.wait COMMAND test_boot_services wait)
+add_test(NAME boot.journal COMMAND test_boot_services journal)
+
+set_tests_properties(boot.resolve boot.wait boot.journal PROPERTIES TIMEOUT 60)
+
+set(SYSMODULE_BOOT_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_sysmodule_boot.py")
+foreach(scenario IN ITEMS dns clock bounded comments)
+  add_test(NAME boot.${scenario}
+           COMMAND ${Python3_EXECUTABLE} "${SYSMODULE_BOOT_TEST}" ${scenario}
+                   --repo "${CMAKE_SOURCE_DIR}")
+  set_tests_properties(boot.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()

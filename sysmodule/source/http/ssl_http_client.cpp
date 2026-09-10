@@ -38,25 +38,6 @@ bool g_socket_up = false;
 bool g_ssl_up = false;
 bool g_nifm_up = false;
 
-/// Whether the console has an internet connection, asked before a connect
-/// rather than after a ten-second timeout.
-///
-/// This is what "offline-safe" costs on a console (CLAUDE.md): a sync tick on a
-/// Switch in a bag would otherwise spend `connect_timeout` per request finding
-/// out what nifm can answer in one IPC call. A nifm that will not answer is not
-/// treated as offline -- the transport is bsd and ssl, and refusing to try
-/// because a diagnostic service was busy would be the worse mistake.
-bool ConsoleIsOnline() {
-  if (!g_nifm_up) return true;
-  NifmInternetConnectionType type{};
-  u32 strength = 0;
-  NifmInternetConnectionStatus status{};
-  if (R_FAILED(nifmGetInternetConnectionStatus(&type, &strength, &status))) {
-    return true;
-  }
-  return status == NifmInternetConnectionStatus_Connected;
-}
-
 /// One `SslConnection`, and the socket it was handed.
 ///
 /// The teardown order is the API's, not a preference: the descriptor
@@ -378,6 +359,23 @@ Result NetworkInitialize(const SocketBudget& budget) {
   // Each half is brought up only if it is not already, so a second call after a
   // half-failed first one retries the half that failed rather than reporting
   // success because the other one is up.
+  //
+  // nifm is diagnostics rather than transport, and a failure here is not one:
+  // the console can still reach a server, it just cannot be asked first whether
+  // it is worth trying (`ConsoleIsOnline`).
+  //
+  // **It is first, and that is not the arbitrary order it looks like.** It is
+  // the only half whose failure is not returned, and since M9-1 (#195) it is
+  // also the only `nifmInitialize` in this build -- `main.cpp` had a second one,
+  // whose `NifmServiceType` libnx silently ignored because the call refcounts.
+  // Bringing it up after `socketInitialize` would mean a console whose transfer
+  // memory did not fit lost `ConsoleIsOnline()`'s real answer as well as its
+  // transport, and a connection probe is exactly what such a console still wants
+  // to be able to give.
+  if (!g_nifm_up) {
+    g_nifm_up = R_SUCCEEDED(nifmInitialize(NifmServiceType_User));
+  }
+
   if (!g_socket_up) {
     const SocketInitConfig config = {
         .tcp_tx_buf_size = budget.tcp_tx_buf_size,
@@ -393,13 +391,6 @@ Result NetworkInitialize(const SocketBudget& budget) {
     const Result rc = socketInitialize(&config);
     if (R_FAILED(rc)) return rc;
     g_socket_up = true;
-  }
-
-  // Diagnostics rather than transport, and a failure here is not one: the
-  // console can still reach a server, it just cannot be asked first whether it
-  // is worth trying (`ConsoleIsOnline`).
-  if (!g_nifm_up) {
-    g_nifm_up = R_SUCCEEDED(nifmInitialize(NifmServiceType_User));
   }
 
   if (!g_ssl_up) {
@@ -426,6 +417,17 @@ void NetworkExit() {
 }
 
 bool NetworkReady() { return g_socket_up && g_ssl_up; }
+
+bool ConsoleIsOnline() {
+  if (!g_nifm_up) return true;
+  NifmInternetConnectionType type{};
+  u32 strength = 0;
+  NifmInternetConnectionStatus status{};
+  if (R_FAILED(nifmGetInternetConnectionStatus(&type, &strength, &status))) {
+    return true;
+  }
+  return status == NifmInternetConnectionStatus_Connected;
+}
 
 std::unique_ptr<http::HttpClient> MakeHorizonHttpClient(const http::ClientOptions& options) {
   return std::unique_ptr<http::HttpClient>(new HorizonHttpClient(options));
