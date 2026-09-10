@@ -367,12 +367,20 @@ void SdEngine::Load(const std::string& config_dir) {
 void SdEngine::UsePairingBackend(PairingBackend backend) {
   pairing_backend_ = std::move(backend);
   if (pairing_backend_.http != nullptr && !pairing_thread_.joinable()) {
-    // See the header: this is the one throwing call in the class, and it happens
-    // at start rather than under a user's finger. It parks on `wake_` until
-    // there is an attempt, so a console that never pairs pays a blocked thread
-    // and its stack -- which is #126's to budget, along with the rest of the
-    // heap the transport needs.
-    pairing_thread_ = std::thread(&SdEngine::DrivePairing, this);
+    // See the header: started here rather than under a user's finger. It parks
+    // on `wake_` until there is an attempt, so a console that never pairs pays a
+    // blocked thread and its stack -- `kThreadStackBytes`, which the heap's
+    // table pays for by the row (`kHeapThreadStacks`, `main.cpp`).
+    //
+    // A failure is reported rather than thrown (M9-2, #207): `std::thread` would
+    // have terminated the process here under `-fno-exceptions`, and a console
+    // that cannot start this thread is one that pairs no worse than a console
+    // with no transport, which is what `StartPairing` already answers for.
+    if (!pairing_thread_.Start<&SdEngine::DrivePairing>(this)) {
+      log::Warn(log::Event::kBoot,
+                "the pairing thread could not be started; pairing is unavailable on this "
+                "boot");
+    }
   }
 }
 
@@ -723,7 +731,14 @@ void SdEngine::StartWorker() {
     return;
   }
   scheduler_.Reconfigure(ScheduleFrom(*ConfigSnapshot()));
-  worker_thread_ = std::thread(&SdEngine::RunWorker, this);
+  // Reported rather than thrown, for `UsePairingBackend`'s reason. Without the
+  // worker nothing syncs and no list page is pumped, so this is the one of the
+  // two whose absence a user will see -- which is exactly why it is a line in
+  // the log rather than a `std::terminate` with no crash report (M9-2, #207).
+  if (!worker_thread_.Start<&SdEngine::RunWorker>(this)) {
+    log::Warn(log::Event::kBoot,
+              "the sync worker thread could not be started; nothing will sync on this boot");
+  }
 }
 
 void SdEngine::ObserveAnswer(auth::Answer answer) {

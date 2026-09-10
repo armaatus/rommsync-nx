@@ -243,7 +243,7 @@ RestoreReport Restore(fs::FileSystem& files, const History& history, std::int64_
   }
 
   // Streamed and staged: a save state is tens of megabytes and the sysmodule's
-  // inner heap is 512 KiB, and the two-rename commit is what makes an
+  // inner heap is 1.3 MiB, and the two-rename commit is what makes an
   // interruption leave the old bytes or the new ones and never a splice.
   const io::CopyResult copied = io::CopyAtomically(backup, destination);
   if (!copied.ok()) {

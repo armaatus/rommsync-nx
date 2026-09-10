@@ -46,7 +46,7 @@ with `cat`, and both substitute the same `version.hpp.in`.
   because libultrahand's own objects reference them (its updater and its package
   handling), and `--gc-sections` cannot drop a symbol a linked object still
   names. The overlay is a launched process with the applet's memory, not a
-  resident sysmodule in a `0xC0000` heap, so the footprint M0-1 was measuring
+  resident sysmodule in a `0x150000` heap, so the footprint M0-1 was measuring
   does not apply to it -- and `ovl-rommsync` itself opens no socket: everything
   it does over the network happens in `sys-rommsync` (overlay/AGENTS.md). The
   rule for the **sysmodule** is unchanged.
@@ -459,12 +459,15 @@ a sysmodule pays for a TLS request is therefore:
    left as it was — it measured what it measured, and a spike edited after the
    fact measures nothing.
 
-   `sys-rommsync`'s inner heap is `0xC0000` (768 KiB), derived term by term in
-   `sysmodule/source/main.cpp` and checked there by a `static_assert` rather than
-   by this table. The default socket config does not fit in it and never will;
-   the sysmodule's leaves ~650 KiB. **Never call `socketInitializeDefault()` from
-   the sysmodule** — that single line is the difference between a working engine
-   and one that dies at `socketInitialize`.
+   `sys-rommsync`'s inner heap is `0x150000` (1.3 MiB), derived term by term in
+   `sysmodule/source/main.cpp` and checked there by a `static_assert` and by
+   `tests/test_heap_budget.py` rather than by this table. It was `0xC0000` until
+   M9-2 (#207), which found the table wrong by more than its own margin — two
+   thread stacks budgeted at a quarter of what devkitA64 gives them, and an open
+   `DIR` costing ~24 KiB with no term at all. The default socket config does not
+   fit in it and never will; the sysmodule's leaves ~1.2 MiB. **Never call
+   `socketInitializeDefault()` from the sysmodule** — that single line is the
+   difference between a working engine and one that dies at `socketInitialize`.
 
    The heap was `0x80000` until M1-7, and the two terms it was short by are the
    two easiest to miss. **A list response is buffered whole** — `Send` returns a
@@ -549,7 +552,7 @@ one in-flight download buffer + the bsd transfer memory above + the `state.db`
 baseline, and stream to file rather than buffering whole roms in RAM. The
 baseline is the one item that grows with the library rather than being a fixed
 buffer — its text and then its parsed rows, bounded by `state::kMaxStateBytes`
-and `state::kMaxRecords`, which are sized against the ~650 KiB this section
+and `state::kMaxRecords`, which are sized against the ~1.2 MiB this section
 leaves free and have to move with it (`core/include/rommsync/state_db.hpp`).
 Since M1-7 (#126) that budget is written out term by term above
 `kInnerHeapSize` in `sysmodule/source/main.cpp`, and a `static_assert` there
@@ -718,7 +721,7 @@ say "update the sysmodule" instead of decoding garbage.
 ### The bounds
 
 `ipc::kMaxPayloadBytes` (8 KiB) caps every single request and response, in both
-directions. The inner heap is `0xC0000` with ~650 KiB left after the trimmed bsd
+directions. The inner heap is `0x150000` with ~1.2 MiB left after the trimmed bsd
 transfer memory ([M0-1](#m0-1-the-measurement-and-the-decision)), and that budget
 already owes a download buffer and the `state.db` baseline.
 

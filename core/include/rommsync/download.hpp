@@ -92,7 +92,7 @@ inline constexpr int kFormatVersion = 1;
 /// read.
 ///
 /// Bounds for `config::kMaxConfigBytes`' reason -- this runs on a sysmodule heap
-/// with ~390 KiB free (docs/DEVELOPMENT.md) over a FAT32 card that gets yanked
+/// with ~1.2 MiB free (docs/DEVELOPMENT.md) over a FAT32 card that gets yanked
 /// mid-write, so a corrupt directory entry claiming four gigabytes has to be a
 /// named refusal rather than a `bad_alloc`.
 ///

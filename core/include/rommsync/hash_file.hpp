@@ -2,7 +2,7 @@
 //
 // Three callers want the same loop and nothing else: `state::HashFile` over a
 // save state, `crypto::Md5FileHex` and `crypto::Sha1FileHex` over a rom. A rom
-// is gigabytes and the sysmodule's inner heap is 512 KiB (core/AGENTS.md), so
+// is gigabytes and the sysmodule's inner heap is 1.3 MiB (core/AGENTS.md), so
 // none of them may read the file whole -- and three copies of "read a chunk,
 // feed the hasher" is three places for the chunk to be sized by how fast it
 // felt on a desktop.

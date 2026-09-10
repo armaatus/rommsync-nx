@@ -192,7 +192,7 @@ void AnUnreadableFileIsNotADigest(checks::Checks& c) {
 /// The digest is `sha1sum`'s, and it is also what RomM's own scan recorded for
 /// the same file -- which is the comparison that matters, since the whole point
 /// of this hash is to agree with the server about a rom. Streamed: the file is
-/// 126 MB and the sysmodule's heap is 512 KiB, so a version of this that read it
+/// 126 MB and the sysmodule's heap is 1.3 MiB, so a version of this that read it
 /// whole would pass here and be a `bad_alloc` on the console.
 bool TheFixtureStreams(checks::Checks& c) {
   const std::string path = std::string(ROMMSYNC_LIBRARY_DIR) + "/roms/gba/synthetic-large.gba";

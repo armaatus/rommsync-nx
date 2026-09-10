@@ -270,7 +270,7 @@ auth::Answer AnswerOf(OperationError error);
 ///
 /// Shared by saves and states rather than spelled twice, because it is the step
 /// docs/SYNC_PROTOCOL.md's hard rule is about: streamed with `io::CopyAtomically`
-/// (the file may be tens of megabytes and the sysmodule heap is 512 KiB), and
+/// (the file may be tens of megabytes and the sysmodule heap is 1.3 MiB), and
 /// stepping past a name that is already taken rather than over it -- a name that
 /// is there is a backup of *something*, and this does not get to decide it is
 /// worthless.

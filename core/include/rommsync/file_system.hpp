@@ -186,7 +186,7 @@ bool SplitPath(const std::string& sd_path, std::string* directory, std::string* 
 ///
 /// **One entry, not a map.** A `Listing` may hold up to `kMaxDirectoryEntries`
 /// names, each of them a heap `std::string`, and the sysmodule's inner heap is
-/// 512 KiB (core/AGENTS.md). Keeping one listing per directory for the length of
+/// 1.3 MiB (core/AGENTS.md). Keeping one listing per directory for the length of
 /// a tick is unbounded in exactly the dimension that is scarce, and it would be
 /// unbounded on the tick that is already the most expensive -- the one that
 /// downloaded a lot of files. Keeping the last one costs a single listing and

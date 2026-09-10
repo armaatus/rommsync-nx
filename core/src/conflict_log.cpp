@@ -372,7 +372,7 @@ LoadedHistory LoadHistory(const std::string& path) {
   // **Bounded, not `ReadFile`.** `state::LoadBaseline`'s rule, and its reason:
   // this file sits on a FAT32 card that gets yanked mid-write, so a corrupt
   // directory entry claiming four gigabytes has to be a named refusal rather
-  // than a `bad_alloc` on a 512 KiB heap before the diagnostic exists.
+  // than a `bad_alloc` on a 1.3 MiB heap before the diagnostic exists.
   std::string contents;
   io::BoundedRead outcome = io::ReadBounded(path, kMaxHistoryBytes, &contents);
   if (outcome == io::BoundedRead::kMissing) {
