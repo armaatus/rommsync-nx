@@ -56,9 +56,13 @@ namespace rommsync::sysmodule {
 /// known to be incomplete, and overflowing a Horizon thread stack is a data
 /// abort, not a diagnosable failure.
 ///
-/// Must be a multiple of the page size: `__syscall_thread_create` refuses
-/// anything else with `EINVAL`, and so does `pthread_attr_setstacksize` on the
-/// hosts the tests run on.
+/// Must be a multiple of the page size, which is what the `static_assert` below
+/// checks: `__syscall_thread_create` refuses a `stack_size` with any of the low
+/// twelve bits set, and that is the one of these three constraints that is
+/// silent on a console. The hosts differ and neither matches it -- macOS wants a
+/// multiple of *its* page size, and glibc has no alignment rule at all, only a
+/// `PTHREAD_STACK_MIN` floor that 128 KiB sits exactly on. `Start` handles a
+/// host that refuses this size; see the comment there.
 inline constexpr std::size_t kThreadStackBytes = 0x20000;
 
 /// What one thread costs the inner heap *besides* its stack.
