@@ -2206,6 +2206,7 @@ endforeach()
 # a cross-compile can (M9-12, #211). The SAC is in the tree, so these run on
 # every push, everywhere.
 add_executable(test_boot_services test_boot_services.cpp
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/boot_wait.cpp"
   "${CMAKE_SOURCE_DIR}/sysmodule/source/http/posix_connection.cpp")
 target_link_libraries(test_boot_services PRIVATE rommsync::host Threads::Threads)
 target_include_directories(test_boot_services PRIVATE
@@ -2215,6 +2216,12 @@ target_include_directories(test_boot_services PRIVATE
 # tests/loopback_server.hpp, on a port the kernel picks. So it never skips.
 add_test(NAME boot.resolve COMMAND test_boot_services resolve)
 
+# Neither does the wait: `boot_wait.cpp` asks a `Waiter`, so the test is the `sm`
+# that never answers and a ten-second bound is spent in accounting rather than in
+# wall-clock.
+add_test(NAME boot.wait COMMAND test_boot_services wait)
+add_test(NAME boot.journal COMMAND test_boot_services journal)
+
 # ...except this one, and only where the resolver itself is the problem: a
 # captive portal or an ISP that answers NXDOMAIN with an address turns it into a
 # test of that resolver. It says so and skips rather than going red on a
@@ -2222,7 +2229,8 @@ add_test(NAME boot.resolve COMMAND test_boot_services resolve)
 add_test(NAME boot.unresolved COMMAND test_boot_services unresolved)
 set_tests_properties(boot.unresolved PROPERTIES SKIP_RETURN_CODE 77)
 
-set_tests_properties(boot.resolve boot.unresolved PROPERTIES TIMEOUT 60)
+set_tests_properties(boot.resolve boot.unresolved boot.wait boot.journal
+                     PROPERTIES TIMEOUT 60)
 
 set(SYSMODULE_BOOT_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_sysmodule_boot.py")
 foreach(scenario IN ITEMS dns clock bounded comments)

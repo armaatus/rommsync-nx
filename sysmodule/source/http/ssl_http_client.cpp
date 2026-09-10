@@ -378,6 +378,22 @@ Result NetworkInitialize(const SocketBudget& budget) {
   // Each half is brought up only if it is not already, so a second call after a
   // half-failed first one retries the half that failed rather than reporting
   // success because the other one is up.
+  //
+  // nifm is diagnostics rather than transport, and a failure here is not one:
+  // the console can still reach a server, it just cannot be asked first whether
+  // it is worth trying (`ConsoleIsOnline`).
+  //
+  // **It is first, and that is not the arbitrary order it looks like.** It is
+  // the only half whose failure is not returned, and since M9-1 (#195) it is
+  // also the only `nifmInitialize` in this build -- `main.cpp` had a second one,
+  // whose `NifmServiceType` libnx silently ignored because the call refcounts.
+  // Bringing it up after `socketInitialize` would mean a console whose transfer
+  // memory did not fit lost `NetworkUp()` as well as its transport, and the
+  // connection probe is exactly what such a console still wants to answer.
+  if (!g_nifm_up) {
+    g_nifm_up = R_SUCCEEDED(nifmInitialize(NifmServiceType_User));
+  }
+
   if (!g_socket_up) {
     const SocketInitConfig config = {
         .tcp_tx_buf_size = budget.tcp_tx_buf_size,
@@ -393,13 +409,6 @@ Result NetworkInitialize(const SocketBudget& budget) {
     const Result rc = socketInitialize(&config);
     if (R_FAILED(rc)) return rc;
     g_socket_up = true;
-  }
-
-  // Diagnostics rather than transport, and a failure here is not one: the
-  // console can still reach a server, it just cannot be asked first whether it
-  // is worth trying (`ConsoleIsOnline`).
-  if (!g_nifm_up) {
-    g_nifm_up = R_SUCCEEDED(nifmInitialize(NifmServiceType_User));
   }
 
   if (!g_ssl_up) {

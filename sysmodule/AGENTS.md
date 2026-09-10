@@ -24,6 +24,20 @@ Runs under Atmosphère with a tight heap.
 - **Heap discipline:** size for one in-flight download buffer plus a TLS context.
   Stream to file; never hold a whole rom in RAM.
 - **Never block boot.** Every network call has a timeout and is offline-safe.
+- **`__appInit` runs before global constructors, and before there is anywhere to
+  log.** `__libnx_init`'s order is `__libnx_initheap → __libnx_init_thread →
+  argvSetup → __appInit → __libc_init_array`, so anything at file scope that
+  `__appInit` touches has to be **constant-initialised** or it is used before its
+  constructor runs. Two rules follow, and `boot.*` is what keeps them (M9-1,
+  #195):
+  - nothing `__appInit` reads or writes may have a runtime constructor —
+    `boot::Journal` is fixed character storage for that reason and static_asserts
+    it;
+  - **no unbounded wait.** A service in the SAC but not yet registered makes `sm`
+    *defer* the request rather than fail it, and a deferred request is never
+    answered — which left this process inert with no crash report and no log.
+    Every acquisition waits with a bound first (`boot_wait.hpp`), and what times
+    out is written to a journal that `main` flushes once the log exists.
 
 Nothing here is run on real hardware until the M8-1 gate passes. It is exercised
 in Ryujinx as a manually-launched NRO first — never as an auto-boot sysmodule.

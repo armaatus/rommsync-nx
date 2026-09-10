@@ -133,7 +133,9 @@ def phase_clock(repo):
 
 def phase_bounded(repo):
     body = uncommented(app_init(read(repo, "sysmodule/source/main.cpp")))
-    waited = set(re.findall(r"WaitForService\s*\(\s*\"([^\"]+)\"", body))
+    # `WaitForService` and `WaitForServiceOrAbort`: what differs is what the
+    # caller does about a timeout, not whether it waited.
+    waited = set(re.findall(r"WaitForService\w*\s*\(\s*\"([^\"]+)\"", body))
     failures = 0
     for call, services in SERVICE_OF_INIT.items():
         if not re.search(r"\b" + call + r"\s*\(", body):
