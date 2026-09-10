@@ -96,11 +96,11 @@ derives from the `Blocked by #N` lines in each issue body, never by hand. Do not
 start a `blocked` issue, nor a **`needs-human-step`** one — its last step is the
 maintainer's, or no agent can do it at all ([WORKFLOW.md](docs/WORKFLOW.md)).
 
-One exception the labels cannot express: **a foundation issue lands alone.** When
-an issue defines an interface that later issues include — M0-2's `HttpClient` —
-it merges before anything that depends on it starts, even if the labels say
-several things are ready. Three agents each inventing their own version of a
-shared header is the one merge conflict worth serialising to avoid.
+One exception the labels cannot express: **a foundation issue lands alone.** An issue
+defining an interface later issues include — M0-2's `HttpClient` — merges before
+anything else starts, even if the labels say several things are ready: three agents
+each inventing their own shared header is the one merge conflict worth serialising to
+avoid. *Alone* runs both ways ([WORKFLOW.md](docs/WORKFLOW.md), #215).
 
 ## Plan before you edit
 

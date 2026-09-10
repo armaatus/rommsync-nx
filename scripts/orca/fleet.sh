@@ -245,7 +245,7 @@ owned_path()   { cat "$OWNED_DIR/$1" 2>/dev/null; }
 # issue that ever stalled. That is the root fix; the two exits in
 # enforce_timebox tidying up after themselves is the belt.
 clear_issue_markers() {
-  rm -f "$STATE_DIR/foundation-wait-$1" \
+  rm -f "$STATE_DIR/foundation-wait-$1" "$STATE_DIR/foundation-$1" \
         "$STATE_DIR/stalled-$1" "$STATE_DIR/stall-labels-$1" \
         "$STATE_DIR/box-labels-$1" "$STATE_DIR/queue-labels-$1" \
         "$STATE_DIR/unreachable-$1" "$STATE_DIR/human-step-$1" \
@@ -360,21 +360,85 @@ waiting_worktrees() {
   done | sort -V | tr '\n' ' ' | sed 's/ $//'
 }
 
-# The line to say when a foundation issue is held, or nothing (1) when it has
-# already been said about this same set of worktrees. A bare count repeated every
-# poll is what #212 looked like from the outside for 47 minutes: it named nothing
-# to act on, so a wait that could never end read the same as one about to. The
-# marker is the SET, not a flag, so the line comes back when what it is waiting
-# on changes -- which is news -- and stays quiet while it does not.
+# Is any worktree that is running right now for a foundation issue? Prints its
+# issue number, or fails. Read from a marker rather than by asking GitHub for
+# each live issue's labels: `one_lookup` is the rule, and this is asked every
+# pass whether or not anything is held.
+#
+# What that cannot see: a worktree this dispatcher did not open. One created by
+# hand, or for an issue that gained the `foundation` label after it started, has
+# no marker, and the reverse half of the rule quietly does not apply to it. The
+# forward half still does -- that reads the candidate's labels live. The marker
+# itself survives a dispatcher restart, since STATE_DIR outlives the process.
+live_foundation() {
+  printf '%s\n' "$1" | while IFS="$(printf '\t')" read -r num path; do
+    [ -n "$path" ] && [ -n "$num" ] && [ "$num" != "-" ] || continue
+    [ -e "$STATE_DIR/foundation-$num" ] && { printf '%s\n' "$num"; break; }
+  done | grep . || return 1
+}
+
+# Once, at startup: a worktree already open when this dispatcher starts has no
+# marker, because only `launch` writes one. The case that matters is the one
+# this rule was written for -- a foundation worktree opened by a dispatcher
+# that predates the rule, or by a person -- where the reverse half would
+# silently not apply to the very worktree it exists for. A lookup per owned
+# issue, once, is a price worth paying at startup; it is not one per pass.
+backfill_foundation_markers() {
+  local list; list="$(live_worktrees)" || return 0
+  printf '%s\n' "$list" | while IFS="$(printf '\t')" read -r num path; do
+    [ -n "$path" ] && [ -n "$num" ] && [ "$num" != "-" ] || continue
+    [ -e "$STATE_DIR/foundation-$num" ] && continue
+    local answer; answer="$(poll_issue "$num")" || continue
+    is_foundation "$(issue_labels_in "$answer")" || continue
+    : >"$STATE_DIR/foundation-$num"
+    say "#$num is a foundation issue and was already running; nothing starts beside it"
+  done
+}
+
+# Why a candidate may not start beside what is already running -- printed as the
+# rest of a sentence beginning `#N` -- or nothing (1) when it may.
+#
+# The rule in ONE place, because #215 was what happens when it lives in two: both
+# spellings asked "is this candidate a foundation issue, and is anything else
+# running?", and neither asked "is a foundation issue already running?". A
+# foundation issue is the most-unblocking work by construction, so it is picked
+# FIRST, launches into an empty fleet, and everything else then launches beside
+# it -- the arrangement the rule exists to prevent.
+#
+# Deliberately not derived from the blocker graph. CLAUDE.md calls this the one
+# exception the labels cannot express -- "even if the labels say several things
+# are ready" -- and the issues that would each invent their own version of a
+# shared header are exactly the ones whose `Blocked by` lines nobody has written
+# yet. A dependency-aware gate would trust the thing the rule says not to trust.
+foundation_hold() {
+  local labels="$1" list="$2"
+  local live_n; live_n="$(printf '%s\n' "$list" | grep -c . || true)"
+  [ "$live_n" -gt 0 ] || return 1
+  if is_foundation "$labels"; then
+    local waiting_on; waiting_on="$(waiting_worktrees "$list")"
+    # Nothing to name means nothing is holding it, and we should not have got
+    # here -- "waiting for" with nothing after it is worse than silence.
+    [ -n "$waiting_on" ] || return 1
+    printf 'is a foundation issue and lands alone; waiting for %s\n' "$waiting_on"
+    return 0
+  fi
+  local holder; holder="$(live_foundation "$list")" || return 1
+  printf 'waits for #%s, a foundation issue, which lands alone\n' "$holder"
+  return 0
+}
+
+# The line to say for a hold, or nothing (1) when that same line has already
+# been said. A reason repeated every poll is what #212 looked like from the
+# outside for 47 minutes: it named nothing to act on, so a wait that could never
+# end read the same as one about to. The marker is the REASON, so the line comes
+# back when what it is waiting on changes -- which is news -- and stays quiet
+# while it does not.
 foundation_wait_notice() {
-  local waiting_on; waiting_on="$(waiting_worktrees "$2")"
-  # Nothing to name means nothing is holding it, and the caller should not have
-  # asked -- saying "waiting for" with nothing after it is worse than silence.
-  [ -n "$waiting_on" ] || return 1
-  [ "$(cat "$STATE_DIR/foundation-wait-$1" 2>/dev/null)" = "$waiting_on" ] && return 1
+  [ -n "$2" ] || return 1
+  [ "$(cat "$STATE_DIR/foundation-wait-$1" 2>/dev/null)" = "$2" ] && return 1
   mkdir -p "$STATE_DIR"
-  printf '%s\n' "$waiting_on" >"$STATE_DIR/foundation-wait-$1"
-  printf '#%s is a foundation issue and lands alone; waiting for %s\n' "$1" "$waiting_on"
+  printf '%s\n' "$2" >"$STATE_DIR/foundation-wait-$1"
+  printf '#%s %s\n' "$1" "$2"
 }
 
 # Prints the count, or fails. A caller that cannot tell how many are running
@@ -589,7 +653,7 @@ BRIEF
 }
 
 launch() {
-  local num="$1" title="$2"
+  local num="$1" title="$2" labels="${3:-}"
   local name; name="$(slug "$num-$title")"
 
   say "opening a worktree for #$num -- $title"
@@ -620,6 +684,10 @@ except Exception:
   rm -f "$out"
   [ -n "$path" ] || { say "  created, but Orca reported no path; not tracking it"; return 1; }
   own "$num" "$path"
+  # After own(), which clears this issue's markers: what foundation_hold reads
+  # to answer "is a foundation issue already running?" without a label lookup
+  # per live worktree per pass. disown_issue clears it when the worktree goes.
+  if is_foundation "$labels"; then : >"$STATE_DIR/foundation-$num"; fi
   card "$path" --workspace-status in-progress --comment "#$num: building"
   say "  #$num is running in $path"
 }
@@ -882,6 +950,18 @@ reap_merged() {
     # keep is one the next pass in sixty seconds will decide to keep again, and
     # the board card carries the standing state either way.
     #
+    # The foundation hold ends here, not at removal. The rule exists to stop two
+    # agents inventing their own version of the same header BEFORE it is on
+    # main; once the PR has merged, the interface is there to include and the
+    # reason is spent. Clearing it only in disown_issue was a fleet-wide freeze
+    # waiting to happen: a merged worktree that still holds an untracked file
+    # takes the `holds` branch below and is never disowned, so the marker
+    # survives, live_worktrees keeps reporting the worktree, and from that pass
+    # on EVERY other candidate is held for an issue that already landed. Before
+    # #215 such a worktree cost one of three slots; it would now cost all three,
+    # with a message that names a reason that is no longer true.
+    rm -f "$STATE_DIR/foundation-$num"
+
     # Their own markers rather than reap_abandoned's: that function clears
     # `held-` and `git-blind-` whenever an issue has no reason to be released,
     # which for a MERGED issue is every single pass.
@@ -1663,6 +1743,15 @@ cmd_status() {
     printf '  #%-5s %s\n' "$num" "$path"
   done
   echo
+  # Otherwise the queue below reads as ready to go while nothing in it can
+  # start, which is the "nothing to act on" shape #212 was. The blank line
+  # belongs to the line it separates, not to the section: printed only when
+  # there is something to separate.
+  local holder
+  if holder="$(live_foundation "$(live_worktrees 2>/dev/null)" 2>/dev/null)"; then
+    echo "held: #$holder is a foundation issue and lands alone -- nothing below starts until it does"
+    echo
+  fi
   echo "next up (ready, not in flight, not labelled $HUMAN_STEP_LABEL;"
   echo "         'unblocks' is how many issues it frees):"
   printf '  %-6s %-9s %s\n' "issue" "unblocks" "title"
@@ -1913,6 +2002,7 @@ while that one is up."
   # against. That is the silence this whole file's staleness report exists to end.
   trap 'release_dispatcher_files' EXIT
   say "fleet up: max $MAX_WORKTREES worktrees, polling every ${POLL_SECONDS}s, ${TIMEBOX_SECONDS}s per issue"
+  backfill_foundation_markers
   $auto && say "mode: auto -- most-unblocking first, until the backlog is empty or you stop it" \
         || say "mode: list -- ${wanted[*]}"
   [ -n "$deadline" ] && say "stopping at $(date -r "$deadline" '+%Y-%m-%d %H:%M')"
@@ -2030,7 +2120,28 @@ while that one is up."
         wanted=("${remaining[@]+"${remaining[@]}"}")
         [ -n "$picked" ] || break
         title="$(GH_PAGER=cat gh issue view "$picked" --json title --jq .title 2>/dev/null)"
-        labels="$(GH_PAGER=cat gh issue view "$picked" --json labels --jq '[.labels[].name]|join(",")' 2>/dev/null)"
+        # From the answer this pass already has, not a second call. An
+        # unguarded one reads a rate-limited `gh` as "no labels", which is not
+        # "not a foundation issue" -- and getting that wrong turns the rule off
+        # BOTH ways at once: the issue launches beside running work, and it
+        # launches without a marker, so nothing is held beside it either, for
+        # the whole life of that worktree.
+        # Belt and braces, and it says so: `issue_needs_human_step` read this
+        # same issue in the loop above, THIS pass, and its "could not tell" arm
+        # continues without setting `picked` -- so by here the poll cache is
+        # populated and this cannot fail. Verified by instrumenting the branch:
+        # under a total `gh` outage it is never reached.
+        #
+        # Nothing is re-added to the queue on the way out. The loop above
+        # already put `picked` in `remaining` and `wanted` was rebuilt from it
+        # two lines up, so appending here would leave a second copy -- and
+        # in_flight asks `gh pr list --state open` once per entry per pass.
+        local answer
+        if ! answer="$(poll_issue "$picked")"; then
+          say "#$picked: could not read its labels -- not starting it this pass"
+          break
+        fi
+        labels="$(issue_labels_in "$answer")"
       else
         $auto || break
         while IFS="$(printf '\t')" read -r n _unblocks l t; do
@@ -2038,28 +2149,29 @@ while that one is up."
           # Said once, when the box fired -- not once per poll for the rest of
           # the run.
           gave_up_on "$n" && continue
-          # A foundation issue defines an interface later issues include, so it
-          # lands alone: three worktrees each inventing their own version of a
-          # shared header is the one merge conflict worth serialising to avoid.
-          #
-          # Named, and said once. A bare count repeated every poll is what #212
-          # looked like from the outside for 47 minutes -- it does not say what
-          # would end the wait, so there is nothing to act on and nothing to
-          # notice when the set changes. The marker is cleared when it does, so
-          # the next line is news rather than the same line again.
-          if is_foundation "$l" && [ "$live" -gt 0 ]; then
-            local notice; notice="$(foundation_wait_notice "$n" "$live_list")" \
-              && say "$notice"
-            break
-          fi
           picked="$n"; title="$t"; labels="$l"
           break
         done < <(ready_issues)
       fi
       [ -n "$picked" ] || break
 
-      if is_foundation "$labels" && [ "$live" -gt 0 ]; then break; fi
-      if launch "$picked" "$title"; then
+      # A foundation issue lands alone, in both directions -- see
+      # foundation_hold. ONE place, for both modes: #215 was the same question
+      # asked in two spellings, each of which asked half of it, so a second
+      # caller here would be re-creating the shape this is the fix for. The
+      # candidate is held rather than skipped, so the queue does not fall
+      # through to work that would start beside it.
+      #
+      # In list mode this used to break in silence, and a person who ran
+      # `fleet.sh run 196 197` got no explanation for why the second never
+      # started.
+      local hold
+      if hold="$(foundation_hold "$labels" "$live_list")"; then
+        local notice; notice="$(foundation_wait_notice "$picked" "$hold")" \
+          && say "$notice"
+        break
+      fi
+      if launch "$picked" "$title" "$labels"; then
         opened=$((opened + 1))
       else
         # It stays in the queue. Dropping an issue whose worktree failed to open
