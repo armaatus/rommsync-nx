@@ -2144,6 +2144,7 @@ set(ENGINE_SCENARIOS
   syncnow   # M7-2: Sync now starts a tick and says so, instead of "one is already running"
   restore_race  # M7-2: a restore pressed while a tick is writing saves is refused, not interleaved
   log       # M7-3: the misconfigurations docs/TROUBLESHOOTING.md answers, on the record
+  stale_active  # M9-5: an `active` row a power cut left is work, not a live transfer
 )
 foreach(scenario IN LISTS ENGINE_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
@@ -2200,7 +2201,7 @@ endforeach()
 # long -- so both slow the transfer down from the test side rather than from the
 # engine (`Throttled`, tests/test_engine.cpp). Serial with the rest of this group
 # for the reason every rig test is: they download the shared fixture's roms.
-foreach(scenario downloading preempts shutdown)
+foreach(scenario downloading preempts discards shutdown)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
   if(NOT ROMMSYNC_REQUIRE_RIG)
     set_tests_properties(engine.${scenario} PROPERTIES SKIP_RETURN_CODE 77)

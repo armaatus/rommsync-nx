@@ -618,6 +618,23 @@ class SdEngine : public ipc::Engine {
   /// `mutex_` for the counter and notifies outside it.
   void Wake();
 
+  /// `Wake()`, **and the download queue is worth another look now** -- whatever
+  /// backoff the last drain earned is cleared (M9-5, #197).
+  ///
+  /// The commands that change what a drain would decide: a rom queued or taken
+  /// out of the queue, an edit to `config.ini`, a pairing committed. Without it
+  /// a console that spent its way up to `kMaxDownloadRetryBackoff` on one rom
+  /// whose endpoint keeps answering 500 would refuse a *healthy* rom queued
+  /// afterwards for the next quarter of an hour, with nothing on any screen
+  /// saying why -- and the same for switching `[downloads]` back on, and for
+  /// pairing again after a drain gave up `kUnauthorized`.
+  ///
+  /// Deliberately **not** every `Wake()`: `ListNext` wakes the worker for a
+  /// library page, and a user paging while one rom's endpoint is failing would
+  /// otherwise reset the backoff on every page and turn it into a hot retry
+  /// loop against that endpoint.
+  void WakeDownloads();
+
   /// Record a tick that did not transfer anything. The caller holds `mutex_`.
   ///
   /// The counts go to zero with it: `ipc::Status` carries *the last sync's*
@@ -857,11 +874,10 @@ class SdEngine : public ipc::Engine {
 
   /// When the next drain is worth making, and what the last refusal bought.
   ///
-  /// **Guarded by nothing, because there is one toucher**: `RunOneDrain`, on
-  /// the worker, one drain at a time. Nothing on the IPC surface reads them --
-  /// what the overlay is shown about the queue comes off `queue_`, which has
-  /// its own lock. A second toucher is what would change that, exactly as
-  /// `play_` documents.
+  /// Guarded by `mutex_`, because there are two touchers: `RunOneDrain` sets
+  /// them on the worker, and `WakeDownloads` clears them from the IPC thread
+  /// when a command arrives that changes what a drain would decide. Both are
+  /// assignments, never held across anything.
   std::chrono::steady_clock::time_point download_due_{};
   std::chrono::milliseconds download_backoff_{0};
 

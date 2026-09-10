@@ -146,6 +146,18 @@ void SdEngine::Wake() {
   wake_.notify_all();
 }
 
+void SdEngine::WakeDownloads() {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++wakes_;
+    // Whatever the last drain earned. See the header for why this is not on
+    // every `Wake()`.
+    download_due_ = std::chrono::steady_clock::time_point{};
+    download_backoff_ = std::chrono::milliseconds{0};
+  }
+  wake_.notify_all();
+}
+
 void SdEngine::UseCard(fs::FileSystem* filesystem) {
   card_ = filesystem;
   lists_.UseCard(filesystem);
@@ -234,6 +246,30 @@ void SdEngine::Load(const std::string& config_dir) {
   // `queue.json` is an empty queue plus a diagnostic, and nothing may block boot
   // (`download.hpp`, CLAUDE.md).
   download::LoadedQueue queued = download::LoadQueue(PathTo(download::kQueueFileName));
+  // A row that says `active` or `verifying` on a *boot* is a row nothing is
+  // working on: the process that was working on it is gone, which is what a
+  // power cut and ovl-sysmodules' `pmshellTerminateProgram` both leave behind
+  // (M6-2, #33). It is put back to `queued`, and nothing else about it is
+  // touched -- `bytes_done` and the `.part` beside it are what make the next
+  // drain a resume rather than a restart (M9-5, #197).
+  //
+  // Two things go wrong without it, and the second is why it is here rather
+  // than left as cosmetic. The queue screen draws the first `active` row as the
+  // download in flight (`download::Queue::Status`), so a console that lost
+  // power mid-rom comes back showing a transfer that is not moving, for as long
+  // as the entries in front of it take. And `Dequeue` decides whether to cancel
+  // the transfer in flight from the removed row's own state, so a stale
+  // `active` row sitting behind a healthy one would abort the healthy rom's
+  // transfer when the user took the stale one out.
+  //
+  // Here rather than in `LoadQueue`, because `core/` cannot know that a load is
+  // a boot: the same parse is what `download.roundtrip` drives over a string.
+  for (download::QueueEntry& entry : queued.entries) {
+    if (entry.state == download::QueueState::kActive ||
+        entry.state == download::QueueState::kVerifying) {
+      entry.state = download::QueueState::kQueued;
+    }
+  }
   queue_.Reset(std::move(queued.entries));
   queue_trusted_ = queued.trusted;
   // The complaint goes to the queue and nowhere else.
@@ -548,6 +584,11 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
     {
       std::lock_guard<std::mutex> lock(mutex_);
       AbandonPairingLocked();
+      // ...and so is the drain, which since M9-5 (#197) copied `base_url` and
+      // the token at its start and would carry on fetching rom bodies from the
+      // server that has just been replaced, with a token that has just been
+      // discarded, for as long as the queue took to empty.
+      CancelDrainLocked();
     }
     // Every other write to `attempt_` notifies, and this one has the longest
     // wait to cut short: the thread is parked in `AwaitNextPoll` until the
@@ -612,8 +653,10 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
   }
   // The scheduler may now have something due -- a shortened interval, a switch
   // turned back on, or a park lifted -- and the worker is asleep on a deadline
-  // that was computed from the configuration before this one.
-  Wake();
+  // that was computed from the configuration before this one. `WakeDownloads`
+  // because `[downloads] enabled` and `[server] url` are both in this file, and
+  // both change what a drain would decide (M9-5, #197).
+  WakeDownloads();
   return ipc::Error::kOk;
 }
 
@@ -802,14 +845,33 @@ void SdEngine::RunWorker() {
 
 SdEngine::DrainStep SdEngine::RunOneDrain() {
   const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
-  if (now < download_due_) {
-    // Backing off from a drain that got nowhere. See `kDownloadRetryBackoff`.
-    return {false, std::chrono::duration_cast<std::chrono::milliseconds>(download_due_ - now)};
+  http::HttpClient* client = nullptr;
+  fs::FileSystem* files = nullptr;
+  auth::StoredToken token;
+  bool blocked = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stopping_) {
+      return {};
+    }
+    if (now < download_due_) {
+      // Backing off from a drain that got nowhere. `WakeDownloads` is what
+      // clears it early when a command changes the answer. See
+      // `kDownloadRetryBackoff`.
+      return {false, std::chrono::duration_cast<std::chrono::milliseconds>(download_due_ - now)};
+    }
+    client = server_;
+    files = card_;
+    token = token_;
+    blocked = gate_.blocked();
   }
+
   if (queue_.pending() == 0) {
-    // The idle case, and the cheapest thing this function can be: no
-    // configuration snapshot, no lock, one integer.
-    download_backoff_ = std::chrono::milliseconds{0};
+    // The idle case, and as cheap as this function gets: one integer behind the
+    // queue's own lock, no configuration snapshot, no request. It is not free --
+    // that lock is held across a `queue.json` write since M9-5 (#197), so an
+    // `Enqueue` landing at this instant makes the worker wait out one small
+    // write (`download::Queue::EnqueueAndStore`).
     return {};
   }
 
@@ -820,21 +882,6 @@ SdEngine::DrainStep SdEngine::RunOneDrain() {
     // off costs one bool -- and the queue is *not* dropped, which is what
     // docs/CONFIG.md promises: switching it back on resumes what was there.
     return {};
-  }
-
-  http::HttpClient* client = nullptr;
-  fs::FileSystem* files = nullptr;
-  auth::StoredToken token;
-  bool blocked = false;
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (stopping_) {
-      return {};
-    }
-    client = server_;
-    files = card_;
-    token = token_;
-    blocked = gate_.blocked();
   }
   if (blocked || client == nullptr || files == nullptr || token.access_token.empty() ||
       !config->configured()) {
@@ -882,6 +929,7 @@ SdEngine::DrainStep SdEngine::RunOneDrain() {
   ObserveAnswer(download::AnswerOf(result.outcome));
   LogDrain(result);
 
+  std::lock_guard<std::mutex> lock(mutex_);
   switch (result.outcome) {
     case download::DrainOutcome::kCompleted:
     case download::DrainOutcome::kIdle:
@@ -1689,8 +1737,10 @@ void SdEngine::CommitGrant(const std::shared_ptr<PairingAttempt>& attempt,
     }
   }
   // A paired console usually has a tick due: `[sync] on_boot` fired long before
-  // there were credentials to fire it with.
-  Wake();
+  // there were credentials to fire it with -- and a queue too, if a drain gave
+  // up `kUnauthorized` against the credentials this one has just replaced
+  // (M9-5, #197).
+  WakeDownloads();
 }
 
 ipc::Error SdEngine::Unpair() {
@@ -1730,7 +1780,14 @@ ipc::Error SdEngine::Unpair() {
     if (server_ != nullptr) {
       lists_.UseServer(server_, list_token_);
     }
+    // ...and a *drain* is exactly such a worker, since M9-5 (#197): it copies
+    // the token at its start and holds it for a transfer that may take an hour.
+    // Clearing `token_` does not reach it, so without this the console would go
+    // on fetching rom bodies with the credentials the user has just discarded.
+    CancelDrainLocked();
   }
+  // Outside the lock, so the cancelled drain's backoff wait is cut short too.
+  Wake();
   return cleared ? ipc::Error::kOk : ipc::Error::kWriteFailed;
 }
 
@@ -1745,8 +1802,10 @@ ipc::Error SdEngine::Enqueue(std::int64_t rom_id, std::int32_t* position) {
     // The worker, which since M9-5 (#197) has something to do with this. A
     // console whose schedule is parked -- `interval_min = 0`, or the switch off
     // -- waits on no deadline at all, so a rom that did not wake it would sit
-    // in the queue until some unrelated command happened along (`wakes_`).
-    Wake();
+    // in the queue until some unrelated command happened along (`wakes_`). And
+    // `WakeDownloads` rather than `Wake`, so a healthy rom is not made to wait
+    // out the backoff a *different* rom's failing endpoint earned.
+    WakeDownloads();
   }
   return answered;
 }
@@ -1779,7 +1838,12 @@ ipc::Error SdEngine::Dequeue(std::int64_t rom_id) {
     // The `.part` stays, deliberately: it is what makes queueing the same rom
     // again a resume rather than 120 MiB fetched twice, and `Drain` salvages a
     // staged body its digest recognises without a transfer at all.
-    Wake();
+    WakeDownloads();
+  } else if (answered == ipc::Error::kOk) {
+    // Taking the entry a drain kept setting aside out of the queue is exactly
+    // the command that should end that drain's backoff: what is left may be
+    // perfectly healthy.
+    WakeDownloads();
   }
   return answered;
 }

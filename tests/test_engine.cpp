@@ -39,11 +39,15 @@
 //   nonblocking -- M1-6: `StartPair` returns while the init is still in flight
 //   repairs   -- M1-6: `StartPair` then `Unpair`, with neither instant losing
 //                both the old pairing and the new attempt
+//   stale_active -- M9-5: an `active` row a power cut left behind is work, not a
+//                   transfer in flight
 //   drains    -- M9-5: a rom queued over IPC becomes a file on the card
 //   downloading -- M9-5: progress read over IPC mid-transfer, and the Dequeue
 //                  that stops it
 //   preempts  -- M9-5: a Sync now mid-transfer stops the drain rather than queuing
 //                behind it, and the rom resumes afterwards
+//   discards  -- M9-5: an Unpair mid-transfer stops it, rather than fetching on
+//                credentials the user has just discarded
 //   shutdown  -- M9-5: the destructor ends a transfer at a boundary, keeping the
 //                `.part` the next boot resumes from
 #include <chrono>
@@ -1868,6 +1872,69 @@ ipc::Status Until(Console& console, const std::function<bool(const ipc::Status&)
   return status;
 }
 
+/// M9-5 (#197): a row that says `active` on a *boot* is a row nothing is doing.
+///
+/// The state a power cut leaves in `queue.json`, and the one ovl-sysmodules'
+/// `pmshellTerminateProgram` leaves too (M6-2, #33) -- the process that was
+/// transferring is gone and the row still claims it is. Needs no server: what
+/// it pins is what `Load` makes of the card.
+void StaleActiveOnBoot(checks::Checks& c) {
+  Console console(c, "engine-stale-active");
+  // Two rows, the stale one *behind* the healthy one, which is the order that
+  // used to matter: the worker takes the first pending entry, so a `Dequeue` of
+  // the second would have cancelled the first one's transfer.
+  std::vector<download::QueueEntry> rows;
+  for (const auto& [rom_id, state] :
+       {std::pair<std::int64_t, download::QueueState>{4, download::QueueState::kQueued},
+        {5, download::QueueState::kActive},
+        {6, download::QueueState::kVerifying},
+        {7, download::QueueState::kDone}}) {
+    download::QueueEntry entry;
+    entry.rom_id = rom_id;
+    entry.state = state;
+    entry.queued_at = rom_id;
+    entry.bytes_done = state == download::QueueState::kActive ? 4096 : 0;
+    rows.push_back(std::move(entry));
+  }
+  c.Expect(console.sandbox.Write("/config/rommsync/queue.json", download::SerializeQueue(rows)),
+           "a queue a yanked card left mid-transfer");
+  console.Boot();
+
+  const ipc::Status status = console.Status();
+  c.Expect(status.download.state == ipc::DownloadState::kQueued,
+           "the console comes up with work waiting rather than drawing a transfer that is not "
+           "moving -- which is what an `active` row nothing is working on would say");
+  c.ExpectEq(status.download.rom_id, std::int64_t{4},
+             "and the entry it is about is the first one still to do");
+  c.ExpectEq(status.queue_depth, std::int64_t{3}, "three rows are still work");
+
+  // The bytes are kept: that is what makes the next drain a resume rather than
+  // 4 KiB fetched again.
+  bool resumable = false;
+  for (const download::QueueEntry& entry : console.OnCard().entries) {
+    if (entry.rom_id == 5) {
+      resumable = entry.state == download::QueueState::kQueued && entry.bytes_done == 4096;
+    }
+  }
+  c.Expect(!resumable, "nothing is written back until something changes the queue");
+
+  // ...and once something does, the normalised states are what reaches the card.
+  std::int32_t position = 0;
+  c.Expect(console.Enqueue(8, &position) == ipc::Error::kOk, "a rom is queued");
+  for (const download::QueueEntry& entry : console.OnCard().entries) {
+    if (entry.rom_id == 5) {
+      c.Expect(entry.state == download::QueueState::kQueued,
+               "the stale row is `queued` on the card too");
+      c.ExpectEq(entry.bytes_done, std::int64_t{4096},
+                 "with its bytes kept, so the drain resumes rather than starts over");
+    }
+    if (entry.rom_id == 7) {
+      c.Expect(entry.state == download::QueueState::kDone,
+               "and a finished row is left exactly as it was");
+    }
+  }
+}
+
 /// M9-5 (#197): a rom queued over IPC becomes a file on the card.
 ///
 /// Before this issue `download::Drain` had no caller outside `tests/`, so the
@@ -2111,6 +2178,96 @@ int DrainPreempted(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// M9-5 (#197): a drain does not outlive the credentials it started with.
+///
+/// `RunOneDrain` copies the token and the base URL at its start and holds them
+/// for a transfer the issue's own design notes say can take an hour. `Unpair`
+/// clears `token_` and takes `token.dat` off the card -- and none of that
+/// reaches a drain already running, so before this the console went on fetching
+/// rom bodies with the credentials the user had just discarded, and writing them
+/// to the card, until the queue emptied. Repointing `[server] url` is the same
+/// gap with the old server's URL as well as its token.
+int DrainDiscarded(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+
+  rlog::Reset();
+  Throttled slow(client, std::chrono::milliseconds{1});
+
+  Console console(c, "engine-discards");
+  if (!Downloadable(console, c, base, fixture)) {
+    return c.failures();
+  }
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseCard(card.get());
+  console.engine.UseServer(&slow, std::string());
+  console.Boot();
+
+  harness::Rom rom;
+  if (!harness::FindRom(client, base, fixture, "synthetic-large.gba", &rom)) {
+    c.Expect(false, "the seeded library holds synthetic-large.gba");
+    return c.failures();
+  }
+
+  std::int32_t position = 0;
+  c.Expect(console.Enqueue(rom.id, &position) == ipc::Error::kOk, "the 120 MiB rom is queued");
+  console.engine.StartWorker();
+
+  const ipc::Status moving = Until(
+      console,
+      [](const ipc::Status& status) {
+        return status.download.state == ipc::DownloadState::kDownloading &&
+               status.download.bytes_done > 0;
+      },
+      std::chrono::seconds{120});
+  c.Expect(moving.download.state == ipc::DownloadState::kDownloading,
+           "a transfer is in flight on the token about to be discarded");
+
+  std::string response;
+  c.Expect(console.Call(ipc::Command::kUnpair, ipc::EncodeEmpty(), &response) == ipc::Error::kOk,
+           "the console is unpaired");
+  c.Expect(!console.sandbox.Exists("/config/rommsync/token.dat"),
+           "and the credentials are off the card");
+
+  // Waited for on the log rather than on a stopwatch, for `engine.preempts`'
+  // reason: `download.drain the drain was stopped` is written on
+  // `DrainOutcome::kCanceled` and on nothing else.
+  ipc::LogTail tail = console.Log();
+  const std::chrono::steady_clock::time_point deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{60};
+  bool cancelled = false;
+  while (!cancelled && std::chrono::steady_clock::now() < deadline) {
+    for (const std::string& line : tail.lines) {
+      cancelled = cancelled || line.find("the drain was stopped") != std::string::npos;
+    }
+    if (cancelled) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    tail = console.Log();
+  }
+  c.Expect(cancelled,
+           "the transfer is stopped rather than run on with a discarded token:" + Rendered(tail));
+
+  // ...and it stays stopped. An unpaired console has nothing to send, so the
+  // worker's guard refuses the next drain rather than retrying with an empty
+  // bearer token.
+  c.Expect(console.Status().auth == ipc::AuthState::kNeverPaired,
+           "the console reports itself unpaired");
+  std::this_thread::sleep_for(std::chrono::seconds{1});
+  c.Expect(console.Status().download.state != ipc::DownloadState::kDownloading,
+           "and no further transfer is started");
+  c.Expect(!console.sandbox.Exists("/tico/roms/gba/synthetic-large.gba"),
+           "so no rom fetched on discarded credentials reaches the card");
+  c.Expect(console.Status().queue_depth > 0,
+           "while the entry stays queued, for a console that pairs again");
+  return c.failures();
+}
+
 /// M9-5 (#197): a shutdown mid-transfer ends at a boundary, not at the end of a
 /// 4 GB file.
 ///
@@ -2225,6 +2382,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"drains", Drains},
       {"downloading", DrainProgress},
       {"preempts", DrainPreempted},
+      {"discards", DrainDiscarded},
       {"shutdown", DrainShutdown},
   };
   for (const RigScenario& scenario : kRigScenarios) {
@@ -2271,6 +2429,8 @@ int main(int argc, char** argv) {
     SyncNowStarts(checks);
   } else if (scenario == "unreachable") {
     Unreachable(checks);
+  } else if (scenario == "stale_active") {
+    StaleActiveOnBoot(checks);
   } else if (scenario == "log") {
     LogsMisconfiguration(checks);
   } else if (const RigScenario* rig_scenario = FindRigScenario(scenario)) {

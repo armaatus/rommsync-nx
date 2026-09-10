@@ -491,10 +491,11 @@ class Queue {
   /// turning a finished download back into a queued one.
   ///
   /// **What it costs is every other reader of the queue waiting out one small
-  /// write**, and that includes `Status()` on the frame-polled `GetStatus`
-  /// path. `queue.json` is a few kilobytes and is written at state transitions
-  /// only -- five or so per rom, never per byte -- so the collision is rare and
-  /// bounded by one `io::WriteAtomically`. It is the price of the promise
+  /// write**: `Status()` on the frame-polled `GetStatus` path, `ReportProgress`
+  /// on a transfer thread, and `pending()` on the worker deciding whether there
+  /// is anything to drain. `queue.json` is a few kilobytes and is written at
+  /// state transitions only -- five or so per rom, never per byte -- so the
+  /// collision is rare and bounded by one `io::WriteAtomically`. It is the price of the promise
   /// `ipc::Error::kWriteFailed` makes, which is that a refused change left
   /// *nothing* half-applied; there is no version-check that keeps that promise
   /// with the write outside the lock, because a rollback that declined to run
