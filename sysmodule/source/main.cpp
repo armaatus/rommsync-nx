@@ -44,6 +44,7 @@
 #include "http/http_wire.hpp"
 #include "http/ssl_http_client.hpp"
 #include "ipc/server.hpp"
+#include "power.hpp"
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/core.hpp"
 #include "rommsync/device_identity.hpp"
@@ -462,6 +463,10 @@ class SmWaiter final : public rommsync::sysmodule::boot::Waiter {
 /// init takes the count below zero.
 bool g_time_up = false;
 
+/// The same, for `pscmInitialize()` (M9-4, #208), and for the same reason: an
+/// unmatched `pscmExit` takes libnx's refcount below zero.
+bool g_psc_up = false;
+
 /// Whether the "this sm will not answer 65100" note has already been taken. One
 /// note, not one per service: it is the same answer for every question that
 /// follows, and a journal full of it would push out the note that matters.
@@ -689,6 +694,32 @@ void __appInit(void) {
     g_time_up = R_SUCCEEDED(rc);
   }
 
+  // **PSC, so this process finds out that the console is going to sleep**
+  // (M9-4, #208). Without it the transition happens around us: `fsp-srv` and the
+  // sockets are still in use when the services behind them go down, which is the
+  // pattern that crashes consoles for other projects -- and for us it is a save
+  // write cut in half, which is hard rule 2. `power.hpp` has the whole argument
+  // and the crash reports.
+  //
+  // Registered here, where every service acquisition is, and **subscribed to in
+  // `main`**: `pscmGetPmModule` needs a `power::Sink` to hand requests to, and
+  // the engine that is one does not exist until then.
+  //
+  // Not fatal, and this is the one place the choice is arguable. A console with
+  // no sleep handling is one that can lose a save, so aborting has a case -- but
+  // it would take the overlay, the settings screen and the queue down with it
+  // over a service Nintendo's own boot registers before `/atmosphere/contents`
+  // is reached at all (`psc` is what publishes `time:s`, waited for just above).
+  // So it is a `warn` in the log a user is asked to attach, and the client runs
+  // as it did before this issue.
+  if (WaitForService("psc:m")) {
+    rc = pscmInitialize();
+    if (R_FAILED(rc)) {
+      rommsync::sysmodule::boot::Note(g_boot, "rommsync: pscmInitialize", rc);
+    }
+    g_psc_up = R_SUCCEEDED(rc);
+  }
+
   // The transport, here rather than on first use, because a sysmodule does
   // everything at start: a failure here is a line in a boot log, and the same
   // failure under a user's thumb is a pairing screen that never moves. Its
@@ -775,6 +806,7 @@ void __appInit(void) {
 void __appExit(void) {
   // `nifmExit` is `NetworkExit`'s, not ours: this process opens `nifm:u` once,
   // inside `NetworkInitialize` (#195).
+  if (g_psc_up) pscmExit();
   if (g_time_up) timeExit();
   rommsync::sysmodule::NetworkExit();
   fsdevUnmountAll();
@@ -890,6 +922,20 @@ int main(int, char**) {
   engine.UseCard(g_card.get());
   engine.UseNetworkProbe(&rommsync::sysmodule::ConsoleIsOnline);
   engine.StartWorker();
+
+  // **The console can now tell this process that it is going to sleep** (M9-4,
+  // #208). After `StartWorker`, because the thing a sleep has to stop is the
+  // worker -- a subscription taken before it would answer its first request by
+  // waiting for a thread that does not exist yet.
+  //
+  // Held for the life of the process. It is never destroyed, because `main`
+  // never returns; the destructor exists for the tests, which is where the
+  // watcher's thread is actually joined.
+  const std::unique_ptr<rommsync::sysmodule::power::Subscription> psc =
+      rommsync::sysmodule::power::Subscribe(engine);
+  Log(psc != nullptr ? "rommsync: subscribed to psc:m; sleep will be handled"
+                     : "rommsync: no psc:m subscription; this console will not be told when "
+                       "it sleeps");
 
   rommsync::ipc::ServiceCore core(engine);
   rommsync::sysmodule::ServiceServer server(core, g_service_port);

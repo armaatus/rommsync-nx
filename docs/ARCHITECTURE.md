@@ -186,6 +186,71 @@ worker: GET /api/roms/{id} → resolve fs_name, platform_fs_slug, size, sha1
   → verify sha1 → move into place → report progress over IPC
 ```
 
+## Sleep and wake: the PSC contract
+
+The console suspends. Horizon tells a process so through **PSC** (`psc:m`, the
+power state controller), and a process that does not subscribe is one the
+transition happens *around*: its `fsp-srv` sessions and its sockets are still in
+use when the services behind them go down. For other projects that is a crash --
+sys-autopilot's reports were `omm` aborting with `2165-1001` beside `bsdsocket`
+aborts, on a console that hard-restarts on wake. For this one it is worse: the
+worker can be mid-`sync::Execute` when the card goes away, which is a save write
+cut in half and hard rule 2 defeated by timing.
+
+It is not an edge case reached once a week. The console wakes itself
+periodically with the display off to talk to the network, and sysmodules run in
+those windows too.
+
+```
+psc:m  --SleepReady-->  power::Watcher  --Quiesce-->  SdEngine
+                              |                          | cancel the drain
+                              |                          | cancel the tick
+                              |                          | wait: worker parked
+                              |                          | wait: no save write
+                              |<-------------------------+
+                              +--Acknowledge--> psc:m
+   ...console sleeps, and this process issues nothing at all...
+psc:m  --MinimumAwake-->  power::Watcher  --Resume-->  SdEngine
+                              +--Acknowledge--> psc:m
+```
+
+Four rules, and each of them is a different broken console:
+
+1. **Every request is acknowledged, exactly once.** PSC waits for the
+   acknowledgement before it moves the console on, so a module that does not
+   answer is a whole system frozen with no fatal and no crash report (sys-con#155
+   is exactly that, and sys-clk#85 is a console that then never wakes).
+2. **The acknowledgement goes out only once nothing is in flight** — no
+   `download::Drain`, no `sync::RunTick`, and no save write from a restore. The
+   acknowledgement *is* this process telling PSC that the card and the sockets
+   are free of it, so sending it early is the lie hard rule 2 cannot survive.
+3. **...and it goes out anyway, within `kQuiesceBudget`.** Rules 1 and 2 pull in
+   opposite directions and the budget is where they meet: three seconds, after
+   which the acknowledgement goes out with a `warn` in the log saying what was
+   still busy. Waiting longer is rule 1 broken.
+4. **Nothing is issued between `SleepReady` and the next `MinimumAwake`.** Not
+   `EssentialServicesAwake`, which says the critical services are back and
+   nothing about `fsp-srv` — Atmosphere's own `erpt` turns its filesystem access
+   back on at `MinimumAwake` and not before, and this follows it. Sockets do not
+   survive sleep at all.
+
+The wake does **not** fire a backlog. `sync::Scheduler` states its interval on
+the wall clock rather than on `steady_clock`, so an eleven-hour suspend is one
+interval elapsed and one tick, not twenty-two.
+
+The module registers with `PscPmModuleId_Fs` as its dependency, which is what
+decides *where in the order* it is told: early on the way down, late on the way
+back up, which is what a process that writes to the card needs. Its own
+`PscPmModuleId` is arbitrary — there is no registry, and third-party sysmodules
+pick unused values with nothing managing the collisions (`power_psc.cpp` says
+which one and why).
+
+The seam is `sysmodule/source/power.hpp`: `power::Module` is the platform half
+(`psc:m`, in `power_psc.cpp`, compiled only by devkitPro), `power::Sink` is what
+a transition does to this process (`SdEngine`), and `power::Watcher` is the loop
+between them. Everything but the first is host-testable, which is what `power.*`
+and `engine.sleeps` are.
+
 ## Explicitly out of scope (v1)
 
 - Multi-file / disc-set roms (`has_multiple_files`) — **detect and skip**, with

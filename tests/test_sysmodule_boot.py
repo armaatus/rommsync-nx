@@ -32,6 +32,13 @@ Four phases, one CTest entry each, so a red run names the promise that broke:
   comments  the two claims in this file that are false: that newlib exports no
             `fsync`, and -- by way of a second `nifmInitialize` -- that the
             parameters of a refcounted second init do anything at all.
+
+  psc       M9-4 (#208): the console tells a process it is going to sleep
+            through `psc:m`, and a process that never subscribes is one the
+            transition happens around -- `fsp-srv` and the sockets still in use
+            when the services behind them go down. The grant, the subscription
+            and the `fs` dependency that decides WHEN we are told, all three of
+            which are invisible to every other check here.
 """
 import argparse
 import json
@@ -59,6 +66,7 @@ SERVICE_OF_INIT = {
     "nifmInitialize": ["nifm:u"],
     "socketInitialize": ["bsd:u", "sfdnsres"],
     "sslInitialize": ["ssl"],
+    "pscmInitialize": ["psc:m"],
 }
 
 
@@ -213,6 +221,52 @@ def phase_comments(repo):
     return 0
 
 
+def phase_psc(repo):
+    """`psc:m` granted, initialised, and depended on the way a card writer must.
+
+    Three things, and each is a different console when it is missing. Without the
+    grant `pscmInitialize` fails on every boot the way `timeInitialize` did
+    before #195 -- cleanly, and with nobody looking. Without the call the module
+    is never registered and PSC never tells us anything. Without
+    `PscPmModuleId_Fs` as the dependency we are told at the wrong point in the
+    order: the dependency is what puts a module early on the way down and late on
+    the way back up, which for something that writes save files is the whole
+    point (Atmosphere's own `erpt` registers the same way).
+    """
+    failures = 0
+    if "psc:m" not in npdm(repo).get("service_access", []):
+        failures += fail(
+            "sys-rommsync.json does not grant `psc:m`; sm validates the SAC before it "
+            "looks at anything else, so pscmInitialize would fail on every boot and the "
+            "console would never tell this process it is going to sleep (#208)")
+
+    body = app_init(read(repo, "sysmodule/source/main.cpp"))
+    if not re.search(r"\bpscmInitialize\s*\(", body):
+        failures += fail(
+            "__appInit never calls pscmInitialize(); a process that does not subscribe to "
+            "PSC is one the sleep transition happens around, with fsp-srv and its sockets "
+            "still in use when the services behind them go down (#208)")
+
+    subscriber = uncommented(read(repo, "sysmodule/source/power_psc.cpp"))
+    if not re.search(r"\bpscmGetPmModule\s*\(", subscriber):
+        failures += fail("power_psc.cpp never registers a module with pscmGetPmModule (#208)")
+    if "PscPmModuleId_Fs" not in subscriber:
+        failures += fail(
+            "power_psc.cpp does not depend on PscPmModuleId_Fs. The dependency decides "
+            "where in the order a module is told: `fs` is notified early on the way down "
+            "and late on the way back up, which is what a module writing save files needs "
+            "(#208)")
+    if not re.search(r"\bpscPmModuleAcknowledge\s*\(", subscriber):
+        failures += fail(
+            "power_psc.cpp never acknowledges a request. PSC waits for one before it moves "
+            "the console on, so an unanswered request is a whole system frozen with no "
+            "fatal and no crash report (sys-con#155, #208)")
+    if failures:
+        return 1
+    print("ok: psc:m is granted, subscribed to, and depended on through fs")
+    return 0
+
+
 def read(repo, relative):
     with open(repo + "/" + relative, "r", encoding="utf-8") as handle:
         return handle.read()
@@ -227,6 +281,7 @@ PHASES = {
     "clock": phase_clock,
     "bounded": phase_bounded,
     "comments": phase_comments,
+    "psc": phase_psc,
 }
 
 

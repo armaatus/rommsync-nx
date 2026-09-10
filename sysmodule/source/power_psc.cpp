@@ -1,0 +1,193 @@
+// The Horizon half of `power::Module`: `psc:m` (M9-4, #208).
+//
+// `power.hpp` states the contract and `power.cpp` is the loop; this is the part
+// that names libnx, and the only part of the three a laptop cannot run. It is
+// compiled by devkitPro and by nothing else -- `card.cpp`'s arrangement, for
+// `card.cpp`'s reason -- so what stands behind it is `switch.builds` compiling
+// it and the static checks in `tests/test_sysmodule_boot.py` reading the grant
+// out of the npdm.
+//
+// Nothing here has ever run: it is Horizon-side and is exercised in Ryujinx
+// before the M8-1 gate, never on hardware (sysmodule/AGENTS.md).
+#include <switch.h>
+
+#include <memory>
+
+#include "power.hpp"
+#include "rommsync/log.hpp"
+
+namespace rommsync::sysmodule::power {
+namespace {
+
+/// This sysmodule's `PscPmModuleId`, and **it is arbitrary**.
+///
+/// There is no registry. The ids up to `PscPmModuleId_Spsm` (127) are
+/// Nintendo's, and every third-party sysmodule that subscribes picks an unused
+/// value out of the air: sys-con uses 126, MissionControl 0xBD, sys-autopilot
+/// 0x4150. Two of them picking the same number is possible and nothing manages
+/// it, so this is written down rather than left to be inferred.
+///
+/// 0x524D is "RM", which is what `program_id` 0x4200000000524D53 ends with
+/// (`sys-rommsync.json`). It is out of Nintendo's range and out of the three
+/// above, which is the most that can be said for any choice here.
+constexpr PscPmModuleId kModuleId = static_cast<PscPmModuleId>(0x524D);
+
+/// What this module is registered as depending on: **fs**.
+///
+/// The dependency decides *where in the order* a module is told. `fs` is
+/// notified early on the way down and late on the way back up, which is exactly
+/// what a module that writes save files to the card needs -- told before the
+/// filesystem goes, told again only once it is back. Atmosphere's own `erpt`
+/// registers the same way for the same reason
+/// (`erpt/srv/erpt_srv_service.cpp`).
+constexpr u32 kDependencies[] = {PscPmModuleId_Fs};
+
+/// The watcher's stack, out of the 768 KiB inner heap (`kInnerHeapSize`,
+/// main.cpp), and sized here rather than left to devkitA64's default -- which is
+/// the whole reason `power::Watcher` owns no thread.
+///
+/// 16 KiB for a thread that waits on an event and calls `SdEngine::Quiesce`,
+/// which itself only takes a lock and waits on a condition variable. It is the
+/// smallest term in that heap's table and it is in the table.
+constexpr size_t kWatcherStackSize = 0x4000;
+
+/// The main thread's priority (`sys-rommsync.json`), which is what this wants
+/// too: a module that answers PSC late is a console that sleeps late, and one
+/// that outranks the worker would still have to wait for it to park.
+constexpr int kWatcherPriority = 0x2C;
+
+/// `psc:m`, behind the interface `power::Watcher` drives.
+class PscModule final : public Module {
+ public:
+  ~PscModule() override {
+    // `Finalize` before `Close`: the first tells PSC this module is gone, the
+    // second drops the session. Closing without finalizing leaves PSC with a
+    // module it will keep waiting for an acknowledgement from, which is the
+    // freeze this whole file exists to avoid.
+    pscPmModuleFinalize(&module_);
+    pscPmModuleClose(&module_);
+  }
+
+  /// Register with PSC. False leaves the console exactly where it was before
+  /// this issue -- asleep-unaware -- rather than refusing to start.
+  bool Open() {
+    ueventCreate(&stop_, /*autoclear=*/false);
+    const Result rc = pscmGetPmModule(&module_, kModuleId, kDependencies,
+                                      sizeof(kDependencies) / sizeof(kDependencies[0]),
+                                      /*autoclear=*/true);
+    if (R_FAILED(rc)) {
+      log::Warn(log::Event::kBoot,
+                "rommsync: psc: this console will not be told when it goes to sleep");
+      return false;
+    }
+    return true;
+  }
+
+  bool NextRequest(State* state) override {
+    while (true) {
+      s32 signalled = -1;
+      // **Blocked on an event, never polled.** SysDVR#395 is a battery-drain and
+      // heat report caused by a sysmodule busy-waiting through sleep; a thread
+      // parked here costs nothing until PSC has something to say.
+      //
+      // Two objects rather than one, so `Stop()` can end this. Nothing on the
+      // console calls it -- `main` never leaves its service loop -- but a wait
+      // with no way out is a destructor that cannot run, and this class has one.
+      const Result rc = waitMulti(&signalled, UINT64_MAX, waiterForEvent(&module_.event),
+                                  waiterForUEvent(&stop_));
+      if (R_FAILED(rc) || signalled != 0) {
+        return false;
+      }
+      PscPmState raw = PscPmState_Awake;
+      u32 flags = 0;
+      if (R_FAILED(pscPmModuleGetRequest(&module_, &raw, &flags))) {
+        // The event fired and PSC had nothing to hand over. Nothing to
+        // acknowledge either -- an acknowledgement for a request that was never
+        // made is worse than none -- so go back to waiting.
+        continue;
+      }
+      // The values are libnx's `PscPmState` and the names on this side are
+      // Nintendo's; `power::State` carries the mapping and why libnx's is wrong
+      // for two of the six.
+      *state = static_cast<State>(raw);
+      return true;
+    }
+  }
+
+  bool Acknowledge(State state) override {
+    // **Which of the two commands this is.** `pscPmModuleAcknowledge` dispatches
+    // cmd 4 -- `AcknowledgeEx`, which carries the state -- on 5.1.0 and up, and
+    // cmd 2 below it, which does not. That is decided by `hosversionGet()`, and
+    // `__appInit` calls `hosversionSet` before anything version-gated, aborting
+    // if it cannot: an unset host version reads as 0, which would silently take
+    // the pre-5.1.0 path here, and cmd 2 on newer firmware just aborts.
+    return R_SUCCEEDED(pscPmModuleAcknowledge(&module_, static_cast<PscPmState>(state)));
+  }
+
+  void Stop() override { ueventSignal(&stop_); }
+
+ private:
+  PscPmModule module_{};
+  UEvent stop_{};
+};
+
+/// The module, the loop and the thread it runs on, kept alive together.
+class PscSubscription final : public Subscription {
+ public:
+  explicit PscSubscription(Sink& sink) : watcher_(module_, sink) {}
+
+  ~PscSubscription() override {
+    if (!started_) {
+      return;
+    }
+    module_.Stop();
+    threadWaitForExit(&thread_);
+    threadClose(&thread_);
+  }
+
+  bool Start() {
+    if (!module_.Open()) {
+      return false;
+    }
+    // A stack of this file's choosing, which is the one thing `std::thread`
+    // cannot be asked for and the reason the watcher is a plain object rather
+    // than a thread that owns itself (`kWatcherStackSize`).
+    //
+    // `cpuid` is -2, the process default, because the npdm pins this process to
+    // core 3 anyway (`sys-rommsync.json`) and naming the core in two places is
+    // one place for them to disagree.
+    Result rc = threadCreate(&thread_, &PscSubscription::Entry, this, nullptr,
+                             kWatcherStackSize, kWatcherPriority, -2);
+    if (R_SUCCEEDED(rc)) {
+      rc = threadStart(&thread_);
+      if (R_FAILED(rc)) {
+        threadClose(&thread_);
+      }
+    }
+    started_ = R_SUCCEEDED(rc);
+    if (!started_) {
+      log::Warn(log::Event::kBoot, "rommsync: psc: no thread to answer sleep requests on");
+    }
+    return started_;
+  }
+
+ private:
+  static void Entry(void* self) { static_cast<PscSubscription*>(self)->watcher_.Run(); }
+
+  PscModule module_;
+  Watcher watcher_;
+  Thread thread_{};
+  bool started_ = false;
+};
+
+}  // namespace
+
+std::unique_ptr<Subscription> Subscribe(Sink& sink) {
+  auto subscription = std::make_unique<PscSubscription>(sink);
+  if (!subscription->Start()) {
+    return nullptr;
+  }
+  return subscription;
+}
+
+}  // namespace rommsync::sysmodule::power

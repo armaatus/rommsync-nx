@@ -2322,7 +2322,7 @@ add_test(NAME boot.journal COMMAND test_boot_services journal)
 set_tests_properties(boot.resolve boot.wait boot.journal PROPERTIES TIMEOUT 60)
 
 set(SYSMODULE_BOOT_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_sysmodule_boot.py")
-foreach(scenario IN ITEMS dns clock bounded comments)
+foreach(scenario IN ITEMS dns clock bounded comments psc)
   add_test(NAME boot.${scenario}
            COMMAND ${Python3_EXECUTABLE} "${SYSMODULE_BOOT_TEST}" ${scenario}
                    --repo "${CMAKE_SOURCE_DIR}")
