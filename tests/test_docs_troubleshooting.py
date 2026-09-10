@@ -47,6 +47,12 @@ SECTIONS = [
     "The SD card is full",
     "`config.ini` complaints",
     "The server refused the sync",
+    # M9-5 (#197). Not one of #38's twelve: that issue was written when nothing
+    # in the sysmodule drained the download queue, so "a rom never arrives" had
+    # no failure mode to describe. It has one now, and `download.drain` is a tag
+    # the code writes, which the `events` phase would refuse without a section
+    # to point at.
+    "A queued rom never arrives",
     "What to attach to a bug report",
     "What this page cannot tell you yet",
 ]

@@ -97,6 +97,11 @@ SdEngine::~SdEngine() {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     stopping_ = true;
+    // The same courtesy the tick gets, for a longer wait: a 4 GB rom would
+    // otherwise hold the join for as long as it had left, and terminating a
+    // dynamic sysmodule from ovl-sysmodules is not something a user can be asked
+    // to wait out (M9-5, #197).
+    CancelDrainLocked();
   }
   // Before the join, not after it: a tick already in flight ends at its next
   // operation boundary rather than being waited out in full, which on the link
@@ -351,8 +356,8 @@ void SdEngine::AdoptConfigLocked(config::LoadResult loaded) {
   }
 }
 
-bool SdEngine::WriteQueue() {
-  return download::SaveQueue(PathTo(download::kQueueFileName), queue_).ok();
+bool SdEngine::WriteQueue(const std::vector<download::QueueEntry>& entries) const {
+  return download::SaveQueue(PathTo(download::kQueueFileName), entries).ok();
 }
 
 const config::Config& SdEngine::config() const {
@@ -630,6 +635,11 @@ bool SdEngine::RequestSync() {
     // running" for a console that is merely switched off, which is the exact
     // sentence this issue exists to remove.
     scheduler_.RequestNow();
+    // The press must not wait out a rom. The drain ends at its next boundary
+    // with its entry still queued and its `.part` on the card, the tick runs,
+    // and the next pass of the worker's loop picks the transfer back up from
+    // where it stopped (M9-5, #197).
+    CancelDrainLocked();
     taken = true;
   }
   // Outside the lock: the worker takes `mutex_` the moment it wakes.
@@ -759,18 +769,188 @@ void SdEngine::RunWorker() {
       continue;
     }
 
+    // The download queue, **last**: a due tick and a page somebody is looking at
+    // a screen waiting for both come first, and a rom is the one thing on this
+    // thread that can take an hour (M9-5, #197). Before this issue nothing here
+    // touched the queue at all, so a console downloaded nothing, ever.
+    lock.unlock();
+    const DrainStep drained = RunOneDrain();
+    lock.lock();
+    if (drained.ran) {
+      // More may be queued, and if it is, it is work to do now.
+      continue;
+    }
+
     const auto woken = [this, decided_at] { return stopping_ || wakes_ != decided_at; };
     if (woken()) {
       continue;
     }
-    if (decision.parked) {
+    if (decision.parked && drained.retry_in == kNoDownloadDeadline) {
       // No deadline at all. This is the idle cost the whole scheduler exists to
       // avoid: a switched-off or boot-only console waits to be woken by a
       // command and costs nothing in between (scheduler.hpp).
       wake_.wait(lock, woken);
+    } else if (decision.parked) {
+      wake_.wait_for(lock, drained.retry_in, woken);
     } else {
-      wake_.wait_for(lock, decision.sleep_for, woken);
+      // Whichever is sooner. A parked schedule with a drain backing off still
+      // has a deadline, and a drain with none must not stretch the tick's.
+      wake_.wait_for(lock, std::min(decision.sleep_for, drained.retry_in), woken);
     }
+  }
+}
+
+SdEngine::DrainStep SdEngine::RunOneDrain() {
+  const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+  if (now < download_due_) {
+    // Backing off from a drain that got nowhere. See `kDownloadRetryBackoff`.
+    return {false, std::chrono::duration_cast<std::chrono::milliseconds>(download_due_ - now)};
+  }
+  if (queue_.pending() == 0) {
+    // The idle case, and the cheapest thing this function can be: no
+    // configuration snapshot, no lock, one integer.
+    download_backoff_ = std::chrono::milliseconds{0};
+    return {};
+  }
+
+  const std::shared_ptr<const config::Config> config = ConfigSnapshot();
+  if (!config->downloads.enabled) {
+    // `Drain` answers `kDisabled` and opens nothing, but it would answer it on
+    // every pass of the loop. Asked here so a console with downloads switched
+    // off costs one bool -- and the queue is *not* dropped, which is what
+    // docs/CONFIG.md promises: switching it back on resumes what was there.
+    return {};
+  }
+
+  http::HttpClient* client = nullptr;
+  fs::FileSystem* files = nullptr;
+  auth::StoredToken token;
+  bool blocked = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stopping_) {
+      return {};
+    }
+    client = server_;
+    files = card_;
+    token = token_;
+    blocked = gate_.blocked();
+  }
+  if (blocked || client == nullptr || files == nullptr || token.access_token.empty() ||
+      !config->configured()) {
+    // The same five a tick gives up on, with the same answer -- nothing was
+    // written and nothing reached a server. **Silent**, unlike `RunOneTick`:
+    // that one runs once an interval and says which of them it is, while this
+    // is reached on every pass of the loop, so a line here would be the log
+    // rather than a note in it. Each is lifted by a command, and every command
+    // that lifts one wakes the worker, which is why there is no deadline.
+    return {};
+  }
+
+  const std::shared_ptr<http::CancelToken> cancel = std::make_shared<http::CancelToken>();
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stopping_) {
+      return {};
+    }
+    download_cancel_ = cancel;
+  }
+
+  download::WorkerOptions options;
+  options.base_url = config->server.url;
+  options.bearer_token = token.access_token;
+  // The path this class already writes the queue to, so the worker and the two
+  // commands never disagree about which file the queue is (`PathTo`).
+  options.queue_path = PathTo(download::kQueueFileName);
+  options.cancel = cancel.get();
+  // A backoff a shutdown can cut short. The default is a plain sleep, and a
+  // plain sleep of up to `max_backoff` is that much added to every terminate.
+  options.wait = [this](std::chrono::milliseconds delay) { AwaitBackoff(delay); };
+
+  const download::DrainResult result =
+      download::Drain(*client, *files, *config, queue_, options);
+
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Dropped rather than left standing, so a `Dequeue` between drains does not
+    // fire a token nothing is holding.
+    download_cancel_.reset();
+  }
+  // Every request the drain made went out on this console's token, so what it
+  // came back with counts towards the one verdict -- the seam a downloader that
+  // never reported would leave open, exactly as `lists::Service` did (#31).
+  ObserveAnswer(download::AnswerOf(result.outcome));
+  LogDrain(result);
+
+  switch (result.outcome) {
+    case download::DrainOutcome::kCompleted:
+    case download::DrainOutcome::kIdle:
+    case download::DrainOutcome::kCanceled:
+      // Nothing to pace. A cancel is somebody else asking for this thread, and
+      // what they asked for is the next thing round the loop.
+      download_backoff_ = std::chrono::milliseconds{0};
+      download_due_ = std::chrono::steady_clock::time_point{};
+      break;
+    case download::DrainOutcome::kDisabled:
+    case download::DrainOutcome::kRetryable:
+    case download::DrainOutcome::kUnauthorized:
+    case download::DrainOutcome::kForbidden:
+    case download::DrainOutcome::kStoreFailed:
+      download_backoff_ = download_backoff_ == std::chrono::milliseconds{0}
+                              ? kDownloadRetryBackoff
+                              : std::min(download_backoff_ * 2, kMaxDownloadRetryBackoff);
+      download_due_ = std::chrono::steady_clock::now() + download_backoff_;
+      break;
+  }
+  return {true, download_backoff_};
+}
+
+void SdEngine::AwaitBackoff(std::chrono::milliseconds delay) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  wake_.wait_for(lock, delay, [this] {
+    return stopping_ || (download_cancel_ != nullptr && download_cancel_->canceled());
+  });
+}
+
+void SdEngine::CancelDrainLocked() {
+  if (download_cancel_ != nullptr) {
+    download_cancel_->Cancel();
+  }
+}
+
+void SdEngine::LogDrain(const download::DrainResult& result) {
+  switch (result.outcome) {
+    case download::DrainOutcome::kIdle:
+    case download::DrainOutcome::kDisabled:
+      // Nothing was opened and nothing was asked. A line per pass of an idle
+      // loop is the log, not a note in it.
+      return;
+    case download::DrainOutcome::kCanceled:
+      // Somebody else wanted this thread, and the entry is still queued with
+      // its `.part`. Said at all because a user who pressed "Sync now" during a
+      // download is entitled to see why the bar stopped.
+      log::Info(log::Event::kDownload, "the drain was stopped; the queue is untouched");
+      return;
+    case download::DrainOutcome::kUnauthorized:
+    case download::DrainOutcome::kForbidden:
+      // The credentials, not the download. Same event as the tick's, because it
+      // is the same fix and the guide has one section for it.
+      log::Error(log::Event::kAuthRejected,
+                 std::string("downloads refused: ") + download::ToString(result.outcome) + "; " +
+                     result.message);
+      return;
+    case download::DrainOutcome::kCompleted:
+      log::Info(log::Event::kDownload,
+                "drain: " + std::to_string(result.downloaded) + " downloaded, " +
+                    std::to_string(result.skipped) + " skipped, " +
+                    std::to_string(result.failed) + " failed");
+      return;
+    case download::DrainOutcome::kRetryable:
+    case download::DrainOutcome::kStoreFailed:
+      log::Warn(log::Event::kDownload,
+                std::string("drain ended ") + download::ToString(result.outcome) + ": " +
+                    result.message);
+      return;
   }
 }
 
@@ -1555,11 +1735,49 @@ ipc::Error SdEngine::Unpair() {
 }
 
 ipc::Error SdEngine::Enqueue(std::int64_t rom_id, std::int32_t* position) {
-  return Commit([&] { return queue_.Enqueue(rom_id, position); });
+  if (!queue_writable()) {
+    return ipc::Error::kWriteFailed;
+  }
+  const ipc::Error answered = queue_.EnqueueAndStore(
+      rom_id, position,
+      [this](const std::vector<download::QueueEntry>& entries) { return WriteQueue(entries); });
+  if (answered == ipc::Error::kOk) {
+    // The worker, which since M9-5 (#197) has something to do with this. A
+    // console whose schedule is parked -- `interval_min = 0`, or the switch off
+    // -- waits on no deadline at all, so a rom that did not wake it would sit
+    // in the queue until some unrelated command happened along (`wakes_`).
+    Wake();
+  }
+  return answered;
 }
 
 ipc::Error SdEngine::Dequeue(std::int64_t rom_id) {
-  return Commit([&] { return queue_.Remove(rom_id); });
+  if (!queue_writable()) {
+    return ipc::Error::kWriteFailed;
+  }
+  // Asked before the row goes, because afterwards there is nothing left to ask.
+  // `download::Queue::Remove` deliberately does not interrupt the transfer in
+  // flight -- the cancel token is the caller's to fire -- and this is the
+  // caller: letting a 120 MiB body run to completion for a rom that is no
+  // longer queued is the one thing a cancel may not cost (M9-5, #197).
+  const download::QueueEntry entry = queue_.Find(rom_id);
+  const bool in_flight = entry.rom_id == rom_id &&
+                         (entry.state == download::QueueState::kActive ||
+                          entry.state == download::QueueState::kVerifying);
+  const ipc::Error answered = queue_.RemoveAndStore(
+      rom_id,
+      [this](const std::vector<download::QueueEntry>& entries) { return WriteQueue(entries); });
+  if (answered == ipc::Error::kOk && in_flight) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      CancelDrainLocked();
+    }
+    // The `.part` stays, deliberately: it is what makes queueing the same rom
+    // again a resume rather than 120 MiB fetched twice, and `Drain` salvages a
+    // staged body its digest recognises without a transfer at all.
+    Wake();
+  }
+  return answered;
 }
 
 ipc::Error SdEngine::ListBegin(const ipc::ListRequest& request, ipc::Cursor* cursor) {

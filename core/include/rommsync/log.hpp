@@ -140,6 +140,16 @@ enum class Event {
   /// is the whole of hard rule 2 (docs/SYNC_PROTOCOL.md#backups).
   kSaveFailed,
 
+  /// How one drain of the download queue ended, and what it moved (M9-5, #197).
+  ///
+  /// Its own tag rather than a sentence under `sync.tick`: a rom and a save are
+  /// two different things going wrong for a user -- "the rom never arrived" and
+  /// "my save did not sync" -- and they have different fixes. A 401 or a 403
+  /// met by a *download* is still `auth.rejected`, because that one is about
+  /// the credentials rather than about the queue and the guide answers it in
+  /// one place.
+  kDownload,
+
   /// The play-session buffer could not be written (M7-4). **Never a reason to
   /// fail a tick** -- play time is the most droppable thing in the client -- but
   /// not silent either: a `play.db` that will not write is a buffer that stops
@@ -156,7 +166,7 @@ inline constexpr std::array kAllEvents = {
     Event::kConfigDiagnostic, Event::kNoServer, Event::kNoSaveDirs,
     Event::kNetOffline,  Event::kNetTls,      Event::kScanSkipped,
     Event::kSyncRefused, Event::kSyncTick,    Event::kSaveFailed,
-    Event::kPlayFailed,
+    Event::kDownload,    Event::kPlayFailed,
 };
 
 /// Stable tag -- `net.offline`. Never null.

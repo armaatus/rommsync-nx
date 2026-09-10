@@ -102,6 +102,7 @@ and a log is not worth it. A save is never in that position; see
 | `sync.refused` | the server answered, and the answer will not change | [The server refused the sync](#the-server-refused-the-sync) |
 | `save.failed` | a save could not be written — usually a full card | [The SD card is full](#the-sd-card-is-full) |
 | `sync.tick` | how one sync ended — every tick writes one | [What to attach to a bug report](#what-to-attach-to-a-bug-report) |
+| `download.drain` | how one pass at the download queue ended — how many roms came down, and what stopped it | [A queued rom never arrives](#a-queued-rom-never-arrives) |
 | `play.failed` | play time could not be recorded — no save is at risk | [The SD card is full](#the-sd-card-is-full) |
 
 The overlay does not show the log yet. `sys-rommsync` serves it over IPC —
@@ -472,6 +473,46 @@ next time — which is why this is not `net.offline`. Three real causes:
 **The fix.** For 1 and 2, open RomM's device list and either re-enable sync for
 this console or pair it again. For 3, open `[server] url` in a browser and check
 that RomM itself answers there rather than a proxy, a portal or a redirect.
+
+---
+
+## A queued rom never arrives
+
+**Symptom.** You queued a rom from the overlay's library screen, the queue
+screen shows it waiting, and it never turns into a file.
+
+**Log line.**
+
+```
+11 info download.drain drain: 1 downloaded, 0 skipped, 0 failed
+11 warn download.drain drain ended retryable: GET /api/roms/42 answered 500
+11 info download.drain the drain was stopped; the queue is untouched
+```
+
+**What is happening.** The sysmodule drains the queue on the same thread that
+runs the sync tick, and it does it **last** — a sync that is due and a list page
+the overlay is waiting for both go first. So a rom that is not moving is usually
+one of five things, and the queue screen names which:
+
+1. **`[downloads] enabled = false`.** Nothing is opened and nothing is lost;
+   switching it back on resumes exactly what was there.
+2. **This console is not paired, has no `[server] url`, or its token was
+   revoked.** Downloads need the same credentials a sync does, and a revoked one
+   is `auth.rejected` rather than a line here.
+3. **The entry was set aside.** One rom whose own endpoint keeps answering 500
+   does not hold up the rest of the queue: it stays queued, its attempt count
+   goes up, and the drain tries again on a backoff that starts at 30 seconds and
+   doubles to 15 minutes. That is the `retryable` line above.
+4. **It is a disc set.** A multi-file rom is skipped deliberately and never
+   downloaded as a zip — the queue screen says so on the row.
+5. **Something asked for the thread.** Pressing **Sync now**, taking the rom out
+   of the queue, or terminating the sysmodule all stop the transfer where it
+   stands. The bytes already on the card are kept as a `.part`, so the next
+   attempt resumes rather than starting over — that is the `stopped` line.
+
+**The fix.** Read the row on the overlay's queue screen first; it carries the
+reason for that rom. For 3, the drain is already retrying and nothing needs
+doing. For 1 and 2, the settings and pairing screens are where both are fixed.
 
 ---
 

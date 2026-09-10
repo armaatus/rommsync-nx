@@ -15,6 +15,7 @@
 //
 //   roundtrip  -- every field survives queue.json, states and a null hash included
 //   queue      -- Enqueue/Remove/Clear/Snapshot, and the fixed IPC error set
+//   transact   -- M9-5: a change and its write are one step no thread can interleave
 //   corrupt    -- truncated, garbage, another release's format: an empty queue and a reason
 //   store      -- the write is atomic, leaves no .tmp/.old, and a failed one costs nothing
 //   bounds     -- a full queue of worst-case entries still fits the byte bound
@@ -462,6 +463,110 @@ void QueueApi(checks::Checks& c) {
 }
 
 // --- a file the card left behind ----------------------------------------------
+
+/// M9-5 (#197): a change to the queue and the write that records it are one
+/// step, and nothing can land between them.
+///
+/// Until this issue the queue had one writer at a time, and
+/// `sysmodule::SdEngine::Commit` said so in as many words: it snapshotted,
+/// changed, wrote, and on a failed write put the whole snapshot back -- correct
+/// only while nothing else touched the queue in between, and it named the
+/// download worker as the thing that would end that. The worker now runs, and
+/// it writes the queue at every state transition, so an undo that took the
+/// snapshot's word for it would carry a transition away with it and turn a
+/// finished download back into a queued one.
+///
+/// What this pins is that nothing *can* land in between: a second thread's
+/// `Update` is still waiting when the store runs, and still waiting when the
+/// rollback runs, so the change it makes is the one that stands.
+void Transact(checks::Checks& c) {
+  download::Queue queue;
+  std::int32_t position = 0;
+  c.Expect(queue.Enqueue(4, &position) == ipc::Error::kOk, "a rom is queued");
+
+  QueueEntry active = queue.Find(4);
+  active.state = QueueState::kActive;
+  active.bytes_done = 1024;
+  c.Expect(queue.Update(active), "and the worker has started on it");
+
+  // The worker's next transition, on a thread of its own -- which is where it
+  // comes from on a console.
+  std::atomic<bool> arrived{false};
+  std::atomic<bool> updated{false};
+  QueueEntry finished = active;
+  finished.state = QueueState::kDone;
+  finished.bytes_done = 4096;
+  std::thread worker([&] {
+    arrived.store(true);
+    queue.Update(finished);
+    updated.store(true);
+  });
+
+  bool landed_between = false;
+  std::size_t seen_by_store = 0;
+  const ipc::Error refused = queue.EnqueueAndStore(
+      5, &position, [&](const std::vector<QueueEntry>& entries) {
+        seen_by_store = entries.size();
+        while (!arrived.load()) {
+          std::this_thread::yield();
+        }
+        // Long enough that a thread not held out by the lock would have
+        // finished several times over.
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        landed_between = updated.load();
+        return false;  // ...and the card refuses the write.
+      });
+  worker.join();
+
+  c.ExpectEq(seen_by_store, std::size_t{2}, "the store is handed the change it is recording");
+  c.Expect(!landed_between,
+           "and no other thread's change lands between that change and the write");
+  c.Expect(refused == ipc::Error::kWriteFailed, "a write that did not happen is a named failure");
+  c.ExpectEq(queue.size(), std::size_t{1},
+             "the rom that could not be recorded is not in the queue either");
+
+  const QueueEntry after = queue.Find(4);
+  c.Expect(after.state == QueueState::kDone,
+           "and the worker's transition -- which was waiting for the lock the whole time -- is "
+           "the one that stands, rather than being undone by a rollback that never saw it");
+  c.ExpectEq(after.bytes_done, std::int64_t{4096}, "with the bytes it recorded");
+
+  // The other two, and the three answers each can give.
+  bool stored = false;
+  const auto accept = [&stored](const std::vector<QueueEntry>&) {
+    stored = true;
+    return true;
+  };
+  const auto refuse = [&stored](const std::vector<QueueEntry>&) {
+    stored = true;
+    return false;
+  };
+
+  stored = false;
+  QueueEntry missing;
+  missing.rom_id = 999;
+  c.Expect(queue.UpdateAndStore(missing, accept) == download::Queue::Committed::kGone,
+           "a transition for a row the user dequeued is `gone`");
+  c.Expect(!stored, "and is not written -- there is nothing to write");
+
+  stored = false;
+  QueueEntry moved = after;
+  moved.bytes_done = 8192;
+  c.Expect(queue.UpdateAndStore(moved, refuse) == download::Queue::Committed::kStoreFailed,
+           "a transition the card refuses is `store_failed`");
+  c.Expect(stored, "the write was attempted");
+  c.ExpectEq(queue.Find(4).bytes_done, std::int64_t{4096},
+             "and the row is exactly as it was, not half a transition ahead of the file");
+
+  stored = false;
+  c.Expect(queue.RemoveAndStore(4, refuse) == ipc::Error::kWriteFailed,
+           "a removal the card refuses is a named failure");
+  c.ExpectEq(queue.size(), std::size_t{1}, "and leaves the entry where it was");
+  c.Expect(queue.RemoveAndStore(4, accept) == ipc::Error::kOk, "the retry removes it");
+  c.ExpectEq(queue.size(), std::size_t{0}, "once");
+  c.Expect(queue.RemoveAndStore(4, accept) == ipc::Error::kNotQueued,
+           "and taking out one that is not there says so");
+}
 
 void Corrupt(checks::Checks& c) {
   const std::string good = download::SerializeQueue({Populated()});
@@ -2487,6 +2592,8 @@ int main(int argc, char** argv) {
     Roundtrip(checks);
   } else if (scenario == "queue") {
     QueueApi(checks);
+  } else if (scenario == "transact") {
+    Transact(checks);
   } else if (scenario == "corrupt") {
     Corrupt(checks);
   } else if (scenario == "store") {

@@ -2041,10 +2041,14 @@ target_compile_definitions(test_download PRIVATE
   # serving from, which is the only comparison that proves a download rather than
   # a plausible-looking file of the right length.
   ROMMSYNC_LIBRARY_DIR="${CMAKE_SOURCE_DIR}/server/testing/library")
+# M9-5 (#197): `transact` drives the queue from two threads at once, which is
+# what the compare-and-set inside `download::Queue` is for.
+target_link_libraries(test_download PRIVATE Threads::Threads)
 
 set(DOWNLOAD_UNIT_SCENARIOS
   roundtrip  # every field survives queue.json, states and a null hash included
   queue      # Enqueue/Remove/Clear/Snapshot, and the fixed IPC error set
+  transact   # M9-5: a change and its write are one step no thread can interleave
   corrupt    # truncated, garbage, another release's format: an empty queue and a reason
   store      # the write is atomic, leaves no .tmp/.old, and a failed one costs nothing
   bounds     # a full queue of worst-case entries still fits the byte bound

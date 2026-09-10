@@ -463,7 +463,109 @@ class Queue {
   /// treats it as "this entry is no longer mine" and moves on.
   bool Update(const QueueEntry& entry);
 
+  /// What a change that had to reach the card did.
+  enum class Committed {
+    kOk,           ///< the change is in memory and on the card
+    kGone,         ///< there is no such row; nothing was changed and nothing written
+    kStoreFailed,  ///< the write failed, and the queue is exactly as it was
+  };
+
+  /// The three changes that have to be **one step with the write that records
+  /// them**, because two threads now make them.
+  ///
+  /// `store` is handed the entries as they stand after the change and answers
+  /// whether they reached the card; a `false` puts the queue back exactly as it
+  /// was, `kMaxQueueEntries`-full re-queue and all -- which is why the whole
+  /// vector is kept rather than the change reversed (`Reset`).
+  ///
+  /// **The lock is held across `store`, and that is the point.** Until M9-5
+  /// (#197) the queue had one writer at a time -- `sysmodule::SdEngine::Commit`
+  /// said so in as many words and named a live download worker as the thing
+  /// that would end it. That worker now runs, so the snapshot, the change, the
+  /// write and the undo have to be uninterruptible: a `Persist` landing between
+  /// an `Enqueue`'s failed write and its rollback would be undone with it,
+  /// turning a finished download back into a queued one.
+  ///
+  /// **What it costs is every other reader of the queue waiting out one small
+  /// write**, and that includes `Status()` on the frame-polled `GetStatus`
+  /// path. `queue.json` is a few kilobytes and is written at state transitions
+  /// only -- five or so per rom, never per byte -- so the collision is rare and
+  /// bounded by one `io::WriteAtomically`. It is the price of the promise
+  /// `ipc::Error::kWriteFailed` makes, which is that a refused change left
+  /// *nothing* half-applied; there is no version-check that keeps that promise
+  /// with the write outside the lock, because a rollback that declined to run
+  /// would be exactly the half-applied state.
+  ///
+  /// `store` may not call back into this object: the lock is not recursive. It
+  /// is handed the entries for that reason, rather than being left to ask.
+  template <typename Store>
+  ipc::Error EnqueueAndStore(std::int64_t rom_id, std::int32_t* position, Store&& store) {
+    std::lock_guard<std::mutex> held(mutex_);
+    const Undo before = TakeUndoLocked();
+    const ipc::Error refused = EnqueueLocked(rom_id, position);
+    if (refused != ipc::Error::kOk) {
+      return refused;
+    }
+    if (store(Rows())) {
+      return ipc::Error::kOk;
+    }
+    RestoreLocked(before);
+    return ipc::Error::kWriteFailed;
+  }
+
+  template <typename Store>
+  ipc::Error RemoveAndStore(std::int64_t rom_id, Store&& store) {
+    std::lock_guard<std::mutex> held(mutex_);
+    const Undo before = TakeUndoLocked();
+    const ipc::Error refused = RemoveLocked(rom_id);
+    if (refused != ipc::Error::kOk) {
+      return refused;
+    }
+    if (store(Rows())) {
+      return ipc::Error::kOk;
+    }
+    RestoreLocked(before);
+    return ipc::Error::kWriteFailed;
+  }
+
+  template <typename Store>
+  Committed UpdateAndStore(const QueueEntry& entry, Store&& store) {
+    std::lock_guard<std::mutex> held(mutex_);
+    const Undo before = TakeUndoLocked();
+    if (!UpdateLocked(entry)) {
+      return Committed::kGone;
+    }
+    if (store(Rows())) {
+      return Committed::kOk;
+    }
+    RestoreLocked(before);
+    return Committed::kStoreFailed;
+  }
+
  private:
+  /// Everything a failed write has to put back -- the rows, and the two pieces
+  /// of bookkeeping that are not on them (`live_rom_id_`, `last_finished_rom_id_`).
+  struct Undo {
+    std::vector<QueueEntry> entries;
+    std::int64_t live_rom_id = 0;
+    std::int64_t live_bytes_per_second = 0;
+    std::int64_t last_finished_rom_id = 0;
+  };
+
+  /// The rows as a `store` sees them: read-only, and never a copy.
+  const std::vector<QueueEntry>& Rows() const { return entries_; }
+
+  /// The caller holds `mutex_`.
+  Undo TakeUndoLocked() const;
+  void RestoreLocked(const Undo& undo);
+
+  /// The bodies of `Enqueue`, `Remove` and `Update`, with the lock already
+  /// held, so the transactional forms above are the same code and cannot drift
+  /// from the plain ones.
+  ipc::Error EnqueueLocked(std::int64_t rom_id, std::int32_t* position);
+  ipc::Error RemoveLocked(std::int64_t rom_id);
+  bool UpdateLocked(const QueueEntry& entry);
+
   /// The caller holds `mutex_`.
   std::vector<QueueEntry>::iterator FindLocked(std::int64_t rom_id);
 
@@ -623,6 +725,14 @@ struct StoreResult {
 /// and nothing says so. An entry that cannot be written is a bug in whatever put
 /// it there, so the whole write refuses and says which bound it hit.
 StoreResult SaveQueue(const std::string& path, const Queue& queue);
+
+/// The same write, over entries a caller already holds.
+///
+/// What `Queue::EnqueueAndStore` and friends need: they hand their `store` the
+/// rows with the queue's own lock held, and a writer that took a `Queue` would
+/// ask for that lock again and deadlock. The `Queue` overload is this one with
+/// a `Snapshot()` in front.
+StoreResult SaveQueue(const std::string& path, const std::vector<QueueEntry>& entries);
 
 // --- the worker ---------------------------------------------------------------
 

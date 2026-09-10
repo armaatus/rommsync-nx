@@ -190,11 +190,14 @@ worker: GET /api/roms/{id} → resolve fs_name, platform_fs_slug, size, sha1
 
 - Multi-file / disc-set roms (`has_multiple_files`) — **detect and skip**, with
   a message the overlay can render; never download the zip.
-  `download::EnqueueRom` refuses one at the door with `ipc::Error::kMultiFile`
-  from the rom index the engine already holds, so nothing is queued and the
-  overlay can say so while the user is still looking at the rom; the worker is
-  the backstop and settles such an entry `kSkipped` with a reason rather than
-  dropping it silently.
+  **The worker is what refuses it**, and there is no refusal at the door: the
+  sysmodule's engine holds no `roms::RomIndex` — a tick fetches one and does not
+  keep it, deliberately (`sysmodule::SdEngine::Enqueue`) — so `Enqueue` records
+  the id, and the drain settles the entry `kSkipped` with a reason the queue
+  screen draws. `download::EnqueueRom` is the door-side check for a caller that
+  *does* hold an index, and answers `ipc::Error::kMultiFile` there; nothing on
+  the console calls it today. This paragraph said the opposite until M9-5 (#197)
+  wired the worker and found the two disagreeing.
 
   The reason is not effort. `GET /content` on a disc set serves a zip RomM
   builds on the fly with **no `Content-Length`**, and the rom-level `sha1_hash`
