@@ -410,15 +410,32 @@ std::vector<QueueEntry>::iterator Queue::FindLocked(std::int64_t rom_id) {
                       [rom_id](const QueueEntry& entry) { return entry.rom_id == rom_id; });
 }
 
+Queue::Undo Queue::TakeUndoLocked() const {
+  return {entries_, live_rom_id_, live_bytes_per_second_, last_finished_rom_id_};
+}
+
+void Queue::RestoreLocked(const Undo& undo) {
+  // Exactly as it was, the two off-row fields included: a rollback that put the
+  // rows back and left `live_rom_id_` pointing at a transfer the change had
+  // cleared would quote a rate against a bar that is not moving.
+  entries_ = undo.entries;
+  live_rom_id_ = undo.live_rom_id;
+  live_bytes_per_second_ = undo.live_bytes_per_second;
+  last_finished_rom_id_ = undo.last_finished_rom_id;
+}
+
 ipc::Error Queue::Enqueue(std::int64_t rom_id, std::int32_t* position) {
+  std::lock_guard<std::mutex> held(mutex_);
+  return EnqueueLocked(rom_id, position);
+}
+
+ipc::Error Queue::EnqueueLocked(std::int64_t rom_id, std::int32_t* position) {
   if (rom_id <= 0) {
     // There is no such rom, and saying so here means every caller is held to it
     // -- `EnqueueRom` checks the library, and a `sysmodule` engine that skipped
     // that check would otherwise write a `"rom_id":0` entry the reader discards.
     return ipc::Error::kUnknownRom;
   }
-  std::lock_guard<std::mutex> held(mutex_);
-
   const auto existing = FindLocked(rom_id);
   if (existing != entries_.end()) {
     if (!Terminal(existing->state)) {
@@ -455,9 +472,16 @@ ipc::Error Queue::Enqueue(std::int64_t rom_id, std::int32_t* position) {
 
 ipc::Error Queue::Remove(std::int64_t rom_id) {
   std::lock_guard<std::mutex> held(mutex_);
+  return RemoveLocked(rom_id, nullptr);
+}
+
+ipc::Error Queue::RemoveLocked(std::int64_t rom_id, QueueEntry* removed) {
   const auto found = FindLocked(rom_id);
   if (found == entries_.end()) {
     return ipc::Error::kNotQueued;
+  }
+  if (removed != nullptr) {
+    *removed = *found;
   }
   entries_.erase(found);
   if (rom_id == last_finished_rom_id_) {
@@ -653,6 +677,10 @@ QueueEntry Queue::NextPending(const std::vector<std::int64_t>& skip) const {
 
 bool Queue::Update(const QueueEntry& entry) {
   std::lock_guard<std::mutex> held(mutex_);
+  return UpdateLocked(entry);
+}
+
+bool Queue::UpdateLocked(const QueueEntry& entry) {
   const auto found = FindLocked(entry.rom_id);
   if (found == entries_.end()) {
     return false;
@@ -898,8 +926,11 @@ LoadedQueue LoadQueue(const std::string& path) {
 }
 
 StoreResult SaveQueue(const std::string& path, const Queue& queue) {
+  return SaveQueue(path, queue.Snapshot());
+}
+
+StoreResult SaveQueue(const std::string& path, const std::vector<QueueEntry>& entries) {
   StoreResult result;
-  const std::vector<QueueEntry> entries = queue.Snapshot();
 
   if (entries.size() > kMaxQueueEntries) {
     result.error = StoreError::kTooManyEntries;
@@ -1417,23 +1448,30 @@ class Drainer {
   /// file and memory never disagree by more than one `rename` -- which is what
   /// makes a power cut resumable rather than a restart.
   Written Persist(const QueueEntry& entry, Step* step) {
-    // Taken before the change, so a write that fails can be undone exactly --
-    // `SdEngine::Commit`'s scheme, and here for two reasons beyond tidiness.
-    // The invariant this module claims is that the file and memory never
-    // disagree by more than one `rename`: memory left a transition ahead would
-    // have an entry `kDone` here and `kActive` on the card, so the rom is not
-    // retried this boot and *is* re-downloaded after a reboot. And a row the
-    // writer refuses (`kUnusableEntry`) would otherwise stay in memory and make
-    // every later write fail the same way, including one for an unrelated rom.
-    std::vector<QueueEntry> before = queue_.Snapshot();
-    if (!queue_.Update(entry)) {
-      return Written::kGone;
-    }
-    const StoreResult stored = SaveQueue(options_.queue_path, queue_);
-    if (stored.ok()) {
+    // One step, undone exactly when the write fails -- `Queue::UpdateAndStore`,
+    // which holds the queue's own lock across all three parts. It is a
+    // transaction for two reasons beyond tidiness. The invariant this module
+    // claims is that the file and memory never disagree by more than one
+    // `rename`: memory left a transition ahead would have an entry `kDone` here
+    // and `kActive` on the card, so the rom is not retried this boot and *is*
+    // re-downloaded after a reboot. And a row the writer refuses
+    // (`kUnusableEntry`) would otherwise stay in memory and make every later
+    // write fail the same way, including one for an unrelated rom.
+    //
+    // Uninterruptible since M9-5 (#197), which is what put a second writer on
+    // the other side of it: the IPC thread's `Enqueue` now runs while this does.
+    StoreResult stored;
+    const Queue::Committed committed =
+        queue_.UpdateAndStore(entry, [this, &stored](const std::vector<QueueEntry>& entries) {
+          stored = SaveQueue(options_.queue_path, entries);
+          return stored.ok();
+        });
+    if (committed == Queue::Committed::kOk) {
       return Written::kOk;
     }
-    queue_.Reset(std::move(before));
+    if (committed == Queue::Committed::kGone) {
+      return Written::kGone;
+    }
     step->outcome = DrainOutcome::kStoreFailed;
     step->store = stored;
     step->message = stored.message;

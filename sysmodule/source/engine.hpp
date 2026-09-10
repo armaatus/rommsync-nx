@@ -105,6 +105,29 @@ inline constexpr const char* kSdRoot = "sdmc:";
 inline constexpr std::chrono::seconds kNetworkWaitBudget{120};
 inline constexpr std::chrono::seconds kNetworkPollInterval{2};
 
+/// How long the worker waits before trying a drain that did not get anywhere,
+/// and the ceiling that wait doubles up to (M9-5, #197).
+///
+/// A pace of its own rather than the sync schedule's, because the two are not
+/// the same kind of work: a tick is due on a clock a user set, and a drain is
+/// due whenever there is a rom in the queue. What the backoff is for is the one
+/// outcome that would otherwise spin -- `DrainOutcome::kRetryable`, an entry
+/// the drain set aside because its own endpoint answered 500. `pending()` never
+/// reaches zero for it, so a worker with no pacing would ask again on the next
+/// pass of the loop, forever.
+///
+/// Thirty seconds is short enough that a server coming back is noticed in the
+/// time it takes a user to look at the screen; fifteen minutes is long enough
+/// that a console left with a permanently-failing entry costs four requests an
+/// hour rather than a thousand.
+inline constexpr std::chrono::milliseconds kDownloadRetryBackoff{30'000};
+inline constexpr std::chrono::milliseconds kMaxDownloadRetryBackoff{900'000};
+
+/// "There is no deadline a drain is waiting for" -- nothing queued, downloads
+/// switched off, or a console a command rather than a timer has to change.
+inline constexpr std::chrono::milliseconds kNoDownloadDeadline =
+    std::chrono::milliseconds::max();
+
 /// What a pairing attempt needs that neither `core/` nor this file can supply.
 ///
 /// Both are platform facilities. `core/` may not name a transport (hard rule 4),
@@ -367,13 +390,25 @@ class SdEngine : public ipc::Engine {
   /// M3-2 (#19). Both are real: the queue is on the card and neither touches
   /// the network, which is `ipc.hpp`'s rule for every command.
   ///
-  /// **`kUnknownRom` and `kMultiFile` are not reachable from here yet**, and
-  /// that is a missing *library*, not a missing check. Both are answers only a
-  /// `roms::RomIndex` can give, and this build fetches nothing -- so an id no
-  /// rom has is queued and the worker settles it `kFailed` with a sentence
-  /// rather than silently losing it. The moment the engine holds an index, the
-  /// one call to make is `download::EnqueueRom(queue_, library, rom_id,
-  /// position)`, which produces the whole fixed error set.
+  /// **`kUnknownRom` for an id no rom can have, and `kMultiFile` never**, and
+  /// that is a missing *library* rather than a missing check. Both of the
+  /// library's refusals -- a rom the server does not hold, and a disc set --
+  /// are answers only a `roms::RomIndex` can give, and this engine holds none:
+  /// `RunOneTick` fetches one per tick and does not keep it, deliberately
+  /// (`roms::FetchRomIndex` is refetched every tick so a rom added since the
+  /// last one is not silently unmatched). So a disc set is queued and the
+  /// **worker** settles it `kSkipped` with a sentence the queue screen draws,
+  /// which is what M9-5 (#197) made true rather than theoretical -- and
+  /// docs/ARCHITECTURE.md, which said the overlay is refused at the door, was
+  /// corrected to say this instead.
+  ///
+  /// A successful `Enqueue` wakes the worker: with `[sync] interval_min = 0`
+  /// the schedule parks on no deadline at all, so a rom that did not wake it
+  /// would wait for some unrelated command (`wakes_`).
+  ///
+  /// A `Dequeue` of the entry the worker is **transferring** stops that
+  /// transfer. `download::Queue::Remove` deliberately does not -- the cancel
+  /// token is the caller's to fire -- and this is the caller.
   ipc::Error Enqueue(std::int64_t rom_id, std::int32_t* position) override;
   ipc::Error Dequeue(std::int64_t rom_id) override;
   /// M5-4 (#31). All three are `lists::Service`'s, which owns the cursors, the
@@ -448,50 +483,26 @@ class SdEngine : public ipc::Engine {
   std::shared_ptr<const config::Config> ConfigSnapshot() const;
 
  private:
-  /// Apply `change` to the queue and write the file, or leave both exactly as
-  /// they were. Shared by `Enqueue` and `Dequeue` so the rollback cannot be got
-  /// right in one and wrong in the other.
+  /// Whether a change to the queue may be written at all.
   ///
-  /// A template rather than a `std::function`, which is not style: both call
-  /// sites pass a lambda capturing more than libstdc++'s small-buffer holds, so
-  /// every enqueue would allocate on an inner heap of 512 KiB (AGENTS.md's heap
-  /// discipline). It also keeps `<functional>` out of a header the console
-  /// compiles.
+  /// False when the card had a bad moment and `queue.json` would not open, so
+  /// the queue in memory is empty and the one on the card is probably not.
+  /// Writing now would turn "empty for this boot" into the user's pending
+  /// downloads gone for good (`download::LoadedQueue::trusted`). Refusing costs
+  /// them one command and a reboot; the alternative costs them the queue.
   ///
-  /// The snapshot, the change and the restore are not one atomic step. That is
-  /// correct today -- nothing else touches `queue_`, because the download worker
-  /// is not started here yet -- and it is the thing to fix first when it is: a
-  /// failed write would otherwise `Reset` over a state transition the worker
-  /// persisted in between, turning a finished download back into a queued one.
-  /// The compare-and-set belongs inside `download::Queue` at that point.
-  template <typename Change>
-  ipc::Error Commit(Change&& change) {
-    if (!queue_trusted_) {
-      // The card had a bad moment and `queue.json` would not open, so the queue
-      // in memory is empty and the one on the card is probably not. Writing now
-      // would turn "empty for this boot" into the user's pending downloads gone
-      // for good (`download::LoadedQueue::trusted`). Refusing costs them one
-      // command and a reboot; the alternative costs them the queue.
-      return ipc::Error::kWriteFailed;
-    }
-    // The whole queue, so a failed write can be undone exactly -- see
-    // `download::Queue::Reset` for why reversing the change would not be.
-    std::vector<download::QueueEntry> before = queue_.Snapshot();
-    const ipc::Error refused = std::forward<Change>(change)();
-    if (refused != ipc::Error::kOk) {
-      return refused;
-    }
-    if (WriteQueue()) {
-      return ipc::Error::kOk;
-    }
-    // `kWriteFailed` promises the in-memory state is unchanged too, so a caller
-    // that retries is not fighting a half-applied edit (`ipc.hpp`).
-    queue_.Reset(std::move(before));
-    return ipc::Error::kWriteFailed;
-  }
+  /// The change and the write themselves are `download::Queue`'s -- see
+  /// `EnqueueAndStore`. They used to be a template here, which was correct only
+  /// while nothing else touched `queue_`; M9-5 (#197) started the download
+  /// worker that ends that, and moved the compare-and-set to where the lock is.
+  bool queue_writable() const { return queue_trusted_; }
 
-  /// Write `queue.json`. False when it did not reach the card.
-  bool WriteQueue();
+  /// Write `entries` to `queue.json`. False when they did not reach the card.
+  ///
+  /// Takes the rows rather than the queue because it is called from inside
+  /// `download::Queue`'s own lock, which a `SaveQueue(path, queue_)` would ask
+  /// for a second time.
+  bool WriteQueue(const std::vector<download::QueueEntry>& entries) const;
 
   /// One pairing attempt: the session, and the server it was started against.
   ///
@@ -544,6 +555,56 @@ class SdEngine : public ipc::Engine {
   /// it and the destructor stops it.
   void RunWorker();
 
+  /// What one pass at the download queue did, and when the next one is worth
+  /// making.
+  struct DrainStep {
+    /// True when a drain actually ran, so the loop goes round again rather than
+    /// waiting: a queue with more in it is more work, now.
+    bool ran = false;
+
+    /// How long to wait before asking again, or `kNoDownloadDeadline` when no
+    /// timer will change the answer -- an empty queue, downloads switched off,
+    /// a console with no transport, no card, no token, or a blocked gate. Each
+    /// of those is lifted by a *command*, and every command that lifts one
+    /// wakes the worker.
+    std::chrono::milliseconds retry_in = kNoDownloadDeadline;
+  };
+
+  /// Drain the download queue once, if there is anything to drain.
+  ///
+  /// **On the worker thread, and last in its loop** -- after a due tick and
+  /// after a list page somebody is waiting for. It is the one thing here that
+  /// can take an hour, and the issue that wired it (M9-5, #197) asked for it on
+  /// this thread rather than a second one: a sysmodule's heap is measured in
+  /// hundreds of kilobytes (sysmodule/AGENTS.md), one transfer is in flight at
+  /// a time by design (`download::Drain`), and a thread of its own would buy a
+  /// stack and a second set of ordering rules for no parallelism.
+  ///
+  /// **What it costs is the list pages.** A page the overlay is waiting for is
+  /// pumped between drains rather than during one, so browsing the library
+  /// while a rom comes down waits for the rom. The alternative -- cancelling
+  /// the drain for every `Wake()` -- makes a screen that pages in a loop starve
+  /// the download outright, which is worse. The three things that *do* stop a
+  /// drain are the three that cannot wait: shutdown, `SyncNow`, and a `Dequeue`
+  /// of the rom being transferred.
+  DrainStep RunOneDrain();
+
+  /// Wait out one of the drain's backoffs, cut short by a shutdown or a cancel.
+  ///
+  /// `download::WorkerOptions::wait` defaults to a plain sleep, and a plain
+  /// sleep of up to `max_backoff` is that much added to every `Shutdown`.
+  void AwaitBackoff(std::chrono::milliseconds delay);
+
+  /// Stop the drain in flight, if there is one. The caller holds `mutex_`.
+  ///
+  /// Firing the token is all it does: the drain ends at its next boundary,
+  /// leaving the entry `kQueued` beside the `.part` it got to, which is what
+  /// makes the next attempt a resume rather than a restart.
+  void CancelDrainLocked();
+
+  /// One line for a drain that is over. Nothing for one that did nothing.
+  static void LogDrain(const download::DrainResult& result);
+
   /// Wait for `network_probe_` to say yes, or for the budget to run out.
   ///
   /// Bounded rather than indefinite: a console that lives on a coffee table with
@@ -556,6 +617,23 @@ class SdEngine : public ipc::Engine {
   /// Tell the worker there is something to do. Safe from any thread; takes
   /// `mutex_` for the counter and notifies outside it.
   void Wake();
+
+  /// `Wake()`, **and the download queue is worth another look now** -- whatever
+  /// backoff the last drain earned is cleared (M9-5, #197).
+  ///
+  /// The commands that change what a drain would decide: a rom queued or taken
+  /// out of the queue, an edit to `config.ini`, a pairing committed. Without it
+  /// a console that spent its way up to `kMaxDownloadRetryBackoff` on one rom
+  /// whose endpoint keeps answering 500 would refuse a *healthy* rom queued
+  /// afterwards for the next quarter of an hour, with nothing on any screen
+  /// saying why -- and the same for switching `[downloads]` back on, and for
+  /// pairing again after a drain gave up `kUnauthorized`.
+  ///
+  /// Deliberately **not** every `Wake()`: `ListNext` wakes the worker for a
+  /// library page, and a user paging while one rom's endpoint is failing would
+  /// otherwise reset the backoff on every page and turn it into a hot retry
+  /// loop against that endpoint.
+  void WakeDownloads();
 
   /// Record a tick that did not transfer anything. The caller holds `mutex_`.
   ///
@@ -649,7 +727,7 @@ class SdEngine : public ipc::Engine {
   std::string config_dir_ = kConfigDir;
 
   /// `queue.json` was readable, so writing it back loses nothing. False only
-  /// after a read that failed on a file that is there -- see `Commit`.
+  /// after a read that failed on a file that is there -- see `queue_writable`.
   bool queue_trusted_ = true;
 
   /// The configuration in force, behind a pointer.
@@ -780,6 +858,39 @@ class SdEngine : public ipc::Engine {
   /// which is the rule that matters: a tick stops at a boundary rather than
   /// half way through the accounting call.
   http::CancelToken tick_cancel_;
+
+  /// The drain in flight, or null.
+  ///
+  /// A `shared_ptr` and a fresh one per drain because `http::CancelToken` is
+  /// one-way and neither copyable nor movable: a token that stayed cancelled
+  /// would let one `SyncNow` stop every download this console ever makes. The
+  /// worker holds its own copy for the length of the drain, so a `Dequeue`
+  /// replacing this pointer frees nothing under it -- `attempt_`'s arrangement,
+  /// for its reason.
+  ///
+  /// Guarded by `mutex_`. Three things fire it: the destructor, `RequestSync`,
+  /// and a `Dequeue` of the rom being transferred.
+  std::shared_ptr<http::CancelToken> download_cancel_;
+
+  /// When the next drain is worth making, and what the last refusal bought.
+  ///
+  /// Guarded by `mutex_`, because there are two touchers: `RunOneDrain` sets
+  /// them on the worker, and `WakeDownloads` clears them from the IPC thread
+  /// when a command arrives that changes what a drain would decide. Both are
+  /// assignments, never held across anything.
+  std::chrono::steady_clock::time_point download_due_{};
+  std::chrono::milliseconds download_backoff_{0};
+
+  /// Bumped by `WakeDownloads` alone, under `mutex_`, and compared by
+  /// `RunOneDrain` across the drain it just ran.
+  ///
+  /// It closes the window `wakes_` cannot: a command landing between a drain
+  /// ending `kRetryable` and the pacing being written for it would have its
+  /// clear overwritten a microsecond later, and the healthy rom the user had
+  /// just queued would wait out the backoff the failing one earned after all.
+  /// A counter of its own rather than `wakes_`, for `WakeDownloads`' reason --
+  /// a library page must not clear a download backoff.
+  std::uint64_t download_wakes_ = 0;
 
   /// What `Status::sync_in_progress` draws, and the same fact `RequestSync`
   /// answers false on.

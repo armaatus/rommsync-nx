@@ -393,14 +393,18 @@ class Queue {
   /// Replace the whole queue. Entries past `kMaxQueueEntries` are dropped from
   /// the tail.
   ///
-  /// Two callers, and no third: a **load**, and the **rollback** of a change
-  /// whose write failed (`sysmodule::SdEngine::Commit`). The second is here
-  /// rather than done by reversing the change because reversing is not exact --
-  /// `Enqueue` erases a terminal entry to re-queue a rom, and a `Remove` that
-  /// put the new row back would lose the `failed` row a user is entitled to
-  /// still see. Anything else that replaces the whole queue is a bug: the
-  /// queue is the user's list, and the only things that shorten it are `Remove`
-  /// and `Clear`.
+  /// One caller, and no second: a **load**. The other one it used to have --
+  /// the rollback of a change whose write failed -- is `RestoreLocked`, which
+  /// M9-5 (#197) moved in here beside the change it undoes; a rollback that
+  /// reached this method could not put back `live_rom_id_` and the rest, and
+  /// could not be atomic against the download worker either.
+  ///
+  /// A rollback replaces the whole vector rather than reversing the change,
+  /// because reversing is not exact: `Enqueue` erases a terminal entry to
+  /// re-queue a rom, and a `Remove` that put the new row back would lose the
+  /// `failed` row a user is entitled to still see. Anything else that replaces
+  /// the whole queue is a bug: the queue is the user's list, and the only
+  /// things that shorten it are `Remove` and `Clear`.
   void Reset(std::vector<QueueEntry> entries);
 
   /// Entries the worker still has to do: everything not `Terminal`. This is the
@@ -463,7 +467,120 @@ class Queue {
   /// treats it as "this entry is no longer mine" and moves on.
   bool Update(const QueueEntry& entry);
 
+  /// What a change that had to reach the card did.
+  enum class Committed {
+    kOk,           ///< the change is in memory and on the card
+    kGone,         ///< there is no such row; nothing was changed and nothing written
+    kStoreFailed,  ///< the write failed, and the queue is exactly as it was
+  };
+
+  /// The three changes that have to be **one step with the write that records
+  /// them**, because two threads now make them.
+  ///
+  /// `store` is handed the entries as they stand after the change and answers
+  /// whether they reached the card; a `false` puts the queue back exactly as it
+  /// was, `kMaxQueueEntries`-full re-queue and all -- which is why the whole
+  /// vector is kept rather than the change reversed (`Reset`).
+  ///
+  /// **The lock is held across `store`, and that is the point.** Until M9-5
+  /// (#197) the queue had one writer at a time -- `sysmodule::SdEngine::Commit`
+  /// said so in as many words and named a live download worker as the thing
+  /// that would end it. That worker now runs, so the snapshot, the change, the
+  /// write and the undo have to be uninterruptible: a `Persist` landing between
+  /// an `Enqueue`'s failed write and its rollback would be undone with it,
+  /// turning a finished download back into a queued one.
+  ///
+  /// **What it costs is every other reader of the queue waiting out one small
+  /// write**: `Status()` on the frame-polled `GetStatus` path, `ReportProgress`
+  /// on a transfer thread, and `pending()` on the worker deciding whether there
+  /// is anything to drain. `queue.json` is a few kilobytes and is written at
+  /// state transitions only -- five or so per rom, never per byte -- so the
+  /// collision is rare and bounded by one `io::WriteAtomically`. It is the price of the promise
+  /// `ipc::Error::kWriteFailed` makes, which is that a refused change left
+  /// *nothing* half-applied; there is no version-check that keeps that promise
+  /// with the write outside the lock, because a rollback that declined to run
+  /// would be exactly the half-applied state.
+  ///
+  /// `store` may not call back into this object: the lock is not recursive. It
+  /// is handed the entries for that reason, rather than being left to ask.
+  template <typename Store>
+  ipc::Error EnqueueAndStore(std::int64_t rom_id, std::int32_t* position, Store&& store) {
+    std::lock_guard<std::mutex> held(mutex_);
+    const Undo before = TakeUndoLocked();
+    const ipc::Error refused = EnqueueLocked(rom_id, position);
+    if (refused != ipc::Error::kOk) {
+      return refused;
+    }
+    if (store(Rows())) {
+      return ipc::Error::kOk;
+    }
+    RestoreLocked(before);
+    return ipc::Error::kWriteFailed;
+  }
+
+  /// `removed`, when not null, is the row as it stood the instant before it
+  /// went. It is the only way to ask "was the worker transferring this one?"
+  /// with no window between the question and the answer, and `SdEngine::Dequeue`
+  /// needs exactly that: a rom that turns `kQueued` -> `kActive` between a
+  /// separate `Find` and this call would be taken out of the queue with its
+  /// transfer left running to completion for a rom nobody wants.
+  ///
+  /// Written even when the store then fails and the row comes back, so a caller
+  /// acts on it only after `kOk`.
+  template <typename Store>
+  ipc::Error RemoveAndStore(std::int64_t rom_id, QueueEntry* removed, Store&& store) {
+    std::lock_guard<std::mutex> held(mutex_);
+    const Undo before = TakeUndoLocked();
+    const ipc::Error refused = RemoveLocked(rom_id, removed);
+    if (refused != ipc::Error::kOk) {
+      return refused;
+    }
+    if (store(Rows())) {
+      return ipc::Error::kOk;
+    }
+    RestoreLocked(before);
+    return ipc::Error::kWriteFailed;
+  }
+
+  template <typename Store>
+  Committed UpdateAndStore(const QueueEntry& entry, Store&& store) {
+    std::lock_guard<std::mutex> held(mutex_);
+    const Undo before = TakeUndoLocked();
+    if (!UpdateLocked(entry)) {
+      return Committed::kGone;
+    }
+    if (store(Rows())) {
+      return Committed::kOk;
+    }
+    RestoreLocked(before);
+    return Committed::kStoreFailed;
+  }
+
  private:
+  /// Everything a failed write has to put back -- the rows, and the three
+  /// fields of bookkeeping that are not on them (`live_rom_id_`,
+  /// `live_bytes_per_second_`, `last_finished_rom_id_`).
+  struct Undo {
+    std::vector<QueueEntry> entries;
+    std::int64_t live_rom_id = 0;
+    std::int64_t live_bytes_per_second = 0;
+    std::int64_t last_finished_rom_id = 0;
+  };
+
+  /// The rows as a `store` sees them: read-only, and never a copy.
+  const std::vector<QueueEntry>& Rows() const { return entries_; }
+
+  /// The caller holds `mutex_`.
+  Undo TakeUndoLocked() const;
+  void RestoreLocked(const Undo& undo);
+
+  /// The bodies of `Enqueue`, `Remove` and `Update`, with the lock already
+  /// held, so the transactional forms above are the same code and cannot drift
+  /// from the plain ones.
+  ipc::Error EnqueueLocked(std::int64_t rom_id, std::int32_t* position);
+  ipc::Error RemoveLocked(std::int64_t rom_id, QueueEntry* removed);
+  bool UpdateLocked(const QueueEntry& entry);
+
   /// The caller holds `mutex_`.
   std::vector<QueueEntry>::iterator FindLocked(std::int64_t rom_id);
 
@@ -534,7 +651,7 @@ struct LoadedQueue {
   /// A card having a bad moment is not: the queue on it is probably intact, and
   /// a caller that wrote an empty one over it would turn "empty for this boot"
   /// into a user's pending downloads gone for good. Such a caller must refuse to
-  /// write instead (`sysmodule::SdEngine::Commit`).
+  /// write instead (`sysmodule::SdEngine::queue_writable`).
   bool trusted = true;
 
   /// Something in the file was lost: it was there and its contents could not be
@@ -623,6 +740,14 @@ struct StoreResult {
 /// and nothing says so. An entry that cannot be written is a bug in whatever put
 /// it there, so the whole write refuses and says which bound it hit.
 StoreResult SaveQueue(const std::string& path, const Queue& queue);
+
+/// The same write, over entries a caller already holds.
+///
+/// What `Queue::EnqueueAndStore` and friends need: they hand their `store` the
+/// rows with the queue's own lock held, and a writer that took a `Queue` would
+/// ask for that lock again and deadlock. The `Queue` overload is this one with
+/// a `Snapshot()` in front.
+StoreResult SaveQueue(const std::string& path, const std::vector<QueueEntry>& entries);
 
 // --- the worker ---------------------------------------------------------------
 

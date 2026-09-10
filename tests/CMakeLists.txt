@@ -2087,10 +2087,14 @@ target_compile_definitions(test_download PRIVATE
   # serving from, which is the only comparison that proves a download rather than
   # a plausible-looking file of the right length.
   ROMMSYNC_LIBRARY_DIR="${CMAKE_SOURCE_DIR}/server/testing/library")
+# M9-5 (#197): `transact` drives the queue from two threads at once, which is
+# what the compare-and-set inside `download::Queue` is for.
+target_link_libraries(test_download PRIVATE Threads::Threads)
 
 set(DOWNLOAD_UNIT_SCENARIOS
   roundtrip  # every field survives queue.json, states and a null hash included
   queue      # Enqueue/Remove/Clear/Snapshot, and the fixed IPC error set
+  transact   # M9-5: a change and its write are one step no thread can interleave
   corrupt    # truncated, garbage, another release's format: an empty queue and a reason
   store      # the write is atomic, leaves no .tmp/.old, and a failed one costs nothing
   bounds     # a full queue of worst-case entries still fits the byte bound
@@ -2186,6 +2190,7 @@ set(ENGINE_SCENARIOS
   syncnow   # M7-2: Sync now starts a tick and says so, instead of "one is already running"
   restore_race  # M7-2: a restore pressed while a tick is writing saves is refused, not interleaved
   log       # M7-3: the misconfigurations docs/TROUBLESHOOTING.md answers, on the record
+  stale_active  # M9-5: an `active` row a power cut left is work, not a live transfer
 )
 foreach(scenario IN LISTS ENGINE_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
@@ -2227,8 +2232,22 @@ set(ENGINE_RIG_SCENARIOS
   nonblocking  # `StartPair` returns while the init is stalled: `ipc.hpp`'s contract
   repairs      # `StartPair` then `Unpair`, with neither instant leaving nothing
   log_faults   # M7-3: the four transport failures the guide documents, as the proxy makes them
+  drains       # M9-5: a rom queued over IPC becomes a file on the card
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
+  add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(engine.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  set_tests_properties(engine.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+endforeach()
+
+# M9-5 (#197)'s two. Both move the 120 MiB fixture and both have to catch the
+# worker *while it is still moving it*, which off a loopback RomM it is not for
+# long -- so both slow the transfer down from the test side rather than from the
+# engine (`Throttled`, tests/test_engine.cpp). Serial with the rest of this group
+# for the reason every rig test is: they download the shared fixture's roms.
+foreach(scenario downloading preempts discards repoints shutdown)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
   if(NOT ROMMSYNC_REQUIRE_RIG)
     set_tests_properties(engine.${scenario} PROPERTIES SKIP_RETURN_CODE 77)

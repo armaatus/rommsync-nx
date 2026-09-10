@@ -743,13 +743,17 @@ worst case the client must survive.
 ### Multi-file roms, and the three things that are not what they look like
 
 **The v1 decision: detect and skip.** A rom with `has_multiple_files` is never
-downloaded. `download::EnqueueRom` refuses it with `ipc::Error::kMultiFile` from
-the rom index the engine already holds, and the worker is the backstop for an
-entry that reached the queue anyway — it settles `kSkipped` with a sentence
-naming the disc set, so the overlay can say why nothing arrived. Verified
-against a live 5.2.0 by `harness.multifile`, `download.multifile`,
-`download.nested` and `download.nestedname`; [ARCHITECTURE.md](ARCHITECTURE.md#explicitly-out-of-scope-v1)
-records the same decision.
+downloaded. **The worker is what refuses it**, not the enqueue: the sysmodule's
+engine holds no rom index — a tick fetches one and deliberately does not keep it
+(`sysmodule::SdEngine::Enqueue`) — so the id is queued and the drain settles the
+entry `kSkipped` with a sentence naming the disc set, which is what the overlay's
+queue screen draws. `download::EnqueueRom` is the door-side refusal, answering
+`ipc::Error::kMultiFile` for a caller that *does* hold an index; nothing on the
+console is one today. This paragraph and
+[ARCHITECTURE.md](ARCHITECTURE.md#explicitly-out-of-scope-v1) both said the
+opposite until M9-5 (#197) wired the worker and found them disagreeing with the
+code. Verified against a live 5.2.0 by `harness.multifile`,
+`download.multifile`, `download.nested` and `download.nestedname`.
 
 Three things here are silent, and together they are the reason:
 

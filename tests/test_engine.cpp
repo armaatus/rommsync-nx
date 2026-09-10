@@ -39,6 +39,19 @@
 //   nonblocking -- M1-6: `StartPair` returns while the init is still in flight
 //   repairs   -- M1-6: `StartPair` then `Unpair`, with neither instant losing
 //                both the old pairing and the new attempt
+//   stale_active -- M9-5: an `active` row a power cut left behind is work, not a
+//                   transfer in flight
+//   drains    -- M9-5: a rom queued over IPC becomes a file on the card
+//   downloading -- M9-5: progress read over IPC mid-transfer, and the Dequeue
+//                  that stops it
+//   preempts  -- M9-5: a Sync now mid-transfer stops the drain rather than queuing
+//                behind it, and the rom resumes afterwards
+//   discards  -- M9-5: an Unpair mid-transfer stops it, rather than fetching on
+//                credentials the user has just discarded
+//   repoints  -- M9-5: a `[server] url` change never lets one server's token reach
+//                another
+//   shutdown  -- M9-5: the destructor ends a transfer at a boundary, keeping the
+//                `.part` the next boot resumes from
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -64,6 +77,7 @@
 #include "rommsync/ipc.hpp"
 #include "rommsync/log.hpp"
 #include "rommsync/pairing.hpp"
+#include "rommsync/sha1.hpp"
 #include "rommsync/token_store.hpp"
 
 namespace auth = rommsync::auth;
@@ -76,6 +90,7 @@ namespace ipc = rommsync::ipc;
 // Aliased `rlog` and not `log`: at global scope that name is already taken by
 // `::log`, the C library's logarithm, and GCC refuses a namespace alias that
 // redeclares it (clang accepts it, which is how this reached CI once).
+namespace crypto = rommsync::crypto;
 namespace rlog = rommsync::log;
 namespace sysmodule = rommsync::sysmodule;
 
@@ -1759,6 +1774,715 @@ void Commands(checks::Checks& c) {
            "as does SetConfig (#30)");
 }
 
+// --- M9-5 (#197): the worker drains the queue -------------------------------
+
+/// The real client, slowed to the timescale a console's Wi-Fi gives a rom.
+///
+/// The 120 MiB fixture moves off a loopback RomM in well under the 250 ms a
+/// console publishes progress on (`download::kProgressInterval`), so a transfer
+/// watched through `GetStatus` from here would be over before the first poll --
+/// which is a fact about the rig, not about the engine. `download.progress`
+/// answers it by turning the publish interval down, which is not available
+/// here: the interval is the *engine's* to choose, and a test that reached in
+/// and changed it would be pinning a number this issue is not about.
+///
+/// So the transfer is slowed instead, in the one place that holds it up without
+/// touching a line of the code under test: `http::ProgressCallback` runs on the
+/// transfer thread between reads of the socket, thousands of times per rom, and
+/// is documented as holding the transfer up for as long as it runs. A
+/// millisecond each puts 120 MiB back at a few seconds.
+class Throttled : public http::HttpClient {
+ public:
+  Throttled(http::HttpClient& inner, std::chrono::milliseconds per_callback)
+      : inner_(inner), delay_(per_callback) {}
+
+  http::Result Send(const http::Request& request) override {
+    Record(request);
+    return inner_.Send(request);
+  }
+
+  http::Result Download(const http::Request& request,
+                        const http::DownloadTarget& target) override {
+    Record(request);
+    http::DownloadTarget slowed = target;
+    slowed.progress = [this, sink = target.progress](std::uint64_t staged, std::uint64_t total) {
+      std::this_thread::sleep_for(delay_);
+      if (sink) {
+        sink(staged, total);
+      }
+    };
+    // `slowed` outlives the call: the backend borrows a pointer to its sink
+    // (`curl_http_client.cpp`), so it may not be a temporary.
+    return inner_.Download(request, slowed);
+  }
+
+  /// Every request that went out, with whether it carried a bearer token.
+  ///
+  /// Recorded here rather than asserted on a response, because what
+  /// `engine.repoints` has to pin is that a request was **never made** -- and a
+  /// request nobody made has no response to look at. Under a lock: the worker
+  /// makes them and the scenario reads them.
+  struct Sent {
+    std::string url;
+    bool authorized = false;
+  };
+
+  std::vector<Sent> sent() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return sent_;
+  }
+
+ private:
+  void Record(const http::Request& request) {
+    bool authorized = false;
+    for (const http::Header& header : request.headers) {
+      authorized = authorized || header.name == "Authorization";
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    sent_.push_back({request.url, authorized});
+  }
+
+  http::HttpClient& inner_;
+  std::chrono::milliseconds delay_;
+  mutable std::mutex mutex_;
+  std::vector<Sent> sent_;
+};
+
+
+/// A card the engine can write roms to, and the platform folders on it.
+///
+/// Creating a mapped folder is the platform layer's job and never the engine's
+/// (atomic_file.hpp), so a scenario that skipped this would be pinning the
+/// failure path for a folder that is not there rather than a download.
+std::unique_ptr<fs::FileSystem> Card(const Console& console) {
+  for (const char* folder : {"/tico/roms/nes", "/tico/roms/gba"}) {
+    console.sandbox.MakeDirs(folder);
+  }
+  return rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+}
+
+/// A console configured for the fixture RomM with the *sync tick parked*, so the
+/// only thing its worker can be doing is draining the download queue.
+///
+/// `interval_min = 0` with `on_boot = false` is `engine.syncnow`'s shape: the
+/// scheduler waits on no deadline at all, which is what makes a rom that arrives
+/// evidence about the download worker rather than about a tick that happened to
+/// run.
+bool Downloadable(Console& console, checks::Checks& c, const std::string& base,
+                  const harness::Fixture& fixture, bool sync_enabled = false) {
+  if (!console.sandbox.Write("/config/rommsync/config.ini",
+                             "[server]\nurl = " + base + "\n\n[sync]\nenabled = " +
+                                 (sync_enabled ? "true" : "false") +
+                                 "\ninterval_min = 0\non_boot = false\n")) {
+    c.Expect(false, "the console is configured for the fixture RomM");
+    return false;
+  }
+  auth::StoredToken token;
+  token.server_url = base;
+  token.access_token = fixture.token;
+  token.device_id = fixture.device_id;
+  token.scopes = {"roms.read"};
+  if (!auth::SaveToken(console.directory + auth::kTokenFileName, token).ok()) {
+    c.Expect(false, "and paired with it");
+    return false;
+  }
+  return true;
+}
+
+/// Poll `GetStatus` through the dispatch table until `done`, or give up.
+///
+/// Through the service and never off the engine's own object: what M9-5 owes the
+/// overlay is that the progress is readable **over IPC** while the worker moves,
+/// and a check that read the struct would pass with the codec broken.
+ipc::Status Until(Console& console, const std::function<bool(const ipc::Status&)>& done,
+                  std::chrono::milliseconds budget) {
+  const std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + budget;
+  ipc::Status status = console.Status();
+  while (!done(status) && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    status = console.Status();
+  }
+  return status;
+}
+
+/// M9-5 (#197): a row that says `active` on a *boot* is a row nothing is doing.
+///
+/// The state a power cut leaves in `queue.json`, and the one ovl-sysmodules'
+/// `pmshellTerminateProgram` leaves too (M6-2, #33) -- the process that was
+/// transferring is gone and the row still claims it is. Needs no server: what
+/// it pins is what `Load` makes of the card.
+void StaleActiveOnBoot(checks::Checks& c) {
+  Console console(c, "engine-stale-active");
+  // Two rows, the stale one *behind* the healthy one, which is the order that
+  // used to matter: the worker takes the first pending entry, so a `Dequeue` of
+  // the second would have cancelled the first one's transfer.
+  std::vector<download::QueueEntry> rows;
+  for (const auto& [rom_id, state] :
+       {std::pair<std::int64_t, download::QueueState>{4, download::QueueState::kQueued},
+        {5, download::QueueState::kActive},
+        {6, download::QueueState::kVerifying},
+        {7, download::QueueState::kDone}}) {
+    download::QueueEntry entry;
+    entry.rom_id = rom_id;
+    entry.state = state;
+    entry.queued_at = rom_id;
+    entry.bytes_done = state == download::QueueState::kActive ? 4096 : 0;
+    rows.push_back(std::move(entry));
+  }
+  c.Expect(console.sandbox.Write("/config/rommsync/queue.json", download::SerializeQueue(rows)),
+           "a queue a yanked card left mid-transfer");
+  console.Boot();
+
+  const ipc::Status status = console.Status();
+  c.Expect(status.download.state == ipc::DownloadState::kQueued,
+           "the console comes up with work waiting rather than drawing a transfer that is not "
+           "moving -- which is what an `active` row nothing is working on would say");
+  c.ExpectEq(status.download.rom_id, std::int64_t{4},
+             "and the entry it is about is the first one still to do");
+  c.ExpectEq(status.queue_depth, std::int64_t{3}, "three rows are still work");
+
+  // The bytes are kept: that is what makes the next drain a resume rather than
+  // 4 KiB fetched again.
+  bool resumable = false;
+  for (const download::QueueEntry& entry : console.OnCard().entries) {
+    if (entry.rom_id == 5) {
+      resumable = entry.state == download::QueueState::kQueued && entry.bytes_done == 4096;
+    }
+  }
+  c.Expect(!resumable, "nothing is written back until something changes the queue");
+
+  // ...and once something does, the normalised states are what reaches the card.
+  std::int32_t position = 0;
+  c.Expect(console.Enqueue(8, &position) == ipc::Error::kOk, "a rom is queued");
+  for (const download::QueueEntry& entry : console.OnCard().entries) {
+    if (entry.rom_id == 5) {
+      c.Expect(entry.state == download::QueueState::kQueued,
+               "the stale row is `queued` on the card too");
+      c.ExpectEq(entry.bytes_done, std::int64_t{4096},
+                 "with its bytes kept, so the drain resumes rather than starts over");
+    }
+    if (entry.rom_id == 7) {
+      c.Expect(entry.state == download::QueueState::kDone,
+               "and a finished row is left exactly as it was");
+    }
+  }
+}
+
+/// M9-5 (#197): a rom queued over IPC becomes a file on the card.
+///
+/// Before this issue `download::Drain` had no caller outside `tests/`, so the
+/// shipped sysmodule never drained its own queue and **no download happened on a
+/// console at all**. This scenario is that end to end -- `Enqueue` over
+/// `ipc::Dispatch`, the engine's own worker, the fixture RomM, and the bytes at
+/// the destination the folder map names, hashed against what the server said.
+int Drains(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+
+  Console console(c, "engine-drains");
+  if (!Downloadable(console, c, base, fixture)) {
+    return c.failures();
+  }
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseCard(card.get());
+  console.engine.UseServer(&client, std::string());
+  console.Boot();
+
+  harness::Rom rom;
+  if (!harness::FindRom(client, base, fixture, "240pee.nes", &rom)) {
+    c.Expect(false,
+             "the seeded library holds 240pee.nes -- re-seed and rescan: "
+             "./server/testing/seed.sh && ./.venv/bin/python server/testing/provision.py");
+    return c.failures();
+  }
+
+  std::int32_t position = 0;
+  c.Expect(console.Enqueue(rom.id, &position) == ipc::Error::kOk,
+           "the overlay queues the rom by id alone");
+  c.ExpectEq(console.Status().queue_depth, std::int64_t{1}, "and the status screen shows it");
+
+  console.engine.StartWorker();
+  const ipc::Status drained = Until(
+      console, [](const ipc::Status& status) { return status.queue_depth == 0; },
+      std::chrono::seconds{60});
+  c.ExpectEq(drained.queue_depth, std::int64_t{0},
+             "the console's own worker drained the queue -- which nothing in the shipped "
+             "sysmodule did before this issue");
+  c.Expect(drained.download.state == ipc::DownloadState::kIdle,
+           "and reports itself idle once there is nothing left to do");
+
+  c.Expect(console.sandbox.Exists("/tico/roms/nes/240pee.nes"),
+           "the rom is at the destination the folder map names");
+  const download::LoadedQueue on_card = console.OnCard();
+  c.ExpectEq(on_card.entries.size(), std::size_t{1},
+             "the finished entry stays on the card, for the queue screen");
+  if (on_card.entries.size() != 1) {
+    return c.failures();
+  }
+  const download::QueueEntry& entry = on_card.entries.front();
+  c.Expect(entry.state == download::QueueState::kDone, "in `done`");
+  c.ExpectEq(entry.destination, std::string("/tico/roms/nes/240pee.nes"),
+             "recording where it went, as an SD path");
+  c.Expect(!entry.sha1_hash.empty(), "with the digest the server declared");
+  c.ExpectEq(crypto::Sha1FileHex(console.sandbox.Host("/tico/roms/nes/240pee.nes")),
+             entry.sha1_hash, "and the file on the card hashes to exactly that");
+  c.Expect(!console.sandbox.Exists("/tico/roms/nes/240pee.nes.tmp.part"),
+           "no .part is left beside it");
+  c.Expect(!console.sandbox.Exists("/tico/roms/nes/240pee.nes.tmp"),
+           "nor the staging file the hash was taken over");
+
+  // The queue screen is served from the same rows, so a drained queue is one the
+  // overlay can still explain (#31).
+  const std::vector<ipc::ListItem> listed = console.QueueList();
+  c.ExpectEq(listed.size(), std::size_t{1}, "and the queue list still has a row to draw");
+  return c.failures();
+}
+
+/// M9-5 (#197): the overlay can watch a transfer move, and stop it.
+///
+/// Two things the acceptance asks for, in one 120 MiB transfer because both need
+/// one that is still going when the assertion runs: `ipc::Status::download`
+/// carrying real bytes **through the codec** while the worker is mid-file, and a
+/// `Dequeue` of the entry in flight actually ending the transfer rather than
+/// letting it run to completion for a rom nobody wants any more.
+int DrainProgress(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+
+  // A millisecond per socket read, so the transfer is still going when the
+  // assertions below run. See `Throttled`.
+  Throttled slow(client, std::chrono::milliseconds{1});
+
+  Console console(c, "engine-progress");
+  if (!Downloadable(console, c, base, fixture)) {
+    return c.failures();
+  }
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseCard(card.get());
+  console.engine.UseServer(&slow, std::string());
+  console.Boot();
+
+  harness::Rom rom;
+  if (!harness::FindRom(client, base, fixture, "synthetic-large.gba", &rom)) {
+    c.Expect(false,
+             "the seeded library holds synthetic-large.gba -- re-seed and rescan: "
+             "./server/testing/seed.sh && ./.venv/bin/python server/testing/provision.py");
+    return c.failures();
+  }
+
+  std::int32_t position = 0;
+  c.Expect(console.Enqueue(rom.id, &position) == ipc::Error::kOk, "the 120 MiB rom is queued");
+  console.engine.StartWorker();
+
+  const ipc::Status moving = Until(
+      console,
+      [](const ipc::Status& status) {
+        return status.download.state == ipc::DownloadState::kDownloading &&
+               status.download.bytes_done > 0;
+      },
+      std::chrono::seconds{120});
+  c.Expect(moving.download.state == ipc::DownloadState::kDownloading,
+           "the status screen sees a transfer in flight, over the wire rather than off the "
+           "engine's own struct");
+  c.ExpectEq(moving.download.rom_id, rom.id, "on the rom that was queued");
+  c.ExpectEq(moving.download.fs_name, std::string("synthetic-large.gba"),
+             "named by fs_name and never by path");
+  c.Expect(moving.download.bytes_done > 0, "with bytes already on the card");
+  c.ExpectEq(moving.download.bytes_total, rom.size,
+             "and the size the server declared to draw the bar against");
+  c.Expect(moving.download.bytes_done < moving.download.bytes_total,
+           "read while the transfer was still going, not after it finished");
+
+  // The user's cancel. `Dequeue` on the entry the worker is *on* has to end the
+  // transfer: letting a 120 MiB body run to completion for a rom that is no
+  // longer queued is the cost this has to not pay.
+  const std::chrono::steady_clock::time_point pressed = std::chrono::steady_clock::now();
+  c.Expect(console.Dequeue(rom.id) == ipc::Error::kOk, "the user takes it out of the queue");
+  const ipc::Status stopped = Until(
+      console,
+      [](const ipc::Status& status) {
+        return status.download.state == ipc::DownloadState::kIdle;
+      },
+      std::chrono::seconds{30});
+  const std::chrono::seconds took = std::chrono::duration_cast<std::chrono::seconds>(
+      std::chrono::steady_clock::now() - pressed);
+  c.Expect(stopped.download.state == ipc::DownloadState::kIdle,
+           std::string("and the worker stops rather than finishing the file -- took ") +
+               std::to_string(took.count()) + "s");
+  c.ExpectEq(stopped.queue_depth, std::int64_t{0}, "with nothing left in the queue");
+  c.Expect(!console.sandbox.Exists("/tico/roms/gba/synthetic-large.gba"),
+           "and no rom at the destination, because the user did not want one");
+  c.ExpectEq(console.OnCard().entries.size(), std::size_t{0},
+             "nor a row on the card for a rom nobody asked for any more");
+  return c.failures();
+}
+
+/// M9-5 (#197): "Sync now" does not wait out a 4 GB rom.
+///
+/// The other half of the interruptibility the issue asks for, and the half
+/// `engine.shutdown` does not cover: a drain and a sync tick are on the same
+/// thread by design, so a press that arrives mid-transfer has to stop the
+/// transfer rather than queue behind it. `RequestSync` fires the drain's cancel
+/// token in the same breath as `Scheduler::RequestNow`.
+///
+/// Asserted on the log rather than on a stopwatch: `download.drain the drain was
+/// stopped` is written on `DrainOutcome::kCanceled` and on nothing else, so its
+/// presence beside a tick that ran is exactly the sequence under test -- and it
+/// does not depend on the transfer still being unfinished when the assertion
+/// runs.
+int DrainPreempted(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+
+  rlog::Reset();
+  Throttled slow(client, std::chrono::milliseconds{1});
+
+  Console console(c, "engine-preempts");
+  // Sync **on** this time, and still parked -- `interval_min = 0` with no boot
+  // tick means the press is the only thing that can ever run one, which is what
+  // makes a tick that ran evidence about the press rather than about a timer.
+  if (!Downloadable(console, c, base, fixture, true)) {
+    return c.failures();
+  }
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseCard(card.get());
+  console.engine.UseServer(&slow, std::string());
+  console.Boot();
+
+  harness::Rom rom;
+  if (!harness::FindRom(client, base, fixture, "synthetic-large.gba", &rom)) {
+    c.Expect(false, "the seeded library holds synthetic-large.gba");
+    return c.failures();
+  }
+
+  std::int32_t position = 0;
+  c.Expect(console.Enqueue(rom.id, &position) == ipc::Error::kOk, "the 120 MiB rom is queued");
+  console.engine.StartWorker();
+
+  const ipc::Status moving = Until(
+      console,
+      [](const ipc::Status& status) {
+        return status.download.state == ipc::DownloadState::kDownloading &&
+               status.download.bytes_done > 0;
+      },
+      std::chrono::seconds{120});
+  c.Expect(moving.download.state == ipc::DownloadState::kDownloading,
+           "a transfer is in flight when the button is pressed");
+  c.Expect(!moving.sync_in_progress, "and no tick is running");
+
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, "Sync now is accepted");
+  const ipc::Status ticked = Until(
+      console,
+      [](const ipc::Status& status) { return status.last_sync_result != ipc::SyncResult::kNever; },
+      std::chrono::seconds{120});
+  c.Expect(ticked.last_sync_result != ipc::SyncResult::kNever,
+           "and the tick actually ran, rather than waiting for the rom to finish");
+
+  const ipc::LogTail tail = console.Log();
+  bool stopped = false;
+  for (const std::string& line : tail.lines) {
+    stopped = stopped || line.find("the drain was stopped") != std::string::npos;
+  }
+  c.Expect(stopped,
+           "because the drain was cancelled to make room for it, rather than run to the end "
+           "of a 120 MiB body:" + Rendered(tail));
+
+  // ...and the rom is not abandoned. The entry stays queued beside its `.part`,
+  // so the next pass of the worker's loop resumes it.
+  const ipc::Status after = Until(
+      console, [](const ipc::Status& status) { return status.queue_depth == 0; },
+      std::chrono::seconds{120});
+  c.ExpectEq(after.queue_depth, std::int64_t{0},
+             "the worker picks the transfer back up once the tick is done, and finishes it");
+  c.Expect(console.sandbox.Exists("/tico/roms/gba/synthetic-large.gba"),
+           "so the rom still arrives");
+  return c.failures();
+}
+
+/// M9-5 (#197): a drain does not outlive the credentials it started with.
+///
+/// `RunOneDrain` copies the token and the base URL at its start and holds them
+/// for a transfer the issue's own design notes say can take an hour. `Unpair`
+/// clears `token_` and takes `token.dat` off the card -- and none of that
+/// reaches a drain already running, so before this the console went on fetching
+/// rom bodies with the credentials the user had just discarded, and writing them
+/// to the card, until the queue emptied. Repointing `[server] url` is the same
+/// gap with the old server's URL as well as its token.
+int DrainDiscarded(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+
+  rlog::Reset();
+  Throttled slow(client, std::chrono::milliseconds{1});
+
+  Console console(c, "engine-discards");
+  if (!Downloadable(console, c, base, fixture)) {
+    return c.failures();
+  }
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseCard(card.get());
+  console.engine.UseServer(&slow, std::string());
+  console.Boot();
+
+  harness::Rom rom;
+  if (!harness::FindRom(client, base, fixture, "synthetic-large.gba", &rom)) {
+    c.Expect(false, "the seeded library holds synthetic-large.gba");
+    return c.failures();
+  }
+
+  std::int32_t position = 0;
+  c.Expect(console.Enqueue(rom.id, &position) == ipc::Error::kOk, "the 120 MiB rom is queued");
+  console.engine.StartWorker();
+
+  const ipc::Status moving = Until(
+      console,
+      [](const ipc::Status& status) {
+        return status.download.state == ipc::DownloadState::kDownloading &&
+               status.download.bytes_done > 0;
+      },
+      std::chrono::seconds{120});
+  c.Expect(moving.download.state == ipc::DownloadState::kDownloading,
+           "a transfer is in flight on the token about to be discarded");
+
+  std::string response;
+  c.Expect(console.Call(ipc::Command::kUnpair, ipc::EncodeEmpty(), &response) == ipc::Error::kOk,
+           "the console is unpaired");
+  c.Expect(!console.sandbox.Exists("/config/rommsync/token.dat"),
+           "and the credentials are off the card");
+
+  // Waited for on the log rather than on a stopwatch, for `engine.preempts`'
+  // reason: `download.drain the drain was stopped` is written on
+  // `DrainOutcome::kCanceled` and on nothing else.
+  ipc::LogTail tail = console.Log();
+  const std::chrono::steady_clock::time_point deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{60};
+  bool cancelled = false;
+  while (!cancelled && std::chrono::steady_clock::now() < deadline) {
+    for (const std::string& line : tail.lines) {
+      cancelled = cancelled || line.find("the drain was stopped") != std::string::npos;
+    }
+    if (cancelled) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    tail = console.Log();
+  }
+  c.Expect(cancelled,
+           "the transfer is stopped rather than run on with a discarded token:" + Rendered(tail));
+
+  // ...and it stays stopped. An unpaired console has nothing to send, so the
+  // worker's guard refuses the next drain rather than retrying with an empty
+  // bearer token.
+  c.Expect(console.Status().auth == ipc::AuthState::kNeverPaired,
+           "the console reports itself unpaired");
+  std::this_thread::sleep_for(std::chrono::seconds{1});
+  c.Expect(console.Status().download.state != ipc::DownloadState::kDownloading,
+           "and no further transfer is started");
+  c.Expect(!console.sandbox.Exists("/tico/roms/gba/synthetic-large.gba"),
+           "so no rom fetched on discarded credentials reaches the card");
+  c.Expect(console.Status().queue_depth > 0,
+           "while the entry stays queued, for a console that pairs again");
+  return c.failures();
+}
+
+/// M9-5 (#197): a drain never carries one server's token to another.
+///
+/// `ApplyConfigEdit` calls this "a bearer token pointed at a stranger" and takes
+/// the credential off the card *before* the write for exactly that reason. It
+/// had two holes, and the drain is what made both reachable.
+///
+/// The card was cleared and **memory was not**: `token_` and `list_token_` still
+/// held the previous server's token, so the next tick -- and, since M9-5, the
+/// next drain -- would have sent it to the new host. And a discard landing in the
+/// window before a starting drain registered its cancel token found nothing to
+/// fire, so the drain ran on credentials that were already gone.
+///
+/// What is asserted is a request that was never made, which is why the client
+/// records rather than the test reading a response: a request nobody made has no
+/// response to look at.
+int DrainRepointed(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+
+  rlog::Reset();
+  Throttled slow(client, std::chrono::milliseconds{1});
+
+  Console console(c, "engine-repoints");
+  if (!Downloadable(console, c, base, fixture)) {
+    return c.failures();
+  }
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseCard(card.get());
+  console.engine.UseServer(&slow, std::string());
+  console.Boot();
+
+  harness::Rom rom;
+  if (!harness::FindRom(client, base, fixture, "synthetic-large.gba", &rom)) {
+    c.Expect(false, "the seeded library holds synthetic-large.gba");
+    return c.failures();
+  }
+
+  std::int32_t position = 0;
+  c.Expect(console.Enqueue(rom.id, &position) == ipc::Error::kOk, "the 120 MiB rom is queued");
+  console.engine.StartWorker();
+
+  const ipc::Status moving = Until(
+      console,
+      [](const ipc::Status& status) {
+        return status.download.state == ipc::DownloadState::kDownloading &&
+               status.download.bytes_done > 0;
+      },
+      std::chrono::seconds{120});
+  c.Expect(moving.download.state == ipc::DownloadState::kDownloading,
+           "a transfer is in flight against the server about to be replaced");
+
+  const std::string elsewhere = "https://elsewhere.example.com";
+  c.Expect(console.Set(Edit("server", "url", elsewhere)).outcome == ipc::WriteOutcome::kApplied,
+           "the console is repointed at another server");
+  c.Expect(console.Status().auth == ipc::AuthState::kNeverPaired,
+           "which discards the pairing, as it always has");
+
+  // The drain is cancelled, and every drain after it is refused by the guard --
+  // the console holds no token to send anywhere now.
+  std::this_thread::sleep_for(std::chrono::seconds{2});
+  const std::vector<Throttled::Sent> sent = slow.sent();
+  int to_the_stranger = 0;
+  int authorized_to_the_stranger = 0;
+  for (const Throttled::Sent& request : sent) {
+    if (request.url.rfind(elsewhere, 0) == 0) {
+      ++to_the_stranger;
+      authorized_to_the_stranger += request.authorized ? 1 : 0;
+    }
+  }
+  c.ExpectEq(authorized_to_the_stranger, 0,
+             "no request carrying this console's bearer token reached the new server");
+  c.ExpectEq(to_the_stranger, 0, "nor any request at all, because there is nothing to send");
+  c.Expect(sent.size() > 0, "and the recording client was actually the one in use");
+
+  c.Expect(!console.sandbox.Exists("/tico/roms/gba/synthetic-large.gba"),
+           "the rom did not arrive on credentials the console no longer holds");
+  c.Expect(console.Status().queue_depth > 0,
+           "and stays queued, for a console that pairs with the new server");
+  return c.failures();
+}
+
+/// M9-5 (#197): a shutdown mid-transfer ends at a boundary, not at the end of a
+/// 4 GB file.
+///
+/// The engine's destructor already cancels a sync tick in flight; a download
+/// worker on the same thread has to answer the same way, or terminating the
+/// sysmodule from ovl-sysmodules would hang for as long as the rom had left.
+/// What survives is the `.part`, which is what makes the next boot resume rather
+/// than restart (`download::Drain`).
+int DrainShutdown(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+
+  harness::Sandbox sandbox(c, "engine-shutdown");
+  const std::string directory = sandbox.Host(harness::kConfigDir) + "/";
+  c.Expect(sandbox.Write("/config/rommsync/config.ini",
+                         "[server]\nurl = " + base +
+                             "\n\n[sync]\nenabled = false\ninterval_min = 0\non_boot = false\n"),
+           "a configured console with its sync tick parked");
+  sandbox.MakeDirs("/tico/roms/gba");
+  auth::StoredToken token;
+  token.server_url = base;
+  token.access_token = fixture.token;
+  token.device_id = fixture.device_id;
+  token.scopes = {"roms.read"};
+  c.Expect(auth::SaveToken(directory + auth::kTokenFileName, token).ok(), "and paired with it");
+
+  harness::Rom rom;
+  if (!harness::FindRom(client, base, fixture, "synthetic-large.gba", &rom)) {
+    c.Expect(false, "the seeded library holds synthetic-large.gba");
+    return c.failures();
+  }
+
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  Throttled slow(client, std::chrono::milliseconds{1});
+  std::chrono::milliseconds tore_down{0};
+  {
+    // The engine behind a pointer, so it can be destroyed -- which is the only
+    // way to stop its worker -- while the card it wrote to is still here to look
+    // at afterwards.
+    auto engine = std::make_unique<sysmodule::SdEngine>();
+    engine->UseCard(card.get());
+    engine->UseServer(&slow, std::string());
+    engine->Load(directory);
+    auto core = std::make_unique<ipc::ServiceCore>(*engine);
+
+    std::string response;
+    c.Expect(ipc::Dispatch(*core, static_cast<std::uint32_t>(ipc::Command::kEnqueue),
+                           ipc::EncodeRomId(rom.id), &response) == ipc::Error::kOk,
+             "the 120 MiB rom is queued");
+    engine->StartWorker();
+
+    const std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds{120};
+    ipc::DownloadSnapshot snapshot;
+    while (std::chrono::steady_clock::now() < deadline) {
+      ipc::Dispatch(*core, static_cast<std::uint32_t>(ipc::Command::kGetStatus),
+                    ipc::EncodeEmpty(), &response);
+      snapshot = ipc::DecodeStatus(response).value.download;
+      if (snapshot.state == ipc::DownloadState::kDownloading && snapshot.bytes_done > 0) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    }
+    c.Expect(snapshot.state == ipc::DownloadState::kDownloading,
+             "and the worker is mid-transfer when the process is asked to go away");
+
+    // The service goes first: it holds a reference to the engine.
+    core.reset();
+    const std::chrono::steady_clock::time_point stopping = std::chrono::steady_clock::now();
+    engine.reset();
+    tore_down = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - stopping);
+  }
+  c.Expect(tore_down < std::chrono::seconds{15},
+           std::string("the engine shut down at an operation boundary rather than waiting the "
+                       "transfer out -- took ") +
+               std::to_string(tore_down.count()) + "ms");
+
+  c.Expect(!sandbox.Exists("/tico/roms/gba/synthetic-large.gba"),
+           "nothing reached the destination, because the transfer never finished");
+  c.Expect(sandbox.Exists("/tico/roms/gba/synthetic-large.gba.tmp.part"),
+           "and the bytes that did arrive are kept, so the next boot resumes rather than "
+           "starts over");
+  const download::LoadedQueue on_card = download::LoadQueue(directory + download::kQueueFileName);
+  c.ExpectEq(on_card.entries.size(), std::size_t{1}, "the entry is still on the card");
+  if (on_card.entries.size() == 1) {
+    c.Expect(!download::Terminal(on_card.entries.front().state),
+             "and still something to do, rather than a rom recorded as finished");
+  }
+  return c.failures();
+}
+
 /// The scenarios that need the docker RomM, by name. A table rather than a
 /// second `if` chain, so the list of them is written down once.
 struct RigScenario {
@@ -1773,6 +2497,12 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"nonblocking", NonBlocking},
       {"repairs", Repairs},
       {"log_faults", LogsTransportFailures},
+      {"drains", Drains},
+      {"downloading", DrainProgress},
+      {"preempts", DrainPreempted},
+      {"discards", DrainDiscarded},
+      {"repoints", DrainRepointed},
+      {"shutdown", DrainShutdown},
   };
   for (const RigScenario& scenario : kRigScenarios) {
     if (name == scenario.name) {
@@ -1818,6 +2548,8 @@ int main(int argc, char** argv) {
     SyncNowStarts(checks);
   } else if (scenario == "unreachable") {
     Unreachable(checks);
+  } else if (scenario == "stale_active") {
+    StaleActiveOnBoot(checks);
   } else if (scenario == "log") {
     LogsMisconfiguration(checks);
   } else if (const RigScenario* rig_scenario = FindRigScenario(scenario)) {

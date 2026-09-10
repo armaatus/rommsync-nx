@@ -594,8 +594,13 @@ void Cursors(checks::Checks& c) {
 /// The `queue` kind: served off the card, and never over the network.
 void QueueList(checks::Checks& c) {
   Console console(c, "lists-queue");
+  // `active` and `verifying` are deliberately not here: a queue.json claiming
+  // one is a row the process that was transferring left behind, and
+  // `SdEngine::Load` puts it back to `queued` (M9-5, #197, `engine.stale_active`).
+  // The two states a *running* worker produces are projected below, off a live
+  // queue, which is the only way the overlay ever meets them.
   const std::vector<download::QueueEntry> entries = {
-      Entry(11, "Alpha.gba", download::QueueState::kActive),
+      Entry(11, "Alpha.gba", download::QueueState::kQueued),
       Entry(12, "Beta.gba", download::QueueState::kQueued),
       Entry(13, "Gamma.gba", download::QueueState::kFailed, "the server answered 404"),
       Entry(14, "Delta.gba", download::QueueState::kDone),
@@ -642,6 +647,37 @@ void QueueList(checks::Checks& c) {
                  "attempts" + where);
       c.ExpectEq(Text(item, keys::kQueueMessage), entry.message, "message" + where);
       c.ExpectEq(item.fields.size(), std::size_t{9}, "and nothing else" + where);
+    }
+  }
+
+  // The other half of the projection: the two states a transfer in flight is in.
+  // Off `lists::Service` and a live `download::Queue` rather than off a card,
+  // because a boot cannot hold either -- which is the whole of what
+  // `engine.stale_active` pins, and would make a card fixture assert the
+  // opposite of it.
+  {
+    config::Config configuration = config::Defaults();
+    download::Queue live;
+    live.Reset({Entry(31, "Zeta.gba", download::QueueState::kActive),
+                Entry(32, "Eta.gba", download::QueueState::kVerifying)});
+    lists::Service service(lists::Service::FixedConfig(configuration), live);
+    ipc::ListRequest moving;
+    moving.kind = ipc::ListKind::kQueue;
+    moving.page_size = ipc::kMaxPageSize;
+    ipc::Cursor cursor = 0;
+    ipc::ListPage in_flight;
+    c.ExpectEq(static_cast<int>(service.ListBegin(moving, &cursor)),
+               static_cast<int>(ipc::Error::kOk), "a cursor opens on a queue being worked");
+    c.ExpectEq(static_cast<int>(service.ListNext(cursor, &in_flight)),
+               static_cast<int>(ipc::Error::kOk), "and pages");
+    service.ListEnd(cursor);
+    c.ExpectEq(in_flight.items.size(), std::size_t{2}, "both rows arrive");
+    if (in_flight.items.size() == 2) {
+      c.ExpectEq(Text(in_flight.items[0], keys::kQueueState), std::string("active"),
+                 "a transfer in flight draws as `active`");
+      c.ExpectEq(Text(in_flight.items[1], keys::kQueueState), std::string("verifying"),
+                 "and one being hashed as `verifying` -- a bar at 100% would be the wrong "
+                 "sentence for it");
     }
   }
 
