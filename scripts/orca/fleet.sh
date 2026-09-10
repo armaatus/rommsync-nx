@@ -411,7 +411,7 @@ backfill_foundation_markers() {
 # shared header are exactly the ones whose `Blocked by` lines nobody has written
 # yet. A dependency-aware gate would trust the thing the rule says not to trust.
 foundation_hold() {
-  local labels="$2" list="$3"
+  local labels="$1" list="$2"
   local live_n; live_n="$(printf '%s\n' "$list" | grep -c . || true)"
   [ "$live_n" -gt 0 ] || return 1
   if is_foundation "$labels"; then
@@ -2166,7 +2166,7 @@ while that one is up."
       # `fleet.sh run 196 197` got no explanation for why the second never
       # started.
       local hold
-      if hold="$(foundation_hold "$picked" "$labels" "$live_list")"; then
+      if hold="$(foundation_hold "$labels" "$live_list")"; then
         local notice; notice="$(foundation_wait_notice "$picked" "$hold")" \
           && say "$notice"
         break

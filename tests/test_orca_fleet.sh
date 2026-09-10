@@ -589,7 +589,7 @@ STUB
 # inlined the pair as a quoted `eval` string seven times was harder to read than
 # either.
 hold_notice() {
-  in_fleet eval "foundation_wait_notice $1 \"\$(foundation_hold $1 '$2' \"\$(live_worktrees)\")\""
+  in_fleet eval "foundation_wait_notice $1 \"\$(foundation_hold '$2' \"\$(live_worktrees)\")\""
 }
 
 worktree_list() {
@@ -1112,8 +1112,8 @@ case "${1:-}" in
   foundation_foreign)
     make_fixture ok
     # A foundation issue lands alone, so the dispatcher holds it until `live`
-    # reaches 0 (the gate is `is_foundation && [ "$live" -gt 0 ]`). With the
-    # count unscoped that never happened: a worktree on another repo held every
+    # reaches 0 -- `foundation_hold` is where that is decided. With the count
+    # unscoped that never happened: a worktree on another repo held every
     # foundation issue forever, because nothing this fleet does can close one.
     #
     # This asserts the gate's two inputs rather than driving `cmd_run`. A
@@ -1136,9 +1136,10 @@ JSON
     labels="$(awk -F'\t' '$1 == 196 { print $3 }' <<<"$out")"
     in_fleet has_label "$labels" foundation \
       || fail "the fixture issue is not labelled foundation, so this phase asserts the wrong gate: [$labels]"
-    # ...and the gate itself, as the dispatcher asks it -- one predicate, so
-    # this phase cannot drift into asserting a spelling the code has dropped.
-    in_fleet foundation_hold 196 "$labels" "$(in_fleet live_worktrees)" >/dev/null \
+    # ...and the gate itself, asked the way the dispatcher asks it -- through
+    # the one predicate, so this phase cannot drift into asserting a spelling
+    # the code has dropped.
+    in_fleet foundation_hold "$labels" "$(in_fleet live_worktrees)" >/dev/null \
       && fail "the gate is still shut with only another repo's worktree open"
     in_fleet eval "is_foundation '$labels'" \
       || fail "is_foundation did not fire on the fixture's labels, so the gate above proves nothing: [$labels]"
@@ -1205,7 +1206,7 @@ JSON
     mkdir -p "$ROMMSYNC_FLEET_DIR"
     : >"$ROMMSYNC_FLEET_DIR/foundation-196"
     worktree_list "196:wt"
-    hold="$(in_fleet foundation_hold 197 ready "$(in_fleet live_worktrees)")" \
+    hold="$(in_fleet foundation_hold ready "$(in_fleet live_worktrees)")" \
       || fail "an ordinary issue was cleared to start beside a running foundation issue"
     grep -q "#196" <<<"$hold" \
       || fail "the hold does not name the foundation issue holding it: $hold"
@@ -1214,13 +1215,13 @@ JSON
     [ -e "$ROMMSYNC_FLEET_DIR/foundation-42" ] \
       || fail "could not arm the marker, so the hold below would prove nothing"
     worktree_list "42:wt"
-    in_fleet foundation_hold 196 ready,foundation "$(in_fleet live_worktrees)" >/dev/null \
+    in_fleet foundation_hold ready,foundation "$(in_fleet live_worktrees)" >/dev/null \
       || fail "a foundation issue was cleared to start while something else was running"
     # An empty fleet holds nothing, in either direction.
     worktree_list
-    in_fleet foundation_hold 196 ready,foundation "$(in_fleet live_worktrees)" >/dev/null \
+    in_fleet foundation_hold ready,foundation "$(in_fleet live_worktrees)" >/dev/null \
       && fail "it held a foundation issue with nothing running"
-    in_fleet foundation_hold 197 ready "$(in_fleet live_worktrees)" >/dev/null \
+    in_fleet foundation_hold ready "$(in_fleet live_worktrees)" >/dev/null \
       && fail "it held an ordinary issue with nothing running"
     echo "ok: a foundation issue lands alone, in both directions"
     ;;
@@ -1277,7 +1278,7 @@ JSON
     [ -e "$ROMMSYNC_FLEET_DIR/foundation-196" ] \
       && fail "the marker outlived the worktree, so nothing may ever start again"
     worktree_list "196:wt"
-    in_fleet foundation_hold 197 ready "$(in_fleet live_worktrees)" >/dev/null \
+    in_fleet foundation_hold ready "$(in_fleet live_worktrees)" >/dev/null \
       && fail "a stale-free fleet still held an ordinary issue"
     echo "ok: the foundation marker does not outlive its worktree"
     ;;
