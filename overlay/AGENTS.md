@@ -46,22 +46,31 @@ Ultrahand overlay list.
   fonts come from `pl:u` and Nintendo's are not redistributable, so a substitute
   TTF changes every wrap and centring and a snapshot would pin our own output
   rather than the console's (docs/TESTING.md, "The overlay, precisely").
-  A new screen puts its layout behind a `DrawList` too. One that draws through
-  `tsl::gfx::Renderer` directly has left the reach of every test.
+  A new screen puts its layout behind a `DrawList` too, in a `<thing>_paint.*`
+  beside its `<thing>_screen.*`, and adds it to `test_overlay_native`'s sources
+  and to `overlay.portable`'s list. One that draws through `tsl::gfx::Renderer`
+  directly has left the reach of every test.
 - **The parts of this directory that need no renderer are compiled and run on a
   host.** `source/card_probe.cpp`, `source/ipc_client.cpp`,
   `source/screen_frame.cpp` and `source/status_paint.cpp` are built into
   `test_overlay_native` and driven against the real `ipc::Dispatch` and the real
   `sysmodule::ToResult` — so a payload the two halves disagree about is a red
   test rather than a first-boot surprise. libnx comes from
-  `tests/hostswitch/switch.h`, which stubs the twelve symbols `ipc_client.cpp`
-  names **and nothing else**: a file that needs a thirteenth is either one that
-  does not belong on this seam, or a sign the seam has moved. Say which here
-  rather than growing the stub.
+  `tests/hostswitch/switch.h`, which stubs **only** what those four files name,
+  plus the one thing the seam itself has to model — a session whose sysmodule
+  exited. A file that needs it to grow is either one that does not belong on
+  this seam, or a sign the seam has moved. Say which here rather than reaching
+  for the stub: the value of that header is that it is small enough to read.
 - **Keep `source/screen_frame.hpp` free of `tesla.hpp`.** It is what lets the
   handshake and the *not running* / *unreachable* decision run under
-  `ctest -R overlay.version` and `overlay.errors`. Colours live in
-  `source/palette.hpp`, which every screen that draws includes directly.
+  `ctest -R overlay.version` and `overlay.errors`, and it is what will let the
+  *next* screen's painter run at all. Colours live in `source/palette.hpp`,
+  which every screen that draws includes directly, and the button glyphs in
+  `source/prompts.hpp`. `ctest -R overlay.portable` greps the whole portable
+  half of this directory for `tesla.hpp`, `tsl::`, `libultrahand` and
+  `arm_neon` rather than leaving it reviewed -- a `tesla.hpp` that crept back
+  into `screen_frame.hpp` would take a new painter out of every test's reach
+  without breaking any target that exists today.
 - Flat files in `core/src/` only. CMake globs recursively; `switch.mk` uses a
   non-recursive wildcard, so a `core/src/overlay/` would build on the host and
   silently vanish from the Switch build.

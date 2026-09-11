@@ -4,7 +4,7 @@
 // Split out of `screen_frame.hpp` by M9-7 (#198). The rest of that header -- the
 // session handshake and the "not running" / "unreachable" decision -- names no
 // libultrahand type and now compiles on a host, which is what lets
-// `ctest -R overlay.link` assert a version mismatch end to end. A screen that
+// `ctest -R 'overlay.(version|errors)'` assert a version mismatch end to end. A screen that
 // needs a colour includes this; a screen that only needs the handshake does not.
 #pragma once
 
@@ -29,7 +29,12 @@ tsl::Color ColorFor(Tone tone);
 tsl::Color MutedColor();
 
 /// Every colour a frame is drawn in, as the raw RGBA4444 words a `DrawList`
-/// speaks (`draw_list.hpp`).
+/// speaks.
+///
+/// The type is `draw_list.hpp`'s rather than this file's, and has to be: a
+/// painter takes a `Palette` and must not include a header that names
+/// `tsl::Color`. This file is where one is *filled in*, which is the half that
+/// needs libultrahand.
 ///
 /// Resolved once at the top of a frame rather than per row: `Renderer::a` folds
 /// in the fade-animation alpha, so each of these answers differently on every

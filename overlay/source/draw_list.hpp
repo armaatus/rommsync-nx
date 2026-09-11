@@ -1,5 +1,5 @@
-// The half of drawing that needs no renderer: the primitives a screen asks for,
-// the palette it asks for them in, and the button prompts it labels them with.
+// The half of drawing that needs no renderer: the primitives a screen asks for
+// and the palette it asks for them in.
 //
 // M9-7 (#198). Until this existed a screen's layout was `tsl::gfx::Renderer`
 // calls inline in its `Draw`, and `tsl::gfx::Renderer` is `final` with
@@ -15,9 +15,10 @@
 // layout, and layout is what this makes testable.
 //
 // **Nothing here may name a libnx or libultrahand type.** That is the whole
-// point: a `DrawList` compiles on a host. Colours arrive as the 16-bit RGBA4444
-// word libtesla stores, resolved from the user's theme by the one file that is
-// allowed to know about themes (`screen_frame.hpp`).
+// point: a `DrawList` compiles on a host, and `ctest -R overlay.portable` greps
+// this file and its neighbours to keep it that way. Colours arrive as the
+// 16-bit RGBA4444 word libtesla stores, resolved from the user's theme by the
+// one file that is allowed to know about themes (`palette.hpp`).
 #pragma once
 
 #include <cstdint>
@@ -112,29 +113,5 @@ class DrawList {
   virtual void Rect(std::int32_t x, std::int32_t y, std::int32_t width, std::int32_t height,
                     Rgba4444 color) = 0;
 };
-
-/// The button glyphs libtesla draws from the Switch's own font.
-///
-/// Here rather than in each screen: they were written out in `sync_screen.cpp`,
-/// `library_screen.cpp` and `pairing_screen.cpp` before `screen_frame.hpp`
-/// existed, and a private-use codepoint typed from memory in four places is
-/// four chances to get one wrong. In *this* header rather than that one because
-/// a prompt is text a layout draws, and a layout gets everything it needs from
-/// here. Every screen still reaches them through `screen_frame.hpp`, which
-/// includes this file.
-inline constexpr const char* kGlyphA = "\uE0E0";
-inline constexpr const char* kGlyphB = "\uE0E1";
-inline constexpr const char* kGlyphX = "\uE0E2";
-inline constexpr const char* kGlyphY = "\uE0E3";
-
-/// A control's prompt: the glyph, two spaces, and what pressing it does.
-///
-/// The two spaces are the whole of it, and they are why this is a function
-/// rather than a convention: the glyph is a square in the console's font, and a
-/// prompt that spaced it differently from the screen next door reads as a
-/// different control.
-inline std::string Prompt(const char* glyph, const std::string& label) {
-  return std::string(glyph) + "  " + label;
-}
 
 }  // namespace rommsync::overlay

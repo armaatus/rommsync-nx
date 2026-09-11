@@ -481,8 +481,8 @@ add_test(NAME overlay.settings COMMAND test_overlay_settings)
 # Four of them are compiled in here. Two needed nothing but a seam --
 # `card_probe.cpp` a parameter for the `sdmc:` mount, `status_paint.cpp` a
 # `DrawList` instead of a `tsl::gfx::Renderer` -- and two reach libnx and get
-# `tests/hostswitch/switch.h` instead, which stubs the twelve symbols
-# `ipc_client.cpp` names and nothing else. `sysmodule/source/ipc/result.cpp` is
+# `tests/hostswitch/switch.h` instead, which stubs only what those two files
+# name. `sysmodule/source/ipc/result.cpp` is
 # the far side's `Error` -> `Result` mapping, compiled in so the overlay's
 # inverse is tested against the real one rather than against a copy of it.
 #
@@ -509,7 +509,8 @@ target_include_directories(test_overlay_native PRIVATE
   "${CMAKE_SOURCE_DIR}/overlay/source"
   "${CMAKE_SOURCE_DIR}/sysmodule/source/ipc")
 target_compile_definitions(test_overlay_native PRIVATE
-  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_OVERLAY_SOURCE_DIR="${CMAKE_SOURCE_DIR}/overlay/source")
 
 foreach(scenario
         card       # the card the status screen reads when nothing answers
@@ -517,6 +518,7 @@ foreach(scenario
         roundtrip  # the payloads, through both real codecs
         version    # a contract mismatch, end to end
         errors     # a refusal is not a transport failure, and neither is a bad payload
+        portable   # the half of a screen that must keep compiling on a host
         draw)      # what the status screen actually asks to be drawn
   add_test(NAME overlay.${scenario} COMMAND test_overlay_native ${scenario})
   set_tests_properties(overlay.${scenario} PROPERTIES TIMEOUT 60)

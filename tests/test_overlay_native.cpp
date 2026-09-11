@@ -51,6 +51,7 @@
 #include "card_probe.hpp"
 #include "draw_list.hpp"
 #include "ipc_client.hpp"
+#include "prompts.hpp"
 #include "result.hpp"
 #include "screen_frame.hpp"
 #include "status_paint.hpp"
@@ -674,6 +675,67 @@ int RunErrors(Checks& checks) {
   return checks.failures();
 }
 
+// --- overlay.portable ---------------------------------------------------------
+
+/// The files that are only host-compilable because they name no libultrahand
+/// and no libnx type, and the rule `overlay/AGENTS.md` owes a check for.
+///
+/// A grep rather than the compile, because the compile only fails for the four
+/// files `test_overlay_native` happens to build: a *fifth* screen whose layout
+/// went behind a `DrawList` -- which is what that file now tells the next agent
+/// to do -- would include `screen_frame.hpp`, and a `tesla.hpp` that had crept
+/// back into it would take the new painter out of every test's reach without
+/// breaking this target. That is the failure this is for, and the same shape as
+/// the greps `overlay.sync_actions` and `conflicts.overlay` already run.
+constexpr const char* kPortableFiles[] = {
+    "draw_list.hpp", "prompts.hpp", "screen_frame.hpp",
+    "screen_frame.cpp", "status_paint.hpp", "status_paint.cpp",
+};
+
+/// What none of them may name. `card_probe` and `ipc_client` are deliberately
+/// absent from the list above: the first names `sys/stat.h` and the second is
+/// libnx by definition, and both are compiled here behind the shim instead.
+constexpr const char* kForbiddenPlatform[] = {
+    "tesla.hpp", "tsl::", "libultrahand", "arm_neon",
+};
+
+int RunPortable(Checks& checks) {
+  for (const char* name : kPortableFiles) {
+    const std::filesystem::path path =
+        std::filesystem::path(ROMMSYNC_OVERLAY_SOURCE_DIR) / name;
+    std::ifstream file(path);
+    checks.Expect(file.good(), std::string("the source is readable: ") + name);
+    std::string line;
+    int number = 0;
+    while (std::getline(file, line)) {
+      ++number;
+      // Comment lines are skipped: these files explain the rule they keep, and
+      // explaining a rule is not breaking it. The same convention the greps in
+      // `overlay.library` and `overlay.settings` use.
+      const std::size_t first = line.find_first_not_of(" \t");
+      if (first != std::string::npos && line.compare(first, 2, "//") == 0) {
+        continue;
+      }
+      for (const char* token : kForbiddenPlatform) {
+        checks.Expect(line.find(token) == std::string::npos,
+                      std::string(name) + ":" + std::to_string(number) + " names " + token +
+                          "; this half of a screen has to compile on a host "
+                          "(overlay/AGENTS.md)");
+      }
+    }
+  }
+
+  // ...and the other direction: the files above are the ones this suite
+  // actually builds, so a rule about them is only as good as the list. Without
+  // this, renaming `status_paint.cpp` leaves a check with nothing to check.
+  for (const char* name : kPortableFiles) {
+    checks.Expect(
+        std::filesystem::exists(std::filesystem::path(ROMMSYNC_OVERLAY_SOURCE_DIR) / name),
+        std::string(name) + " is still in overlay/source/ -- the rule has a file to be about");
+  }
+  return checks.failures();
+}
+
 // --- overlay.draw -------------------------------------------------------------
 
 /// A `DrawList` that keeps what it was handed. The host half of the seam
@@ -906,10 +968,13 @@ int main(int argc, char** argv) {
   if (scenario == "errors") {
     return RunErrors(checks);
   }
+  if (scenario == "portable") {
+    return RunPortable(checks);
+  }
   if (scenario == "draw") {
     return RunDraw(checks);
   }
   std::cerr << "usage: test_overlay_native "
-               "<card|wire|roundtrip|version|errors|draw>\n";
+               "<card|wire|roundtrip|version|errors|portable|draw>\n";
   return 2;
 }

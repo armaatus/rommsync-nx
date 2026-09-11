@@ -18,24 +18,24 @@
 // `MutedColor` moved to `palette.hpp` in M9-7 (#198), because they are the half
 // of a frame that needs libultrahand and this half does not.
 //
-// **This file runs.** `ctest -R overlay.link` drives `Ready()` and `Diagnose()`
-// against a real `ipc::Dispatch` through the real `IpcClient`, which is what
-// naming no libultrahand type here buys. `draw_list.hpp` is included for the
-// button prompts every screen reaches for through this header; it names none
-// either.
+// **This file runs.** `ctest -R 'overlay.(version|errors)'` drives `Ready()` and
+// `Diagnose()` against a real `ipc::Dispatch` through the real `IpcClient`,
+// which is what naming no libultrahand type here buys. `prompts.hpp` is
+// included for the button glyphs every screen reaches for through this header;
+// it names no libultrahand type either.
 #pragma once
 
 #include <cstdint>
 #include <string>
 
-#include "draw_list.hpp"
 #include "ipc_client.hpp"
+#include "prompts.hpp"
 #include "rommsync/overlay_status_view.hpp"
 
 namespace rommsync::overlay {
 
 // `ColorFor`, `MutedColor` and `CurrentPalette` are `palette.hpp`'s, and
-// `kGlyphA`..`kGlyphY` and `Prompt` are `draw_list.hpp`'s -- both moved in M9-7
+// `kGlyphA`..`kGlyphY` and `Prompt` are `prompts.hpp`'s -- both moved in M9-7
 // (#198) so that what is left here compiles on a host. A screen that draws
 // includes `palette.hpp`; the prompts still arrive through this header.
 

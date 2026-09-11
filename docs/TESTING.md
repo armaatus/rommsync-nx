@@ -721,7 +721,7 @@ ctest --test-dir build --output-on-failure
   process is told about a sleep early enough to matter. None of the
   eight needs Docker, a rig, or a resolver, so none of them ever skips.
 - The `overlay.card`, `overlay.wire`, `overlay.roundtrip`, `overlay.version`,
-  `overlay.errors` and `overlay.draw` scenarios are **`overlay/source/` itself,
+  `overlay.errors`, `overlay.portable` and `overlay.draw` scenarios are **`overlay/source/` itself,
   compiled by a host compiler and run** (M9-7, #198). Everything else in the
   `overlay.*` group tests the view models in `core/` -- what a screen *says* --
   and greps the directory for what it must not contain; until #198 not one of
@@ -738,7 +738,13 @@ ctest --test-dir build --output-on-failure
   split into `sysmodule/source/ipc/result.cpp` so the overlay's `DecodeError` is
   held against the mapping that ships rather than against a copy of it. So an
   overlay/sysmodule contract mismatch is a red test rather than a first-boot
-  surprise. None of the six needs Docker or a rig, so none of them skips.
+  surprise. `overlay.portable` is the odd one out and is a grep: it holds the
+  portable half of `overlay/source/` -- `draw_list.hpp`, `prompts.hpp`,
+  `screen_frame.*`, `status_paint.*` -- to naming no `tesla.hpp`, `tsl::`,
+  `libultrahand` or `arm_neon`, because the compile only covers the files this
+  target happens to build and the *next* screen's painter is the one that would
+  quietly leave the reach of every test. None of the seven needs Docker or a
+  rig, so none of them skips.
   What they do **not** reach, and why, is in the two limits below.
 - The `power.*` pair is the sleep contract without a console (M9-4, #208).
   `psc:m` is a service and cannot be reached from a laptop, but everything the
@@ -1206,7 +1212,7 @@ than it was, and it is these three things:
   Snapshot tests over that would catch *our* regressions and not fidelity.
   Post-gate at best.
 - **The `cmif`/`hipc` message.** `tests/hostswitch/switch.h` stands in for the
-  twelve libnx symbols `ipc_client.cpp` names, and the seam it models is the
+  libnx symbols those files name, and the seam it models is the
   contract on either side of the transport: request bytes in, response bytes out,
   a `Result`, and the `u64` reply word saying how much of the Out buffer is
   valid. The message itself -- what `HandleRequest` unpacks in

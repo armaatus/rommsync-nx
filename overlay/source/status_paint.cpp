@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "draw_list.hpp"
+#include "prompts.hpp"
 #include "rommsync/overlay_status_view.hpp"
 
 namespace rommsync::overlay {
