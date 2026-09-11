@@ -3,31 +3,12 @@
 #include <cstdint>
 #include <string>
 
+#include "draw_list.hpp"
 #include "ipc_client.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/overlay_status_view.hpp"
 
 namespace rommsync::overlay {
-
-tsl::Color ColorFor(Tone tone) {
-  switch (tone) {
-    case Tone::kGood:
-      return tsl::gfx::Renderer::a(tsl::healthyRamTextColor);
-    case Tone::kWarn:
-      return tsl::gfx::Renderer::a(tsl::warningTextColor);
-    case Tone::kBad:
-      return tsl::gfx::Renderer::a(tsl::badRamTextColor);
-    case Tone::kNeutral:
-      break;
-  }
-  return tsl::gfx::Renderer::a(tsl::defaultTextColor);
-}
-
-tsl::Color MutedColor() { return tsl::gfx::Renderer::a(tsl::infoTextColor); }
-
-std::string Prompt(const char* glyph, const std::string& label) {
-  return std::string(glyph) + "  " + label;
-}
 
 Link ScreenFrame::Ready() {
   if (!client_.open()) {

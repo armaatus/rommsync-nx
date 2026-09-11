@@ -127,7 +127,7 @@ inline constexpr std::size_t kMaxPayloadBytes = 8 * 1024;
 /// The Horizon result module `Error` is reported under, and the one number on
 /// this wire that `core/` states without being able to name its type.
 ///
-/// It is here rather than in `sysmodule/source/ipc/service.hpp`, where it was
+/// It is here rather than in `sysmodule/source/ipc/result.hpp`, where it was
 /// written, because **both** halves need it: the sysmodule maps an `Error` onto
 /// `MAKERESULT(kResultModule, <the enum's ordinal>)`, and the overlay has to map
 /// it back -- a `kDuplicate` and a sysmodule that is not running arrive at a
@@ -199,7 +199,7 @@ bool IsCommand(std::uint32_t id, Command* out = nullptr);
 /// Why a command did not do what was asked.
 ///
 /// Portable on purpose: the sysmodule maps this onto a Horizon `Result` at the
-/// boundary (`sysmodule/source/ipc/service.cpp`) and `core/` never names one.
+/// boundary (`sysmodule/source/ipc/result.cpp`) and `core/` never names one.
 ///
 /// `kUnknownCommand` through `kInternal` are the *transport's* errors rather
 /// than any one command's. They are here rather than folded into `kInvalid`
@@ -298,7 +298,7 @@ inline constexpr std::array kAllErrors = {
 /// holds it.
 ///
 /// The inverse of the sysmodule's `Error` -> `Result` mapping, which is by
-/// ordinal (`sysmodule/source/ipc/service.hpp`), and the reason the ordinals
+/// ordinal (`sysmodule/source/ipc/result.hpp`), and the reason the ordinals
 /// are append-only: this is how the *overlay* reads a refusal back off a
 /// failing `Result` (`overlay::DecodeError`). An ordinal from a newer sysmodule
 /// is false rather than guessed.

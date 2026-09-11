@@ -4,6 +4,7 @@
 #include <string>
 
 #include "ipc_client.hpp"
+#include "palette.hpp"
 #include "rommsync/core.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/overlay_pairing_view.hpp"
@@ -144,10 +145,12 @@ void PairingScreen::Start() {
 void PairingScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
                          s32 height) const {
   // Nothing is drawn past the bounds `CustomDrawer` handed us, and nothing runs
-  // off the right edge: `drawString`'s `maxWidth` defaults to "no limit", and a
-  // `verification_url` is the user's own origin -- `ipc::kMaxServerUrlBytes` is
-  // 512, so a routine `http://romm.homelab.example:8080/pair/device` draws past
-  // a ~448px panel.
+  // off the right edge: a `verification_url` is the user's own origin --
+  // `ipc::kMaxServerUrlBytes` is 512, so a routine
+  // `http://romm.homelab.example:8080/pair/device` draws past a ~448px panel.
+  // Every string goes through `DrawBounded`, because a width that came out `0`
+  // here means "no room" and `drawString` would read it as "no limit"
+  // (`palette.hpp`).
   const s32 bottom = y + height;
   const s32 line_width = width > kInset ? width - kInset : 0;
   const tsl::Color muted = MutedColor();
@@ -167,7 +170,7 @@ void PairingScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
       clipped = true;
       return;
     }
-    renderer->drawString(text, false, x, row, font, color, line_width);
+    DrawBounded(renderer, text, x, row, font, color, line_width);
     row += advance;
   };
 
@@ -198,7 +201,7 @@ void PairingScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
                                                 : std::string();
   if (!action.empty() && fits(kRowHeight * 2)) {
     row += kRowHeight / 2;
-    renderer->drawString(action, false, x, row, kBodyFont,
+    DrawBounded(renderer, action, x, row, kBodyFont,
                          tsl::gfx::Renderer::a(tsl::defaultTextColor), line_width);
   }
 }

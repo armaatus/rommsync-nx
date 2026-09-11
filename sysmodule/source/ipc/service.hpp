@@ -20,23 +20,15 @@
 
 #include <switch.h>
 
+#include "result.hpp"
 #include "rommsync/ipc.hpp"
 
 namespace rommsync::sysmodule {
 
-/// The Horizon result module these errors are reported under.
-///
-/// The number itself is `ipc::kResultModule`, in `core/`, because the overlay
-/// needs it too: it maps a failing `Result` back to the `ipc::Error` this side
-/// mapped it from, and a second copy of the number here is the two halves
-/// disagreeing about a wire constant. Kept as a name because this is where it
-/// is *used*, and because a `u32` is the type this side of the boundary speaks.
-inline constexpr u32 kResultModule = ipc::kResultModule;
-
-/// `error` as a Horizon `Result`. `kOk` is `0`; everything else is
-/// `MAKERESULT(kResultModule, <the enum's ordinal>)`, so a description of `N`
-/// reads straight off `ipc::Error` and a new error cannot silently reuse one.
-Result ToResult(ipc::Error error);
+// `kResultModule` and `ToResult` are `result.hpp`'s. They are the half of this
+// boundary that is arithmetic rather than `cmif`, so M9-7 (#198) moved them
+// where a host compiler can reach them and the overlay's inverse can be tested
+// against the real mapping instead of a copy of it.
 
 /// Answer one `cmif` request out of `message`, which is the calling thread's IPC
 /// buffer (`armGetTls()`).

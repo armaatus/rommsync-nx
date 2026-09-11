@@ -1,32 +1,52 @@
 #include "status_screen.hpp"
 
+#include <cstdint>
 #include <ctime>
 #include <string>
 
 #include "card_probe.hpp"
+#include "draw_list.hpp"
 #include "ipc_client.hpp"
+#include "palette.hpp"
 #include "rommsync/core.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/overlay_status_view.hpp"
 #include "screen_frame.hpp"
 #include "settings_screen.hpp"
+#include "status_paint.hpp"
 
 namespace rommsync::overlay {
 namespace {
 
-// The screen's geometry, in the coordinate space `CustomDrawer` hands us. Named
-// rather than sprinkled through `Draw`, because a layout is the one thing here
-// that will be adjusted against a real panel in M8-2 (#44) and a person doing
-// that should have one place to look.
-constexpr s32 kHeadlineFont = 23;
-constexpr s32 kBodyFont = 19;
-constexpr s32 kRowHeight = 26;
-constexpr s32 kHeadlineHeight = 34;
-constexpr s32 kHintHeight = 26;
-constexpr s32 kBarHeight = 12;
-constexpr s32 kValueColumn = 160;
-/// How far short of the drawer's right edge the progress track stops.
-constexpr s32 kBarInset = 8;
+/// `PaintStatus`'s commands, replayed into the real renderer.
+///
+/// The whole of what is left on this side of the seam: no geometry, no
+/// conditionals, nothing a test would want to reach (`draw_list.hpp`). Adding
+/// anything here is moving layout back out of `status_paint.cpp`, where it can
+/// be asserted, and into the half that has never run.
+class RendererDrawList : public DrawList {
+ public:
+  explicit RendererDrawList(tsl::gfx::Renderer* renderer) : renderer_(renderer) {}
+
+  /// Through `DrawBounded`, which is what makes `DrawList`'s "zero means zero"
+  /// true on a console: libtesla reads `drawString`'s `maxWidth = 0` as *no
+  /// limit* (`palette.hpp`). Every other screen goes through the same function.
+  void String(const std::string& text, std::int32_t x, std::int32_t y, std::int32_t font_size,
+              Rgba4444 color, std::int32_t wrap_width) override {
+    DrawBounded(renderer_, text, static_cast<s32>(x), static_cast<s32>(y),
+                static_cast<s32>(font_size), tsl::Color(color),
+                static_cast<s32>(wrap_width));
+  }
+
+  void Rect(std::int32_t x, std::int32_t y, std::int32_t width, std::int32_t height,
+            Rgba4444 color) override {
+    renderer_->drawRect(static_cast<s32>(x), static_cast<s32>(y), static_cast<s32>(width),
+                        static_cast<s32>(height), tsl::Color(color));
+  }
+
+ private:
+  tsl::gfx::Renderer* renderer_;
+};
 
 /// Polls between two looks at the card, while the sysmodule is not answering.
 ///
@@ -116,71 +136,8 @@ const CardState& StatusScreen::CardThisPoll(Link link) {
 
 void StatusScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
                         s32 height) const {
-  // Nothing is drawn past the bounds `CustomDrawer` handed us. The row count is
-  // bounded and the panel is not, so this only ever fires on a layout that has
-  // to be adjusted in M8-2 (#44) -- but a row painted over the frame's chrome is
-  // the kind of thing that reads as a corrupted overlay rather than as a
-  // too-long list.
-  const tsl::Color muted = MutedColor();
-  // Nothing runs off the right edge either. `drawString`'s `maxWidth` defaults
-  // to "no limit", and a value is not ours to bound: `fs_name` comes off a RomM
-  // library and `ipc::kMaxNameBytes` is 256, so a routine
-  // `Some Game (USA) (Rev 1) [!].gba` draws past a ~448px panel.
-  const s32 value_width = width > kValueColumn + kBarInset ? width - kValueColumn - kBarInset : 0;
-  const s32 full_width = width > kBarInset ? width - kBarInset : 0;
-
-  // The one control this screen has, drawn at the foot of the panel and
-  // reserved before anything else: the rows below the headline grow with what
-  // is downloading, so a prompt drawn after them is the first thing to fall off
-  // a full screen -- and a control nobody can see is a menu this overlay does
-  // not have (#26).
-  const s32 prompt = y + height - kRowHeight;
-  renderer->drawString(Prompt(kGlyphY, "Settings"), false, x, prompt, kBodyFont, muted,
-                       full_width);
-  const s32 bottom = prompt - kRowHeight / 2;
-
-  s32 row = y;
-  renderer->drawString(view_.headline, false, x, row, kHeadlineFont, ColorFor(view_.tone),
-                       full_width);
-  row += kHeadlineHeight;
-  if (!view_.hint.empty()) {
-    renderer->drawString(view_.hint, false, x, row, kBodyFont, muted, full_width);
-    row += kHintHeight;
-  }
-  row += kRowHeight / 2;
-
-  for (const Line& line : view_.lines) {
-    if (row + kRowHeight > bottom) {
-      return;
-    }
-    renderer->drawString(line.label, false, x, row, kBodyFont, muted, kValueColumn);
-    renderer->drawString(line.value, false, x + kValueColumn, row, kBodyFont,
-                         ColorFor(line.tone), value_width);
-    row += kRowHeight;
-  }
-
-  if (view_.progress.kind == Progress::Kind::kNone) {
-    return;
-  }
-  row += kRowHeight / 2;
-  if (row + kRowHeight + kBarHeight > bottom) {
-    return;
-  }
-  renderer->drawString(view_.progress.caption, false, x, row, kBodyFont, muted, full_width);
-  row += kRowHeight;
-
-  const s32 track = full_width;
-  renderer->drawRect(x, row, track, kBarHeight,
-                     tsl::gfx::Renderer::a(tsl::trackBarEmptyColor));
-  if (view_.progress.kind == Progress::Kind::kFraction) {
-    // Integer maths on the per mille the view model already clamped, so a bar
-    // cannot be drawn past its own track by a server that under-declared a
-    // length (`overlay_status_view.hpp`).
-    const s32 filled = static_cast<s32>(static_cast<std::int64_t>(track) *
-                                        view_.progress.permille / 1000);
-    renderer->drawRect(x, row, filled, kBarHeight,
-                       tsl::gfx::Renderer::a(tsl::trackBarFullColor));
-  }
+  RendererDrawList out(renderer);
+  PaintStatus(view_, CurrentPalette(), out, x, y, width, height);
 }
 
 }  // namespace rommsync::overlay

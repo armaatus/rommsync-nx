@@ -627,7 +627,7 @@ reporting it as an `ipc::Error`, which the sysmodule maps to a `Result`.
 
 The mapping is by ordinal -- `MAKERESULT(ipc::kResultModule, <the enum's
 ordinal>)` -- and it runs in **both** directions. The sysmodule maps an
-`ipc::Error` onto a `Result` (`sysmodule/source/ipc/service.cpp`) and the
+`ipc::Error` onto a `Result` (`sysmodule/source/ipc/result.cpp`) and the
 overlay maps it back (`overlay::DecodeError`), because otherwise a refusal and a
 sysmodule that is not running reach a screen as the same failing `Result`: an
 `Enqueue` answering `kDuplicate` would be drawn as "sys-rommsync is not
@@ -687,10 +687,11 @@ progress rides on the `queue` list kind (M5-4).
 |---|---|
 | `core/include/rommsync/ipc.hpp`, `core/src/ipc.cpp` | ids, payloads, encoders and decoders |
 | `core/src/ipc_service.cpp` | `ipc::ServiceCore` -- one method per command, and every decision |
-| `sysmodule/source/ipc/service.*` | the `cmif` binding: buffers in, buffers out, `ipc::Error` to a `Result`. No logic. |
+| `sysmodule/source/ipc/result.*` | `ipc::Error` to a `Result`, by ordinal. The half of the boundary that is arithmetic, so `overlay.errors` compiles it on the host and holds it against `overlay::DecodeError` (M9-7, #198) |
+| `sysmodule/source/ipc/service.*` | the `cmif` binding: buffers in, buffers out. No logic. Not reachable from any host test -- see docs/TESTING.md |
 | `sysmodule/source/ipc/server.*` | hosting it: `smRegisterServiceCmif`, `svcAcceptSession`, the session table, `svcReplyAndReceive` |
 | `sysmodule/source/engine.*` | the `ipc::Engine` `ServiceCore` reads the console out of, as far as it is built. Names no libnx type, so the host build compiles it too and `engine.*` drives it against a directory (`tests/test_engine.cpp`) |
-| `overlay/source/ipc_client.*` | `smGetService("rommsync")` and the *same* codecs |
+| `overlay/source/ipc_client.*` | `smGetService("rommsync")` and the *same* codecs. Compiled and run on the host by `overlay.wire`/`overlay.roundtrip`, behind `tests/hostswitch/switch.h` |
 | `core/include/rommsync/overlay_status_view.hpp` | what the status screen *says*, decided off the framebuffer (`overlay.status`) |
 | `core/include/rommsync/overlay_pairing_view.hpp` | the same for the pairing screen: the code, the address, the countdown, and which of four sentences a dead pairing gets (`overlay.pairing`) |
 | `core/include/rommsync/overlay_sync_actions.hpp` | the sync screen: which control may be pressed, and what a refused press says (`overlay.sync_actions`) |

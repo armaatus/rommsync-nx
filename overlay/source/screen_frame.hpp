@@ -1,6 +1,6 @@
-// The three things every screen in this directory does before it can draw
-// anything: pick a colour for a `Tone`, complete the version handshake, and
-// decide *not running* from *unreachable* when a call fails.
+// The two things every screen in this directory does before it can draw
+// anything: complete the version handshake, and decide *not running* from
+// *unreachable* when a call fails.
 //
 // It exists because those were written out twice -- in `status_screen.cpp`
 // (M4-1, #23) and in `pairing_screen.cpp` (M4-5, #27) -- and #24 is the third
@@ -12,56 +12,32 @@
 // merge conflict bought for nothing.
 //
 // What is *not* here is any screen's layout. The geometry constants stay beside
-// the `Draw` that uses them, because they are the one thing that will be
+// the painter that uses them, because they are the one thing that will be
 // adjusted against a real panel in M8-2 (#44) and a person doing that should
-// have one block per screen to look at.
+// have one block per screen to look at. Nor is the palette: `ColorFor` and
+// `MutedColor` moved to `palette.hpp` in M9-7 (#198), because they are the half
+// of a frame that needs libultrahand and this half does not.
 //
-// Nothing here has ever run: overlay UI is verified after the M8-1 gate
-// (overlay/AGENTS.md). What is checked today is that it cross-compiles.
+// **This file runs.** `ctest -R 'overlay.(version|errors)'` drives `Ready()` and
+// `Diagnose()` against a real `ipc::Dispatch` through the real `IpcClient`,
+// which is what naming no libultrahand type here buys. `prompts.hpp` is
+// included for the button glyphs every screen reaches for through this header;
+// it names no libultrahand type either.
 #pragma once
-
-#include <tesla.hpp>
 
 #include <cstdint>
 #include <string>
 
 #include "ipc_client.hpp"
+#include "prompts.hpp"
 #include "rommsync/overlay_status_view.hpp"
 
 namespace rommsync::overlay {
 
-/// The renderer's palette for a `Tone`. `core/` names no colour (hard rule 4),
-/// so this is the only place the two vocabularies meet -- and it uses
-/// libultrahand's theme variables rather than literals so a user's theme still
-/// applies.
-///
-/// Through `Renderer::a`, which folds in the overlay's fade animation alpha.
-/// Without it the frame's chrome fades on open and close while everything a
-/// screen draws stays fully opaque and pops (libtesla's own convention).
-tsl::Color ColorFor(Tone tone);
-
-/// The colour a label, a hint or a caption is drawn in -- the quiet half of
-/// every row, and not a `Tone`: it is a role rather than a judgement.
-tsl::Color MutedColor();
-
-/// The button glyphs libtesla draws from the Switch's own font.
-///
-/// Here rather than in each screen for `ColorFor`'s reason: they were written
-/// out in `sync_screen.cpp`, `library_screen.cpp` and `pairing_screen.cpp`
-/// before this file existed, and a fourth copy in `settings_screen.cpp` (#26)
-/// is a private-use codepoint typed from memory in four places.
-inline constexpr const char* kGlyphA = "\uE0E0";
-inline constexpr const char* kGlyphB = "\uE0E1";
-inline constexpr const char* kGlyphX = "\uE0E2";
-inline constexpr const char* kGlyphY = "\uE0E3";
-
-/// A control's prompt: the glyph, two spaces, and what pressing it does.
-///
-/// The two spaces are the whole of it, and they are why this is a function
-/// rather than a convention: the glyph is a square in the console's font, and a
-/// prompt that spaced it differently from the screen next door reads as a
-/// different control.
-std::string Prompt(const char* glyph, const std::string& label);
+// `ColorFor`, `MutedColor` and `CurrentPalette` are `palette.hpp`'s, and
+// `kGlyphA`..`kGlyphY` and `Prompt` are `prompts.hpp`'s -- both moved in M9-7
+// (#198) so that what is left here compiles on a host. A screen that draws
+// includes `palette.hpp`; the prompts still arrive through this header.
 
 /// The session state a screen keeps between frames, and the two questions it
 /// asks of it.

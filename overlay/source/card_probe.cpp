@@ -3,6 +3,7 @@
 #include <sys/stat.h>
 
 #include <string>
+#include <string_view>
 
 #include "rommsync/config.hpp"
 
@@ -10,10 +11,13 @@ namespace rommsync::overlay {
 namespace {
 
 /// Where Atmosphère looks for a sysmodule, with this one's id already in it.
-const std::string& ContentsDir() {
-  static const std::string dir =
-      std::string("sdmc:/atmosphere/contents/") + kProgramIdHex + "/";
-  return dir;
+///
+/// Built per call rather than cached in a static: the prefix is a parameter now
+/// (`ProbeCardAt`), and a static would answer the first caller's prefix to every
+/// later one. It is three `stat`s every `kPollsBetweenProbes` polls
+/// (`status_screen.cpp`), so the string is not what costs anything here.
+std::string ContentsDir(std::string_view prefix) {
+  return std::string(prefix) + "/atmosphere/contents/" + kProgramIdHex + "/";
 }
 
 /// `stat` rather than `fopen`: `exefs.nsp` is the whole sysmodule and opening it
@@ -25,15 +29,18 @@ bool Present(const std::string& path) {
 
 }  // namespace
 
-CardState ProbeCard() {
+CardState ProbeCard() { return ProbeCardAt("sdmc:"); }
+
+CardState ProbeCardAt(std::string_view prefix) {
+  const std::string contents = ContentsDir(prefix);
   CardState card;
-  card.installed = Present(ContentsDir() + "exefs.nsp");
+  card.installed = Present(contents + "exefs.nsp");
   // Not the same question. Atmosphère loads `exefs.nsp` and ignores this file;
   // ovl-sysmodules reads this file and ignores `exefs.nsp`, so an install with
   // one and not the other boots and is absent from the list
   // (`overlay_status_view.hpp`).
-  card.listable = Present(ContentsDir() + "toolbox.json");
-  card.set_to_boot = Present(ContentsDir() + "flags/boot2.flag");
+  card.listable = Present(contents + "toolbox.json");
+  card.set_to_boot = Present(contents + "flags/boot2.flag");
 
   // The configuration as the card holds it, which is not the same question as
   // "what is the sysmodule running": there is no sysmodule. `LoadConfig` never
@@ -50,7 +57,7 @@ CardState ProbeCard() {
   // `config::kConfigSdPath` rather than a second spelling of the directory: the
   // sysmodule joins its own `sdmc:` prefix to the same file name, and a path
   // typed here as well is one the two halves come to disagree about.
-  const std::string settings = std::string("sdmc:") + config::kConfigSdPath;
+  const std::string settings = std::string(prefix) + config::kConfigSdPath;
   if (Present(settings)) {
     card.config_read = true;
     card.sync_enabled = config::LoadConfig(settings).value.sync.enabled;

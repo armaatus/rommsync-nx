@@ -3,6 +3,7 @@
 #include <string>
 
 #include "ipc_client.hpp"
+#include "palette.hpp"
 #include "rommsync/core.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/overlay_sync_actions.hpp"
@@ -165,8 +166,9 @@ void SyncScreen::Refresh() { view_ = RenderSyncActions(status_, last_); }
 void SyncScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
                       s32 height) const {
   // Nothing is drawn past the bounds `CustomDrawer` handed us, and nothing runs
-  // off the right edge: `drawString`'s `maxWidth` defaults to "no limit", and a
-  // refusal is a sentence rather than a word.
+  // off the right edge: a refusal is a sentence rather than a word. Every string
+  // goes through `DrawBounded`, because a width that came out `0` here means
+  // "no room" and `drawString` would read it as "no limit" (`palette.hpp`).
   const s32 bottom = y + height;
   const s32 line_width = width > kInset ? width - kInset : 0;
   const s32 value_width = width > kValueColumn + kInset ? width - kValueColumn - kInset : 0;
@@ -187,7 +189,7 @@ void SyncScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
       clipped = true;
       return;
     }
-    renderer->drawString(text, false, x, row, font, color, line_width);
+    DrawBounded(renderer, text, x, row, font, color, line_width);
     row += advance;
   };
 
@@ -199,8 +201,8 @@ void SyncScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
     if (!fits(kRowHeight)) {
       return;
     }
-    renderer->drawString(value.label, false, x, row, kBodyFont, muted, kValueColumn);
-    renderer->drawString(value.value, false, x + kValueColumn, row, kBodyFont,
+    DrawBounded(renderer, value.label, x, row, kBodyFont, muted, kValueColumn);
+    DrawBounded(renderer, value.value, x + kValueColumn, row, kBodyFont,
                          ColorFor(value.tone), value_width);
     row += kRowHeight;
   }

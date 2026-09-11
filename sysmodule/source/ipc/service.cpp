@@ -37,13 +37,6 @@ ReplyPayload* MakeReply(void* message, Result result) {
 
 }  // namespace
 
-Result ToResult(ipc::Error error) {
-  if (error == ipc::Error::kOk) {
-    return 0;
-  }
-  return MAKERESULT(kResultModule, static_cast<u32>(error));
-}
-
 Result HandleRequest(ipc::ServiceCore& core, void* message) {
   const HipcParsedRequest parsed = hipcParseRequest(message);
   if (parsed.meta.type != CmifCommandType_Request) {

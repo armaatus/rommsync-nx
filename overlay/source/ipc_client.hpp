@@ -16,10 +16,13 @@
 // the sysmodule has taken the work; a screen polls `GetStatus` or
 // `GetPairState` while it runs.
 //
-// Nothing here has been run: overlay UI and the Horizon IPC path are verified
-// after the M8-1 gate (overlay/AGENTS.md). What is checked today is that it
-// cross-compiles and that the payloads it speaks round-trip natively
-// (`ctest -R ipc`).
+// **This file runs.** M9-7 (#198) compiles it on the host behind
+// `tests/hostswitch/switch.h` and drives every method below against the real
+// `ipc::Dispatch` and the real `sysmodule::ToResult` -- `ctest -R overlay.wire`,
+// `overlay.roundtrip`, `overlay.errors`. What is still hardware-only is the
+// Horizon transport underneath: `smGetService` finding a real port, and the
+// `cmif` message `sysmodule/source/ipc/service.cpp` unpacks. Those are verified
+// after the M8-1 gate (overlay/AGENTS.md).
 #pragma once
 
 #include <switch.h>
@@ -50,7 +53,7 @@ constexpr Result MalformedResponse() {
 /// The `ipc::Error` a failing `Result` carries, when it carries one.
 ///
 /// The sysmodule maps every refusal onto `MAKERESULT(ipc::kResultModule, <the
-/// enum's ordinal>)` (`sysmodule/source/ipc/service.hpp`), and until this
+/// enum's ordinal>)` (`sysmodule/source/ipc/result.hpp`), and until this
 /// existed the overlay threw that away: `Enqueue` answering `kDuplicate` and a
 /// sysmodule that is not running both reached a screen as "a `Result` that
 /// failed", so `ScreenFrame::Diagnose` read the first as the second and drew

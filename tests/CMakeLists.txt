@@ -471,6 +471,59 @@ target_compile_definitions(test_overlay_settings PRIVATE
   ROMMSYNC_SETTINGS_VIEW_SRC="${CMAKE_SOURCE_DIR}/core/src/overlay_settings_view.cpp")
 add_test(NAME overlay.settings COMMAND test_overlay_settings)
 
+# --- the overlay's own code, compiled and run natively ------------------------
+# M9-7 (#198). Every target above names only its own `.cpp`:
+# `ROMMSYNC_OVERLAY_SOURCE_DIR` is a string a test greps a directory with, not a
+# compile input, so until this target existed not one of the 19 files under
+# `overlay/source/` had been built by anything but devkitPro and none of them had
+# run anywhere. `status_screen.hpp` said so in its header comment.
+#
+# Four of them are compiled in here. Two needed nothing but a seam --
+# `card_probe.cpp` a parameter for the `sdmc:` mount, `status_paint.cpp` a
+# `DrawList` instead of a `tsl::gfx::Renderer` -- and two reach libnx and get
+# `tests/hostswitch/switch.h` instead, which stubs only what those two files
+# name. `sysmodule/source/ipc/result.cpp` is
+# the far side's `Error` -> `Result` mapping, compiled in so the overlay's
+# inverse is tested against the real one rather than against a copy of it.
+#
+# `tesla.hpp` is deliberately NOT stubbed. `tsl::gfx::Renderer` is `final` with
+# non-virtual inline methods, so there is no faking it, and stubbing the whole
+# library would need an arm64 host (`tesla.hpp` has an unguarded
+# `#include <arm_neon.h>`). The screens are split at `DrawList` instead; see
+# `overlay/source/draw_list.hpp` and docs/TESTING.md.
+#
+# The include order matters: `tests/hostswitch` has to be reachable as
+# `<switch.h>`, and `sysmodule/source/ipc` as `"result.hpp"`.
+add_executable(test_overlay_native
+  test_overlay_native.cpp
+  "${CMAKE_SOURCE_DIR}/tests/hostswitch/switch.cpp"
+  "${CMAKE_SOURCE_DIR}/overlay/source/card_probe.cpp"
+  "${CMAKE_SOURCE_DIR}/overlay/source/ipc_client.cpp"
+  "${CMAKE_SOURCE_DIR}/overlay/source/screen_frame.cpp"
+  "${CMAKE_SOURCE_DIR}/overlay/source/status_paint.cpp"
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/ipc/result.cpp")
+target_link_libraries(test_overlay_native PRIVATE rommsync::core)
+target_include_directories(test_overlay_native PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}"
+  "${CMAKE_SOURCE_DIR}/tests/hostswitch"
+  "${CMAKE_SOURCE_DIR}/overlay/source"
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/ipc")
+target_compile_definitions(test_overlay_native PRIVATE
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_OVERLAY_SOURCE_DIR="${CMAKE_SOURCE_DIR}/overlay/source")
+
+foreach(scenario
+        card       # the card the status screen reads when nothing answers
+        wire       # every command reaches its own id, with both buffers mapped
+        roundtrip  # the payloads, through both real codecs
+        version    # a contract mismatch, end to end
+        errors     # a refusal is not a transport failure, and neither is a bad payload
+        portable   # the half of a screen that must keep compiling on a host
+        draw)      # what the status screen actually asks to be drawn
+  add_test(NAME overlay.${scenario} COMMAND test_overlay_native ${scenario})
+  set_tests_properties(overlay.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
 # --- rig smoke test: proves docker RomM + fault proxy + ctest all work -------
 # Uses libcurl directly on purpose. It tests the RIG, not our code, and must
 # keep working while M0-2 replaces it as the way production code speaks HTTP.
