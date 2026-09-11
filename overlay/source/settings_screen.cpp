@@ -8,6 +8,7 @@
 #include "ipc_client.hpp"
 #include "library_screen.hpp"
 #include "pairing_screen.hpp"
+#include "palette.hpp"
 #include "rommsync/auth.hpp"
 #include "rommsync/core.hpp"
 #include "rommsync/ipc.hpp"

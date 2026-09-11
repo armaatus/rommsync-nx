@@ -17,6 +17,8 @@
 // come to disagree about what is on. Nothing here opens a file for writing.
 #pragma once
 
+#include <string_view>
+
 #include "rommsync/overlay_status_view.hpp"
 
 namespace rommsync::overlay {
@@ -35,5 +37,18 @@ inline constexpr const char* kProgramIdHex = "4200000000524D53";
 /// Look at the card. Never fails: every field is a question with a `false`
 /// answer, and a card that cannot be read is one that says nothing.
 CardState ProbeCard();
+
+/// The same, against an explicit mount prefix.
+///
+/// `sdmc:` is a libnx devoptab and there is no such mount on a host, so every
+/// path below would `stat` to "absent" and the only answer a host could ever
+/// observe would be the empty one. The prefix is therefore a parameter and
+/// `ProbeCard()` is the device call site that supplies it -- which is what lets
+/// M9-7 (#198) lay a card out in a scratch directory and assert the four states
+/// this file exists to tell apart (`ctest -R overlay.card`).
+///
+/// `prefix` is joined to an absolute path, so it carries no trailing separator:
+/// `sdmc:` on a console, `/tmp/whatever` in a test.
+CardState ProbeCardAt(std::string_view prefix);
 
 }  // namespace rommsync::overlay

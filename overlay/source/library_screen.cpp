@@ -6,6 +6,7 @@
 #include <string>
 
 #include "ipc_client.hpp"
+#include "palette.hpp"
 #include "rommsync/core.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/overlay_library_model.hpp"
