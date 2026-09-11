@@ -866,6 +866,22 @@ int RunDraw(Checks& checks) {
       checks.Expect(command.width > 0,
                     "a narrow panel asks for no unbounded string: \"" + command.text + "\"");
     }
+    // What it does instead: the full-width half of the screen is still drawn,
+    // and a row is dropped whole. Half a row is a label with nothing beside it,
+    // which reads as a value that failed to load rather than as a narrow panel.
+    checks.Expect(out.Drew("Syncing"), "a narrow panel still draws the headline");
+    checks.Expect(out.Drew(overlay::Prompt(overlay::kGlyphY, "Settings")),
+                  "...and still draws the way into the menu");
+    checks.Expect(!out.Drew("Server") && !out.Drew("reachable"),
+                  "...and drops a row whole rather than half of it");
+  }
+
+  // No panel at all. Nothing is drawn rather than a headline painted across
+  // whatever is to the right of it.
+  {
+    Recorder out;
+    overlay::PaintStatus(view, palette, out, kPanelX, kPanelY, 4, kPanelHeight);
+    checks.Expect(out.commands.empty(), "a panel with no width draws nothing");
   }
   return checks.failures();
 }

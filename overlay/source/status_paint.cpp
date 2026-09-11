@@ -35,9 +35,22 @@ void PaintStatus(const StatusView& view, const Palette& palette, DrawList& out, 
   // Nothing runs off the right edge either. A value is not ours to bound:
   // `fs_name` comes off a RomM library and `ipc::kMaxNameBytes` is 256, so a
   // routine `Some Game (USA) (Rev 1) [!].gba` draws past a ~448px panel.
+  //
+  // **A width of zero is "no room", and it is never handed to a renderer.**
+  // libtesla reads `drawString`'s `maxWidth = 0` as *no limit*, so a panel too
+  // narrow for the value column used to draw every value unbounded -- the exact
+  // thing the subtraction above exists to prevent, at exactly the width where it
+  // matters most. The rows that have no width are dropped instead, here, where a
+  // test can see it: `DrawList` takes zero as zero (`draw_list.hpp`) and
+  // `RendererDrawList` refuses to pass one on.
   const std::int32_t value_width =
       width > kValueColumn + kBarInset ? width - kValueColumn - kBarInset : 0;
   const std::int32_t full_width = width > kBarInset ? width - kBarInset : 0;
+  if (full_width <= 0) {
+    // Not a panel at all. Drawing the headline across whatever is to the right
+    // of it is worse than drawing nothing.
+    return;
+  }
 
   // The one control this screen has, drawn at the foot of the panel and
   // reserved before anything else: the rows below the headline grow with what
@@ -57,7 +70,15 @@ void PaintStatus(const StatusView& view, const Palette& palette, DrawList& out, 
   }
   row += kRowHeight / 2;
 
+  // A row is a label *and* a value, so a panel with no room for the value column
+  // has no room for the row: half a row is a label with nothing beside it, which
+  // reads as a value that failed to load rather than as a screen that is too
+  // narrow. The rest of the screen -- headline, hint, prompt and bar -- is full
+  // width and still drawn.
   for (const Line& line : view.lines) {
+    if (value_width <= 0) {
+      break;
+    }
     if (row + kRowHeight > bottom) {
       return;
     }
