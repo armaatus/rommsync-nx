@@ -102,12 +102,14 @@ SdEngine::~SdEngine() {
     // dynamic sysmodule from ovl-sysmodules is not something a user can be asked
     // to wait out (M9-5, #197).
     CancelDrainLocked();
+    // Before the join, not after it: a tick already in flight ends at its next
+    // operation boundary rather than being waited out in full, which on the link
+    // whose loss is usually why the process is going away is three timeouts and
+    // two backoffs saved (`sync::TickOptions::cancel`). Under the lock since
+    // M9-4 (#208), because the token is now the tick's rather than the
+    // process's (`tick_cancel_`).
+    CancelTickLocked();
   }
-  // Before the join, not after it: a tick already in flight ends at its next
-  // operation boundary rather than being waited out in full, which on the link
-  // whose loss is usually why the process is going away is three timeouts and
-  // two backoffs saved (`sync::TickOptions::cancel`).
-  tick_cancel_.Cancel();
   wake_.notify_all();
   if (worker_thread_.joinable()) {
     worker_thread_.join();
@@ -731,11 +733,18 @@ void SdEngine::StartWorker() {
     return;
   }
   scheduler_.Reconfigure(ScheduleFrom(*ConfigSnapshot()));
+  // Before the thread rather than from inside it: `Quiesce` waits for a worker
+  // that exists, and a console that suspended in the instant between this call
+  // and `RunWorker`'s first line would otherwise be told there was nobody to
+  // wait for (`worker_live_`). Cleared again below when there is no thread after
+  // all, so a sleep does not spend its whole budget waiting for one.
+  worker_live_ = true;
   // Reported rather than thrown, for `UsePairingBackend`'s reason. Without the
   // worker nothing syncs and no list page is pumped, so this is the one of the
   // two whose absence a user will see -- which is exactly why it is a line in
   // the log rather than a `std::terminate` with no crash report (M9-2, #207).
   if (!worker_thread_.Start<&SdEngine::RunWorker>(this)) {
+    worker_live_ = false;
     log::Warn(log::Event::kBoot,
               "the sync worker thread could not be started; nothing will sync on this boot");
   }
@@ -779,7 +788,7 @@ void SdEngine::ObserveAnswer(auth::Answer answer) {
   auth::SaveBlock(PathTo(auth::kAuthStateFileName), block);
 }
 
-void SdEngine::AwaitNetwork() {
+bool SdEngine::AwaitNetwork() {
   // The wait for the network happens **here**, on this thread, and never in
   // `main`: a console that comes up with no Wi-Fi must not hold boot
   // (CLAUDE.md, docs/ARCHITECTURE.md §1). A null probe is "the network is up",
@@ -790,32 +799,65 @@ void SdEngine::AwaitNetwork() {
     probe = network_probe_;
   }
   if (!probe) {
-    return;
+    return true;
   }
 
   const std::chrono::steady_clock::time_point deadline =
       std::chrono::steady_clock::now() + kNetworkWaitBudget;
   std::unique_lock<std::mutex> lock(mutex_);
-  while (!stopping_ && std::chrono::steady_clock::now() < deadline) {
+  // `suspended_` as well as `stopping_`, and for the same reason: this runs
+  // before the worker's loop, so a console that sleeps during the boot wait
+  // would otherwise keep asking `nifm` for two minutes with `Quiesce` waiting on
+  // a park that cannot come until the budget runs out (M9-4, #208).
+  while (!stopping_ && !suspended_ && std::chrono::steady_clock::now() < deadline) {
     lock.unlock();
     // Outside the lock: `nifm` is a service call and `mutex_` guards state the
     // frame-polled commands read.
     const bool up = probe();
     lock.lock();
     if (up) {
-      return;
+      return true;
     }
     // `wait_for` rather than a sleep, so a shutdown cuts this short instead of
     // costing the destructor the rest of the poll interval.
-    wake_.wait_for(lock, kNetworkPollInterval, [this] { return stopping_; });
+    wake_.wait_for(lock, kNetworkPollInterval, [this] { return stopping_ || suspended_; });
   }
+  // False when the budget ran out, the process is going away, or the console
+  // went to sleep. Only the last of those is worth another go, and `RunWorker`
+  // is what decides that.
+  return false;
 }
 
 void SdEngine::RunWorker() {
-  AwaitNetwork();
+  bool network_seen = AwaitNetwork();
 
   std::unique_lock<std::mutex> lock(mutex_);
   while (!stopping_) {
+    if (suspended_) {
+      // The console is asleep (M9-4, #208). **Parking here is the whole of "no
+      // network or card I/O between `SleepReady` and the next `MinimumAwake`"**
+      // -- one flag in one place, rather than a rule every call site below has
+      // to remember -- and reaching this line is what `Quiesce` is waiting for,
+      // because getting here means nothing is in flight on this thread.
+      worker_parked_ = true;
+      quiesced_.notify_all();
+      wake_.wait(lock, [this] { return stopping_ || !suspended_; });
+      worker_parked_ = false;
+      if (!stopping_ && !network_seen) {
+        // The boot wait was cut short by the sleep rather than satisfied
+        // (`AwaitNetwork` returns which). A console that came up with Wi-Fi not
+        // yet associated and was shut a few seconds later would otherwise wake
+        // straight into its boot tick and its first drain at `MinimumAwake`,
+        // with `nifm` not reassociated -- both failing, and the boot tick spent.
+        // The grace `kNetworkWaitBudget` exists for is given again, and it still
+        // ends the moment the probe says yes.
+        lock.unlock();
+        network_seen = AwaitNetwork();
+        lock.lock();
+      }
+      continue;
+    }
+
     // Read **before** the decision and compared after the pump: everything that
     // gives this thread work bumps it under `mutex_`, so a notification that
     // lands while the lock is released below cannot be missed. See `wakes_`.
@@ -870,13 +912,18 @@ void SdEngine::RunWorker() {
       wake_.wait_for(lock, std::min(decision.sleep_for, drained.retry_in), woken);
     }
   }
+  // Nothing waits for a worker that has left. A `Quiesce` racing the destructor
+  // would otherwise spend the whole budget on a thread that is already on its
+  // way out, and add three seconds to a shutdown for nothing.
+  worker_live_ = false;
+  quiesced_.notify_all();
 }
 
 SdEngine::DrainStep SdEngine::RunOneDrain() {
   const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (stopping_) {
+    if (stopping_ || suspended_) {
       return {};
     }
     if (now < download_due_) {
@@ -928,7 +975,10 @@ SdEngine::DrainStep SdEngine::RunOneDrain() {
     // documented order and the one `AdoptConfigLocked` already uses: that lock
     // is a leaf and nothing is called while it is held (`config_mutex_`).
     std::lock_guard<std::mutex> lock(mutex_);
-    if (stopping_) {
+    if (stopping_ || suspended_) {
+      // The console went to sleep between the pending count above and here.
+      // Registering the cancel token and starting anyway would be a transfer
+      // opened *after* `Quiesce` had already fired everything it could find.
       return {};
     }
     asked_at = download_wakes_;
@@ -1018,7 +1068,8 @@ SdEngine::DrainStep SdEngine::RunOneDrain() {
 void SdEngine::AwaitBackoff(std::chrono::milliseconds delay) {
   std::unique_lock<std::mutex> lock(mutex_);
   wake_.wait_for(lock, delay, [this] {
-    return stopping_ || (download_cancel_ != nullptr && download_cancel_->canceled());
+    return stopping_ || suspended_ ||
+           (download_cancel_ != nullptr && download_cancel_->canceled());
   });
 }
 
@@ -1026,6 +1077,133 @@ void SdEngine::CancelDrainLocked() {
   if (download_cancel_ != nullptr) {
     download_cancel_->Cancel();
   }
+}
+
+void SdEngine::CancelTickLocked() {
+  if (tick_cancel_ != nullptr) {
+    tick_cancel_->Cancel();
+  }
+}
+
+void SdEngine::Quiesce() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (suspended_) {
+    // Already quiet. `power::Watcher` collapses the two sleep states PSC sends
+    // into one call, so this is belt and braces rather than the ordinary path --
+    // but a second tear-down for one sleep is three seconds of budget spent
+    // twice, and the check is one comparison.
+    return;
+  }
+  suspended_ = true;
+  // Both, and in either order: the worker is in at most one of them. What they
+  // buy is the *bound* -- a drain moving a 4 GB rom and a tick three requests
+  // into a negotiation both end at their next operation boundary rather than
+  // when they were going to.
+  CancelDrainLocked();
+  CancelTickLocked();
+  // The worker may be parked on a deadline rather than inside anything, in which
+  // case nothing above reaches it. `wakes_` is what its wait predicate compares.
+  ++wakes_;
+  lock.unlock();
+  wake_.notify_all();
+  lock.lock();
+
+  const std::chrono::steady_clock::time_point deadline =
+      std::chrono::steady_clock::now() + kQuiesceBudget;
+  // **The whole promise of this function**: when it returns, the worker is not
+  // inside `download::Drain` and not inside `sync::RunTick`, so no save byte and
+  // no rom byte is on its way to the card. A worker that was never started has
+  // nothing to wait for.
+  const bool parked = quiesced_.wait_until(lock, deadline, [this] {
+    return (worker_parked_ || !worker_live_) && !pairing_busy_;
+  });
+  // Read apart rather than derived from `parked`, because the two are
+  // independent and the budget can run out with both of them false. Collapsing
+  // them costs the half of the reason that is not reported, in the one line a
+  // user has to go on.
+  const bool worker_back = worker_parked_ || !worker_live_;
+  const bool pairing_idle = !pairing_busy_;
+  lock.unlock();
+
+  // The other writer of a save file: a restore, on the IPC thread, which takes
+  // this lock rather than `mutex_` (`save_write_mutex_`). It is not the worker
+  // and no cancel token reaches it -- one restore is one copy and it ends on its
+  // own -- so the only thing to do is wait for it, with what is left of the
+  // budget.
+  const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+  // `try_lock` and not `try_lock_for(0)` when the budget is already gone, so the
+  // line below says what was actually true rather than reporting a save write in
+  // flight because there was no time left to ask.
+  const bool quiet = now < deadline ? save_write_mutex_.try_lock_for(deadline - now)
+                                    : save_write_mutex_.try_lock();
+  if (quiet) {
+    save_write_mutex_.unlock();
+  }
+
+  if (!parked || !quiet) {
+    // Said out loud, because the acknowledgement goes out anyway and this is the
+    // only way anyone finds out that it went out early. Refusing to acknowledge
+    // is not the alternative: that is a console that never finishes the
+    // transition, with no fatal and no crash report to show for it
+    // (sys-con#155). Before the sink goes, so it reaches the card rather than
+    // only the tail.
+    log::Warn(log::Event::kPower,
+              std::string("the console is sleeping and this client is still busy after ") +
+                  std::to_string(kQuiesceBudget.count()) + "ms" +
+                  (worker_back ? "" : "; the worker has not come back") +
+                  (pairing_idle ? "" : "; a pairing request has not come back") +
+                  (quiet ? "" : "; a save write is still in flight"));
+  }
+
+  // **What is deliberately not done here: sockets and transfer memory.** #208's
+  // scope asks for both, and the answer to each is a fact about this client's
+  // transport. There is no socket to close -- one is opened per request inside
+  // `ssl_http_client.cpp` and closed when the request ends, and there is no
+  // listening socket in this process at all, so the waits above are what make it
+  // true that none is open. And releasing the bsd transfer memory means
+  // `socketExit()`, which cannot be undone: `socketInitialize` is not refcounted
+  // and answers `0xF59 AlreadyInitialized` forever afterwards (`main.cpp`
+  // argues the same point about not retrying the transport). Doing it would buy
+  // 116 KiB the kernel keeps mapped either way and cost the network for the rest
+  // of the boot.
+  //
+  // **Last, and it is the piece parking the worker cannot buy.** A `log::Write`
+  // from any thread opens the log file, appends and closes it, so a single line
+  // after this point is `fsp-srv` I/O on a card this process has just told PSC
+  // it is finished with (`log::SetSinkEnabled`). The tail stays, so `GetLog`
+  // still answers everything a sleeping console had to say.
+  log::SetSinkEnabled(false);
+}
+
+void SdEngine::Resume() {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!suspended_) {
+      return;
+    }
+    suspended_ = false;
+    // The card is back, so the log file is too -- `MinimumAwake` and not
+    // `EssentialServicesAwake`, which is the state `power::Resumes` picks for
+    // exactly this reason. `erpt` turns its own filesystem access back on at the
+    // same point.
+    log::SetSinkEnabled(true);
+    // Wake the worker, and **nothing else**.
+    //
+    // Not `WakeDownloads`'s clear of `download_due_`/`download_backoff_`, which
+    // is the tempting mistake: a drain cancelled by the suspend already ends
+    // `DrainOutcome::kCanceled` and `RunOneDrain` clears the pacing for it
+    // there, so clearing again here would only ever discard a backoff a *server*
+    // earned -- and a console that woke up straight onto a rom endpoint that has
+    // been answering 500 for an hour is the loop `kDownloadRetryBackoff` exists
+    // to prevent.
+    ++wakes_;
+    // **Nothing restamps the schedule**, deliberately. `sync::Scheduler` states
+    // its interval on the wall clock precisely so that the hours a suspend hid
+    // are hours elapsed: an eleven-hour sleep is one interval due, not
+    // twenty-two, and `Poll()` fires once (scheduler.hpp). Touching it here
+    // would be this file having a second opinion about the same question.
+  }
+  wake_.notify_all();
 }
 
 void SdEngine::LogDrain(const download::DrainResult& result) {
@@ -1204,8 +1382,24 @@ void SdEngine::RunOneTick() {
   fs::FileSystem* files = nullptr;
   auth::StoredToken token;
   bool blocked = false;
+  // This tick's cancel token, registered before anything is read so that a
+  // shutdown or a sleep landing an instant later finds something to fire. Held
+  // as a local for the length of the tick as well: `Resume` replaces the member
+  // and the copy here is what keeps this tick's token alive under it
+  // (`tick_cancel_`, and `download_cancel_` before it).
+  const std::shared_ptr<http::CancelToken> cancel = std::make_shared<http::CancelToken>();
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    tick_cancel_ = cancel;
+    if (stopping_ || suspended_) {
+      // The window the worker's own check cannot cover: it decided a tick was
+      // due, released `mutex_`, and a shutdown or a `SleepReady` landed before
+      // this line. Cancelling the token rather than returning is what keeps the
+      // scheduler's accounting straight -- every stage answers `kCanceled` at
+      // once and `Finished` is still called with it, where an early return would
+      // leave a tick the scheduler handed out and never heard back about.
+      cancel->Cancel();
+    }
     client = server_;
     files = card_;
     token = token_;
@@ -1378,7 +1572,7 @@ void SdEngine::RunOneTick() {
   options.enabled = config->sync.enabled;
   options.execute.backup_dir = sync::kBackupDir;
   options.finish.state_sd_path = sync::kStateSdPath;
-  options.cancel = &tick_cancel_;
+  options.cancel = cancel.get();
   // The save folders and `.backup/`, and deliberately **not** `/config/rommsync`
   // itself: those records recover from their own `.old` when they are read, and
   // the overlay writes `config.ini` from another thread, where a sweep removing
@@ -1414,7 +1608,7 @@ void SdEngine::RunOneTick() {
   // arriving from the overlay is refused rather than interleaved
   // (`save_write_mutex_`). Held across the transfers and the states half, and
   // released before the counters go under `mutex_`.
-  std::unique_lock<std::mutex> writing(save_write_mutex_);
+  std::unique_lock<std::timed_mutex> writing(save_write_mutex_);
 
   const sync::TickResult tick =
       sync::RunTick(*client, *files, token, reported, targets, loaded.value, options);
@@ -1459,7 +1653,7 @@ void SdEngine::RunOneTick() {
     state::Baseline baseline = state::LoadBaseline(baseline_path).value;
     sync::StateSyncOptions state_options;
     state_options.backup_dir = sync::kBackupDir;
-    state_options.cancel = &tick_cancel_;
+    state_options.cancel = cancel.get();
     state_options.place = [place = placer(&config::PlatformFolders::states)](
                               const sync::ServerState& server) {
       return place(server.rom_id, server.file_name);
@@ -1687,8 +1881,46 @@ bool SdEngine::AwaitNextPoll(const std::shared_ptr<PairingAttempt>& attempt) {
   // shutdown, which is what promptness there actually depends on.
   const std::chrono::steady_clock::time_point due = attempt->session.next_poll_at();
   std::unique_lock<std::mutex> lock(mutex_);
+  // Between requests, which is the only moment this thread is not busy: the flag
+  // is claimed by whoever hands this thread an attempt and released here, so a
+  // `Quiesce` sees it clear exactly while there is nothing in flight and nothing
+  // about to be (`pairing_busy_`).
+  pairing_busy_ = false;
+  quiesced_.notify_all();
   wake_.wait_until(lock, due, [this, &attempt] { return stopping_ || attempt_ != attempt; });
-  return !stopping_ && attempt_ == attempt;
+  // ...and then, if the console has gone to sleep, until it comes back (M9-4,
+  // #208). This is the *only* thing a suspend can do about this thread: a poll
+  // already in flight cannot be cancelled -- `http::HttpClient` has no way to be
+  // interrupted from outside a call -- so what is left is to refuse to start the
+  // next one. Without it a sleeping console goes on asking RomM for a token over
+  // a socket the transition is about to take away.
+  //
+  // The code the user is looking at may well expire while the console sleeps.
+  // That is `auth::PairingSession`'s answer to give, and it gives the same one
+  // it would have given had the poll gone out and been refused.
+  wake_.wait(lock, [this, &attempt] {
+    return stopping_ || attempt_ != attempt || !suspended_;
+  });
+  if (stopping_ || attempt_ != attempt) {
+    return false;
+  }
+  // **Busy again here, under the lock that just read `!suspended_`.** Claiming it
+  // in `DrivePairing` after this returns would leave a window with the lock
+  // released, and a `Quiesce` landing in it would find the flag clear,
+  // acknowledge the sleep, and then watch this thread open a socket.
+  pairing_busy_ = true;
+  return true;
+}
+
+void SdEngine::SetPairingBusy(bool busy) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pairing_busy_ = busy;
+  }
+  // Only a `Quiesce` waits on this, and only for the false edge -- but notifying
+  // on both costs one wake-up per pairing poll on a console that is not
+  // sleeping, which is a few over the life of an attempt.
+  quiesced_.notify_all();
 }
 
 void SdEngine::DrivePairing() {
@@ -1696,7 +1928,12 @@ void SdEngine::DrivePairing() {
     std::shared_ptr<PairingAttempt> attempt;
     {
       std::unique_lock<std::mutex> lock(mutex_);
-      wake_.wait(lock, [this] { return stopping_ || attempt_ != driven_; });
+      // `!suspended_` as well (M9-4, #208): `Begin()` below is a network
+      // request, and a `StartPair` that arrives while the console is asleep must
+      // not send one over a socket the transition is taking away. The command
+      // itself is still answered -- `StartPairing` returns `kStarting` and the
+      // screen draws it -- and this thread picks the attempt up on the wake.
+      wake_.wait(lock, [this] { return stopping_ || (attempt_ != driven_ && !suspended_); });
       if (stopping_) {
         return;
       }
@@ -1707,11 +1944,23 @@ void SdEngine::DrivePairing() {
         // picked it up. There is nothing to drive.
         continue;
       }
+      // Claimed here rather than after the lock is released, for the reason
+      // `AwaitNextPoll` gives about the same window.
+      pairing_busy_ = true;
     }
 
     // The request `StartPairing` refused to wait for. Everything from here down
     // is off the IPC thread, so it may take as long as `request_timeout`.
+    //
+    // Bracketed by `pairing_busy_` since M9-4 (#208): a `Quiesce` may not
+    // acknowledge a sleep with a request in flight on *any* thread, and this is
+    // the one thread whose request it cannot stop. The two waits above are what
+    // stop the *next* one going out; both claim the flag before they let go of
+    // `mutex_`, so there is no window between deciding to call and being seen to
+    // be calling.
     auth::PairingState state = attempt->session.Begin();
+    // `AwaitNextPoll` releases the flag while it waits and takes it again before
+    // it returns true -- see it for why it cannot be done out here.
     while (!auth::IsTerminal(state) && AwaitNextPoll(attempt)) {
       state = attempt->session.Poll();
     }
@@ -1719,12 +1968,22 @@ void SdEngine::DrivePairing() {
       // Denied, expired, failed -- or superseded, in which case the attempt that
       // replaced this one is what the next turn of this loop picks up. All four
       // leave the card exactly as it was.
+      //
+      // Still marked busy if the flag was reclaimed by the last poll, so it is
+      // released before going round: the outer wait is the other place this
+      // thread is idle.
+      SetPairingBusy(false);
       continue;
     }
     const auth::DeviceTokenResponse* granted = attempt->session.token();
     if (granted != nullptr) {
+      // **Still busy, deliberately.** The flag has been held since the poll that
+      // approved this, because these are two card writes and a sleep
+      // acknowledged between `token.dat` and `auth.json` is the transition
+      // taking `fsp-srv` away in the middle of a commit.
       CommitGrant(attempt, *granted);
     }
+    SetPairingBusy(false);
   }
 }
 
@@ -2000,7 +2259,7 @@ ipc::Error SdEngine::RestoreBackup(std::int64_t entry_id, conflicts::RestoreRepo
   // `kBackupFailed` is the outcome whose promise is exactly what holds here --
   // nothing was written -- and the sentence beside it is what the screen draws,
   // so the user is told to press again rather than told their backup is gone.
-  std::unique_lock<std::mutex> writing(save_write_mutex_, std::try_to_lock);
+  std::unique_lock<std::timed_mutex> writing(save_write_mutex_, std::try_to_lock);
   if (!writing.owns_lock()) {
     report->outcome = conflicts::RestoreOutcome::kBackupFailed;
     report->message = "a sync is running; try the restore again when it finishes";

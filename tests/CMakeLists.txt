@@ -84,6 +84,7 @@ foreach(scenario
         rotates   # the cap, the single `.old`, and the ceiling on the pair
         tail      # the in-memory ring GetLog is answered from
         sink      # a null sink writes nowhere; an installed one gets everything
+        suspended # M9-4: the card off for a sleep, with the ring still filling
         events)   # every tag is unique and IsEvent round-trips kAllEvents
   add_test(NAME log.${scenario} COMMAND test_log ${scenario})
   set_tests_properties(log.${scenario} PROPERTIES TIMEOUT 60)
@@ -2164,7 +2165,8 @@ endforeach()
 # card), which is what makes "it compiles" stop being a description of what the
 # engine does. Needs no server: what it pins is the card.
 add_executable(test_engine test_engine.cpp
-  "${CMAKE_SOURCE_DIR}/sysmodule/source/engine.cpp")
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/engine.cpp"
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/power.cpp")
 target_link_libraries(test_engine PRIVATE rommsync::host)
 target_include_directories(test_engine PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/sysmodule/source")
@@ -2192,6 +2194,7 @@ set(ENGINE_SCENARIOS
   restore_race  # M7-2: a restore pressed while a tick is writing saves is refused, not interleaved
   log       # M7-3: the misconfigurations docs/TROUBLESHOOTING.md answers, on the record
   stale_active  # M9-5: an `active` row a power cut left is work, not a live transfer
+  sleeps    # M9-4: the console sleeps mid-tick, and the acknowledgement waits for the save write
 )
 foreach(scenario IN LISTS ENGINE_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
@@ -2248,12 +2251,37 @@ endforeach()
 # long -- so both slow the transfer down from the test side rather than from the
 # engine (`Throttled`, tests/test_engine.cpp). Serial with the rest of this group
 # for the reason every rig test is: they download the shared fixture's roms.
-foreach(scenario downloading preempts discards repoints shutdown)
+# `sleep_download` joins them for M9-4 (#208): the other thing the worker can be
+# doing at a `SleepReady` is a rom, and the assertion is that it had come back
+# from `download::Drain` before the acknowledgement rather than after it.
+foreach(scenario downloading preempts discards repoints shutdown sleep_download)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
   if(NOT ROMMSYNC_REQUIRE_RIG)
     set_tests_properties(engine.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
   endif()
   set_tests_properties(engine.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+endforeach()
+
+# --- M9-4: the console going to sleep, and coming back -----------------------
+# `psc:m` is a service, so the console's `power::Module` cannot be reached from a
+# laptop -- but everything the module is FOR can be, and every one of those is a
+# console that hangs, crashes or sleeps with a save half written when it is
+# wrong: one acknowledgement per request, the quiesce BEFORE the acknowledgement,
+# two sleep states in a row being one suspend, and a state this build has never
+# heard of still being answered (#208).
+#
+# `power.cpp` is the portable half and is compiled here; `power_psc.cpp` is the
+# libnx one and is compiled by nothing but devkitPro, which is `card.cpp`'s
+# arrangement for `card.cpp`'s reason.
+add_executable(test_power test_power.cpp
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/power.cpp")
+target_link_libraries(test_power PRIVATE rommsync::host Threads::Threads)
+target_include_directories(test_power PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/sysmodule/source")
+
+foreach(scenario states once)
+  add_test(NAME power.${scenario} COMMAND test_power ${scenario})
+  set_tests_properties(power.${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
 
 # --- M9-1: what `__appInit` does, and what it cannot be asked ----------------
@@ -2296,7 +2324,7 @@ add_test(NAME boot.journal COMMAND test_boot_services journal)
 set_tests_properties(boot.resolve boot.wait boot.journal PROPERTIES TIMEOUT 60)
 
 set(SYSMODULE_BOOT_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_sysmodule_boot.py")
-foreach(scenario IN ITEMS dns clock bounded comments)
+foreach(scenario IN ITEMS dns clock bounded comments psc)
   add_test(NAME boot.${scenario}
            COMMAND ${Python3_EXECUTABLE} "${SYSMODULE_BOOT_TEST}" ${scenario}
                    --repo "${CMAKE_SOURCE_DIR}")

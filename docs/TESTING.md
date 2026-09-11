@@ -714,8 +714,22 @@ ctest --test-dir build --output-on-failure
   `boot.resolve` drives the shipping connector at a host *name* through
   `posix_connection.cpp`, and
   `boot.wait` and `boot.journal` drive the bounded wait against a fake `sm`, so a
-  ten-second budget is spent in accounting rather than in wall-clock. None of the
-  seven needs Docker, a rig, or a resolver, so none of them ever skips.
+  ten-second budget is spent in accounting rather than in wall-clock. `boot.psc`
+  is the fifth static reader (M9-4, #208): `psc:m` granted in the SAC,
+  `pscmInitialize` called with a bound in front of it, and a module registered
+  with `PscPmModuleId_Fs` as its dependency -- which is what decides whether this
+  process is told about a sleep early enough to matter. None of the
+  eight needs Docker, a rig, or a resolver, so none of them ever skips.
+- The `power.*` pair is the sleep contract without a console (M9-4, #208).
+  `psc:m` is a service and cannot be reached from a laptop, but everything the
+  subscription is *for* can be: `power.states` drives a whole
+  `SleepReady -> ... -> MinimumAwake` through `power::Watcher` and a scripted
+  `power::Module`, and `power.once` pins the two orderings that decide whether a
+  console freezes or loses a save -- the quiesce happens **before** the
+  acknowledgement, and a state this build has never heard of is acknowledged
+  anyway. Neither needs Docker or a rig. The engine's half of the same contract
+  is `engine.sleeps` (a save write in flight at `SleepReady`, no rig) and
+  `engine.sleep_download` (a 120 MiB rom in flight, which needs one).
 - The `package.*` group covers `scripts/package.sh`, which turns those two build
   outputs into the zip a user unpacks onto their SD card. `package.layout`,
   `package.refuses`, `package.deterministic` and `package.upgrade` stub the two

@@ -156,6 +156,16 @@ enum class Event {
   /// draining and a window that stops moving, and both are invisible from
   /// outside. No save is at risk; that is `kSaveFailed`.
   kPlayFailed,
+
+  /// The console was going to sleep and this client was still busy (M9-4, #208).
+  ///
+  /// **Only ever written when the quiesce ran out of budget**, which is the one
+  /// thing about sleep handling nobody can see from outside: the acknowledgement
+  /// to PSC goes out either way -- a request PSC never gets back is a whole
+  /// console frozen with no fatal and no crash report (sys-con#155) -- so this
+  /// line is what says it went out with a transfer or a save write still in
+  /// flight. Ordinarily a console sleeps and writes nothing here at all.
+  kPower,
 };
 
 /// Every event, in declaration order. The guide and the emitted set are both
@@ -166,7 +176,7 @@ inline constexpr std::array kAllEvents = {
     Event::kConfigDiagnostic, Event::kNoServer, Event::kNoSaveDirs,
     Event::kNetOffline,  Event::kNetTls,      Event::kScanSkipped,
     Event::kSyncRefused, Event::kSyncTick,    Event::kSaveFailed,
-    Event::kDownload,    Event::kPlayFailed,
+    Event::kDownload,    Event::kPlayFailed,  Event::kPower,
 };
 
 /// Stable tag -- `net.offline`. Never null.
@@ -251,6 +261,42 @@ void SetSink(Sink* sink);
 /// The installed sink, or null. For a test that wants to put its own back.
 Sink* GetSink();
 
+/// Stop and start writing to the sink, keeping the tail either way (M9-4, #208).
+///
+/// **The console going to sleep is what this is for.** A sink writes to the SD
+/// card -- `FileSink` opens the file, appends and closes it, once per line -- and
+/// between `SleepReady` and the next `MinimumAwake` this process may not touch
+/// `fsp-srv` at all: it has told PSC that it is finished with the card, and the
+/// services behind it are going down. A log line written in that window is the
+/// one piece of card I/O that no amount of parking the worker prevents, because
+/// every thread writes through here.
+///
+/// Atmosphere's own `erpt` does exactly this and nothing more elaborate:
+/// `Stream::EnableFsAccess(false)` on the way down and `true` at `MinimumAwake`
+/// (`erpt/srv/erpt_srv_service.cpp`).
+///
+/// **Nothing is lost that `GetLog` could show.** The tail is in memory and is
+/// filled whether a sink is enabled or not, so the overlay reads the lines a
+/// sleeping console wrote exactly as it reads any other. What they miss is the
+/// *file*, which is the trade the card is owed -- and a sleeping console writes
+/// very little, because the whole point of the suspend is that it has stopped.
+///
+/// Idempotent, and safe from any thread. Not the same as `SetSink(nullptr)`: the
+/// sink is remembered, so whoever installed it is still the only caller who has
+/// to know what it is.
+///
+/// **It does not wait for a write already past the check.** `Write` reads the
+/// switch under the lock and calls the sink outside it, so a thread inside that
+/// gap finishes its line. Making this wait would mean a suspend blocking on a
+/// card write it cannot bound, which is the console that will not sleep; the
+/// caller's answer is instead to have parked every thread it owns first
+/// (`SdEngine::Quiesce`), which leaves no writer to be in the gap.
+void SetSinkEnabled(bool enabled);
+
+/// Whether the sink is being written to. False between a `SetSinkEnabled(false)`
+/// and the matching `true`, whether or not a sink was ever installed.
+bool SinkEnabled();
+
 /// Write one line: `<ordinal> <level> <event> <detail>`.
 ///
 /// `detail` may be empty, in which case the line is the first three fields. It
@@ -307,8 +353,10 @@ struct Line {
 /// written, which is what tells a reader the tail is a tail.
 std::uint64_t Tail(std::size_t count, std::vector<Line>* out);
 
-/// Forget every line and reset the ordinal. **For tests**, which run several
-/// scenarios in one process and would otherwise read each other's lines.
+/// Forget every line, reset the ordinal, and switch the sink back on. **For
+/// tests**, which run several scenarios in one process and would otherwise read
+/// each other's lines -- or, since M9-4 (#208), inherit a sink one of them
+/// disabled by putting a console to sleep.
 void Reset();
 
 /// `text` with the three things that may never be written down taken out.

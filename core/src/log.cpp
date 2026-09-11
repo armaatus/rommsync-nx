@@ -22,6 +22,11 @@ namespace {
 struct State {
   std::mutex mutex;
   Sink* sink = nullptr;
+
+  /// Whether the sink is written to at all (M9-4, #208). True until a console
+  /// goes to sleep, when the card is off-limits and the ring is all there is.
+  bool sink_enabled = true;
+
   std::uint64_t written = 0;
   std::deque<Line> ring;
 };
@@ -314,6 +319,8 @@ const char* ToString(Event event) {
       return "download.drain";
     case Event::kPlayFailed:
       return "play.failed";
+    case Event::kPower:
+      return "power.sleep";
   }
   return "unknown";
 }
@@ -354,6 +361,18 @@ Sink* GetSink() {
   return state.sink;
 }
 
+void SetSinkEnabled(bool enabled) {
+  State& state = TheLog();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  state.sink_enabled = enabled;
+}
+
+bool SinkEnabled() {
+  State& state = TheLog();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  return state.sink_enabled;
+}
+
 void Write(Level level, Event event, std::string_view detail) {
   std::string line;
   Sink* sink = nullptr;
@@ -385,7 +404,20 @@ void Write(Level level, Event event, std::string_view detail) {
     while (state.ring.size() > kTailLines) {
       state.ring.pop_front();
     }
-    sink = state.sink;
+    // The ring is filled either way; only the *card* is switched off (M9-4,
+    // #208, and `SetSinkEnabled`).
+    //
+    // **It is read here and the sink is called below, outside the lock**, so a
+    // `SetSinkEnabled(false)` landing in between still lets this one line reach
+    // the card. That is not closed here, and it is not a hole: the callers this
+    // could be are the ones `SdEngine::Quiesce` already waits for -- the worker
+    // has parked and the pairing thread is between requests before the switch is
+    // thrown, and neither can be part-way through a `log::Write` once it has --
+    // plus the IPC thread, which `Quiesce` documents as not covered either way.
+    // Closing it would mean either calling the sink under this lock, which is
+    // the one thing the comment below forbids, or making a suspend wait on a
+    // card write it cannot bound.
+    sink = state.sink_enabled ? state.sink : nullptr;
   }
 
   // Outside the lock, deliberately: a sink writes to an SD card, and holding the
@@ -440,6 +472,10 @@ void Reset() {
   std::lock_guard<std::mutex> lock(state.mutex);
   state.ring.clear();
   state.written = 0;
+  // Back on, because "reset" has to mean the log as a fresh process finds it. A
+  // scenario that put a console to sleep (M9-4, #208) and reset afterwards would
+  // otherwise leave the next one silently writing nothing to its sink.
+  state.sink_enabled = true;
 }
 
 std::string PreviousLogPathFor(std::string_view path) { return std::string(path) + ".old"; }

@@ -44,6 +44,7 @@
 #include "http/http_wire.hpp"
 #include "http/ssl_http_client.hpp"
 #include "ipc/server.hpp"
+#include "power.hpp"
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/core.hpp"
 #include "rommsync/device_identity.hpp"
@@ -73,11 +74,12 @@ namespace {
 //   | one in-flight transfer buffer            | `kHeapTransferBuffer`   | 0x4000  |  16 KiB |
 //   | the largest buffered response            | `kHeapListResponse`     | 0x7D000 | 500 KiB |
 //   | two thread stacks (M1-6, M7-2)           | `kHeapThreadStacks`     | 0x44000 | 272 KiB |
+//   | the PSC watcher's stack (M9-4)           | `kHeapWatcherStack`     | 0xA000  |  40 KiB |
 //   | the log's in-memory tail (M7-3)          | `kHeapLogTail`          | 0x1800  |   6 KiB |
 //   | the play-session buffer (M7-4)           | `kHeapPlaySessions`     | 0x8000  |  32 KiB |
 //   | the directories open at once (M9-2)      | `kHeapOpenDirectories`  | 0x2000  |   8 KiB |
 //   | newlib arena overhead and fragmentation  | `kHeapNewlibOverhead`   | 0x8000  |  32 KiB |
-//   | **peak**                                 | `kHeapPeak`             | 0x135800 | 1238 KiB |
+//   | **peak**                                 | `kHeapPeak`             | 0x13F800 | 1278 KiB |
 //
 // The table is written this way so that something other than a reader adds it
 // up. `tests/test_heap_budget.py` totals these rows and compares each against
@@ -116,6 +118,13 @@ namespace {
 //     than devkitA64's undeclared 128 KiB (`sized_thread.hpp`), and the term is
 //     the stack plus what libnx allocates beside it -- thread-local storage, a
 //     `struct _reent`, and the page a `memalign` wastes at the front.
+//   * **Three threads since M9-4 (#208)**, and the third is a quarter of the
+//     size, which is why it is its own row rather than a bigger multiplier on
+//     the one above. The PSC watcher waits on an event and calls
+//     `SdEngine::Quiesce`; it reaches no JSON, no save write and no recursion,
+//     so `kWatcherStackBytes` is 32 KiB where the engine's threads take 128
+//     (`sized_thread.hpp` measures both). Its overhead beside the stack is the
+//     same `kThreadHeapOverheadBytes` the other two pay.
 //   * **The log keeps its last lines in RAM**, so `GetLog` can answer without
 //     going near the card (log.hpp). It is `kTailLines * kMaxLineBytes` at
 //     worst, and it is a term here rather than a cost nobody added up. That is
@@ -226,14 +235,17 @@ constexpr size_t kHeapListResponse = kHeapPlatformsResponse > kHeapRomIndexRespo
                                          : kHeapRomIndexResponse;
 constexpr size_t kHeapThreadStacks =
     2 * (rommsync::sysmodule::kThreadStackBytes + rommsync::sysmodule::kThreadHeapOverheadBytes);
+constexpr size_t kHeapWatcherStack =
+    rommsync::sysmodule::kWatcherStackBytes + rommsync::sysmodule::kThreadHeapOverheadBytes;
 constexpr size_t kHeapLogTail = rommsync::log::kTailLines * rommsync::log::kMaxLineBytes;
 constexpr size_t kHeapPlaySessions = 2 * rommsync::play::kMaxBufferBytes;
 constexpr size_t kHeapOpenDirectories = kMaxOpenDirectories * kOpenDirectoryBytes;
 constexpr size_t kHeapNewlibOverhead = 0x8000;
 
 constexpr size_t kHeapPeak = kHeapSocketMemory + kHeapStateBaseline + kHeapTransferBuffer +
-                             kHeapListResponse + kHeapThreadStacks + kHeapLogTail +
-                             kHeapPlaySessions + kHeapOpenDirectories + kHeapNewlibOverhead;
+                             kHeapListResponse + kHeapThreadStacks + kHeapWatcherStack +
+                             kHeapLogTail + kHeapPlaySessions + kHeapOpenDirectories +
+                             kHeapNewlibOverhead;
 
 // The arithmetic above, checked by the compiler rather than by a reader. It is
 // the transfer memory that this is really about: the trimmed socket config is
@@ -248,6 +260,7 @@ static_assert(kHeapTransferBuffer == 0x4000, "kTransferBufferSize moved; retotal
 static_assert(kHeapListResponse == 0x7D000,
               "roms::kDefaultPageSize or lists::kMaxPlatforms moved; retotal the table");
 static_assert(kHeapThreadStacks == 0x44000, "kThreadStackBytes moved; retotal the table");
+static_assert(kHeapWatcherStack == 0xA000, "kWatcherStackBytes moved; retotal the table");
 static_assert(kHeapLogTail == 0x1800, "log::kTailLines moved; retotal the table");
 static_assert(kHeapPlaySessions == 0x8000, "play::kMaxBufferBytes moved; retotal the table");
 static_assert(kHeapOpenDirectories == 0x2000,
@@ -256,12 +269,13 @@ static_assert(kHeapOpenDirectories == 0x2000,
 // to its row rather than a second reader of a bound. Changing the term is a red
 // build here, which is the point: it is the term a reader is likeliest to nudge.
 static_assert(kHeapNewlibOverhead == 0x8000, "the newlib arena term moved; retotal the table");
-static_assert(kHeapPeak == 0x135800, "the table above no longer sums to its peak row");
+static_assert(kHeapPeak == 0x13F800, "the table above no longer sums to its peak row");
 
-// 0x150000 leaves 0x1A800 -- 106 KiB -- over that peak, which is the margin a
+// 0x150000 leaves 0x10800 -- 66 KiB -- over that peak, which is the margin a
 // process nobody can attach a debugger to needs. It is the only margin stated
 // here on purpose: #207's prose quoted two, 94 KiB and 78 KiB, and the
-// arithmetic gave neither.
+// arithmetic gave neither. M9-4 (#208) took 40 KiB of it for the PSC watcher's
+// thread, which is the row above.
 //
 // **It grew by 0x90000 in M9-2**, from 0xC0000: 576 KiB more `.bss` in a
 // resident image that was ~2.00 MiB, against an Atmosphere third-party sysmodule
@@ -288,7 +302,7 @@ constexpr size_t kInnerHeapSize = 0x150000;
 constexpr size_t kHeapMargin = kInnerHeapSize - kHeapPeak;
 
 static_assert(kHeapPeak < kInnerHeapSize, "the heap no longer covers the peak in the table above");
-static_assert(kHeapMargin == 0x1A800,
+static_assert(kHeapMargin == 0x10800,
               "the margin in the sentence above is no longer the one left");
 
 alignas(16) u8 g_inner_heap[kInnerHeapSize];
@@ -461,6 +475,10 @@ class SmWaiter final : public rommsync::sysmodule::boot::Waiter {
 /// `__appInit` skipped: libnx's service guard counts, and an exit without an
 /// init takes the count below zero.
 bool g_time_up = false;
+
+/// The same, for `pscmInitialize()` (M9-4, #208), and for the same reason: an
+/// unmatched `pscmExit` takes libnx's refcount below zero.
+bool g_psc_up = false;
 
 /// Whether the "this sm will not answer 65100" note has already been taken. One
 /// note, not one per service: it is the same answer for every question that
@@ -689,6 +707,32 @@ void __appInit(void) {
     g_time_up = R_SUCCEEDED(rc);
   }
 
+  // **PSC, so this process finds out that the console is going to sleep**
+  // (M9-4, #208). Without it the transition happens around us: `fsp-srv` and the
+  // sockets are still in use when the services behind them go down, which is the
+  // pattern that crashes consoles for other projects -- and for us it is a save
+  // write cut in half, which is hard rule 2. `power.hpp` has the whole argument
+  // and the crash reports.
+  //
+  // Registered here, where every service acquisition is, and **subscribed to in
+  // `main`**: `pscmGetPmModule` needs a `power::Sink` to hand requests to, and
+  // the engine that is one does not exist until then.
+  //
+  // Not fatal, and this is the one place the choice is arguable. A console with
+  // no sleep handling is one that can lose a save, so aborting has a case -- but
+  // it would take the overlay, the settings screen and the queue down with it
+  // over a service Nintendo's own boot registers before `/atmosphere/contents`
+  // is reached at all (`psc` is what publishes `time:s`, waited for just above).
+  // So it is a `warn` in the log a user is asked to attach, and the client runs
+  // as it did before this issue.
+  if (WaitForService("psc:m")) {
+    rc = pscmInitialize();
+    if (R_FAILED(rc)) {
+      rommsync::sysmodule::boot::Note(g_boot, "rommsync: pscmInitialize", rc);
+    }
+    g_psc_up = R_SUCCEEDED(rc);
+  }
+
   // The transport, here rather than on first use, because a sysmodule does
   // everything at start: a failure here is a line in a boot log, and the same
   // failure under a user's thumb is a pairing screen that never moves. Its
@@ -775,6 +819,7 @@ void __appInit(void) {
 void __appExit(void) {
   // `nifmExit` is `NetworkExit`'s, not ours: this process opens `nifm:u` once,
   // inside `NetworkInitialize` (#195).
+  if (g_psc_up) pscmExit();
   if (g_time_up) timeExit();
   rommsync::sysmodule::NetworkExit();
   fsdevUnmountAll();
@@ -890,6 +935,35 @@ int main(int, char**) {
   engine.UseCard(g_card.get());
   engine.UseNetworkProbe(&rommsync::sysmodule::ConsoleIsOnline);
   engine.StartWorker();
+
+  // **The console can now tell this process that it is going to sleep** (M9-4,
+  // #208). After `StartWorker`, because the thing a sleep has to stop is the
+  // worker -- a subscription taken before it would answer its first request by
+  // waiting for a thread that does not exist yet.
+  //
+  // Held for the life of the process. It is never destroyed, because `main`
+  // never returns; the destructor exists for the tests, which is where the
+  // watcher's thread is actually joined.
+  //
+  // **Declared after `engine`, and it has to be.** `Quiesce` runs on the thread
+  // this owns and reads the engine's members, so were the engine to be destroyed
+  // first it would be torn out from under a quiesce in flight. Reverse
+  // declaration order is what makes this go first; `SdEngine::Quiesce` records
+  // the requirement.
+  //
+  // **Gated on `g_psc_up`**, which is this file's pattern rather than a
+  // precaution about this call: `timeExit` is gated the same way and
+  // `NetworkInitialize` runs only behind the four `WaitForService`s that
+  // precede it. Without the gate `pscmGetPmModule` would go out on a session
+  // `pscmInitialize` never opened -- which `Open()` handles, and which is
+  // exactly the kind of "handled" a reader has to go and check.
+  std::unique_ptr<rommsync::sysmodule::power::Subscription> psc;
+  if (g_psc_up) {
+    psc = rommsync::sysmodule::power::Subscribe(engine);
+  }
+  Log(psc != nullptr ? "rommsync: subscribed to psc:m; sleep will be handled"
+                     : "rommsync: no psc:m subscription; this console will not be told when "
+                       "it sleeps");
 
   rommsync::ipc::ServiceCore core(engine);
   rommsync::sysmodule::ServiceServer server(core, g_service_port);
