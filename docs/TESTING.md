@@ -741,10 +741,14 @@ ctest --test-dir build --output-on-failure
   surprise. `overlay.portable` is the odd one out and is a grep: it holds the
   portable half of `overlay/source/` -- `draw_list.hpp`, `prompts.hpp`,
   `screen_frame.*`, `status_paint.*` -- to naming no `tesla.hpp`, `tsl::`,
-  `libultrahand` or `arm_neon`, because the compile only covers the files this
-  target happens to build and the *next* screen's painter is the one that would
-  quietly leave the reach of every test. None of the seven needs Docker or a
-  rig, so none of them skips.
+  `libultrahand` or `arm_neon`, transitively through the headers they include,
+  because the compile only covers the files this target happens to build and the
+  *next* screen's painter is the one that would quietly leave the reach of every
+  test. It carries one more rule the compile cannot: **nothing in
+  `overlay/source/` calls `drawString` except `DrawBounded`**, the one function
+  that refuses a `maxWidth` of `0` -- which libtesla reads as *no limit* while
+  every screen's width arithmetic produces it to mean *no room*. None of the
+  seven needs Docker or a rig, so none of them skips.
   What they do **not** reach, and why, is in the two limits below.
 - The `power.*` pair is the sleep contract without a console (M9-4, #208).
   `psc:m` is a service and cannot be reached from a laptop, but everything the

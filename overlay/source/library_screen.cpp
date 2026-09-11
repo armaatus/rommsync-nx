@@ -254,8 +254,10 @@ s32 LibraryScreen::PromptRows() const {
 void LibraryScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
                          s32 height) const {
   // Nothing is drawn past the bounds `CustomDrawer` handed us, and nothing runs
-  // off the right edge: `drawString`'s `maxWidth` defaults to "no limit", and a
-  // rom's name is the user's data with no length this screen can assume.
+  // off the right edge: a rom's name is the user's data with no length this
+  // screen can assume. Every string goes through `DrawBounded`, because a width
+  // that came out `0` here means "no room" and `drawString` would read it as
+  // "no limit" (`palette.hpp`).
   const s32 bottom = y + height;
   const s32 line_width = width > kInset ? width - kInset : 0;
   const s32 label_width =
@@ -278,7 +280,7 @@ void LibraryScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
       clipped = true;
       return;
     }
-    renderer->drawString(text, false, x, row, font, color, line_width);
+    DrawBounded(renderer, text, x, row, font, color, line_width);
     row += advance;
   };
 
@@ -314,7 +316,7 @@ void LibraryScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
     // selection of its own, and a caret is one glyph against a theme this
     // screen does not own.
     if (selected) {
-      renderer->drawString(">", false, x, row, kBodyFont,
+      DrawBounded(renderer, ">", x, row, kBodyFont,
                            tsl::gfx::Renderer::a(tsl::defaultTextColor), kRowIndent);
     }
     // A row that will not download is drawn muted -- present, greyed, with its
@@ -323,10 +325,10 @@ void LibraryScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
     const bool live = entry.state == RowState::kReady || entry.state == RowState::kInert;
     const tsl::Color label_color =
         live ? tsl::gfx::Renderer::a(tsl::defaultTextColor) : muted;
-    renderer->drawString(entry.label, false, x + kRowIndent, row, kBodyFont, label_color,
+    DrawBounded(renderer, entry.label, x + kRowIndent, row, kBodyFont, label_color,
                          label_width);
     if (!entry.value.empty() && value_width > 0) {
-      renderer->drawString(entry.value, false, x + width - kValueColumn, row, kBodyFont, muted,
+      DrawBounded(renderer, entry.value, x + width - kValueColumn, row, kBodyFont, muted,
                            value_width);
     }
     row += kRowHeight;
@@ -338,7 +340,7 @@ void LibraryScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
       if (row + kNoteHeight > rows_bottom) {
         break;
       }
-      renderer->drawString(entry.note, false, x + kRowIndent, row, kNoteFont,
+      DrawBounded(renderer, entry.note, x + kRowIndent, row, kNoteFont,
                            ColorFor(entry.tone), label_width);
       row += kNoteHeight;
     }

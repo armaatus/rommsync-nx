@@ -10,6 +10,8 @@
 
 #include <tesla.hpp>
 
+#include <string>
+
 #include "draw_list.hpp"
 #include "rommsync/overlay_status_view.hpp"
 
@@ -41,5 +43,26 @@ tsl::Color MutedColor();
 /// frame of an open or close, and a painter that is meant to run on a host
 /// cannot call it at all.
 Palette CurrentPalette();
+
+/// `drawString`, refusing a `max_width` of zero.
+///
+/// **Every screen in this directory computes its column widths as
+/// `width > K ? width - K : 0`, meaning "no room" -- and libtesla reads
+/// `drawString`'s `maxWidth = 0` as *no limit*.** Handed straight over, that is
+/// the opposite of what the subtraction is for, at exactly the width where
+/// bounding matters most: a 256-byte `fs_name` off a RomM library, or a
+/// 512-byte `verification_url`, painted across the console.
+///
+/// M9-7 (#198) found it in the status screen, which by then had a layout a test
+/// could reach. The other four screens have the same arithmetic and no test, so
+/// the guard is here rather than repeated in each: one place to be right, and
+/// `ctest -R overlay.portable` greps this directory so nothing calls
+/// `drawString` around it. A screen that genuinely wants no bound has to say so
+/// with a width; none of them does.
+///
+/// Nothing else about it differs from `drawString`. `drawRect` needs no twin --
+/// libtesla already declines a non-positive width.
+void DrawBounded(tsl::gfx::Renderer* renderer, const std::string& text, s32 x, s32 y,
+                 s32 font_size, tsl::Color color, s32 max_width);
 
 }  // namespace rommsync::overlay

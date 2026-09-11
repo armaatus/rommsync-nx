@@ -317,8 +317,10 @@ s32 SettingsScreen::PromptRows() const {
 void SettingsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
                           s32 height) const {
   // Nothing is drawn past the bounds `CustomDrawer` handed us, and nothing runs
-  // off the right edge: `drawString`'s `maxWidth` defaults to "no limit", and a
-  // folder path is the user's own text with no length this screen can assume.
+  // off the right edge: a folder path is the user's own text with no length this
+  // screen can assume. Every string goes through `DrawBounded`, because a width
+  // that came out `0` here means "no room" and `drawString` would read it as
+  // "no limit" (`palette.hpp`).
   const s32 bottom = y + height;
   const s32 line_width = width > kInset ? width - kInset : 0;
   // Everything drawn at `x + kRowIndent` is bounded from there, not from `x`.
@@ -346,7 +348,7 @@ void SettingsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
       clipped = true;
       return;
     }
-    renderer->drawString(text, false, x, row, font, color, line_width);
+    DrawBounded(renderer, text, x, row, font, color, line_width);
     row += advance;
   };
 
@@ -375,7 +377,7 @@ void SettingsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
     // screen does not own.
     const auto marker = [&]() {
       if (selected) {
-        renderer->drawString(">", false, x, row, kBodyFont, plain, kRowIndent);
+        DrawBounded(renderer, ">", x, row, kBodyFont, plain, kRowIndent);
       }
     };
 
@@ -385,9 +387,9 @@ void SettingsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
         break;
       }
       marker();
-      renderer->drawString(complaint.label, false, x + kRowIndent, row, kNoteFont,
+      DrawBounded(renderer, complaint.label, x + kRowIndent, row, kNoteFont,
                            ColorFor(complaint.tone), kValueColumn);
-      renderer->drawString(complaint.value, false, x + kRowIndent + kValueColumn, row, kNoteFont,
+      DrawBounded(renderer, complaint.value, x + kRowIndent + kValueColumn, row, kNoteFont,
                            ColorFor(complaint.tone), value_width);
       row += kRowHeight;
       continue;
@@ -399,7 +401,7 @@ void SettingsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
         break;
       }
       marker();
-      renderer->drawString(section.title, false, x + kRowIndent, row, kBodyFont, plain,
+      DrawBounded(renderer, section.title, x + kRowIndent, row, kBodyFont, plain,
                            indented_width);
       row += kSectionHeight;
       // A section with no rows is a section with something to say -- a platform
@@ -409,7 +411,7 @@ void SettingsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
         if (row + kNoteHeight > list_bottom) {
           break;
         }
-        renderer->drawString(section.note, false, x + kRowIndent, row, kNoteFont,
+        DrawBounded(renderer, section.note, x + kRowIndent, row, kNoteFont,
                              ColorFor(section.note_tone), indented_width);
         row += kNoteHeight;
       }
@@ -421,9 +423,9 @@ void SettingsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
       break;
     }
     marker();
-    renderer->drawString(entry_row.label, false, x + kRowIndent, row, kBodyFont, muted,
+    DrawBounded(renderer, entry_row.label, x + kRowIndent, row, kBodyFont, muted,
                          kValueColumn);
-    renderer->drawString(entry_row.value, false, x + kRowIndent + kValueColumn, row, kBodyFont,
+    DrawBounded(renderer, entry_row.value, x + kRowIndent + kValueColumn, row, kBodyFont,
                          ColorFor(entry_row.tone), value_width);
     row += kRowHeight;
 
@@ -434,7 +436,7 @@ void SettingsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
       if (row + kNoteHeight > list_bottom) {
         break;
       }
-      renderer->drawString(entry_row.note, false, x + kRowIndent, row, kNoteFont,
+      DrawBounded(renderer, entry_row.note, x + kRowIndent, row, kNoteFont,
                            ColorFor(entry_row.tone), indented_width);
       row += kNoteHeight;
     }

@@ -190,9 +190,10 @@ s32 ConflictsScreen::PromptRows() const {
 void ConflictsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
                            s32 height) const {
   // Nothing is drawn past the bounds `CustomDrawer` handed us, and nothing runs
-  // off the right edge: `drawString`'s `maxWidth` defaults to "no limit", and a
-  // rom's name and an SD path are the user's data with no length this screen can
-  // assume.
+  // off the right edge: a rom's name and an SD path are the user's data with no
+  // length this screen can assume. Every string goes through `DrawBounded`,
+  // because a width that came out `0` here means "no room" and `drawString`
+  // would read it as "no limit" (`palette.hpp`).
   const s32 bottom = y + height;
   const s32 line_width = width > kInset ? width - kInset : 0;
   const s32 body_width = width > kRowIndent + kInset ? width - kRowIndent - kInset : 0;
@@ -216,7 +217,7 @@ void ConflictsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width
       clipped = true;
       return;
     }
-    renderer->drawString(text, false, x, row, font, color, line_width);
+    DrawBounded(renderer, text, x, row, font, color, line_width);
     row += advance;
   };
 
@@ -248,21 +249,21 @@ void ConflictsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width
       }
       const bool selected = index == view_.selected;
       if (selected) {
-        renderer->drawString(">", false, x, row, kBodyFont, plain, kRowIndent);
+        DrawBounded(renderer, ">", x, row, kBodyFont, plain, kRowIndent);
       }
       // An entry that cannot be restored is drawn muted -- present, greyed,
       // with its reason under it. Never hidden: an overwrite the screen did not
       // list is an overwrite the user cannot find the backup for, which is the
       // failure this screen exists to prevent.
       const bool live = entry.restorable == Restorability::kReady;
-      renderer->drawString(entry.label, false, x + kRowIndent, row, kBodyFont,
+      DrawBounded(renderer, entry.label, x + kRowIndent, row, kBodyFont,
                            live ? plain : muted, body_width);
       row += kRowHeight;
       if (!entry.value.empty()) {
         if (row + kNoteHeight > body_bottom) {
           break;
         }
-        renderer->drawString(entry.value, false, x + kRowIndent, row, kNoteFont, muted,
+        DrawBounded(renderer, entry.value, x + kRowIndent, row, kNoteFont, muted,
                              body_width);
         row += kNoteHeight;
       }
@@ -272,7 +273,7 @@ void ConflictsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width
         if (row + kNoteHeight > body_bottom) {
           break;
         }
-        renderer->drawString(entry.note, false, x + kRowIndent, row, kNoteFont,
+        DrawBounded(renderer, entry.note, x + kRowIndent, row, kNoteFont,
                              ColorFor(entry.tone), body_width);
         row += kNoteHeight;
       }
@@ -284,8 +285,8 @@ void ConflictsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width
       if (clipped || row + kNoteHeight > body_bottom) {
         break;
       }
-      renderer->drawString(detail.label, false, x, row, kNoteFont, muted, kDetailLabel);
-      renderer->drawString(detail.value, false, x + kDetailLabel, row, kNoteFont,
+      DrawBounded(renderer, detail.label, x, row, kNoteFont, muted, kDetailLabel);
+      DrawBounded(renderer, detail.value, x + kDetailLabel, row, kNoteFont,
                            ColorFor(detail.tone), value_width);
       row += kNoteHeight;
     }

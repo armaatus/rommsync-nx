@@ -27,6 +27,7 @@
 // One scenario per CTest entry (`overlay.card`, `overlay.wire`, ...), selected
 // by argv[1], so a red run names the behaviour that broke. Nothing here needs a
 // server, so nothing here skips.
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -562,12 +563,51 @@ int RunVersion(Checks& checks) {
 
   // No port at all. The state a user who forgot the boot toggle is in, and the
   // only one the card is then consulted about (`card_probe.hpp`).
+  //
+  // Asserted as a *contrast*, because the blocks above each registered and
+  // unregistered a port of their own: a bare `Ready()` here would answer
+  // `kNotRunning` whatever this code did, and the assertion would pass over a
+  // `Ready()` that had stopped working entirely.
+  {
+    Console running;
+    running.Start();
+    overlay::IpcClient present;
+    overlay::ScreenFrame present_frame(present);
+    checks.Expect(present_frame.Ready() == overlay::Link::kOk,
+                  "a fresh session on a registered port is ready");
+  }
   {
     overlay::IpcClient orphan;
     overlay::ScreenFrame orphan_frame(orphan);
-    console.Stop();
     checks.Expect(orphan_frame.Ready() == overlay::Link::kNotRunning,
-                  "no rommsync port is kNotRunning");
+                  "and with no rommsync port, the same first call is kNotRunning");
+  }
+
+  // **A passed handshake is not re-run while the session lives.** So `Ready()`
+  // still answers `kOk` after the sysmodule exits underneath it -- a handle
+  // stays a handle until somebody uses it, and it is the next *command* that
+  // discovers the far end is gone (`overlay.errors` drives that, and
+  // `ScreenFrame::Diagnose` is what turns it into a sentence).
+  //
+  // Pinned rather than left implicit. It is correct as it stands -- a screen
+  // polls inside one `update()`, so the failed command and the redraw are the
+  // same frame and no stale frame reaches the panel -- but it is the exact
+  // shape M9-6 (#209) has to bound: that next command is the one with no
+  // timeout in front of it.
+  {
+    Console live;
+    live.Start();
+    overlay::IpcClient client;
+    overlay::ScreenFrame frame(client);
+    checks.Expect(frame.Ready() == overlay::Link::kOk, "the handshake passes");
+    live.Stop();
+    checks.Expect(frame.Ready() == overlay::Link::kOk,
+                  "and Ready() does not re-probe a session it has already checked");
+    ipc::Status status;
+    const Result rc = client.GetStatus(&status);
+    checks.Expect(R_FAILED(rc), "the next command is what fails");
+    checks.Expect(frame.Diagnose(rc) == overlay::Link::kNotRunning,
+                  "...and Diagnose is what names it 'not running'");
   }
   return checks.failures();
 }
@@ -688,7 +728,7 @@ int RunErrors(Checks& checks) {
 /// breaking this target. That is the failure this is for, and the same shape as
 /// the greps `overlay.sync_actions` and `conflicts.overlay` already run.
 constexpr const char* kPortableFiles[] = {
-    "draw_list.hpp", "prompts.hpp", "screen_frame.hpp",
+    "draw_list.hpp",    "prompts.hpp",      "screen_frame.hpp",
     "screen_frame.cpp", "status_paint.hpp", "status_paint.cpp",
 };
 
@@ -699,28 +739,78 @@ constexpr const char* kForbiddenPlatform[] = {
     "tesla.hpp", "tsl::", "libultrahand", "arm_neon",
 };
 
+/// `line` with any trailing `//` comment removed.
+///
+/// Cut rather than skipped whole: these files explain the rules they keep, and
+/// explaining a rule is not breaking it -- but a *code* line with a trailing
+/// comment (`Palette p;  // the host twin of tsl::Color`) is code, and skipping
+/// it whole would let the next token past while failing this one for a comment.
+/// A `/* */` block is not handled, and neither is one in the greps next door;
+/// nothing in this directory uses them.
+std::string WithoutComment(const std::string& line) {
+  const std::size_t at = line.find("//");
+  return at == std::string::npos ? line : line.substr(0, at);
+}
+
+/// Every local header `path` includes, directly. `<angled>` includes are the
+/// forbidden tokens' business and are not followed.
+std::vector<std::string> LocalIncludes(const std::filesystem::path& path) {
+  std::vector<std::string> included;
+  std::ifstream file(path);
+  std::string line;
+  while (std::getline(file, line)) {
+    const std::string code = WithoutComment(line);
+    const std::size_t hash = code.find("#include \"");
+    if (hash == std::string::npos) {
+      continue;
+    }
+    const std::size_t start = code.find('"', hash) + 1;
+    const std::size_t end = code.find('"', start);
+    if (end == std::string::npos) {
+      continue;
+    }
+    const std::string name = code.substr(start, end - start);
+    // Only this directory's own headers. `rommsync/...` is `core/`, which hard
+    // rule 4 already holds to the same standard.
+    if (name.find('/') == std::string::npos) {
+      included.push_back(name);
+    }
+  }
+  return included;
+}
+
 int RunPortable(Checks& checks) {
   for (const char* name : kPortableFiles) {
-    const std::filesystem::path path =
-        std::filesystem::path(ROMMSYNC_OVERLAY_SOURCE_DIR) / name;
-    std::ifstream file(path);
-    checks.Expect(file.good(), std::string("the source is readable: ") + name);
-    std::string line;
-    int number = 0;
-    while (std::getline(file, line)) {
-      ++number;
-      // Comment lines are skipped: these files explain the rule they keep, and
-      // explaining a rule is not breaking it. The same convention the greps in
-      // `overlay.library` and `overlay.settings` use.
-      const std::size_t first = line.find_first_not_of(" \t");
-      if (first != std::string::npos && line.compare(first, 2, "//") == 0) {
-        continue;
+    // **Transitively.** A token scan of these six files alone would pass while
+    // one of them grew `#include "palette.hpp"` -- and `palette.hpp` is the
+    // tesla-carrying sibling sitting right next to them, so that is the likely
+    // way this comes back rather than an unlikely one. The closure is what the
+    // compiler would see.
+    std::vector<std::string> queue{name};
+    std::vector<std::string> seen{name};
+    for (std::size_t at = 0; at < queue.size(); ++at) {
+      const std::filesystem::path path =
+          std::filesystem::path(ROMMSYNC_OVERLAY_SOURCE_DIR) / queue[at];
+      std::ifstream file(path);
+      checks.Expect(file.good(), std::string("the source is readable: ") + queue[at]);
+      std::string line;
+      int number = 0;
+      while (std::getline(file, line)) {
+        ++number;
+        const std::string code = WithoutComment(line);
+        for (const char* token : kForbiddenPlatform) {
+          checks.Expect(code.find(token) == std::string::npos,
+                        std::string(queue[at]) + ":" + std::to_string(number) + " names " +
+                            token + ", and " + name +
+                            " includes it; this half of a screen has to compile on a host "
+                            "(overlay/AGENTS.md)");
+        }
       }
-      for (const char* token : kForbiddenPlatform) {
-        checks.Expect(line.find(token) == std::string::npos,
-                      std::string(name) + ":" + std::to_string(number) + " names " + token +
-                          "; this half of a screen has to compile on a host "
-                          "(overlay/AGENTS.md)");
+      for (const std::string& next : LocalIncludes(path)) {
+        if (std::find(seen.begin(), seen.end(), next) == seen.end()) {
+          seen.push_back(next);
+          queue.push_back(next);
+        }
       }
     }
   }
@@ -732,6 +822,33 @@ int RunPortable(Checks& checks) {
     checks.Expect(
         std::filesystem::exists(std::filesystem::path(ROMMSYNC_OVERLAY_SOURCE_DIR) / name),
         std::string(name) + " is still in overlay/source/ -- the rule has a file to be about");
+  }
+
+  // Nothing in this directory calls `drawString` except the one function that
+  // guards it. libtesla reads `maxWidth = 0` as *no limit* and every screen
+  // computes a width that can come out `0` meaning "no room", so a call around
+  // `DrawBounded` is that bug back (`palette.hpp`, M9-7 #198). A grep because
+  // none of the five `Draw` methods is reachable from any test.
+  for (const std::filesystem::directory_entry& entry :
+       std::filesystem::directory_iterator(ROMMSYNC_OVERLAY_SOURCE_DIR)) {
+    const std::filesystem::path path = entry.path();
+    if (path.extension() != ".cpp" && path.extension() != ".hpp") {
+      continue;
+    }
+    const std::string name = path.filename().string();
+    if (name == "palette.cpp") {
+      continue;  // the guard itself
+    }
+    std::ifstream file(path);
+    std::string line;
+    int number = 0;
+    while (std::getline(file, line)) {
+      ++number;
+      checks.Expect(WithoutComment(line).find("drawString") == std::string::npos,
+                    name + ":" + std::to_string(number) +
+                        " calls drawString around DrawBounded; a maxWidth of 0 is "
+                        "\"no limit\" (palette.hpp)");
+    }
   }
   return checks.failures();
 }

@@ -26,6 +26,14 @@ Ultrahand overlay list.
   rendering-independent view model in `core/`, held by a host test
   (`ctest -R overlay.status`). What is left here is the drawing. Put a decision
   in a `tsl::Gui` and it becomes untestable until someone has a console.
+- **Never call `drawString` directly; call `DrawBounded` (`source/palette.hpp`).**
+  libtesla reads `maxWidth = 0` as *no limit*, and every screen here computes
+  its column widths as `width > K ? width - K : 0`, meaning *no room* — so a
+  narrow panel used to paint a 256-byte `fs_name` straight off a RomM library
+  across the console, in all five screens. One guard, in one place;
+  `ctest -R overlay.portable` greps this directory for a call around it, because
+  not one of the five `Draw` methods is reachable from a test. `drawRect` needs
+  no twin: libtesla already declines a non-positive width.
 - **The drawing is two halves too, and one of those runs.** M9-7 (#198) put a
   pure-data seam between a screen's layout and libtesla: `source/draw_list.hpp`
   is a `DrawList` of two calls and a `Palette` of raw RGBA4444 words, the layout
@@ -56,11 +64,13 @@ Ultrahand overlay list.
   `test_overlay_native` and driven against the real `ipc::Dispatch` and the real
   `sysmodule::ToResult` — so a payload the two halves disagree about is a red
   test rather than a first-boot surprise. libnx comes from
-  `tests/hostswitch/switch.h`, which stubs **only** what those four files name,
-  plus the one thing the seam itself has to model — a session whose sysmodule
-  exited. A file that needs it to grow is either one that does not belong on
-  this seam, or a sign the seam has moved. Say which here rather than reaching
-  for the stub: the value of that header is that it is small enough to read.
+  `tests/hostswitch/switch.h`, which stubs **only** what the two files that
+  reach for it name — `source/ipc_client.cpp` and `source/screen_frame.cpp`;
+  the other two name no libnx symbol at all — plus the one thing the seam itself
+  has to model, a session whose sysmodule exited. A file that needs it to grow
+  is either one that does not belong on this seam, or a sign the seam has moved.
+  Say which here rather than reaching for the stub: the value of that header is
+  that it is small enough to read.
 - **Keep `source/screen_frame.hpp` free of `tesla.hpp`.** It is what lets the
   handshake and the *not running* / *unreachable* decision run under
   `ctest -R overlay.version` and `overlay.errors`, and it is what will let the

@@ -28,17 +28,14 @@ class RendererDrawList : public DrawList {
  public:
   explicit RendererDrawList(tsl::gfx::Renderer* renderer) : renderer_(renderer) {}
 
+  /// Through `DrawBounded`, which is what makes `DrawList`'s "zero means zero"
+  /// true on a console: libtesla reads `drawString`'s `maxWidth = 0` as *no
+  /// limit* (`palette.hpp`). Every other screen goes through the same function.
   void String(const std::string& text, std::int32_t x, std::int32_t y, std::int32_t font_size,
               Rgba4444 color, std::int32_t wrap_width) override {
-    if (wrap_width <= 0) {
-      // `drawString`'s `maxWidth` takes 0 as "no limit", so a width of zero
-      // handed straight over would draw the one thing a zero was asked for to
-      // prevent. A screen with no room for a string draws none.
-      return;
-    }
-    renderer_->drawString(text, false, static_cast<s32>(x), static_cast<s32>(y),
-                          static_cast<s32>(font_size), tsl::Color(color),
-                          static_cast<ssize_t>(wrap_width));
+    DrawBounded(renderer_, text, static_cast<s32>(x), static_cast<s32>(y),
+                static_cast<s32>(font_size), tsl::Color(color),
+                static_cast<s32>(wrap_width));
   }
 
   void Rect(std::int32_t x, std::int32_t y, std::int32_t width, std::int32_t height,
