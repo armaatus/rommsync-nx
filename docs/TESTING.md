@@ -720,6 +720,26 @@ ctest --test-dir build --output-on-failure
   with `PscPmModuleId_Fs` as its dependency -- which is what decides whether this
   process is told about a sleep early enough to matter. None of the
   eight needs Docker, a rig, or a resolver, so none of them ever skips.
+- The `overlay.card`, `overlay.wire`, `overlay.roundtrip`, `overlay.version`,
+  `overlay.errors` and `overlay.draw` scenarios are **`overlay/source/` itself,
+  compiled by a host compiler and run** (M9-7, #198). Everything else in the
+  `overlay.*` group tests the view models in `core/` -- what a screen *says* --
+  and greps the directory for what it must not contain; until #198 not one of
+  the 19 files under `overlay/source/` had been built by anything but devkitPro,
+  and `status_screen.hpp` said so in its own header comment. Four of them are
+  compiled into `test_overlay_native`:
+  `card_probe.cpp` (the four install states the status screen tells apart, off a
+  card laid out in the scratch directory -- `ProbeCardAt` is the seam),
+  `ipc_client.cpp` (the whole client half of the wire),
+  `screen_frame.cpp` (the version handshake, and *not running* versus
+  *unreachable*), and `status_paint.cpp` (the status screen's layout, behind the
+  `DrawList` seam). The far side is the **real** `ipc::Dispatch` over a real
+  `ipc::ServiceCore`, answering through the **real** `sysmodule::ToResult` --
+  split into `sysmodule/source/ipc/result.cpp` so the overlay's `DecodeError` is
+  held against the mapping that ships rather than against a copy of it. So an
+  overlay/sysmodule contract mismatch is a red test rather than a first-boot
+  surprise. None of the six needs Docker or a rig, so none of them skips.
+  What they do **not** reach, and why, is in the two limits below.
 - The `power.*` pair is the sleep contract without a console (M9-4, #208).
   `psc:m` is a service and cannot be reached from a laptop, but everything the
   subscription is *for* can be: `power.states` drives a whole
@@ -1070,7 +1090,7 @@ two cannot drift.
 | `sync` | Full sync engine (M2) passes on host + docker RomM, including conflict / partial-failure / resume. | `sync.*`, `execute.*`, `states.*`, `complete.*`, `tick.*`, `scan.*`, `core.state_db`, `core.md5`, `core.sha1*`, and the edge cases the box names by hand: `harness.conflict`, `harness.partial`, `harness.resume`, `harness.same_timestamp` |
 | `downloads` | Downloads (M3) pass with Range resume + hash verify against docker RomM. | `download.*`, `rom.*`, `toggle.download`, `http.range*`, `http.resume*`, `wire.range*`, `wire.resume*`, `harness.content_hash`, `harness.multifile` |
 | `auth` | Auth (M1) full device-code flow + 401/refresh proven on host + docker RomM. | `auth.*`, `pair.*`, `device.*`, `core.token_store`, `core.device_identity`, `harness.expired`, and M1-6's `engine.pairs`, `engine.repairs`, `engine.nonblocking`, `engine.unauthenticated` |
-| `ipc` | Config + IPC (M5) proven on host harness. | `core.config`, `config.*`, `ipc.*`, `lists.*`, `overlay.*`, `engine.config`, `engine.commands`. What these prove is the protocol; `sysmodule/source/ipc/server.cpp` is libnx `cmif` glue that no test reaches either, and it is verified with the rest of the Horizon glue at M8-2. |
+| `ipc` | Config + IPC (M5) proven on host harness. | `core.config`, `config.*`, `ipc.*`, `lists.*`, `overlay.*`, `engine.config`, `engine.commands`. What these prove is the protocol, and since M9-7 (#198) they prove it through the overlay's own `ipc_client.cpp` as well as through `ipc::Dispatch` -- `overlay.wire`, `overlay.roundtrip`, `overlay.errors`. What no test reaches is the libnx `cmif`/`hipc` glue: `sysmodule/source/ipc/server.cpp` and the message unpacking in `service.cpp`, verified with the rest of the Horizon glue at M8-2. |
 | `ssl` | HttpClient ssl-service backend proven in a Ryujinx NRO (M0-1), or on an isolated NRO on a backup SD. | **Nothing yet.** `switch.builds` and `switch.tlsprobe` prove it compiles and links for aarch64; no handshake has been executed anywhere. See *what the first console decides*. |
 | `backup` | Every save-overwrite path shown to back up first (SYNC_PROTOCOL hard rule) -- verified by tests. | `harness.backup`, `execute.*`, `states.overwrite`, `states.keeps_both`, `tick.backupdir`, `tick.durable` — **and a census** of every `io::CommitStaged`/`CopyAtomically`/`WriteAtomically` call site in `core/src`, `sysmodule/source` and `overlay/source`, so a *new* overwrite path fails the gate until somebody classifies it. The two Horizon targets are in scope because `sysmodule/source/engine.cpp` already writes a file, and a census that only read `core/` would answer a narrower question than the row asks. Each row that lands on a save names the call that does it, and the census insists a call to `sync::BackUpFirst` comes before it — which is how M7-1's restore, whose overwrite is a `CopyAtomically` rather than a `CommitStaged`, is held to the same rule as the two paths M2-5 wrote. That census is the word "every"; the tests are the rest. |
 | `release` | A tagged, released v1 build exists (M6). | A `v1` tag reachable from `main` that agrees with `VERSION`, and a published, non-draft release carrying the zip and `SHA256SUMS`. **Failing today: this repository has no tags and no releases.** |
@@ -1166,3 +1186,34 @@ with `.backup/` populated before ever pointing at the real library.
   scheduling, ovl-sysmodules toggling, and the Tesla/Ultrahand overlay UI itself
   (emulators don't load overlays). These are deliberately the *last* things
   touched, and only after everything above is proven.
+
+### The overlay, precisely
+
+"The overlay UI" above is no longer the whole of `overlay/source/`. Since M9-7
+(#198) the parts of it that are not drawing calls compile and run on a host --
+see the `overlay.*` bullet under rung 1. What remains hardware-only is narrower
+than it was, and it is these three things:
+
+- **Pixels.** `tsl::gfx::Renderer` is `final` with non-virtual inline methods and
+  every element's `draw` takes the concrete type, so there is no fake to pass it.
+  The screens are split at `DrawList` (`overlay/source/draw_list.hpp`) instead:
+  what a screen *asks* to be drawn is asserted natively (`overlay.draw`), and
+  what the renderer does with it is not. A pixel-exact host renderer is possible
+  in principle -- `getPixelOffset` is pure integer maths and every primitive
+  below `init`/`startFrame`/`endFrame` is portable C++ -- but the fonts come from
+  `pl:u` and Nintendo's shared fonts are not redistributable, so a substitute TTF
+  would change glyph metrics and with them every wrap, ellipsis and centring.
+  Snapshot tests over that would catch *our* regressions and not fidelity.
+  Post-gate at best.
+- **The `cmif`/`hipc` message.** `tests/hostswitch/switch.h` stands in for the
+  twelve libnx symbols `ipc_client.cpp` names, and the seam it models is the
+  contract on either side of the transport: request bytes in, response bytes out,
+  a `Result`, and the `u64` reply word saying how much of the Out buffer is
+  valid. The message itself -- what `HandleRequest` unpacks in
+  `sysmodule/source/ipc/service.cpp`, and what libnx packs on the other side --
+  is not modelled, because reimplementing it would test the reimplementation.
+  It is M8-2's.
+- **`tsl::Gui` lifecycle.** `createUI`, `update` per frame, `handleInput`, the
+  `changeTo` stack, and `tsl::loop`'s behaviour while the overlay is hidden.
+  M9-6 (#209) is what takes as much of this as can be taken, on the seam #198
+  built.

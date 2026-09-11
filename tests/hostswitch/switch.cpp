@@ -41,8 +41,8 @@ void Register(const char* name, Server* server) {
   ++Generation();
 }
 
-void Unregister(const char* name) {
-  if (RegisteredName() == name) {
+void Unregister(const char* name, Server* server) {
+  if (RegisteredName() == name && RegisteredServer() == server) {
     RegisteredName().clear();
     RegisteredServer() = nullptr;
     ++Generation();

@@ -119,8 +119,9 @@ class DrawList {
 /// `library_screen.cpp` and `pairing_screen.cpp` before `screen_frame.hpp`
 /// existed, and a private-use codepoint typed from memory in four places is
 /// four chances to get one wrong. In *this* header rather than that one because
-/// a prompt is a string and `screen_frame.hpp` includes `tesla.hpp`; a painter
-/// that needs the label must not need a renderer to get it.
+/// a prompt is text a layout draws, and a layout gets everything it needs from
+/// here. Every screen still reaches them through `screen_frame.hpp`, which
+/// includes this file.
 inline constexpr const char* kGlyphA = "\uE0E0";
 inline constexpr const char* kGlyphB = "\uE0E1";
 inline constexpr const char* kGlyphX = "\uE0E2";

@@ -105,7 +105,10 @@ class Server {
 /// for -- a shim that let a live session keep working would make that path
 /// unreachable.
 void Register(const char* name, Server* server);
-void Unregister(const char* name);
+
+/// Takes the server it is giving up, so a fixture that went out of scope after a
+/// later one registered cannot unregister the later one's port.
+void Unregister(const char* name, Server* server);
 
 /// Every dispatch this process has made, for the assertions that are about the
 /// call rather than about the answer.

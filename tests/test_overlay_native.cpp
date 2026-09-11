@@ -137,7 +137,7 @@ class Console {
   Console& operator=(const Console&) = delete;
 
   void Start() { hostswitch::Register(ipc::kServiceName, &sysmodule_); }
-  void Stop() { hostswitch::Unregister(ipc::kServiceName); }
+  void Stop() { hostswitch::Unregister(ipc::kServiceName, &sysmodule_); }
 
   fakes::FakeEngine& engine() { return engine_; }
   HostSysmodule& sysmodule() { return sysmodule_; }
@@ -564,7 +564,7 @@ int RunVersion(Checks& checks) {
   {
     overlay::IpcClient orphan;
     overlay::ScreenFrame orphan_frame(orphan);
-    hostswitch::Unregister(ipc::kServiceName);
+    console.Stop();
     checks.Expect(orphan_frame.Ready() == overlay::Link::kNotRunning,
                   "no rommsync port is kNotRunning");
   }

@@ -26,6 +26,42 @@ Ultrahand overlay list.
   rendering-independent view model in `core/`, held by a host test
   (`ctest -R overlay.status`). What is left here is the drawing. Put a decision
   in a `tsl::Gui` and it becomes untestable until someone has a console.
+- **The drawing is two halves too, and one of those runs.** M9-7 (#198) put a
+  pure-data seam between a screen's layout and libtesla: `source/draw_list.hpp`
+  is a `DrawList` of two calls and a `Palette` of raw RGBA4444 words, the layout
+  lives in a file that includes no `tesla.hpp` (`source/status_paint.cpp`), and
+  what is left in the `tsl::Gui` is an adapter that replays each command into
+  `tsl::gfx::Renderer`. `ctest -R overlay.draw` records the commands and asserts
+  the row positions, the clip against the panel's foot, the bar arithmetic and
+  the colours. The precedent is `masagrator/Status-Monitor-Deux`, which puts the
+  same struct between its logic and libtesla.
+  **Why a seam rather than a fake renderer:** `tsl::gfx::Renderer` is `final`
+  with non-virtual inline methods and every element's
+  `virtual void draw(gfx::Renderer*)` takes the concrete type, so there is
+  nothing to inject. The alternative was a stub `switch.h` for the whole of
+  libultrahand — some thirty symbols — on an arm64 host, because `tesla.hpp` has
+  an unguarded `#include <arm_neon.h>`. That buys a library nobody asserts
+  anything about; this buys the layout, which is the part with the arithmetic in
+  it. A **pixel-exact** host renderer was considered and rejected for now: the
+  fonts come from `pl:u` and Nintendo's are not redistributable, so a substitute
+  TTF changes every wrap and centring and a snapshot would pin our own output
+  rather than the console's (docs/TESTING.md, "The overlay, precisely").
+  A new screen puts its layout behind a `DrawList` too. One that draws through
+  `tsl::gfx::Renderer` directly has left the reach of every test.
+- **The parts of this directory that need no renderer are compiled and run on a
+  host.** `source/card_probe.cpp`, `source/ipc_client.cpp`,
+  `source/screen_frame.cpp` and `source/status_paint.cpp` are built into
+  `test_overlay_native` and driven against the real `ipc::Dispatch` and the real
+  `sysmodule::ToResult` — so a payload the two halves disagree about is a red
+  test rather than a first-boot surprise. libnx comes from
+  `tests/hostswitch/switch.h`, which stubs the twelve symbols `ipc_client.cpp`
+  names **and nothing else**: a file that needs a thirteenth is either one that
+  does not belong on this seam, or a sign the seam has moved. Say which here
+  rather than growing the stub.
+- **Keep `source/screen_frame.hpp` free of `tesla.hpp`.** It is what lets the
+  handshake and the *not running* / *unreachable* decision run under
+  `ctest -R overlay.version` and `overlay.errors`. Colours live in
+  `source/palette.hpp`, which every screen that draws includes directly.
 - Flat files in `core/src/` only. CMake globs recursively; `switch.mk` uses a
   non-recursive wildcard, so a `core/src/overlay/` would build on the host and
   silently vanish from the Switch build.
@@ -34,13 +70,15 @@ Ultrahand overlay list.
   would collide with the `core/src/pairing.cpp` linked in beside it —
   `switch.mk` stops the build rather than letting VPATH pick a winner. Screens
   are `<thing>_screen.*`, which keeps them clear of `core/src/`.
-- **A screen's palette, handshake and reopen are `source/screen_frame.*`'s, not
-  its own.** Take a `ScreenFrame` member, call `Ready()` before any command and
-  `Diagnose(rc)` after a failed one, and name no colour: `ColorFor(Tone)` is the
-  one place `core/`'s vocabulary and libultrahand's meet. Three copies of the
-  handshake is how a version check gets fixed in two screens out of four. What
-  stays per-screen is the layout block, because M8-2 (#44) adjusts it against a
-  real panel one screen at a time.
+- **A screen's handshake and reopen are `source/screen_frame.*`'s, and its
+  palette is `source/palette.*`'s — neither is its own.** Take a `ScreenFrame`
+  member, call `Ready()` before any command and `Diagnose(rc)` after a failed
+  one, and name no colour: `ColorFor(Tone)` is the one place `core/`'s
+  vocabulary and libultrahand's meet, and `CurrentPalette()` is that resolved
+  once per frame for a `DrawList`. Three copies of the handshake is how a
+  version check gets fixed in two screens out of four. What stays per-screen is
+  the layout block, because M8-2 (#44) adjusts it against a real panel one
+  screen at a time.
 - **A refusal the sysmodule named is not a transport failure.** Both arrive as a
   failing `Result`; `overlay::DecodeError(rc, &error)` is what tells them apart,
   and only what it refuses goes to `ScreenFrame::Diagnose`. A screen that sent
@@ -102,8 +140,10 @@ Ultrahand overlay list.
   those for anything in `source/`, and do not patch the submodule in place —
   bumping it is moving the pointer.
 
-Overlay UI is one of the few things an emulator cannot exercise, so it is
-verified last, on hardware, after the M8-1 gate. `README.md` carries the script
-M8-2 (#44) runs.
+What is left that no test reaches is narrower than it was, and
+[docs/TESTING.md](../docs/TESTING.md) names it precisely: the pixels libtesla
+paints, the `cmif`/`hipc` message under the IPC client, and the `tsl::Gui`
+lifecycle. Those are verified last, on hardware, after the M8-1 gate;
+`README.md` carries the script M8-2 (#44) runs.
 
 [libultrahand]: https://github.com/ppkantorski/libultrahand

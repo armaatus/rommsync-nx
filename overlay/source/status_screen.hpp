@@ -9,10 +9,13 @@
 // same reason: what cannot be tested before the M8-1 gate is kept to a size a
 // person can check by reading it.
 //
-// **Nothing here has ever run.** Overlay UI is one of the few things an emulator
-// cannot exercise, so it is verified last, on hardware, after the M8-1 gate
-// (overlay/AGENTS.md). What is checked today is that it cross-compiles and that
-// the payloads it reads round-trip natively.
+// The drawing itself is split again by M9-7 (#198): the layout is
+// `status_paint.cpp`, which takes a `DrawList` and runs under
+// `ctest -R overlay.draw`, and what is left in this file is a `tsl::Gui`, a
+// `CustomDrawer` callback and an adapter that replays commands into
+// `tsl::gfx::Renderer`. That last part has still never run -- overlay UI is one
+// of the few things an emulator cannot exercise, so it is verified last, on
+// hardware, after the M8-1 gate (overlay/AGENTS.md).
 #pragma once
 
 #include <tesla.hpp>

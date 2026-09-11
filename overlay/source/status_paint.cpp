@@ -75,17 +75,16 @@ void PaintStatus(const StatusView& view, const Palette& palette, DrawList& out, 
   // reads as a value that failed to load rather than as a screen that is too
   // narrow. The rest of the screen -- headline, hint, prompt and bar -- is full
   // width and still drawn.
-  for (const Line& line : view.lines) {
-    if (value_width <= 0) {
-      break;
+  if (value_width > 0) {
+    for (const Line& line : view.lines) {
+      if (row + kRowHeight > bottom) {
+        return;
+      }
+      out.String(line.label, x, row, kBodyFont, muted, kValueColumn);
+      out.String(line.value, x + kValueColumn, row, kBodyFont, palette.For(line.tone),
+                 value_width);
+      row += kRowHeight;
     }
-    if (row + kRowHeight > bottom) {
-      return;
-    }
-    out.String(line.label, x, row, kBodyFont, muted, kValueColumn);
-    out.String(line.value, x + kValueColumn, row, kBodyFont, palette.For(line.tone),
-               value_width);
-    row += kRowHeight;
   }
 
   if (view.progress.kind == Progress::Kind::kNone) {
