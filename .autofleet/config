@@ -37,3 +37,12 @@ AUTOFLEET_NOTIFY_TITLE="rommsync-nx fleet"
 # works; $REPO_ROOT is set by config.sh before this file is sourced.
 AUTOFLEET_BUILD_CMD="$REPO_ROOT/.autofleet/claude-opus"
 AUTOFLEET_REVIEW_CMD="$REPO_ROOT/.autofleet/claude-opus"
+
+# THIS HOST'S FLEET STATE, APART FROM EVERY OTHER REPOSITORY'S. The default is
+# `~/.autofleet` for every repo on the machine, and its records are keyed by
+# issue number alone (`gaveup-161`, `builds/161`, `worktrees/161`, one
+# `fleet.pid`), so two hosts on one laptop read each other's state: on install
+# day `fleet.sh status` here listed autofleet's own PR #165. Exported, not just
+# set, because `guard.py`'s STOP file and every script the agent runs inside a
+# worktree read the same variable (armaatus/autofleet#166).
+export AUTOFLEET_DIR="$HOME/.autofleet/rommsync-nx"
