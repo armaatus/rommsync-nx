@@ -892,6 +892,105 @@ directions — no reader sees a half-written file, and no writer has its temp fi
 carried off by another's rename. The derivation is a pure function of the
 worktree path, so concurrent writers publish identical bytes.
 
+Tearing the stack down by hand is `./scripts/orca/compose.sh down -v`, and the
+wrapper adds two flags of its own to it: `--profile tls` and `--remove-orphans`.
+A service behind a `profiles:` key is invisible to a `docker compose` command
+that has not activated its profile, so a bare `down` left the TLS terminator
+running — `restart: unless-stopped` brought it back on every docker start, and
+it held that worktree's `TLS_PORT` and, because a running container pins it, the
+network the rest of the teardown was waiting on (`Resource is still in use`).
+The fleet's `archive.sh` and `reap.sh` name it through `AUTOFLEET_COMPOSE_DOWN_ARGS`
+in `.autofleet/config`; this is the same hole in the path a person types.
+
+`up -d` is deliberately left alone: it still starts neither the terminator nor
+anything else profiled, which is what keeps the host suite talking plain HTTP to
+the fault proxy. And the profile is named rather than wildcarded — `--profile
+'*'` would cover a profile added later without a second edit, but it needs
+Compose 2.24 and an older one reads `*` as a literal profile name, activating
+nothing and restoring the leak in silence. A profile added to the compose file
+has to be added to `AUTOFLEET_COMPOSE_DOWN_ARGS` and to `compose.sh` by hand.
+
+Removing a worktree runs `scripts/fleet/archive.sh`, which takes that worktree's
+stack and volumes down with it (`AUTOFLEET_COMPOSE_FILE` and
+`AUTOFLEET_COMPOSE_DOWN_ARGS` in `.autofleet/config` say which file and which
+profiles). It derives the project name from the worktree path rather than
+reading `.env` back, so a worktree whose `.env` never got written still tears
+down cleanly. The dispatcher runs it before `git worktree remove` and sweeps once
+the directory is confirmed gone.
+
+Stacks can still outlive their worktree — one deleted with `rm -rf`, or removed
+while Docker was stopped. The fixture restarts `unless-stopped`, so those come
+back on every docker start and hold three ports each. Sweep them up with:
+
+```bash
+./scripts/fleet/reap.sh          # list stacks with no worktree, change nothing
+./scripts/fleet/reap.sh --yes    # remove them, volumes included
+```
+
+It protects two sets of stacks: those belonging to a live worktree of this repo,
+whose project names it derives the same way `env.sh` did, and those whose
+containers still point at a directory that exists — which covers a separate
+clone of this repo that `git worktree list` cannot see. Anything it cannot
+positively establish as stale is left alone, and it refuses to sweep at all
+rather than run with an incomplete idea of what is live, so a stack it cannot
+account for survives instead of being deleted.
+
+The gap that remains: a *separate clone* whose stack has been reduced to volumes
+alone leaves nothing pointing at its directory, so it looks stale. Run the
+dry-run first if more than one clone of this repo is in play.
+
+## Rung 2 — the manually-launched NRO
+
+- A standalone **NRO** (manually launched, *not* a sysmodule, *not* on the boot
+  path) that exercises the Horizon `ssl`/`bsd` path against a real RomM. It
+  exists: [`tlsprobe/`](../tlsprobe/README.md), built by CI on every push and by
+  `ctest -R switch.tlsprobe`.
+- The rig speaks plain HTTP, so the probe cannot use it as-is. The compose file
+  carries a `tls` profile — an nginx terminator in front of RomM with a
+  throwaway self-signed certificate — that nothing else starts:
+
+  ```bash
+  ./scripts/orca/tls-fixture.sh up      # mint the cert, start the terminator
+  ./scripts/orca/tls-fixture.sh ini     # the probe's ini for this worktree
+  ./scripts/orca/tls-fixture.sh check   # a verified 200, and again over TLS 1.2
+  ```
+
+  `tls.isolated`, `tls.cert` and `tls.serves` are what keep that honest — in
+  particular that the profile stays out of every other test's way and that the
+  port stays bound to `127.0.0.1`.
+- **The emulator itself is the part that is not available here.** Ryujinx was
+  discontinued in October 2024, its GitHub mirrors answer HTTP 451, and running
+  any title in a surviving fork still needs `prod.keys` and a firmware dump from
+  a console — which hard rule 1 forbids this project from having. So this rung
+  is available in principle and not executable in this environment; the honest
+  status of the `ssl` answer, and what an emulator run would and would not have
+  proven, is recorded in
+  [DEVELOPMENT.md](DEVELOPMENT.md#m0-1-the-measurement-and-the-decision).
+- Whichever way that resolves, the same NRO is what runs first on a **backup SD**
+  at M8 — still never an auto-boot sysmodule.
+
+## Rung 3 — the v1 gate and real hardware (M8)
+
+**M8-1 (#43) is the gate, and [`scripts/v1-gate.sh`](../scripts/v1-gate.sh) is
+where it lives.** It was eight sentences in an issue body, repeated here and
+alluded to in a dozen source comments, and nothing evaluated any of them — which
+is the failure [the M0 exit gate](#the-m0-exit-gate) is written against, one
+milestone down: *a box checked because someone believes it is not checked.* So
+each row below names the command that demonstrates it, and the script is the
+only copy of the eight; this table is checked against it by `gate.doc` so the
+two cannot drift.
+
+| id | The claim | What demonstrates it |
+|---|---|---|
+| `sync` | Full sync engine (M2) passes on host + docker RomM, including conflict / partial-failure / resume. | `sync.*`, `execute.*`, `states.*`, `complete.*`, `tick.*`, `scan.*`, `core.state_db`, `core.md5`, `core.sha1*`, and the edge cases the box names by hand: `harness.conflict`, `harness.partial`, `harness.resume`, `harness.same_timestamp` |
+| `downloads` | Downloads (M3) pass with Range resume + hash verify against docker RomM. | `download.*`, `rom.*`, `toggle.download`, `http.range*`, `http.resume*`, `wire.range*`, `wire.resume*`, `harness.content_hash`, `harness.multifile` |
+| `auth` | Auth (M1) full device-code flow + 401/refresh proven on host + docker RomM. | `auth.*`, `pair.*`, `device.*`, `core.token_store`, `core.device_identity`, `harness.expired`, and M1-6's `engine.pairs`, `engine.repairs`, `engine.nonblocking`, `engine.unauthenticated` |
+| `ipc` | Config + IPC (M5) proven on host harness. | `core.config`, `config.*`, `ipc.*`, `lists.*`, `overlay.*`, `engine.config`, `engine.commands`. What these prove is the protocol, and since M9-7 (#198) they prove it through the overlay's own `ipc_client.cpp` as well as through `ipc::Dispatch` -- `overlay.wire`, `overlay.roundtrip`, `overlay.errors`. What no test reaches is the libnx `cmif`/`hipc` glue: `sysmodule/source/ipc/server.cpp` and the message unpacking in `service.cpp`, verified with the rest of the Horizon glue at M8-2. |
+| `ssl` | HttpClient ssl-service backend proven in a Ryujinx NRO (M0-1), or on an isolated NRO on a backup SD. | **Nothing yet.** `switch.builds` and `switch.tlsprobe` prove it compiles and links for aarch64; no handshake has been executed anywhere. See *what the first console decides*. |
+| `backup` | Every save-overwrite path shown to back up first (SYNC_PROTOCOL hard rule) -- verified by tests. | `harness.backup`, `execute.*`, `states.overwrite`, `states.keeps_both`, `tick.backupdir`, `tick.durable` — **and a census** of every `io::CommitStaged`/`CopyAtomically`/`WriteAtomically` call site in `core/src`, `sysmodule/source` and `overlay/source`, so a *new* overwrite path fails the gate until somebody classifies it. The two Horizon targets are in scope because `sysmodule/source/engine.cpp` already writes a file, and a census that only read `core/` would answer a narrower question than the row asks. Each row that lands on a save names the call that does it, and the census insists a call to `sync::BackUpFirst` comes before it — which is how M7-1's restore, whose overwrite is a `CopyAtomically` rather than a `CommitStaged`, is held to the same rule as the two paths M2-5 wrote. That census is the word "every"; the tests are the rest. |
+| `release` | A tagged, released v1 build exists (M6). | A `v1` tag reachable from `main` that agrees with `VERSION`, and a published, non-draft release carrying the zip and `SHA256SUMS`. **Failing today: this repository has no tags and no releases.** |
+| `media` | A known-good NAND/SD backup exists; testing will be on a spare/backup SD or emuMMC, not the daily driver. | **Nothing in a repository can attest to this**, and a checkbox that says otherwise is worse than none. See *what the first console decides*. |
+
 ### Running it
 
 ```bash
