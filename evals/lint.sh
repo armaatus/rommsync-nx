@@ -49,23 +49,6 @@ elif [ -e AGENTS.md ]; then
   fail "AGENTS.md is a real file; it must be a symlink to CLAUDE.md so the two cannot drift"
 fi
 
-echo "== REVIEW.md"
-if [ ! -f REVIEW.md ]; then
-  fail "REVIEW.md is missing; /code-review and the PR review workflow both read it"
-else
-  for needle in "Correctness" "Important vs Nit" "Do not report"; do
-    grep -q "$needle" REVIEW.md || fail "REVIEW.md has no '$needle' section"
-  done
-  ok "REVIEW.md names its passes and its thresholds"
-  # The trailer merge_gate.py reads. It is the only thing separating a review
-  # that found five nits from one that found nothing -- both are a COMMENTED
-  # verdict -- and a policy file that stops asking for it turns the gate's
-  # fail-closed default into the ordinary case, so every PR waits on an answer
-  # to a review that said nothing.
-  grep -q 'review-findings' REVIEW.md \
-    || fail "REVIEW.md no longer asks a review to say how many findings it left; merge_gate.py cannot tell a clean review from a nitty one without it"
-  ok "REVIEW.md asks for the findings count merge-gate reads"
-fi
 
 # A skill is a folder with a SKILL.md whose frontmatter says when it triggers.
 # Both halves are load-bearing: no frontmatter and it never loads, no description
@@ -136,74 +119,13 @@ fi
 # pattern that stops matching fails here rather than the day it lets something
 # through.
 echo "== guards actually guard"
-# The exhaustive table lives in the hook itself (`guard.py --selftest`), next to
-# the code it constrains, so a guard and its assertion cannot drift into
-# separate files. It runs here so `ctest -R agent.config` and CI both cover it.
-#
-# One deliberate exception, below: the fleet's self-protection is asserted HERE
-# rather than in the table, because a fleet-opened worktree cannot write
-# `.claude/hooks/` -- which is the very rule being asserted. The table cannot
-# grow an assertion that only a hand-opened worktree may add, so `guard.py
-# --selftest` alone is no longer the whole record. This file is the rest of it.
+# The exhaustive table lives in the hook itself (`guard.py --selftest`): every
+# rule in it has a row, and one without is not shipped (autofleet hard rule 3).
+# What this project asks it to protect on top -- the pinned RomM contract, the
+# fixture credentials -- is .autofleet/guard.json, and the selftest reads it.
 if [ -x .claude/hooks/guard.py ]; then
   python3 .claude/hooks/guard.py --selftest 2>&1 | sed 's/^/  /'
   [ "${PIPESTATUS[0]}" = 0 ] || fail "the guard selftest does not hold"
-
-  # ...and it has to hold from INSIDE a fleet worktree too. The stateless cases
-  # assert what the guard does for an ordinary developer ("an ordinary push is
-  # fine"), which is untrue by design where the fleet's own rules apply. Run
-  # against the real fleet directory the selftest passed on a laptop and failed
-  # in every agent's worktree -- `ctest -R agent.config` red exactly where the
-  # work happens, green only on CI runners that are nobody's fleet.
-  guard_tmp="$(mktemp -d)"
-  mkdir -p "$guard_tmp/worktrees"
-  printf '%s\n' "$REPO_ROOT" >"$guard_tmp/worktrees/999"
-  ROMMSYNC_FLEET_DIR="$guard_tmp" python3 .claude/hooks/guard.py --selftest >/dev/null 2>&1 \
-    || fail "the guard selftest depends on where it is run: it fails inside a fleet worktree"
-  ok "the guard selftest holds from inside a fleet worktree too"
-
-  # ...and every path in SELF_PROTECTED is asserted, absolutely and through a
-  # `cd`-shortened relative path, by `_stateful_checks` inside guard.py itself
-  # (#139). #98 had to park those here because a fleet-opened worktree cannot
-  # write `.claude/hooks/` -- but that left them outside merge_gate.py's
-  # HUMAN_ONLY_PREFIXES, so a PR deleting them auto-merged with nobody
-  # watching. In guard.py they are the enforcement layer, and a person merges
-  # any PR that touches it.
-  #
-  # One thing guard.py still cannot check about itself: that SELF_PROTECTED has
-  # not grown a fourth entry that no assertion covers. That pin stays here.
-  # The list below is literal on purpose: derived from SELF_PROTECTED, removing
-  # an entry would remove its own check. That catches a removal but not an
-  # ADDITION -- a fourth marker would get no assertion in guard.py's
-  # _stateful_checks and the coverage would quietly narrow -- so pin the set.
-  if sp_drift="$(python3 -c '
-import importlib.util, sys
-spec = importlib.util.spec_from_file_location("g", ".claude/hooks/guard.py")
-g = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(g)
-want = {"/.claude/hooks/", "/.claude/settings.json", "/.claude/settings.local.json"}
-if set(g.SELF_PROTECTED) != want:
-    print(repr(sorted(g.SELF_PROTECTED)))
-    sys.exit(1)
-')"; then
-    ok "SELF_PROTECTED still names exactly the paths _stateful_checks asserts"
-  else
-    fail "SELF_PROTECTED is now $sp_drift; give each entry an assertion in guard.py's _stateful_checks and update this list"
-  fi
-
-  # The six fleet-gate assertions that stood here are in guard.py's own
-  # `_stateful_checks` now (#98, #139): parked here they could be deleted by a
-  # PR that merged itself, and there they are part of the enforcement layer,
-  # which never auto-merges. `--selftest` above is what runs them, and it fails
-  # this script if any of them go red.
-  #
-  # Nothing is left behind on purpose. The first version of this move deleted
-  # the two helpers and kept their call sites, so every run printed twelve
-  # `command not found` lines to stderr, recorded no failure, and still said
-  # "agent configuration is well-formed" -- the silent-success this file's own
-  # header exists to warn about.
-
-  rm -rf "$guard_tmp"
 else
   fail ".claude/hooks/guard.py is missing or not executable"
 fi
@@ -243,25 +165,6 @@ sys.exit(0 if s.get("enabledPlugins", {}).get("mattpocock-skills@claude-plugins-
 else
   fail "mattpocock-skills is not enabled in .claude/settings.json, but the agent brief calls its skills"
 fi
-
-echo "== the flow's own scripts"
-# The brief names these by path. A rename that misses the brief turns into an
-# agent halfway through a task running a command that does not exist.
-for script in fleet.sh stop.sh await-review.sh review-status.sh record-review.sh \
-              resolve-thread.sh answer-review.sh issue-command.sh agent-autostart.sh; do
-  path="scripts/orca/$script"
-  [ -x "$path" ] || { fail "$path is missing or not executable"; continue; }
-  bash -n "$path" || { fail "$path does not parse"; continue; }
-  ok "$script"
-done
-# ...and the brief must still name them.
-brief="$(sed -n "/^sed .*BRIEF/,/^BRIEF$/p" scripts/orca/issue-command.sh)"
-for named in record-review.sh await-review.sh review-status.sh resolve-thread.sh \
-              answer-review.sh; do
-  grep -q "$named" <<<"$brief" \
-    || fail "the agent brief no longer mentions $named, so the loop stops at that step"
-done
-ok "the brief still names the review loop"
 
 echo "== every test phase actually runs"
 # A phase defined in one of the phase-dispatching test scripts and missing from
@@ -323,8 +226,14 @@ for names, body in re.findall(r"foreach\(phase\b(.*?)\)(.*?)endforeach\(\)", cml
         bad = 1
     covered += 1
 if covered == 0:
-    print("no foreach(phase ...) block was paired with a script; this check now asserts nothing")
-    bad = 1
+    # No phase-dispatching suite is registered this way any more (the v1 fleet
+    # suites were). Nothing to pair is not a broken pairing: say so and keep the
+    # check for the day one comes back.
+    if "foreach(phase" in cml:
+        print("no foreach(phase ...) block was paired with a script; this check now asserts nothing")
+        bad = 1
+    else:
+        print("no foreach(phase ...) block in tests/CMakeLists.txt; nothing to pair")
 sys.exit(bad)
 PHASES
 then
@@ -349,163 +258,6 @@ else
   echo "  --: actionlint is not installed (brew install actionlint); CI still checks this"
 fi
 
-# claude-code-action authenticates by exchanging a GitHub OIDC token, so a job
-# that uses it needs `id-token: write` -- at the job level, or inherited from the
-# workflow. Without it the action retries three times, fails, and submits
-# nothing. That is invisible in the way that matters: `merge-gate` then blocks
-# every PR on a review that will never arrive, and the only clue is a red job
-# nobody required. It cost the first real fleet run.
-if ls .github/workflows/*.yml >/dev/null 2>&1; then
-  if python3 - <<'PY'
-import re, sys, glob
-
-bad = []
-for path in glob.glob(".github/workflows/*.yml"):
-    text = open(path).read()
-    if "claude-code-action" not in text:
-        continue
-    # Cheap and good enough: the token is needed somewhere in scope, and these
-    # files declare permissions either at the top or on the job.
-    if "id-token: write" not in text:
-        bad.append(path)
-for path in bad:
-    print(path)
-sys.exit(1 if bad else 0)
-PY
-  then
-    ok "every workflow using claude-code-action grants id-token: write"
-  else
-    fail "a workflow uses claude-code-action without 'id-token: write'; the action cannot authenticate and will submit nothing"
-  fi
-fi
-
-# `track_progress: true` forces the action into TAG mode, which waits for an
-# @claude trigger phrase. On an automatic review there is none, so the action
-# skips -- and the JOB GOES GREEN while nothing was reviewed. That is the worst
-# shape a failure can take here: merge-gate then blocks every PR on a review
-# that was never submitted, and the check that should have said so is passing.
-# The KEY, not the word: the comment above the removal in claude-review.yml
-# explains what track_progress does, and a bare grep flags its own explanation.
-if grep -rnE "^[[:space:]]*track_progress:" .github/workflows/*.yml >/dev/null 2>&1; then
-  fail "a workflow sets track_progress, which forces tag mode; an automatic review then skips silently while its job reports success"
-else
-  ok "no workflow forces tag mode on an automatic review"
-
-fi
-
-# Silence is this workflow's failure mode and it is invisible: the action can
-# burn 35 turns and real money, decide a verdict, and end without ever running
-# `gh pr review` -- is_error false, job green, nothing on the PR. That happened
-# on #99 twice on one head, and every watcher downstream then waits forever for
-# a review that already came and went.
-#
-# Two things have to stay true, and both are one careless edit from gone.
-review_wf=".github/workflows/claude-review.yml"
-if [ -f "$review_wf" ]; then
-  grep -q "no verdict was submitted" "$review_wf" \
-    || fail "claude-review.yml no longer notices a review that submitted nothing"
-  ok "a review that submits nothing is reported"
-
-  # It must stay a COMMENT. A generated review would satisfy merge_gate.py's
-  # requirement for an independent review while carrying no judgement at all --
-  # worse than the silence it replaces, because it would merge things.
-  if sed -n '/say so if no verdict/,/^      - /p' "$review_wf" | grep -q "gh pr review"; then
-    fail "the no-verdict notice submits a REVIEW; that would satisfy merge-gate with no judgement"
-  fi
-  ok "the no-verdict notice is a comment, never a review"
-
-  # ...and the reviewer is told to declare what it found. Without the trailer
-  # every review fails closed, so this does not break a PR -- it makes every one
-  # of them wait for an answer to findings that may not exist, which is the
-  # slow way for a gate to stop meaning anything.
-  grep -q 'review-findings' "$review_wf" \
-    || fail "claude-review.yml no longer tells the reviewer to end with <!-- review-findings: N -->, which merge_gate.py reads to tell a clean review from one with findings"
-  ok "the reviewer is told to declare how many findings it left"
-fi
-
-# The reviewer is told to submit its verdict with a command it can actually run.
-#
-# `claude_args` grants Read, Grep, Glob and a fixed list of gh/git calls -- no
-# Write, no generic Bash, no redirection and no mktemp. The prompt nonetheless
-# told it to submit with `--body-file <file>`, a file it had no way to create.
-# So a run only submitted at all if it improvised away from its instruction, and
-# PR #131 got three green review runs and zero reviews out of it. A green job
-# that did nothing is the shape nothing else here catches.
-if [ -f "$review_wf" ]; then
-  # 2>&1 because the checks below report by `sys.exit("...")`, which writes to
-  # stderr; without it the failure would print a reason that is an empty string.
-  if reason="$(python3 - "$review_wf" 2>&1 <<'REVIEWCMD'
-import re, sys
-
-text = open(sys.argv[1]).read()
-# From `review:` to the next top-level job key, BY SHAPE. Naming the job that
-# follows would hard-code the very thing the comment on the sed below says not
-# to, and the two slices of this same file must not disagree.
-start = text.find("\n  review:")
-if start < 0:
-    sys.exit("claude-review.yml has no `review:` job")
-after = re.search(r"\n  [a-z][a-z_-]*:\n", text[start + 1:])
-job = text[start:start + 1 + after.start()] if after else text[start:]
-
-args = re.search(r"claude_args:\s*(.+)", job)
-if not args:
-    sys.exit("the review job has no claude_args, so what it may run is unknown")
-allowed = args.group(1)
-# Anything that could create a file for --body-file to read.
-can_write = ("Write" in allowed
-             or re.search(r"Bash(?!\()", allowed)
-             or "Bash(mktemp" in allowed)
-# The COMMAND, not the word: the prompt explains why --body-file is wrong, and a
-# bare search flags its own explanation.
-told_to = [ln for ln in job.splitlines()
-           if "gh pr review" in ln and "--body-file" in ln]
-if told_to and not can_write:
-    sys.exit("the review prompt submits with `--body-file`, and the job grants "
-             "no tool that can create a file: " + told_to[0].strip())
-if "gh pr review" not in job:
-    sys.exit("the review prompt no longer names `gh pr review`, so nothing tells "
-             "it to submit a review at all")
-if "Bash(gh pr review:" not in allowed:
-    sys.exit("the review job does not allow `gh pr review`, so it cannot submit")
-REVIEWCMD
-)"
-  then
-    ok "the reviewer can run the command it is told to submit with"
-  else
-    # The check's OWN words. A fixed string here reported a renamed job or a
-    # missing claude_args as "the reviewer cannot run its submit command",
-    # which sends the reader to the wrong line.
-    fail "claude-review.yml: $reason"
-  fi
-
-  # A review is not a build. Cancelling the run that was producing the verdict
-  # leaves that head with none -- and the no-verdict notice is `needs: review`,
-  # so it does not fire either. #86's merged head and #81's both show
-  # `cancelled` for this job.
-  # From `review:` to the next top-level job key, by shape rather than by name:
-  # a range hard-coded to `verdict:` would silently swallow the rest of the file
-  # the day that job is renamed, and pick up the `mention` job's own
-  # cancel-in-progress -- a failure about the wrong job.
-  if sed -n '/^  review:/,/^  [a-z][a-z_-]*:$/p' "$review_wf" \
-       | grep -qE "^[[:space:]]*cancel-in-progress:[[:space:]]*true"; then
-    fail "the review job cancels in progress; a killed review leaves the head with no verdict and nothing that says so"
-  fi
-  ok "a review in flight is never cancelled by the next event"
-
-  # ...and when a review IS silent, the pipeline asks once more on its own. The
-  # comment alone named two remedies and both were manual, so a PR whose review
-  # said nothing waited for a person to notice it.
-  grep -q 'gh workflow run claude-review.yml' "$review_wf" \
-    || fail "a review that submitted nothing no longer asks for another one; the PR waits for a person"
-  # ...and the run it asks for must be allowed to happen. A dispatch by
-  # GITHUB_TOKEN runs as github-actions[bot], and claude-code-action refuses a
-  # non-human actor unless it is named here -- so without this the retry starts
-  # a run that always declines, which is a mechanism that cannot fire.
-  grep -qE "^[[:space:]]*allowed_bots:.*(github-actions|\*)" "$review_wf" \
-    || fail "the review job does not allow github-actions, so the review it asks for after a silent one is refused as a non-human actor"
-  ok "a silent review asks for exactly one more, and that one is allowed to run"
-fi
-
 # A cancelled run is not a green run. `cancel-in-progress` is right on a branch,
 # where only the newest push matters, and wrong on main, where every commit is
 # one somebody has to be able to trust: two merges close together cancelled the
@@ -518,113 +270,6 @@ if [ -f .github/workflows/ci.yml ]; then
   ok "main's builds are never cancelled by the next merge"
 fi
 
-echo "== the cross-reference conventions"
-# `Closes #N` and `Blocked by #N` are read by three parsers -- GitHub itself,
-# unblock.yml, and fleet.sh via merge_gate.py's neighbour -- and every way they
-# disagree is silent. The fleet either opens a second worktree for work already
-# in flight, or reports "nothing startable" with the backlog wide open.
-if [ -x .github/scripts/issue_refs.py ]; then
-  python3 .github/scripts/issue_refs.py --selftest 2>&1 | sed 's/^/  /'
-  [ "${PIPESTATUS[0]}" = 0 ] || fail "the issue-reference selftest does not hold"
-else
-  fail ".github/scripts/issue_refs.py is missing or not executable"
-fi
-
-# unblock.yml is JavaScript inside YAML and cannot import the module, so the one
-# thing keeping the two in step is that they spell the pattern identically.
-# Asserted from BOTH ends: change either alone and this goes red.
-grep -qF 'blocked\s+by\s+#(\d+)/gi' .github/workflows/unblock.yml \
-  || fail "unblock.yml no longer matches blocked\\s+by\\s+#(\\d+)/gi; issue_refs.BLOCKED_BY is now a different rule from the one that maintains the labels"
-python3 -c '
-import importlib.util, sys
-spec = importlib.util.spec_from_file_location("r", ".github/scripts/issue_refs.py")
-m = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(m)
-sys.exit(0 if m.BLOCKED_BY.pattern == r"blocked\s+by\s+#(\d+)" else 1)
-' || fail "issue_refs.BLOCKED_BY no longer spells unblock.yml's pattern character for character"
-ok "the fleet and unblock.yml read the same blockers"
-
-# ...and EVERY function in the fleet that reads one of the two conventions gets
-# it from the module. A `grep -q issue_refs` over the whole file would be
-# satisfied by one surviving import while the other three regrew patterns of
-# their own, which is precisely the drift this section exists to catch -- so
-# each function is checked on its own, by name.
-fleet_reads_shared=1
-for fn in ready_issues has_open_pr issue_is_done count_startable; do
-  body="$(sed -n "/^$fn()/,/^}/p" scripts/orca/fleet.sh)"
-  [ -n "$body" ] \
-    || { fail "scripts/orca/fleet.sh has no $fn(); this check no longer covers what it names"
-         fleet_reads_shared=0; continue; }
-  grep -q 'from issue_refs import' <<<"$body" \
-    || { fail "fleet.sh's $fn() no longer imports issue_refs; it can drift from GitHub and unblock.yml again"
-         fleet_reads_shared=0; }
-  # Any regex of its own over either convention, in any spelling and either
-  # language -- not just the two capitalisations it used to carry.
-  if grep -inE '(close[sd]?|fix(e[sd])?|resolve[sd]?|blocked[^"]*by)[^"]*#' <<<"$body" \
-     | grep -vi '^ *[0-9]*: *#' | grep -q .; then
-    fail "fleet.sh's $fn() spells out a closing or blocker reference again; there is one place for those, .github/scripts/issue_refs.py"
-    fleet_reads_shared=0
-  fi
-done
-[ "$fleet_reads_shared" = 1 ] && ok "every fleet function reading a body reads the shared patterns"
-
-echo "== the merge gate"
-# The one required check `gh pr merge --auto` waits on. Its decision lives in a
-# script rather than in the YAML precisely so it can be tested without a pull
-# request -- and so a change to what "may merge" means fails here first.
-if [ -x .github/scripts/merge_gate.py ]; then
-  python3 .github/scripts/merge_gate.py --selftest 2>&1 | sed 's/^/  /'
-  [ "${PIPESTATUS[0]}" = 0 ] || fail "the merge-gate selftest does not hold"
-else
-  fail ".github/scripts/merge_gate.py is missing or not executable"
-fi
-grep -q 'merge_gate.py' .github/workflows/merge-gate.yml \
-  || fail "merge-gate.yml no longer calls merge_gate.py, so the check decides nothing"
-# merge_gate.py imports issue_refs.py, and the gate job checks out
-# `.github/scripts` ALONE. Widen that import to anything outside this directory
-# and the gate stops with an ImportError -- a required check that can never
-# conclude, on every PR.
-if ! grep -q 'sparse-checkout: .github/scripts' .github/workflows/merge-gate.yml; then
-  fail "merge-gate.yml no longer sparse-checks-out .github/scripts; the paths merge_gate.py imports from are no longer the ones it gets"
-fi
-sparse_tmp="$(mktemp -d)"
-cp -R .github/scripts "$sparse_tmp/scripts"
-if ( cd "$sparse_tmp/scripts" && python3 -c 'import merge_gate' ) 2>"$sparse_tmp/err"; then
-  ok "the gate still imports from the only directory it is given"
-else
-  fail "merge_gate.py does not import with only .github/scripts on disk, which is all the gate job checks out: $(tr '\n' ' ' <"$sparse_tmp/err")"
-fi
-rm -rf "$sparse_tmp"
-
-# One query, paginated, in one file. `reviewThreads(first:100)` is the FIRST
-# hundred: past that a PR silently loses its newest threads and the gate reports
-# "no review thread is unresolved" from a page it knew was partial. Both readers
-# used to carry their own copy of that query, and so their own copy of the bug.
-if [ -x .github/scripts/pr_payload.sh ]; then
-  bash -n .github/scripts/pr_payload.sh || fail ".github/scripts/pr_payload.sh does not parse"
-  for reader in .github/workflows/merge-gate.yml scripts/orca/review-status.sh; do
-    grep -q 'pr_payload.sh' "$reader" \
-      || fail "$reader does not read the PR through .github/scripts/pr_payload.sh, so it is paging threads on its own again"
-    # Comment lines excluded: both files EXPLAIN what `reviewThreads(first:100)`
-    # got wrong, and a bare grep flags its own explanation.
-    grep -vE '^[[:space:]]*#' "$reader" | grep -q 'reviewThreads(first:' \
-      && fail "$reader carries its own reviewThreads query again; the first page is not the list"
-  done
-  # merge-gate.yml runs BOTH of these out of the BASE branch's checkout, and a
-  # base predating either one is a PR a person merges -- which has to be SAID.
-  # Before the guard named both, the second one to be added killed the step with
-  # `No such file or directory` on exactly the PR introducing it.
-  for needed in merge_gate.py pr_payload.sh; do
-    sed -n '/agreed rule to judge this by/,/^      - name:/p' \
-      .github/workflows/merge-gate.yml | grep -q "$needed" \
-      || fail "merge-gate.yml runs $needed from the base checkout without checking the base has it; a base predating it dies with a shell error instead of the human-merge notice"
-  done
-  ok "a base without the gate's own scripts is told, not crashed into"
-
-  ok "the gate and review-status read one paginated payload"
-else
-  fail ".github/scripts/pr_payload.sh is missing or not executable"
-fi
 
 echo "== orca.yaml"
 if [ ! -f orca.yaml ]; then
@@ -635,6 +280,18 @@ else
   grep -q 'setupAgentStartupPolicy: wait-for-setup' orca.yaml \
     || fail "orca.yaml no longer holds the agent tab for setup; agents will run ctest against a RomM that is not up"
   ok "orca.yaml still wires the agent to the spec"
+fi
+
+
+echo "== the vendored payload"
+# scripts/fleet/, the hooks and the gate are autofleet's; its own scanners
+# (bash -n, shellcheck, the pipefail and stderr traps, the selftests) run here
+# too, so a worktree sees a break in the payload before CI does.
+if [ -x evals/run.sh ]; then
+  ./evals/run.sh 2>&1 | sed 's/^/  /'
+  [ "${PIPESTATUS[0]}" = 0 ] || fail "evals/run.sh: the vendored payload is not well-formed"
+else
+  fail "evals/run.sh is missing; the payload's own checks never run"
 fi
 
 echo "== eval cases"

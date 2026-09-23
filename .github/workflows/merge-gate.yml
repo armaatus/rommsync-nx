@@ -7,34 +7,24 @@ name: merge gate
 # .github/scripts/merge_gate.py -- a plain script with its own selftest, kept out
 # of the YAML so it can be run and tested without a pull request.
 #
-# Deliberately cheap: two API calls, no checkout, seconds. It runs on every event
-# that can change the answer, so the check re-evaluates when a review lands, a
-# thread is resolved, a fix is pushed, or the body is edited.
+# Deliberately cheap: two API calls, a two-file sparse checkout, seconds. It runs
+# on every event that can change the answer, so the check re-evaluates when a
+# review lands, a fix is pushed, or the body is edited.
 
 on:
-  # `review_requested` is in here because re-requesting review is what the agent
-  # does after resolving threads, and it is the only event that follows a
-  # resolution.
+  # There is NO trigger for thread resolution: `pull_request_review_thread` is a
+  # webhook event, not a workflow trigger, and putting it here makes the whole
+  # file invalid -- which shows up as a failed run with no jobs, named after the
+  # file. actionlint rejects it too. Nothing here needs it any more: whether every
+  # thread is resolved is `required_conversation_resolution`, which is branch
+  # protection and is GitHub's own to re-evaluate (armaatus/autofleet#152).
   #
-  # There is NO trigger for thread resolution itself: `pull_request_review_thread`
-  # is a webhook event, not a workflow trigger, and putting it here makes the
-  # whole file invalid -- which shows up as a failed run with no jobs, named
-  # after the file. actionlint rejects it too, so the check in evals/lint.sh
-  # catches a re-attempt before CI does.
-  #
-  # So resolving the last thread does not re-run this on its own, and for a long
-  # while nothing else did either: the gate stayed red on a thread that was
-  # already closed and auto-merge never fired. `scripts/orca/resolve-thread.sh`
-  # is what closes that -- it resolves the threads and then re-runs this
-  # workflow's own failed run on the head, which updates that check run IN
-  # PLACE, the same mechanism `clear-stale` below relies on. A dispatch could
-  # not: its check runs attach to the ref dispatched, not to a PR head.
+  # `pull_request_review: submitted` is the one that matters: it is how the
+  # reviewer's verdict reaches this check.
   pull_request:
-    types: [opened, reopened, synchronize, ready_for_review, edited, review_requested]
+    types: [opened, reopened, synchronize, ready_for_review, edited]
   pull_request_review:
     types: [submitted, dismissed]
-  pull_request_review_comment:
-    types: [created, deleted]
 
 permissions:
   contents: read
@@ -73,17 +63,18 @@ jobs:
       # `gh pr merge --auto` would land it. Listing .github/scripts/ as
       # human-merge-only cannot help there, because the modified script is the
       # one evaluating that list.
+      #
+      # `.autofleet/config` used to ride along, because the gate read
+      # AUTOFLEET_REVIEW_MODE out of it. There is one review venue now
+      # (armaatus/autofleet#152) and the gate reads no configuration at all, so
+      # the sparse checkout is the scripts and nothing else.
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.sha }}
-          sparse-checkout: .github/scripts
+          sparse-checkout: |
+            .github/scripts
           sparse-checkout-cone-mode: false
 
-      # BEFORE Gather, because Gather now runs a script from that same base
-      # checkout. A base predating it would otherwise kill the step with
-      # `No such file or directory` under `set -euo pipefail` -- a raw shell
-      # error in place of the deliberate notice below, on exactly the PR that
-      # introduces the file.
       - name: Is there an agreed rule to judge this by?
         run: |
           set -euo pipefail
@@ -101,12 +92,17 @@ jobs:
         run: |
           set -euo pipefail
           owner="${NWO%%/*}"; name="${NWO##*/}"
-          gh api --paginate "repos/$NWO/pulls/$PR/files" --jq '.[].filename' >files.txt
+          # `previous_filename` TOO, so a RENAME cannot walk a file out of the
+          # protected set. The API reports a moved file under its new path only;
+          # `git mv .autofleet/guard.json .autofleet/guard.json.bak` therefore
+          # looked like an ordinary new file to merge_gate, while guard.py reads
+          # an absent config as `{}` and enforces nothing. Exact-name matching
+          # makes that a one-command escape; the prefix half has the same hole
+          # (move a file out of `.claude/`). Found by the local self-review.
+          gh api --paginate "repos/$NWO/pulls/$PR/files" \
+            --jq '.[] | .filename, (.previous_filename // empty)' >files.txt
           # The query itself is in .github/scripts/pr_payload.sh, next to the
-          # script that judges what it returns and checked out with it. It PAGES
-          # the review threads: `reviewThreads(first:100)` inline here was the
-          # first hundred, so a PR past that lost its newest threads and this
-          # step handed the gate a partial list to call clean.
+          # script that judges what it returns and checked out with it.
           bash .github/scripts/pr_payload.sh "$owner" "$name" "$PR" >pr.json
 
       # The base branch may not have the gate yet -- on the pull request that

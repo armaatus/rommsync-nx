@@ -802,27 +802,20 @@ that machinery; the verdict is the script's exit code, and today it is not 0.
 ### Worktree isolation
 
 Agents work in parallel worktrees and sync tests mutate saves by design, so each
-worktree runs **its own** RomM. `scripts/orca/env.sh` derives a compose project
-name and two ports from the worktree path into `.env`; `orca.yaml` runs it on
-worktree creation and tears the stack down on removal. Only immutable, expensive
-things are shared across worktrees — the checksum-pinned ROM cache and the
-content-addressed ccache. Never hardcode a port; read `.env`.
+worktree runs **its own** RomM. `scripts/orca/env.sh` wraps the fleet's
+`scripts/fleet/env.sh`: the fleet derives a compose project name and three ports
+from the worktree path (`.autofleet/config` names the bases), and the wrapper
+adds the URLs and shared caches this project's tests read, all into `.env`.
+The fleet's setup hook (`scripts/fleet/setup.sh` → `.autofleet/setup.sh`) runs it
+on worktree creation and `scripts/fleet/archive.sh` tears the stack down on
+removal. Only immutable, expensive things are shared across worktrees — the
+checksum-pinned ROM cache and the content-addressed ccache. Never hardcode a
+port; read `.env`.
 
-Setup finishes by putting the environment where you can see it: a log tab
-following the stack, a browser tab on this worktree's RomM already signed in as
-the fixture admin (`scripts/orca/romm-browser.sh`), and — for a worktree created
-from an issue — the spec submitted to the agent rather than left drafted in its
-composer (`scripts/orca/agent-autostart.sh`). Both are conveniences and neither
-can fail setup. See [TESTING.md](TESTING.md#the-romm-browser-tab).
-
-Removal is the reverse: `scripts/orca/archive.sh` drops that worktree's stack and
-volumes, leaving the shared caches alone. Note that only the Orca UI runs that
-hook by itself — `orca worktree rm` skips `orca.yaml` hooks unless `--run-hooks`
-is passed. For stacks orphaned that way, or by a worktree deleted with `rm -rf`,
-`scripts/orca/reap.sh` lists them and `--yes` removes them; it errs towards
-keeping anything it cannot prove stale. `fleet.sh` takes that second route on
-purpose — the hook runs before Orca commits to the removal, so a refused one
-would tear down a live worktree's rig (#163). See [TESTING.md](TESTING.md#worktree-isolation).
+Stacks orphaned by a worktree deleted with `rm -rf`, or removed while Docker was
+stopped, are listed by `./scripts/fleet/reap.sh` and removed with `--yes`; it
+errs towards keeping anything it cannot prove stale. See
+[TESTING.md](TESTING.md#worktree-isolation).
 
 The **server contract** is testable off-console: `server/probe_contract.py`
 exercises auth + negotiate + saves against a RomM and prints the real response

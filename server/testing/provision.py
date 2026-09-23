@@ -2,7 +2,7 @@
 """Provision this worktree's RomM fixture so tests can authenticate.
 
 seed.sh puts ROM files on disk; this puts RomM into the state the test suite
-needs. It runs after `compose up -d` (scripts/orca/setup.sh) because every step
+needs. It runs after `compose up -d` (.autofleet/setup.sh) because every step
 here talks to a live server.
 
 What it guarantees, idempotently:

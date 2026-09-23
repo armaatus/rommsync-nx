@@ -12,9 +12,9 @@ Labels: `sysmodule`, `overlay`, `server`, `auth`, `sync`, `download`, `ipc`,
 
 [docs/WORKFLOW.md](docs/WORKFLOW.md) is the loop this backlog feeds: an idea
 filed with the **Intent** template becomes an issue carrying Goal / Scope /
-Design notes / Acceptance, a `ready` issue becomes an Orca worktree, and the
-worktree produces a plan, a diff with its tests, review findings and a PR
-carrying `Closes #N`. A human merges.
+Design notes / Acceptance, a `ready` issue becomes a fleet worktree, and the
+worktree produces a diff with its tests and a PR carrying `Closes #N`; the
+dispatcher reviews it and the rules merge it.
 
 The issue body is the spec — it is the only channel between three agents working
 in parallel who cannot see each other. Keeping it true as the work reveals

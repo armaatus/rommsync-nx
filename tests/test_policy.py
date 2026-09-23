@@ -155,7 +155,7 @@ def find_python(repo: str) -> str | None:
 def phase_guards(args) -> int:
     python = find_python(args.repo)
     if python is None:
-        print("no interpreter with `requests`; run scripts/orca/setup.sh")
+        print("no interpreter with `requests`; run .autofleet/setup.sh")
         return SKIP
 
     invocations = [

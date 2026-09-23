@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Covers scripts/orca/env.sh -- the first thing setup.sh runs, and the one step
-# whose failure costs the whole worktree.
+# Covers scripts/orca/env.sh -- this project's wrapper over the fleet's
+# scripts/fleet/env.sh, the first thing .autofleet/setup.sh runs, and the one
+# step whose failure costs the whole worktree.
 #
 # env.sh is not the only caller of itself: compose.sh generates a missing .env
-# before it does anything, so the `romm` tab -- which polls compose.sh from the
-# moment Orca opens it -- writes .env too, at the same moment setup.sh does.
+# before it does anything, so a second shell in the worktree writes .env too, at
+# the same moment setup does.
 #
 #   test_orca_env.sh concurrent   two writers at once both succeed and agree.
 #                                 This is the regression: sharing one `.env.tmp`
@@ -23,9 +24,10 @@
 #                                 `python -m venv` over it exits 1 -- every
 #                                 re-run, forever.
 #   test_orca_env.sh setup_fails_fast
-#                                 setup.sh itself stops on the interpreter
-#                                 before seeding or building, and says why.
-#   test_orca_env.sh python       setup.sh installs server/requirements.txt with
+#                                 .autofleet/setup.sh itself stops on the
+#                                 interpreter before seeding or building, and
+#                                 says why.
+#   test_orca_env.sh python       setup installs server/requirements.txt with
 #                                 an interpreter new enough for it, and says so
 #                                 in one line when there is none. This is the
 #                                 regression: a worktree created from the Orca
@@ -51,10 +53,14 @@ trap cleanup EXIT
 
 # env.sh derives everything from its own location, so a copy of the scripts in a
 # throwaway directory derives that directory's ports and touches nothing real.
+# The fleet's half comes along whole: scripts/fleet/env.sh sources lib.sh, which
+# sources config.sh, which reads .autofleet/config for the prefix and the ports.
 make_fixture() {
   FIXTURE="$(mktemp -d)"
-  mkdir -p "$FIXTURE/scripts/orca"
+  mkdir -p "$FIXTURE/scripts/orca" "$FIXTURE/.autofleet"
   cp "$REPO_ROOT"/scripts/orca/{env.sh,lib.sh,compose.sh} "$FIXTURE/scripts/orca/"
+  cp -R "$REPO_ROOT/scripts/fleet" "$FIXTURE/scripts/fleet"
+  cp "$REPO_ROOT/.autofleet/config" "$FIXTURE/.autofleet/config"
 }
 
 WRITERS=6
@@ -205,27 +211,26 @@ case "${1:-}" in
     # setup.sh's own half. Without running it, losing the `. lib.sh` line or the
     # check itself goes unnoticed -- the picker can be perfect and the hook
     # still broken.
-    FIXTURE="$(mktemp -d)"
-    mkdir -p "$FIXTURE/scripts/orca"
-    cp "$REPO_ROOT"/scripts/orca/{setup.sh,lib.sh,env.sh,compose.sh} "$FIXTURE/scripts/orca/"
+    make_fixture
+    cp "$REPO_ROOT/.autofleet/setup.sh" "$FIXTURE/.autofleet/setup.sh"
     fake_python python3 3.9
 
     # PATH holds nothing but the old interpreter. If the check is not first,
-    # setup.sh reaches env.sh or seed.sh and fails over a missing tool instead.
-    # Invoked through bash by absolute path: setup.sh's `#!/usr/bin/env bash`
+    # setup reaches env.sh or seed.sh and fails over a missing tool instead.
+    # Invoked through bash by absolute path: the hook's `#!/usr/bin/env bash`
     # would need `env` and `bash` resolvable on the stripped PATH, and failing
     # to exec is not the failure this phase is about.
     fake_path="$(fake_only_path)"
-    out="$(cd "$FIXTURE" && PATH="$fake_path" "$BASH" ./scripts/orca/setup.sh 2>&1)"
+    out="$(cd "$FIXTURE" && PATH="$fake_path" "$BASH" ./.autofleet/setup.sh 2>&1)"
     rc=$?
-    [ "$rc" -ne 0 ] || fail "setup.sh carried on with an interpreter too old to install requirements.txt"
+    [ "$rc" -ne 0 ] || fail ".autofleet/setup.sh carried on with an interpreter too old to install requirements.txt"
     grep -qi "python" <<<"$out" \
-      || fail "setup.sh failed without mentioning Python, which is the whole diagnosis: $out"
+      || fail ".autofleet/setup.sh failed without mentioning Python, which is the whole diagnosis: $out"
     # Nothing expensive may have happened first: no .env means it stopped before
     # env.sh, which is what makes the failure fast as well as clear.
     [ -e "$FIXTURE/.env" ] \
-      && fail "setup.sh got as far as deriving .env before checking the interpreter"
-    echo "PASS: setup.sh stops on the interpreter before doing any work, and says why"
+      && fail ".autofleet/setup.sh got as far as deriving .env before checking the interpreter"
+    echo "PASS: .autofleet/setup.sh stops on the interpreter before doing any work, and says why"
     ;;
 
   concurrent)

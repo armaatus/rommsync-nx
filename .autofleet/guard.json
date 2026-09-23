@@ -1,0 +1,11 @@
+{
+  "_comment": "What guard.py protects in rommsync-nx over and above its universal rules: the pinned RomM contract (recorded, never hand-edited) and the per-worktree credentials CLAUDE.md hard rule 5 keeps out of the tree.",
+  "protected_paths": [
+    {"path": "server/contract/captures/",
+     "tail": "captures/",
+     "reason": "the pinned RomM 5.2.0 contract; a test diffs a live probe against it"}
+  ],
+  "secret_suffixes": ["/config.ini", "/token.dat", "/device.dat", "/server/testing/fixture-auth.env"],
+  "secret_contains": ["/token.dat", "/device.dat", "fixture-auth.env"],
+  "secret_tails": ["token.dat", "device.dat", "config.ini", "fixture-auth.env"]
+}

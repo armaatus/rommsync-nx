@@ -1,55 +1,33 @@
 # Orca workspace configuration for rommsync-nx.
 #
-# Every worktree created from this repo self-provisions: it derives its own
-# isolated ports and compose project, seeds the ROM fixtures, configures the
-# build, and brings up its own RomM. By the time the agent's tab is live,
-# `ctest` is a meaningful command.
-#
 # Orca will ask you to trust this file before it runs anything, and again after
 # each change -- these scripts execute on your machine.
+#
+# Every worktree created from this repo self-provisions through autofleet's
+# hooks: scripts/fleet/setup.sh derives the isolated ports and compose project
+# into .env, then runs .autofleet/setup.sh -- this project's half: ROM
+# fixtures, the build, the venv, RomM. By the time the agent's tab is live,
+# `ctest` is a meaningful command.
 
 scripts:
-  # Runs once per new worktree. See scripts/orca/setup.sh.
-  setup: ./scripts/orca/setup.sh
-  # Runs when a worktree is removed: tears down that worktree's RomM stack and
-  # its volumes, leaving the shared caches alone.
-  archive: ./scripts/orca/archive.sh
+  setup: ./scripts/fleet/setup.sh
+  # Tears down that worktree's RomM stack and its volumes, leaving the shared
+  # caches alone.
+  archive: ./scripts/fleet/archive.sh
 
 # Hold the agent's tab until setup finishes. Without this the agent can run
 # `ctest` before RomM is listening, read the connection error as a code bug, and
-# go chasing it. The few seconds this costs buys away that whole failure mode.
+# go chasing it.
 setupAgentStartupPolicy: wait-for-setup
 
 # The prompt an agent starts with when the workspace is created from a linked
-# issue. Orca treats this as a TEMPLATE, not as argv: it substitutes {{issue}}
-# and {{artifact_url}} and nothing else -- there is no $1 -- and with an empty
-# composer the result becomes the agent's opening prompt. Left unset, Orca's own
-# default is `Complete {{artifact_url}}`, which is how an agent ends up starting
-# work from a bare URL and never reads the spec. So this points the agent at
-# issue-command.sh, which resolves the issue to its body, labels and milestone --
-# the sole channel design intent travels through on this project.
+# issue. Orca substitutes {{issue}} and {{artifact_url}} and nothing else.
 issueCommand: |
-  Run `GH_PAGER=cat ./scripts/orca/issue-command.sh {{issue}}` first and follow
+  Run `GH_PAGER=cat ./scripts/fleet/issue-command.sh {{issue}}` first and follow
   everything it prints. It resolves issue #{{issue}} ({{artifact_url}}) to its
   full body, labels and milestone -- the only place this project's design intent
-  is written down -- and then states the finishing conditions. Nothing about the
+  is written down -- and then states what to do with it. Nothing about the
   workflow is repeated here, so this prompt cannot drift from that script.
 
 defaultTabs:
-  # Tab 1 is the agent, opened by Orca itself.
-  - title: romm
-    # Streams the fixture's logs so infrastructure failure is distinguishable
-    # from code failure at a glance. Goes through romm-logs.sh rather than
-    # `compose.sh logs -f` directly because the tabs start alongside setup.sh --
-    # `wait-for-setup` above holds only the agent's tab -- and following a stack
-    # that setup.sh has not brought up yet exits instantly. See the script.
-    command: ./scripts/orca/romm-logs.sh
   - title: shell
-
-worktree:
-  # Shared across worktrees because they are immutable and expensive to rebuild.
-  # Everything mutable -- RomM's database volume, .env, build/ -- stays strictly
-  # per-worktree, so no agent can corrupt another's fixtures. See docs/TESTING.md.
-  sharedDirectories:
-    - .cache/roms     # checksum-pinned homebrew ROM downloads
-    - .cache/ccache   # content-addressed compiler cache; safe for concurrent use
