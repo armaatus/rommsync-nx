@@ -68,7 +68,7 @@ jobs:
       # AUTOFLEET_REVIEW_MODE out of it. There is one review venue now
       # (armaatus/autofleet#152) and the gate reads no configuration at all, so
       # the sparse checkout is the scripts and nothing else.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           sparse-checkout: |
