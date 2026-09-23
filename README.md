@@ -86,7 +86,7 @@ Full detail in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 | `switch.mk` | Shared devkitPro rules for both Switch targets |
 | `core/` | The portable engine — auth, sync, downloads, config, state. Builds and is tested natively. |
 | `server/` | API snapshot (source of truth), contract-probe script, and the docker RomM test fixture |
-| `orca.yaml` | Per-worktree provisioning: isolated RomM, seeded fixtures, ready-to-run build |
+| `.autofleet/` | This project's answers to autofleet: ports, compose file, test command, and the setup hook that gives a worktree its own RomM, seeded fixtures and a ready-to-run build |
 | `ISSUES.md` | The full milestone + issue backlog |
 | `scripts/create_issues.sh` | Creates the GitHub milestones/labels/issues via `gh` |
 | `CLAUDE.md` | Working agreement for agents and contributors — rules, commands, PR flow |

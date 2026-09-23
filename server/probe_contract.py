@@ -9,7 +9,7 @@ code can be written against verified fields instead of guesses.
 Usage:
     ./.venv/bin/python server/probe_contract.py --url "$ROMM_BASE_URL"
 
-(The venv is created by scripts/orca/setup.sh from server/requirements.txt.)
+(The venv is created by .autofleet/setup.sh from server/requirements.txt.)
 
 By default it runs the read-only checks. Add --auth to run the device-code
 pairing flow, then --negotiate to do a no-op sync negotiation.

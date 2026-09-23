@@ -1,19 +1,36 @@
 name: unblock dependents
 
 # GitHub has no native "blocked by" relation, so this repo uses a convention:
-# an issue body carries `Blocked by #N` lines, and carries the `blocked` label
-# while any of those are open. That convention is load-bearing -- it is the only
-# thing stopping work from starting on an issue whose foundation has not landed
-# -- so it is maintained here rather than by hand.
+# an issue body carries `Blocked by #N` lines below a `<!-- blockers -->` marker,
+# and carries the `blocked` label while any of those are open. That convention is
+# load-bearing -- it is the only thing stopping work from starting on an issue
+# whose foundation has not landed -- so it is maintained here rather than by hand.
 #
-# On merge, every issue blocked by the just-closed issue is re-evaluated: if all
-# of its blockers are now closed it becomes `ready`, otherwise it stays `blocked`.
+# Every run re-derives `blocked`/`ready` for EVERY open issue from scratch, so
+# every trigger below is the same idempotent job.
 
 on:
   pull_request:
     types: [closed]
+  # `opened` and `edited` as well as the two closings, and their absence was a
+  # hole with no bottom: `fleet.sh` selects on the POSITIVE `ready` label, so an
+  # issue filed with no blockers carried NO label and was unstartable until some
+  # unrelated issue happened to close. Every issue filed by hand got `ready` only
+  # because somebody passed it on the command line -- and CLAUDE.md tells agents
+  # to file and edit issues as they find things, which is exactly the path that
+  # produces one nothing will ever start.
+  #
+  # `edited` for the other half of the same convention: CLAUDE.md says the
+  # `Blocked by #N` lines are editable, and until now editing them re-derived
+  # nothing, so a dependency that had genuinely been resolved kept its issue
+  # blocked.
+  #
+  # Dropping `opened` returns the repo to issues nothing will ever start,
+  # silently, which is the hole this trigger set was widened to close -- and
+  # README.md and docs/WORKFLOW.md describe the list to agents, so it is not
+  # free to drift.
   issues:
-    types: [closed, reopened]
+    types: [opened, edited, closed, reopened]
   workflow_dispatch:
 
 permissions:
@@ -24,6 +41,30 @@ jobs:
   reconcile:
     # Only a merged PR counts; a closed-without-merge PR blocks nothing.
     if: github.event_name != 'pull_request' || github.event.pull_request.merged == true
+    # ON THE JOB, NOT THE WORKFLOW. At workflow level every triggering event
+    # enters the group -- including the `pull_request: closed` of a PR that was
+    # never merged, which the `if:` above then skips. That run would cancel a
+    # reconcile pass in flight and do no relabelling of its own, leaving the
+    # backlog half-written until some unrelated issue event arrived; a
+    # `workflow_dispatch` recovery run could be killed by any routine issue edit
+    # the same way. A job skipped by `if:` never takes the slot. Found by the
+    # independent review.
+    #
+    # The group itself: this was the only workflow here without one, on the
+    # trigger that fires most often. Two runs from two edits interleave like
+    # this -- run A reads #40's body (no blockers); before A reaches #40 an agent
+    # adds a real `Blocked by #12`; run B, from edit 2, correctly sets `blocked`;
+    # A finishes, adds `ready` and removes `blocked`. #40 ends `ready` with an
+    # open blocker, which is the collision the label exists to prevent, and
+    # fleet.sh will start it (#47).
+    #
+    # `cancel-in-progress` rather than a queue: the job recomputes the whole
+    # backlog, so the newer run's answer is strictly better than the older one's
+    # and letting the older one finish last would only widen the window it is
+    # wrong in.
+    concurrency:
+      group: unblock
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/github-script@v9
@@ -32,31 +73,113 @@ jobs:
             const {owner, repo} = context.repo;
 
             // Re-evaluate every open issue rather than only the dependents of
-            // the issue that just closed. It is one extra API page for a
-            // backlog this size, and it makes the job self-healing: a label
-            // edited by hand, or a merge that bypassed this workflow, still
-            // converges on the next run.
+            // the issue that just closed. It is one API page for a backlog this
+            // size, and it makes the job self-healing: a label edited by hand,
+            // or a merge that bypassed this workflow, still converges on the
+            // next run.
             const issues = await github.paginate(github.rest.issues.listForRepo, {
               owner, repo, state: 'open', per_page: 100,
             });
 
-            const state = new Map();
-            const isOpen = async (number) => {
-              if (!state.has(number)) {
-                try {
-                  const {data} = await github.rest.issues.get({owner, repo, issue_number: number});
-                  state.set(number, data.state === 'open');
-                } catch {
-                  state.set(number, false); // unknown issue blocks nothing
-                }
-              }
-              return state.get(number);
+            // THE PAGE IS THE ANSWER, and there is no second lookup.
+            //
+            // This used to `issues.get` every distinct blocker number, cache the
+            // verdict for the run, and read anything that was not a 404 as
+            // "open" so the issue stayed `blocked`. One 5xx or one secondary
+            // rate limit therefore froze every issue naming that blocker, never
+            // retried, and -- because it reported through `core.warning` -- left
+            // the check GREEN while it did. `fleet.sh` reads `blocked` as "this
+            // worktree will never produce a merged PR": it interrupts the agent
+            // and, a poll later, removes a worktree that is legitimately empty
+            // because an agent plans before it edits (docs/WORKFLOW.md, "is
+            // anyone using this"). A rate limit could cost three slots and the
+            // work in them, overnight, behind a passing check.
+            //
+            // `paginate` has just returned every OPEN issue and pull request in
+            // this repo, so "is #N open" is membership in that list. A number
+            // absent from it is closed, or was never filed -- both of which
+            // block nothing, which is what the old 404 branch already concluded.
+            // The failure mode goes with the calls: `paginate` throws rather
+            // than returning a short list, and github-script fails the step on a
+            // throw, so a transient error is now a RED run that relabels nothing
+            // instead of a green one that freezes the backlog.
+            const openNumbers = new Set(issues.map((i) => i.number));
+
+            // Character for character the two patterns in
+            // `.github/scripts/issue_refs.py`, which is the module `fleet.sh`
+            // reads the same bodies with. This file is JavaScript inside YAML
+            // and cannot import it, so that module's own `--selftest` compares
+            // these two literals against its own, character for character, and
+            // fails if either side is edited alone. An issue the two disagree
+            // about is one the fleet may start while the labels call it blocked.
+            //
+            // `^` rather than `\b`, because `\b` still matches inside `no longer
+            // blocked by #7` -- and CLAUDE.md tells agents to write sentences
+            // like that into issue bodies as they work, on a trigger that now
+            // fires on every edit. A blocker is a LINE.
+            // The prefix is wide on purpose -- `- `, `* `, `+ `, `> `, `1. `,
+            // `1) `, `- [ ] ` and `**Blocked by #7**` are all spellings an agent
+            // writes a list in, and a narrower class does not fail loudly: it
+            // returns NO blockers, which marks the issue `ready` with its
+            // foundation open. `[0-9]` and not `\d`, because Python's `\d` takes
+            // any Unicode decimal digit and JavaScript's does not -- so
+            // `Blocked by #\u0667` was a blocker to the fleet and invisible here.
+            // No `\*{1,2}` branch: `*` is already in the class, so `**` is two
+            // iterations and the extra branch matched the same text two ways --
+            // exponential under the outer `*`, not merely redundant. 22
+            // asterisks took 15 SECONDS to fail; a separator line in an issue
+            // body would hang this workflow on every edit, and the dispatcher's
+            // queue with it. Found by the independent review.
+            const BLOCKED_BY =
+              /^[ \t]*(?:(?:[-*+>]|[0-9]+[.)]|\[[ xX]\])[ \t]*)*blocked\s+by\s+#([0-9]+)/gim;
+            // ...and only below the FIRST marker that is alone on its own
+            // line. The own-line anchor is what handles #47, which quotes
+            // `<!-- blockers -->` mid-sentence while describing this bug and
+            // carries the real marker, empty, at the end: matching the bare
+            // string picks the quoted one and reads the rest of the issue as
+            // blockers. Anchoring to a whole line excludes the quote by itself,
+            // so taking the LAST marker bought nothing and cost a body that
+            // carries the template marker twice -- it read as NO blockers with
+            // one open. First-wins over-collects instead. Found by the
+            // independent review.
+            const BLOCKERS_MARKER = /^[ \t]*<!--\s*blockers\s*-->[ \t]*$/gm;
+
+            // CRLF folded first: a body edited through the GitHub WEB UI
+            // arrives with `\r\n`, `$` matches before the `\n` and not before
+            // the `\r`, and the marker line silently stops existing -- falling
+            // back to the whole body, which is the read this change exists to
+            // stop. Folded on the INPUT rather than patched into the pattern,
+            // so the two readers mean the same thing in both languages; the
+            // parity check lifts this pattern text into Python and cannot see
+            // an engine difference in how `$` and `\r` interact.
+            const blockersSection = (body) => {
+              const text = (body || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+              let first = null;
+              for (const m of text.matchAll(BLOCKERS_MARKER)) { first = m; break; }
+              // No marker: the whole body, still line-anchored. Issues predating
+              // the convention, and host projects that never adopt it, must not
+              // read as unblocked -- that is the direction that starts work on a
+              // foundation which has not landed.
+              return first ? text.slice(first.index + first[0].length) : text;
             };
+
+            // Label writes that failed, reported after the loop rather than
+            // through it -- see the removeLabel catch below.
+            const writeFailures = [];
+
+            // Collected so the log below can say it once, rather than per issue
+            // -- but WITH the issues that named each one. A bare list of numbers
+            // cannot answer the question the log exists for ("which issue went
+            // ready on a blocker that was never filed?"), and most entries on it
+            // are ordinary closed blockers, so without the citation the one that
+            // matters is indistinguishable from the noise around it. Found by
+            // the independent review.
+            const notOpen = new Map();
 
             for (const issue of issues) {
               if (issue.pull_request) continue;
 
-              const blockers = [...(issue.body || '').matchAll(/blocked\s+by\s+#(\d+)/gi)]
+              const blockers = [...blockersSection(issue.body).matchAll(BLOCKED_BY)]
                 .map((m) => Number(m[1]));
 
               // An issue that was never blocked still needs `ready`: CLAUDE.md
@@ -64,24 +187,123 @@ jobs:
               // them permanently unstartable.
               const open = [];
               for (const number of blockers) {
-                if (await isOpen(number)) open.push(number);
+                if (openNumbers.has(number)) open.push(number);
+                else {
+                  if (!notOpen.has(number)) notOpen.set(number, []);
+                  notOpen.get(number).push(issue.number);
+                }
               }
 
               const labels = issue.labels.map((l) => (typeof l === 'string' ? l : l.name));
+              // Did the stale label actually come off? Nothing is added until it
+              // has -- see the gate below.
+              let removed = true;
               const shouldBlock = open.length > 0;
               const add = shouldBlock ? 'blocked' : 'ready';
               const remove = shouldBlock ? 'ready' : 'blocked';
 
-              if (!labels.includes(add)) {
-                await github.rest.issues.addLabels({
-                  owner, repo, issue_number: issue.number, labels: [add],
-                });
-                core.info(`#${issue.number}: +${add}` +
-                  (shouldBlock ? ` (waiting on ${open.map((n) => '#' + n).join(', ')})` : ''));
-              }
+              // REMOVE FIRST, THEN ADD. `cancel-in-progress` makes a run that
+              // dies between these two calls reachable, and the add-then-remove
+              // order leaves the issue carrying BOTH labels in that window.
+              // `fleet.sh`'s ready_issues() selects on `ready` and never
+              // consults `blocked`, so an issue holding both is startable --
+              // the foundation collision, arriving through the very mechanism
+              // added to prevent it. This order leaves NEITHER label instead,
+              // and the fleet starts nothing without `ready`. Found by the
+              // independent review.
               if (labels.includes(remove)) {
-                await github.rest.issues.removeLabel({
+                // 404 ONLY, and the rest is recorded rather than swallowed.
+                //
+                // The catch used to discard everything, which put the both-labels
+                // state back behind a green check by another door: a 403
+                // secondary rate limit on `removeLabel('ready')` is dropped,
+                // `addLabels('blocked')` succeeds, and the issue carries BOTH --
+                // which `ready_issues()` starts, because it selects on `ready`
+                // and never consults `blocked`.
+                //
+                // WHAT THIS DOES AND DOES NOT FIX, because the reverse is easy to
+                // assume from the reorder above. Reordering covers a run that
+                // DIES between the two writes. It does not cover one whose
+                // removal FAILS: this issue then keeps `ready`, never gains
+                // `blocked`, and is startable with an open blocker until a later
+                // run repairs it. That is not a regression -- the old order left
+                // both labels and was startable just the same -- and it cannot be
+                // closed here: no ordering of two writes helps when the first is
+                // the one that fails. Closing it means teaching `ready_issues()`
+                // to consult `blocked`, which is its own change.
+                //
+                // So: a 404 is the label already being gone, which is the state
+                // wanted. Anything else is recorded and the run FAILS AFTER THE
+                // LOOP, rather than throwing here -- throwing mid-loop abandons
+                // every issue after this one, which is strictly worse than
+                // relabelling them correctly and then going red. Found by the
+                // independent review, twice: once for the swallow, once for the
+                // claim the throw did not support.
+                removed = await github.rest.issues.removeLabel({
                   owner, repo, issue_number: issue.number, name: remove,
-                }).catch(() => {});
+                }).then(() => true).catch((err) => {
+                  // A 404 is the label already being gone, which IS removed.
+                  if (!err || err.status !== 404) {
+                    writeFailures.push(`#${issue.number}: could not remove ` +
+                      `\`${remove}\` (${err && err.status}) -- left carrying ` +
+                      `\`${remove}\` alone, so a later run has to finish it`);
+                    return false;
+                  }
+                  return true;
+                });
               }
+              // GATED ON THE REMOVAL. Reordering the two writes closed the
+              // case where a run DIES between them; it left open the case where
+              // the removal FAILS and control falls through, because `labels` is
+              // the pre-run snapshot and knows nothing about what just happened.
+              // A 403 on `removeLabel('ready')` was recorded and then
+              // `addLabels('blocked')` ran anyway -- the both-labels state, which
+              // `ready_issues()` starts because it selects on `ready` and never
+              // consults `blocked`. Exactly what the comment above said had been
+              // closed, and three places said so. Now: either both writes land or
+              // neither does, and the issue keeps the single label it had. Found
+              // by the independent review.
+              if (removed && !labels.includes(add)) {
+                // Recorded, not thrown -- the same policy as the removal above,
+                // which this call did not follow. A 403 here used to fail the
+                // step outright, abandoning every issue after this one in the
+                // loop, losing whatever `writeFailures` had already collected,
+                // and skipping the not-open log. Worse since the reorder: the
+                // removal has already run, so the issue is left carrying NEITHER
+                // label -- an issue that should be `ready` has just lost `ready`
+                // and does not get it back until some later event fires.
+                //
+                // No 404 exemption here: there is no safe failure for an add.
+                // Found by the independent review.
+                const added = await github.rest.issues.addLabels({
+                  owner, repo, issue_number: issue.number, labels: [add],
+                }).then(() => true).catch((err) => {
+                  writeFailures.push(`#${issue.number}: could not add ` +
+                    `\`${add}\` (${err && err.status}) -- it now carries neither ` +
+                    `label, and nothing starts it until a later run`);
+                  return false;
+                });
+                if (added) {
+                  core.info(`#${issue.number}: +${add}` +
+                    (shouldBlock ? ` (waiting on ${open.map((n) => '#' + n).join(', ')})` : ''));
+                }
+              }
+            }
+
+            // The old 404 branch concluded "blocks nothing" and said NOTHING AT
+            // ALL, which is how an agent filing #50 with `Blocked by #51` before
+            // #51 exists gets #50 marked `ready` with its foundation unfiled and
+            // no line in any log to read afterwards. Same conclusion, said out
+            // loud, once per run.
+            if (writeFailures.length) {
+              core.setFailed('label writes failed; the backlog is only partly ' +
+                             'relabelled and a later run has to finish it:\n  ' +
+                             writeFailures.join('\n  '));
+            }
+
+            if (notOpen.size) {
+              const said = [...notOpen.keys()].sort((a, b) => a - b).map((n) =>
+                `#${n} (named by ${notOpen.get(n).map((c) => '#' + c).join(', ')})`);
+              core.info('treated as not open, so blocking nothing -- these are ' +
+                        'closed, or were never filed: ' + said.join('; '));
             }

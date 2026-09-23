@@ -275,8 +275,8 @@ directly:
 git switch -c release-0.2.0
 echo 0.2.0 > VERSION            # or 0.2.0-rc1 for a prerelease
 git commit -am "Release 0.2.0"
-gh pr create                    # ...and a person merges it. Not --fill:
-                                # the body carries both review passes
+gh pr create                    # body: `Closes #<the release issue>`. Not
+                                # --fill: the gate reads the closing line
 
 git switch main && git pull     # now the bump is on main
 git tag v0.2.0
@@ -303,16 +303,14 @@ Eight things are worth knowing before you do it:
 
 - **That pull request meets `merge-gate` like any other, and `--fill` does not
   satisfy it.** `.github/scripts/merge_gate.py` is a required check on `main`,
-  and it exempts neither a release nor whoever opened it: the body has to show
-  both local passes — `/code-review` and `mattpocock-skills:code-review` — an
-  independent review has to exist on the current head, and no review thread may
-  be left open (`required_conversation_resolution` is on). `gh pr create --fill`
-  writes the body from the commit message, so a `Release 0.2.0` commit produces
-  a body that satisfies none of it. Run the two passes on the bump the way you
-  would on anything else and put the findings in the body; `release.procedure`
-  is what keeps this paragraph and that script in step. `enforce_admins` is off,
-  so an admin *can* merge it with the check red — that is the escape hatch for a
-  broken review job, not the route.
+  and it exempts neither a release nor whoever opened it: the body has to carry
+  a `Closes #N` line (file a release issue if there is none), an approving
+  review of the current head has to exist — the dispatcher's, once the PR is
+  open, or a person's — and no review thread may be left open
+  (`required_conversation_resolution` is on). `gh pr create --fill` writes the
+  body from the commit message, so a `Release 0.2.0` commit produces a body with
+  no closing line. `enforce_admins` is off, so an admin *can* merge it with the
+  check red — that is the escape hatch for a broken review, not the route.
 
 - **The tag and `VERSION` must agree**, or the build is red rather than a release
   labelled with a version nothing inside it reports. `ctest -R version.tag` is
@@ -802,27 +800,20 @@ that machinery; the verdict is the script's exit code, and today it is not 0.
 ### Worktree isolation
 
 Agents work in parallel worktrees and sync tests mutate saves by design, so each
-worktree runs **its own** RomM. `scripts/orca/env.sh` derives a compose project
-name and two ports from the worktree path into `.env`; `orca.yaml` runs it on
-worktree creation and tears the stack down on removal. Only immutable, expensive
-things are shared across worktrees — the checksum-pinned ROM cache and the
-content-addressed ccache. Never hardcode a port; read `.env`.
+worktree runs **its own** RomM. `scripts/orca/env.sh` wraps the fleet's
+`scripts/fleet/env.sh`: the fleet derives a compose project name and three ports
+from the worktree path (`.autofleet/config` names the bases), and the wrapper
+adds the URLs and shared caches this project's tests read, all into `.env`.
+The fleet's setup hook (`scripts/fleet/setup.sh` → `.autofleet/setup.sh`) runs it
+on worktree creation and `scripts/fleet/archive.sh` tears the stack down on
+removal. Only immutable, expensive things are shared across worktrees — the
+checksum-pinned ROM cache and the content-addressed ccache. Never hardcode a
+port; read `.env`.
 
-Setup finishes by putting the environment where you can see it: a log tab
-following the stack, a browser tab on this worktree's RomM already signed in as
-the fixture admin (`scripts/orca/romm-browser.sh`), and — for a worktree created
-from an issue — the spec submitted to the agent rather than left drafted in its
-composer (`scripts/orca/agent-autostart.sh`). Both are conveniences and neither
-can fail setup. See [TESTING.md](TESTING.md#the-romm-browser-tab).
-
-Removal is the reverse: `scripts/orca/archive.sh` drops that worktree's stack and
-volumes, leaving the shared caches alone. Note that only the Orca UI runs that
-hook by itself — `orca worktree rm` skips `orca.yaml` hooks unless `--run-hooks`
-is passed. For stacks orphaned that way, or by a worktree deleted with `rm -rf`,
-`scripts/orca/reap.sh` lists them and `--yes` removes them; it errs towards
-keeping anything it cannot prove stale. `fleet.sh` takes that second route on
-purpose — the hook runs before Orca commits to the removal, so a refused one
-would tear down a live worktree's rig (#163). See [TESTING.md](TESTING.md#worktree-isolation).
+Stacks orphaned by a worktree deleted with `rm -rf`, or removed while Docker was
+stopped, are listed by `./scripts/fleet/reap.sh` and removed with `--yes`; it
+errs towards keeping anything it cannot prove stale. See
+[TESTING.md](TESTING.md#worktree-isolation).
 
 The **server contract** is testable off-console: `server/probe_contract.py`
 exercises auth + negotiate + saves against a RomM and prints the real response

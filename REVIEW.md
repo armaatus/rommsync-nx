@@ -1,129 +1,131 @@
 # Review policy
 
-What `/code-review` looks for on this repo, what counts as **Important** rather
-than a **Nit**, and what it should not report at all.
+What the independent review looks for, which findings **block a merge** and
+which do not, and what it should not report at all.
 
-CLAUDE.md makes `/code-review` on your own branch a required step before opening
-a PR, with the findings in the PR body. This file is what makes those findings
-comparable between agents and between PRs: without it, three worktrees produce
-three different reviews of three different things, and a human cannot tell a
-serious finding from a preference.
+**It runs once.** One review per pull request, from a context that has not seen
+the conversation which produced the diff, because an author reviewing its own
+work shares its blind spots. If it asks for changes, the author gets exactly one
+fix session and that fix is re-reviewed once. That second verdict is final: a
+second request for changes parks the pull request for a person. **Two reviews
+maximum, ever.**
 
-Read this before reviewing. If you are the author, read it before you finish --
-a finding you can predict is one you can avoid.
+Nothing else reads the branch. That bound is the finding of #86, which burned
+four reviews without one ever judging the commit that merged: every answer to a
+finding is a commit, every commit moves the head, and a head move invalidates
+the review that asked for it. Reviewing a branch four times is not four times
+the assurance; it is the same review of four different commits.
 
-## The passes
+Read this file before reviewing. If you are the author, read it before you
+finish — a finding you can predict is one you can avoid.
 
-Run all three. Report them separately.
+## The dimensions
 
-### 1. Correctness
+Evaluate all seven. Report only what you found; a dimension with nothing in it
+gets one line or none.
 
-Bugs, logic errors, and the failure paths this project cares about most:
+1. **Architecture and design** — separation of concerns, modularity, coupling,
+   whether abstractions are at a consistent level, whether the design holds at
+   the size this will actually reach.
+2. **Code quality and maintainability** — readability by someone with no AI
+   assistance and no context, naming, unnecessary complexity, duplication that
+   should be extracted, error handling, and whether comments explain *why*.
+3. **Impact and breaking changes** — every usage of a changed interface found
+   and updated, backward compatibility, migrations that are safe and reversible,
+   consumers of a changed API accounted for, downstream effects considered.
+4. **Testing** — critical paths and edge cases covered, tests meaningful and
+   independent, failure cases tested. **Is there a test that would have failed
+   before this change?** Name it. Its absence is Important regardless of how
+   green the suite is.
+5. **Performance** — algorithmic complexity at the expected data size, query
+   patterns and N+1s, resource usage, whether long-running work blocks something
+   it should not.
+6. **Security** — input validation, authentication and authorisation, exposure
+   of sensitive data, injection, and dependencies.
+7. **Project standards and spec** — the hard rules in `CLAUDE.md`; the issue's
+   **Scope** and **Acceptance**, naming anything in the diff outside Scope and
+   anything in Acceptance the diff does not cover; the `## Plan` section, where
+   an undocumented departure from it is Important and a documented one is fine;
+   and whether the work invalidated an issue — any issue — that has not been
+   edited, which is Important because those bodies are the only channel between
+   parallel worktrees.
 
-- **The save guarantee.** Any path that overwrites a save file backs it up first
-  and writes atomically. An interruption anywhere in the sequence leaves either
-  the old file or the new one. A failed backup aborts the write. This is hard
-  rule 2, and a breach is always Important.
-- **Network calls.** Every one has a timeout, is safe offline, retries with
-  backoff, and never blocks boot. A call missing a timeout is Important.
-- **Conflict resolution.** The server is the source of truth. Local-wins
-  behaviour that is not explicitly specified in the issue is a bug.
-- **Partial state.** What is left on disk when the process dies here? A
-  half-written state.db, a `.tmp` beside a save, or a token file with no
-  matching device record is Important.
-- **Integer and buffer handling** in anything that parses a server response.
+**A fleet pull request carries its `fleet.sh cost` figure.** It is the only
+number saying whether a run got cheaper. Missing, it is a Suggestion.
 
-### 2. Portability and platform rules
+### ...and this project's own
 
-- Nothing in `core/` includes a host-only or libnx header (hard rule 4). CI
-  catches the mechanical form; report the ones it cannot -- a platform
-  assumption smuggled in as a type, a path separator, an endianness assumption,
-  a `long` that is not the same width on aarch64.
-- Nothing new is on the boot path.
-- No real hardware and no production RomM is touched (hard rule 1). A test or
-  script that reaches a non-loopback address is Important -- `policy.loopback_only`
-  exists for this and a finding here means it was worked around.
-- No secrets in the tree (hard rule 5).
+A host repository adds its correctness rules in **`.autofleet/review.md`**, and
+they are part of this policy wherever that file exists. Read it after this one.
 
-### 3. Compliance with the spec
+That seam is the point. The rules that belong there are the ones this file
+cannot know — the save file that must be written atomically, the header that may
+not appear in `core/`, the address a test may not reach. They were written into
+this file once, and this file is **vendored into every host repository**, so
+every project that installed autofleet was reviewed against another project's
+save format. Nothing in the payload may know about one project; that is hard rule
+2, and this file was breaking it.
 
-- Against the issue: does the diff do what **Scope** asked, and does it satisfy
-  **Acceptance**? Name anything in the diff that is outside Scope, and anything
-  in Acceptance the diff does not cover.
-- Against the PR body's `## Plan`: where the implementation departed from it, is
-  the departure written down? An undocumented one is Important; a documented one
-  is fine.
-- Is there a test that would have failed before this change? Name it. Its
-  absence is Important regardless of how green the suite is.
-- Did the work invalidate an issue -- any issue -- that has not been edited? That
-  is Important: those bodies are the only channel between parallel worktrees.
+## Critical, Important, Suggestion
 
-## Important vs Nit
+**Critical** — security, data loss or corruption, a breaking change with no
+migration, or a production failure. **A Critical finding is fixed, never argued
+away.** There is no second reviewer behind this one to take the argument to.
 
-**Important** is reserved for a finding that would break behaviour, destroy or
-corrupt a save, leak a secret, breach a hard rule, break the build on either
-target, or leave the tracker saying something untrue.
+**Important** — a real defect or a breach of a hard rule: wrong behaviour on a
+path that matters, a missing test that would have caught the bug, a broken build
+on either target, or the tracker left saying something untrue. Fixed, or
+disputed in the commit message with a reason the re-review accepts.
 
-Everything else is a **Nit**: naming, comment wording, ordering, a clearer
-formulation of something already correct.
+**Suggestion** — naming, comment wording, ordering, a clearer formulation of
+something already correct. **A Suggestion is posted, and that is all.** It goes
+in an ordinary pull request comment that blocks nothing and that nobody has to
+answer; `review.sh` separates them from the blocking half by severity, so
+labelling one thing as another is the single mistake here that moves a merge.
+The asymmetry is deliberate: a nit that held a branch cost a whole loop to
+change a comment.
 
-Report at most **five nits**, and summarise the rest as a count. A review whose
-signal is buried in twenty preferences costs more attention than it saves.
+**A Suggestion never becomes its own issue.** One that does costs a whole loop —
+brief, implementation, review, fix — to change a comment, and a review that
+mints work every round is the most expensive thing in this system. Anything
+worth keeping goes on the repository's standing nit issue, if it keeps one.
 
-## Say how many findings you left
+Report at most **five Suggestions**, and summarise the rest as a count. A review
+whose signal is buried in twenty preferences costs more attention than it saves.
 
-Every review of a pull request ends its body with this line, and nothing else
-after it:
+## What not to report
 
-```
-<!-- review-findings: N -->
-```
+- **The comment density**, where a project's own rules ask for it. A diff that
+  matches the code around it is correct.
+- **A preference restated as a defect.** If the existing code is correct and you
+  would have written it differently, that is a Suggestion at most, and it counts
+  against the cap of five.
+- **Anything you cannot cite.** A behaviour claim needs a `file:line` in the
+  actual source, not an inference from a name. If you are unsure a finding is
+  real, drop it or say you are unsure — there is one fix session behind this
+  review, and a wrong Important finding spends it with no later round to take it
+  back in.
 
-`N` is Important plus Nit, across all three passes, inline comments included.
-`0` means the review found nothing.
+## The verdict is a field, not a sentence
 
-It is an HTML comment, so it does not show up in the rendered review. It exists
-because `merge-gate` cannot otherwise tell a review that found five nits from
-one that found nothing: REVIEW.md sends anything Important to
-`--request-changes` and everything else to `--comment`, so both of those are a
-COMMENTED verdict and both satisfy every other condition the gate has.
+The reviewer answers with a JSON object — `verdict`, and `findings` each
+carrying a severity, a file, a line and its text. `scripts/fleet/review.sh`
+posts it: the Critical and Important findings as the review body, the
+Suggestions as an ordinary comment, and a marker naming the head it judged.
 
-`gh pr merge --auto` is armed when the PR is opened -- deliberately, so a
-finished PR does not sit green with nobody left to merge it -- and this review
-runs afterwards. Get the number wrong in the `0` direction and the branch merges
-while its author is still fixing what you found. Four PRs went in that way.
+**`verdict` is `request-changes` if and only if something is Critical or
+Important.** Nothing reads prose to decide. That marker is the only thing
+`.github/scripts/merge_gate.py` looks for, and it is written by the script from
+the `verdict` field — never spelled by the model, and never reachable from the
+worktree under review (`.claude/hooks/guard.py` refuses `gh pr review` there).
 
-Leaving the line out is safe: the PR is then held as though findings were left,
-and its author has to answer a review that said nothing. Write the line.
+It has to be a marker and not GitHub's own APPROVED state because GitHub
+refuses `--approve` and `--request-changes` on your own pull request, and the
+reviewer signs in as whoever `gh` is — normally the account that opened the PR.
+`review.sh` tries the real state first and falls back, so a repository with a
+separate reviewer identity gets the badge for free.
 
-## Do not report
-
-- Anything CI already enforces: compiler warnings, `core/` include hygiene,
-  shell scripts that do not parse, an unformatted Python file, artifact shape.
-  CI going red says it better and does not need a human to read it.
-- Comment density or naming that matches the surrounding code. CLAUDE.md asks
-  for consistency with what is there, not for a house style this file does not
-  define.
-- Generated or vendored trees: `build/`, `.venv/`, `server/testing/library/`,
-  `.cache/`.
-- `server/contract/captures/` content. It is a recorded snapshot of a real
-  server; it is not written by hand and reviewing its style is meaningless.
-  A *change* to it, on the other hand, is Important and belongs in pass 3.
-
-## What findings do and do not do
-
-No review here approves, and no agent merges its own work (CLAUDE.md, "Finishing
-a task"). Findings do not decide whether a PR is good enough; a human reading
-them does.
-
-They do hold the branch, though, and that is not the same thing. `merge-gate`
-refuses a PR while a `--request-changes` is standing, while a review thread is
-open, and while a review reporting findings has not been answered by its author
--- `./scripts/orca/answer-review.sh "<what you did>"` is that answer, and "I am
-not doing this, because" is as good an answer as a fix. What none of that does
-is judge the finding; it only makes sure somebody read it before the code went
-in.
-
-When a review flags the same mistake twice across PRs, the correction goes into
-CLAUDE.md as part of that review. That is how this stops being a review finding
-and starts being something the next session already knows.
+**A count of findings is not a trailer.** Three HTML comments used to end every
+review body, because the gate could not otherwise tell five Suggestions from
+nothing at all — both being a COMMENTED verdict. The severity field tells it
+now, in the one place the reviewer states it.

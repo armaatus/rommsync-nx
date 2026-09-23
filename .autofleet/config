@@ -1,0 +1,39 @@
+# rommsync-nx's answers to autofleet. Everything not named here keeps the
+# default in scripts/fleet/config.sh; docs/CONFIGURATION.md explains each knob.
+
+# THE STACK NAMES ARE THE OLD ONES ON PURPOSE. scripts/orca/env.sh derived
+# `rmx-<slug>-<offset>` from the worktree path (sha1 mod 2000), and v2's
+# scripts/fleet/env.sh derives the same slug and offset the same way -- so with
+# this prefix a worktree's compose project, and therefore its RomM volumes,
+# survive the switch, and `scripts/fleet/reap.sh` sees the stacks the old
+# reap.sh would have.
+AUTOFLEET_PROJECT_PREFIX=rmx
+
+# One port per service, base + the worktree's offset. RomM itself, the fault
+# proxy in front of it, and the TLS front for tlsprobe. The BASE_URLs the tests
+# read are derived from these by scripts/orca/env.sh, which wraps the fleet's.
+AUTOFLEET_PORTS="ROMM_PORT:21000 PROXY_PORT:23000 TLS_PORT:25000"
+
+# The fixture. `--profile tls` on the way down because tls-fixture.sh starts
+# the TLS front under that profile and a plain `down -v` leaves it holding the
+# port (tests/CMakeLists.txt, the tls fixture block, says so).
+AUTOFLEET_COMPOSE_FILE=server/testing/docker-compose.yml
+AUTOFLEET_COMPOSE_DOWN_ARGS="--profile tls"
+
+# What the brief tells the agent to run, and what the reviewer reads as "the
+# suite". The Switch targets are not in it: nothing built here runs anywhere
+# before the M8-1 gate, and `switch-build` stays a required CI check instead.
+AUTOFLEET_TEST_COMMAND="ctest --test-dir build --output-on-failure"
+
+# Two worktrees, not three, for the first unattended nights
+# (armaatus/autofleet#154): each one runs its own RomM and its own build.
+AUTOFLEET_MAX=2
+
+AUTOFLEET_NOTIFY_TITLE="rommsync-nx fleet"
+
+# EVERY FLEET-OWNED CLAUDE IS OPUS. Without these, `claude -p` inherits the
+# model from ~/.claude/settings.json -- the maintainer's interactive choice.
+# The wrapper is one word so review.sh's quoted invocation of the seam still
+# works; $REPO_ROOT is set by config.sh before this file is sourced.
+AUTOFLEET_BUILD_CMD="$REPO_ROOT/.autofleet/claude-opus"
+AUTOFLEET_REVIEW_CMD="$REPO_ROOT/.autofleet/claude-opus"

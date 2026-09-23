@@ -120,7 +120,7 @@ jobs:
 
       # A running RomM is not a usable one: the staged roms are not imported
       # until something drives the socket.io scan, and rig.provisioned fails on
-      # the empty library that leaves behind. Mirrors scripts/orca/setup.sh.
+      # the empty library that leaves behind. Mirrors .autofleet/setup.sh.
       - name: Provision the fixture
         run: |
           set -a; . ./.env; set +a

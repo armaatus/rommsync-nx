@@ -5,7 +5,7 @@
 # name was wrong. CI runs the same check across scripts/orca and
 # server/testing; this is that check, one push earlier.
 #
-# scripts/orca/*.sh provision every worktree on this project, and a syntax error
+# scripts/fleet/*.sh provision every worktree on this project, and a syntax error
 # in one does not fail where it was typed -- it fails in the next worktree Orca
 # creates, during setup, as a hook that exits non-zero for a reason nothing on
 # screen explains. CI checks the same thing (`Shell scripts parse`), but CI is
@@ -42,7 +42,7 @@ print(json.dumps({
         "hookEventName": "PostToolUse",
         "additionalContext": (
             f"{path} no longer parses. CI's 'Shell scripts parse' step will fail on "
-            f"this, and if it is one of scripts/orca/*.sh the next worktree Orca "
+            f"this, and if it is one of scripts/fleet/*.sh the next worktree Orca "
             f"creates will fail to provision. Fix it before moving on:\n{out}"
         ),
     }

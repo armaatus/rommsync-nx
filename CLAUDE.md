@@ -25,11 +25,10 @@ idea to a merged PR — this file is the short form of it.
 
 ## Environment
 
-Your worktree provisioned itself when it was created (`orca.yaml` →
-`scripts/orca/setup.sh`): it derived isolated ports, seeded ROM fixtures,
-configured the build, started its own RomM, opened it in a browser tab already
-signed in, and submitted your issue to this agent. Ports live in `.env` — never
-hardcode one, and never assume `8080` or `1515`.
+A fleet worktree provisions itself when it is created (`scripts/fleet/setup.sh`
+→ `.autofleet/setup.sh`): it derives isolated ports, seeds ROM fixtures, builds,
+and starts its own RomM with the fixture provisioned inside it. Ports live in
+`.env` — never hardcode one, and never assume `8080` or `1515`.
 
 ```bash
 cmake -S . -B build && cmake --build build      # build
@@ -41,28 +40,15 @@ ctest --test-dir build -R sync --output-on-failure   # one group
 docker run --rm -v "$PWD:/work" -w /work devkitpro/devkita64:latest \
   bash -lc 'make -C sysmodule && make -C overlay && make -C tlsprobe'
 
-./scripts/orca/fleet.sh status                   # what the fleet is running, and what is next
-./scripts/orca/stop.sh                           # drain the fleet (--now also interrupts the agents)
-./evals/lint.sh                                  # the agent config still holds
 ./scripts/orca/env.sh                            # regenerate .env
 ./scripts/orca/compose.sh up -d                  # start RomM  (logs -f to follow)
-./scripts/orca/romm-browser.sh                   # reopen the signed-in tab
-./scripts/orca/romm-logs.sh                      # reopen the log tab
 ./server/testing/seed.sh                         # re-seed ROM fixtures
 ./.venv/bin/python server/testing/provision.py   # scan the library, mint a fixture token
 ./scripts/orca/tls-fixture.sh up                 # TLS in front of RomM, for tlsprobe
-./scripts/orca/reap.sh                           # RomM stacks whose worktree is gone (--yes removes)
+./evals/lint.sh                                  # the agent config still holds
+./scripts/fleet/fleet.sh status                  # what the fleet is running, and what is next
+./scripts/fleet/reap.sh                          # RomM stacks whose worktree is gone (--yes removes)
 ```
-
-There is a browser tab on this worktree's RomM, logged in as the fixture admin.
-Use it — a scan result, a platform slug or a rom's real metadata is one glance
-away there and several API calls away otherwise. `romm-browser.sh` reopens it.
-
-Removing a worktree from the **Orca UI** runs the teardown hook; `orca worktree
-rm` needs `--run-hooks`, and a stack left behind restarts `unless-stopped`,
-holding two ports forever. Prefer sweeping with `./scripts/orca/reap.sh --yes`:
-Orca runs the hook *before* it knows the removal succeeded, so a refusal has
-already taken that worktree's RomM down under whoever is in it (#163).
 
 If `ctest` reports `rig.smoke` as **Skipped**, RomM is not running — start it
 rather than working around it.
@@ -90,25 +76,24 @@ public CI. Homebrew and freely redistributable only.
 
 ## Working in parallel
 
-At most **3 worktrees** run at once, and an issue is startable only when it
-carries `ready` rather than `blocked` — labels [`unblock.yml`](.github/workflows/unblock.yml)
+The fleet runs at most **2 worktrees** at once, and an issue is startable only
+when it carries `ready` rather than `blocked` — labels [`unblock.yml`](.github/workflows/unblock.yml)
 derives from the `Blocked by #N` lines in each issue body, never by hand. Do not
 start a `blocked` issue, nor a **`needs-human-step`** one — its last step is the
 maintainer's, or no agent can do it at all ([WORKFLOW.md](docs/WORKFLOW.md)).
 
 One exception the labels cannot express: **a foundation issue lands alone.** An issue
 defining an interface later issues include — M0-2's `HttpClient` — merges before
-anything else starts, even if the labels say several things are ready: three agents
+anything else starts, even if the labels say several things are ready: two agents
 each inventing their own shared header is the one merge conflict worth serialising to
-avoid. *Alone* runs both ways ([WORKFLOW.md](docs/WORKFLOW.md), #215).
+avoid. *Alone* runs both ways (#215).
 
-## Plan before you edit
+## The issue is the plan
 
-Start in plan mode and stay there until the plan is right: **Files that change /
-Order of work / Risks / Proof**. The bar is that someone who never saw the
-conversation could implement the change from it alone. It goes in the PR body,
-under `## Plan`, along with anything the implementation ended up doing
-differently. Departing from a plan is normal; departing silently is not.
+`/implement` opens with no planning phase: the issue's **Goal / Scope / Design
+notes / Acceptance** are the plan, and they are meant to be sufficient. Where the
+implementation ends up departing from them, the PR body says so under `## Plan`.
+Departing is normal; departing silently is not.
 
 ## Code
 
@@ -138,24 +123,26 @@ Those lines *are* editable, and a genuinely missing dependency should be added,
 but changing one changes what other agents may start: do it deliberately, alone,
 and say so in the PR body. Never edit them as a side effect of rewording a body.
 
-## Finishing a task
+## Finishing
+
+Your job ends at an open pull request.
 
 1. `ctest --test-dir build --output-on-failure` is green, and your change has a
    test that would have failed before it — run it and read the output before
    reporting complete. For a bug fix, commit the failing test before the fix.
-2. **Run `/code-review` on your own branch** and put the findings in the PR body.
-   Required, not optional — it is what makes a human review tractable, and
-   [REVIEW.md](REVIEW.md) is the policy it follows.
-3. Any issue your findings invalidated is edited; the PR body says which and why.
-4. Open a PR with `Closes #N` for your issue. `merge-gate` requires a closing
-   line and a workflow reads it to unblock dependants, so it is not optional.
-5. `gh pr merge --auto --squash` — it asks GitHub to merge once the required
-   checks pass, `merge-gate` among them, so the rules decide. Never merge
-   directly; `.claude/`, `.github/workflows/` and `.github/scripts/` need a person.
-6. **Answer the independent review** — `./scripts/orca/answer-review.sh "<what
-   you did, or why you did not>"`. Step 5 arms the merge before the review has
-   said anything, so without that answer the branch merges while you are still
-   fixing what it found ([WORKFLOW.md](docs/WORKFLOW.md)).
+   A change under `sysmodule/`, `overlay/` or `tlsprobe/` is built with devkitPro
+   too (the docker line above); `switch-build` is a required check and CI will
+   not merge a red one.
+2. Any issue your work invalidated is edited; the PR body says which and why.
+3. Push, and open the PR with `## Plan` — what the issue asked, where you
+   departed, which issues you edited — and its `Closes #N` line. `merge-gate`
+   requires the closing line, and `unblock.yml` reads it to free dependants.
+4. **Stop.** The dispatcher runs the independent review against
+   [REVIEW.md](REVIEW.md) and `.autofleet/review.md`; a `request-changes` buys
+   exactly one fix session, the re-review of that fix is final, and the rules
+   merge an approved PR. `guard.py` refuses `gh pr merge` and `gh pr review`
+   from a fleet worktree. A PR touching `.github/`, `.claude/` or `.autofleet/`
+   never merges itself; a person merges that one.
 
 ## What is watching you
 
@@ -164,18 +151,18 @@ and say so in the PR body. Never edit them as a side effect of rewording a body.
   anything reaching for a platform facility inside `core/`, `tracker-is-spec` on
   anything that finds an issue to be wrong. They are advisory.
 - **Hooks** ([`.claude/hooks/guard.py`](.claude/hooks/guard.py)) are not. They
-  block, with an explanation: merging a PR, force-pushing `main`, writing to
-  `server/contract/captures/`, editing secrets, editing `unblock.yml` — from a
-  shell command as well as from an edit. Three more apply **only in a worktree
-  the fleet opened**: editing the hooks or settings, pushing before the local
-  review is recorded, and anything outward while the fleet is stopped. A block is
-  a rule you were about to break, not a bug. It is not a sandbox:
-  `guard.py --selftest` is the record of what has been checked, not a proof that
-  nothing gets through.
+  block, with an explanation: merging or reviewing your own PR, force-pushing
+  `main`, writing to `server/contract/captures/`, editing secrets — from a shell
+  command as well as from an edit. What this project adds to the universal rules
+  is [`.autofleet/guard.json`](.autofleet/guard.json). While the fleet is
+  stopped, nothing outward leaves a fleet worktree. A block is a rule you were
+  about to break, not a bug. It is not a sandbox: `guard.py --selftest` is the
+  record of what has been checked, not a proof that nothing gets through.
 - **Subagents**: [`verifier`](.claude/agents/verifier.md) gives an independent
   build-and-test verdict from a fresh context before you open a PR;
   [`researcher`](.claude/agents/researcher.md) answers questions about the
-  codebase without spending your context on the files it read.
+  codebase without spending your context on the files it read;
+  [`reviewer`](.claude/agents/reviewer.md) is the dispatcher's, not yours.
 - `./evals/lint.sh` (also `ctest -R agent.config`) checks that all of the above
   is still well-formed and still enforcing what it claims.
 
@@ -194,7 +181,9 @@ put it there as part of the work, not in a note to yourself.
 | `server/` | Pinned RomM API snapshot, contract probe, and the Docker test fixture. |
 | `tests/` | CTest suites. |
 | `packaging/` | What the release zip ships beside the two artifacts; `scripts/package.sh` builds it. |
-| `scripts/orca/` | Per-worktree provisioning hooks. |
-| `evals/` | Regression tests for the agent configuration itself. |
-| `.claude/` | Skills, subagents and hooks — what steers and what blocks. |
+| `scripts/fleet/` | autofleet, vendored: the dispatcher, the brief, the review, the cost report. Nothing in it knows this project. |
+| `.autofleet/` | This project's answers to it: ports, compose file, test command, `setup.sh`, `guard.json`, `review.md`. |
+| `scripts/orca/` | The project half of provisioning: `env.sh` (the fleet's ports plus our URLs), `compose.sh`, `tls-fixture.sh`. |
+| `evals/` | Regression tests for the agent configuration itself, and the payload's own scanners. |
+| `.claude/` | Skills, subagents and hooks — what steers and what blocks. Merged by a person, never by the rules. |
 | `AGENTS.md` | Symlink to this file, for agent tools that look for that name. |

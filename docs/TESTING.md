@@ -878,124 +878,19 @@ The Python tooling lives in a per-worktree `.venv` built from
 
 Several agents work in parallel worktrees, and sync tests mutate saves by design.
 Each worktree therefore gets its **own** RomM: `scripts/orca/env.sh` derives a
-compose project name and two ports from the worktree path and writes them to
-`.env`, so no two worktrees share a port or a database. Only immutable, expensive
-things are shared between worktrees — the checksum-pinned ROM downloads and the
-content-addressed ccache, declared in [`orca.yaml`](../orca.yaml).
+compose project name and three ports from the worktree path and writes them to
+`.env`, so no two worktrees share a port or a database. The derivation is the
+fleet's (`scripts/fleet/env.sh`, bases in `.autofleet/config`); the wrapper adds
+the `*_BASE_URL`s and the two shared caches. Only immutable, expensive things
+are shared between worktrees — the checksum-pinned ROM downloads and the
+content-addressed ccache under `.cache/`.
 
 `.env` has more than one writer: `compose.sh` generates a missing one before it
-runs, so the `romm` tab writes it at the same moment `setup.sh` does. Each run
+runs, so a second shell writes it at the same moment setup does. Each run
 renames its own `mktemp` file into place, which makes that safe in both
 directions — no reader sees a half-written file, and no writer has its temp file
 carried off by another's rename. The derivation is a pure function of the
 worktree path, so concurrent writers publish identical bytes.
-
-### The romm log tab
-
-`defaultTabs` in [`orca.yaml`](../orca.yaml) asks Orca for a tab following this
-worktree's RomM. It is a request, and Orca does not always grant it: worktrees
-have come up with the tabs created, untitled, and running none of their commands
-while the fixture was live and serving. A running fixture nothing is showing
-looks exactly like one that failed to start.
-
-So `setup.sh` runs `scripts/orca/ensure-romm-tab.sh` — before it brings the stack
-up, because a failure there is exactly when you need the tab and `set -e` would
-otherwise skip the check. `romm-logs.sh` publishes a pidfile while it follows; if
-one is live, Orca honoured the request and the script does nothing, and if not,
-it asks the `orca` CLI for the tab itself and waits for a follower to actually
-appear before claiming success. It never fails setup, and it no-ops on a plain
-clone or in CI where there is no CLI and no tabs to create.
-
-Do not expect the tab to be called `romm`. Orca titles a tab after the command it
-was given and re-derives that title from the running process, so a rename races
-it and lands only sometimes. The tab is therefore created with exactly the
-command `orca.yaml` asks for, so that when the rename loses, the title still
-reads `./scripts/orca/romm-logs.sh`.
-
-### The RomM browser tab
-
-The log tab tells you the server is alive. It does not tell you what the scan
-decided: which platform RomM inferred each seeded folder is, what a rom's
-metadata actually looks like, whether the `Handheld` collection ended up with
-anything in it. Those are the questions that come up while implementing against
-the API, and they are one glance away in RomM's own web UI — if you are logged
-in, on the right port, out of three.
-
-So `setup.sh` finishes by running `scripts/orca/romm-browser.sh`, which opens an
-Orca browser tab on this worktree's RomM and authenticates that tab's session
-with the fixture credentials. It runs after provisioning because provisioning is
-what creates the admin it signs in as.
-
-It signs in from inside the page rather than by driving the login form: one
-`fetch` to `/api/login` with the same Basic header and `X-CSRFToken` echo that
-`provision.py` uses, leaving the tab holding a genuine `romm_session` cookie. The
-form is a Vue app whose markup is RomM's to change; `/api/login` is the pinned
-contract in [API_CONTRACT.md](API_CONTRACT.md).
-
-Reopen or re-authenticate it at any time:
-
-```bash
-./scripts/orca/romm-browser.sh
-```
-
-It always exits 0 — a browser tab must never fail a worktree — so it reports
-success through `.orca/romm-browser.state` instead, and `setup.sh` only promises
-a signed-in tab in its summary when that file says one exists.
-
-It is idempotent — a tab belonging to **this** worktree and already pointing at
-**this** worktree's RomM is reused rather than duplicated. Both halves of that
-matter: `orca tab list` reports every tab on the machine, so matching on the port
-alone would hand the script another worktree's tab to log in and navigate, and
-matching on the worktree alone would adopt a tab someone opened on unrelated
-documentation. Like the log tab, it never fails setup and no-ops on a plain clone
-or in CI where there is no Orca CLI.
-
-### The agent's prompt is drafted, not sent
-
-Creating a worktree from a linked issue puts the resolved spec — what
-`issue-command.sh` produced — into the agent's composer as a **draft**, and does
-not submit it. That is Orca's own behaviour for issue-linked workspaces and it is
-not reachable from `orca.yaml`: the app picks `promptDelivery: draft` whenever a
-work item is linked. The result is a fully provisioned worktree whose agent has
-read nothing, waiting for someone to walk over and press Return.
-
-`scripts/orca/agent-autostart.sh` presses it. Everything about how it is written
-comes from one asymmetry: the keypress it replaces is a small annoyance, while
-submitting a *human's* half-typed prompt for them would be a real one. So it
-presses Return on Orca's paste and on nothing else, and it takes three
-independent conditions to get there.
-
-- **A linked issue.** `--watch` refuses to run unless `orca worktree current`
-  reports one. Without a linked issue Orca drafts nothing, so any text in that
-  composer was typed by a person and there is nothing here to do.
-- **Arriving with the agent.** Orca delivers the draft as part of launching the
-  agent — sometimes as a launch argument, sometimes pasted once the agent is
-  ready — so there is a short grace window (30s) for it to appear. Once that
-  window closes on an empty composer, text showing up later is someone typing,
-  and watching stops there. The window is the one place where the guarantee is
-  a judgement rather than a proof: a person who opens a brand-new issue-linked
-  agent tab, types, and pauses, all within those 30 seconds, would have it
-  submitted. `AGENT_AUTOSTART_GRACE_SECONDS` shortens it.
-- **Read twice, identically.** A paste caught part way through is a shorter
-  string, and submitting there would hand the agent a truncated issue.
-
-`orca terminal read --json` is what makes any of this possible: it reports unsent
-composer text as `draft`, separately from the terminal's output, so there is
-something specific to look for rather than a keystroke fired on a timer.
-
-`setup.sh` starts it detached, in watching mode, as its last act. The order
-forces that: `setupAgentStartupPolicy: wait-for-setup` holds the agent's tab
-until setup returns, so while setup is running the draft does not exist yet. The
-watcher gives up after two minutes — what it waits for is part of the agent's
-launch, not something that can turn up later.
-
-Run by hand it takes a single shot and is *not* gated on a linked issue: running
-it is itself the deliberate act, and "submit whatever is drafted" is then what
-was asked for. Set `ROMMSYNC_AGENT_AUTOSTART=0` to keep the manual Return.
-
-Removing a worktree signals the watcher on the way out (`archive.sh`). It
-identifies the process before signalling it, because a pidfile outlives a
-`kill -9` and a reboot, and the number in it is then whatever the system reused.
 
 Tearing the stack down by hand is `./scripts/orca/compose.sh down -v`, and the
 wrapper adds two flags of its own to it: `--profile tls` and `--remove-orphans`.
@@ -1004,42 +899,32 @@ that has not activated its profile, so a bare `down` left the TLS terminator
 running — `restart: unless-stopped` brought it back on every docker start, and
 it held that worktree's `TLS_PORT` and, because a running container pins it, the
 network the rest of the teardown was waiting on (`Resource is still in use`).
-`archive.sh` and `reap.sh` already named the profile; this is the same hole in
-the path a person types.
+The fleet's `archive.sh` and `reap.sh` name it through `AUTOFLEET_COMPOSE_DOWN_ARGS`
+in `.autofleet/config`; this is the same hole in the path a person types.
 
 `up -d` is deliberately left alone: it still starts neither the terminator nor
 anything else profiled, which is what keeps the host suite talking plain HTTP to
 the fault proxy. And the profile is named rather than wildcarded — `--profile
 '*'` would cover a profile added later without a second edit, but it needs
 Compose 2.24 and an older one reads `*` as a literal profile name, activating
-nothing and restoring the leak in silence. `orca.teardown_covers_profiles` and
-`orca.compose_down_covers_profiles` read the profiles out of the compose file
-instead, so adding one fails the suite rather than passing quietly.
+nothing and restoring the leak in silence. A profile added to the compose file
+has to be added to `AUTOFLEET_COMPOSE_DOWN_ARGS` and to `compose.sh` by hand.
 
-Removing a worktree runs `scripts/orca/archive.sh`, which takes that worktree's
-stack and volumes down with it. It derives the project name from the worktree
-path rather than reading `.env` back, so a worktree whose `.env` never got
-written still tears down cleanly, and it checks afterwards that docker holds
-nothing under that project instead of assuming `down` worked.
+Removing a worktree runs `scripts/fleet/archive.sh`, which takes that worktree's
+stack and volumes down with it (`AUTOFLEET_COMPOSE_FILE` and
+`AUTOFLEET_COMPOSE_DOWN_ARGS` in `.autofleet/config` say which file and which
+profiles). It derives the project name from the worktree path rather than
+reading `.env` back, so a worktree whose `.env` never got written still tears
+down cleanly. The dispatcher runs it before `git worktree remove` and sweeps once
+the directory is confirmed gone.
 
-Only the Orca UI runs that hook by itself. `orca worktree rm` **skips**
-`orca.yaml` archive hooks unless `--run-hooks` is passed, so removing a worktree
-from the CLI without it leaves the whole stack running with no worktree left to
-find it from. Pass the flag, or sweep afterwards with `reap.sh --yes`.
-
-`fleet.sh` takes the second route deliberately. Orca runs the hook *before* it
-decides whether the removal succeeds, so a removal it then refuses has already
-torn the stack down under a worktree that is still there and still being worked
-in (#163). The dispatcher removes with no hooks and sweeps once the directory is
-confirmed gone.
-
-Stacks can still outlive their worktree — one deleted with `rm -rf`, removed with
-`orca worktree rm` and no `--run-hooks`, or removed while Docker was stopped. The fixture restarts `unless-stopped`, so those come
-back on every docker start and hold two ports each. Sweep them up with:
+Stacks can still outlive their worktree — one deleted with `rm -rf`, or removed
+while Docker was stopped. The fixture restarts `unless-stopped`, so those come
+back on every docker start and hold three ports each. Sweep them up with:
 
 ```bash
-./scripts/orca/reap.sh          # list stacks with no worktree, change nothing
-./scripts/orca/reap.sh --yes    # remove them, volumes included
+./scripts/fleet/reap.sh          # list stacks with no worktree, change nothing
+./scripts/fleet/reap.sh --yes    # remove them, volumes included
 ```
 
 It protects two sets of stacks: those belonging to a live worktree of this repo,

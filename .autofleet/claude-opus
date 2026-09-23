@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# The fleet's model is pinned HERE, not inherited. `claude -p` with no --model
+# takes ~/.claude/settings.json's default, which is whatever the maintainer last
+# picked for an interactive session -- on 2026-09-23 that was Fable, and a build
+# ran on it unnoticed. AUTOFLEET_BUILD_CMD and AUTOFLEET_REVIEW_CMD in
+# .autofleet/config name this wrapper so every fleet-owned claude is Opus.
+# One word on purpose: review.sh invokes the seam quoted, as a single program.
+exec claude --model opus "$@"

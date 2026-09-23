@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Remove RomM stacks whose worktree no longer exists.
+# Remove this project's docker stacks whose worktree no longer exists.
 #
-# archive.sh is the normal path, but it only runs when Orca removes a worktree
-# and docker is healthy at that moment. A worktree deleted with `rm -rf`, or
-# removed while Docker Desktop was down, leaves a stack behind -- and because
-# the fixture restarts `unless-stopped` it comes back on every docker start,
-# holding two ports and four volumes, with no directory left to find it from.
-# This is the sweep that catches those.
+# archive.sh is the normal path, but it only runs when the runner removes a
+# worktree and docker is healthy at that moment. A worktree deleted with
+# `rm -rf`, or removed while Docker Desktop was down, leaves a stack behind --
+# and a service that restarts `unless-stopped` comes back on every docker start,
+# holding its ports and volumes, with no directory left to find it from. This is
+# the sweep that catches those.
 #
-#   ./scripts/orca/reap.sh          # list what is stale, change nothing
-#   ./scripts/orca/reap.sh --yes    # tear those stacks down, volumes included
-#   ./scripts/orca/reap.sh --yes --only rmx-foo-123   # ...that one, if it is stale
+#   ./scripts/fleet/reap.sh          # list what is stale, change nothing
+#   ./scripts/fleet/reap.sh --yes    # tear those stacks down, volumes included
+#   ./scripts/fleet/reap.sh --yes --only af-foo-123    # ...that one, if it is stale
 #
 # This deletes databases, so every uncertainty resolves towards keeping a stack:
 # anything it cannot positively establish is stale is left alone, and it refuses
@@ -18,15 +18,15 @@
 #
 # `--only` narrows the result and can never widen it: the stale set is computed
 # exactly as it always was, and the named projects are then intersected with it.
-# It exists for fleet.sh, which removes worktrees with no Orca hooks and sweeps
-# afterwards (#163) -- a dispatcher releasing ONE worktree should not also delete
+# It exists for fleet.sh, which removes worktrees with no runner hooks and
+# sweeps afterwards (armaatus/rommsync-nx#163) -- a dispatcher releasing ONE worktree should not also delete
 # the database of an orphan somebody is still looking at. Repeatable, because a
 # renamed worktree runs its stack under a name that no longer matches its path.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
-. ./scripts/orca/lib.sh
+. ./scripts/fleet/lib.sh
 
 APPLY=false
 ONLY=""
@@ -50,7 +50,7 @@ done
 # Every query below reports "nothing found" when the daemon is unreachable, so
 # without this the tool documented as the recovery path for "docker was down"
 # would print a clean bill of health precisely when docker is down.
-orca_docker_ready \
+fleet_docker_ready \
   || { echo "docker is not reachable; cannot tell which stacks are stale" >&2; exit 1; }
 
 protected=""
@@ -79,14 +79,14 @@ while IFS= read -r line; do
   # marked `prunable`. Trusting the list alone would protect exactly the orphans
   # this tool exists to sweep, so require the directory to still be there.
   [ -d "$wt" ] || continue
-  orca_derive_env "$wt" \
+  fleet_derive_env "$wt" \
     || { echo "cannot derive a project name for $wt; refusing to sweep" >&2; exit 1; }
-  protect "$orca_project"
+  protect "$fleet_project"
 done <<EOF
 $worktrees
 EOF
 
-# `git worktree list` only knows this repository. A second clone of rommsync-nx
+# `git worktree list` only knows this repository. A second clone of the repo
 # elsewhere on the machine is not a worktree of this one, and its running stack
 # would otherwise look stale. Its containers still point at the directory that
 # holds its compose file, so protect any project whose directory is still there.
@@ -102,23 +102,23 @@ done < <(docker ps -a --format \
 # This checkout is itself a worktree of this repo, so its own project must have
 # come out of the loop above. If it did not, the protected set is not to be
 # trusted and neither is anything derived from it.
-orca_derive_env "$REPO_ROOT" \
+fleet_derive_env "$REPO_ROOT" \
   || { echo "cannot derive this worktree's own project name" >&2; exit 1; }
 case " $protected " in
-  *" $orca_project "*) ;;
-  *) echo "sanity check failed: this worktree ($orca_project) is not in the protected set" >&2
+  *" $fleet_project "*) ;;
+  *) echo "sanity check failed: this worktree ($fleet_project) is not in the protected set" >&2
      echo "refusing to remove anything" >&2
      exit 1 ;;
 esac
 
-# Every rmx-* project docker knows about, across all three resource kinds -- a
-# half-removed stack may survive as volumes alone.
+# Every project docker knows about under this repo's prefix, across all three
+# resource kinds -- a half-removed stack may survive as volumes alone.
 found="$(
   {
     docker ps -a      --format '{{.Label "com.docker.compose.project"}}'
     docker volume ls  --format '{{.Label "com.docker.compose.project"}}'
     docker network ls --format '{{.Label "com.docker.compose.project"}}'
-  } 2>/dev/null | grep '^rmx-' | sort -u || true
+  } 2>/dev/null | grep "^${AUTOFLEET_PROJECT_PREFIX}-" | sort -u || true
 )"
 
 stale=""
@@ -137,7 +137,7 @@ if [ -z "${stale// /}" ]; then
   if [ -n "${ONLY// /}" ]; then
     echo "nothing to reap;$ONLY has no stack left, or still has a worktree"
   else
-    echo "nothing to reap; every rmx-* stack belongs to a live worktree"
+    echo "nothing to reap; every ${AUTOFLEET_PROJECT_PREFIX}-* stack belongs to a live worktree"
   fi
   exit 0
 fi
@@ -145,15 +145,20 @@ fi
 failed=false
 for project in $stale; do
   echo "== $project (no worktree)"
-  orca_project_remnants "$project" | sed 's/^/     /'
+  fleet_project_remnants "$project" | sed 's/^/     /'
   if ! $APPLY; then continue; fi
 
-  # This repo's compose file describes every rmx-* stack -- only the project
-  # name differs -- so it can tear down a stack whose own worktree is long gone.
-  # --profile tls for the same reason as archive.sh: an inactive profile's
-  # containers are invisible to `down`, and the TLS terminator restarts itself.
-  docker compose -p "$project" -f server/testing/docker-compose.yml \
-    --profile tls down -v --remove-orphans || echo "!! down failed for $project"
+  # This repo's compose file describes every one of its stacks -- only the
+  # project name differs -- so it can tear down a stack whose own worktree is
+  # long gone. AUTOFLEET_COMPOSE_DOWN_ARGS for the same reason as archive.sh: a
+  # service whose profile is not active is invisible to `down`, and comes back
+  # under `restart: unless-stopped`.
+  if [ -n "${AUTOFLEET_COMPOSE_FILE:-}" ]; then
+    # shellcheck disable=SC2086 # the down args are a deliberate word list
+    docker compose -p "$project" -f "$AUTOFLEET_COMPOSE_FILE" \
+      ${AUTOFLEET_COMPOSE_DOWN_ARGS:-} down -v --remove-orphans \
+      || echo "!! down failed for $project"
+  fi
 
   # `down` only removes what it recognises as its own: a stack that was
   # half-dismantled by hand keeps its network, and sometimes a stray container,
@@ -167,9 +172,9 @@ for project in $stale; do
       volume)    docker volume rm "$name" >/dev/null 2>&1 || true ;;
       network)   docker network rm "$name" >/dev/null 2>&1 || true ;;
     esac
-  done < <(orca_project_remnants "$project")
+  done < <(fleet_project_remnants "$project")
 
-  remnants="$(orca_project_remnants "$project")"
+  remnants="$(fleet_project_remnants "$project")"
   if [ -n "$remnants" ]; then
     echo "!! $project still has:"
     echo "$remnants" | sed 's/^/     /'
