@@ -267,21 +267,65 @@ instead — `sync::StateBackupDiscriminator`, giving
 prevent, one asset kind over
 ([Save states](#save-states)).
 
-**The backup promises ordering, and — once the platform layer has said how —
-durability too.** The copy is flushed, closed, made durable and only then renamed
-into place, before the save is touched: no reader ever sees half a backup, no
-overwrite happens without one, and a console that loses power between the copy
-and the overwrite does not leave a backup whose name landed and whose data blocks
-never did.
+**The guarantee is an ordering of persistence, not of calls** (M9-14, #203).
+After a power cut at any instant, and the boot sweep that follows it
+(`sync::RecoverStaging`), the save holds its old bytes or its new ones — and if
+it holds the new ones, a backup holding the old ones in full is on the card.
+Neither FAT32 nor exFAT journals, so "the backup call returned before the
+overwrite call started" does not imply that; what does is each step being
+durable before the next one can be:
 
-That last part is `io::FileSync`, a hook the platform layer installs because
-neither `fsync` nor Horizon's `fsFsCommit` is reachable from `core/`.
-`host/src/file_sync.cpp` syncs one descriptor; `sysmodule/source/main.cpp` calls
-`fsdevCommitDevice("sdmc:")`, which is the only primitive devkitA64 has — its
-newlib exports no `fsync` at all, which is why the hook takes a path rather than
-an open handle. A hook that refuses fails the copy, so a backup that could not be
-put on the card stops the overwrite rather than being counted as one. With none
-installed the older, weaker promise stands.
+1. The save is copied to `.backup/<name>.tmp`, closed, and **synced**.
+2. It is renamed to `.backup/<name>`, and **`.backup/` is synced**, so the name
+   is on the card and not only the bytes. A card that will not confirm this is a
+   failed backup (`kBackupFailed`): the copy is removed and the overwrite does
+   not happen. The overwrite is in a different directory, and without this a
+   power cut could keep it and lose the backup's name — the one gap the call
+   order hid, found by the replay below.
+3. The new bytes are staged beside the save and **synced** — by
+   `io::WriteAtomically`/`CopyAtomically` for a restore, by the HTTP backend
+   before it renames its `.part` for a download.
+4. `io::CommitStaged`: the save to `<save>.old`, the staged file onto the save,
+   `<save>.old` removed, and the save's directory synced. A cut between the two
+   renames leaves `.old` and no save, which the boot sweep renames back.
+
+Every sync is `io::Sync`, through the same `io::Disk` seam every write, rename
+and remove goes through (#202), which asks the platform's `io::FileSync` hook:
+`host/src/file_sync.cpp` `fsync`s by path, and `sysmodule/source/main.cpp`
+calls `fsdevCommitDevice("sdmc:")`, which commits the whole card and ignores the
+path — which is why the hook takes a path rather than an open handle. A hook
+that refuses fails the step it guards. With none installed the older, weaker
+promise stands: no reader ever sees half a file, and nothing about power cuts.
+
+**What proves it.** `tests/crash_disk.hpp` records every call an overwrite makes
+through `io::Disk`, cuts the record at every call, and enumerates what a card
+that does not journal may keep: per directory, any prefix of the names changed
+since its last sync; per file, the data written since its last sync lost, torn,
+short, or complete. Each card is swept as the next boot would sweep it, and
+judged against the property above. `execute.crash` (a download),
+`states.crash` (a state) and `conflicts.crash` (a restore) are the three paths
+that land on a save, each also run with `.backup/` unconfirmed;
+`execute.crash_model` shows the replay catches an overwrite written in place,
+one with no backup, and a rename of bytes nothing synced. The `backup` row of
+`scripts/v1-gate.sh` counts them. What the model assumes — a sync that says yes
+did persist, a directory's own updates land in order, no flying writes — is
+listed at the top of that header; a kernel-level injector such as lazyfs is the
+check on those assumptions, and is not in the suite.
+
+**`state.db` keeps the same rename protocol, and gets no A/B slots — decided,
+not deferred.** A flying write (a sector written whole, to the wrong place) can
+corrupt a file nothing opened, and A/B copies with a generation counter and a
+CRC32C would detect that. They are not worth it here, because of what
+`state.db` is: an optimisation and never a gate (`state_db.hpp`). A file that
+is garbage, truncated, or fails the strict per-row JSON read costs a re-hash and
+a renegotiation; a row that a stray write left *parseable but wrong* — the only
+case a checksum would add — costs a wrong arbitration, and every arbitration
+that replaces local bytes backs them up first under the property above. So the
+worst a corrupted baseline can do is put the server's copy on the card with the
+local one under `.backup/` — a conflict a person can undo (M7-1), never a lost
+save. Save files themselves keep the rename protocol too: doubling every save
+write is the cost the issue ruled out. If `state.db` ever becomes a gate —
+something a tick refuses to run without — this decision has to be reopened.
 
 ### Conflicts
 

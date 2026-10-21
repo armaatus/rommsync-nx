@@ -41,7 +41,8 @@ namespace rommsync::io {
 /// It takes the **path** rather than an open handle because the two platforms
 /// do not agree on what durability is a property of: the host syncs one file
 /// descriptor, and Horizon commits the whole `sdmc:` filesystem
-/// (`fsdevCommitDevice`; devkitA64's newlib exports no `fsync` at all). A hook
+/// (`fsdevCommitDevice`; a per-file `fsync` does link there, and only flushes
+/// -- `sysmodule/source/main.cpp` says why it is the wrong call). A hook
 /// that ignores the path and commits everything is a correct implementation of
 /// this contract.
 ///
@@ -60,6 +61,11 @@ namespace rommsync::io {
 ///
 /// Null -- the default -- keeps the older, weaker promise: no reader ever sees
 /// half a file. Nothing here fails for want of a hook.
+///
+/// **Callers do not call it directly.** They call `io::Sync` (disk.hpp), whose
+/// stdio implementation calls this; that keeps the durability point inside the
+/// `io::Disk` seam, where a test can record it beside the writes it orders and
+/// replay a power cut at every call (#203).
 using FileSync = bool (*)(const std::string& path);
 
 /// Install the hook, process-wide.

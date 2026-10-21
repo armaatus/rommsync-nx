@@ -799,6 +799,33 @@ ctest --test-dir build --output-on-failure
   "the card refused the write" sentence rather than "full". The free-space check
   before a download starts does not depend on it -- `statvfs` over `fsdev` reads
   `fsFsGetFreeSpace` -- which is why it is there.
+- **A power cut at every call of an overwrite** (M9-14, #203). Hard rule 2 is
+  an ordering of *persistence* -- after a power cut at any instant, the save is
+  its old bytes or its new ones, and new bytes never stand without the old under
+  `.backup/` -- and a test of the order of *calls* does not prove it. The same
+  `io::Disk` seam carries `Sync`, the durability point, so
+  `tests/crash_disk.hpp`'s `crash::Recorder` logs every open, write, rename,
+  remove and sync an overwrite makes on real files. `crash::Replay` then cuts the
+  log at every call and enumerates what a card that does not journal may keep --
+  per directory, any prefix of the names changed since its last sync; per file,
+  the data since its last sync lost, torn, short or complete -- writes each
+  distinct card to scratch, runs `sync::RecoverStaging` over it as the next boot
+  would, and judges it. `execute.crash` (a download), `states.crash` (a state)
+  and `conflicts.crash` (a restore) are the three paths the gate's census says
+  land on a save; each also runs once with the card refusing to confirm
+  `.backup/`, which must stop the overwrite. `execute.crash_model` is the
+  replay's own check: an overwrite written in place, one with no backup, and a
+  rename of bytes nothing synced must each be caught, or a green run means
+  nothing. None needs privileges, and all run the same on a Mac and on Linux.
+
+  What the model does **not** cover is stated at the top of `crash_disk.hpp`: a
+  sync that returns true and persisted nothing, flying writes, metadata
+  reordered within one directory, and `fseek`/`ftruncate` (no save path reaches
+  them). A durability call made *beside* the seam is invisible to it, which is
+  how the host backend's descriptor `fsync` was found -- so a backend that makes
+  something durable does it through `io::Sync`. A kernel-level injector
+  ([lazyfs](https://github.com/dsrhaslab/lazyfs), Linux and FUSE) is the check
+  on the model's assumptions and is not part of this suite.
 - The `package.*` group covers `scripts/package.sh`, which turns those two build
   outputs into the zip a user unpacks onto their SD card. `package.layout`,
   `package.refuses`, `package.deterministic` and `package.upgrade` stub the two
@@ -1069,7 +1096,7 @@ two cannot drift.
 | `auth` | Auth (M1) full device-code flow + 401/refresh proven on host + docker RomM. | `auth.*`, `pair.*`, `device.*`, `core.token_store`, `core.device_identity`, `harness.expired`, and M1-6's `engine.pairs`, `engine.repairs`, `engine.nonblocking`, `engine.unauthenticated` |
 | `ipc` | Config + IPC (M5) proven on host harness. | `core.config`, `config.*`, `ipc.*`, `lists.*`, `overlay.*`, `engine.config`, `engine.commands`. What these prove is the protocol, and since M9-7 (#198) they prove it through the overlay's own `ipc_client.cpp` as well as through `ipc::Dispatch` -- `overlay.wire`, `overlay.roundtrip`, `overlay.errors`. What no test reaches is the libnx `cmif`/`hipc` glue: `sysmodule/source/ipc/server.cpp` and the message unpacking in `service.cpp`, verified with the rest of the Horizon glue at M8-2. |
 | `ssl` | HttpClient ssl-service backend proven in a Ryujinx NRO (M0-1), or on an isolated NRO on a backup SD. | **Nothing yet.** `switch.builds` and `switch.tlsprobe` prove it compiles and links for aarch64; no handshake has been executed anywhere. See *what the first console decides*. |
-| `backup` | Every save-overwrite path shown to back up first (SYNC_PROTOCOL hard rule) -- verified by tests. | `harness.backup`, `execute.*`, `states.overwrite`, `states.keeps_both`, `tick.backupdir`, `tick.durable` — **and a census** of every `io::CommitStaged`/`CopyAtomically`/`WriteAtomically` call site in `core/src`, `sysmodule/source` and `overlay/source`, so a *new* overwrite path fails the gate until somebody classifies it. The two Horizon targets are in scope because `sysmodule/source/engine.cpp` already writes a file, and a census that only read `core/` would answer a narrower question than the row asks. Each row that lands on a save names the call that does it, and the census insists a call to `sync::BackUpFirst` comes before it — which is how M7-1's restore, whose overwrite is a `CopyAtomically` rather than a `CommitStaged`, is held to the same rule as the two paths M2-5 wrote. That census is the word "every"; the tests are the rest. |
+| `backup` | Every save-overwrite path shown to back up first, durably (SYNC_PROTOCOL hard rule) -- verified by tests, a power cut replayed at every call. | `harness.backup`, `execute.*`, `states.overwrite`, `states.keeps_both`, `states.crash`, `conflicts.crash`, `tick.backupdir`, `tick.durable` — **a crash-prefix replay** of each of the three paths that land on a save (`execute.crash`, `states.crash`, `conflicts.crash`; `tests/crash_disk.hpp`), which makes "first" an order of *persistence* rather than of calls: every point of the recorded overwrite is cut, every card a non-journalling FAT may keep is swept by the boot sweep, and each must hold the old bytes or the new, never the new without the old under `.backup/` — **and a census** of every `io::CommitStaged`/`CopyAtomically`/`WriteAtomically` call site in `core/src`, `sysmodule/source` and `overlay/source`, so a *new* overwrite path fails the gate until somebody classifies it. The two Horizon targets are in scope because `sysmodule/source/engine.cpp` already writes a file, and a census that only read `core/` would answer a narrower question than the row asks. Each row that lands on a save names the call that does it, and the census insists a call to `sync::BackUpFirst` comes before it — which is how M7-1's restore, whose overwrite is a `CopyAtomically` rather than a `CommitStaged`, is held to the same rule as the two paths M2-5 wrote. That census is the word "every"; the tests are the rest. |
 | `release` | A tagged, released v1 build exists (M6). | A `v1` tag reachable from `main` that agrees with `VERSION`, and a published, non-draft release carrying the zip and `SHA256SUMS`. **Failing today: this repository has no tags and no releases.** |
 | `media` | A known-good NAND/SD backup exists; testing will be on a spare/backup SD or emuMMC, not the daily driver. | **Nothing in a repository can attest to this**, and a checkbox that says otherwise is worse than none. See *what the first console decides*. |
 
