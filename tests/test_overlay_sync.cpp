@@ -79,9 +79,8 @@ class KnobEngine : public ipc::Engine {
   ipc::Error ListConflicts(const ipc::ConflictQuery&, ipc::ConflictPage*) override {
     return ipc::Error::kOk;
   }
-  ipc::Error RestoreBackup(std::int64_t, conflicts::RestoreReport*) override {
-    return ipc::Error::kOk;
-  }
+  ipc::RestoreState RequestRestore(std::int64_t) override { return {}; }
+  ipc::RestoreState restore_state() const override { return {}; }
 
  private:
   std::vector<config::Diagnostic> notes_;

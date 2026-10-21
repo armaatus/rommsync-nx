@@ -65,6 +65,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -78,7 +79,9 @@
 #include "rig.hpp"
 #include "rommsync/auth.hpp"
 #include "rommsync/auth_gate.hpp"
+#include "rommsync/conflict_log.hpp"
 #include "rommsync/download.hpp"
+#include "rommsync/file_system.hpp"
 #include "rommsync/host/curl_http_client.hpp"
 #include "rommsync/host/native_file_system.hpp"
 #include "rommsync/ipc.hpp"
@@ -200,6 +203,40 @@ class Console {
     std::string response;
     Call(ipc::Command::kGetLog, ipc::EncodeLogRequest(ipc::kMaxLogLines), &response);
     return ipc::DecodeLogTail(response).value;
+  }
+
+  /// Command 15, read off the wire: where the restore stands the instant the
+  /// press was taken (M9-6, #209).
+  ipc::RestoreState Restore(std::int64_t entry_id, ipc::Error* answered = nullptr) {
+    std::string response;
+    const ipc::Error answer =
+        Call(ipc::Command::kRestoreBackup, ipc::EncodeEntryId(entry_id), &response);
+    if (answered != nullptr) {
+      *answered = answer;
+    }
+    return ipc::DecodeRestoreState(response).value;
+  }
+
+  /// Command 17: what the overlay polls while a restore runs.
+  ipc::RestoreState RestoreState() {
+    std::string response;
+    Call(ipc::Command::kGetRestoreState, ipc::EncodeEmpty(), &response);
+    return ipc::DecodeRestoreState(response).value;
+  }
+
+  /// Poll command 17 until the restore of `entry_id` is done, the way the
+  /// conflicts screen does. A state that never got there is returned as it
+  /// last stood, so the caller's assertion names what it saw.
+  ipc::RestoreState AwaitRestore(std::int64_t entry_id) {
+    ipc::RestoreState state = RestoreState();
+    for (int waited = 0; waited < 400; ++waited) {
+      if (state.phase == ipc::RestorePhase::kDone && state.entry_id == entry_id) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds{25});
+      state = RestoreState();
+    }
+    return state;
   }
 
   /// The queue as the *card* holds it, which is the only copy that survives a
@@ -1430,7 +1467,7 @@ class HeldServer final : public http::HttpClient {
 /// M7-2 (#37): a restore and a running tick both write saves, and only one of
 /// them may.
 ///
-/// Until this issue nothing else in the sysmodule wrote a save, so
+/// Until that issue nothing else in the sysmodule wrote a save, so
 /// `RestoreBackup` had the card to itself. The worker changed that: it runs
 /// `sync::Execute` and `sync::SyncStates` over the same `sd_path` a restore
 /// targets. Each write is atomic on its own, so what a collision produces is a
@@ -1439,12 +1476,14 @@ class HeldServer final : public http::HttpClient {
 /// which is hard rule 2 defeated by timing rather than by a bug in either
 /// writer.
 ///
-/// **The check has to be concurrent**, not a sequential call that finds a flag
-/// set: an earlier version of this fix read `sync_in_progress_` under a lock and
-/// then let it go, which is a race with a handful of instructions in it rather
-/// than no race. So this holds a tick open *inside* `sync::RunTick` -- a stub
-/// server that blocks on the negotiation -- and presses restore while it is
-/// there.
+/// **What M9-6 (#209) changed is the answer, not the exclusion.** The restore
+/// used to run on the IPC thread and was *refused* while a tick held the card.
+/// It now runs on the worker, which is the thread the tick is on -- so it
+/// cannot interleave with one by construction, and a press during a tick
+/// **waits its turn** instead of being turned away. Still held open inside
+/// `sync::RunTick`, because the claim is about a tick that is demonstrably
+/// mid-flight: the restore is accepted, stays running while the tick is held,
+/// and runs the moment it lets go.
 void RestoreDuringSync(checks::Checks& c) {
   Console console(c, "engine-restore-during-sync");
   c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
@@ -1473,36 +1512,182 @@ void RestoreDuringSync(checks::Checks& c) {
   c.Expect(server.AwaitNegotiate(), "the worker reaches the negotiation and is held there");
 
   // The press, while the tick is demonstrably mid-flight. The entry id is one
-  // nothing has: the refusal has to come from the write lock and not from the
-  // history, which is what tells this apart from `kNoSuchEntry`.
-  std::string response;
-  const ipc::Error answered =
-      console.Call(ipc::Command::kRestoreBackup, ipc::EncodeEntryId(1), &response);
+  // nothing has, so what the restore finally answers says it reached the
+  // history -- `kNoSuchEntry` -- rather than a lock.
+  ipc::Error answered = ipc::Error::kInternal;
+  const ipc::RestoreState taken = console.Restore(1, &answered);
   c.Expect(answered == ipc::Error::kOk, "the command is answered rather than failing");
-  const conflicts::RestoreReport report = ipc::DecodeRestoreReport(response).value;
-  c.Expect(report.outcome == conflicts::RestoreOutcome::kBackupFailed,
-           "a restore during a tick is refused, with the outcome whose promise is "
-           "'nothing was written'");
-  c.Expect(report.message.find("a sync is running") != std::string::npos,
-           "and the sentence names the reason, so the screen can say press again -- got: " +
-               report.message);
+  c.Expect(taken.phase == ipc::RestorePhase::kRunning && taken.entry_id == 1,
+           std::string("a restore during a tick is taken, not refused: ") +
+               ipc::ToString(taken.phase));
+
+  // ...and it does not run while the tick does. Asked a few times over, so a
+  // restore that ran *beside* the tick would have had the time to finish.
+  for (int look = 0; look < 4; ++look) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    c.Expect(console.RestoreState().phase == ipc::RestorePhase::kRunning,
+             "it waits while the tick holds the card");
+  }
 
   server.Release();
 
-  // And once the tick has let go, the same press reaches the history again --
-  // `kNoSuchEntry` for an id nothing has, which is the answer that proves the
-  // refusal above was the lock and not a permanent state.
-  conflicts::RestoreReport after;
-  for (int waited = 0; waited < 200; ++waited) {
-    console.Call(ipc::Command::kRestoreBackup, ipc::EncodeEntryId(1), &response);
-    after = ipc::DecodeRestoreReport(response).value;
-    if (after.outcome != conflicts::RestoreOutcome::kBackupFailed) {
-      break;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  // And once the tick has let go, it runs: `kNoSuchEntry` for an id nothing
+  // has, which is the answer that proves it reached the history.
+  const ipc::RestoreState after = console.AwaitRestore(1);
+  c.Expect(after.phase == ipc::RestorePhase::kDone,
+           std::string("the restore runs the moment the tick is done: ") +
+               ipc::ToString(after.phase));
+  c.Expect(after.report.outcome == conflicts::RestoreOutcome::kNoSuchEntry,
+           std::string("and it reached the history: ") +
+               conflicts::ToString(after.report.outcome) + " -- " + after.report.message);
+}
+
+/// A card that can be made to stop answering in the middle of a restore.
+///
+/// Every file `conflicts::Restore` touches is reached through `Resolve` first,
+/// so holding that one call is holding the restore -- a large save copying on
+/// a slow card, which is the case #209 names -- without timing anything.
+class SlowCard final : public fs::FileSystem {
+ public:
+  explicit SlowCard(std::unique_ptr<fs::FileSystem> real) : real_(std::move(real)) {}
+
+  fs::Listing List(std::string_view sd_path) override { return real_->List(sd_path); }
+  fs::MakeDirResult CreateDirectory(std::string_view sd_path) override {
+    return real_->CreateDirectory(sd_path);
   }
-  c.Expect(after.outcome == conflicts::RestoreOutcome::kNoSuchEntry,
-           "and the restore is available again the moment the tick is done");
+  fs::Volume VolumeOf(std::string_view sd_path) const override { return real_->VolumeOf(sd_path); }
+
+  std::string Resolve(std::string_view sd_path) const override {
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      if (armed_) {
+        held_ = true;
+        changed_.notify_all();
+        changed_.wait(lock, [this] { return !armed_; });
+      }
+    }
+    return real_->Resolve(sd_path);
+  }
+
+  void Arm() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    armed_ = true;
+  }
+
+  void Release() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      armed_ = false;
+    }
+    changed_.notify_all();
+  }
+
+  /// A call is being held. False if none arrived, which is a scenario that
+  /// proved nothing rather than one that passed.
+  bool AwaitHeld() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return changed_.wait_for(lock, std::chrono::seconds{10}, [this] { return held_; });
+  }
+
+ private:
+  std::unique_ptr<fs::FileSystem> real_;
+  mutable std::mutex mutex_;
+  mutable std::condition_variable changed_;
+  bool armed_ = false;
+  mutable bool held_ = false;
+};
+
+/// M9-6 (#209): a restore that takes as long as the card does holds no IPC
+/// call for that long.
+///
+/// `RestoreBackup` used to copy the save on the IPC thread before it answered,
+/// so the overlay's draw thread -- waiting in `serviceDispatchOut` -- was held
+/// for the whole copy, and so was every other command the sysmodule would have
+/// answered in the meantime. Now the command starts the restore on the worker
+/// and answers at once, and `GetRestoreState` is what the overlay polls.
+///
+/// The card is held *inside* the restore, so every assertion below is made
+/// while the copy is demonstrably still running.
+void RestoreIsPolled(checks::Checks& c) {
+  Console console(c, "engine-restore-polled");
+  // Switched off, so the worker's only work is the restore: a tick here would
+  // be a second thing on the card and a different scenario.
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini", "[sync]\nenabled = false\n"),
+           "a card with sync switched off");
+
+  const std::string previous = "the bytes this console had\n";
+  const std::string server_copy = "the server's copy\n";
+  const std::string save = harness::SavePath("game.srm");
+  const std::string backup = std::string(harness::kBackupDir) + "/4-retroarch-srm-1757000000.srm";
+  c.Expect(console.sandbox.SeedSave(save, server_copy), "the save a sync wrote is on the card");
+  c.Expect(console.sandbox.Write(backup, previous), "and so is the backup of what it replaced");
+  std::int64_t entry_id = 0;
+  {
+    conflicts::History history(console.directory + conflicts::kHistoryFileName);
+    history.Load();
+    conflicts::Entry entry;
+    entry.kind = conflicts::EntryKind::kSave;
+    entry.event = conflicts::Event::kReplaced;
+    entry.rom_id = 4;
+    entry.rom_name = "Game";
+    entry.file_name = "game.srm";
+    entry.slot = "retroarch-srm";
+    entry.when = 1'757'000'000;
+    entry.sd_path = save;
+    entry.backup_sd_path = backup;
+    const auto appended = history.Append(entry);
+    c.Expect(appended.ok(), "the overwrite is in the history");
+    entry_id = appended.id;
+  }
+
+  SlowCard card(rommsync::host::MakeNativeFileSystem(console.sandbox.root().string()));
+  console.Boot();
+  console.engine.UseCard(&card);
+  console.engine.StartWorker();
+
+  card.Arm();
+  const auto start = std::chrono::steady_clock::now();
+  ipc::Error answered = ipc::Error::kInternal;
+  const ipc::RestoreState taken = console.Restore(entry_id, &answered);
+  const auto took = std::chrono::steady_clock::now() - start;
+  c.Expect(answered == ipc::Error::kOk, "RestoreBackup is answered");
+  c.Expect(taken.phase == ipc::RestorePhase::kRunning && taken.entry_id == entry_id,
+           std::string("with the restore taken and running, not finished: ") +
+               ipc::ToString(taken.phase));
+  c.Expect(card.AwaitHeld(), "the restore is on the worker, held inside the copy");
+  c.Expect(took < std::chrono::seconds{1},
+           "and the command came back without waiting for the card");
+
+  // **The IPC thread is free while the copy runs.** Every command the overlay
+  // polls is answered -- the status screen's, and the conflicts screen's own.
+  const auto polled = std::chrono::steady_clock::now();
+  (void)console.Status();
+  const ipc::RestoreState running = console.RestoreState();
+  c.Expect(std::chrono::steady_clock::now() - polled < std::chrono::seconds{1},
+           "GetStatus and GetRestoreState are answered while the save is copying");
+  c.Expect(running.phase == ipc::RestorePhase::kRunning && running.entry_id == entry_id,
+           "and the poll says it is still running");
+
+  // A second press while one is running starts nothing: it is answered with the
+  // restore that is already out, which is what lets a screen tell "mine" from
+  // "someone else's".
+  const ipc::RestoreState again = console.Restore(entry_id + 100);
+  c.Expect(again.phase == ipc::RestorePhase::kRunning && again.entry_id == entry_id,
+           "a press during a restore is answered with the one already running");
+  c.ExpectEq(console.sandbox.Read(save), server_copy, "nothing is written while it is held");
+
+  card.Release();
+  const ipc::RestoreState done = console.AwaitRestore(entry_id);
+  c.Expect(done.phase == ipc::RestorePhase::kDone, "the restore finishes once the card answers");
+  c.Expect(done.report.outcome == conflicts::RestoreOutcome::kRestored,
+           std::string("and it restored: ") + conflicts::ToString(done.report.outcome) + " -- " +
+               done.report.message);
+  c.ExpectEq(console.sandbox.Read(save), previous, "the bytes are back on the card");
+  c.Expect(!done.report.backup_sd_path.empty() &&
+               console.sandbox.Read(done.report.backup_sd_path) == server_copy,
+           "and what they replaced was backed up first (hard rule 2)");
+  c.Expect(console.RestoreState().phase == ipc::RestorePhase::kDone,
+           "the outcome stays readable until the next restore");
 }
 
 // --- M9-4 (#208): the console goes to sleep ----------------------------------
@@ -2852,6 +3037,8 @@ int main(int argc, char** argv) {
     Sleeps(checks);
   } else if (scenario == "restore_race") {
     RestoreDuringSync(checks);
+  } else if (scenario == "restore_polled") {
+    RestoreIsPolled(checks);
   } else if (scenario == "syncnow") {
     SyncNowStarts(checks);
   } else if (scenario == "unreachable") {

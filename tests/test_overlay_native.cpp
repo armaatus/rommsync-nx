@@ -49,12 +49,15 @@
 #include "scratch.hpp"
 
 #include "rommsync/config.hpp"
+#include "rommsync/conflict_log.hpp"
 #include "rommsync/ipc.hpp"
+#include "rommsync/overlay_conflicts_view.hpp"
 #include "rommsync/overlay_status_view.hpp"
 
 // The overlay's own headers, and the sysmodule's half of the error mapping.
 // Both reach `switch.h`, which here is `tests/hostswitch/switch.h`.
 #include "card_probe.hpp"
+#include "conflicts_pump.hpp"
 #include "draw_list.hpp"
 #include "ipc_client.hpp"
 #include "prompts.hpp"
@@ -370,8 +373,13 @@ constexpr ClientCall kClientCalls[] = {
      }},
     {ipc::Command::kRestoreBackup, "RestoreBackup",
      [](overlay::IpcClient& c) {
-       rommsync::conflicts::RestoreReport out;
+       ipc::RestoreState out;
        return c.RestoreBackup(3, &out);
+     }},
+    {ipc::Command::kGetRestoreState, "GetRestoreState",
+     [](overlay::IpcClient& c) {
+       ipc::RestoreState out;
+       return c.GetRestoreState(&out);
      }},
 };
 
@@ -549,14 +557,24 @@ int RunRoundtrip(Checks& checks) {
   engine.restore_report.outcome = rommsync::conflicts::RestoreOutcome::kRestored;
   engine.restore_report.message = "restored from 2026-03-01";
   engine.restore_report.backup_sd_path = "/switch/rommsync/.backup/some-game.sav";
-  rommsync::conflicts::RestoreReport report;
-  checks.Expect(R_SUCCEEDED(client.RestoreBackup(3, &report)), "RestoreBackup succeeds");
+  // Taken and finished on the spot, which is what an engine with no worker
+  // does -- so the whole state, report included, crosses in one answer.
+  ipc::RestoreState state;
+  checks.Expect(R_SUCCEEDED(client.RestoreBackup(3, &state)), "RestoreBackup succeeds");
+  checks.Expect(state.phase == ipc::RestorePhase::kDone, "the phase survives");
+  checks.ExpectEq(state.entry_id, static_cast<std::int64_t>(3), "...and which restore it is");
+  const rommsync::conflicts::RestoreReport& report = state.report;
   checks.Expect(report.ok(), "the restore outcome survives");
   checks.ExpectEq(report.message, engine.restore_report.message, "...and its message");
   checks.ExpectEq(report.backup_sd_path, engine.restore_report.backup_sd_path,
                   "...and the backup this restore itself wrote first (hard rule 2)");
   checks.ExpectEq(engine.last_restore_id, static_cast<std::int64_t>(3),
                   "against the entry id the overlay named");
+  ipc::RestoreState polled;
+  checks.Expect(R_SUCCEEDED(client.GetRestoreState(&polled)), "GetRestoreState succeeds");
+  checks.Expect(polled.phase == ipc::RestorePhase::kDone && polled.entry_id == 3 &&
+                    polled.report.message == engine.restore_report.message,
+                "and answers the same restore when polled");
   return checks.failures();
 }
 
@@ -908,6 +926,91 @@ int RunTimeout(Checks& checks) {
   return checks.failures();
 }
 
+// --- overlay.restore ----------------------------------------------------------
+
+/// M9-6 (#209): a restore that is still copying holds no frame.
+///
+/// `RestoreBackup` used to copy the save before it answered, on the
+/// sysmodule's IPC thread, with the overlay's draw thread inside
+/// `serviceDispatchOut` for the whole of it -- a large save on a slow card was a
+/// frozen overlay holding the user's input. Now the command answers the moment
+/// the restore is taken, and the screen polls. This drives the conflicts
+/// screen's own frame -- `PumpConflicts`, the code `ConflictsScreen::update`
+/// runs -- through the real client against an engine whose restore does not
+/// finish until the test says so, and times every frame.
+///
+/// The sysmodule's half of the same claim -- that the copy really is off its
+/// IPC thread -- is `engine.restore_polled`, against the real `SdEngine`.
+int RunRestore(Checks& checks) {
+  Console console;
+  fakes::FakeEngine& engine = console.engine();
+  engine.restore_runs_inline = false;
+  engine.restore_report.outcome = rommsync::conflicts::RestoreOutcome::kRestored;
+  {
+    ipc::ConflictRow row;
+    row.entry.id = 7;
+    row.entry.kind = rommsync::conflicts::EntryKind::kSave;
+    row.entry.event = rommsync::conflicts::Event::kReplaced;
+    row.entry.rom_id = 4;
+    row.entry.rom_name = "Game";
+    row.entry.file_name = "game.srm";
+    row.entry.sd_path = "/roms/gba/game.srm";
+    row.entry.backup_sd_path = "/config/rommsync/.backup/4-retroarch-srm-1.srm";
+    row.backup_present = true;
+    engine.conflicts_.push_back(row);
+  }
+  console.Start();
+
+  overlay::IpcClient client(kTestBudget);
+  overlay::ScreenFrame frame(client);
+  overlay::ConflictsModel model;
+  overlay::Link link = overlay::Link::kOk;
+
+  // One frame, timed. What a frame costs is the claim, so every frame below
+  // goes through this.
+  std::chrono::milliseconds slowest{0};
+  const auto pump = [&] {
+    const Clock::time_point start = Clock::now();
+    overlay::PumpConflicts(frame, client, model, link);
+    slowest = std::max(slowest, Since(start));
+  };
+
+  pump();  // the handshake and the first page
+  checks.ExpectEq(model.loaded(), std::size_t{1}, "the history's one entry is loaded");
+  model.Activate();  // open it
+  model.Activate();  // confirm
+  model.Activate();  // press
+
+  pump();  // the restore goes out, and is answered at once
+  checks.ExpectEq(engine.last_restore_id, static_cast<std::int64_t>(7),
+                  "the restore was asked for the entry that was open");
+  overlay::ConflictsView view = model.Render();
+  checks.Expect(view.headline.find("Restoring") != std::string::npos,
+                "the screen says it is restoring rather than freezing: " + view.headline);
+
+  // **The copy is still running for all of these**, and not one frame waits
+  // for it: each is one poll, answered from memory.
+  for (int frames = 0; frames < 30; ++frames) {
+    pump();
+  }
+  checks.Expect(slowest < kPrompt, "no frame is held while the save copies: the slowest took " +
+                                       std::to_string(slowest.count()) + "ms");
+  checks.Expect(model.Render().headline.find("Restoring") != std::string::npos,
+                "and it still says so, thirty frames in");
+  checks.ExpectEq(engine.restore_requests, 1, "the restore was asked for once, then polled");
+
+  engine.FinishRestore();
+  pump();
+  view = model.Render();
+  checks.Expect(view.headline.find("Restored") != std::string::npos,
+                "the outcome arrives on the next frame after it finishes: " + view.headline);
+  checks.Expect(!view.can_restore, "with the restore no longer on offer");
+  checks.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
+                "and the polling stops");
+  checks.Expect(slowest < kPrompt, "and still no frame was held");
+  return checks.failures();
+}
+
 // --- overlay.portable ---------------------------------------------------------
 
 /// The files that are only host-compilable because they name no libultrahand
@@ -921,8 +1024,8 @@ int RunTimeout(Checks& checks) {
 /// breaking this target. That is the failure this is for, and the same shape as
 /// the greps `overlay.sync_actions` and `conflicts.overlay` already run.
 constexpr const char* kPortableFiles[] = {
-    "draw_list.hpp",    "prompts.hpp",      "screen_frame.hpp",
-    "screen_frame.cpp", "status_paint.hpp", "status_paint.cpp",
+    "draw_list.hpp",    "prompts.hpp",      "screen_frame.hpp",   "screen_frame.cpp",
+    "status_paint.hpp", "status_paint.cpp", "conflicts_pump.hpp", "conflicts_pump.cpp",
 };
 
 /// What none of them may name. `card_probe` and `ipc_client` are deliberately
@@ -1277,6 +1380,9 @@ int main(int argc, char** argv) {
   }
   if (scenario == "errors") {
     return RunErrors(checks);
+  }
+  if (scenario == "restore") {
+    return RunRestore(checks);
   }
   if (scenario == "timeout") {
     return RunTimeout(checks);

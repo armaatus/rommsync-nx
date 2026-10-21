@@ -511,6 +511,7 @@ add_executable(test_overlay_native
   test_overlay_native.cpp
   "${CMAKE_SOURCE_DIR}/tests/hostswitch/switch.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/card_probe.cpp"
+  "${CMAKE_SOURCE_DIR}/overlay/source/conflicts_pump.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/ipc_client.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/screen_frame.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/status_paint.cpp"
@@ -532,6 +533,7 @@ foreach(scenario
         version    # a contract mismatch, end to end
         errors     # a refusal is not a transport failure, and neither is a bad payload
         timeout    # a sysmodule that does not answer holds no frame past one budget
+        restore    # a restore that is still copying holds no frame at all
         portable   # the half of a screen that must keep compiling on a host
         draw)      # what the status screen actually asks to be drawn
   add_test(NAME overlay.${scenario} COMMAND test_overlay_native ${scenario})
@@ -2091,7 +2093,8 @@ set(ENGINE_SCENARIOS
   commands  # what is still `kUnavailable`, so the list shrinks deliberately
   unreachable  # M1-6: a server that answers nothing refuses the attempt, and writes nothing
   syncnow   # M7-2: Sync now starts a tick and says so, instead of "one is already running"
-  restore_race  # M7-2: a restore pressed while a tick is writing saves is refused, not interleaved
+  restore_race  # M7-2: a restore pressed while a tick is writing saves waits its turn, not interleaved
+  restore_polled  # M9-6: a restore on a slow card holds no IPC call while it copies
   log       # M7-3: the misconfigurations docs/TROUBLESHOOTING.md answers, on the record
   stale_active  # M9-5: an `active` row a power cut left is work, not a live transfer
   sleeps    # M9-4: the console sleeps mid-tick, and the acknowledgement waits for the save write
