@@ -717,6 +717,19 @@ ctest --test-dir build --output-on-failure
   formats; it reads no artifact, so it never skips — the fixtures are chosen so
   that a parser reading the wrong offset gets a wrong answer rather than a lucky
   one.
+- The `stack.*` group is the main thread's stack: the one the npdm sizes, and
+  the one that parses `queue.json` off the card at boot and every IPC payload
+  after it (M9-18, #216). `json::kMaxDepth` and `main_thread_stack_size` were
+  never held against each other, and a max-depth document cost ~33 KiB of a
+  32 KiB stack. `stack.fit` holds the npdm to `sysmodule/source/stack_budget.hpp`
+  and the deepest parse to half the stack; `stack.contract` holds `kMaxDepth`
+  to at least twice the deepest response shape a pinned RomM OpenAPI snapshot
+  describes; `stack.walk` is the call-graph arithmetic on hand-built graphs.
+  Those three read the tree and never skip. `stack.measured` cross-compiles the
+  sysmodule with `-fcallgraph-info=su`, walks the deepest chain from `main`, and
+  fails when a frame outgrows the header's ceilings; it needs the devkitPro
+  image, so it skips where `npdm.svcs` does and runs in the `switch-build` job
+  beside it, under the same `toolchain` label.
 - The `toolchain.*` group holds the two pins the Switch build rests on and
   nothing here produces (M9-8, #199). `toolchain.pins` reads every file in the
   tree: each one naming the devkitPro image names the dated tag

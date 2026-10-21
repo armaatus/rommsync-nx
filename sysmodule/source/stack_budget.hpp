@@ -4,10 +4,10 @@
 // The main thread is the one stack this process does not choose in code: the
 // npdm sizes it (`main_thread_stack_size` in `sys-rommsync.json`), and it runs
 // the two things that parse whatever they are given -- `SdEngine::Load`, which
-// reads `queue.json`, `auth.json` and `device.dat` off the card at boot, and
-// the IPC loop, which decodes every payload the overlay sends. `json::Parser`
-// recurses once per nesting level, so the deepest document `json::kMaxDepth`
-// lets through is the deepest stack either of them can reach.
+// reads `queue.json` and `auth.json` off the card at boot, and the IPC loop,
+// which decodes every payload the overlay sends and runs the handlers it
+// names. `json::Parser` recurses once per nesting level, so the deepest
+// document `json::kMaxDepth` lets through is the deepest stack either reaches.
 //
 // At 0x8000 and a `kMaxDepth` of 64 those did not fit: `-fcallgraph-info`
 // over the sysmodule measured the chain at 33,472 bytes against 32,768, and a

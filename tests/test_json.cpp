@@ -157,6 +157,24 @@ void Rejects(checks::Checks& c) {
            "nesting just under the limit parses");
   c.Expect(!json::Parse(too_deep + std::string(json::kMaxDepth + 1, ']')).ok(),
            "nesting past the limit is refused");
+  // Exactly the limit parses and one more does not. sysmodule/source/
+  // stack_budget.hpp prices the worst case at kMaxDepth + 1 levels -- each one
+  // accepted, and the frame that refuses the next -- so the boundary is part of
+  // the main thread's stack budget, not only of this parser (#216).
+  c.Expect(json::Parse(std::string(json::kMaxDepth, '[') + std::string(json::kMaxDepth, ']'))
+               .ok(),
+           "nesting exactly at the limit parses");
+  c.Expect(!json::Parse(std::string(json::kMaxDepth, '[') + "1" +
+                        std::string(json::kMaxDepth, ']'))
+                .ok(),
+           "a value inside the deepest container the limit allows is one level too deep");
+  // ...and the limit is not one RomM reaches. A rom row's IGDB multiplayer mode
+  // names its platform seven levels down a page of roms, the deepest typed
+  // response either pinned OpenAPI snapshot describes (`stack.contract`).
+  c.Expect(json::Parse("{\"items\": [{\"igdb_metadata\": {\"multiplayer_modes\": "
+                       "[{\"platform\": {\"id\": 1, \"name\": \"Nintendo Switch\"}}]}}]}")
+               .ok(),
+           "RomM's deepest response shape parses");
 }
 
 void ReaderReportsTheField(checks::Checks& c) {

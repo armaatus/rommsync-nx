@@ -60,6 +60,10 @@
 // is built out of `kThreadStackBytes`: dropping the include from `engine.hpp`
 // should break the thread code, not the budget (M9-2, #207).
 #include "sized_thread.hpp"
+// For its `static_assert`: the deepest JSON document `json::kMaxDepth` lets
+// through has to fit this thread's npdm-sized stack, and this is the thread
+// (M9-18, #216).
+#include "stack_budget.hpp"
 
 namespace {
 

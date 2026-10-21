@@ -214,9 +214,14 @@ guess, and is still wrong to make now.
 
   `main_thread_stack_size` went from the template's `0x4000` to `0x8000` for a
   reason that is not the transport: the main thread is where `SdEngine::Load`
-  parses `config.ini`, `queue.json` and `auth.json`, and `json::kMaxDepth` is 64
-  — so a document a card left behind can recurse further than 16 KiB of stack
-  allows, and the failure that causes has no console to report it on.
+  parses `config.ini`, `queue.json` and `auth.json`, and the IPC loop decodes
+  every payload the overlay sends — and a JSON document recurses once per level,
+  so the failure a deep one causes has no console to report it on. 0x8000 was
+  itself not enough while `json::kMaxDepth` was 64: the deepest parse measured
+  ~33 KiB. M9-18 (#216) lowered the limit to 16 rather than raising the stack —
+  RomM's deepest response nests 7 deep — and `source/stack_budget.hpp` holds the
+  deepest parse to half the stack, with `stack.fit`, `stack.measured` and
+  `stack.contract` holding the npdm, the frames and the limit to it.
 
   `service_access` is what is used and nothing more — `fsp-srv`, `set:sys`,
   `ssl`, `bsd:u`, `sfdnsres`, `nifm:u`, `time:s`. M1-7 (#126) dropped `time:s`

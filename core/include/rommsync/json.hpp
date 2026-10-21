@@ -40,7 +40,16 @@ namespace rommsync::json {
 enum class Type { kNull, kBool, kNumber, kString, kArray, kObject };
 
 /// How deep a document may nest before it is refused.
-inline constexpr int kMaxDepth = 64;
+///
+/// **16, and it is a stack budget before it is a parsing rule.** The parser
+/// recurses once per level, and on the sysmodule the deepest document it
+/// accepts is the deepest stack the main thread can reach -- off the card at
+/// boot, or from the overlay over IPC. At 64 that was ~33 KiB of a 32 KiB stack
+/// (#216); at 16 it is ~12.5 KiB, and `sysmodule/source/stack_budget.hpp` holds
+/// it to half. The cost is nothing real: RomM's deepest typed response nests 7
+/// deep, and `stack.contract` fails if a pinned RomM snapshot ever promises
+/// more than half of this. Raising it is a question for that header first.
+inline constexpr int kMaxDepth = 16;
 
 class Value;
 

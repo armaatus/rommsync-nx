@@ -26,10 +26,11 @@ break by accident.
 - **A stack buffer here gets 16 KiB, and should assume less.**
   `sysmodule/sys-rommsync.json` sets `main_thread_stack_size` to `0x8000` — 32
   KiB, raised from the template's `0x4000` by M1-7 (#126) because
-  `json::kMaxDepth` is 64 and `SdEngine::Load` parses documents off a card on
-  that thread — and the inner heap is `0x160000` (1.4 MiB). **All** of that 32 KiB
-  is spoken for by the deepest parse, not half of it: 64 levels at 496 bytes a
-  level is 31,744, which is #216's to settle. A worker thread does not get this
+  `SdEngine::Load` parses documents off a card on that thread — and the inner
+  heap is `0x160000` (1.4 MiB). The deepest parse is budgeted to **half** of that
+  32 KiB in `sysmodule/source/stack_budget.hpp`, which is why `json::kMaxDepth`
+  is 16 rather than 64: at 64 the parse alone was the whole stack (#216), and
+  `stack.fit` fails if either number moves out from under the other. A worker thread does not get this
   number at all — it gets `sysmodule::kThreadStackBytes`, 128 KiB out of the heap
   rather than out of the npdm (`sysmodule/source/sized_thread.hpp`, M9-2 #207) —
   so the budget to write against is unchanged either way. A chunk size picked for
