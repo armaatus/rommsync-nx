@@ -289,6 +289,27 @@ is in the archive:
 The only file the upgrade overwrites that you might have edited is
 `config/rommsync/config.ini.example`, which nothing reads.
 
+**Update both halves together.** The sysmodule and the overlay are separate
+files, and replacing only one of them leaves two releases on the card. The
+overlay notices: when the two cannot talk at all it says *sysmodule
+unreachable* and names the half to update, and when they can but are from
+different releases its status screen shows both builds and says to install both
+from the same release. Unzipping the whole release again is the fix either way.
+
+**Going back to an older release** is safe for your settings and your pairing,
+but not seamless. An older build — any from the one after v1.0.0-rc1 on —
+refuses a `config.ini` or a `token.dat` that a
+newer one wrote rather than misreading it — it runs idle on its defaults, says
+so under Settings, and leaves both files exactly as they were for when you
+upgrade again. The records it can rebuild (the sync baseline, the download
+queue) it rebuilds. The full list is in
+[ARCHITECTURE.md](ARCHITECTURE.md#formats-across-releases).
+
+v1.0.0-rc1 predates all of that: it reads a newer file as best it can. The one
+setting that reads differently there is a `[platform.<slug>]` section holding
+only `emulator =` — rc1 ignores that key, so the section maps no folders and
+the platform is skipped. Remove such a section before going back to rc1.
+
 ---
 
 ## 7. Uninstalling and un-pairing

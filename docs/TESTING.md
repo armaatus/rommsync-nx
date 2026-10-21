@@ -442,6 +442,17 @@ ctest --test-dir build --output-on-failure
   block-boundary lengths the padding gets wrong, and then the property that
   actually matters — the identifier is the *same* identifier across a restart, a
   re-pair, a different seed, an interrupted commit and a corrupt record.
+- `compat.fixtures` covers every record under `config/rommsync/` across releases
+  (#205): the files v1.0.0-rc1's own writers produced
+  (`tests/fixtures/v1.0.0-rc1/`) must read back to the values they were written
+  with, and — while a format's version is still rc1's — be written back byte for
+  byte, so a format cannot move without its version. Each is then bumped one
+  version past this build and must be refused or discarded by its policy
+  ([ARCHITECTURE.md](ARCHITECTURE.md#formats-across-releases)), never misread,
+  and the refused ones never rewritten. `engine.newer` is the same downgrade
+  through a booted engine: a later release's `config.ini` and `token.dat` are
+  two errors on the status screen, and an edit from the overlay leaves both on
+  the card as they were.
 - `core.md5` covers the digest RomM compares saves on (M2-3): RFC 1321's own
   vectors including the empty string, the padding boundaries (55/56/63/64/119/
   120/128 bytes) where the length field does and does not fit in the last block,

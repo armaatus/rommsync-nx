@@ -150,6 +150,42 @@ overlay.
 The overlay and sysmodule both read config; the **sysmodule owns writes** to
 token/state to avoid races — the overlay asks it to change things via IPC.
 
+#### Formats across releases
+
+`scripts/package.sh` ships only `config.ini.example`, so an upgrade never
+replaces a record and every file below routinely outlives the build that wrote
+it. Each carries a version, and each has a stated answer for a file from an
+**older** release (an upgrade) and from a **newer** one (a downgrade, or a card
+where only one of the two halves was updated) (#205). What can be rebuilt is
+discarded and rebuilt; what cannot is refused and **left exactly as it is**, so
+an older build never writes over a newer file.
+
+| File | Version | Older | Newer |
+|---|---|---|---|
+| `config.ini` | `version = N` above the first section; none = 1 | read; a later release migrates in its parser | refused: built-in defaults, one `error`, edits refused ([CONFIG.md](CONFIG.md#version)) |
+| `token.dat` | `"version":N`; none = 1, which is what v1 writes | read | refused as `kNewerFormat`, not read from `.old`, untouched; one `error` on Settings |
+| `device.dat` | none, by design | read | read for `client_device_identifier`, whatever else it carries — refusing would mint a second console |
+| `state.db` | header line | discarded, every save rehashed (v1 → v2 did this) | the same |
+| `conflicts.db` | header line | read | refused and never written over: this boot's entries stay in memory, the backups stay on the card |
+| `queue.json` | `"version"` | read | discarded; the user queues again |
+| `play.db` | header line | read | discarded: unsent play time is lost, nothing else |
+| `auth.json` | `"version"` | read | no verdict; re-derived by asking |
+
+`compat.fixtures` (`tests/test_compat.cpp`) holds all of it to the files
+v1.0.0-rc1 actually wrote, in `tests/fixtures/v1.0.0-rc1/` — produced by that
+tag's own writers (`generate.cpp` there says how), named with `_` for `.` because
+the real names are guarded secrets. While a file's version is still rc1's, this
+build must write rc1's bytes; a format that moves needs its version moved and
+the older one read. A release that changes a format adds its own fixture
+directory the same way, so the migration after it is testable too.
+
+**The two halves on one card.** The IPC contract has its own version
+(`ipc::kVersion`): when it differs the overlay draws "sysmodule unreachable" and
+names the half to update, whichever is behind. When it matches but the builds
+do not, everything works until something only one half knows about — so the
+status screen shows both builds, as warnings, and says to install both from the
+same release.
+
 ## Data flow: a sync tick
 
 ```

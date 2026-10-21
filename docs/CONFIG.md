@@ -4,6 +4,8 @@
 IPC "reload"; the overlay edits it through the sysmodule (which owns writes).
 
 ```ini
+version = 1                        ; the format of this file; see "Version" below
+
 [server]
 url = https://romm.example.com     ; RomM origin, HTTPS strongly recommended
 
@@ -37,6 +39,35 @@ states = /retroarch/states, /tico/states/gba
 
 ; ... nes, gbc, gb, n64, genesis, psx, nds, dreamcast, psp
 ```
+
+## Version
+
+`version = 1`, above the first section, says which format the file is written
+in. It describes the **file**, not the client: a release that adds a key with a
+default (as `emulator` was added after v1.0.0-rc1) leaves it alone, because an
+older file simply does not have that key. The number moves only when a key's
+*meaning* changes, and the release that moves it reads every older version into
+the new meaning.
+
+- **No `version` line** is version 1. That is every `config.ini` v1.0.0-rc1 left
+  on a card, and it is read exactly as before.
+- **A version this build does not know yet** — a file written for a later
+  release, met after a downgrade or after updating only the overlay — is
+  **refused, not guessed at**. None of the file is in force: the built-in
+  defaults are, so there is no server and the client stays idle. One `error`
+  names the line and the remedy, the overlay's status screen counts it, and the
+  file is left exactly as it is — an edit from the overlay is refused too, so an
+  older sysmodule never writes over a newer file. Install the sysmodule and the
+  overlay from the release that wrote it.
+- A `version` line that is not a whole number of at least 1 is a `warning`, and
+  the file is read as version 1.
+- A file the sysmodule creates — the first edit from the overlay on a console
+  with no `config.ini` — starts with `version = 1`. An edit to an existing file
+  never adds or changes the line.
+
+Every other record under `config/rommsync/` has its own version and its own
+answer to an older and a newer one; they are listed in
+[ARCHITECTURE.md](ARCHITECTURE.md#formats-across-releases).
 
 ## Defaults & the folder map
 
@@ -177,7 +208,9 @@ platform_fs_slug = gba, fs_name = synthetic-large.gba
 
 ## Validation rules
 
-Nothing in this file can stop the client from starting. A line the parser
+Nothing in this file can stop the client from starting — not even a file from
+a later release, which leaves it running on the defaults ([Version](#version)).
+A line the parser
 cannot use is reported and dropped, the built-in default stays in force, and the
 rest of the file still applies — a console with no keyboard cannot be talked
 through a parse error, and a sysmodule that refuses to boot over a typo is worse
