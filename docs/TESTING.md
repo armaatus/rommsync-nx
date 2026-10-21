@@ -16,7 +16,7 @@ so they are fully testable natively.
 
 ## There is no mock RomM
 
-Tests run against a **real RomM** in Docker — 5.2.0 by default, 5.4.0 beside it
+Tests run against a **real RomM** in Docker — 5.4.0
 ([choosing the version](#choosing-the-romm-version)) — not a hand-written mock. A
 mock only ever encodes what we *believe* RomM does; when a test passes against
 the real thing, the behaviour is real, and the whole class of "the mock drifted
@@ -117,15 +117,19 @@ have quietly turned it into a no-op. It runs a real second process to do it, for
 the reason `RUN_SERIAL` cannot help either: nothing inside one invocation can see
 the other.
 
-**What this does not fix**, because it cannot be fixed from this side: RomM keeps
-one active sync session per device and cancels the existing one on every
-negotiate (`/backend/endpoints/sync.py` in 5.2.0), and every rig process
-negotiates as the fixture's single device. A second `ctest` therefore still ends
-this run's session the moment it reaches its own first negotiate. What #174
-closed is the *startup* door — a second run clears sessions before it has done
-anything else, which is the window it spends most of its life in, and the one
-`#156` was measured through. Closing the rest would mean a registered device per
-process, not a claim file.
+**What this did not fix on 5.2.0**, because it could not be fixed from this
+side: 5.2.0 keeps one active sync session per device and cancels the existing
+one on every negotiate (`/backend/endpoints/sync.py` in 5.2.0), and every rig
+process negotiates as the fixture's single device. A second `ctest` therefore
+still ended this run's session the moment it reached its own first negotiate.
+What #174 closed is the *startup* door — a second run clears sessions before it
+has done anything else, which is the window it spends most of its life in, and
+the one `#156` was measured through. **That residue is 5.2.0-only** (#235):
+5.4.0 cancels nothing on negotiate — a session belongs to the negotiation that
+opened it — so a second run's negotiate leaves this one's session alone, and
+only the cleanup above could end it, which the claim files already prevent.
+The `RUN_SERIAL` lines in `tests/CMakeLists.txt` that cite #76 still stand for
+the fault proxy, which is shared whatever RomM does with sessions.
 
 Two `ctest`s at once broke a second thing, on disk rather than on the wire, and
 for the same reason (#151). `ROMMSYNC_TEST_SCRATCH` is per build tree, so it kept
@@ -215,7 +219,7 @@ that demonstrates it. A box checked because someone believes it is not checked.
 | # | The claim | What demonstrates it |
 |---|---|---|
 | 1 | The engine builds on a laptop with warnings as errors, and the same `core/` sources still build for Horizon — compiled and linked, not just parsed. | `cmake --build build`; CI `switch-build` (a real devkitA64 build of both targets, checked to be a PFS0 and an `ULTR`-signed `.ovl`); `switch.builds`, `switch.ci_requires_artifacts` |
-| 2 | One command brings up a real RomM 5.2.0 on a throwaway volume, isolated per worktree. | `scripts/orca/compose.sh up -d`; `rig.smoke`; `orca.env_*` |
+| 2 | One command brings up a real RomM 5.4.0 on a throwaway volume, isolated per worktree. | `scripts/orca/compose.sh up -d`; `rig.smoke`; `orca.env_*` |
 | 3 | That fixture is *usable*, not merely running: library scanned, collection created, client token minted with no human in the loop. | `rig.provisioned`; [`provision.py`](../server/testing/provision.py) |
 | 3b | ...and *stable*: it answers the ten-thousandth call the way it answered the first, rather than retiring a worker under a request in flight. | `rig.recycling`, `rig.recycling_live` |
 | 4 | The failure paths a healthy RomM will not produce on demand can be forced, deterministically, in CI. | `http.status`, `http.truncate`, `http.drop`, `http.stall`, `pair.stall`, `pair.drop`, and the whole `harness.*` set |
@@ -331,7 +335,7 @@ ctest --test-dir build --output-on-failure
 ```
 
 - The fixture is [`server/testing/docker-compose.yml`](../server/testing/docker-compose.yml):
-  RomM 5.2.0 on a throwaway volume, with metadata providers disabled so runs are
+  RomM 5.4.0 on a throwaway volume, with metadata providers disabled so runs are
   deterministic and offline.
 - [`seed.sh`](../server/testing/seed.sh) populates the library from
   `roms.manifest` — **homebrew and freely redistributable ROMs only**,
@@ -987,12 +991,16 @@ one-in-a-few-hundred chance of a 502 from a retired worker (#155).
 
 ### Choosing the RomM version
 
-The fixture runs whichever RomM `ROMM_VERSION` in `.env` names: `5.2.0` by
-default, and `5.4.0` beside it until #235 makes that the default and drops
-5.2.0 (D1 in #226). `scripts/orca/env.sh` writes it — from the environment when
+The fixture runs whichever RomM `ROMM_VERSION` in `.env` names: `5.4.0` by
+default since #235, which is also the floor (D1 in #226) — every suite asserts
+5.4.0's behaviour. `scripts/orca/env.sh` writes it — from the environment when
 the variable is set there, else as `.env` already had it, so the regenerations
-`compose.sh` and `seed.sh` do on their own never move a worktree back. To move
-one:
+`compose.sh` and `seed.sh` do on their own never move a worktree back.
+
+**That includes a `.env` written before #235**, which names `5.2.0` only because
+that was the default then: env.sh keeps it, and the stack keeps running 5.2.0
+until someone moves it. `rig.version_live` is what says so — it fails any
+`ROMM_VERSION` below env.sh's default, with these steps:
 
 ```bash
 ROMM_VERSION=5.4.0 ./scripts/orca/env.sh
@@ -1002,7 +1010,9 @@ ROMM_VERSION=5.4.0 ./scripts/orca/env.sh
 ctest --test-dir build --output-on-failure
 ```
 
-`down -v` is not optional when going back. RomM migrates its database forward
+The same four lines with another version are how a worktree moves to one for an
+experiment; nothing below 5.4.0 is expected to pass. `down -v` is not optional
+when going back. RomM migrates its database forward
 when it starts and never back, so a 5.2.0 started on a volume 5.4.0 has touched
 is a server nobody tested against. Going forward it is only slow: 5.4.0's
 release notes put its migrations at 15–20 minutes on a volume with a library in
@@ -1022,17 +1032,16 @@ for that check and for `contract.captures`. `rig.slot_cap` holds the
 it, and a cap left to each release's default would make every pruning test
 depend on which RomM ran it.
 
-CI runs `host-tests` once per version. The 5.2.0 leg keeps the job name branch
-protection requires; `host-tests (RomM 5.4.0)` runs beside it, required by
-nothing and allowed to fail until #235. What fails there, and which issue owns
-each failure, is listed in #227.
+CI runs `host-tests` once per version in its matrix, which since #235 is 5.4.0
+alone, under the plain job name branch protection requires. The 5.2.0 leg was
+dropped with the flip; the next RomM lands as a second matrix line beside it.
 
 ### Keeping the captured contract honest
 
 `contract.captures` re-runs `probe_contract.py --auth --negotiate
 --sync-scenarios` against the fixture and compares the result with the committed
-captures for the fixture's RomM — `server/contract/captures/` for 5.2.0,
-`server/contract/captures/5.4.0/` for 5.4.0 — the responses [API_CONTRACT.md](API_CONTRACT.md),
+captures for the fixture's RomM — `server/contract/captures/5.4.0/` for 5.4.0,
+and `server/contract/captures/` for 5.2.0, kept as history — the responses [API_CONTRACT.md](API_CONTRACT.md),
 [AUTH.md](AUTH.md) and [SYNC_PROTOCOL.md](SYNC_PROTOCOL.md) quote and that M1/M2
 are coded against. It compares field names, nesting and JSON types, plus the
 `action`/`reason` pairs each scenario is named for; ids, timestamps and the

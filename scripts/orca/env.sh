@@ -19,9 +19,11 @@ cd "$REPO_ROOT"
 # whatever .env already said, because compose.sh and seed.sh regenerate this
 # file on their own and must not quietly move a worktree back. Read before the
 # fleet rewrites .env below, which keeps none of this script's lines. The
-# default is the one server/testing/docker-compose.yml falls back to; #235 moves
-# both.
-ROMM_VERSION_DEFAULT=5.2.0
+# default is the one server/testing/docker-compose.yml falls back to, and the
+# two move together (`orca.env_romm_version`). 5.4.0 since #235, and the floor
+# too: `rig.version_live` fails a .env that names anything older, because a
+# .env written before #235 says 5.2.0 only because that was the default then.
+ROMM_VERSION_DEFAULT=5.4.0
 romm_version="${ROMM_VERSION:-}"
 if [ -z "$romm_version" ] && [ -f .env ]; then
   romm_version="$(sed -n 's/^ROMM_VERSION=//p' .env | head -1)"

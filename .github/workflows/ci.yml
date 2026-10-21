@@ -105,19 +105,17 @@ jobs:
   # ROMMSYNC_REQUIRE_RIG=ON means an unreachable fixture FAILS here rather than
   # skipping. A green run must mean the tests actually ran.
   #
-  # Once per RomM version (#227). 5.2.0 keeps the job name `host-tests`, which is
-  # the required check branch protection names; 5.4.0 runs beside it as
-  # `host-tests (RomM 5.4.0)`, required by nothing and allowed to fail, until
-  # #235 makes 5.4.0 the default and drops 5.2.0 from this list. Its failures
-  # are listed in #227 and owned by #232-#235.
+  # Once per RomM version (#227), and since #235 that is 5.4.0 alone: the
+  # default, the floor, and the version every suite asserts. Kept a matrix so
+  # the next RomM has a line to land on beside it; the leg branch protection
+  # requires is the one named plain `host-tests`.
   host-tests:
-    name: ${{ matrix.romm == '5.2.0' && 'host-tests' || format('host-tests (RomM {0})', matrix.romm) }}
+    name: host-tests
     runs-on: ubuntu-latest
-    continue-on-error: ${{ matrix.romm != '5.2.0' }}
     strategy:
       fail-fast: false
       matrix:
-        romm: ["5.2.0", "5.4.0"]
+        romm: ["5.4.0"]
     env:
       # Read by scripts/orca/env.sh, which writes it into .env for compose and
       # the tests -- every later step sees the same version.

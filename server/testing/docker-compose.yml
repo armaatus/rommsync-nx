@@ -11,8 +11,8 @@
 # RomM volume.
 #
 # Which RomM is ROMM_VERSION in .env, also written by env.sh (#227). The
-# fallback below is env.sh's default, and the two move together (#235 makes it
-# 5.4.0). The volumes are NOT per version: RomM migrates its database forward on
+# fallback below is env.sh's default, and the two move together (5.4.0 since
+# #235). The volumes are NOT per version: RomM migrates its database forward on
 # start and never back, so a stack that has run a newer RomM must be emptied
 # before an older one starts on it -- docs/TESTING.md#choosing-the-romm-version.
 
@@ -26,7 +26,7 @@ volumes:
 
 services:
   romm:
-    image: rommapp/romm:${ROMM_VERSION:-5.2.0}
+    image: rommapp/romm:${ROMM_VERSION:-5.4.0}
     restart: unless-stopped
     environment:
       DB_HOST: romm-db

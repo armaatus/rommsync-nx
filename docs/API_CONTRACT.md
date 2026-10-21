@@ -1002,10 +1002,12 @@ the issue that acts on it.
 - **The library scan refuses `playmatch_enabled`.** 5.4.0 validates the `scan`
   socket payload with `extra="forbid"`; 5.2.0 defaults the option to *on*
   unless named. `provision.py` sends it only to RomM older than 5.4.
-- **The web bundle is split.** `rig::DiscoverLargeAsset` takes the
+- **The web bundle is split.** `rig::DiscoverLargeAsset` took the
   `index-*.js` RomM's page links as a file over 1 MB to test ranged reads on;
   5.4.0's is 118 KB and no linked script is over 133 KB, so `http.range`,
-  `wire.range`, both `*_expected_size` and `scratch.concurrent` fail.
+  `wire.range`, both `*_expected_size` and `scratch.concurrent` failed. Since
+  #235 it falls back to the files the index stylesheet links — the 1.3 MB icon
+  font on 5.4.0.
 - **First start on an empty volume is fast.** The 15–20 minutes of migrations
   are an upgrade with data; an empty volume migrates in 7 s and answers
   `/api/heartbeat` 21 s after `up` ([TESTING.md](TESTING.md#choosing-the-romm-version)).

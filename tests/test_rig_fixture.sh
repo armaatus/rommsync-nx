@@ -176,6 +176,24 @@ phase_version_live() {
   # ctest` is a claim about the server, and this is where it is checked.
   want="${ROMM_VERSION:-$(sed -n 's/^ROMM_VERSION=//p' "$REPO_ROOT/.env" 2>/dev/null | head -1)}"
   [ -n "$want" ] || fail "no ROMM_VERSION in .env -- regenerate it with ./scripts/orca/env.sh"
+
+  # And not below the default, which is also the floor (#235): the suites
+  # assert 5.4.0's behaviour, and a .env written before the flip names 5.2.0
+  # only because that was the default then -- env.sh keeps it, by design, so
+  # nothing else would ever say so. Asked before the image, so the answer is
+  # the move rather than "recreate what you have".
+  local floor
+  floor="$(sed -n 's/^ROMM_VERSION_DEFAULT=//p' "$REPO_ROOT/scripts/orca/env.sh" | head -1)"
+  [ -n "$floor" ] || fail "scripts/orca/env.sh names no ROMM_VERSION_DEFAULT"
+  [ "$(printf '%s\n%s\n' "$want" "$floor" | sort -V | head -1)" = "$floor" ] || fail \
+"ROMM_VERSION is $want, below $floor, the version the suites now assert.
+  Move this worktree -- emptied first, since RomM never migrates a database
+  back and a 5.2.0 volume is not one to keep -- with:
+    ROMM_VERSION=$floor ./scripts/orca/env.sh
+    ./scripts/orca/compose.sh down -v && ./scripts/orca/compose.sh up -d
+    ./.venv/bin/python server/testing/provision.py
+  (docs/TESTING.md#choosing-the-romm-version)"
+
   image="$(docker inspect --format '{{.Config.Image}}' "$container" 2>/dev/null)"
   [ "$image" = "rommapp/romm:$want" ] || fail \
 "$container runs $image, but ROMM_VERSION asks for rommapp/romm:$want.
