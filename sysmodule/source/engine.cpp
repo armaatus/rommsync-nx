@@ -456,7 +456,8 @@ ipc::EngineSnapshot SdEngine::Snapshot() const {
     // network (`ipc.hpp`), so what the screen draws is the last tick's evidence
     // rather than a fresh answer nobody asked for.
     snapshot.online = last_sync_result_ == ipc::SyncResult::kOk ||
-                      last_sync_result_ == ipc::SyncResult::kPartial;
+                      last_sync_result_ == ipc::SyncResult::kPartial ||
+                      last_sync_result_ == ipc::SyncResult::kServerDisabled;
   }
   // M3-2 (#19): these two come off the queue on the card rather than being the
   // zero a console with no engine reports. `pending()` counts what the worker
@@ -1679,8 +1680,12 @@ void SdEngine::RunOneTick() {
   }
 
   sync::StateSyncReport states;
+  // Not when RomM says sync is off for this console either: states have no
+  // negotiate of their own to refuse them, and the user who turned the switch
+  // off did not mean "saves only" (#235).
   if (config->sync.states && tick.outcome != sync::TickOutcome::kCanceled &&
-      tick.outcome != sync::TickOutcome::kDisabled) {
+      tick.outcome != sync::TickOutcome::kDisabled &&
+      tick.outcome != sync::TickOutcome::kServerDisabled) {
     // The baseline is re-read rather than carried: `sync::RunTick` persisted its
     // own copy on the way out, and `SyncStates` advances the same file. Reading
     // it back is one small file and is what keeps the two halves from writing
@@ -1739,6 +1744,9 @@ void SdEngine::RunOneTick() {
       break;
     case sync::TickOutcome::kRefused:
     case sync::TickOutcome::kServerDisabled:
+      // The switch in RomM is still logged as a refusal: it is the server
+      // saying no, and docs/TROUBLESHOOTING.md's `sync.refused` section is
+      // where a user reading the log is sent for it. Only the status differs.
       log::Warn(log::Event::kSyncRefused,
                 sync::ToString(tick.negotiated.error) + std::string(": ") +
                     tick.negotiated.message);
@@ -1816,9 +1824,12 @@ void SdEngine::RunOneTick() {
       // Nothing happened that a status screen should report as a sync. The last
       // result stands, which for a first boot is `kNever`.
       break;
+    case sync::TickOutcome::kServerDisabled:
+      // A setting, not a failure, and the overlay says whose (#235).
+      last_sync_result_ = ipc::SyncResult::kServerDisabled;
+      break;
     case sync::TickOutcome::kOffline:
     case sync::TickOutcome::kRefused:
-    case sync::TickOutcome::kServerDisabled:
     case sync::TickOutcome::kUnauthorized:
       last_sync_result_ = ipc::SyncResult::kFailed;
       break;

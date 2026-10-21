@@ -159,6 +159,15 @@ void SetHeadline(StatusView* view, const ipc::Status& status) {
     view->tone = Tone::kWarn;
     return;
   }
+  // Below the console's own switch and below "Offline" -- a server that
+  // answered this was reached -- and above "failed", because it is not one: it
+  // is a setting, and the one place to change it is RomM (#235).
+  if (status.last_sync_result == ipc::SyncResult::kServerDisabled) {
+    view->headline = "Sync disabled on server";
+    view->hint = "Turn sync on for this console in RomM's device settings";
+    view->tone = Tone::kWarn;
+    return;
+  }
   if (status.last_sync_result == ipc::SyncResult::kFailed) {
     view->headline = "Last sync failed";
     view->tone = Tone::kBad;
@@ -222,8 +231,9 @@ std::string SyncResultText(ipc::SyncResult result) {
     case ipc::SyncResult::kPartial:
       return "Partly finished";
     case ipc::SyncResult::kFailed:
-    case ipc::SyncResult::kServerDisabled:
       return "Failed";
+    case ipc::SyncResult::kServerDisabled:
+      return "Disabled on server";
   }
   return "Unknown";
 }
@@ -237,8 +247,9 @@ Tone SyncResultTone(ipc::SyncResult result) {
     case ipc::SyncResult::kPartial:
       return Tone::kWarn;
     case ipc::SyncResult::kFailed:
-    case ipc::SyncResult::kServerDisabled:
       return Tone::kBad;
+    case ipc::SyncResult::kServerDisabled:
+      return Tone::kWarn;
   }
   return Tone::kNeutral;
 }

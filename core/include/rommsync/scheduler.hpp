@@ -250,6 +250,9 @@ class Scheduler {
   ///     off on the same curve, which is the "harder than usual" the outcome
   ///     asks for, because the alternative is asking a server that has said no
   ///     once every interval forever.
+  ///   - `kServerDisabled` -- sync is switched off for this console in RomM
+  ///     (#235). Not a failure: the backoff is cleared and the interval runs,
+  ///     which is how the switch turned back on is noticed within one.
   ///   - `kUnauthorized` -- **not backed off here.** `auth::Gate` owns what a
   ///     rejected call means and how long to wait for it, and the caller consults
   ///     `blocked()` before the next tick. The *schedule* is restamped anyway,

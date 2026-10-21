@@ -225,7 +225,6 @@ void Scheduler::Finished(TickOutcome outcome, http::Error transport) {
 
     case TickOutcome::kOffline:
     case TickOutcome::kRefused:
-    case TickOutcome::kServerDisabled:
       rescans_ = 0;
       break;
 
@@ -236,6 +235,17 @@ void Scheduler::Finished(TickOutcome outcome, http::Error transport) {
       // schedule that did not restamp would fire again on the very next `Poll()`,
       // which is a tight loop against a caller that forgot to consult the gate.
       backoff_.Succeed();
+      rescans_ = 0;
+      MarkRan(steady_now, wall_now);
+      return;
+
+    case TickOutcome::kServerDisabled:
+      // A setting on the server, not a failure (#235). The interval rather than
+      // the backoff, because the only way to notice the user turning it back on
+      // is to ask, and the backoff's ceiling would make that an hour. Not
+      // sooner either: once an interval is what every working tick costs.
+      backoff_.Succeed();
+      tls_failures_ = 0;
       rescans_ = 0;
       MarkRan(steady_now, wall_now);
       return;

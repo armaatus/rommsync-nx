@@ -36,10 +36,13 @@ TickOutcome OutcomeOf(NegotiateError error) {
       // The two `ShouldRetry` picks, and the only two that say nothing about
       // this client: the link, or RomM having a bad minute.
       return TickOutcome::kOffline;
+    case NegotiateError::kSyncDisabled:
+      // The user's switch in RomM, and its own outcome because it is not a
+      // failure: the schedule keeps the interval, and the screen names it.
+      return TickOutcome::kServerDisabled;
     case NegotiateError::kUnusablePayload:
     case NegotiateError::kNotRegistered:
     case NegotiateError::kNoSuchDevice:
-    case NegotiateError::kSyncDisabled:
     case NegotiateError::kRejected:
     case NegotiateError::kMalformed:
       // Answers that do not get better by asking again. A malformed body is in

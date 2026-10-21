@@ -463,7 +463,8 @@ time no matter how long you wait.
 ```
 3 warn sync.refused GET /api/roms: the rom index is not the shape this client reads: at offset 8: expected ':' after an object key
 7 warn sync.refused no such device: the device was deleted in RomM's web UI
-7 warn sync.refused sync disabled: sync is disabled for this device
+7 warn sync.refused sync_disabled: sync is turned off for this device in RomM; turn it back on there
+7 info sync.tick outcome=server_disabled completed=0 failed=0 states_completed=0 states_failed=0 baseline=not stored
 ```
 
 The first of those is a truncated or non-RomM body, and it is the one that reads
@@ -475,7 +476,12 @@ next time — which is why this is not `net.offline`. Three real causes:
 
 1. **The device was deleted in RomM's web UI.** The token still works; the
    device it was bound to is gone.
-2. **Sync is switched off for this device**, in RomM, by you.
+2. **Sync is switched off for this device**, in RomM, by you. This one is not
+   a failure, and the client does not treat it as one: the status screen says
+   **Sync disabled on server**, the tick ends `outcome=server_disabled`, save
+   states are left alone too, and the console keeps asking once per interval
+   rather than backing off — so it starts syncing again within one interval of
+   the switch going back on.
 3. **The answer was not the shape this client reads.** A truncated body, a
    reverse proxy's error page, or a login portal's HTML where a rom index was
    expected — the URL reaches *something*, and that something is not RomM.
