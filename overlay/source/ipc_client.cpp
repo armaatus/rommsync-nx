@@ -1,8 +1,13 @@
 #include "ipc_client.hpp"
 
+#include <pthread.h>
 #include <switch.h>
 
+#include <chrono>
+#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <string_view>
 
@@ -27,9 +32,30 @@ bool DecodeError(Result rc, ipc::Error* out) {
   return true;
 }
 
-IpcClient::IpcClient() { response_.resize(ipc::kMaxPayloadBytes); }
+namespace {
 
-IpcClient::~IpcClient() { Close(); }
+/// The worker's stack.
+///
+/// Its whole call graph is `Run` -> `Dispatch` -> `serviceDispatchOut`, which
+/// packs the request into the thread's TLS message buffer rather than onto the
+/// stack, and none of it parses anything: the decode is the caller's, on the
+/// draw thread. 16 KiB is several times what that needs, and it is a number
+/// this file owns rather than the 128 KiB a null `pthread_attr_t` costs on
+/// devkitA64 (`sysmodule/source/sized_thread.hpp` has the arithmetic) -- out of
+/// an overlay heap that libultrahand sizes at 4 MiB on a console that has not
+/// been given more.
+constexpr std::size_t kWorkerStackBytes = 0x4000;
+static_assert(kWorkerStackBytes % 0x1000 == 0,
+              "a thread stack must be page-aligned or __syscall_thread_create returns EINVAL");
+
+}  // namespace
+
+IpcClient::IpcClient(std::chrono::milliseconds budget) : budget_(budget) {
+  request_.reserve(ipc::kMaxPayloadBytes);
+  response_.resize(ipc::kMaxPayloadBytes);
+}
+
+IpcClient::~IpcClient() { Shutdown(); }
 
 Result IpcClient::Open() {
   if (serviceIsActive(&service_)) {
@@ -38,12 +64,110 @@ Result IpcClient::Open() {
   return smGetService(&service_, ipc::kServiceName);
 }
 
-void IpcClient::Close() { serviceClose(&service_); }
+void IpcClient::Close() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (slot_ == Slot::kQueued || slot_ == Slot::kRunning) {
+    return;
+  }
+  // A late answer nobody wanted goes with the session it arrived on.
+  slot_ = Slot::kIdle;
+  abandoned_ = false;
+  serviceClose(&service_);
+}
+
+void IpcClient::Shutdown() {
+  {
+    std::unique_lock<std::mutex> lock(mutex_);
+    // No budget, for the reason in the header: the worker cannot be left inside
+    // a dispatch when the overlay is unloaded under it.
+    done_.wait(lock, [this] { return slot_ != Slot::kQueued && slot_ != Slot::kRunning; });
+    stopping_ = true;
+  }
+  work_.notify_all();
+  if (started_) {
+    ::pthread_join(thread_, nullptr);
+    started_ = false;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  // Usable again afterwards, which nothing on a console needs -- an overlay is
+  // one `Shutdown` per process run -- and which costs three assignments.
+  stopping_ = false;
+  slot_ = Slot::kIdle;
+  abandoned_ = false;
+  serviceClose(&service_);
+}
+
+bool IpcClient::busy() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return abandoned_ && slot_ != Slot::kDone;
+}
+
+void* IpcClient::Enter(void* self) {
+  static_cast<IpcClient*>(self)->Run();
+  return nullptr;
+}
+
+bool IpcClient::StartWorkerLocked() {
+  if (started_) {
+    return true;
+  }
+  ::pthread_attr_t attributes;
+  if (::pthread_attr_init(&attributes) != 0) {
+    return false;
+  }
+  // A refused size falls back to the platform's default rather than to no
+  // worker, which is `SizedThread::Start`'s rule and its reason: on Horizon the
+  // `static_assert` above rules the refusal out, and a host -- glibc's floor is
+  // 128 KiB on aarch64 -- is better served by a default stack than by a test
+  // run with no bound in it.
+  const bool sized = ::pthread_attr_setstacksize(&attributes, kWorkerStackBytes) == 0;
+  bool ok = sized && ::pthread_create(&thread_, &attributes, &IpcClient::Enter, this) == 0;
+  if (!sized) {
+    ok = ::pthread_create(&thread_, nullptr, &IpcClient::Enter, this) == 0;
+  }
+  ::pthread_attr_destroy(&attributes);
+  started_ = ok;
+  return ok;
+}
+
+void IpcClient::Run() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  for (;;) {
+    work_.wait(lock, [this] { return stopping_ || slot_ == Slot::kQueued; });
+    if (stopping_) {
+      // `Shutdown` only sets this once nothing is queued or running, so there is
+      // no call to abandon on the way out.
+      return;
+    }
+    slot_ = Slot::kRunning;
+    const ipc::Command command = command_;
+    // Not held across the dispatch: that is the wait the caller must be able
+    // to stop doing.
+    lock.unlock();
+    const Result result = Dispatch(command);
+    lock.lock();
+    result_ = result;
+    slot_ = Slot::kDone;
+    done_.notify_all();
+  }
+}
 
 Result IpcClient::Call(ipc::Command command, std::string_view request) {
-  // Grown back to the full buffer and shrunk to the answer's length below, so
-  // the allocation happens once in the constructor and never on a draw.
-  response_.resize(ipc::kMaxPayloadBytes);
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (abandoned_) {
+    if (slot_ != Slot::kDone) {
+      // The last call is still out. Not sent: one session answers one request
+      // at a time, and a second one queued behind a stuck first would only be
+      // one more answer to drop.
+      return NotResponding();
+    }
+    // It came back after its caller left. **Dropped**, never handed on: it is
+    // an answer to a different command, and the decoder of this one might even
+    // accept it.
+    abandoned_ = false;
+    slot_ = Slot::kIdle;
+  }
+
   if (!serviceIsActive(&service_)) {
     response_.clear();
     return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
@@ -55,6 +179,37 @@ Result IpcClient::Call(ipc::Command command, std::string_view request) {
     return MAKERESULT(Module_Libnx, LibnxError_BadInput);
   }
 
+  // Into the reserved buffer, so no allocation: `Fits` bounds it at the
+  // capacity the constructor reserved.
+  request_.assign(request.data(), request.size());
+  command_ = command;
+
+  if (!StartWorkerLocked()) {
+    // No thread to carry it. The call still happens, unbounded, exactly as it
+    // did before #209 -- an overlay that could not start a thread and so could
+    // not talk to the sysmodule at all would be a worse failure than one that
+    // can be held by a stuck one.
+    lock.unlock();
+    return Dispatch(command);
+  }
+
+  slot_ = Slot::kQueued;
+  work_.notify_one();
+  if (!done_.wait_for(lock, budget_, [this] { return slot_ == Slot::kDone; })) {
+    // The bound. The call stays out and the worker stays on it; `response_` is
+    // the worker's until it comes back, so nothing here reads it.
+    abandoned_ = true;
+    return NotResponding();
+  }
+  slot_ = Slot::kIdle;
+  return result_;
+}
+
+Result IpcClient::Dispatch(ipc::Command command) {
+  // Grown back to the full buffer and shrunk to the answer's length below, so
+  // the allocation happens once in the constructor and never on a draw.
+  response_.resize(ipc::kMaxPayloadBytes);
+
   u64 length = 0;
   const Result result = serviceDispatchOut(
       &service_, static_cast<u32>(command), length,
@@ -64,7 +219,7 @@ Result IpcClient::Call(ipc::Command command, std::string_view request) {
               SfBufferAttr_HipcMapAlias | SfBufferAttr_Out,
           },
       .buffers = {
-          {request.data(), request.size()},
+          {request_.data(), request_.size()},
           {response_.data(), response_.size()},
       });
   if (R_FAILED(result)) {

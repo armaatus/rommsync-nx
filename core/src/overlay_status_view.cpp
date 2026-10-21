@@ -193,6 +193,8 @@ const char* ToString(Link link) {
       return "unreadable";
     case Link::kIncompatible:
       return "incompatible";
+    case Link::kNotResponding:
+      return "not_responding";
   }
   return "unknown";
 }
@@ -399,6 +401,13 @@ StatusView RenderUnreachable(Link link, std::uint32_t sysmodule_interface) {
                                                                   : "Update the sysmodule") +
                   ": it speaks version " + std::to_string(sysmodule_interface) +
                   ", this overlay speaks " + std::to_string(ipc::kVersion);
+      break;
+    case Link::kNotResponding:
+      // Running, and busy or stuck. Nothing for the user to fix and nothing to
+      // restart from here: the screen comes back by itself on the first answer,
+      // and B still leaves, because the overlay stopped waiting (#209).
+      view.headline = "sys-rommsync is not responding";
+      view.hint = "It is busy or stuck; this screen recovers when it answers";
       break;
   }
   // No rows at all. Every one of them would be a number this overlay does not

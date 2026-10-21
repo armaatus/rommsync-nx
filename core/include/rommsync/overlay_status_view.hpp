@@ -49,6 +49,14 @@ enum class Link {
   /// and because command 0's encoding is frozen precisely so this is knowable
   /// before anything else is decoded (`ipc.hpp`).
   kIncompatible,
+
+  /// It is running and a call into it did not come back within the overlay's
+  /// budget (M9-6, #209). Not `kNotRunning`, whose sentence sends a user to
+  /// ovl-sysmodules to turn on something that is already on, and not
+  /// `kUnreadable`, which is an answer this build could not read: there was no
+  /// answer at all. The screen keeps drawing and the user keeps their buttons;
+  /// it clears by itself on the first call that is answered.
+  kNotResponding,
 };
 const char* ToString(Link link);
 
