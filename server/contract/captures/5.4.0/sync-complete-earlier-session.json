@@ -1,0 +1,17 @@
+{
+  "session": {
+    "id": 13,
+    "device_id": "a67dd764-f25e-4b95-bebe-88460178cad6",
+    "user_id": 1,
+    "status": "COMPLETED",
+    "initiated_at": "2026-10-21T08:39:40+00:00",
+    "completed_at": "2026-10-21T08:39:40+00:00",
+    "operations_planned": 4,
+    "operations_completed": 0,
+    "operations_failed": 0,
+    "error_message": null,
+    "created_at": "2026-10-21T08:39:40+00:00",
+    "updated_at": "2026-10-21T08:39:40+00:00"
+  },
+  "play_session_ingest": null
+}

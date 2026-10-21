@@ -1,0 +1,16 @@
+{
+  "detail": [
+    {
+      "type": "string_too_long",
+      "loc": [
+        "query",
+        "emulator"
+      ],
+      "msg": "String should have at most 50 characters",
+      "input": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "ctx": {
+        "max_length": 50
+      }
+    }
+  ]
+}

@@ -161,17 +161,21 @@ phase_slot_cap() {
 
 phase_version_live() {
   local want container image
-  want="$(sed -n 's/^ROMM_VERSION=//p' "$REPO_ROOT/.env" 2>/dev/null | head -1)"
+  # The environment first, as contract.captures reads it: `ROMM_VERSION=5.4.0
+  # ctest` is a claim about the server, and this is where it is checked.
+  want="${ROMM_VERSION:-$(sed -n 's/^ROMM_VERSION=//p' "$REPO_ROOT/.env" 2>/dev/null | head -1)}"
   [ -n "$want" ] || fail "no ROMM_VERSION in .env -- regenerate it with ./scripts/orca/env.sh"
 
   find_romm_container
   [ -n "$container" ] || { echo "this worktree's RomM is not running -- skipping"; exit "$SKIP"; }
   image="$(docker inspect --format '{{.Config.Image}}' "$container" 2>/dev/null)"
   [ "$image" = "rommapp/romm:$want" ] || fail \
-"$container runs $image, but .env asks for rommapp/romm:$want.
-  Every rig test is answering for the wrong RomM. Recreate it with:
-    ./scripts/orca/compose.sh up -d
-    ./.venv/bin/python server/testing/provision.py"
+"$container runs $image, but ROMM_VERSION asks for rommapp/romm:$want.
+  Every rig test is answering for the wrong RomM. Recreate it -- emptied
+  first, since RomM never migrates a database back -- with:
+    ./scripts/orca/compose.sh down -v && ./scripts/orca/compose.sh up -d
+    ./.venv/bin/python server/testing/provision.py
+  (docs/TESTING.md#choosing-the-romm-version)"
   echo "rig.version_live ok ($image)"
 }
 

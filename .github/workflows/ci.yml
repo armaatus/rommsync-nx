@@ -73,13 +73,29 @@ jobs:
           fi
 
   # The primary rig (docs/TESTING.md): the core engine built natively and run
-  # against a REAL RomM 5.2.0 in Docker, reached through the fault proxy so the
+  # against a REAL RomM in Docker, reached through the fault proxy so the
   # failure paths are exercised too.
   #
   # ROMMSYNC_REQUIRE_RIG=ON means an unreachable fixture FAILS here rather than
   # skipping. A green run must mean the tests actually ran.
+  #
+  # Once per RomM version (#227). 5.2.0 keeps the job name `host-tests`, which is
+  # the required check branch protection names; 5.4.0 runs beside it as
+  # `host-tests (RomM 5.4.0)`, required by nothing and allowed to fail, until
+  # #235 makes 5.4.0 the default and drops 5.2.0 from this list. Its failures
+  # are listed in #227 and owned by #232-#235.
   host-tests:
+    name: ${{ matrix.romm == '5.2.0' && 'host-tests' || format('host-tests (RomM {0})', matrix.romm) }}
     runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.romm != '5.2.0' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        romm: ["5.2.0", "5.4.0"]
+    env:
+      # Read by scripts/orca/env.sh, which writes it into .env for compose and
+      # the tests -- every later step sees the same version.
+      ROMM_VERSION: ${{ matrix.romm }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -110,6 +126,11 @@ jobs:
       - name: Start the RomM fixture
         run: ./scripts/orca/compose.sh up -d
 
+      # Five minutes is ample for either version: RomM migrates before it
+      # answers, and on the empty volume a runner starts from 5.4.0's migrations
+      # take seconds (21 s to first heartbeat, measured for #227). The 15-20
+      # minutes in its release notes is an upgrade of a volume with data in it,
+      # which no runner has.
       - name: Wait for RomM
         run: |
           set -a; . ./.env; set +a

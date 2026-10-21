@@ -1,0 +1,32 @@
+{
+  "session_id": 8,
+  "operations": [
+    {
+      "action": "delete",
+      "rom_id": 4,
+      "save_id": null,
+      "file_name": "probe.srm",
+      "slot": "probe-8c6cefe2-delete",
+      "emulator": "probe-emulator",
+      "reason": "Save was deleted on the server",
+      "server_updated_at": null,
+      "server_content_hash": null
+    },
+    {
+      "action": "download",
+      "rom_id": 4,
+      "save_id": 5,
+      "file_name": "probe [2026-10-21_08-39-40].srm",
+      "slot": "probe-8c6cefe2-versions",
+      "emulator": "probe-emulator",
+      "reason": "Save exists on server but not on client",
+      "server_updated_at": "2026-10-21T08:39:38+00:00",
+      "server_content_hash": "abd8fff93894e8112c7dd17386e54a5f"
+    }
+  ],
+  "total_upload": 0,
+  "total_download": 1,
+  "total_conflict": 0,
+  "total_no_op": 0,
+  "total_delete": 1
+}

@@ -118,23 +118,41 @@ class Romm:
             raise ProvisionError("login succeeded but set no romm_session cookie")
 
 
-def wait_for_heartbeat(romm: Romm, timeout: int) -> None:
-    """Block until RomM answers, or fail with a diagnosis rather than a stack trace."""
+def wait_for_heartbeat(romm: Romm, timeout: int) -> tuple[int, ...]:
+    """Block until RomM answers, and return its version as a tuple.
+
+    Fails with a diagnosis rather than a stack trace. The version is the one
+    thing the fixture has to know about the server it provisions (#227): the
+    heartbeat is unauthenticated and carries `SYSTEM.VERSION` on 5.2.0 and 5.4.0
+    alike.
+    """
     deadline = time.monotonic() + timeout
     last = ""
     while time.monotonic() < deadline:
         try:
             r = romm.get("/api/heartbeat")
             if r.status_code == 200:
-                return
+                return version_tuple(r.json().get("SYSTEM", {}).get("VERSION", ""))
             last = f"http {r.status_code}"
         except requests.RequestException as exc:
             last = type(exc).__name__
         time.sleep(2)
+    # RomM migrates its database before it serves anything. On the empty volume
+    # a fixture starts from that is seconds; on a volume an older RomM filled, a
+    # 5.4.0 runs 15-20 minutes of it -- docs/TESTING.md#choosing-the-romm-version.
     raise ProvisionError(
         f"RomM did not answer within {timeout}s (last: {last}). "
-        f"Is the stack up? ./scripts/orca/compose.sh ps"
+        f"Is the stack up? ./scripts/orca/compose.sh ps -- and if it is still "
+        f"migrating (compose.sh logs romm), wait, or start it on an empty volume"
     )
+
+
+def version_tuple(text: str) -> tuple[int, ...]:
+    """`5.4.0` as (5, 4, 0). Anything unparseable reads as the newest RomM."""
+    try:
+        return tuple(int(part) for part in text.split("-")[0].split("."))
+    except ValueError:
+        return (999,)
 
 
 def ensure_admin(romm: Romm) -> None:
@@ -219,7 +237,7 @@ def ensure_platforms(romm: Romm) -> list[str]:
     return all_slugs
 
 
-def scan_library(romm: Romm, timeout: int) -> dict:
+def scan_library(romm: Romm, timeout: int, version: tuple[int, ...]) -> dict:
     """Run a library scan and wait for it to finish.
 
     The scan is not reachable over REST: `POST /api/tasks/run/scan_library`
@@ -229,7 +247,11 @@ def scan_library(romm: Romm, timeout: int) -> dict:
     login cookie into the handshake.
 
     Metadata providers are left off, matching docker-compose.yml: enrichment
-    would reach the network and make the fixture non-deterministic.
+    would reach the network and make the fixture non-deterministic. Which
+    switches that takes depends on the RomM: 5.2.0 reads the options with
+    `.get(..., True)`, so playmatch is ON unless it is named, and 5.4.0
+    validates them with `extra="forbid"` and refuses the scan if it is named --
+    it no longer has the option at all (#227).
     """
     session = romm.s.cookies.get("romm_session")
     if not session:
@@ -259,19 +281,19 @@ def scan_library(romm: Romm, timeout: int) -> dict:
     except Exception as exc:  # socketio raises its own hierarchy
         raise ProvisionError(f"could not open the scan socket: {exc}") from exc
 
+    options = {
+        "platforms": [],
+        "platform_fs_slugs": [],
+        "type": "quick",
+        "roms_ids": [],
+        "apis": [],
+        "launchbox_remote_enabled": False,
+    }
+    # Only 5.2.0 is verified on this side of the line; 5.3 is in no matrix.
+    if version < (5, 4):
+        options["playmatch_enabled"] = False
     try:
-        sio.emit(
-            "scan",
-            {
-                "platforms": [],
-                "platform_fs_slugs": [],
-                "type": "quick",
-                "roms_ids": [],
-                "apis": [],
-                "launchbox_remote_enabled": False,
-                "playmatch_enabled": False,
-            },
-        )
+        sio.emit("scan", options)
         deadline = time.monotonic() + timeout
         while "ok" not in done and time.monotonic() < deadline:
             sio.sleep(0.5)
@@ -512,14 +534,15 @@ def main() -> int:
     romm = Romm(args.base_url)
     try:
         print(f"==> provisioning {args.base_url}")
-        wait_for_heartbeat(romm, args.wait)
+        version = wait_for_heartbeat(romm, args.wait)
+        print(f"  RomM {'.'.join(map(str, version))}")
         ensure_admin(romm)
         romm.login()
         on_disk = ensure_platforms(romm)
 
         expected = expected_roms_on_disk(args.library)
         print(f"  scanning ({len(on_disk)} platform(s), expecting {expected} rom(s))")
-        scan_library(romm, args.scan_timeout)
+        scan_library(romm, args.scan_timeout, version)
         found = wait_for_roms(romm, expected, timeout=120)
         print(f"  library ready: {found} rom(s)")
 

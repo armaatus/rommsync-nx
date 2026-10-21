@@ -16,7 +16,8 @@ so they are fully testable natively.
 
 ## There is no mock RomM
 
-Tests run against a **real RomM 5.2.0** in Docker, not a hand-written mock. A
+Tests run against a **real RomM** in Docker — 5.2.0 by default, 5.4.0 beside it
+([choosing the version](#choosing-the-romm-version)) — not a hand-written mock. A
 mock only ever encodes what we *believe* RomM does; when a test passes against
 the real thing, the behaviour is real, and the whole class of "the mock drifted
 from the server" bugs cannot happen.
@@ -838,11 +839,54 @@ the whole period the next was false: the first throughout the entire period the
 library was empty, and the second throughout the period every full run had a
 one-in-a-few-hundred chance of a 502 from a retired worker (#155).
 
+### Choosing the RomM version
+
+The fixture runs whichever RomM `ROMM_VERSION` in `.env` names: `5.2.0` by
+default, and `5.4.0` beside it until #235 makes that the default and drops
+5.2.0 (D1 in #226). `scripts/orca/env.sh` writes it — from the environment when
+the variable is set there, else as `.env` already had it, so the regenerations
+`compose.sh` and `seed.sh` do on their own never move a worktree back. To move
+one:
+
+```bash
+ROMM_VERSION=5.4.0 ./scripts/orca/env.sh
+./scripts/orca/compose.sh down -v      # empty the volumes first -- see below
+./scripts/orca/compose.sh up -d
+./.venv/bin/python server/testing/provision.py
+ctest --test-dir build --output-on-failure
+```
+
+`down -v` is not optional when going back. RomM migrates its database forward
+when it starts and never back, so a 5.2.0 started on a volume 5.4.0 has touched
+is a server nobody tested against. Going forward it is only slow: 5.4.0's
+release notes put its migrations at 15–20 minutes on a volume with a library in
+it, during which `/api/heartbeat` does not answer and `provision.py --wait`
+gives up. On the empty volume `down -v` leaves, the same migrations took 7
+seconds and the first heartbeat came 21 seconds after `up` (measured for #227),
+which is why neither CI nor `provision.py` needed a longer wait. The volumes are
+not split per version on purpose: `archive.sh` tears a stack down with `-p` and
+no `.env`, and a volume name built from `ROMM_VERSION` would make it remove the
+wrong ones.
+
+`rig.version_live` fails when the running image is not the one `ROMM_VERSION`
+names, so a stack nobody recreated cannot answer the suite for the wrong
+server; `ROMM_VERSION` in the environment of a `ctest` run overrides `.env`
+for that check and for `contract.captures`. `rig.slot_cap` holds the
+`MAX_SAVES_PER_SLOT: "10"` the compose file pins: 5.3+ prunes every slot to
+it, and a cap left to each release's default would make every pruning test
+depend on which RomM ran it.
+
+CI runs `host-tests` once per version. The 5.2.0 leg keeps the job name branch
+protection requires; `host-tests (RomM 5.4.0)` runs beside it, required by
+nothing and allowed to fail until #235. What fails there, and which issue owns
+each failure, is listed in #227.
+
 ### Keeping the captured contract honest
 
 `contract.captures` re-runs `probe_contract.py --auth --negotiate
 --sync-scenarios` against the fixture and compares the result with the committed
-`server/contract/captures/` — the responses [API_CONTRACT.md](API_CONTRACT.md),
+captures for the fixture's RomM — `server/contract/captures/` for 5.2.0,
+`server/contract/captures/5.4.0/` for 5.4.0 — the responses [API_CONTRACT.md](API_CONTRACT.md),
 [AUTH.md](AUTH.md) and [SYNC_PROTOCOL.md](SYNC_PROTOCOL.md) quote and that M1/M2
 are coded against. It compares field names, nesting and JSON types, plus the
 `action`/`reason` pairs each scenario is named for; ids, timestamps and the
