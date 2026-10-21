@@ -128,7 +128,11 @@ inline constexpr const char* kServiceName = "rommsync";
 /// restore is taken. A v2 overlay decoding that as a report would fail, and a
 /// v3 one reading a v2 sysmodule's report would wait for a restore that had
 /// already happened -- so the two say "update" to each other instead.
-inline constexpr std::uint32_t kVersion = 3;
+///
+/// **4** since M10-9 (#235), which added `SyncResult::kServerDisabled`. An enum
+/// value is a field's value a decoder does not tolerate either: a v3 overlay
+/// reading `"server_disabled"` fails to decode the whole `Status`.
+inline constexpr std::uint32_t kVersion = 4;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///
@@ -348,7 +352,11 @@ const char* ToString(AuthState state);
 /// `kPartial` is its own answer because M2-7 makes it one: a tick that uploaded
 /// four saves and failed the fifth is not a failed sync, and telling the user it
 /// was sends them looking for a problem with the four that worked.
-enum class SyncResult { kNever, kOk, kPartial, kFailed };
+///
+/// `kServerDisabled` is the same argument for a setting (#235): RomM answered
+/// that sync is switched off for this console, which is the user's switch on
+/// the server rather than a failure, and the screen has to say which switch.
+enum class SyncResult { kNever, kOk, kPartial, kFailed, kServerDisabled };
 const char* ToString(SyncResult result);
 
 /// What the download worker is doing with the entry it is on.

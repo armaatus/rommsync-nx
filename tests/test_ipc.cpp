@@ -188,9 +188,10 @@ int Version() {
   // 2 since M4-1 (#23): `Status` gained two fields the decoder requires, and a
   // required field is an incompatible change by this header's own rule. 3 since
   // M9-6 (#209): `RestoreBackup` answers a `RestoreState` rather than the
-  // finished report. What is frozen is command 0's *encoding*, asserted above
+  // finished report. 4 since M10-9 (#235): `SyncResult` gained a value a v3
+  // decoder refuses. What is frozen is command 0's *encoding*, asserted above
   // -- not the number in it.
-  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{3},
+  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{4},
                   "the interface version this build speaks");
   checks.ExpectEq(static_cast<int>(ipc::Command::kGetInterfaceVersion), 0,
                   "GetInterfaceVersion is command 0");
@@ -344,8 +345,9 @@ int RoundTrip() {
     checks.Expect(back.ok() && back.value.auth == state,
                   std::string("auth state survives: ") + ipc::ToString(state));
   }
-  for (const ipc::SyncResult result : {ipc::SyncResult::kNever, ipc::SyncResult::kOk,
-                                       ipc::SyncResult::kPartial, ipc::SyncResult::kFailed}) {
+  for (const ipc::SyncResult result :
+       {ipc::SyncResult::kNever, ipc::SyncResult::kOk, ipc::SyncResult::kPartial,
+        ipc::SyncResult::kFailed, ipc::SyncResult::kServerDisabled}) {
     ipc::Status status;
     status.last_sync_result = result;
     const ipc::Decoded<ipc::Status> back = ipc::DecodeStatus(ipc::EncodeStatus(status));

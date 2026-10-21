@@ -1738,6 +1738,7 @@ void SdEngine::RunOneTick() {
                  "the server stopped accepting this console's token: " + tick.negotiated.message);
       break;
     case sync::TickOutcome::kRefused:
+    case sync::TickOutcome::kServerDisabled:
       log::Warn(log::Event::kSyncRefused,
                 sync::ToString(tick.negotiated.error) + std::string(": ") +
                     tick.negotiated.message);
@@ -1817,6 +1818,7 @@ void SdEngine::RunOneTick() {
       break;
     case sync::TickOutcome::kOffline:
     case sync::TickOutcome::kRefused:
+    case sync::TickOutcome::kServerDisabled:
     case sync::TickOutcome::kUnauthorized:
       last_sync_result_ = ipc::SyncResult::kFailed;
       break;

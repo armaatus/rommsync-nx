@@ -222,6 +222,7 @@ std::string SyncResultText(ipc::SyncResult result) {
     case ipc::SyncResult::kPartial:
       return "Partly finished";
     case ipc::SyncResult::kFailed:
+    case ipc::SyncResult::kServerDisabled:
       return "Failed";
   }
   return "Unknown";
@@ -236,6 +237,7 @@ Tone SyncResultTone(ipc::SyncResult result) {
     case ipc::SyncResult::kPartial:
       return Tone::kWarn;
     case ipc::SyncResult::kFailed:
+    case ipc::SyncResult::kServerDisabled:
       return Tone::kBad;
   }
   return Tone::kNeutral;

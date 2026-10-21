@@ -2149,6 +2149,75 @@ int LogsTransportFailures(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// Sync switched off for this console in RomM, seen from the overlay (#235).
+///
+/// The acceptance's own words: the overlay shows "sync disabled on server" for
+/// the 400. What crosses IPC is `SyncResult::kServerDisabled` with the server
+/// counted as reached -- `overlay.status` holds the sentence it renders to --
+/// and the log still names it under `sync.refused`, where
+/// docs/TROUBLESHOOTING.md's section for it lives. A real device whose switch is
+/// really off, so the 400 is RomM's and not the proxy's.
+int ServerDisabled(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  const std::string device_id =
+      harness::CreateSyncDisabledDevice(c, client, base, fixture, "engine-server-disabled");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+
+  rommsync::log::Reset();
+  Console console(c, "engine-server-disabled");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = " + base +
+                                     "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                     "on_boot = false\n"),
+           "the console points at the rig");
+  auth::StoredToken token;
+  token.server_url = base;
+  token.access_token = fixture.token;
+  token.device_id = device_id;
+  token.scopes = {"roms.read"};
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+           "with a pairing to the switched-off device on the card");
+
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&client, token.access_token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, "a tick is asked for");
+
+  ipc::Status status = console.Status();
+  for (int waited = 0; waited < 400 && status.last_sync_result == ipc::SyncResult::kNever;
+       ++waited) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    status = console.Status();
+  }
+  c.Expect(status.last_sync_result == ipc::SyncResult::kServerDisabled,
+           std::string("the status says the server switched sync off, not that it failed: ") +
+               ipc::ToString(status.last_sync_result));
+  c.Expect(status.online, "the server was reached, so the screen does not say offline");
+  c.Expect(status.auth == ipc::AuthState::kPaired, "and the pairing stands");
+
+  const ipc::LogTail tail = console.Log();
+  c.Expect(Logged(tail, "sync.refused"),
+           "the log names it where the guide looks for it:" + Rendered(tail));
+  bool said = false;
+  for (const std::string& line : tail.lines) {
+    said = said || line.find("server_disabled") != std::string::npos;
+  }
+  c.Expect(said, "and the tick ends as server_disabled:" + Rendered(tail));
+
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
 void Commands(checks::Checks& c) {
   Console console(c, "engine-commands");
   console.Boot();
@@ -3038,6 +3107,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"nonblocking", NonBlocking},
       {"repairs", Repairs},
       {"log_faults", LogsTransportFailures},
+      {"server_disabled", ServerDisabled},
       {"drains", Drains},
       {"downloading", DrainProgress},
       {"preempts", DrainPreempted},

@@ -164,9 +164,20 @@ enum class TickOutcome {
   kOffline,
 
   /// The server answered, and the answer does not change on a second attempt: a
-  /// device deleted in the web UI, sync switched off for it, a body it refused.
-  /// Backing off harder than usual is the polite response; re-pairing is not.
+  /// device deleted in the web UI, a body it refused. Backing off harder than
+  /// usual is the polite response; re-pairing is not.
   kRefused,
+
+  /// Negotiate answered `400 "Sync is disabled for this device"`: the user
+  /// switched sync off for this console in RomM. **Nothing was written.**
+  ///
+  /// Apart from `kRefused` because it is not a failure. It is a setting, the
+  /// user's own, and a console that reported it as "last sync failed" and
+  /// backed off on the failure curve would send them looking for a fault and
+  /// then take an hour to notice the switch turned back on (#235). So the
+  /// schedule treats it as a tick that ran -- the interval, not the backoff --
+  /// and the status screen names the switch.
+  kServerDisabled,
 
   /// The server stopped accepting the token, or refused a scope. `answer` is
   /// what `auth::Gate` needs; the tick did not decide anything about the

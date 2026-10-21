@@ -221,6 +221,27 @@ void CheckResults(Checks& checks) {
   checks.ExpectEq(ValueOf(second, "Conflicts"), std::string("1"), "conflicts are shown");
   checks.ExpectEq(ValueOf(second, "Failed"), std::string("2"), "and so are failures");
 
+  // #235: RomM answered that sync is off for this console. The server was
+  // reached and nothing is broken, so neither "Offline" nor "Last sync failed"
+  // is true -- and the switch that would fix it is RomM's, not the overlay's.
+  ipc::Status server_off = Healthy();
+  server_off.last_sync_result = ipc::SyncResult::kServerDisabled;
+  const overlay::StatusView off_view = RenderOverWire(checks, server_off);
+  ExpectNothingBlank(checks, off_view, "server_disabled");
+  checks.ExpectEq(off_view.headline, std::string("Sync disabled on server"),
+                  "the server's switch is named as the server's");
+  checks.Expect(off_view.hint.find("RomM") != std::string::npos,
+                "and the hint says where to turn it back on: " + off_view.hint);
+  checks.ExpectEq(std::string(overlay::ToString(off_view.tone)), std::string("warn"),
+                  "a setting reads as a warning, not as a fault");
+  checks.ExpectEq(ValueOf(off_view, "Result"), std::string("Disabled on server"),
+                  "and the result row says the same");
+  // The local switch is the one the user is holding, so it still comes first.
+  ipc::Status both_off = server_off;
+  both_off.enabled = false;
+  checks.ExpectEq(RenderOverWire(checks, both_off).headline, std::string("Sync is off"),
+                  "the console's own switch outranks the server's");
+
   ipc::Status never_run = Healthy();
   never_run.last_sync_at = 0;
   never_run.last_sync_result = ipc::SyncResult::kNever;

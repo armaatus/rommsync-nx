@@ -139,6 +139,8 @@ const char* ToString(TickOutcome outcome) {
       return "offline";
     case TickOutcome::kRefused:
       return "refused";
+    case TickOutcome::kServerDisabled:
+      return "server_disabled";
     case TickOutcome::kUnauthorized:
       return "unauthorized";
     case TickOutcome::kCanceled:

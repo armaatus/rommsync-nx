@@ -417,6 +417,46 @@ void Failures(checks::Checks& c) {
   c.ExpectEq(rescanning.failures(), 1, "past which it is treated as a failure and backed off");
 }
 
+/// Sync switched off for this console in RomM is a setting, not a failure
+/// (#235): the schedule keeps its interval rather than backing off, so the tick
+/// after the user turns it back on is at most one interval away -- and it does
+/// not come round sooner either, because asking every thirty seconds is the
+/// hammering the backoff exists to prevent.
+void ServerDisabled(checks::Checks& c) {
+  Clocks clocks;
+  Scheduler scheduler(ConfigWith(minutes{30}), clocks.steady_fn(), clocks.wall_fn());
+  c.Expect(scheduler.Poll().trigger == Trigger::kBoot, "boot");
+
+  scheduler.Finished(TickOutcome::kOffline);
+  c.ExpectEq(scheduler.failures(), 1, "an offline tick first, so there is a backoff to clear");
+
+  clocks.Advance(seconds{31});
+  c.Expect(scheduler.Poll().run(), "the retry fires");
+  scheduler.Finished(TickOutcome::kServerDisabled);
+  c.ExpectEq(scheduler.failures(), 0, "a server that says sync is off is not a failure");
+  c.Expect(scheduler.backoff() == milliseconds{0}, "and clears the backoff");
+  c.Expect(scheduler.last_tick_at().time_since_epoch().count() != 0,
+           "the tick is stamped as one that ran");
+
+  const Decision waiting = scheduler.Poll();
+  c.Expect(!waiting.run() && !waiting.parked,
+           "nothing runs before the interval, and nothing parks either");
+  clocks.Advance(minutes{29});
+  c.Expect(!scheduler.Poll().run(), "still nothing a minute short of it");
+  clocks.Advance(minutes{2});
+  c.Expect(scheduler.Poll().trigger == Trigger::kInterval,
+           "and the interval asks again, which is how a switch turned back on is noticed");
+
+  // Every interval, not on a growing curve: ten in a row are still ten ticks
+  // one interval apart.
+  for (int i = 0; i < 10; ++i) {
+    scheduler.Finished(TickOutcome::kServerDisabled);
+    clocks.Advance(minutes{31});
+    c.Expect(scheduler.Poll().run(), "each interval asks again");
+  }
+  c.ExpectEq(scheduler.failures(), 0, "and none of them counts as a failure");
+}
+
 /// A handshake failure is a configuration fault, and is capped rather than
 /// retried every thirty seconds for the life of the console.
 void Tls(checks::Checks& c) {
@@ -622,6 +662,8 @@ int main(int argc, char** argv) {
     Skew(checks);
   } else if (scenario == "failures") {
     Failures(checks);
+  } else if (scenario == "server_disabled") {
+    ServerDisabled(checks);
   } else if (scenario == "tls") {
     Tls(checks);
   } else if (scenario == "idle") {

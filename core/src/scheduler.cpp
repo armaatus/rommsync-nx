@@ -225,6 +225,7 @@ void Scheduler::Finished(TickOutcome outcome, http::Error transport) {
 
     case TickOutcome::kOffline:
     case TickOutcome::kRefused:
+    case TickOutcome::kServerDisabled:
       rescans_ = 0;
       break;
 

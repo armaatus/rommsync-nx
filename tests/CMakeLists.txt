@@ -1422,6 +1422,7 @@ set(SCHEDULER_SCENARIOS
   suspend   # a clock advanced past several intervals is ONE catch-up tick
   skew      # a wall clock corrected in either direction: no storm, no stall
   failures  # backoff after a failed tick, floor again after a success
+  server_disabled  # #235: sync off in RomM keeps the interval, never the backoff
   tls       # a handshake failure is capped rather than retried forever
   idle      # a day switched off costs no wakeups; a day offline costs tens of ticks
   pairing   # PairingSession polls on the shared curve, not on one of its own
@@ -1477,6 +1478,7 @@ endforeach()
 set(TICK_RIG_SCENARIOS
   negotiate_5xx    # a 5xx past the retry budget: nothing is written at all
   negotiate_drop   # ...and neither is anything by a reset mid-plan
+  server_disabled  # #235: sync off in RomM is its own outcome, and writes nothing
   upload_5xx       # refused before RomM saw it: no row, no save touched
   upload_truncate  # a short 200 is a *completed* upload whose save_id is unknown
   upload_drop      # the row exists and the client cannot know -- and must not re-post
@@ -2187,6 +2189,7 @@ set(ENGINE_RIG_SCENARIOS
   nonblocking  # `StartPair` returns while the init is stalled: `ipc.hpp`'s contract
   repairs      # `StartPair` then `Unpair`, with neither instant leaving nothing
   log_faults   # M7-3: the four transport failures the guide documents, as the proxy makes them
+  server_disabled  # #235: sync off in RomM reaches the status screen as the server's switch
   drains       # M9-5: a rom queued over IPC becomes a file on the card
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)

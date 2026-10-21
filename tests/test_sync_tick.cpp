@@ -857,6 +857,49 @@ void NegotiateFault(rig::Checks& checks, http::HttpClient& client, const std::st
   checks.ExpectEq(rows, 0, what + ": and the server holds no row for a save never sent");
 }
 
+/// Sync switched off for this console in RomM (#235): the real 400, from a
+/// device of the fixture user's whose switch is really off.
+///
+/// Its own outcome rather than `kRefused`, because what a caller does about it
+/// differs -- the schedule keeps its interval and the status screen names the
+/// switch (sync_tick.hpp). And everything `NegotiateFault` holds a refused
+/// negotiation to holds here too: no operation, nothing on the card changed.
+void ServerDisabled(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                    const Fixture& fixture, const harness::Rom& rom) {
+  const std::string device_id =
+      harness::CreateSyncDisabledDevice(checks, client, base, fixture, "tick-server-disabled");
+  if (device_id.empty()) {
+    return;
+  }
+  Sandbox sandbox(checks, "tick-server-disabled");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  UploadFixture arranged;
+  if (ArrangeUpload(checks, *files, sandbox, rom, "m10-9-server-disabled", &arranged)) {
+    const std::map<std::string, std::string> before = Snapshot(sandbox);
+    auth::StoredToken token = TokenFor(base, fixture);
+    token.device_id = device_id;
+    sync::TickOptions options = OptionsAt(1'757'000'350);
+    Impatient(&options);
+    const sync::TickResult tick = sync::RunTick(client, *files, token, {arranged.local},
+                                                arranged.targets, /*previous=*/{}, options);
+    checks.Expect(tick.negotiated.error == sync::NegotiateError::kSyncDisabled,
+                  std::string("RomM's answer is read as the switch: ") +
+                      sync::ToString(tick.negotiated.error) + " -- " + tick.negotiated.message);
+    checks.ExpectEq(tick.negotiated.attempts, 1, "and asked once, not retried");
+    checks.Expect(tick.outcome == sync::TickOutcome::kServerDisabled,
+                  std::string("the tick is server_disabled, not a refusal: ") +
+                      sync::ToString(tick.outcome));
+    checks.Expect(tick.answer == auth::Answer::kAccepted,
+                  "and the token was read to answer it, which clears the gate's count");
+    checks.ExpectEq(tick.executed.operations.size(), static_cast<std::size_t>(0),
+                    "no operation was attempted");
+    checks.Expect(Snapshot(sandbox) == before, "and the card is byte-for-byte what it was");
+    SaveSurvived(checks, sandbox, arranged.name, arranged.bytes, "sync disabled on the server");
+  }
+  harness::DeleteDevice(client, base, fixture, device_id);
+}
+
 // --- M7-2: the schedule around a failed tick ---------------------------------
 //
 // Everything above is about one tick. These two are about what happens *next*,
@@ -1615,6 +1658,8 @@ int main(int argc, char** argv) {
                    R"({"mode":"drop","bytes":16,"path":"/api/sync/negotiate","count":9})",
                    sync::NegotiateError::kUnreachable, sync::TickOutcome::kOffline,
                    "a reset at negotiate");
+  } else if (scenario == "server_disabled") {
+    ServerDisabled(checks, *client, base, fixture, rom);
   } else if (scenario == "upload_5xx") {
     // The upload never reaches RomM: the proxy answers the status itself, so
     // there is no row for the tick to have to account for.

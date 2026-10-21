@@ -206,6 +206,7 @@ constexpr SyncResult kAllSyncResults[] = {
     SyncResult::kOk,
     SyncResult::kPartial,
     SyncResult::kFailed,
+    SyncResult::kServerDisabled,
 };
 
 constexpr DownloadState kAllDownloadStates[] = {
@@ -602,6 +603,8 @@ const char* ToString(SyncResult result) {
       return "partial";
     case SyncResult::kFailed:
       return "failed";
+    case SyncResult::kServerDisabled:
+      return "server_disabled";
   }
   return "never";
 }

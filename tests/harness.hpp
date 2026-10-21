@@ -394,6 +394,44 @@ inline http::Result PostJson(http::HttpClient& client, const std::string& url,
   return client.Send(request);
 }
 
+/// A second device of the fixture user's, with sync switched off for it in
+/// RomM -- the setting `400 "Sync is disabled for this device"` reports (#235).
+/// Empty, with a failed check, when RomM would not make one.
+///
+/// Its own device rather than the fixture's switched off and back: every rig
+/// process negotiates as the fixture device, so turning *that* one off would
+/// fail whichever test was mid-tick on it. The fixture token can do this
+/// because pairing granted `devices.write`. `DeleteDevice` removes it.
+inline std::string CreateSyncDisabledDevice(rig::Checks& checks, http::HttpClient& client,
+                                            const std::string& base, const Fixture& fixture,
+                                            const std::string& name) {
+  const http::Result created =
+      PostJson(client, base + "/api/devices", fixture,
+               "{\"name\":" + json::Quote(name + "-" + std::to_string(getpid())) +
+                   ",\"allow_existing\":false}");
+  const std::string device_id = rig::JsonString(created.response.body, "device_id");
+  checks.Expect(created.successful() && !device_id.empty(),
+                "RomM registers a second device: HTTP " +
+                    std::to_string(created.response.status));
+  if (device_id.empty()) {
+    return {};
+  }
+  http::Request off = Authed(http::Method::kPut, base + "/api/devices/" + device_id, fixture);
+  off.headers.push_back({"Content-Type", "application/json"});
+  off.body = "{\"sync_enabled\":false}";
+  const http::Result switched = client.Send(off);
+  checks.Expect(switched.successful(), "and switches sync off for it: HTTP " +
+                                           std::to_string(switched.response.status));
+  return device_id;
+}
+
+inline void DeleteDevice(http::HttpClient& client, const std::string& base,
+                         const Fixture& fixture, const std::string& device_id) {
+  if (!device_id.empty()) {
+    client.Send(Authed(http::Method::kDelete, base + "/api/devices/" + device_id, fixture));
+  }
+}
+
 // --- reading a plan -----------------------------------------------------------
 
 /// The operation the server planned for `slot`, or nullptr.
