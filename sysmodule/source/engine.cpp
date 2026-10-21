@@ -570,12 +570,22 @@ auth::PairingStatus SdEngine::pairing_status() const {
     // Pair did nothing, which is the exact failure `kStarting` exists to prevent.
     status.state = auth::PairingState::kStarting;
   }
-  if (!attempt_commit_failure_.empty()) {
+  if (!attempt_->commit_failure.empty()) {
     // The session succeeded and the card did not. It has no way to know that and
     // would go on reporting `kApproved` -- a console that says it paired and
     // holds no credentials.
     status.state = auth::PairingState::kFailed;
-    status.message = attempt_commit_failure_;
+    status.message = attempt_->commit_failure;
+  } else if (status.state == auth::PairingState::kApproved && !attempt_->committed) {
+    // The server has granted a token and `CommitGrant` has not put it on the
+    // card yet. Saying `kApproved` here is what `engine.pairs` caught under load:
+    // the overlay -- or anything else that stops on a terminal state -- reads
+    // "Paired" while `token.dat` is still `token.dat.tmp`, and a commit the card
+    // then refuses turns an announced success into a failure. Still pending, then,
+    // with the code on screen for the few milliseconds the write takes, and with
+    // a reason in case the card makes it longer than that.
+    status.state = auth::PairingState::kPending;
+    status.message = "approved -- saving the pairing to the SD card";
   }
   return status;
 }
@@ -2169,7 +2179,6 @@ ipc::Error SdEngine::StartPairing() {
     // `PairingConfig`, which is `core/`'s to add.
     attempt_ = std::make_shared<PairingAttempt>(*pairing_backend_.http, std::move(pairing),
                                                 ConfigSnapshot()->server.url);
-    attempt_commit_failure_.clear();
   }
   wake_.notify_all();
   // `pairing_status()` already answers `kStarting`, which is the contract
@@ -2178,10 +2187,7 @@ ipc::Error SdEngine::StartPairing() {
   return ipc::Error::kOk;
 }
 
-void SdEngine::AbandonPairingLocked() {
-  attempt_.reset();
-  attempt_commit_failure_.clear();
-}
+void SdEngine::AbandonPairingLocked() { attempt_.reset(); }
 
 bool SdEngine::AwaitNextPoll(const std::shared_ptr<PairingAttempt>& attempt) {
   // Until the session says the next request is due, rather than on a tick of our
@@ -2295,6 +2301,13 @@ void SdEngine::DrivePairing() {
       // acknowledged between `token.dat` and `auth.json` is the transition
       // taking `fsp-srv` away in the middle of a commit.
       CommitGrant(attempt, *granted);
+    } else {
+      // `PairingSession` promises a token with every `kApproved`, so this is a
+      // defect rather than a state. Named anyway: `pairing_status` holds an
+      // uncommitted approval at `kPending`, and without this the screen would
+      // show a code that can never complete.
+      std::lock_guard<std::mutex> lock(mutex_);
+      attempt->commit_failure = "the pairing was approved and no token came with it -- pair again";
     }
     SetPairingBusy(false);
   }
@@ -2342,9 +2355,12 @@ void SdEngine::CommitGrant(const std::shared_ptr<PairingAttempt>& attempt,
   if (!saved.ok()) {
     // Said out loud on the pairing screen rather than left to be discovered at
     // the next sync tick: the approval is spent, so the remedy is to pair again,
-    // and a screen still reading `kApproved` would tell the user the opposite.
+    // and a screen still showing the code as pending would tell them to wait.
+    //
+    // On the attempt, not the engine: a "Start over" pressed during the write
+    // has already replaced `attempt_`, and the new code must not inherit this.
     std::lock_guard<std::mutex> lock(mutex_);
-    attempt_commit_failure_ =
+    attempt->commit_failure =
         std::string("the pairing was approved and the token could not be saved (") +
         auth::ToString(saved.error) + ") -- pair again";
     return;
@@ -2360,6 +2376,11 @@ void SdEngine::CommitGrant(const std::shared_ptr<PairingAttempt>& attempt,
     std::lock_guard<std::mutex> lock(mutex_);
     gate_.Reset();
     auth_ = ipc::AuthState::kPaired;
+    // ...and only now does the attempt read `kApproved`: in the slice that makes
+    // the console paired, after `token.dat` is on the card. Whoever sees the
+    // pairing screen say "Paired" sees a `GetStatus` that agrees, and a card
+    // that does too.
+    attempt->committed = true;
     // The credentials the worker and the lists use, replaced in the same slice
     // as the state that says the console is paired -- so the first tick after a
     // pairing runs on the token that pairing just produced rather than on

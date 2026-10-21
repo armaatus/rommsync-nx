@@ -678,12 +678,26 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// The constructor exists because `auth::PairingSession` is neither copyable
   /// nor movable -- it carries the mutex `status()` is safe under -- so the
   /// session has to be built in place rather than assigned into an aggregate.
+  ///
+  /// `committed` and `commit_failure` are what the session cannot know: whether
+  /// the grant it reports reached the card. They live on the attempt rather than
+  /// on the engine so that a commit finishing after a "Start over" can only ever
+  /// mark the attempt it belongs to. Both are guarded by `SdEngine::mutex_`.
   struct PairingAttempt {
     PairingAttempt(http::HttpClient& client, auth::PairingConfig config, std::string url)
         : session(client, std::move(config)), server_url(std::move(url)) {}
 
     auth::PairingSession session;
     std::string server_url;
+
+    /// Set by `CommitGrant` in the slice that makes the console paired, after
+    /// `token.dat` is committed. Until it is, an approved session is reported as
+    /// still pending (`pairing_status`).
+    bool committed = false;
+
+    /// An approved pairing whose token would not reach the card. Reported as
+    /// `kFailed` with this as the reason.
+    std::string commit_failure;
   };
 
   /// The pairing thread. Runs one attempt at a time: `Begin()`, then `Poll()`
@@ -702,6 +716,13 @@ class SdEngine : public ipc::Engine, public power::Sink {
   bool AwaitNextPoll(const std::shared_ptr<PairingAttempt>& attempt);
 
   /// Persist an approved grant, and leave the console reporting itself paired.
+  ///
+  /// **The attempt reads `kApproved` from here, and not from the poll that was
+  /// granted it** -- `pairing_status` holds it at `kPending` until this marks it
+  /// `committed`, in the same `mutex_` slice that sets `auth_` and `token_`, and
+  /// only after `token.dat` is written, renamed and synced. A commit the card
+  /// refuses marks it `commit_failure` instead, so the overlay goes from the
+  /// code straight to "Pairing failed" and never says "Paired" in between.
   ///
   /// Takes `card_mutex_` for the two writes and `mutex_` only for the checks and
   /// the assignments around them, so nothing polled every frame waits on the
@@ -1316,12 +1337,6 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// waits on -- and null-vs-null is "nothing is running", which that wait has to
   /// tell apart from "a new attempt started while the old one was mid-request".
   std::shared_ptr<PairingAttempt> driven_;
-
-  /// What went wrong *after* the session succeeded -- an approved pairing whose
-  /// token would not reach the card. `PairingSession` cannot know about it and
-  /// would keep reporting `kApproved`, which is a console that says it paired
-  /// and has no credentials.
-  std::string attempt_commit_failure_;
 };
 
 }  // namespace rommsync::sysmodule

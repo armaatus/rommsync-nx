@@ -148,7 +148,12 @@ production RomM or a real library.
    characters and the address, with a countdown that moves. Read the code back
    at arm's length: it is the one string on any of these screens a person has to
    copy by hand. Approve it in the browser and expect *"Paired"*; let one
-   expire and expect *"The code expired"*, not *"Pairing failed"*.
+   expire and expect *"The code expired"*, not *"Pairing failed"*. Between the
+   approval and *"Paired"* the code may stay up for a moment with *approved --
+   saving the pairing to the SD card* under it: *"Paired"* waits for `token.dat`
+   to be on the card. A screen that stays there is a card write that is not
+   finishing; one that says *"Pairing failed"* with *the token could not be
+   saved* is a card that refused it.
 
 10. **The sync screen's two controls.** On the sync screen with the sysmodule
     running, configured and paired:
