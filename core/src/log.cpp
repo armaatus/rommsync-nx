@@ -1,8 +1,8 @@
 #include "rommsync/log.hpp"
 
+#include <array>
 #include <cstdio>
 #include <cstring>
-#include <deque>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -28,7 +28,27 @@ struct State {
   bool sink_enabled = true;
 
   std::uint64_t written = 0;
-  std::deque<Line> ring;
+
+  /// The last `kTailLines` lines, as a fixed ring rather than a container that
+  /// grows at one end and shrinks at the other (M9-15, #204).
+  ///
+  /// It was a `std::deque`, which allocates a chunk each time the window
+  /// crosses into a new one and frees the old one after it: a process that
+  /// logs a line a minute churned a chunk of its 1.4 MiB heap every few dozen
+  /// lines, forever, and what it held stepped up and down with the window's
+  /// position -- which is what `soak` saw and `alloc.log_ring` holds.
+  ///
+  /// Here a slot is reserved at `kMaxLineBytes` the first time it is used and
+  /// every later line is `assign`ed into it, which never reallocates: a line is
+  /// bounded by that same constant above. So the ring costs exactly the
+  /// `kTailLines * kMaxLineBytes` the heap's table says it does (`kHeapLogTail`,
+  /// sysmodule/source/main.cpp), from the moment it is full and for as long as
+  /// the process lives -- not a figure it creeps up to as longer lines happen to
+  /// land in more slots, which is what reusing a slot's capacity alone did: the
+  /// soak's floor rose 64 bytes a round for eleven rounds before it settled.
+  std::array<Line, kTailLines> ring;
+  std::size_t next = 0;   ///< the slot the next line goes in
+  std::size_t filled = 0; ///< how many slots hold a line, up to `kTailLines`
 };
 
 State& TheLog() {
@@ -400,9 +420,16 @@ void Write(Level level, Event event, std::string_view detail) {
       line += kTruncationMarker;
     }
 
-    state.ring.push_back(Line{level, ordinal, line});
-    while (state.ring.size() > kTailLines) {
-      state.ring.pop_front();
+    Line& slot = state.ring[state.next];
+    if (slot.text.capacity() < kMaxLineBytes) {
+      slot.text.reserve(kMaxLineBytes);
+    }
+    slot.level = level;
+    slot.ordinal = ordinal;
+    slot.text.assign(line);
+    state.next = (state.next + 1) % kTailLines;
+    if (state.filled < kTailLines) {
+      ++state.filled;
     }
     // The ring is filled either way; only the *card* is switched off (M9-4,
     // #208, and `SetSinkEnabled`).
@@ -458,10 +485,11 @@ std::uint64_t Tail(std::size_t count, std::vector<Line>* out) {
   std::lock_guard<std::mutex> lock(state.mutex);
   if (out != nullptr) {
     out->clear();
-    const std::size_t want = count < state.ring.size() ? count : state.ring.size();
+    const std::size_t want = count < state.filled ? count : state.filled;
     out->reserve(want);
-    for (std::size_t at = state.ring.size() - want; at < state.ring.size(); ++at) {
-      out->push_back(state.ring[at]);
+    // The oldest of the `want` newest lines sits `want` slots behind `next`.
+    for (std::size_t back = want; back > 0; --back) {
+      out->push_back(state.ring[(state.next + kTailLines - back) % kTailLines]);
     }
   }
   return state.written;
@@ -470,7 +498,11 @@ std::uint64_t Tail(std::size_t count, std::vector<Line>* out) {
 void Reset() {
   State& state = TheLog();
   std::lock_guard<std::mutex> lock(state.mutex);
-  state.ring.clear();
+  // Emptied, not merely forgotten: `Reset` is a fresh process's log, and that
+  // holds no line's bytes either.
+  state.ring = {};
+  state.next = 0;
+  state.filled = 0;
   state.written = 0;
   // Back on, because "reset" has to mean the log as a fresh process finds it. A
   // scenario that put a console to sleep (M9-4, #208) and reset afterwards would

@@ -421,11 +421,15 @@ void JudgeRule(checks::Checks& c) {
 /// allocating its next chunk as the window of `log::kTailLines` lines crossed a
 /// chunk boundary -- bounded, but a heap that churns a chunk every few dozen
 /// lines on a console with 1.4 MiB of it, and a floor no judge can call steady.
+///
+/// Short lines first and then lines of every length, because the second half of
+/// what the soak found was the slots' capacity creeping up as longer lines
+/// happened to land in more of them: a ring that only reused capacity passes
+/// with lines of one length and fails here.
 void LogRing(checks::Checks& c) {
   rlog::Reset();
-  const std::string detail(80, 'x');
   for (std::size_t at = 0; at < 2 * rlog::kTailLines; ++at) {
-    rlog::Info(rlog::Event::kSyncTick, detail);
+    rlog::Info(rlog::Event::kSyncTick, "short");
   }
   const count_new::Snapshot full = count_new::Now();
   std::int64_t lowest = full.outstanding;
@@ -434,7 +438,8 @@ void LogRing(checks::Checks& c) {
   // Ten times the ring, so the window crosses whatever boundary a container
   // under it has, several times over.
   for (std::size_t at = 0; at < 10 * rlog::kTailLines; ++at) {
-    rlog::Info(rlog::Event::kSyncTick, detail);
+    // 7 is prime to the ring's 24, so every length lands in every slot.
+    rlog::Info(rlog::Event::kSyncTick, std::string(20 + (at % 7) * 60, 'x'));
     const count_new::Snapshot now = count_new::Now();
     lowest = std::min(lowest, now.outstanding);
     highest = std::max(highest, now.outstanding);
@@ -442,10 +447,8 @@ void LogRing(checks::Checks& c) {
   }
   c.ExpectEq(highest - lowest, std::int64_t{0},
              "a full log ring holds the same blocks however many more lines go through it");
-  // The ordinal gains a digit at 100, so a line can grow by a byte; that is the
-  // only movement allowed, and only once per slot.
-  c.Expect(moved <= static_cast<std::int64_t>(rlog::kTailLines),
-           "and the same bytes, give or take a digit a line: moved " + std::to_string(moved));
+  c.ExpectEq(moved, std::int64_t{0},
+             "and the same bytes, whatever the length of the lines going through it");
   rlog::Reset();
 }
 
