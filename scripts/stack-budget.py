@@ -21,10 +21,11 @@ ceilings, and this script holds every side of the arithmetic:
             keeps the stack safe is not one a real RomM response reaches.
   walk      (every push) the call-graph arithmetic below, against hand-built
             graphs whose answers are worked out in the comments beside them.
-  measured  (where devkitPro is) reads the `.ci` files `-fcallgraph-info=su`
-            leaves beside a cross-compile, finds the deepest chain from `main`
-            and `__appInit`, and fails when the measured level or rest outgrows
-            the header's ceilings -- which is how a frame that grew is caught.
+  measured  (every push, in the image) reads the `.ci` files that
+            `-fcallgraph-info=su` leaves beside a cross-compile, finds the
+            deepest chain from `main` and `__appInit`, and fails when the
+            measured level or rest outgrows the header's ceilings -- which is
+            how a frame that grew is caught.
 
 How a chain is costed. Each function's frame is GCC's own static figure. Every
 recursion reachable from `main` must be one `kMaxDepth` bounds -- the parser,

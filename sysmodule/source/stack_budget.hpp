@@ -28,8 +28,9 @@
 //
 //   * `stack.fit` (every push): the npdm says `kMainThreadStackBytes`, and the
 //     `static_assert` below holds with today's `kMaxDepth`.
-//   * `stack.measured` (where devkitPro is): a cross-compile with
-//     `-fcallgraph-info=su`, walked from `main`, stays under both ceilings.
+//   * `stack.measured` (every push, in the `switch-build` job): a
+//     cross-compile with `-fcallgraph-info=su`, walked from `main`, stays
+//     under both ceilings.
 //   * `stack.contract` (every push): `kMaxDepth` stays at least twice the
 //     deepest shape a pinned RomM snapshot promises, so lowering it again is
 //     caught where it would start refusing real responses.
@@ -54,7 +55,7 @@ inline constexpr std::size_t kJsonLevelBytes = 512;
 /// Everything on the deepest parsing chain that does not repeat per level:
 /// the frames from `main` down to `json::Parse`, and the deepest tail below the
 /// last level (`ParseString` -> `ParseUnicodeEscape` -> `ParseHex4` and a
-/// string allocation). Measured at 5,392 bytes, through `main` (1,952) ->
+/// string allocation). Measured at 5,488 bytes, through `main` (2,048) ->
 /// the IPC loop -> `ipc::Dispatch` (400) -> an `SdEngine` handler ->
 /// `auth::LoadOrCreateDeviceIdentity` -> `json::Parse` (320).
 inline constexpr std::size_t kMainRestBytes = 0x1800;

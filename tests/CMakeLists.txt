@@ -1617,13 +1617,13 @@ set_tests_properties(switch.ci_requires_artifacts PROPERTIES TIMEOUT 60)
 # wrapped in if(NOT ROMMSYNC_REQUIRE_RIG). Every other skippable test flips to a
 # failure under that option precisely so CI cannot go green on a skip -- and
 # that is the right default, so each exception needs its reason recorded rather
-# than inferred. There are five, all with this one's reason, and all carrying
+# than inferred. There are six, all with this one's reason, and all carrying
 # the `toolchain` label: `switch.builds`, `switch.tlsprobe`, `toolchain.libnx`,
-# `npdm.svcs` and `package.builds`.
+# `npdm.svcs`, `package.builds` and `stack.measured`.
 #
 # They skip in host-tests and run in `switch-build` instead. That job is inside
 # the pinned image already, and it runs tests/toolchain_suite.sh --here, which
-# runs exactly these five in place and treats a skip as a failure (M9-12, #211).
+# runs exactly these six in place and treats a skip as a failure (M9-12, #211).
 # Until then the assertions in them had never run anywhere: the job built the
 # artifacts and read four bytes of each. `switch.toolchain_suite` below holds
 # the suite to this label, so an entry added here without both runs nowhere.
@@ -2346,14 +2346,14 @@ foreach(scenario IN ITEMS fit contract walk)
 endforeach()
 
 # The frames themselves, from a cross-compile. Its SKIP_RETURN_CODE is
-# unwrapped for `npdm.svcs`'s reason, given at length beside it: the frame
-# sizes exist only in the devkitpro image, and no CI job runs ctest in that
-# image yet -- M9-12 (#211) is where one does. `walk` above is what keeps the
-# arithmetic covered everywhere meanwhile. RUN_SERIAL for the other container
+# unwrapped for `switch.builds`'s reason, given at length beside it: the frame
+# sizes exist only in the devkitpro image. It carries the `toolchain` label and
+# is an entry in tests/toolchain_suite.sh, so the `switch-build` job runs it in
+# place on every push and fails on a skip. RUN_SERIAL for the other container
 # builds' reason: two `make -j$(nproc)` at once is a red build about nothing.
 add_test(NAME stack.measured
          COMMAND "${BASH_PROGRAM}" "${CMAKE_CURRENT_SOURCE_DIR}/test_stack_budget.sh" measured)
-set_tests_properties(stack.measured PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900
+set_tests_properties(stack.measured PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900 LABELS toolchain
                      RUN_SERIAL TRUE
                      ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
 

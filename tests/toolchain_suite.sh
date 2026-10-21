@@ -27,6 +27,7 @@ switch.builds      test_switch_build.sh  builds
 switch.tlsprobe    test_switch_build.sh  tlsprobe
 npdm.svcs          test_npdm.sh          svcs
 package.builds     test_package.sh       builds
+stack.measured     test_stack_budget.sh  measured
 '
 
 entries() { grep -v '^ *$' <<<"$ENTRIES" | awk '{ print $1, $2, $3 }'; }

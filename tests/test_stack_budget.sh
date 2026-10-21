@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # The main thread's stack against a real cross-compile's frames (M9-18, #216).
 #
-#   test_stack_budget.sh measured   cross-compiles sysmodule/ in
-#                                   devkitpro/devkita64 with
+#   test_stack_budget.sh measured   cross-compiles sysmodule/ in the pinned
+#                                   devkitpro/devkita64 (or in place, under
+#                                   tests/toolchain_suite.sh --here) with
 #                                   -fstack-usage -fcallgraph-info=su and runs
 #                                   `scripts/stack-budget.py measured` over the
 #                                   .ci files it leaves: the deepest chain from
@@ -18,7 +19,6 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../scripts/toolchain.sh
 . "$REPO_ROOT/scripts/toolchain.sh"
-IMAGE="$DEVKITPRO_IMAGE"
 SKIP=77
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -29,10 +29,8 @@ cleanup() { [ -n "$SCRATCH" ] && rm -rf "$SCRATCH"; return 0; }
 trap cleanup EXIT
 
 phase_measured() {
-  command -v docker >/dev/null 2>&1 || skip "no docker"
-  docker info >/dev/null 2>&1 || skip "docker daemon not running"
-  docker image inspect "$IMAGE" >/dev/null 2>&1 ||
-    skip "$IMAGE not pulled (docker pull $IMAGE)"
+  local missing
+  missing="$(toolchain_missing)" && skip "$missing"
 
   # A copy, for tests/test_switch_build.sh's reasons: three worktrees may run
   # this at once, and a build in the tree leaves objects behind. Here that is
@@ -48,9 +46,9 @@ phase_measured() {
   # DEFINES would override every `DEFINES +=` switch.mk or a Makefile makes,
   # and the frames measured would stop being the frames that ship. From the
   # environment it is only the starting value those lines append to.
-  if ! docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work \
-        -e DEFINES="-fstack-usage -fcallgraph-info=su" "$IMAGE" \
-        bash -lc 'make -C sysmodule -j"$(nproc)"' >"$log" 2>&1; then
+  if ! toolchain_run "$SCRATCH" \
+        'DEFINES="-fstack-usage -fcallgraph-info=su" make -C sysmodule -j"$(nproc)"' \
+        >"$log" 2>&1; then
     cat "$log" >&2
     fail "the sysmodule cross-compile failed"
   fi

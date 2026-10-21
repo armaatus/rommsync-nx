@@ -484,7 +484,9 @@ nothing in CI runs them: $(sed -n 's/^UNLABELLED //p' <<<"$labelled" | tr '\n' '
   cp "$REPO_ROOT/scripts/toolchain.sh" "$SCRATCH/scripts/"
   local script out
   stub_entries() {  # stub_entries STATUS-FOR-test_npdm.sh
-    for script in test_toolchain.sh test_switch_build.sh test_package.sh; do
+    # Every script the suite lists, read from its own --list, so an entry added
+    # to it is stubbed here without an edit (#216 added the sixth).
+    for script in $(bash "$suite" --list | awk '{ print $2 }' | sort -u); do
       printf 'exit 0\n' >"$SCRATCH/tests/$script"
     done
     printf 'exit %s\n' "$1" >"$SCRATCH/tests/test_npdm.sh"

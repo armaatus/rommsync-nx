@@ -101,12 +101,13 @@ table) -- before trusting a green `switch.builds`.
 
 ### The toolchain's ctest entries
 
-Five entries need the image: `switch.builds`, `switch.tlsprobe`,
-`toolchain.libnx`, `npdm.svcs` and `package.builds`, the `toolchain` label
-(`ctest -L toolchain`). They skip without it, and the host-tests runner never
-has it, so they run in the `switch-build` job instead: that job is already
-inside the pinned image, and its last step is `tests/toolchain_suite.sh --here`,
-which runs all five in place and **fails on a skip** (M9-12, #211). Before
+Six entries need the image: `switch.builds`, `switch.tlsprobe`,
+`toolchain.libnx`, `npdm.svcs`, `package.builds` and `stack.measured`, the
+`toolchain` label (`ctest -L toolchain`). They skip without it, and the
+host-tests runner never has it, so they run in the `switch-build` job instead:
+that job is already inside the pinned image, and its last step is
+`tests/toolchain_suite.sh --here`, which runs all six in place and **fails on a
+skip** (M9-12, #211). Before
 that, CI read four bytes of each artifact and nothing else; the symbols, the
 NACP and the NPDM checks had never run anywhere. `switch.toolchain_suite` holds
 the suite's list to the label, so a new entry needs both.
