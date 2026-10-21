@@ -2329,6 +2329,34 @@ foreach(scenario IN ITEMS rows pinned margin dirs prose)
   set_tests_properties(heap.${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
 
+# --- M9-18: the main thread's stack, against the deepest JSON it parses -------
+# The heap above is the inner heap; this is the one stack the npdm sizes. Its
+# 0x8000 and `json::kMaxDepth`'s 64 were never checked against each other, and
+# a max-depth document cost the main thread ~33 KiB of its 32 (#216). The budget
+# is sysmodule/source/stack_budget.hpp; scripts/stack-budget.py says how each
+# number is held.
+#
+# `fit`, `contract` and `walk` read the tree only and never skip.
+set(STACK_BUDGET "${CMAKE_SOURCE_DIR}/scripts/stack-budget.py")
+foreach(scenario IN ITEMS fit contract walk)
+  add_test(NAME stack.${scenario}
+           COMMAND ${Python3_EXECUTABLE} "${STACK_BUDGET}" ${scenario}
+                   --repo "${CMAKE_SOURCE_DIR}")
+  set_tests_properties(stack.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
+# The frames themselves, from a cross-compile. Its SKIP_RETURN_CODE is
+# unwrapped for `npdm.svcs`'s reason, given at length beside it: the frame
+# sizes exist only in the devkitpro image, and no CI job runs ctest in that
+# image yet -- M9-12 (#211) is where one does. `walk` above is what keeps the
+# arithmetic covered everywhere meanwhile. RUN_SERIAL for the other container
+# builds' reason: two `make -j$(nproc)` at once is a red build about nothing.
+add_test(NAME stack.measured
+         COMMAND "${BASH_PROGRAM}" "${CMAKE_CURRENT_SOURCE_DIR}/test_stack_budget.sh" measured)
+set_tests_properties(stack.measured PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900
+                     RUN_SERIAL TRUE
+                     ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
+
 # --- M9-15: what the sysmodule holds between ticks, measured -----------------
 # The heap's table above is a bound added up from constants; this is the
 # process measured. Every `operator new` in the executable is counted
