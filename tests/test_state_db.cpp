@@ -680,7 +680,7 @@ void AVersion2FileIsMigratedNotDiscarded(checks::Checks& c) {
   state::LoadedBaseline loaded = state::ParseBaseline(v2);
   c.Expect(loaded.diagnostics.empty(), "a version 2 file reads silently -- " +
                                            loaded.DescribeDiagnostics());
-  c.ExpectEq(loaded.version, 2, "and says which version it was");
+  c.ExpectEq(loaded.version, state::kSourceSlotVersion, "and says which version it was");
   c.Expect(loaded.value.Find(12, std::nullopt) != nullptr, "its archival row is kept as it was");
   c.Expect(loaded.value.FindState(12, "Game (USA).state") != nullptr,
            "and so is its state: states are keyed by name, which #236 did not move");

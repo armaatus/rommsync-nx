@@ -162,9 +162,18 @@ ResolveReport ResolveRefusedUploads(http::HttpClient& client, fs::FileSystem& fi
   // Once per tick, and only the refused saves, scoped to their roms: unscoped,
   // the server answers a narrow question with a download for every save in the
   // library this device has no history for.
+  //
+  // **Unfiltered** (#236). The guard refused the upload over the slot's newest
+  // save from *any* emulator, and the question is what that save is. Filtered,
+  // a head written by a lineage this console does not load would stay invisible:
+  // the answer would be this console's own previous version, every later upload
+  // would draw the same 409, and each would be "resolved" by putting that old
+  // version back over the player's progress.
+  NegotiateOptions unfiltered = options.negotiate;
+  unfiltered.emulators.reset();
   Negotiation second = options.rom_ids
-                           ? NegotiateRoms(client, token, asked, rom_ids, options.negotiate)
-                           : Negotiate(client, token, asked, options.negotiate);
+                           ? NegotiateRoms(client, token, asked, rom_ids, unfiltered)
+                           : Negotiate(client, token, asked, unfiltered);
   out.renegotiated = true;
   out.negotiate_error = second.error;
   out.negotiate_message = second.message;

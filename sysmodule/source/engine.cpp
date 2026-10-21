@@ -1839,7 +1839,8 @@ bool SdEngine::RunOneTick() {
     target.rom_id = save.rom_id;
     target.slot = save.slot;
     target.sd_path = save.sd_path;
-    target.file_name = save.server_name;
+    // The name negotiate was told, so the upload and the plan agree (#236).
+    target.file_name = reported.back().file_name;
     targets.push_back(std::move(target));
   }
 

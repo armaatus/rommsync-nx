@@ -147,7 +147,10 @@ never downloaded over a Tico DuckStation card. It is left out — not sent as `[
 which matches nothing — when a scanned save has no emulator: RomM cannot list
 `null`, and that save's own uploads would drop out of the pairing and be
 uploaded again every tick. The slot guard is not filtered: an upload into a slot
-whose newest save is a lineage the filter hides still draws the 409 below.
+whose newest save is a lineage the filter hides still draws the 409 below — so
+the 409's second negotiation goes out **without** the filter, to see the save
+the guard saw. Filtered, it would answer with this console's own previous
+version, and every later upload would be refused and "resolved" the same way.
 
 ### Upgrading from rc1: the old slots (#236)
 
