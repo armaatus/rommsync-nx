@@ -164,7 +164,14 @@ carry an `.eh_frame`, the sysmodule's linked `.eh_frame` stays under 32 KiB, and
 both targets' `.text` under 640 KiB, which a revert to `-O2` overshoots in both;
 and the build log carries no warning, vendored code and the link included, since
 neither is `-Werror`.
-The budget for the whole image is M9-15 (#204)'s.
+Those ceilings, and the budget for the whole image, live in
+`scripts/image-budget.sh` (M9-15, #204): the three LOAD segments an NSO maps,
+each rounded up to its page, must stay under **2.25 MiB** (2,080,768 bytes when
+the budget was set), and `.bss` must hold `kInnerHeapSize` and at most 64 KiB
+besides. The `switch-build` job runs it after its upload and writes the numbers
+to the run's summary; `switch.builds` runs the same script over its own build.
+Moving the budget is an edit to that script, with its reason beside it -- the CI
+step passes no flag, and `switch.ci_requires_artifacts` refuses one.
 
 What is still linked and could go: newlib's full `printf` (`_svfprintf_r`,
 ~15 KiB, plus `_dtoa_r`), first pulled in by our six `snprintf` calls, none of

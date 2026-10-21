@@ -177,12 +177,12 @@ check_image_budget() {
   grep -q 'past its' <<<"$out" ||
     { echo "$out" >&2; fail "a 4 KiB image budget failed, but not on the image's size"; }
 
-  # The .bss tie, against a main.cpp that declares a heap a third the size linked:
+  # The .bss tie, against a main.cpp that declares a 4 KiB heap over the one linked:
   # the check has to read the constant out of the source it was built from, or
   # a heap that grew without the constant moving would go unnoticed.
   local main="$SCRATCH/sysmodule/source/main.cpp" saved
   saved="$(cat "$main")"
-  sed -i.bak 's/^constexpr size_t kInnerHeapSize = 0x[0-9A-Fa-f]*;/constexpr size_t kInnerHeapSize = 0x80000;/' "$main"
+  sed -i.bak 's/^constexpr size_t kInnerHeapSize = 0x[0-9A-Fa-f]*;/constexpr size_t kInnerHeapSize = 0x1000;/' "$main"
   rm -f "$main.bak"
   out="$(image_budget 2>&1)" &&
     { printf '%s\n' "$saved" >"$main"; echo "$out" >&2;

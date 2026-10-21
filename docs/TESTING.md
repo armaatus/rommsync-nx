@@ -830,6 +830,37 @@ ctest --test-dir build --output-on-failure
   something durable does it through `io::Sync`. A kernel-level injector
   ([lazyfs](https://github.com/dsrhaslab/lazyfs), Linux and FUSE) is the check
   on the model's assumptions and is not part of this suite.
+- **What the sysmodule holds, measured** (M9-15, #204). The heap's table in
+  `sysmodule/source/main.cpp` is a bound added up from constants, and two things
+  measure what it describes. `scripts/image-budget.sh` reads the linked image --
+  the three NSO segments page-aligned, `.bss` against `kInnerHeapSize`, the
+  `.eh_frame` and `.text` ceilings -- and fails past a budget it states; the
+  `switch-build` job runs it on every push and `switch.builds` runs it here,
+  then shows the budget and the `.bss` tie each bite. And `test_heap_steady`
+  counts every `operator new` in the process (`tests/count_new.hpp`, after
+  llvm's `count_new.h`) while the sysmodule's own `SdEngine` ticks against the
+  fixture RomM: `alloc.steady` samples what is outstanding between sixteen ticks
+  after a warm-up and fails if it grows with the number of ticks, and
+  `soak.smoke` does the same for rounds of a tick and a rom download. The judge
+  (`alloc.judge`) compares the least reading of each half of the run, so a block
+  kept per tick and a vector that only ever reallocates are both caught, and
+  `alloc.counts` checks the counter sees every signature and that allocation
+  elision is off for the target. The first soak found the log ring's `std::deque`
+  stepping a 4 KiB chunk up and down as its window moved; `alloc.log_ring` holds
+  the fixed ring that replaced it.
+
+  The same scenario runs nightly for a thousand rounds
+  (`.github/workflows/soak.yml`), with its samples kept as an artifact. A
+  schedule GitHub can disable for inactivity is not trusted on its own: the
+  `soak-fresh` job turns main red when the soak has not passed in three days
+  (`scripts/soak-fresh.sh`; `soak.workflow` and `soak.fresh` hold both).
+
+  These are host numbers: the host's standard library, C++ allocations only
+  (libcurl's are the host transport's), and a fixture library of a few roms.
+  What carries to the console is the shape -- flat or growing -- and the order
+  of magnitude of a tick. Not done here: curl-style OOM injection (fail
+  allocation *N* on run *N*), and `libfaketime` to run the scheduler's own
+  clock fast -- the soak asks for each tick instead of waiting for one.
 - The `package.*` group covers `scripts/package.sh`, which turns those two build
   outputs into the zip a user unpacks onto their SD card. `package.layout`,
   `package.refuses`, `package.deterministic` and `package.upgrade` stub the two

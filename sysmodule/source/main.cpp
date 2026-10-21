@@ -126,11 +126,12 @@ namespace {
 //     (`sized_thread.hpp` measures both). Its overhead beside the stack is the
 //     same `kThreadHeapOverheadBytes` the other two pay.
 //   * **The log keeps its last lines in RAM**, so `GetLog` can answer without
-//     going near the card (log.hpp). It is `kTailLines * kMaxLineBytes` at
-//     worst, and it is a term here rather than a cost nobody added up. That is
-//     the **content**: the per-`std::string` header and the deque's blocks are
-//     allocator overhead and belong to the newlib term below, which is what that
-//     term is for.
+//     going near the card (log.hpp). It is `kTailLines * kMaxLineBytes` -- not
+//     at worst but always, since M9-15 (#204) made the ring a fixed one whose
+//     slots are reserved at that bound (log.cpp) -- and it is a term here rather
+//     than a cost nobody added up. That is the **content**: the per-`std::string`
+//     header is allocator overhead and belongs to the newlib term below, which
+//     is what that term is for.
 //   * **An open `DIR` is not free.** fsdev allocates
 //     `sizeof(FsDirectoryEntry)` -- 784 bytes -- times
 //     `__nx_fsdev_direntry_cache_size` for every `::opendir`, and holds it until
@@ -165,6 +166,34 @@ namespace {
 //     *not* held for the life of the process: it is read at `Load` and rewritten
 //     once a tick (`play_sessions.hpp`). It is counted anyway, because a peak is
 //     a peak.
+//
+// **Measured, not only added up (M9-15, #204).** Two measurements stand beside
+// the arithmetic, each re-taken on every run that could move it:
+//
+//   * **The reservation**, off the linked image. `scripts/image-budget.sh` runs
+//     in the `switch-build` job and in `ctest -R switch.builds`, reads
+//     `aarch64-none-elf-size` and `readelf` over this ELF, and fails the build
+//     past its budget. When the budget was set the image mapped 2,080,768 bytes
+//     of the 2,359,296 it allows, and `.bss` was 1,459,344 bytes -- this heap and
+//     17,552 bytes of everything else. It ties `.bss` to the constant below, so
+//     the heap the loader maps is the heap this file declares.
+//   * **The use**, off the process. `ctest -R alloc.steady` counts every
+//     `operator new` while the sysmodule's own `SdEngine` -- this file's
+//     `engine.cpp`, its worker and its scheduler -- ticks against the fixture
+//     RomM (tests/test_heap_steady.cpp). Between ticks it holds ~17 KiB, and
+//     that floor does not move across ticks: not a block, not a byte. A quiet
+//     tick peaks ~170 KiB over it, most of it the rom index being fetched and
+//     parsed. The nightly soak (.github/workflows/soak.yml) holds the same floor
+//     across a thousand rounds of a tick and a download.
+//
+// What the second one is **not**: a console number. It is counted on the host's
+// standard library, it counts C++ allocations only -- libcurl's `malloc`s are
+// the host transport's, and the transport here is a different one -- and the
+// fixture library is a handful of roms, so the terms that scale with a library
+// (`kHeapListResponse`, `kHeapStateBaseline`) are nowhere near their bounds.
+// Those stay arithmetic. What it does settle is the two things arithmetic
+// cannot: that nothing this table omits is large, and that nothing grows with
+// uptime -- which it did, until the log's ring stopped being a `std::deque`.
 
 /// What one platform's JSON weighs on the wire. Measured against the fixture
 /// RomM 5.2.0 (`GET /api/platforms`: 3184 bytes for four rows) and rounded up.
