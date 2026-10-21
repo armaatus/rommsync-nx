@@ -259,6 +259,18 @@ jobs:
             tlsprobe/rommsync-tlsprobe.nro
           if-no-files-found: error
 
+      # The sysmodule's memory budget, measured off the linked image rather than
+      # added up in a comment (M9-15, #204). The heap is a `.bss` array, so the
+      # toolchain's section sizes are the exact bytes the loader maps; the
+      # script holds the mapped image under a budget it states, ties `.bss` to
+      # `kInnerHeapSize`, and writes the numbers to the run summary either way.
+      # This is the only CI job where the linked ELF exists (M9-12, #211).
+      #
+      # After the upload, for the reason Package is: a red budget is when the
+      # artifacts are worth having to look at.
+      - name: The image fits its budget
+        run: bash scripts/image-budget.sh
+
       # Packaged on every push, not only on a tag. `ctest -R package.builds` is the
       # only other thing that runs scripts/package.sh inside this container, and
       # it skips on every runner `host-tests` uses -- so without this step a

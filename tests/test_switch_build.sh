@@ -93,7 +93,17 @@ phase_ci() {
   grep -q 'scripts/package.sh' <<<"$job" ||
     fail "switch-build does not package; a packaging failure would first show on a tag"
 
-  echo "ok: switch-build builds all three targets, packages them, and requires the artifacts"
+  # M9-15 (#204): the image's budget is enforced where the linked ELF exists,
+  # which is this job and nowhere else on CI. The step runs the script as it
+  # stands -- an `--image-budget` here would be a ceiling moved in a YAML file
+  # rather than in the one place that states it and says why.
+  grep -q 'scripts/image-budget.sh' <<<"$job" ||
+    fail "switch-build does not hold the sysmodule's image to its budget (#204)"
+  if grep -q 'image-budget.sh.*--' <<<"$job"; then
+    fail "switch-build passes scripts/image-budget.sh a flag; the budget lives in the script (#204)"
+  fi
+
+  echo "ok: switch-build builds all three targets, packages them, requires the artifacts, and holds the image to its budget"
 }
 
 # --- the real cross-compile ---------------------------------------------------
@@ -108,14 +118,6 @@ check_no_warnings() {
     grep -i 'warning:' "$1" >&2
     fail "the Switch build printed warnings"
   fi
-}
-
-# section_size ELF SECTION -- the size of SECTION in ELF (relative to $SCRATCH),
-# by the toolchain's own `size -A`. Empty if the ELF has no such section.
-section_size() {
-  docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work "$IMAGE" \
-    bash -lc '"$DEVKITPRO"/devkitA64/bin/aarch64-none-elf-size -A "$1"' _ "$1" |
-    awk -v want="$2" '$1 == want { print $2 }'
 }
 
 # M9-9 (#200): every object this build compiles -- ours, core/'s and the
@@ -154,37 +156,40 @@ $(sed -n 's/^unwind //p' <<<"$report")"
   fi
 }
 
-# ...and the linked numbers that buys, held rather than observed once.
-#
-#   .eh_frame, sysmodule  < 32 KiB  #200's acceptance. 85,672 bytes at -O2 with
-#                                   unwind tables; ~27 KiB without, all of it
-#                                   prebuilt library tables (libnx alone ~11 KiB).
-#   .text, both targets   < 640 KiB  holds -Os. At -O2 the sysmodule's .text is
-#                                   ~1.12 MiB and the overlay's ~800 KiB; at -Os
-#                                   ~495 KiB each. A switch.mk that drops -Os
-#                                   lands well past this, and the room under it
-#                                   is growth, not slack to spend on -O2.
-#
-# The absolute budget for the whole image -- .bss and page-aligned segments -- is
-# M9-15 (#204)'s; these are the two numbers #200 moved.
-check_image_ceilings() {
-  local eh
-  eh="$(section_size sysmodule/sys-rommsync.elf .eh_frame)"
-  [ -n "$eh" ] || fail "no .eh_frame in the sysmodule at all; the linker script changed under this check"
-  [ "$eh" -lt $(( 32 * 1024 )) ] ||
-    fail "the sysmodule's .eh_frame is $eh bytes, past the 32 KiB ceiling (#200)"
-  check_text_ceiling sysmodule/sys-rommsync.elf
-  check_text_ceiling overlay/ovl-rommsync.elf
-  echo "ok: sysmodule .eh_frame $eh bytes, under 32 KiB"
+# image_budget [ARGS] -- scripts/image-budget.sh over the build in $SCRATCH,
+# inside the pinned image: the same script, run the same way, that the
+# `switch-build` job runs over its own checkout. The ceilings live there, once.
+image_budget() {
+  docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work "$IMAGE" \
+    bash -lc 'bash scripts/image-budget.sh "$@"' _ "$@"
 }
 
-check_text_ceiling() {
-  local text
-  text="$(section_size "$1" .text)"
-  [ -n "$text" ] || fail "aarch64-none-elf-size reported no .text for $1"
-  [ "$text" -lt $(( 640 * 1024 )) ] ||
-    fail "$1's .text is $text bytes, past the 640 KiB ceiling -- is switch.mk still -Os? (#200)"
-  echo "ok: $1 .text $text bytes, under 640 KiB"
+# The budget, applied, and then shown to bite. A ceiling nothing has ever seen
+# fail is one that may be reading the wrong file, the wrong section or nothing
+# at all, and passing every time for that reason (M9-15, #204).
+check_image_budget() {
+  local out
+  out="$(image_budget 2>&1)" || { echo "$out" >&2; fail "the sysmodule's image is over its budget"; }
+  echo "$out"
+
+  out="$(image_budget --image-budget 4096 2>&1)" &&
+    { echo "$out" >&2; fail "a 4 KiB image budget passed; the ceiling is not being applied"; }
+  grep -q 'past its' <<<"$out" ||
+    { echo "$out" >&2; fail "a 4 KiB image budget failed, but not on the image's size"; }
+
+  # The .bss tie, against a main.cpp that declares a heap a third the size linked:
+  # the check has to read the constant out of the source it was built from, or
+  # a heap that grew without the constant moving would go unnoticed.
+  local main="$SCRATCH/sysmodule/source/main.cpp" saved
+  saved="$(cat "$main")"
+  sed -i.bak 's/^constexpr size_t kInnerHeapSize = 0x[0-9A-Fa-f]*;/constexpr size_t kInnerHeapSize = 0x80000;/' "$main"
+  rm -f "$main.bak"
+  out="$(image_budget 2>&1)" &&
+    { printf '%s\n' "$saved" >"$main"; echo "$out" >&2;
+      fail "a .bss far larger than the declared heap passed the tie"; }
+  printf '%s\n' "$saved" >"$main"
+  grep -q 'something other than the heap' <<<"$out" ||
+    { echo "$out" >&2; fail "the doctored heap failed, but not on the .bss tie"; }
 }
 
 phase_builds() {
@@ -208,6 +213,9 @@ phase_builds() {
   SCRATCH="$(mktemp -d)"
   cp "$REPO_ROOT/VERSION" "$REPO_ROOT/switch.mk" "$SCRATCH/"
   cp -R "$REPO_ROOT/core" "$REPO_ROOT/sysmodule" "$REPO_ROOT/overlay" "$SCRATCH/"
+  mkdir -p "$SCRATCH/scripts"
+  cp "$REPO_ROOT/scripts/image-budget.sh" "$SCRATCH/scripts/" ||
+    fail "no scripts/image-budget.sh; nothing holds the image to a budget (#204)"
   # Sources only. A .nsp left over from a local build is exactly what make would
   # accept as already up to date, and the assertions below would then be reading
   # the previous build's output instead of this one's.
@@ -269,36 +277,8 @@ phase_builds() {
   grep -q 'rommsync::version()' "$SCRATCH/sysmodule/build/sys-rommsync.lst" ||
     fail "no core/ symbol in the linked sysmodule"
 
-  # M9-2 (#207): the heap is a `.bss` array, so the linked image is the one
-  # place that says how big it really is. Everything else about the budget --
-  # the table, the terms, the margin -- is source checked against source
-  # (`ctest -R heap`); this is the measurement, taken with the toolchain's own
-  # `size` the way #207's design note asks for.
-  #
-  # `.bss` is `kInnerHeapSize` plus every other file-scope object the process
-  # has, so the assertion is that the two are within a slack of each other: a
-  # heap that grew without the constant moving, and a constant that moved
-  # without the heap, both land here. M9-15 (#204) is the CI ceiling on the
-  # absolute number; this is only the tie between the two.
-  local declared bss slack
-  declared="$(sed -n 's/^constexpr size_t kInnerHeapSize = \(0x[0-9A-Fa-f]*\);.*/\1/p' \
-      "$REPO_ROOT/sysmodule/source/main.cpp")"
-  [ -n "$declared" ] || fail "no kInnerHeapSize in sysmodule/source/main.cpp"
-  bss="$(section_size sysmodule/sys-rommsync.elf .bss)"
-  [ -n "$bss" ] || fail "aarch64-none-elf-size reported no .bss for the sysmodule"
-  slack=$(( 64 * 1024 ))
-  if [ "$bss" -lt "$(( declared ))" ]; then
-    fail "the linked sysmodule reserves $bss bytes of .bss and main.cpp declares a \
-$(( declared ))-byte inner heap; the heap is not in .bss"
-  fi
-  if [ "$(( bss - declared ))" -gt "$slack" ]; then
-    fail "the linked sysmodule's .bss is $bss bytes against a declared inner heap of \
-$(( declared )); $(( bss - declared )) bytes of that is something other than the heap, \
-which is more than the $slack this check allows (#207, #204)"
-  fi
-
   check_unwind_tables sysmodule overlay
-  check_image_ceilings
+  check_image_budget
 
   # The sysmodule hosts the service the overlay opens (M4-1). Nothing in this
   # repo can run it before the M8-1 gate, so this is the only automated check
@@ -341,8 +321,8 @@ which is more than the $slack this check allows (#207, #204)"
     { cat "$log" >&2; fail "the duplicate basename went unreported"; }
   rm -f "$SCRATCH/sysmodule/source/json.cpp"
 
-  echo "ok: .nsp and .ovl built, signed, hosting and drawing, carrying core/ $version;\
-    .bss $bss against a declared inner heap of $(( declared ))"
+  echo "ok: .nsp and .ovl built, signed, hosting and drawing, carrying core/ $version,\
+ inside the image budget"
 }
 
 
