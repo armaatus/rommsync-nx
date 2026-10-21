@@ -707,6 +707,30 @@ bool g_time_up = false;
 /// unmatched `pscmExit` takes libnx's refcount below zero.
 bool g_psc_up = false;
 
+/// The same, for `pmdmntInitialize()` (M10-16, #242). It also decides whether
+/// the engine gets a foreground probe at all: one on a session that was never
+/// opened would answer "no game" on every call, which is the old behaviour
+/// with nothing saying so.
+bool g_pm_up = false;
+
+/// Whether an application is in the foreground (M10-16, #242): a retail game,
+/// Tico, or RetroArch launched over a title -- anything pm launched as *the*
+/// application. The engine holds every tick while this says yes.
+///
+/// `pm` answers `ResultProcessNotFound` when there is none, and anything that
+/// is not a pid is read as none: a probe that failed closed would be a console
+/// that never syncs again over one bad answer, where failing open is the
+/// client as it was before #242. A library applet -- RetroArch started from the
+/// album -- is not the application, and is not seen; #242 records that.
+///
+/// A poll and not a hook, deliberately: `pmdmntHookToCreateApplicationProcess`
+/// is the one hook `dmnt:cht` holds, and pm does not start a hooked application
+/// until the hooker says so (`boot.foreground` refuses a hook here).
+bool ApplicationRunning() {
+  u64 pid = 0;
+  return R_SUCCEEDED(pmdmntGetApplicationProcessId(&pid));
+}
+
 /// Whether the "this sm will not answer 65100" note has already been taken. One
 /// note, not one per service: it is the same answer for every question that
 /// follows, and a journal full of it would push out the note that matters.
@@ -968,6 +992,23 @@ void __appInit(void) {
     g_psc_up = R_SUCCEEDED(rc);
   }
 
+  // **`pm:dmnt`, so the engine can tell a game is running** (M10-16, #242). A
+  // tick under a running game is the one that loses a save: the game writes its
+  // in-memory copy over a download when it closes. One session, polled only
+  // while a tick is held (`kForegroundPollInterval`).
+  //
+  // Not fatal, for `psc:m`'s reason: without it the client syncs as it did
+  // before #242, which is worse than with it and far better than an overlay
+  // that cannot reach a sysmodule that refused to start. `pm` is one of the
+  // processes the kernel itself launches, so this does not wait in practice.
+  if (WaitForService("pm:dmnt")) {
+    rc = pmdmntInitialize();
+    if (R_FAILED(rc)) {
+      rommsync::sysmodule::boot::Note(g_boot, "rommsync: pmdmntInitialize", rc);
+    }
+    g_pm_up = R_SUCCEEDED(rc);
+  }
+
   // The transport, here rather than on first use, because a sysmodule does
   // everything at start: a failure here is a line in a boot log, and the same
   // failure under a user's thumb is a pairing screen that never moves. Its
@@ -1054,6 +1095,7 @@ void __appInit(void) {
 void __appExit(void) {
   // `nifmExit` is `NetworkExit`'s, not ours: this process opens `nifm:u` once,
   // inside `NetworkInitialize` (#195).
+  if (g_pm_up) pmdmntExit();
   if (g_psc_up) pscmExit();
   if (g_time_up) timeExit();
   rommsync::sysmodule::NetworkExit();
@@ -1174,6 +1216,14 @@ int main(int, char**) {
   engine.UseServer(g_http.get(), "");
   engine.UseCard(g_card.get());
   engine.UseNetworkProbe(&rommsync::sysmodule::ConsoleIsOnline);
+  // Before the worker, so the boot tick is already held if the console came up
+  // straight into a game (#242).
+  if (g_pm_up) {
+    engine.UseForegroundProbe(&ApplicationRunning);
+  } else {
+    Log(rommsync::log::Level::kWarn,
+        "rommsync: no pm:dmnt; a sync can run while a game is open (#242)");
+  }
   engine.StartWorker();
 
   // **The console can now tell this process that it is going to sleep** (M9-4,

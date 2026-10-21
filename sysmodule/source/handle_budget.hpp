@@ -18,8 +18,8 @@
 //     `time:s` and, on 6.0.0+, maps a shared memory.
 //
 // The table is **twice** the count rounded up to a power of two, so the next
-// service (#242's foreground-application detection) is an edit to a term here
-// rather than a surprise on a console. It is not the 1023 maximum other sysmodules declare:
+// service is an edit to a term here rather than a surprise on a console --
+// which is what #242's `pm:dmnt` was: one session, `kPm`, and 64 still fits. It is not the 1023 maximum other sysmodules declare:
 // sessions count against the system resource limit every system module shares,
 // so a table sized for a leak lets one spend that budget, where this one fails
 // the leaking call in this process first.
@@ -80,10 +80,15 @@ inline constexpr std::size_t kService = 1 + kMaxSessions;
 /// be resolving at once, which is the worker and the pairing thread.
 inline constexpr std::size_t kDnsInFlight = 2;
 
+/// `pm:dmnt`, the foreground-application probe (M10-16, #242). One session and
+/// no event: it is polled, because the event pm:dmnt could hand back is the
+/// application-launch hook `dmnt:cht` holds (`main.cpp`).
+inline constexpr std::size_t kPm = 1;
+
 /// The peak. `set:sys` is not in it: `__appInit` closes it before anything
 /// else here is open.
 inline constexpr std::size_t kHeld = kThreads + kSm + kFs + kTime + kPsc + kNifm + kBsd +
-                                     kSsl + kService + kDnsInFlight;
+                                     kSsl + kService + kDnsInFlight + kPm;
 
 /// What `sys-rommsync.json` declares. `scripts/npdm-check.py` reads this line.
 ///
@@ -93,7 +98,7 @@ inline constexpr std::size_t kHeld = kThreads + kSm + kFs + kTime + kPsc + kNifm
 /// the json together would satisfy every other check there is.
 inline constexpr std::size_t kHandleTableSize = 64;
 
-static_assert(kHeld == 28, "the count moved: update sysmodule/README.md's handle row with it");
+static_assert(kHeld == 29, "the count moved: update sysmodule/README.md's handle row with it");
 static_assert(kHandleTableSize == std::bit_ceil(2 * kHeld),
               "kHandleTableSize is not twice the handles this process holds, rounded up to a "
               "power of two; change it and handle_table_size in sys-rommsync.json together "

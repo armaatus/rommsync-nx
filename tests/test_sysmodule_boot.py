@@ -39,6 +39,11 @@ Four phases, one CTest entry each, so a red run names the promise that broke:
             when the services behind them go down. The grant, the subscription
             and the `fs` dependency that decides WHEN we are told, all three of
             which are invisible to every other check here.
+
+  foreground  M10-16 (#242): `pm:dmnt` granted, opened, polled for the
+            application process id and handed to the engine as its foreground
+            probe -- and never hooked, because the application hook is
+            `dmnt:cht`'s and a hooked launch waits for its hooker.
 """
 import argparse
 import json
@@ -67,6 +72,7 @@ SERVICE_OF_INIT = {
     "socketInitialize": ["bsd:u", "sfdnsres"],
     "sslInitialize": ["ssl"],
     "pscmInitialize": ["psc:m"],
+    "pmdmntInitialize": ["pm:dmnt"],
 }
 
 
@@ -267,6 +273,47 @@ def phase_psc(repo):
     return 0
 
 
+def phase_foreground(repo):
+    """`pm:dmnt` granted, opened, and handed to the engine (M10-16, #242).
+
+    The engine holds every tick while a game runs, and the only thing that
+    tells it one is running is the probe `main` installs. Without the grant the
+    init fails on every boot; without the init the probe is a call on a session
+    never opened; without the install the engine is told nothing, and syncs
+    under every game exactly as it did before the issue -- with every host test
+    green, because those inject their own probe.
+
+    And no hook. `pmdmntHookToCreateApplicationProcess` is one hook for the
+    whole console, held by Atmosphere's `dmnt:cht`, and pm does not start an
+    application it is hooked for until the hooker says so: taking it is every
+    game launch on the console waiting on this process.
+    """
+    failures = 0
+    if "pm:dmnt" not in npdm(repo).get("service_access", []):
+        failures += fail(
+            "sys-rommsync.json does not grant `pm:dmnt`; pmdmntInitialize would fail on every "
+            "boot and every tick would run under a running game (#242)")
+    source = read(repo, "sysmodule/source/main.cpp")
+    if not re.search(r"\bpmdmntInitialize\s*\(", app_init(source)):
+        failures += fail("__appInit never calls pmdmntInitialize() (#242)")
+    code = uncommented(source)
+    if not re.search(r"\bpmdmntGetApplicationProcessId\s*\(", code):
+        failures += fail("main.cpp never asks pm for the application process id (#242)")
+    if not re.search(r"\.UseForegroundProbe\s*\(", code):
+        failures += fail(
+            "main.cpp never installs a foreground probe; the engine would sync under every "
+            "game (#242)")
+    if re.search(r"\bpmdmntHook\w*\s*\(", code):
+        failures += fail(
+            "main.cpp hooks process creation through pm:dmnt. The application hook is the "
+            "one dmnt:cht holds, and pm does not start a hooked application until the hooker "
+            "says so (#242)")
+    if failures:
+        return 1
+    print("ok: pm:dmnt is granted, opened, polled and handed to the engine; nothing is hooked")
+    return 0
+
+
 def read(repo, relative):
     with open(repo + "/" + relative, "r", encoding="utf-8") as handle:
         return handle.read()
@@ -282,6 +329,7 @@ PHASES = {
     "bounded": phase_bounded,
     "comments": phase_comments,
     "psc": phase_psc,
+    "foreground": phase_foreground,
 }
 
 

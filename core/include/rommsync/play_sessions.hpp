@@ -10,9 +10,17 @@
 // Horizon will name the foreground *application* -- `pmdmntGetApplicationProcessId`
 // plus `pminfoGetProgramId` -- but on this console that application is RetroArch
 // or Tico, never the rom. No Horizon API says which file an emulator loaded, so
-// a title id cannot produce a `rom_id`, and neither service is in
-// `sysmodule/sys-rommsync.json` today. None of it is testable off a console
-// either, which hard rule 1 settles: it is not in this build.
+// a title id cannot produce a `rom_id`. None of it is testable off a console
+// either, which hard rule 1 settles: no title id is in this build.
+//
+// **What the foreground does give this module, since M10-16 (#242)**, is the
+// window's lower half. `pm:dmnt` is granted now, and the sysmodule holds every
+// tick while an application runs, so no tick stamps `last_seen` mid-game. Before
+// that, an interval tick inside a session moved the window's start past the
+// session's real start while the save -- written by Tico on exit -- had not
+// moved yet, and the session derived after it claimed less than was played:
+// not the upper bound this module promises. A held tick does not look at the
+// card at all, so the next tick's window spans the game.
 //
 // What is here instead is derived from the saves. A save whose mtime moved
 // between two ticks means that rom was played, the two ticks bound the window,

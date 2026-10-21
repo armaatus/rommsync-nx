@@ -177,14 +177,15 @@ guess, and is still wrong to make now.
   under `/atmosphere/contents`, so the template's mask survived and did nothing
   but grant. `npdm.grants` holds the config to `SdCard` on every push and
   `npdm.svcs` holds both halves of the built NPDM to it.
-- **Handle table: 64, twice the 28 handles this process holds at once**
+- **Handle table: 64, twice the 29 handles this process holds at once**
   (#210). The count is term by term in
   [`source/handle_budget.hpp`](source/handle_budget.hpp), read out of libnx's
   own service code: four threads, the `sm` session, one `fsp-srv` session,
   `time:s` with its five sub-sessions and shared memory, `psc:m` and its event,
   `nifm:u`, `bsd:u`'s two sessions plus monitor and transfer memory, `ssl`'s two
-  sessions, the `rommsync` port with three overlay sessions, and two `sfdnsres`
-  lookups in flight. Open files, `SslConnection`s and the `PmModule` are domain
+  sessions, the `rommsync` port with three overlay sessions, two `sfdnsres`
+  lookups in flight, and since #242 the `pm:dmnt` session the foreground probe
+  polls. Open files, `SslConnection`s and the `PmModule` are domain
   objects and cost nothing here; **a socket is not a handle at all**, so the
   `errno == ENOENT` descriptor question in `ssl_http_client.cpp` is a bsd limit
   and not this one. A `static_assert` holds the table to exactly twice the
@@ -230,7 +231,13 @@ guess, and is still wrong to make now.
   back with the `timeInitialize` beside `fsInitialize`, because the scheduler is
   what makes `std::chrono::system_clock` matter — `core/`'s sync and download
   paths call it, and a save stamped from an uninitialised clock is one
-  docs/SYNC_PROTOCOL.md refuses as an epoch `updated_at`.
+  docs/SYNC_PROTOCOL.md refuses as an epoch `updated_at`. M9-4 (#208) added
+  `psc:m` for sleep, and M10-16 (#242) `pm:dmnt`: the engine holds every sync
+  tick while a game is in the foreground, and `pmdmntGetApplicationProcessId`
+  is how it knows. It is polled, and only while a tick is held — the
+  application-launch hook `pm:dmnt` also offers is the single one
+  `dmnt:cht` holds, and pm does not start a hooked application until its hooker
+  says so, so taking it would make every game launch wait on this process.
 
 ## Where the work is
 
