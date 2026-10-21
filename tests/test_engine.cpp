@@ -3720,15 +3720,34 @@ class OtherConsolesSaves {
   std::vector<std::int64_t> ids_;
 };
 
-/// How many `sync.tick` lines the log holds: one per tick that ran, whatever
-/// ended it (`LogTickEnd`).
-int TicksLogged(const ipc::LogTail& tail) {
-  int ticks = 0;
-  for (const std::string& line : tail.lines) {
-    ticks += line.find(" sync.tick ") != std::string::npos ? 1 : 0;
+/// How many `sync.tick` lines the log has written since this was installed:
+/// one per tick that ran, whatever ended it (`LogTickEnd`). Installed before
+/// the console it counts, so it outlives the worker that writes to it.
+///
+/// **Counted at the sink, not off `GetLog`.** The tail is the last
+/// `log::kTailLines` lines, and one tick on a console whose library holds
+/// other consoles' saves writes more than that by itself
+/// (`OtherConsolesSaves`). A count of the tail is then a count of the ticks
+/// that still fit in it, which is how main's fixture made both scenarios
+/// below come up one tick short of ticks that had run. The sink sees every
+/// line; `test_heap_steady`'s `TickCounter` counts the same way.
+class TickLines final : public rlog::Sink {
+ public:
+  TickLines() : previous_(rlog::GetSink()) { rlog::SetSink(this); }
+  ~TickLines() override { rlog::SetSink(previous_); }
+
+  void Write(rlog::Level, std::string_view line) override {
+    if (line.find(" sync.tick ") != std::string_view::npos) {
+      ticks_.fetch_add(1, std::memory_order_relaxed);
+    }
   }
-  return ticks;
-}
+
+  int ticks() const { return ticks_.load(std::memory_order_relaxed); }
+
+ private:
+  rlog::Sink* previous_;
+  std::atomic<int> ticks_{0};
+};
 
 /// The real client, with a game that starts the moment the armed tick asks for
 /// the library -- the one request a tick makes before it touches a save.
@@ -3820,6 +3839,7 @@ int Foreground(http::HttpClient& client, const std::string& base) {
   const OtherConsolesSaves others(c, client, base, fixture);
 
   rlog::Reset();
+  const TickLines ticks;
   Console console(c, "engine-foreground");
   c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
                                  "[server]\nurl = " + base +
@@ -3879,7 +3899,7 @@ int Foreground(http::HttpClient& client, const std::string& base) {
   c.Expect(!held.sync_in_progress, "the status screen does not draw a held tick as syncing");
   c.Expect(held.last_sync_result == ipc::SyncResult::kNever, "nor as one that ran");
   const ipc::LogTail held_log = console.Log();
-  c.ExpectEq(TicksLogged(held_log), 0, "the log has no tick in it:" + Rendered(held_log));
+  c.ExpectEq(ticks.ticks(), 0, "the log has no tick in it:" + Rendered(held_log));
   c.Expect(Logged(held_log, "sync.held"), "and says why:" + Rendered(held_log));
 
   // The game closes.
@@ -3898,7 +3918,7 @@ int Foreground(http::HttpClient& client, const std::string& base) {
   // queued rather than coalesced.
   std::this_thread::sleep_for(std::chrono::seconds{1});
   const ipc::LogTail done_log = console.Log();
-  c.ExpectEq(TicksLogged(done_log), 1,
+  c.ExpectEq(ticks.ticks(), 1,
              "exactly one: the boot tick and both presses were the same tick" +
                  Rendered(done_log));
 
@@ -3938,17 +3958,17 @@ int Foreground(http::HttpClient& client, const std::string& base) {
              "game it now finds");
   c.ExpectEq(SaveIdsFor(client, base, fixture, other.id).size(), other_before.size(),
              "so the second save is not on the server yet");
-  c.ExpectEq(TicksLogged(console.Log()), 1, "and that tick did not end as one that ran");
+  c.ExpectEq(ticks.ticks(), 1, "and that tick did not end as one that ran");
   c.Expect(!console.Status().sync_in_progress, "nor is it drawn as still running");
 
   running = false;
   const std::chrono::steady_clock::time_point ticked_by =
       std::chrono::steady_clock::now() + std::chrono::seconds{60};
-  while (TicksLogged(console.Log()) < 2 && std::chrono::steady_clock::now() < ticked_by) {
+  while (ticks.ticks() < 2 && std::chrono::steady_clock::now() < ticked_by) {
     std::this_thread::sleep_for(std::chrono::milliseconds{25});
   }
   std::this_thread::sleep_for(std::chrono::seconds{1});
-  c.ExpectEq(TicksLogged(console.Log()), 2,
+  c.ExpectEq(ticks.ticks(), 2,
              "the press it was is held, and runs once the game closes -- once");
   std::vector<std::int64_t> other_uploaded;
   for (const std::int64_t id : SaveIdsFor(client, base, fixture, other.id)) {
@@ -4009,6 +4029,7 @@ int ServerDeleted(http::HttpClient& client, const std::string& base) {
     const std::vector<std::int64_t> before = SaveIdsFor(client, base, fixture, rom.id);
 
     rlog::Reset();
+    const TickLines ticks;
     Console console(c, "engine-deleted-" + what);
     c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
                                    "[server]\nurl = " + base +
@@ -4035,14 +4056,14 @@ int ServerDeleted(http::HttpClient& client, const std::string& base) {
     console.engine.UseCard(card.get());
     console.engine.StartWorker();
 
-    const auto tick = [&console, &c, &what](int n) {
+    const auto tick = [&console, &c, &what, &ticks](int n) {
       c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, what + ": a tick is asked for");
       const std::chrono::steady_clock::time_point by =
           std::chrono::steady_clock::now() + std::chrono::seconds{60};
-      while (TicksLogged(console.Log()) < n && std::chrono::steady_clock::now() < by) {
+      while (ticks.ticks() < n && std::chrono::steady_clock::now() < by) {
         std::this_thread::sleep_for(std::chrono::milliseconds{25});
       }
-      c.ExpectEq(TicksLogged(console.Log()), n, what + ": and it ran");
+      c.ExpectEq(ticks.ticks(), n, what + ": and it ran");
     };
 
     tick(1);
