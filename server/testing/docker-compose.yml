@@ -1,4 +1,4 @@
-# Throwaway RomM 5.2.0 fixture — the primary test rig (docs/TESTING.md).
+# Throwaway RomM fixture — the primary test rig (docs/TESTING.md).
 #
 # This is a REAL RomM, not a mock: when a test passes against it, the behaviour
 # is real. Failure modes a healthy RomM will not produce on demand (401 mid-sync,
@@ -9,6 +9,12 @@
 # .env, generated per worktree by scripts/orca/env.sh, so three concurrent
 # worktrees never share a port or a database. NEVER point this at a production
 # RomM volume.
+#
+# Which RomM is ROMM_VERSION in .env, also written by env.sh (#227). The
+# fallback below is env.sh's default, and the two move together (#235 makes it
+# 5.4.0). The volumes are NOT per version: RomM migrates its database forward on
+# start and never back, so a stack that has run a newer RomM must be emptied
+# before an older one starts on it -- docs/TESTING.md#choosing-the-romm-version.
 
 name: ${COMPOSE_PROJECT_NAME:-rmx-local}
 
@@ -20,7 +26,7 @@ volumes:
 
 services:
   romm:
-    image: rommapp/romm:5.2.0
+    image: rommapp/romm:${ROMM_VERSION:-5.2.0}
     restart: unless-stopped
     environment:
       DB_HOST: romm-db
@@ -56,6 +62,12 @@ services:
       # with the fault proxy below, on a request a test names, which is where a
       # server failure belongs in this rig.
       WEB_SERVER_MAX_REQUESTS: "0"
+      # RomM 5.3+ keeps at most this many versions per slot, pruning on every
+      # slotted upload; 5.2.0 ignores it. Pinned rather than left at RomM's
+      # default (50) so a pruning test counts against the fixture's number, not
+      # a release's -- and small, so proving it takes eleven uploads, not
+      # fifty-one. tests/test_rig_fixture.sh holds this line.
+      MAX_SAVES_PER_SLOT: "10"
     volumes:
       - romm_resources:/romm/resources
       - romm_redis_data:/redis-data
