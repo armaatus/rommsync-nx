@@ -41,6 +41,28 @@ bool SecondsUsable(std::int64_t seconds) {
   return seconds == 0 || (seconds >= kEarliest && seconds <= kLatest);
 }
 
+/// The version a `<magic> <version> ...` header names when it is above this
+/// build's, else zero -- which is also the answer for anything that is not this
+/// file's header at all, since those are corrupt rather than newer.
+int NewerVersion(std::string_view header) {
+  const std::string magic = std::string(kFormatMagic) + " ";
+  if (header.substr(0, magic.size()) != magic) {
+    return 0;
+  }
+  int version = 0;
+  std::size_t at = magic.size();
+  for (; at < header.size() && header[at] >= '0' && header[at] <= '9'; ++at) {
+    if (version > 100000) {
+      return 0;  // not a version anybody shipped; corrupt, and discarded as such
+    }
+    version = version * 10 + (header[at] - '0');
+  }
+  if (at == magic.size() || (at < header.size() && header[at] != ' ')) {
+    return 0;
+  }
+  return version > kFormatVersion ? version : 0;
+}
+
 std::string FormatHeader(std::int64_t next_id) {
   return std::string(kFormatMagic) + " " + std::to_string(kFormatVersion) + " " +
          std::to_string(next_id);
@@ -244,6 +266,8 @@ const char* ToString(StoreError error) {
       return "write_failed";
     case StoreError::kCommitFailed:
       return "commit_failed";
+    case StoreError::kNewerFormat:
+      return "newer_format";
   }
   return "none";
 }
@@ -304,6 +328,17 @@ LoadedHistory ParseHistory(std::string_view text) {
   // prefix match on the magic and the version is what says "these bytes are
   // this file"; the number after it is data.
   const std::string prefix = std::string(kFormatMagic) + " " + std::to_string(kFormatVersion) + " ";
+  const int newer = lines.empty() ? 0 : NewerVersion(lines.front());
+  if (newer > 0) {
+    loaded.newer_version = newer;
+    loaded.diagnostics.push_back(
+        "conflicts.db is version " + std::to_string(newer) +
+        ", written by a newer release than this sys-rommsync (which reads " +
+        std::to_string(kFormatVersion) +
+        "); it is not read and not written over, conflicts recorded now last until a reboot, "
+        "and the backups under .backup/ are untouched -- update sys-rommsync to see it again");
+    return loaded;
+  }
   if (lines.empty() || lines.front().size() <= prefix.size() ||
       lines.front().substr(0, prefix.size()) != prefix) {
     // Includes an empty file and a truncated first line. The expected header is
@@ -406,6 +441,7 @@ std::vector<std::string> History::Load() {
   LoadedHistory loaded = LoadHistory(path_);
   entries_ = std::move(loaded.entries);
   next_id_ = loaded.next_id;
+  newer_version_ = loaded.newer_version;
   return std::move(loaded.diagnostics);
 }
 
@@ -420,6 +456,13 @@ const Entry* History::Find(std::int64_t id) const {
 
 StoreResult History::Persist() {
   StoreResult result;
+  if (newer_version_ > 0) {
+    result.error = StoreError::kNewerFormat;
+    result.message = Describe(path_, "is version " + std::to_string(newer_version_) +
+                                         ", a newer release's, so this entry was kept in memory "
+                                         "and the file left as it is");
+    return result;
+  }
   const std::string text = SerializeHistory(entries_, next_id_);
   if (text.size() > kMaxHistoryBytes) {
     // Unreachable with `kMaxEntries` entries of bounded strings -- which is what

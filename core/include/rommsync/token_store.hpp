@@ -23,6 +23,7 @@
 // docs/SECURITY.md is the threat model.
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -39,6 +40,17 @@ namespace rommsync::auth {
 /// rule 4), the file name is this header's, and a caller that spells it out is
 /// a second copy of it.
 inline constexpr const char* kTokenFileName = "token.dat";
+
+/// The format of the record (#205).
+///
+/// Version 1 is the record with **no** `version` field -- every `token.dat`
+/// v1.0.0-rc1 wrote -- and this build writes it that way, byte for byte, so a
+/// downgrade to rc1 still reads it (rc1 ignores a field it does not know, which
+/// is also why a later format cannot rely on rc1 noticing one). A later format
+/// writes `"version":N` and this build refuses it as `kNewerFormat`: this is
+/// the one file that cannot be rebuilt without a human at a browser, so it is
+/// neither misread nor replaced, and it is left exactly as it is.
+inline constexpr std::int64_t kTokenFormatVersion = 1;
 
 /// The record `token.dat` holds, one JSON object.
 ///
@@ -82,6 +94,7 @@ enum class StoreError {
   kCommitFailed,   ///< the rename onto `path` failed; the destination is untouched
   kReadFailed,     ///< no such file, or it could not be read
   kMalformed,      ///< it was read, and it is not a token record
+  kNewerFormat,    ///< it is a record a later release wrote; see `kTokenFormatVersion`
 };
 
 /// Stable, log-friendly name. Never null.

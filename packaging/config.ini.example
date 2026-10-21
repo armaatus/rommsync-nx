@@ -10,6 +10,12 @@
 ; folder map and what happens to a line the parser cannot use, is
 ; docs/CONFIG.md.
 
+; The format this file is written in, not the client's version. Leave it as it
+; is: only a release that changes what a key means moves it (docs/CONFIG.md,
+; "Version"), and an older sysmodule refuses a file from a newer release rather
+; than misreading it.
+version = 1
+
 [server]
 ; The RomM origin. HTTPS strongly recommended: over plain http:// the bearer
 ; token and every save cross your network in the clear. A path prefix is kept,

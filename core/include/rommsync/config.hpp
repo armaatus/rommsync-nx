@@ -50,6 +50,21 @@ inline constexpr const char* kConfigFileName = "config.ini";
 /// has no engine to ask for the path.
 inline constexpr const char* kConfigSdPath = "/config/rommsync/config.ini";
 
+/// The format of `config.ini` this build reads and writes: the `version = N`
+/// line above the first section (#205, docs/CONFIG.md#version).
+///
+/// **Versioned is the file, not the parser.** A key added with a default -- every
+/// key since v1.0.0-rc1, `emulator` included -- needs no bump, because an older
+/// file simply lacks it. What does is a key whose *meaning* changes, since an
+/// older file would then be read as saying something it never said. A bump
+/// comes with the code that reads the previous version into the new meaning.
+///
+/// A file with no `version` line is version 1: that is every file v1.0.0-rc1
+/// left on a card, and the fixture `compat.fixtures` reads. A version above
+/// this one is a file written for a later release, and it is **refused** --
+/// see `LoadResult::version`.
+inline constexpr int kConfigVersion = 1;
+
 /// The largest `config.ini` that will be read.
 ///
 /// A bound rather than "read the file" because this runs at boot on a sysmodule
@@ -344,6 +359,21 @@ struct LoadResult {
   /// saying the rest were dropped, because a sysmodule that answers a corrupt
   /// file with fifty thousand strings has turned a typo into an outage.
   std::vector<Diagnostic> diagnostics;
+
+  /// The file's `version` line, or `kConfigVersion` when it has none or one that
+  /// does not read as a version (a `kWarning`, not a refusal: a typo there is not
+  /// a release).
+  ///
+  /// Above `kConfigVersion` the file was written for a later release, and none
+  /// of it is applied: `value` is the built-in defaults and `diagnostics` holds
+  /// the one `kError` saying which half to update. Reading the keys this build
+  /// knows would be exactly the misparse the version exists to prevent -- a key
+  /// whose meaning moved is the only reason a version moves. `ApplyEdit` refuses
+  /// such a file too, so an older build never writes over a newer one.
+  int version = kConfigVersion;
+
+  /// The file is from a later release; see `version`.
+  bool newer() const { return version > kConfigVersion; }
 
   /// No `kError`. Warnings are compatible with a working client.
   bool ok() const;

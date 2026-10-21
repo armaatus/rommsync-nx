@@ -338,7 +338,8 @@ void Absent(checks::Checks& c) {
   // A console that has never been configured: no file at all.
   const std::string fresh =
       Applied(c, "", One("server", "url", "https://romm.lan"), "the first setting ever written");
-  ExpectSame(c, fresh, "[server]\nurl = https://romm.lan\n", "an empty file grows one section");
+  ExpectSame(c, fresh, "version = 1\n\n[server]\nurl = https://romm.lan\n",
+             "an empty file grows its version line and one section (#205)");
   c.Expect(config::ParseConfig(fresh).value.configured(), "and the console is configured");
 
   // A file with no final newline does not gain one.

@@ -912,6 +912,51 @@ void Unauthenticated(checks::Checks& c) {
            "which stops nothing: the console will find out by asking");
 }
 
+// --- #205: files a later release wrote, read by this one ------------------------
+
+/// The downgrade, as the engine meets it: a `config.ini` and a `token.dat` from
+/// a release this build predates. Neither is misread, both are said on the one
+/// screen a user can read a sentence on, and neither is written over -- not by
+/// the boot, and not by an edit from the overlay.
+void NewerFiles(checks::Checks& c) {
+  Console console(c, "engine-newer");
+  const std::string settings = "version = " + std::to_string(config::kConfigVersion + 1) +
+                               "\n[server]\nurl = https://romm.example.com\n";
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini", settings),
+           "a config.ini from a later release");
+  const std::string credentials =
+      "{\"version\":" + std::to_string(auth::kTokenFormatVersion + 1) +
+      ",\"server_url\":\"https://romm.example.com\",\"access_token\":\"not-a-real-token\","
+      "\"device_id\":\"console-1\",\"scopes\":[],\"expires_at\":null}\n";
+  c.Expect(console.sandbox.Write("/config/rommsync/token.dat", credentials),
+           "and a token.dat from one");
+  console.Boot();
+
+  const ipc::Status status = console.Status();
+  c.Expect(!status.configured, "none of the newer config.ini is in force");
+  c.ExpectEq(status.config_error_count, std::int64_t{2},
+             "two errors on the status screen: the config and the token");
+  c.Expect(status.auth == ipc::AuthState::kPaired,
+           "the console is still paired -- it is this build that cannot use the token");
+  bool config_said = false;
+  bool token_said = false;
+  for (const config::Diagnostic& diagnostic : console.Configured().diagnostics) {
+    const std::string line = diagnostic.Describe();
+    config_said = config_said || (diagnostic.key == "version" && line.find("newer") != std::string::npos);
+    token_said = token_said || (line.find("token.dat") != std::string::npos &&
+                                line.find("newer") != std::string::npos);
+  }
+  c.Expect(config_said, "Settings says the config.ini is a newer release's");
+  c.Expect(token_said, "and that the token.dat is");
+
+  const ipc::ConfigResult edited = console.Set(Edit("sync", "interval_min", "15"));
+  c.Expect(edited.outcome != ipc::WriteOutcome::kApplied, "an edit from the overlay is refused");
+  c.ExpectEq(console.sandbox.Read("/config/rommsync/config.ini"), settings,
+             "and the newer config.ini is byte for byte as it was");
+  c.ExpectEq(console.sandbox.Read("/config/rommsync/token.dat"), credentials,
+             "and so is the newer token.dat");
+}
+
 // --- M1-6: the pairing attempt the console starts -----------------------------
 
 using Clock = std::chrono::steady_clock;
@@ -2781,6 +2826,8 @@ int main(int argc, char** argv) {
     Queue(checks);
   } else if (scenario == "unauthenticated") {
     Unauthenticated(checks);
+  } else if (scenario == "newer") {
+    NewerFiles(checks);
   } else if (scenario == "persists") {
     Persists(checks);
   } else if (scenario == "rollback") {

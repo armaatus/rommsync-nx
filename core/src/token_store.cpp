@@ -24,6 +24,17 @@ std::string Describe(const std::string& path, std::string_view what) {
   return path + ": " + std::string(what);
 }
 
+/// The record's format: `kTokenFormatVersion` when it says none, which is how
+/// v1.0.0-rc1 wrote every one; `-1` when it says something that is not a whole
+/// number. Something that is not an object is left to `json::Reader` to refuse.
+std::int64_t RecordVersion(const json::Value& document) {
+  const json::Value* version = document.is_object() ? document.Find("version") : nullptr;
+  if (version == nullptr) {
+    return kTokenFormatVersion;
+  }
+  return version->is_integer() ? version->integer() : -1;
+}
+
 }  // namespace
 
 const char* ToString(StoreError error) {
@@ -42,6 +53,8 @@ const char* ToString(StoreError error) {
       return "read_failed";
     case StoreError::kMalformed:
       return "malformed";
+    case StoreError::kNewerFormat:
+      return "newer_format";
   }
   return "none";
 }
@@ -79,6 +92,17 @@ Parsed<StoredToken> ParseStoredToken(std::string_view text) {
   json::ParseResult document = json::Parse(text);
   if (!document.ok()) {
     parsed.error = std::move(document.error);
+    return parsed;
+  }
+  // Before any field: a later format is one whose fields this build would
+  // misread, and "missing server_url" is the wrong sentence for it.
+  const std::int64_t version = RecordVersion(document.value);
+  if (version < 1 || version > kTokenFormatVersion) {
+    parsed.error.field = "version";
+    parsed.error.message =
+        version < 1 ? std::string("expected a whole number of at least 1")
+                    : "is " + std::to_string(version) + ", newer than the format " +
+                          std::to_string(kTokenFormatVersion) + " this build reads";
     return parsed;
   }
 
@@ -184,6 +208,19 @@ LoadedToken ReadRecord(const std::string& path, io::ReadError* how) {
 
   Parsed<StoredToken> parsed = ParseStoredToken(read.contents);
   if (!parsed.ok()) {
+    const json::ParseResult document = json::Parse(read.contents);
+    if (document.ok() && RecordVersion(document.value) > kTokenFormatVersion) {
+      // Its own error rather than `kMalformed`: nothing is wrong with the file,
+      // and the remedy is a release, not a re-pair -- though a re-pair is also
+      // the way to replace it, for a user staying on this one.
+      loaded.error = StoreError::kNewerFormat;
+      loaded.message = Describe(
+          path, "was written by a newer release than this sys-rommsync, which reads token "
+                "format " + std::to_string(kTokenFormatVersion) +
+                    "; it is left as it is -- install sys-rommsync and the overlay from the "
+                    "release that wrote it, or pair again to replace it");
+      return loaded;
+    }
     loaded.error = StoreError::kMalformed;
     loaded.message = Describe(path, parsed.error.Describe());
     return loaded;
@@ -205,6 +242,11 @@ LoadedToken LoadToken(const std::string& path) {
   // previous token -- which may be the one the user just revoked, so the next
   // sync tick 401s and the overlay asks for a re-pair that was never needed.
   if (how == io::ReadError::kUnreadable) {
+    return loaded;
+  }
+  // Nor is a later release's record: it is complete, and the `.old` beside it
+  // is an older credential -- possibly one that release has since replaced.
+  if (loaded.error == StoreError::kNewerFormat) {
     return loaded;
   }
   // Missing or unreadable-as-a-record, on the other hand, is exactly what the

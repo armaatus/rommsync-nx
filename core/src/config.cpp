@@ -927,6 +927,40 @@ LoadResult ParseConfig(std::string_view text) {
                 "a line with no key before the '=', ignored");
       continue;
     }
+    if (state.kind == SectionKind::kNone && LowerAscii(key_text) == "version") {
+      // Above the first section because it is about the whole file, and so it
+      // is read before a single key it governs.
+      int version = 0;
+      if (!ParseInt(value, &version) || version < 1) {
+        diags.Add(Severity::kWarning, line_number, "", "version",
+                  "expected the whole number of the format this file is written in, got '" +
+                      Redact(value) + "'; it is read as version " +
+                      std::to_string(kConfigVersion));
+        continue;
+      }
+      if (version > kConfigVersion) {
+        // Refused whole, not read for the keys this build happens to know: a
+        // version moves only when a key's meaning does, so those are exactly
+        // the keys it would misread. Defaults and one error, which the overlay
+        // counts onto the status screen. The file itself is not touched here,
+        // and `ApplyEdit` will not touch it either.
+        LoadResult refused;
+        refused.value = Defaults();
+        refused.version = version;
+        Diagnostics only;
+        only.Add(Severity::kError, line_number, "", "version",
+                 "is " + std::to_string(version) +
+                     ": this config.ini was written by a newer release than this "
+                     "sys-rommsync, which reads version " +
+                     std::to_string(kConfigVersion) +
+                     ". None of it is in use and it is left as it is -- install sys-rommsync and "
+                     "the overlay from the release that wrote it");
+        refused.diagnostics = only.Take();
+        return refused;
+      }
+      result.version = version;
+      continue;
+    }
     if (state.kind == SectionKind::kNone) {
       diags.Add(Severity::kWarning, line_number, "", std::string(key_text),
                 "is above the first section header, so there is nothing it configures");

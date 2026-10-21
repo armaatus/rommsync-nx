@@ -256,6 +256,14 @@ struct LoadedHistory {
   /// In the order they were found, bounded by `kMaxDiagnostics`. A first boot
   /// produces exactly one, saying there is no file yet.
   std::vector<std::string> diagnostics;
+
+  /// The header's version when it is above `kFormatVersion`, else zero.
+  ///
+  /// A file from a later release is the one failure here that is not a bad
+  /// file: it is the only index to backups that release made, and this build
+  /// cannot read it and must not write over it (#205). `entries` is empty, as
+  /// for any refusal, and `History` holds its writes back -- see `Append`.
+  int newer_version = 0;
 };
 
 /// Parse the contents of a `conflicts.db`.
@@ -288,6 +296,7 @@ enum class StoreError {
   kOpenFailed,    ///< the temp file could not be created -- usually a missing directory
   kWriteFailed,   ///< the bytes did not all reach the card; the destination is untouched
   kCommitFailed,  ///< the rename onto `path` failed; see atomic_file.hpp
+  kNewerFormat,   ///< the file on the card is a later release's; it was left as it is
 };
 const char* ToString(StoreError error);
 
@@ -342,6 +351,12 @@ class History {
   /// overlay can still show what just happened, and the next append tries
   /// again. Losing the in-memory entry as well would mean a card that would not
   /// write turned a backup that exists into a backup nobody can name.
+  ///
+  /// Over a file `Load` found to be a later release's, every append is
+  /// `kNewerFormat` and the file is never written: that is the downgrade case,
+  /// and the newer history indexes backups this build has no other record of.
+  /// The entry lives in memory for this boot, and its backup is on the card
+  /// whatever happens to the index.
   StoreResult Append(Entry entry);
 
 
@@ -352,6 +367,9 @@ class History {
   std::string path_;
   std::vector<Entry> entries_;
   std::int64_t next_id_ = 1;
+
+  /// `LoadedHistory::newer_version` of the last `Load`: nonzero holds writes back.
+  int newer_version_ = 0;
 };
 
 /// Cut `text` to `kMaxTextBytes` on a UTF-8 boundary, `...` in place of the

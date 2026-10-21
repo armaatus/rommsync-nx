@@ -751,6 +751,8 @@ void TheDocumentedExampleParses(checks::Checks& c) {
   c.ExpectEq(CountOf(result, config::Severity::kWarning), std::size_t{0},
              "...and no warnings either: " + result.DescribeDiagnostics());
   c.Expect(result.value.configured(), "it configures a server");
+  c.Expect(example.rfind("version = " + std::to_string(config::kConfigVersion), 0) == 0,
+           "the documented example opens with this build's config version");
   c.ExpectEq(result.value.sync.interval_min, 30, "the interval the document shows");
   c.Expect(!result.value.sync.states, "states off, as the document shows");
   c.ExpectEq(result.value.RomTarget("snes"), std::string("/tico/roms/snes"),
@@ -782,6 +784,11 @@ void TheShippedExampleParses(checks::Checks& c) {
   // which the user edits, rather than the "unconfigured" state a commented-out
   // url would leave them silently in.
   c.Expect(result.value.configured(), "it configures a server");
+  // The file a user copies carries the format it is written in, so the one a
+  // later release meets says so rather than being version 1 by omission (#205).
+  c.Expect(example.find("\nversion = " + std::to_string(config::kConfigVersion) + "\n") !=
+               std::string::npos,
+           "the shipped example carries this build's config version");
   // Every other key in it is the built-in default spelled out, so copying the
   // file changes nothing but the URL. A value that drifted from the default
   // would be a setting a user never chose.

@@ -632,6 +632,16 @@ bool ApplyEdit(std::string_view current_text, const Edit& edit, std::string* out
                  std::to_string(kMaxConfigBytes) + " bytes one can be; it was not edited");
     return false;
   }
+  // A file written for a later release is one this build cannot read, so it
+  // cannot rewrite it either without turning a downgrade into lost settings.
+  // The parser's own sentence goes back, since it already says what to update.
+  LoadResult before = ParseConfig(current_text);
+  if (before.newer()) {
+    diagnostics->insert(diagnostics->end(), before.diagnostics.begin(), before.diagnostics.end());
+    Complain(diagnostics, Severity::kError, "", "",
+             "config.ini is from a newer release, so it was not edited");
+    return false;
+  }
 
   // --- resolve and validate the whole edit before a byte of it is applied ---
   //
@@ -694,8 +704,12 @@ bool ApplyEdit(std::string_view current_text, const Edit& edit, std::string* out
   // What the file maps before the edit, which is what a new folder line lands
   // on: the built-in entry for a platform with no section, or with a section
   // that sets only `emulator`.
-  const Config in_force = ParseConfig(current_text).value;
-  Document doc = Split(current_text);
+  const Config in_force = std::move(before.value);
+  // A file this build creates says which format it is in from its first line,
+  // so the one a later release meets is never "no version, presumably 1". A
+  // file that exists keeps whatever it says: an edit is one line, not a rewrite.
+  const std::string created = "version = " + std::to_string(kConfigVersion) + "\n";
+  Document doc = Split(current_text.empty() ? std::string_view(created) : current_text);
   for (const Resolved& target : resolved) {
     const std::vector<std::size_t> hits = AssignmentLines(doc, target.section, target.key);
     if (target.remove) {

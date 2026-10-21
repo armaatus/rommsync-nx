@@ -233,6 +233,13 @@ void SdEngine::Load(const std::string& config_dir) {
     // user can read a complaint.
     auth_diagnostics_.push_back({config::Severity::kWarning, 0, "", "", verdict.diagnostic});
   }
+  if (credentials.error == auth::StoreError::kNewerFormat) {
+    // An error, unlike the verdict above: this is the file that cannot be
+    // worked out again, and nothing syncs until one of the two remedies the
+    // sentence names is taken (#205). It is what the status screen's error
+    // count sends a user to Settings to read.
+    auth_diagnostics_.push_back({config::Severity::kError, 0, "", "", credentials.message});
+  }
   if (auth_ == ipc::AuthState::kPaired) {
     gate_.Restore(verdict.value);
     if (gate_.blocked()) {

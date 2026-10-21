@@ -223,6 +223,18 @@ target_compile_definitions(test_config PRIVATE
   ROMMSYNC_CONFIG_EXAMPLE="${CMAKE_SOURCE_DIR}/packaging/config.ini.example")
 add_test(NAME core.config COMMAND test_config)
 
+# Every on-card file as v1.0.0-rc1 wrote it, read by this build, and each as a
+# later release would write it (#205). The fixtures are that release's own bytes
+# (tests/fixtures/v1.0.0-rc1/generate.cpp), so a format that moves without a
+# version bump and a migration fails here rather than on a card after an upgrade.
+add_executable(test_compat test_compat.cpp)
+target_link_libraries(test_compat PRIVATE rommsync::core)
+target_include_directories(test_compat PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_compat PRIVATE
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+add_test(NAME compat.fixtures COMMAND test_compat)
+
 # The write half of `config.ini` (M5-3). Pure text in and text out -- no file,
 # no server -- because what it has to prove is a claim about *bytes*: the one
 # setting changes and every other byte the user typed is the byte it was. A
@@ -2074,6 +2086,7 @@ set(ENGINE_SCENARIOS
   unpairs   # M5-3: a server change discards the pairing before it writes
   stale     # M5-3: "did the server change" is a question about the card
   unauthenticated  # M1-4: the verdict the card carries, and the re-pair that lifts it
+  newer     # #205: a later release's config.ini and token.dat, said and never written over
   commands  # what is still `kUnavailable`, so the list shrinks deliberately
   unreachable  # M1-6: a server that answers nothing refuses the attempt, and writes nothing
   syncnow   # M7-2: Sync now starts a tick and says so, instead of "one is already running"
