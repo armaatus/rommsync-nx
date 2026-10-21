@@ -1198,7 +1198,7 @@ Verdict Judge(const http::Result& result, Reason* why) {
         say("the card is full; free some space on it and queue this rom again");
         return Verdict::kFatal;
       case http::Error::kFileTooLarge:
-        say("this rom is larger than one file on this card can be (FAT32 stops at 4 GiB)");
+        say("this rom is larger than one file on this card can be; on FAT32 that is 4 GiB");
         return Verdict::kFatal;
       case http::Error::kWriteFailed:
         // A mapped folder that does not exist is the ordinary way to reach it;
@@ -1802,8 +1802,8 @@ class Drainer {
   /// An answer the backend does not have refuses nothing (`fs::Volume`), and
   /// neither does a rom whose size the server does not know: a refusal built on
   /// a guess would block a download that works. What an earlier attempt already
-  /// put on the card counts towards the rom, so a resume onto a nearly full card
-  /// is asked only for the bytes it still needs.
+  /// put on the card counts as space, since it is built on or deleted before the
+  /// transfer writes -- so a resume onto a nearly full card is not refused.
   ///
   /// A refusal is `kFailed`, terminal, and takes the earlier attempt's bytes with
   /// it -- `Judge`'s answer for a card that filled mid-transfer, for the same
@@ -1832,13 +1832,13 @@ class Drainer {
                  : ", and one file on this card can be at most " +
                        overlay::FormatBytes(static_cast<std::int64_t>(volume.max_file_bytes));
     } else if (volume.free_bytes >= 0) {
-      // With `resume` off the in-flight file is truncated, not built on.
-      const std::int64_t partial = config_.downloads.resume ? PartialBytes(staging_) : 0;
-      const std::int64_t have = std::max(FileSizeBytes(staging_), partial);
-      const std::int64_t needed = entry->size_bytes - std::min(have, entry->size_bytes);
-      if (needed > volume.free_bytes) {
-        why = "the card has " + overlay::FormatBytes(volume.free_bytes) +
-              " free, and this rom needs " + overlay::FormatBytes(needed) +
+      // What an earlier attempt left -- the staged body and the in-flight
+      // file -- is either built on or deleted before the transfer writes, so
+      // it is space this rom can use either way.
+      const std::int64_t reusable = FileSizeBytes(staging_) + PartialBytes(staging_);
+      if (entry->size_bytes > volume.free_bytes + reusable) {
+        why = "the card has " + overlay::FormatBytes(volume.free_bytes + reusable) +
+              " free, and this rom needs " + overlay::FormatBytes(entry->size_bytes) +
               "; free some space and queue it again";
       }
     }

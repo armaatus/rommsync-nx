@@ -35,7 +35,6 @@ Error ErrorForWrite(int error_number) {
       return Error::kDiskFull;
     case io::Refusal::kFileTooLarge:
       return Error::kFileTooLarge;
-    case io::Refusal::kNone:
     case io::Refusal::kRefused:
       break;
   }

@@ -672,7 +672,11 @@ class FileWriter final : public BodyWriter {
     file_ = io::OpenForWriting(path_, "r+b");
     if (file_ == nullptr) return false;
     if (std::fseek(file_, 0, SEEK_END) != 0) {
+      // Kept across the close, which may set its own: the caller names the
+      // refusal from it (`http::ErrorForWrite`).
+      const int why = errno;
       Close();
+      errno = why;
       return false;
     }
     return true;
@@ -1240,7 +1244,7 @@ Result WireHttpClient::Download(const Request& request, const DownloadTarget& ta
   }
   if (!flushed) {
     result.error = http::ErrorForWrite(writer.flush_errno());
-    result.message = "could not flush " + partial_path;
+    result.message = "could not flush " + partial_path + ": " + std::strerror(writer.flush_errno());
     return result;
   }
 

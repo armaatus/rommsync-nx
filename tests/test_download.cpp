@@ -2822,6 +2822,33 @@ void TooLarge(checks::Checks& c, http::HttpClient& client, const std::string& ba
     c.ExpectEq(result.downloaded, 1, "a rom exactly at the ceiling and the free space fits");
     c.Expect(rig.sandbox.Read("/tico/roms/nes/240pee.nes") == expected, "byte for byte");
   }
+
+  // An earlier attempt's bytes on a nearly full card, with `resume` off. They
+  // are not built on, but the backend truncates them before it writes, so they
+  // are still space the rom gets: refusing here would refuse a download that
+  // fits. (With `resume` on they are built on, which is the easier case.)
+  {
+    Rig rig(c, "download-resumes-full", base, fixture);
+    harness::Rom rom;
+    const std::int64_t rom_id = Queued(c, client, base, fixture, &rig.queue, "240pee.nes", &rom);
+    if (rom_id == 0) {
+      return;
+    }
+    const std::string partial =
+        http::PartialPathFor(io::TempPathFor("/tico/roms/nes/240pee.nes"));
+    c.Expect(rig.sandbox.Write(partial, expected.substr(0, expected.size() - 8)),
+             "an earlier attempt left all but the last 8 bytes");
+    rig.settings.downloads.resume = false;
+    fs::Volume tight;
+    tight.format = fs::Format::kOther;
+    tight.free_bytes = 16;
+    Bounded card(*rig.filesystem, tight);
+    const download::DrainResult result =
+        download::Drain(client, card, rig.settings, rig.queue, rig.options);
+    c.ExpectEq(result.downloaded, 1,
+               "the space an earlier attempt holds counts towards the rom");
+    c.Expect(rig.sandbox.Read("/tico/roms/nes/240pee.nes") == expected, "byte for byte");
+  }
 }
 
 int main(int argc, char** argv) {

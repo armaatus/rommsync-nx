@@ -58,20 +58,6 @@ int Rename(const std::string& from, const std::string& to) {
 
 int Remove(const std::string& path) { return CurrentDisk().Remove(path); }
 
-const char* ToString(Refusal refusal) {
-  switch (refusal) {
-    case Refusal::kNone:
-      return "none";
-    case Refusal::kFull:
-      return "full";
-    case Refusal::kFileTooLarge:
-      return "file_too_large";
-    case Refusal::kRefused:
-      return "refused";
-  }
-  return "refused";
-}
-
 Refusal RefusalOf(int error_number) {
   switch (error_number) {
     case ENOSPC:
@@ -85,8 +71,6 @@ Refusal RefusalOf(int error_number) {
 
 const char* Explain(Refusal refusal) {
   switch (refusal) {
-    case Refusal::kNone:
-      return "the card took the write";
     case Refusal::kFull:
       return "the card is full";
     case Refusal::kFileTooLarge:

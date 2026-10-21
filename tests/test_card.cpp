@@ -13,7 +13,7 @@
 //   mkdir    -- every parent; an existing directory is success; a file is not
 //   volume   -- the per-file ceiling by format, and the free space on the card
 //   fat32    -- given a mounted FAT32 image (tests/test_fat_volume.sh): the host
-//               backend detects it, a write at 4 GiB is EFBIG, a full image is
+//               backend detects it, a 4 GiB file is EFBIG, a full image is
 //               ENOSPC, and a download onto it is refused as `kDiskFull`
 #include <sys/stat.h>
 #include <unistd.h>
@@ -190,13 +190,16 @@ void Fat32(checks::Checks& c, const std::string& mount) {
   c.Expect(console.free_bytes > 0 && console.free_bytes <= volume.free_bytes + (1 << 20),
            "the console's card reads the same free space off the same image");
 
-  // The ceiling, for real and without writing 4 GiB: one byte *at* 4 GiB.
+  // The ceiling, for real and without writing 4 GiB: one byte at offset
+  // 4 GiB - 1, which would make the file 4 GiB. The seek goes *to* the ceiling
+  // rather than past it, because Linux refuses a seek past a filesystem's
+  // largest file with EINVAL, which is a different question.
   {
     const std::string path = mount + "/past-the-ceiling.bin";
     std::FILE* file = io::OpenForWriting(path, "wb");
     c.Expect(file != nullptr, "a file opens on the image");
     if (file != nullptr) {
-      bool refused = std::fseek(file, 0x100000000L, SEEK_SET) != 0;
+      bool refused = std::fseek(file, 0xFFFFFFFFL, SEEK_SET) != 0;
       int why = errno;
       if (!refused) {
         errno = 0;
@@ -205,7 +208,7 @@ void Fat32(checks::Checks& c, const std::string& mount) {
         why = errno;
       }
       std::fclose(file);
-      c.Expect(refused, "a byte at 4 GiB is refused");
+      c.Expect(refused, "a byte that would make the file 4 GiB is refused");
       c.Expect(io::RefusalOf(why) == io::Refusal::kFileTooLarge,
                std::string("as a file too large, not a full card -- errno ") +
                    std::to_string(why));

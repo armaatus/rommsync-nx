@@ -95,18 +95,14 @@ int Remove(const std::string& path);
 /// fixed by anything this client does, and everything else -- an I/O error, a
 /// card that went away, a folder that is not there -- is "the card refused".
 enum class Refusal {
-  kNone,
   kFull,          ///< ENOSPC: no space left
   kFileTooLarge,  ///< EFBIG: past what one file may hold -- 4 GiB - 1 on FAT32
   kRefused,       ///< any other refusal
 };
 
-/// Stable, log-friendly name. Never null.
-const char* ToString(Refusal refusal);
-
-/// `errno` after a failed write, classified. Zero is `kRefused`, not `kNone`:
-/// it is only asked after something failed, and a stdio that failed without
-/// saying why still failed.
+/// `errno` after a failed write, classified. Zero is `kRefused`: it is only
+/// asked after something failed, and a stdio that failed without saying why
+/// still failed.
 Refusal RefusalOf(int error_number);
 
 /// One clause for a sentence about the refusal: "the card is full". Never

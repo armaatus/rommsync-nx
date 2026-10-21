@@ -2,16 +2,18 @@
 # A real FAT32 volume, for `test_card fat32` (M9-13, #202).
 #
 # The 4 GiB ceiling and a genuinely full card are the two things `faulty::Disk`
-# can only pretend. This makes a small FAT32 image -- sparse, so nothing close to
-# 4 GiB is ever written -- mounts it, and hands the mount to the test binary,
-# which checks that the host backend reads it as FAT32, that a byte at 4 GiB is
-# EFBIG, that filling it is ENOSPC, and that a download onto it is `kDiskFull`.
+# can only pretend. This makes a 64 MiB FAT32 image -- the ceiling is reached by
+# a seek, so nothing close to 4 GiB is ever written -- mounts it, and hands the mount to the test binary,
+# which checks that the host backend reads it as FAT32, that a byte making a file
+# 4 GiB is EFBIG, that filling it is ENOSPC, and that a download onto it is
+# `kDiskFull`.
 #
 # Where it runs (docs/TESTING.md):
 #   macOS  -- `hdiutil`, which needs no privileges. Always runs.
 #   Linux  -- `mkfs.vfat` plus a loop mount, which needs root: it runs when
 #             `sudo -n` is allowed (GitHub's runners allow it) and dosfstools is
-#             installed, and otherwise SKIPS, saying which was missing.
+#             installed (ci.yml does not install it yet), and otherwise SKIPS,
+#             saying which was missing.
 # A skip is exit 77, which ctest reports as Skipped rather than Passed -- a check
 # that silently did not run is worse than one that says so.
 set -euo pipefail
