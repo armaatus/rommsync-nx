@@ -78,8 +78,9 @@ std::string RootOf(std::string_view folder);
 std::string FolderIn(const Resolution& resolved, std::string_view folder);
 
 /// How `root` -- the parent of a Tico folder the map lists, `/tico/saves` --
-/// is laid out under `tico`. Lists `<root>/users` at most once; never for
-/// `account = legacy`.
+/// is laid out under `tico`. One listing of `<root>/users` per call, none for
+/// `account = legacy`. A listing that is cut short or unreadable is
+/// `kUndecided` under `auto`: it cannot say there is only one account.
 Resolution Resolve(const config::TicoConfig& tico, fs::FileSystem& files, std::string_view root);
 
 /// The Tico roots `config` reads: the parent of every Tico folder in its save

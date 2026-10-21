@@ -183,6 +183,9 @@ void DownloadsLandInTicosFolderNames(checks::Checks& c) {
     c.Expect(mapped != nullptr && mapped->roms == found->second.roms &&
                  mapped->saves == found->second.saves && mapped->states == found->second.states,
              "`enabled = true` maps " + slug + " to Tico's folders: " + on.DescribeDiagnostics());
+    c.ExpectEq(on.value.DestinationFor(config::RomFile{slug, "Game.iso"}).path,
+               "/tico/roms/" + std::string(row.tico) + "/Game.iso",
+               "and a " + slug + " rom then downloads into Tico's " + row.tico);
     c.Expect(on.diagnostics.empty(),
              "and turning on a platform this build knows says nothing: " +
                  on.DescribeDiagnostics());

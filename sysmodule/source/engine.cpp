@@ -22,7 +22,6 @@
 #include "rommsync/pairing.hpp"
 #include "rommsync/play_sessions.hpp"
 #include "rommsync/retroarch_cfg.hpp"
-#include "rommsync/tico.hpp"
 #include "rommsync/rom_index.hpp"
 #include "rommsync/save_scan.hpp"
 #include "rommsync/scheduler.hpp"
@@ -30,6 +29,7 @@
 #include "rommsync/state_sync.hpp"
 #include "rommsync/sync_finish.hpp"
 #include "rommsync/sync_tick.hpp"
+#include "rommsync/tico.hpp"
 #include "rommsync/token_store.hpp"
 
 namespace rommsync::sysmodule {

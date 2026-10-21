@@ -1227,6 +1227,23 @@ void Tico(::checks::Checks& checks) {
                         scanned.DescribeSkipped());
   }
 
+  // A `users/` past `fs::kMaxDirectoryEntries` lists only its first names, so
+  // one account in the listing is not one account on the card: `auto` does not
+  // pick it.
+  {
+    RetroArchCard cut("tico-cut");
+    cut.files.AddDirectory("/tico/saves", "users");
+    cut.files.AddDirectory("/tico/saves/users", kAccountA);
+    cut.files.MarkTruncated("/tico/saves/users");
+    cut.Save("/tico/saves/users/" + kAccountA + "/snes", "Snes Game.srm");
+    const scan::ScanResult result =
+        scan::ScanSaves(TicoConfig(""), kRetroArchDefaults, index, cut.files, kFirstTick);
+    checks.Expect(result.saves.empty() &&
+                      SkippedFor(result, "/tico/saves/users", scan::SkipReason::kTicoAccount),
+                  "a cut users/ listing is no answer to whose saves these are: " +
+                      result.DescribeSkipped());
+  }
+
   // Tico 0.8.0, two accounts. `auto` will not pick: nothing of either is synced,
   // and the note names both so the overlay can show which to choose.
   RetroArchCard card("tico-two");

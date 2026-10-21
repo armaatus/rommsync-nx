@@ -101,7 +101,9 @@ Resolution Resolve(const config::TicoConfig& tico, fs::FileSystem& files, std::s
     resolved.uid = tico.uid;
     return resolved;
   }
-  if (!listing.ok() && listing.error != fs::ListError::kTooManyEntries) {
+  if (!listing.ok()) {
+    // Unreadable, or past `fs::kMaxDirectoryEntries` -- which keeps the first
+    // names, so one account in the listing is not one account on the card.
     resolved.layout = Layout::kUndecided;
     resolved.why = resolved.users_dir + " could not be read (" +
                    (listing.message.empty() ? fs::ToString(listing.error) : listing.message) +

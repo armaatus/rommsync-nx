@@ -890,6 +890,22 @@ std::vector<std::string> Config::StateScanDirs() const {
 
 // --- parsing ------------------------------------------------------------------
 
+namespace {
+
+/// The folders this build has for `slug`, on or off by default; nullptr when it
+/// has none.
+const PlatformFolders* BuiltInFolders(std::string_view slug) {
+  for (const auto* table : {&DefaultPlatforms(), &OptionalPlatforms()}) {
+    const auto found = table->find(slug);
+    if (found != table->end()) {
+      return &found->second;
+    }
+  }
+  return nullptr;
+}
+
+}  // namespace
+
 LoadResult ParseConfig(std::string_view text) {
   LoadResult result;
   result.value = Defaults();
@@ -995,8 +1011,7 @@ LoadResult ParseConfig(std::string_view text) {
             continue;
           }
           platform_sections.insert(state.slug);
-          if (DefaultPlatforms().find(state.slug) == DefaultPlatforms().end() &&
-              OptionalPlatforms().find(state.slug) == OptionalPlatforms().end()) {
+          if (BuiltInFolders(state.slug) == nullptr) {
             diags.Add(Severity::kNotice, line_number, state.section, "",
                       "is not a platform this build maps by default; it is used as written -- "
                       "check it matches the folder name under RomM's library/roms/, because a "
@@ -1150,11 +1165,8 @@ LoadResult ParseConfig(std::string_view text) {
     if (!maps_folders && enabled != platform_enabled.end()) {
       // `enabled = true` with no folder of its own: the built-in folders, the
       // off-by-default ones included -- that is what turning `ngc` on means.
-      const auto optional = OptionalPlatforms().find(slug);
-      if (defaults != DefaultPlatforms().end()) {
-        result.value.platforms[slug] = defaults->second;
-      } else if (optional != OptionalPlatforms().end()) {
-        result.value.platforms[slug] = optional->second;
+      if (const PlatformFolders* built_in = BuiltInFolders(slug)) {
+        result.value.platforms[slug] = *built_in;
       } else {
         diags.Add(Severity::kWarning, 0, section, "enabled",
                   "this build has no folders of its own for " + slug +
