@@ -778,37 +778,85 @@ inline std::string Login(http::HttpClient& client, const std::string& base) {
   return token;
 }
 
-/// Path of RomM's own frontend bundle, e.g. `/assets/index-CF4gpQFQ.js`.
+/// How big `DiscoverLargeAsset`'s answer has to be. The range scenarios read
+/// from offset 1,000,000, so anything smaller leaves them no tail to compare.
+inline constexpr std::size_t kLargeAssetBytes = 1024 * 1024;
+
+namespace detail {
+
+/// Every `/assets/index-...` path in `text` that ends in `suffix`, in order.
 ///
-/// The streaming tests need a resource that is big enough to interrupt half way
-/// through and that nginx serves with real `Range` support. The library's roms
-/// would be the natural choice, and since M0-6 they are actually available:
-/// server/testing/provision.py drives the socket.io scan, so a provisioned
-/// worktree has a scanned library rather than an empty one. Switching these
-/// tests onto a real rom is M0-5's call, not a rig helper's -- the bundle is a
-/// genuine ~1.6 MB file served by the same nginx over the same proxy, which is
-/// what these tests are actually about, and it needs no auth.
-/// It is discovered rather than hardcoded so a RomM bump does not break them.
-inline std::string DiscoverLargeAsset(http::HttpClient& client, const std::string& base) {
-  http::Request request;
-  request.url = base + "/";
-  const http::Result result = client.Send(request);
-  if (!result.successful()) {
-    return {};
-  }
-  const std::string_view body = result.response.body;
-  // Bounded to the one quoted attribute it starts in: RomM's HTML also links an
-  // `index-<hash>.css`, and scanning past the closing quote for the next ".js"
-  // would return a "path" made of intervening markup.
-  for (std::size_t at = body.find("/assets/index-"); at != std::string_view::npos;
-       at = body.find("/assets/index-", at + 1)) {
-    const std::size_t end = body.find('"', at);
+/// A path ends at the first character a URL in HTML or CSS cannot continue
+/// with: a quote, a `)`, or the `?v=` cache-buster RomM's stylesheet puts on its
+/// fonts. Bounded that way because RomM's HTML links an `index-<hash>.css` too,
+/// and scanning past the closing quote for the next ".js" would return a "path"
+/// made of intervening markup.
+inline std::vector<std::string> AssetLinks(std::string_view text, std::string_view prefix,
+                                           std::string_view suffix) {
+  std::vector<std::string> links;
+  for (std::size_t at = text.find(prefix); at != std::string_view::npos;
+       at = text.find(prefix, at + 1)) {
+    const std::size_t end = text.find_first_of("\"')?# \n", at);
     if (end == std::string_view::npos) {
       break;
     }
-    const std::string_view candidate = body.substr(at, end - at);
-    if (candidate.size() > 3 && candidate.substr(candidate.size() - 3) == ".js") {
-      return std::string(candidate);
+    const std::string_view candidate = text.substr(at, end - at);
+    if (candidate.size() > suffix.size() &&
+        candidate.substr(candidate.size() - suffix.size()) == suffix &&
+        std::find(links.begin(), links.end(), candidate) == links.end()) {
+      links.emplace_back(candidate);
+    }
+  }
+  return links;
+}
+
+}  // namespace detail
+
+/// Path of a file over `kLargeAssetBytes` that RomM's own frontend links, e.g.
+/// `/assets/index-CF4gpQFQ.js` or `/assets/materialdesignicons-webfont-<hash>.ttf`.
+///
+/// The streaming tests need a resource that is big enough to interrupt half way
+/// through and that nginx serves with real `Range` support. The library's roms
+/// would be the natural choice, but their only route is the authenticated
+/// content endpoint, and the one big fixture rom is 126 MB -- these tests fetch
+/// a reference copy into memory per scenario. A file RomM's page links is
+/// served by the same nginx over the same proxy, which is what these tests are
+/// actually about, and it needs no auth.
+///
+/// Discovered rather than hardcoded so a RomM bump does not break them -- and
+/// #235 is the bump that did: 5.2.0's `index-*.js` was a ~1.6 MB bundle, 5.4.0
+/// splits it and its index is 118 KB. So the page's index script is tried
+/// first, then the files the page's index stylesheet links (5.4.0's icon font
+/// is 1.3 MB), and the first one over the bar wins. Each candidate is fetched
+/// whole, which is a few small requests -- cheaper than a test that silently
+/// streamed a file too small to cut where it means to.
+inline std::string DiscoverLargeAsset(http::HttpClient& client, const std::string& base) {
+  const auto fetch = [&client, &base](const std::string& path) {
+    http::Request request;
+    request.url = base + path;
+    return client.Send(request);
+  };
+  const http::Result page = fetch("/");
+  if (!page.successful()) {
+    return {};
+  }
+  std::vector<std::string> candidates =
+      detail::AssetLinks(page.response.body, "/assets/index-", ".js");
+  for (const std::string& sheet : detail::AssetLinks(page.response.body, "/assets/index-", ".css")) {
+    const http::Result css = fetch(sheet);
+    if (!css.successful()) {
+      continue;
+    }
+    for (std::string& linked : detail::AssetLinks(css.response.body, "/assets/", "")) {
+      if (linked.size() > 3 && linked.substr(linked.size() - 4) != ".css") {
+        candidates.push_back(std::move(linked));
+      }
+    }
+  }
+  for (const std::string& candidate : candidates) {
+    const http::Result asset = fetch(candidate);
+    if (asset.successful() && asset.response.body.size() > kLargeAssetBytes) {
+      return candidate;
     }
   }
   return {};
