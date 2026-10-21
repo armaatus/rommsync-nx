@@ -262,10 +262,13 @@ Which folders those are is the folder map in
 [CONFIG.md](CONFIG.md#defaults--the-folder-map), and there is one warning worth
 repeating here:
 
-> **Check the Tico paths on your own card.** The built-in RetroArch defaults are
-> correct. The Tico defaults are best-guesses, and a wrong `saves` folder is a
-> platform whose saves are silently never found. Correct them in `config.ini`
-> before you rely on the sync.
+> **Check the Tico paths on your own card.** The built-in Tico folders are the
+> names Tico uses (`master-system`, `dc`, ...), and Tico 0.8's per-account
+> layout is found on its own -- but with several accounts on the console, no
+> Tico save syncs until `[tico] account` names one, and the settings screen
+> lists them ([CONFIG.md](CONFIG.md#tico-per-account-saves)). A wrong `saves`
+> folder is a platform whose saves are silently never found, so look before you
+> rely on the sync.
 
 One rule to read there before you edit the map: a `[platform.…]` section
 replaces that platform's defaults rather than adding to them
@@ -310,14 +313,16 @@ upgrade again. The records it can rebuild (the sync baseline, the download
 queue) it rebuilds. The full list is in
 [ARCHITECTURE.md](ARCHITECTURE.md#formats-across-releases).
 
-v1.0.0-rc1 predates all of that: it reads a newer file as best it can. The one
-setting that reads differently there is a `[platform.<slug>]` section holding
+v1.0.0-rc1 predates all of that: it reads a newer file as best it can. The settings
+that read differently there are a `[platform.<slug>]` section holding
 only `emulator =` — rc1 ignores that key, so the section maps no folders and
-the platform is skipped. Remove such a section before going back to rc1. rc1
+the platform is skipped; a section holding only `enabled =` is skipped the same
+way. Remove such a section before going back to rc1. rc1
 also reports the `version = 1` line as a warning ("nothing it configures"),
-which is harmless, and a `[sources]` section as one it does not know, which is
-too: rc1 never reads `retroarch.cfg`, so it scans only the folder map, and does
-so even while RetroArch's own Cloud Sync is on.
+which is harmless, and a `[sources]` or `[tico]` section as one it does not
+know, which is too: rc1 never reads `retroarch.cfg`, so it scans only the folder
+map, and does so even while RetroArch's own Cloud Sync is on -- and it reads
+Tico's folders in the layout before 0.8.0 only, under rc1's own folder names.
 
 ---
 

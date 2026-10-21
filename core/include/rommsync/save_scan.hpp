@@ -180,7 +180,16 @@ enum class SkipReason {
   /// `<folder>/<CoreFolder>/` and nothing beside it, so this is a copy left from
   /// before sorting was on -- and synced, it would win a slot from the copy
   /// RetroArch actually reads.
+  ///
+  /// Also a file in Tico's folder from before 0.8.0 once the per-account layout
+  /// is in use beside it (#231): Tico reads `users/<uid>/<slug>/` instead.
   kOutsideLayout,
+
+  /// Tico keeps saves for several accounts under this `users/` folder (the
+  /// skip's path) and `[tico] account` does not say whose to sync -- or the
+  /// folder would not list -- so none of them is (`tico::Resolve`). Once per
+  /// folder, not per file: its files were never read.
+  kTicoAccount,
 };
 
 /// Stable, log-friendly name. Never null.
@@ -328,6 +337,16 @@ struct ScanResult {
 /// beside it. And while `retroarch::Enabled` says no -- RetroArch's Cloud Sync,
 /// or `[sources] retroarch = off` -- no RetroArch folder is read at all, the
 /// map's included.
+///
+/// **A Tico folder is read in the layout the card is in** (#231): `<root>/<slug>`
+/// from the map is `<root>/users/<uid>/<slug>` once `<root>/users/` exists, the
+/// account chosen by `[tico] account` (`tico::Resolve`). A file still in the old
+/// folder is then a `kOutsideLayout` skip; several accounts and none named is
+/// one `kTicoAccount` skip for the root and nothing read under it.
+///
+/// In every folder, `*.tmp`, `*.png` and `*.restart` are passed over without a
+/// skip: an emulator's half-written file, a state's screenshot, DuckStation's
+/// restart marker -- never a save. Subfolders (Tico's `backups/`) are not read.
 ///
 /// Everything else comes from `config::Config::SaveScanDirs()`, so one physical
 /// folder listed under a dozen platforms is walked **once** and yields one

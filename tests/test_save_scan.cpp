@@ -26,6 +26,8 @@
 //   retroarch    -- the folders retroarch.cfg names, read the way RetroArch lays
 //                   them out: flat, sorted by core, beside the content, and left
 //                   alone while RetroArch's Cloud Sync is on (#230)
+//   tico         -- Tico 0.7.9, and 0.8.0 with one account and with two (#231);
+//                   backups/, .tmp, screenshots and .restart are never synced
 //   library      -- a Sandbox scanned against the docker library, end to end
 //   grown        -- the index is reserved from the first page's total, and a
 //                   library that grows mid-fetch stops it there, and says so
@@ -50,6 +52,7 @@
 #include "rommsync/save_scan.hpp"
 #include "rommsync/state_db.hpp"
 #include "rommsync/sync.hpp"
+#include "rommsync/tico.hpp"
 
 namespace {
 
@@ -61,6 +64,7 @@ namespace roms = rommsync::roms;
 namespace scan = rommsync::scan;
 namespace state = rommsync::state;
 namespace sync = rommsync::sync;
+namespace tico = rommsync::tico;
 
 using harness::Fixture;
 using harness::Sandbox;
@@ -663,7 +667,7 @@ void Truncated(::checks::Checks& checks) {
 
 /// The `config.ini` the `sources` fixtures are scanned under: the built-in map,
 /// plus RetroArch's sort-by-core folders (and one RomM does not know), the Tico
-/// systems the defaults do not map yet (#231), a folder neither emulator owns,
+/// systems the defaults did not map before #231 (spelled out, as a user would), a folder neither emulator owns,
 /// and two overrides.
 constexpr const char* kSourcesConfig = R"ini([server]
 url = https://romm.example.com
@@ -752,7 +756,8 @@ void Sources(::checks::Checks& checks) {
       // Tico, formats no libretro core shares: isolated under tico-* (#226 D3).
       {"/tico/saves/n64", "N64 Tico.eep", "n64", "tico-mupen64plus", "tico-eep"},
       {"/tico/saves/psx", "Psx Tico.mcd", "psx", "tico-duckstation", "tico-mcd"},
-      {"/tico/saves/dreamcast", "Dc Tico.bin", "dreamcast", "tico-flycast", "tico-bin"},
+      {"/tico/saves/dc", "Dc Tico.bin", "dreamcast", "tico-flycast", "tico-bin"},
+      {"/tico/saves/dc", "Dc Romm.bin", "dc", "tico-flycast", "tico-bin"},  // RomM's own spelling
       {"/tico/saves/nds", "Nds Tico.dsv", "nds", "tico-drastic", "tico-dsv"},
       {"/tico/saves/saturn", "Saturn Tico.bkr", "saturn", "tico-yabasanshiro", "tico-bkr"},
       {"/tico/saves/psp", "Psp Tico.bin", "psp", "tico-ppsspp", "tico-bin"},
@@ -1075,6 +1080,209 @@ void RetroArch(::checks::Checks& checks) {
     const scan::ScanResult unsorted = scan::ScanStates(states, flat, index, card.files, kFirstTick);
     checks.Expect(unsorted.states.size() == 1 && unsorted.states.front().emulator == "snes9x",
                   "states: sort_savestates_enable is its own switch");
+  }
+}
+
+// --- tico ---------------------------------------------------------------------
+
+/// Two Switch accounts, as Tico 0.8 names their folders under `users/`.
+const std::string kAccountA = "0123456789abcdef0123456789abcdef";
+const std::string kAccountB = "fedcba9876543210fedcba9876543210";
+
+/// What a Tico module leaves beside a save that is not one (#226 R5): its
+/// rotating `backups/` and a `.tmp` an interrupted write did not rename.
+void AddTicoLitter(RetroArchCard* card, const std::string& directory, const std::string& save) {
+  card->Save(directory + "/backups", save + ".1");
+  card->Save(directory + "/backups", save + ".2");
+  card->files.AddFile(directory, save + ".tmp", 64, kMtime);
+}
+
+config::Config TicoConfig(const std::string& account_line) {
+  const config::LoadResult parsed = config::ParseConfig(
+      "[server]\nurl = https://romm.example.com\n\n[sync]\nstates = true\n" +
+      (account_line.empty() ? std::string() : "\n[tico]\n" + account_line + "\n"));
+  return parsed.value;
+}
+
+roms::RomIndex TicoLibrary() {
+  roms::RomIndex index;
+  index.Add(MakeRom(1, "Snes Game", "snes"));
+  index.Add(MakeRom(2, "Sms Game", "sms"));
+  index.Add(MakeRom(3, "Gba Game", "gba"));
+  index.Add(MakeRom(4, "Old Game", "snes"));
+  index.Add(MakeRom(5, "Other Game", "snes"));
+  index.Add(MakeRom(6, "Psx Game", "psx"));
+  return index;
+}
+
+bool Mentions(const std::vector<config::Diagnostic>& notes, std::string_view text) {
+  for (const config::Diagnostic& note : notes) {
+    if (note.Describe().find(text) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void Tico(::checks::Checks& checks) {
+  const roms::RomIndex index = TicoLibrary();
+
+  // Tico 0.7.9: one folder per system, in Tico's spelling of it, straight under
+  // saves/ -- read through the built-in map, which spells `sms` `master-system`.
+  {
+    RetroArchCard card("tico-079");
+    card.Save("/tico/saves/snes", "Snes Game.srm");
+    card.Save("/tico/saves/master-system", "Sms Game.srm");
+    // Snes9x's clock beside its SRAM: a sidecar, synced as a save of its own in
+    // its own slot, so neither file ever stands in for the other.
+    card.Save("/tico/saves/snes", "Snes Game.rtc");
+    AddTicoLitter(&card, "/tico/saves/snes", "Snes Game.srm");
+    const config::Config config = TicoConfig("");
+    const scan::ScanResult result =
+        scan::ScanSaves(config, kRetroArchDefaults, index, card.files, kFirstTick);
+    checks.ExpectEq(result.saves.size(), std::size_t{3},
+                    "0.7.9: the saves and the clock are found: " + result.DescribeSkipped());
+    const scan::SaveFile* srm = SaveAt(result, "/tico/saves/snes/Snes Game.srm");
+    const scan::SaveFile* rtc = SaveAt(result, "/tico/saves/snes/Snes Game.rtc");
+    checks.Expect(srm != nullptr && rtc != nullptr && srm->rom_id == rtc->rom_id &&
+                      srm->slot == "tico-srm" && rtc->slot == "tico-rtc" &&
+                      rtc->emulator == "snes9x",
+                  "the .rtc is the same rom's, in a slot of its own, under the same emulator");
+    const scan::SaveFile* sms = SaveAt(result, "/tico/saves/master-system/Sms Game.srm");
+    checks.Expect(sms != nullptr && sms->emulator == "genesis_plus_gx" && sms->slot == "tico-srm",
+                  "an sms save is read from Tico's master-system folder");
+    checks.ExpectEq(result.skipped_total, std::size_t{0},
+                    "0.7.9: a .tmp and backups/ are not saves, and not skips either: " +
+                        result.DescribeSkipped());
+    checks.Expect(tico::Notes(config, card.files).empty(), "0.7.9: nothing to say");
+  }
+
+  // Tico 0.8.0, one account: saves/users/<uid>/<slug>/, found without being
+  // told the account; what is left in the old folders is outside the layout.
+  {
+    RetroArchCard card("tico-080");
+    const std::string saves = "/tico/saves/users/" + kAccountA;
+    card.files.AddDirectory("/tico/saves", "users");
+    card.files.AddDirectory("/tico/saves/users", kAccountA);
+    card.Save(saves + "/snes", "Snes Game.srm");
+    card.Save(saves + "/master-system", "Sms Game.srm");
+    AddTicoLitter(&card, saves + "/snes", "Snes Game.srm");
+    card.Save("/tico/saves/snes", "Old Game.srm");
+    card.files.AddFile("/tico/saves/snes", "Old Game.srm.tmp", 64, kMtime);
+    const config::Config config = TicoConfig("");
+    const scan::ScanResult result =
+        scan::ScanSaves(config, kRetroArchDefaults, index, card.files, kFirstTick);
+    checks.ExpectEq(result.saves.size(), std::size_t{2},
+                    "0.8.0: both saves in the account's folders: " + result.DescribeSkipped());
+    const scan::SaveFile* snes = SaveAt(result, saves + "/snes/Snes Game.srm");
+    checks.Expect(snes != nullptr && snes->emulator == "snes9x" && snes->slot == "tico-srm",
+                  "the account's snes save keeps Tico's emulator id and its slot");
+    checks.Expect(SaveAt(result, "/tico/saves/snes/Old Game.srm") == nullptr,
+                  "a save left in the layout before 0.8.0 is not synced");
+    checks.Expect(SkippedFor(result, "/tico/saves/snes/Old Game.srm",
+                             scan::SkipReason::kOutsideLayout),
+                  "...and is said to be outside the layout: " + result.DescribeSkipped());
+    checks.ExpectEq(result.skipped_total, std::size_t{1},
+                    "and nothing else was skipped -- litter is not a skip: " +
+                        result.DescribeSkipped());
+    checks.Expect(Read(result, saves + "/snes"), "the account folder is what was read");
+    checks.Expect(!Read(result, "/tico/saves/snes"), "and the old one is not");
+
+    // The acceptance's own words: neither ever reaches RomM.
+    sync::SyncNegotiatePayload payload;
+    for (const scan::SaveFile& save : result.saves) {
+      payload.saves.push_back(save.ToClientSaveState());
+    }
+    const sync::Encoded encoded = sync::EncodeNegotiateRequest(payload);
+    checks.Expect(encoded.ok(), "the payload encodes");
+    checks.Expect(encoded.body.find("backups") == std::string::npos &&
+                      encoded.body.find(".tmp") == std::string::npos &&
+                      encoded.body.find(".1") == std::string::npos,
+                  "no backups/ file and no .tmp is in the negotiate payload: " + encoded.body);
+
+    const std::vector<config::Diagnostic> notes = tico::Notes(config, card.files);
+    checks.Expect(Mentions(notes, kAccountA), "the overlay is told whose saves are read");
+    for (const config::Diagnostic& note : notes) {
+      checks.Expect(note.severity == config::Severity::kNotice,
+                    "and that is a notice: " + note.Describe());
+    }
+
+    // States: slot 5 is Tico's Auto; its screenshot and DuckStation's
+    // `.restart` are beside it and are not states.
+    const std::string states = "/tico/states/users/" + kAccountA;
+    card.files.AddDirectory("/tico/states", "users");
+    card.files.AddDirectory("/tico/states/users", kAccountA);
+    card.Save(states + "/gba", "Gba Game.state5");
+    card.Save(states + "/gba", "Gba Game.state5.png");
+    card.Save(states + "/psx", "Psx Game.state5");
+    card.Save(states + "/psx", "Psx Game.state5.restart");
+    AddTicoLitter(&card, states + "/gba", "Gba Game.state5");
+    const scan::ScanResult scanned =
+        scan::ScanStates(config, kRetroArchDefaults, index, card.files, kFirstTick);
+    checks.ExpectEq(scanned.states.size(), std::size_t{2},
+                    "0.8.0: the two states, and nothing beside them: " +
+                        scanned.DescribeSkipped());
+    checks.ExpectEq(scanned.skipped_total, std::size_t{0},
+                    "a screenshot, a .restart, a .tmp and backups/ are not skips: " +
+                        scanned.DescribeSkipped());
+  }
+
+  // Tico 0.8.0, two accounts. `auto` will not pick: nothing of either is synced,
+  // and the note names both so the overlay can show which to choose.
+  RetroArchCard card("tico-two");
+  card.files.AddDirectory("/tico/saves", "users");
+  card.files.AddDirectory("/tico/saves/users", kAccountA);
+  card.files.AddDirectory("/tico/saves/users", kAccountB);
+  card.files.AddDirectory("/tico/saves/users", "not-an-account");
+  card.Save("/tico/saves/users/" + kAccountA + "/snes", "Snes Game.srm");
+  card.Save("/tico/saves/users/" + kAccountB + "/snes", "Other Game.srm");
+  card.Save("/tico/saves/snes", "Old Game.srm");
+  {
+    const config::Config config = TicoConfig("");
+    const scan::ScanResult result =
+        scan::ScanSaves(config, kRetroArchDefaults, index, card.files, kFirstTick);
+    checks.Expect(result.saves.empty(),
+                  "two accounts and no choice: no Tico save is synced: " +
+                      result.DescribeSkipped());
+    checks.Expect(SkippedFor(result, "/tico/saves/users", scan::SkipReason::kTicoAccount),
+                  "and the scan says why, once, for the folder: " + result.DescribeSkipped());
+    checks.ExpectEq(result.skipped_total, std::size_t{1},
+                    "once rather than per platform: " + result.DescribeSkipped());
+    const std::vector<config::Diagnostic> notes = tico::Notes(config, card.files);
+    checks.Expect(notes.size() == 1 && notes[0].severity == config::Severity::kWarning &&
+                      notes[0].section == "tico" && notes[0].key == "account",
+                  "one warning on [tico] account");
+    checks.Expect(Mentions(notes, kAccountA) && Mentions(notes, kAccountB) &&
+                      !Mentions(notes, "not-an-account"),
+                  "naming both accounts, and only accounts");
+  }
+  {
+    const config::Config config = TicoConfig("account = " + kAccountB);
+    const scan::ScanResult result =
+        scan::ScanSaves(config, kRetroArchDefaults, index, card.files, kFirstTick);
+    checks.Expect(result.saves.size() == 1 &&
+                      result.saves[0].sd_path ==
+                          "/tico/saves/users/" + kAccountB + "/snes/Other Game.srm",
+                  "a named account is the one synced: " + result.DescribeSkipped());
+    checks.Expect(tico::Notes(config, card.files).empty() ||
+                      tico::Notes(config, card.files)[0].severity == config::Severity::kNotice,
+                  "and that is nothing to warn about");
+  }
+  {
+    const config::Config config = TicoConfig("account = 00000000000000000000000000000000");
+    const std::vector<config::Diagnostic> notes = tico::Notes(config, card.files);
+    checks.Expect(notes.size() == 1 && notes[0].severity == config::Severity::kWarning &&
+                      Mentions(notes, kAccountA),
+                  "an account with no folder is a warning that lists the ones there are");
+  }
+  {
+    const config::Config config = TicoConfig("account = legacy");
+    const scan::ScanResult result =
+        scan::ScanSaves(config, kRetroArchDefaults, index, card.files, kFirstTick);
+    checks.Expect(result.saves.size() == 1 &&
+                      result.saves[0].sd_path == "/tico/saves/snes/Old Game.srm",
+                  "legacy reads the layout before 0.8.0 even beside users/: " +
+                      result.DescribeSkipped());
   }
 }
 
@@ -1412,7 +1620,8 @@ int main(int argc, char** argv) {
 
   if (scenario == "names" || scenario == "ambiguous" || scenario == "walked_once" ||
       scenario == "unusable" || scenario == "truncated" || scenario == "hashing" ||
-      scenario == "sources" || scenario == "grown" || scenario == "retroarch") {
+      scenario == "sources" || scenario == "grown" || scenario == "retroarch" ||
+      scenario == "tico") {
     if (scenario == "names") {
       Names(checks);
     } else if (scenario == "ambiguous") {
@@ -1429,6 +1638,8 @@ int main(int argc, char** argv) {
       Grown(checks);
     } else if (scenario == "retroarch") {
       RetroArch(checks);
+    } else if (scenario == "tico") {
+      Tico(checks);
     } else {
       Unusable(checks);
     }

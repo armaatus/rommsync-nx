@@ -22,6 +22,7 @@
 #include "rommsync/pairing.hpp"
 #include "rommsync/play_sessions.hpp"
 #include "rommsync/retroarch_cfg.hpp"
+#include "rommsync/tico.hpp"
 #include "rommsync/rom_index.hpp"
 #include "rommsync/save_scan.hpp"
 #include "rommsync/scheduler.hpp"
@@ -458,9 +459,13 @@ std::vector<config::Diagnostic> SdEngine::source_notes() const {
   return source_notes_;
 }
 
-void SdEngine::NoteSources(const config::Config& config, const retroarch::LoadResult& loaded) {
+void SdEngine::NoteSources(const config::Config& config, const retroarch::LoadResult& loaded,
+                           std::vector<config::Diagnostic> tico) {
   std::vector<config::Diagnostic> notes = loaded.diagnostics;
   for (config::Diagnostic& note : retroarch::Notes(config, loaded.value)) {
+    notes.push_back(std::move(note));
+  }
+  for (config::Diagnostic& note : tico) {
     notes.push_back(std::move(note));
   }
   const auto same = [](const std::vector<config::Diagnostic>& left,
@@ -1716,7 +1721,9 @@ void SdEngine::RunOneTick() {
   // keep syncing beside a Cloud Sync they have just turned on.
   const retroarch::LoadResult retroarch_cfg =
       retroarch::Load(files->Resolve(retroarch::kConfigSdPath));
-  NoteSources(*config, retroarch_cfg);
+  // Tico's layout is read off the card the same way, every tick: a Tico
+  // update or a new account changes it without touching config.ini.
+  NoteSources(*config, retroarch_cfg, tico::Notes(*config, *files));
   const scan::ScanResult scanned =
       scan::ScanSaves(*config, retroarch_cfg.value, library.index, *files, loaded.value);
   // One line per file the scan would not report, at the spelling the scanner

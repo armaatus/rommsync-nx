@@ -881,9 +881,11 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// reboot and a changed `server.url` lifts a TLS park.
   void AdoptConfigLocked(config::LoadResult loaded);
 
-  /// Keep what this tick's `retroarch.cfg` says for `source_notes()`, logging
-  /// it when it differs from the last tick's. Takes `mutex_`.
-  void NoteSources(const config::Config& config, const retroarch::LoadResult& loaded);
+  /// Keep what this tick's `retroarch.cfg` says for `source_notes()`, and what
+  /// `tico` says about whose Tico saves are read (#231), logging them when they
+  /// differ from the last tick's. Takes `mutex_`.
+  void NoteSources(const config::Config& config, const retroarch::LoadResult& loaded,
+                   std::vector<config::Diagnostic> tico);
 
   /// One of this client's files, under the directory `Load` was given.
   std::string PathTo(const char* file_name) const;

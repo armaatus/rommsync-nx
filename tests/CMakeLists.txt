@@ -1038,6 +1038,7 @@ set(SCAN_UNIT_SCENARIOS
   sources      # fixture trees for each source scan to the emulator id that wrote them
   grown        # the index is reserved from total; a library that grows mid-fetch stops there
   retroarch    # flat, sorted, beside the content and cloud-synced, as retroarch.cfg says
+  tico         # Tico 0.7.9 and 0.8.0 with one and two accounts; litter is never a save
 )
 foreach(scenario IN LISTS SCAN_UNIT_SCENARIOS)
   add_test(NAME scan.${scenario} COMMAND test_save_scan ${scenario})
@@ -2246,6 +2247,7 @@ set(ENGINE_RIG_SCENARIOS
   server_disabled  # #235: sync off in RomM reaches the status screen as the server's switch
   drains       # M9-5: a rom queued over IPC becomes a file on the card
   romm_version # M10-2: the server's version is read first, and below the floor nothing is asked
+  tico_accounts  # #231: two Tico accounts and none named reach the settings screen
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})

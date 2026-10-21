@@ -45,11 +45,25 @@ retroarch             = auto
 ; folders hold roms, so they are read only when this is true.
 retroarch_content_dir = false
 
+[tico]
+; Tico 0.8 keeps saves per Switch account, under /tico/saves/users/<account>/.
+; auto reads the one account there is, and asks (on the settings screen) when
+; there are several; legacy always reads the layout before 0.8.0; or name the
+; account by its 32-digit id, as its folder under users/ is named.
+account = auto
+
 ; --- the platform folder map -------------------------------------------------
 ;
 ; A built-in map ships for the Switch-capable systems (nes, snes, gb, gbc, gba,
-; n64, genesis, psx, nds, dreamcast, psp), so this file only needs the ones you
-; want to change. Uncomment a section to override that platform.
+; n64, genesis, sms, gamegear, segacd, psx, nds, dc, dreamcast, psp, saturn,
+; fbneo, arcade), in Tico's folder names (sms is /tico/roms/master-system), so
+; this file only needs the ones you want to change. Uncomment a section to
+; override that platform.
+;
+; gc, wii and 3ds are off by default. Turn one on with its built-in folders:
+;
+; [platform.ngc]
+; enabled = true
 ;
 ; A [platform.<slug>] section REPLACES that platform's built-in entry rather
 ; than adding to it -- list every key you want it to have. The slug is RomM's
@@ -66,8 +80,7 @@ retroarch_content_dir = false
 ; [platform.gb]
 ; emulator = mgba
 ;
-; Check these against your card before the first sync. The RetroArch paths are
-; correct; the Tico ones are best guesses.
+; What the built-in map holds for two of them:
 ;
 ; [platform.snes]
 ; roms   = /tico/roms/snes

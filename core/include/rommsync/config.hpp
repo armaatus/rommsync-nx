@@ -161,6 +161,29 @@ struct SourcesConfig {
   bool retroarch_content_dir = false;
 };
 
+/// `[tico] account`: which Switch account's saves Tico 0.8 keeps are synced.
+enum class TicoAccount {
+  /// The one account under `<root>/users/`, when there is exactly one; none
+  /// when there are several, with a note asking which (`tico::Resolve`). With
+  /// no `users/` at all, Tico's layout before 0.8.0. The default.
+  kAuto,
+  kLegacy,  ///< Tico's layout before 0.8.0, `<root>/<slug>/`, even beside a `users/`
+  kNamed,   ///< `TicoConfig::uid`'s, wherever a `users/` exists
+};
+
+/// `[tico]` (#231).
+struct TicoConfig {
+  TicoAccount account = TicoAccount::kAuto;
+
+  /// For `kNamed`: the Switch `AccountUid` as 32 lowercase hex digits -- the
+  /// name of its folder under `users/`. Empty otherwise.
+  std::string uid;
+};
+
+/// True when `text` is a Tico account folder's name: 32 hex digits, either case
+/// (FAT32 does not keep case apart; Tico writes lowercase).
+bool IsTicoUid(std::string_view text);
+
 /// Where one RomM platform lives on the SD card.
 ///
 /// All three lists hold absolute paths from the SD root, normalised (see
@@ -234,6 +257,7 @@ struct Config {
   SyncConfig sync;
   DownloadsConfig downloads;
   SourcesConfig sources;
+  TicoConfig tico;
 
   /// Keyed by RomM `platform_fs_slug` -- the on-disk folder name under RomM's
   /// `library/roms/`, so it is case-sensitive and not lowercased on the way in.
@@ -411,14 +435,22 @@ inline constexpr std::size_t kMaxDiagnostics = 64;
 /// saves and states, for the systems the Switch actually has an emulator for.
 ///
 /// `config.ini` overrides entries in this map; it does not have to restate it.
-/// Platforms deliberately absent (ps2, ps3, ps4, wii, ngc, 3ds) are absent
-/// because nothing on the console runs them -- mapping one is a supported
-/// override, not a defect in this list.
+/// Platforms deliberately absent (ps2, ps3, ps4) are absent because nothing on
+/// the console runs them -- mapping one is a supported override, not a defect
+/// in this list.
 ///
 /// The keys are a *guess* at the user's RomM folder names, since a
 /// `platform_fs_slug` is whatever they called the directory. They are the
-/// conventional ones; a library that uses other names needs overrides.
+/// conventional ones, both spellings where two are common (`dc` and
+/// `dreamcast`, `arcade` and `fbneo`); a library that uses other names needs
+/// overrides. The folders are Tico's names for the system, which are not
+/// always RomM's (`scan::TicoSlugFor`): `sms` is `/tico/roms/master-system`.
 const std::map<std::string, PlatformFolders, std::less<>>& DefaultPlatforms();
+
+/// Platforms Tico runs that are **off** by default -- `ngc`, `wii`, `3ds` --
+/// with the folders `[platform.<slug>] enabled = true` turns on. Heavy enough
+/// on the console that downloading their roms unasked would be a disservice.
+const std::map<std::string, PlatformFolders, std::less<>>& OptionalPlatforms();
 
 /// The configuration of a console with no `config.ini` at all.
 Config Defaults();

@@ -125,7 +125,7 @@ production RomM or a real library.
    `[downloads]` and one section per mapped platform. Check three things a host
    test cannot: that the folder paths are legible at arm's length, that the
    first `roms` row reads *the write target* and the rest do not, and that
-   **Ⓧ Re-pair** is still on screen with the built-in folder map's eleven
+   **Ⓧ Re-pair** is still on screen with the built-in folder map's eighteen
    sections above it — the prompts are reserved before the list precisely so a
    long map cannot push them off the bottom. Press **A** on each of the three
    menu rows and expect the sync, library and pairing screens; **B** comes back

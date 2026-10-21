@@ -116,6 +116,116 @@ void DefaultsAreTheDocumentedOnes(checks::Checks& c) {
   c.Expect(defaults.StateScanDirs().size() > 1, "the same for states");
 }
 
+// --- Tico's folder names (#231) -------------------------------------------------
+
+/// Every RomM slug the built-in map carries, and the folder Tico keeps that
+/// system in. Literal rather than derived from `scan::TicoSlugFor`: this is the
+/// table #226 R5 read off Tico, and a test that asked the code would agree with
+/// whatever the code says.
+struct TicoRow {
+  const char* romm;
+  const char* tico;
+};
+constexpr TicoRow kTicoFolders[] = {
+    {"nes", "nes"},         {"snes", "snes"},           {"gb", "gb"},
+    {"gbc", "gbc"},         {"gba", "gba"},             {"n64", "n64"},
+    {"genesis", "genesis"}, {"sms", "master-system"},   {"gamegear", "game-gear"},
+    {"segacd", "sega-cd"},  {"psx", "psx"},             {"nds", "nds"},
+    {"dc", "dc"},           {"dreamcast", "dc"},        {"psp", "psp"},
+    {"saturn", "saturn"},   {"fbneo", "fbneo"},         {"arcade", "fbneo"},
+};
+
+void DownloadsLandInTicosFolderNames(checks::Checks& c) {
+  const config::Config defaults = config::Defaults();
+  for (const TicoRow& row : kTicoFolders) {
+    const std::string slug = row.romm;
+    const config::RomDestination where =
+        defaults.DestinationFor(config::RomFile{slug, "Game (USA).bin"});
+    c.ExpectEq(where.path, "/tico/roms/" + std::string(row.tico) + "/Game (USA).bin",
+               "a " + slug + " rom downloads into the folder Tico scans");
+    const config::PlatformFolders* folders = defaults.Platform(slug);
+    if (folders == nullptr) {
+      c.Expect(false, slug + " is mapped by default");
+      continue;
+    }
+    c.Expect(folders->saves == std::vector<std::string>{"/retroarch/saves",
+                                                        "/tico/saves/" + std::string(row.tico)},
+             slug + "'s saves are read from Tico's folder for it");
+    c.Expect(folders->states == std::vector<std::string>{"/retroarch/states",
+                                                         "/tico/states/" + std::string(row.tico)},
+             slug + "'s states too");
+  }
+  c.ExpectEq(defaults.platforms.size(), std::size_t{std::size(kTicoFolders)},
+             "and the built-in map is exactly that table");
+
+  // Tico runs these, and the console struggles with them: there to turn on,
+  // never on by default.
+  const TicoRow kOptional[] = {{"ngc", "gc"}, {"wii", "wii"}, {"3ds", "3ds"}};
+  for (const TicoRow& row : kOptional) {
+    const std::string slug = row.romm;
+    c.Expect(defaults.Platform(slug) == nullptr, slug + " is off by default");
+    const auto found = config::OptionalPlatforms().find(slug);
+    if (found == config::OptionalPlatforms().end()) {
+      c.Expect(false, slug + " is available to turn on");
+      continue;
+    }
+    c.Expect(found->second.roms == std::vector<std::string>{"/tico/roms/" + std::string(row.tico)},
+             slug + " roms go to Tico's " + row.tico);
+    c.Expect(found->second.saves == std::vector<std::string>{"/retroarch/saves",
+                                                             "/tico/saves/" + std::string(row.tico)},
+             slug + " saves are read from Tico's " + row.tico);
+
+    // Turned on with the documented line, it maps exactly those folders.
+    const config::LoadResult on =
+        config::ParseConfig("[server]\nurl = https://romm.example.com\n\n[platform." + slug +
+                            "]\nenabled = true\n");
+    const config::PlatformFolders* mapped = on.value.Platform(slug);
+    c.Expect(mapped != nullptr && mapped->roms == found->second.roms &&
+                 mapped->saves == found->second.saves && mapped->states == found->second.states,
+             "`enabled = true` maps " + slug + " to Tico's folders: " + on.DescribeDiagnostics());
+    c.Expect(on.diagnostics.empty(),
+             "and turning on a platform this build knows says nothing: " +
+                 on.DescribeDiagnostics());
+  }
+}
+
+void TicoAccountIsReadAndChecked(checks::Checks& c) {
+  const config::Config defaults = config::Defaults();
+  c.Expect(defaults.tico.account == config::TicoAccount::kAuto, "the account is auto by default");
+
+  const auto parse = [](const std::string& line) {
+    return config::ParseConfig("[server]\nurl = https://romm.example.com\n\n[tico]\n" + line +
+                               "\n");
+  };
+  const config::LoadResult legacy = parse("account = Legacy");
+  c.Expect(legacy.value.tico.account == config::TicoAccount::kLegacy && legacy.diagnostics.empty(),
+           "legacy forces the layout before 0.8.0: " + legacy.DescribeDiagnostics());
+  const config::LoadResult picked = parse("account = 0123456789ABCDEF0123456789abcdef");
+  c.Expect(picked.value.tico.account == config::TicoAccount::kNamed && picked.diagnostics.empty(),
+           "a 32-digit uid names one account: " + picked.DescribeDiagnostics());
+  c.ExpectEq(picked.value.tico.uid, std::string("0123456789abcdef0123456789abcdef"),
+             "in lowercase, the way Tico names the folder");
+  const config::LoadResult automatic = parse("account = auto");
+  c.Expect(automatic.value.tico.account == config::TicoAccount::kAuto &&
+               automatic.diagnostics.empty(),
+           "auto is accepted as written");
+
+  for (const char* bad : {"account = 0123", "account = 0123456789abcdef0123456789abcdeg",
+                          "account = ../../atmosphere"}) {
+    const config::LoadResult refused = parse(bad);
+    c.Expect(refused.value.tico.account == config::TicoAccount::kAuto,
+             std::string("'") + bad + "' leaves the account on auto");
+    c.Expect(refused.diagnostics.size() == 1 &&
+                 refused.diagnostics[0].severity == config::Severity::kWarning &&
+                 refused.diagnostics[0].section == "tico" && refused.diagnostics[0].key == "account",
+             std::string("and is a warning on its line: ") + refused.DescribeDiagnostics());
+  }
+  const config::LoadResult unknown = parse("acount = auto");
+  c.Expect(unknown.diagnostics.size() == 1 &&
+               unknown.diagnostics[0].severity == config::Severity::kWarning,
+           "a key [tico] does not have is said to be ignored");
+}
+
 // --- the happy path ----------------------------------------------------------
 
 void AWholeFileParses(checks::Checks& c) {
@@ -817,6 +927,8 @@ void TheShippedExampleParses(checks::Checks& c) {
 int main() {
   checks::Checks c;
   DefaultsAreTheDocumentedOnes(c);
+  DownloadsLandInTicosFolderNames(c);
+  TicoAccountIsReadAndChecked(c);
   AWholeFileParses(c);
   ItSurvivesHowPeopleActuallyWriteFiles(c);
   ABadFileStillBoots(c);

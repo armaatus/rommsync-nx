@@ -6,6 +6,7 @@
 #include "rommsync/save_source.hpp"
 
 #include <cstddef>
+#include <initializer_list>
 #include <iterator>
 #include <limits>
 #include <map>
@@ -124,25 +125,36 @@ bool HasRealHost(std::string_view authority) {
 // --- the built-in folder map ------------------------------------------------
 
 PlatformFolders TicoAndRetroArch(const std::string& slug) {
+  // Tico's folder for the system, which is not always RomM's name for it:
+  // `sms` lives in `/tico/roms/master-system` (#226 R5). A rom downloaded under
+  // RomM's spelling is a rom Tico never lists.
+  const std::string tico = scan::TicoSlugFor(slug);
   PlatformFolders folders;
-  folders.roms = {"/tico/roms/" + slug};
-  folders.saves = {"/retroarch/saves", "/tico/saves/" + slug};
-  folders.states = {"/retroarch/states", "/tico/states/" + slug};
+  folders.roms = {"/tico/roms/" + tico};
+  folders.saves = {"/retroarch/saves", "/tico/saves/" + tico};
+  folders.states = {"/retroarch/states", "/tico/states/" + tico};
   return folders;
+}
+
+std::map<std::string, PlatformFolders, std::less<>> BuildPlatforms(
+    std::initializer_list<const char*> slugs) {
+  std::map<std::string, PlatformFolders, std::less<>> platforms;
+  for (const char* slug : slugs) {
+    platforms.emplace(slug, TicoAndRetroArch(slug));
+  }
+  return platforms;
 }
 
 std::map<std::string, PlatformFolders, std::less<>> BuildDefaultPlatforms() {
   // The systems a Switch has an emulator for, as RomM's `library/roms/` folder
-  // names conventionally spell them. Anything heavier (ps2, ps3, ps4, wii, ngc,
-  // 3ds) is deliberately absent: nothing on the console runs it, and a default
-  // mapping would only invite downloads that cannot be played.
-  const char* const kSlugs[] = {"nes",     "snes", "gb",  "gbc", "gba", "n64",
-                                "genesis", "psx",  "nds", "dreamcast", "psp"};
-  std::map<std::string, PlatformFolders, std::less<>> platforms;
-  for (const char* slug : kSlugs) {
-    platforms.emplace(slug, TicoAndRetroArch(slug));
-  }
-  return platforms;
+  // names conventionally spell them -- both spellings where two are common,
+  // since a key that matches none of the user's folders costs nothing and a
+  // missing one maps their whole platform to nowhere. Anything heavier (ps2,
+  // ps3, ps4) is deliberately absent: nothing on the console runs it, and a
+  // default mapping would only invite downloads that cannot be played.
+  return BuildPlatforms({"nes", "snes", "gb", "gbc", "gba", "n64", "genesis", "sms", "gamegear",
+                         "segacd", "psx", "nds", "dc", "dreamcast", "psp", "saturn", "fbneo",
+                         "arcade"});
 }
 
 // --- the file ---------------------------------------------------------------
@@ -160,7 +172,16 @@ io::BoundedRead ReadBounded(const std::string& path, std::string* out) {
 
 // --- the parse ---------------------------------------------------------------
 
-enum class SectionKind { kNone, kServer, kSync, kDownloads, kSources, kPlatform, kUnknown };
+enum class SectionKind {
+  kNone,
+  kServer,
+  kSync,
+  kDownloads,
+  kSources,
+  kTico,
+  kPlatform,
+  kUnknown,
+};
 
 /// The state one line of the file is read against.
 struct ParseState {
@@ -334,14 +355,49 @@ void ApplyEmulator(const ParseState& state, int line, std::string_view key,
   config->emulators[state.slug] = std::string(value);
 }
 
+/// `[tico]` (#231).
+void ApplyTico(const ParseState& state, int line, std::string_view key, std::string_view value,
+               Config* config, Diagnostics* diags) {
+  if (key != "account") {
+    diags->Add(Severity::kWarning, line, state.section, key, "unknown key, ignored");
+    return;
+  }
+  const std::string lowered = LowerAscii(Trim(value));
+  TicoConfig tico;
+  if (lowered == "legacy") {
+    tico.account = TicoAccount::kLegacy;
+  } else if (IsTicoUid(lowered)) {
+    tico.account = TicoAccount::kNamed;
+    tico.uid = lowered;
+  } else if (lowered != "auto") {
+    // Checked here because the value becomes a folder name under `users/`, and
+    // anything but 32 hex digits is either a typo or a path.
+    diags->Add(Severity::kWarning, line, state.section, key,
+               "expected auto, legacy or an account's 32-digit id, got '" + Redact(value) +
+                   "'; keeping auto");
+  }
+  config->tico = std::move(tico);
+}
+
 /// `rejected` collects slugs whose section had a line the parser could not use,
 /// so the end-of-parse sweep can tell a platform emptied on purpose from one
 /// emptied by a typo.
 void ApplyPlatform(const ParseState& state, int line, std::string_view key,
                    std::string_view value, Config* config, Diagnostics* diags,
-                   std::set<std::string>* rejected) {
+                   std::set<std::string>* rejected, std::map<std::string, bool>* enabled) {
   if (key == "emulator") {
     ApplyEmulator(state, line, key, value, config, diags);
+    return;
+  }
+  if (key == "enabled") {
+    bool flag = false;
+    if (!ParseBool(value, &flag)) {
+      diags->Add(Severity::kWarning, line, state.section, key,
+                 "expected true or false, got '" + Redact(value) + "', ignored");
+      rejected->insert(state.slug);
+      return;
+    }
+    (*enabled)[state.slug] = flag;
     return;
   }
   std::vector<std::string>* target = nullptr;
@@ -676,6 +732,26 @@ const std::map<std::string, PlatformFolders, std::less<>>& DefaultPlatforms() {
   return kPlatforms;
 }
 
+const std::map<std::string, PlatformFolders, std::less<>>& OptionalPlatforms() {
+  // Tico 0.8 runs these, at a cost the console notices; off until asked for.
+  static const std::map<std::string, PlatformFolders, std::less<>> kPlatforms =
+      BuildPlatforms({"ngc", "wii", "3ds"});
+  return kPlatforms;
+}
+
+bool IsTicoUid(std::string_view text) {
+  if (text.size() != 32) {
+    return false;
+  }
+  for (const char c : text) {
+    const bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    if (!hex) {
+      return false;
+    }
+  }
+  return true;
+}
+
 Config Defaults() {
   Config config;
   config.platforms = DefaultPlatforms();
@@ -840,6 +916,7 @@ LoadResult ParseConfig(std::string_view text) {
   std::set<std::string> platform_rejected;   // ...and which had a line that was dropped
   std::set<std::string> platform_folders;    // ...which had a line other than `emulator`
   std::set<std::string> platform_emulators;  // ...and which had an `emulator` line
+  std::map<std::string, bool> platform_enabled;  // ...and what an `enabled` line said
   std::set<std::string> assigned;            // "section\x1fkey" pairs already set
   bool platform_cap_reported = false;
 
@@ -888,6 +965,8 @@ LoadResult ParseConfig(std::string_view text) {
         state.kind = SectionKind::kDownloads;
       } else if (lowered == "sources") {
         state.kind = SectionKind::kSources;
+      } else if (lowered == "tico") {
+        state.kind = SectionKind::kTico;
       } else if (lowered.rfind("platform.", 0) == 0) {
         // The slug keeps its case: it is RomM's `platform_fs_slug`, which is a
         // directory name on the server's filesystem, and lowercasing it would
@@ -916,7 +995,8 @@ LoadResult ParseConfig(std::string_view text) {
             continue;
           }
           platform_sections.insert(state.slug);
-          if (DefaultPlatforms().find(state.slug) == DefaultPlatforms().end()) {
+          if (DefaultPlatforms().find(state.slug) == DefaultPlatforms().end() &&
+              OptionalPlatforms().find(state.slug) == OptionalPlatforms().end()) {
             diags.Add(Severity::kNotice, line_number, state.section, "",
                       "is not a platform this build maps by default; it is used as written -- "
                       "check it matches the folder name under RomM's library/roms/, because a "
@@ -1030,10 +1110,17 @@ LoadResult ParseConfig(std::string_view text) {
       case SectionKind::kSources:
         ApplySources(state, line_number, key, value, &result.value, &diags);
         break;
+      case SectionKind::kTico:
+        ApplyTico(state, line_number, key, value, &result.value, &diags);
+        break;
       case SectionKind::kPlatform:
-        (key == "emulator" ? platform_emulators : platform_folders).insert(state.slug);
+        if (key == "emulator") {
+          platform_emulators.insert(state.slug);
+        } else if (key != "enabled") {
+          platform_folders.insert(state.slug);
+        }
         ApplyPlatform(state, line_number, key, value, &result.value, &diags,
-                      &platform_rejected);
+                      &platform_rejected, &platform_enabled);
         break;
       case SectionKind::kNone:
       case SectionKind::kUnknown:
@@ -1052,8 +1139,30 @@ LoadResult ParseConfig(std::string_view text) {
   for (const std::string& slug : platform_sections) {
     const std::string section = "platform." + slug;
     const auto defaults = DefaultPlatforms().find(slug);
-    if (platform_folders.find(slug) == platform_folders.end() &&
-        platform_emulators.find(slug) != platform_emulators.end() &&
+    const auto enabled = platform_enabled.find(slug);
+    if (enabled != platform_enabled.end() && !enabled->second) {
+      // Switched off in so many words, whatever else the section lists. Not
+      // worth a notice: unlike an emptied section, nobody writes this by accident.
+      result.value.platforms[slug] = PlatformFolders{};
+      continue;
+    }
+    const bool maps_folders = platform_folders.find(slug) != platform_folders.end();
+    if (!maps_folders && enabled != platform_enabled.end()) {
+      // `enabled = true` with no folder of its own: the built-in folders, the
+      // off-by-default ones included -- that is what turning `ngc` on means.
+      const auto optional = OptionalPlatforms().find(slug);
+      if (defaults != DefaultPlatforms().end()) {
+        result.value.platforms[slug] = defaults->second;
+      } else if (optional != OptionalPlatforms().end()) {
+        result.value.platforms[slug] = optional->second;
+      } else {
+        diags.Add(Severity::kWarning, 0, section, "enabled",
+                  "this build has no folders of its own for " + slug +
+                      ", so there is nothing to turn on -- list roms, saves and states instead");
+      }
+      continue;
+    }
+    if (!maps_folders && platform_emulators.find(slug) != platform_emulators.end() &&
         defaults != DefaultPlatforms().end()) {
       // A section that sets only `emulator` is not a folder map, so it does not
       // replace one. "mGBA for GB" must not also mean "stop syncing GB", and

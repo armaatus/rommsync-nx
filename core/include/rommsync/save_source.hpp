@@ -60,7 +60,8 @@ enum class Layout {
   kUnknown,        ///< nothing is assumed: no built-in id, only an override
   kFlat,           ///< RetroArch's one `saves/` (or `states/`) for every system
   kCoreFolder,     ///< RetroArch's sort-by-core `saves/<CoreFolder>/`
-  kPlatformFolder, ///< Tico's `saves/<slug>/`
+  kPlatformFolder, ///< Tico's `saves/<slug>/`, the layout before 0.8.0
+  kAccountFolder,  ///< Tico 0.8's `saves/users/<uid>/<slug>/` (`tico::Resolve`)
 };
 
 /// Where a save came from, and the emulator id that follows from it.
@@ -166,7 +167,9 @@ const TicoModule* TicoModuleFor(std::string_view tico_slug);
 /// `dreamcast`->`dc`, `sms`->`master-system`, `gamegear`->`game-gear`,
 /// `segacd`->`sega-cd`, `ngc`->`gc`, `arcade`->`fbneo`. Anything else unchanged.
 ///
-/// It names the system, nothing more. Which *folder* Tico keeps it in is #231's.
+/// It is also the name of Tico's folder for the system -- `/tico/roms/<it>`,
+/// `/tico/saves/<it>` -- which is how the built-in folder map spells them
+/// (`config::DefaultPlatforms`, #231).
 std::string TicoSlugFor(std::string_view romm_slug);
 
 }  // namespace rommsync::scan

@@ -1,5 +1,7 @@
 #include "rommsync/save_scan.hpp"
 
+#include "rommsync/tico.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <optional>
@@ -109,6 +111,8 @@ const char* ToString(SkipReason reason) {
       return "too many states";
     case SkipReason::kOutsideLayout:
       return "outside layout";
+    case SkipReason::kTicoAccount:
+      return "tico account";
   }
   return "unknown";
 }
@@ -284,6 +288,21 @@ bool IsRetroArchFile(std::string_view name, Folders which) {
   return true;
 }
 
+/// A file an emulator keeps beside its saves and states that is never one: a
+/// `.tmp` it writes before renaming (Tico, #226 R5) -- and one a crash left
+/// behind must never be uploaded as the save it was about to replace -- a state's
+/// `.png` screenshot (Tico and RetroArch both; #239 may send it as the state's
+/// screenshot), and DuckStation's `.restart`. Not a skip: they are not saves
+/// this client declined, any more than a rom in a rom folder is.
+///
+/// Tico's `backups/` needs no rule here: it is a folder, and the walk does not
+/// descend into folders.
+bool NeverSynced(std::string_view name) {
+  const std::string_view suffix = sync::ExtensionOf(name);
+  const std::string extension = LowerAscii(suffix.empty() ? suffix : suffix.substr(1));
+  return extension == "tmp" || extension == "png" || extension == "restart";
+}
+
 SaveSource RetroArchFlat(const std::string& directory) {
   SaveSource source;
   source.source = Source::kRetroArch;
@@ -454,8 +473,9 @@ std::vector<ScanFolder> PlanFolders(const config::Config& config,
           }
           continue;
         }
-        if (base.beside_roms && !IsRetroArchFile(entry.name, which)) {
-          continue;  // a rom
+        if ((base.beside_roms && !IsRetroArchFile(entry.name, which)) ||
+            NeverSynced(entry.name)) {
+          continue;  // a rom, or not a save at all
         }
         ++result->files_seen;
         RecordSkip(result, SkipReason::kOutsideLayout, path,
@@ -469,13 +489,63 @@ std::vector<ScanFolder> PlanFolders(const config::Config& config,
     }
   }
 
+  // Tico's layout is decided once per root (`/tico/saves`), not per folder:
+  // eighteen platforms under one `users/` are one listing and one answer, and
+  // two accounts with no choice made are one skip rather than eighteen.
+  std::map<std::string, tico::Resolution> roots;
   for (const std::string& directory : saves ? config.SaveScanDirs() : config.StateScanDirs()) {
     SaveSource source = SourceOf(directory);
     if (decided.count(LowerAscii(directory)) > 0 ||
         (!enabled && source.source == Source::kRetroArch)) {
       continue;
     }
-    add({directory, std::move(source), hint_for(directory), false});
+    const std::string root = tico::RootOf(directory);
+    if (root.empty()) {
+      add({directory, std::move(source), hint_for(directory), false});
+      continue;
+    }
+    auto found = roots.find(LowerAscii(root));
+    if (found == roots.end()) {
+      found = roots.emplace(LowerAscii(root), tico::Resolve(config.tico, files, root)).first;
+      if (found->second.layout == tico::Layout::kUndecided) {
+        RecordSkip(result, SkipReason::kTicoAccount, found->second.users_dir, found->second.why);
+      }
+    }
+    const tico::Resolution& resolved = found->second;
+    if (resolved.layout == tico::Layout::kLegacy) {
+      add({directory, std::move(source), hint_for(directory), false});
+      continue;
+    }
+    if (resolved.layout == tico::Layout::kUndecided) {
+      continue;  // said once, above
+    }
+
+    const std::string account_folder = tico::FolderIn(resolved, directory);
+    SaveSource account;
+    account.source = Source::kTico;
+    account.folder = account_folder;
+    account.layout = Layout::kAccountFolder;
+    // The platform is the map folder's: `users/<uid>/snes` is snes because
+    // `/tico/saves/snes` is.
+    add({account_folder, std::move(account), hint_for(directory), false});
+
+    // Left in the old folder, a save is one Tico 0.8 no longer reads -- a
+    // module from before 0.8.0 still writing there, or a copy from before the
+    // update. Synced, it would contest the account's slot with stale bytes.
+    fs::Listing legacy = files.List(directory);
+    std::sort(legacy.entries.begin(), legacy.entries.end(),
+              [](const fs::Entry& left, const fs::Entry& right) { return left.name < right.name; });
+    for (const fs::Entry& entry : legacy.entries) {
+      if (entry.is_directory || entry.name.empty() || NeverSynced(entry.name)) {
+        continue;
+      }
+      ++result->files_seen;
+      RecordSkip(result, SkipReason::kOutsideLayout, Join(directory, entry.name),
+                 "Tico 0.8 keeps " + std::string(saves ? "saves" : "states") + " in " +
+                     account_folder +
+                     " now and does not read this one; a module installed before 0.8.0 "
+                     "writes here until it is reinstalled");
+    }
   }
   return plan;
 }
@@ -538,6 +608,9 @@ void Walk(const std::vector<ScanFolder>& folders, Folders which, const roms::Rom
       }
       if (folder.beside_roms && !IsRetroArchFile(entry.name, which)) {
         continue;  // a rom folder's roms are not files this scan has seen
+      }
+      if (NeverSynced(entry.name)) {
+        continue;
       }
       ++result->files_seen;
       const std::string sd_path = Join(directory, entry.name);

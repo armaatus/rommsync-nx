@@ -3366,6 +3366,56 @@ void RommForgotten(checks::Checks& c) {
   c.ExpectEq(server.negotiations(), negotiated, "so the second tick negotiated nothing");
 }
 
+/// #231: a card where Tico 0.8 keeps saves for two accounts and `config.ini`
+/// names neither. The scan syncs no Tico save there (`scan.tico`); what this adds
+/// is that the settings screen -- `GetConfig`, which is where a user goes to pick
+/// one -- names both accounts after a tick, as a warning on `[tico] account`.
+int TicoAccounts(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  rlog::Reset();
+  Console console(c, "engine-tico-accounts");
+  if (!Downloadable(console, c, base, fixture, true)) {
+    return c.failures();
+  }
+  const std::string kAccounts[] = {"0123456789abcdef0123456789abcdef",
+                                   "fedcba9876543210fedcba9876543210"};
+  for (const std::string& uid : kAccounts) {
+    console.sandbox.MakeDirs("/tico/saves/users/" + uid + "/snes");
+  }
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseCard(card.get());
+  console.engine.UseServer(&client, std::string());
+  console.Boot();
+
+  const auto warned = [&console, &kAccounts] {
+    for (const config::Diagnostic& note : console.Configured().diagnostics) {
+      if (note.section == "tico" && note.key == "account" &&
+          note.severity == config::Severity::kWarning &&
+          note.message.find(kAccounts[0]) != std::string::npos &&
+          note.message.find(kAccounts[1]) != std::string::npos) {
+        return true;
+      }
+    }
+    return false;
+  };
+  c.Expect(!warned(), "nothing is said before the card has been read");
+
+  console.engine.StartWorker();
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, "a tick is asked for");
+  const ipc::Status ticked = Until(
+      console,
+      [](const ipc::Status& status) { return status.last_sync_result != ipc::SyncResult::kNever; },
+      std::chrono::seconds{120});
+  c.Expect(ticked.last_sync_result != ipc::SyncResult::kNever, "and it ran");
+  c.Expect(warned(), "the settings screen names both accounts and asks for one");
+  return c.failures();
+}
+
 /// The scenarios that need the docker RomM, by name. A table rather than a
 /// second `if` chain, so the list of them is written down once.
 struct RigScenario {
@@ -3389,6 +3439,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"shutdown", DrainShutdown},
       {"sleep_download", SleepDownload},
       {"romm_version", RommVersion},
+      {"tico_accounts", TicoAccounts},
   };
   for (const RigScenario& scenario : kRigScenarios) {
     if (name == scenario.name) {

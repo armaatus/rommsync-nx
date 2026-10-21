@@ -26,6 +26,9 @@ resume        = true
 retroarch             = auto       ; auto | on | off; auto = off while RetroArch's Cloud Sync is on
 retroarch_content_dir = false      ; read RetroArch saves kept beside the roms
 
+[tico]
+account = auto                     ; auto | legacy | a 32-digit account id; see "Tico" below
+
 ; Platform folder map: RomM platform_fs_slug -> SD folders.
 ; roms   = where downloads land (first entry is the write target)
 ; saves  = dirs to scan/sync for SRAM saves
@@ -41,7 +44,7 @@ roms   = /tico/roms/gba
 saves  = /retroarch/saves, /tico/saves/gba
 states = /retroarch/states, /tico/states/gba
 
-; ... nes, gbc, gb, n64, genesis, psx, nds, dreamcast, psp
+; ... and the rest of the built-in map, below
 ```
 
 ## Version
@@ -75,19 +78,60 @@ answer to an older and a newer one; they are listed in
 
 ## Defaults & the folder map
 
-- A built-in default map ships for the Switch-capable systems (nes, snes, gb,
-  gbc, gba, n64, genesis, psx, nds, dreamcast, psp). `config.ini` only needs to
-  contain **overrides**.
+- A built-in default map ships for the Switch-capable systems. `config.ini`
+  only needs to contain **overrides**.
 - Keys are RomM `platform_fs_slug` values (what you see under RomM's
   `library/roms/`). The right-hand paths are absolute from the SD root.
-- Heavy platforms with no Switch emulator (ps2/ps3/ps4/wii/ngc/3ds) are
-  intentionally unmapped; the client skips anything without a mapping.
-- **Verify Tico's real save paths** on your SD and correct `saves`/`states` —
-  the Tico defaults are best-guesses.
+- The folders are **Tico's names** for each system, which are not always
+  RomM's. Every platform maps `roms = /tico/roms/<folder>`, `saves =
+  /retroarch/saves, /tico/saves/<folder>` and `states = /retroarch/states,
+  /tico/states/<folder>`:
+
+| RomM `platform_fs_slug` | Tico folder |
+|---|---|
+| nes, snes, gb, gbc, gba, n64, genesis, psx, nds, psp, saturn | the same name |
+| sms | `master-system` |
+| gamegear | `game-gear` |
+| segacd | `sega-cd` |
+| dc, dreamcast | `dc` |
+| arcade, fbneo | `fbneo` |
+| ngc *(off by default)* | `gc` |
+| wii, 3ds *(off by default)* | the same name |
+
+- Where two spellings are common (`dc`/`dreamcast`, `arcade`/`fbneo`) both are
+  mapped, to the one folder. The cost is that the folder no longer implies one
+  platform, so a save name both platforms have a rom for is skipped as
+  ambiguous rather than guessed.
+- **gc, wii and 3ds are off by default.** Tico runs them, but they are heavy on
+  the console and their roms are large. Turn one on with its built-in folders:
+
+  ```ini
+  [platform.ngc]
+  enabled = true
+  ```
+
+  `enabled = false` switches any platform off, whatever else its section says.
+  A section holding only `enabled` (or only `emulator`) keeps the built-in
+  folders; add `roms`, `saves` or `states` and it becomes a folder map under
+  the rule below. The overlay does not edit `enabled`; v1.0.0-rc1 warns that it
+  is an unknown key and ignores it.
+- ps2, ps3 and ps4 are intentionally unmapped: nothing on the console runs
+  them, and the client skips anything without a mapping.
+- **Tico's extra rom folders are not read.** Tico can scan up to 16 more rom
+  folders (USB included); the client downloads into, and looks for roms in, only
+  the folders this map lists. Add one to a platform's `roms` list if you keep
+  roms there — after the first, which is where downloads land.
+- **Up to v1.0.0-rc1 the map used `dreamcast` as Tico's folder name.** Tico's folder
+  is `dc`, so Dreamcast roms downloaded into `/tico/roms/dreamcast` were never
+  listed by Tico. Those downloads are now made again into `/tico/roms/dc`; the
+  old folder can be deleted. A `[platform.dreamcast]` section an earlier
+  overlay wrote out still names the old folders until you edit them.
 - **RetroArch's folders come from RetroArch**, not from this map: see
   [RetroArch](#retroarch-read-from-retroarchcfg) below. The map's
   `/retroarch/saves` and `/retroarch/states` are still read as written, after
   RetroArch's own.
+- **Tico's layout comes from the card**: see [Tico](#tico-per-account-saves)
+  below.
 
 ### A platform section replaces that platform's defaults
 
@@ -139,7 +183,7 @@ and other clients look saves up by it. The client works it out per save:
 | arcade / fbneo | `fbneo` | `fbneo` |
 | n64 | `tico-mupen64plus` | `mupen64plus_next` |
 | psx | `tico-duckstation` | `pcsx_rearmed` |
-| dreamcast | `tico-flycast` | `flycast` |
+| dc, dreamcast | `tico-flycast` | `flycast` |
 | nds | `tico-drastic` | `melonds` |
 | saturn | `tico-yabasanshiro` | — |
 | psp | `tico-ppsspp` | `ppsspp` |
@@ -216,6 +260,46 @@ retroarch_content_dir = false  ; true reads saves RetroArch keeps beside the rom
 
 `[sources]` is edited by hand; the overlay does not offer it. v1.0.0-rc1 warns
 that it is not a section it knows and ignores it.
+
+### Tico: per-account saves
+
+Tico 0.8.0 keeps each Switch account's saves apart:
+`/tico/saves/users/<account>/<folder>/`, where `<account>` is the account's id as
+32 hex digits. States moved the same way, under `/tico/states/users/`. Before
+0.8.0 — and in 0.8.0 with no account signed in — the folder was
+`/tico/saves/<folder>/`.
+
+The client reads whichever layout the card is in, every sync. For each Tico
+folder in the map, `/tico/saves/snes` say:
+
+- **no `/tico/saves/users/`**, or an empty one: `/tico/saves/snes` is read, as
+  before;
+- **`users/` holds one account**: `/tico/saves/users/<account>/snes` is read,
+  and the settings screen says whose. A file still in `/tico/saves/snes` is
+  skipped as *outside layout* — Tico 0.8 does not read it. A module installed
+  before 0.8.0 keeps writing there until it is reinstalled;
+- **`users/` holds several accounts**: none of them is synced until you say
+  which. The settings screen lists them as a `warning` on `[tico] account`.
+
+```ini
+[tico]
+account = auto     ; the default: the one account, when there is exactly one
+account = legacy   ; always the layout before 0.8.0, even beside users/
+account = 0123456789abcdef0123456789abcdef   ; this account's folder
+```
+
+A custom root follows the same rule: a Tico folder `<root>/<folder>` is read at
+`<root>/users/<account>/<folder>` once `<root>/users/` exists. The map's folders
+themselves never change, so a file written by v1.0.0-rc1 means what it meant.
+An `account` that is not `auto`, `legacy` or 32 hex digits is a `warning`, and
+`auto` stays in force. `[tico]` is edited by hand; v1.0.0-rc1 ignores it with a
+warning.
+
+**What is never synced**, in any folder: Tico's `backups/` folders (the scan
+reads no subfolder), `*.tmp` (Tico writes a save there and renames it; one a
+crash left behind is never uploaded), `*.png` (a state's screenshot) and
+`*.restart` (DuckStation's). Snes9x's `.rtc` clock is synced beside its `.srm`,
+as a save of its own in its own slot.
 
 ### `conflict_show` hides the screen, never the recording
 

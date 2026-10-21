@@ -60,7 +60,7 @@ SettingsRow Navigate(std::string label, std::string value, Destination destinati
 /// The menu the overlay did not have until this screen.
 ///
 /// It is first rather than last, and that is deliberate: the folder map is one
-/// section per platform and the built-in map alone is eleven of them, so a menu
+/// section per platform and the built-in map alone is eighteen of them, so a menu
 /// under it is a menu nobody scrolls to.
 SettingsSection Menu(const config::SyncConfig& sync) {
   SettingsSection section;

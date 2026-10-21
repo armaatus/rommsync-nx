@@ -47,7 +47,14 @@ For each file under the configured save/state dirs:
    that the copy RetroArch reads wins its slot over an older one the map's flat
    `/retroarch/saves` still holds. While RetroArch's own Cloud Sync is on, no
    RetroArch folder is read at all (`[sources] retroarch = auto`): two writers
-   to one save is the failure to avoid. Then the map's folders, as written.
+   to one save is the failure to avoid. Then the map's folders, as written —
+   except that a Tico folder `<root>/<folder>` is read where Tico 0.8 keeps it,
+   `<root>/users/<account>/<folder>`, once `<root>/users/` exists (#231,
+   [CONFIG.md](CONFIG.md#tico-per-account-saves)). Several accounts and no
+   `[tico] account` naming one is one skip for the whole `users/`, never a
+   guess; a file left in the old folder is *outside layout*. In every folder,
+   `*.tmp`, `*.png` and `*.restart` are not saves and are passed over, and no
+   subfolder — Tico's `backups/` — is read.
 1. Strip the save/state suffix to get the base name (`Game (USA).srm` → `Game (USA)`).
 2. Match to a rom by `fs_name_no_ext` (exact), falling back to `fs_name_no_tags`.
 3. Scope by platform when the path implies one (Tico's per-system folders do;
