@@ -142,6 +142,13 @@ ResolveReport ResolveRefusedUploads(http::HttpClient& client, fs::FileSystem& fi
     return out;
   }
 
+  if (options.hold != nullptr && options.hold()) {
+    // A game launched since the tick's own check (#242) has read the save this
+    // would replace. Nothing is sent; the 409s stand for the next tick.
+    out.held = true;
+    return out;
+  }
+
   // Once per tick, and only the refused saves, scoped to their roms: unscoped,
   // the server answers a narrow question with a download for every save in the
   // library this device has no history for.
@@ -164,9 +171,13 @@ ResolveReport ResolveRefusedUploads(http::HttpClient& client, fs::FileSystem& fi
   for (const std::size_t index : refused) {
     const OperationResult& was = executed->operations[index];
     const SyncOperation* head = PlannedFor(second.plan, was.rom_id, was.slot);
-    if (head == nullptr || ReportedFor(asked, was.rom_id, was.slot) == nullptr) {
+    if (head == nullptr || ReportedFor(asked, was.rom_id, was.slot) == nullptr ||
+        MatchTarget(targets, *head) == nullptr) {
       // Not asked about -- a sibling slot of an asked rom, which the rom scope
-      // still answers for -- is the next tick's, as the header says.
+      // still answers for -- is the next tick's, as the header says. And a
+      // resolution only ever replaces a file step 0 found: with no target,
+      // `ExecutePlan` would *place* one, and a folder the scan left out (a Tico
+      // account it could not decide, #231) is exactly where it must not.
       continue;
     }
     std::optional<SyncOperation> resolved = ResolveNewerOnServer(

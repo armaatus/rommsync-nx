@@ -44,6 +44,7 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -313,6 +314,14 @@ struct TickOptions {
   NegotiateOptions negotiate;
   ExecuteOptions execute;
   FinishOptions finish;
+
+  /// Asked once more, before a 409 is resolved (#232): true holds the
+  /// resolution -- no second negotiation, no transfer -- and leaves the refused
+  /// uploads for the next tick. The engine passes "a game is running" (#242):
+  /// its own check sits before the plan, and the resolution is a second round
+  /// trip after it, so a game launched meanwhile has already read the save the
+  /// resolution would replace. Null never holds.
+  std::function<bool()> hold_resolution;
 
   /// Optional, not owned; must outlive the call.
   ///

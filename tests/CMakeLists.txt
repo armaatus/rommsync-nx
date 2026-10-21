@@ -1494,6 +1494,7 @@ set(TICK_UNIT_SCENARIOS
   canceled   # a token already fired ends the tick without a single request
   unsupported  # M10-2: a server below the floor is never negotiated with
   newer_rule   # #232: a 409'd save becomes a download or a conflict, never another upload
+  newer_bounds # #232: ...held while a game runs (#242), and never placed where step 0 found nothing
 )
 
 # M6-2 (#33). These are the same executables, registered under `toggle.` because

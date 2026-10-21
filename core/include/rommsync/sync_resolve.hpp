@@ -42,6 +42,7 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -93,6 +94,10 @@ struct ResolveOptions {
   /// run -- and merely a larger answer.
   bool rom_ids = true;
 
+  /// `TickOptions::hold_resolution`: asked before the second negotiation, and
+  /// true sends nothing and changes nothing (`ResolveReport::held`).
+  std::function<bool()> hold;
+
   NegotiateOptions negotiate;
   ExecuteOptions execute;
   CompleteOptions complete;
@@ -102,6 +107,10 @@ struct ResolveOptions {
 struct ResolveReport {
   /// Operations in the plan whose upload drew the 409.
   std::size_t refused = 0;
+
+  /// `ResolveOptions::hold` answered true: a game is running, and the refused
+  /// uploads stay refused for the next tick. Nothing was sent.
+  bool held = false;
 
   /// The second negotiation was sent. At most once per tick, and only when
   /// `refused` is not zero.

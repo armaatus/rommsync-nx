@@ -249,12 +249,18 @@ rather than counting it failed forever (`sync::ResolveRefusedUploads`,
 1. **Negotiate once more**, for the refused saves only, scoped with `rom_ids`.
    The first plan may name a head that has since been replaced, and downloading
    that row would fetch — and confirm — a superseded save. Never more than one
-   second negotiation per tick.
+   second negotiation per tick, and none while a game is running: the engine's
+   own check (#242) is before the plan, and this is a round trip after it, so
+   it asks again (`TickOptions::hold_resolution`) and a held resolution leaves
+   the 409 for the next tick.
 2. **Decide** with Grout's rule (#226 R3): local bytes whose MD5 equals the
    server digest `state.db` recorded at the last sync take the head as a
    **download**; anything else — changed bytes, no row, no digest — is a
    **conflict**. A conflict the server names stays one; a `no_op` stays one.
-   **Never another upload.**
+   **Never another upload**, and never a file step 0 did not find: a save the
+   scan left out (a Tico account it could not decide, #231) is not reported,
+   so it is never uploaded, and a resolution without a matched target is not
+   run rather than placed.
 3. **Execute** that through `ExecutePlan`, so it is fetched, verified, backed up
    and committed exactly as a planned download is, and merge it into the tick's
    plan and report at the refused operation's index — the baseline, the conflict

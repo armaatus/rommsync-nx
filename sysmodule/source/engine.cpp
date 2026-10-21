@@ -1855,6 +1855,9 @@ bool SdEngine::RunOneTick() {
   // to be supported -- the refusal above returned -- and passed anyway, so the
   // tick's own gate is the same fact rather than a default.
   options.server = caps;
+  // The check above is the last before the plan. A 409's resolution is a second
+  // negotiation and transfer after it, so it asks again (#232 against #242).
+  options.hold_resolution = [this]() { return application_running(); };
   options.execute.backup_dir = sync::kBackupDir;
   options.finish.state_sd_path = sync::kStateSdPath;
   options.cancel = cancel.get();

@@ -931,6 +931,152 @@ void NewerRule(rig::Checks& checks) {
   }
 }
 
+// --- newer_bounds ---------------------------------------------------------------
+//
+// What a 409's resolution must not do, whatever the server answers: run while a
+// game is running (#242 -- its own check is before the plan, and this is a
+// second round trip after it), or write a save step 0 never found, which is
+// what a folder the scan left out -- a Tico account it could not decide, #231 --
+// would be. No server: a client that answers negotiate with a plan naming the
+// refused save's head, and records whether anything was fetched.
+
+class PlanningClient final : public http::HttpClient {
+ public:
+  http::Result Send(const http::Request& request) override {
+    ++requests;
+    http::Result result;
+    result.response.status = 200;
+    if (request.url.find("/api/sync/negotiate") != std::string::npos) {
+      result.response.body =
+          R"j({"session_id":9,"operations":[{"action":"upload","rom_id":4,"save_id":20,)j"
+          R"j("file_name":"Game [2026-10-21_09-02-32].srm","slot":"autosave",)j"
+          R"j("emulator":"snes9x","reason":"Client save is newer (no sync history)",)j"
+          R"j("server_updated_at":"2026-10-21T09:02:14+00:00",)j"
+          R"j("server_content_hash":"00112233445566778899aabbccddeeff"}],)j"
+          R"j("total_upload":1,"total_download":0,"total_conflict":0,"total_no_op":0})j";
+    } else {
+      result.response.body = "{}";
+    }
+    return result;
+  }
+  http::Result Download(const http::Request&, const http::DownloadTarget&) override {
+    ++downloads;
+    http::Result result;
+    result.error = http::Error::kConnectFailed;
+    return result;
+  }
+
+  int requests = 0;
+  int downloads = 0;
+};
+
+void NewerBounds(rig::Checks& checks) {
+  Sandbox sandbox(checks, "tick-newer-bounds");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  auth::StoredToken token;
+  token.server_url = kNowhere;
+  token.access_token = "not-a-token";
+  token.device_id = "fixture-newer-bounds";
+
+  const std::string bytes = "the save a resolution must leave alone\n";
+  sandbox.SeedSave(SavePath("Game.srm"), bytes);
+  sync::ClientSaveState local;
+  local.rom_id = 4;
+  local.file_name = "Game.srm";
+  local.slot = "autosave";
+  local.content_hash = crypto::Md5Hex(bytes);
+  local.updated_at = std::chrono::system_clock::now();
+  local.file_size_bytes = static_cast<std::int64_t>(bytes.size());
+  const std::vector<sync::SaveTarget> found = {{4, std::string("autosave"), SavePath("Game.srm"),
+                                                "Game.srm"}};
+  state::Baseline previous;
+  state::SaveRecord row;
+  row.rom_id = 4;
+  row.slot = "autosave";
+  row.content_hash = *local.content_hash;
+  row.mtime = local.updated_at;
+  row.file_size_bytes = local.file_size_bytes;
+  row.server_content_hash = *local.content_hash;
+  previous.Set(row);
+
+  const auto refused = [](sync::SyncPlan* plan, sync::ExecutionReport* report) {
+    sync::SyncOperation upload;
+    upload.action = sync::Action::kUpload;
+    upload.action_text = "upload";
+    upload.rom_id = 4;
+    upload.slot = "autosave";
+    plan->session_id = 8;
+    plan->operations = {upload};
+    sync::OperationResult result;
+    result.action = sync::Action::kUpload;
+    result.rom_id = 4;
+    result.slot = "autosave";
+    result.outcome = sync::OperationOutcome::kFailed;
+    result.error = sync::OperationError::kNewerOnServer;
+    result.message = "upload rom 4, slot autosave: 409";
+    report->operations = {result};
+    report->failed = 1;
+    report->warnings = {result.message};
+  };
+
+  // A game launched since the tick's own check: nothing is asked, nothing runs.
+  {
+    sync::SyncPlan plan;
+    sync::ExecutionReport report;
+    refused(&plan, &report);
+    sync::ResolveOptions options;
+    options.hold = []() { return true; };
+    PlanningClient client;
+    const sync::ResolveReport resolved = sync::ResolveRefusedUploads(
+        client, *files, token, {local}, found, previous, &plan, &report, options);
+    checks.Expect(resolved.held && !resolved.renegotiated, "a running game holds the resolution");
+    checks.ExpectEq(client.requests, 0, "and it sends nothing");
+    checks.Expect(report.operations[0].error == sync::OperationError::kNewerOnServer,
+                  "the 409 stands for the next tick");
+  }
+
+  // No file step 0 found for the save: the head is named, and still not fetched.
+  {
+    sync::SyncPlan plan;
+    sync::ExecutionReport report;
+    refused(&plan, &report);
+    PlanningClient client;
+    sync::ResolveOptions options;
+    options.negotiate.wait = [](std::chrono::milliseconds) {};
+    options.complete.wait = [](std::chrono::milliseconds) {};
+    const sync::ResolveReport resolved = sync::ResolveRefusedUploads(
+        client, *files, token, {local}, /*targets=*/{}, previous, &plan, &report, options);
+    checks.Expect(resolved.renegotiated, "the server is asked");
+    checks.ExpectEq(resolved.resolved, std::size_t{0}, "but nothing is resolved");
+    checks.ExpectEq(client.downloads, 0, "and nothing is placed where the scan found no file");
+    checks.Expect(plan.operations[0].action == sync::Action::kUpload &&
+                      report.operations[0].error == sync::OperationError::kNewerOnServer,
+                  "the 409 stands for the next tick");
+  }
+
+  // ...and with the file found, the same answer is a download of the head.
+  {
+    sync::SyncPlan plan;
+    sync::ExecutionReport report;
+    refused(&plan, &report);
+    PlanningClient client;
+    sync::ResolveOptions options;
+    options.negotiate.wait = [](std::chrono::milliseconds) {};
+    options.complete.wait = [](std::chrono::milliseconds) {};
+    options.execute.backup_dir = harness::kBackupDir;
+    const sync::ResolveReport resolved = sync::ResolveRefusedUploads(
+        client, *files, token, {local}, found, previous, &plan, &report, options);
+    checks.ExpectEq(resolved.resolved, std::size_t{1}, "a found save is resolved");
+    checks.Expect(plan.operations[0].action == sync::Action::kDownload &&
+                      plan.operations[0].save_id == std::optional<std::int64_t>(20),
+                  "as a download of the head the server named");
+    checks.Expect(client.downloads > 0, "which is fetched");
+  }
+  checks.ExpectEq(sandbox.Read(SavePath("Game.srm")), bytes,
+                  "and the save is untouched: the fetch went nowhere");
+}
+
 // --- the rig scenarios --------------------------------------------------------
 //
 // One shape, four stages. Each arranges a plan of exactly one operation, arms
@@ -2085,7 +2231,8 @@ int main(int argc, char** argv) {
   // The eight that need no server, so they stay checked with docker stopped.
   if (scenario == "recovery" || scenario == "durable" || scenario == "backupdir" ||
       scenario == "offline" || scenario == "rescan" || scenario == "canceled" ||
-      scenario == "disabled" || scenario == "unsupported" || scenario == "newer_rule") {
+      scenario == "disabled" || scenario == "unsupported" || scenario == "newer_rule" ||
+      scenario == "newer_bounds") {
     if (scenario == "recovery") {
       Recovery(checks);
     } else if (scenario == "durable") {
@@ -2102,6 +2249,8 @@ int main(int argc, char** argv) {
       Unsupported(checks);
     } else if (scenario == "newer_rule") {
       NewerRule(checks);
+    } else if (scenario == "newer_bounds") {
+      NewerBounds(checks);
     } else {
       Canceled(checks);
     }

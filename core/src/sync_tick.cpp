@@ -245,6 +245,7 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
   // another upload, and never more than one second negotiation (#232).
   ResolveOptions resolve;
   resolve.rom_ids = options.server.rom_ids;
+  resolve.hold = options.hold_resolution;
   resolve.negotiate = negotiate;
   resolve.execute = execute;
   resolve.complete = options.finish.complete;
