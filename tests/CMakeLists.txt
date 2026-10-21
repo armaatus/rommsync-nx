@@ -1514,6 +1514,29 @@ set(TICK_RIG_SCENARIOS
   resumes          # a reset mid-download, then a second tick: one save, one row
 )
 
+# M10-2 (#228): which RomM this console is talking to. `versions` and
+# `heartbeat` need no server -- the version rule, and the shallow read of a
+# heartbeat body -- so they stay checked with docker stopped. `live` asks the
+# fixture, whichever ROMM_VERSION started it, and holds the capability set to
+# what that version must yield; `faults` drives the retry through the proxy.
+add_executable(test_server_capabilities test_server_capabilities.cpp)
+target_link_libraries(test_server_capabilities PRIVATE rommsync::host)
+target_include_directories(test_server_capabilities PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_server_capabilities PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+foreach(scenario versions heartbeat)
+  add_test(NAME server.${scenario} COMMAND test_server_capabilities ${scenario})
+  set_tests_properties(server.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+foreach(scenario live faults)
+  add_test(NAME server.${scenario} COMMAND test_server_capabilities ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(server.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  set_tests_properties(server.${scenario} PROPERTIES TIMEOUT 120)
+endforeach()
+
 # M7-2 (#37), registered under `sched.` because what they check is the schedule
 # around a tick rather than the tick. They live in this executable because the
 # two acceptance cases they cover cannot be produced with an injected outcome: a
