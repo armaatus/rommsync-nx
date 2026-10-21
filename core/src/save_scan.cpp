@@ -336,14 +336,19 @@ std::vector<ScanFolder> PlanFolders(const config::Config& config,
   const bool beside_roms =
       saves ? settings.savefiles_in_content_dir : settings.savestates_in_content_dir;
 
-  // The folder retroarch.cfg names is RetroArch's to lay out, so the map's entry
-  // for it -- the built-in `/retroarch/saves`, or one a user wrote -- is decided
-  // here and never read flat beside it.
+  // The folder retroarch.cfg names is RetroArch's to lay out, so where the map
+  // lists that same folder -- the built-in `/retroarch/saves`, when the file
+  // names it, or one a user wrote -- it is decided here and never read flat
+  // beside it.
   std::set<std::string> decided = {LowerAscii(configured)};
 
   if (enabled && !by_content) {
     std::vector<ScanFolder> bases;
     if (beside_roms) {
+      // Sorting still applies beside the content: RetroArch takes the content's
+      // folder as the save folder first and appends the core's name to it after
+      // (`runloop_path_set_redirect`, v1.22.2), so with both on a save is in
+      // `<rom folder>/<CoreFolder>/`.
       if (config.sources.retroarch_content_dir) {
         // The map's rom folders, each implying its platform when only one maps it.
         std::map<std::string, std::string, std::less<>> rom_hints;
@@ -365,10 +370,14 @@ std::vector<ScanFolder> PlanFolders(const config::Config& config,
       }
     } else {
       std::string directory = configured;
-      if (LowerAscii(configured) != LowerAscii(fallback) &&
-          files.List(configured).error == fs::ListError::kMissing) {
-        // RetroArch ignores a `savefile_directory` that is not a directory and
-        // writes to its default instead, so that is where the saves are.
+      const auto not_a_folder = [&files](const std::string& path) {
+        const fs::ListError error = files.List(path).error;
+        return error == fs::ListError::kMissing || error == fs::ListError::kNotADirectory;
+      };
+      if (LowerAscii(configured) != LowerAscii(fallback) && not_a_folder(configured)) {
+        // RetroArch ignores a `savefile_directory` that is not a directory
+        // (`path_is_directory`, configuration.c) and writes to its default
+        // instead, so that is where the saves are.
         directory = fallback;
         decided.insert(LowerAscii(fallback));
       }
@@ -448,7 +457,11 @@ void Walk(const std::vector<ScanFolder>& folders, Folders which, const roms::Rom
   std::size_t emitted = 0;
   for (const ScanFolder& folder : folders) {
     const std::string& directory = folder.directory;
-    result->folders.push_back(directory);
+    if (!folder.beside_roms) {
+      // A rom folder is not one a save sweep may touch: a rom download stages
+      // its `.tmp` there, and the sweep removes every `.tmp` it finds.
+      result->folders.push_back(directory);
+    }
     fs::Listing listing = files.List(directory);
     if (!listing.ok() && listing.error != fs::ListError::kMissing) {
       // A *missing* folder is a normal card -- a platform mapped to a Tico

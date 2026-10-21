@@ -252,10 +252,13 @@ struct ScanResult {
   /// Files seen in the mapped directories, matched or not.
   std::size_t files_seen = 0;
 
-  /// Every directory the scan read for files, in the order it read them: the
-  /// folder map's, and the ones `retroarch.cfg` led it to. What a sweep for an
-  /// interrupted write has to cover, since a save is overwritten where it was
+  /// Every save directory the scan read for files, in the order it read them:
+  /// the folder map's, and the ones `retroarch.cfg` led it to. What a sweep for
+  /// an interrupted write has to cover, since a save is overwritten where it was
   /// found (`sync::TickOptions::recover_dirs`).
+  ///
+  /// **Not the rom folders** read for saves kept beside the content: a rom
+  /// download stages its `.tmp` there, and the sweep removes every `.tmp`.
   std::vector<std::string> folders;
 
   /// The rom index did not hold the whole library (`roms::RomIndex::truncated`).

@@ -219,7 +219,7 @@ class Reader {
     } else {
       Complain(where + ": expected \"true\" or \"false\", got '" + Redact(value) +
                "'; RetroArch's default is assumed");
-      *flag = FlagFor(&defaults_, key) != nullptr && *FlagFor(&defaults_, key);
+      *flag = *FlagFor(&defaults_, key);
     }
   }
 

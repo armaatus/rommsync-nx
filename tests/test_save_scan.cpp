@@ -959,6 +959,9 @@ void RetroArch(::checks::Checks& checks) {
                       gba->rom_id == 1,
                   "content dir, opted in: the save beside the rom is RetroArch's");
     checks.ExpectEq(open.saves.size(), std::size_t{1}, "content dir: and a rom is never a save");
+    checks.Expect(!Read(open, "/tico/roms/gba"),
+                  "content dir: a rom folder is not offered to the .tmp sweep, where a rom "
+                  "download stages");
     checks.ExpectEq(open.skipped_total, std::size_t{0},
                     "content dir: the roms are not even unmatched files: " +
                         open.DescribeSkipped());

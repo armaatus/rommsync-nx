@@ -459,16 +459,19 @@ void SdEngine::NoteSources(const config::Config& config, const retroarch::LoadRe
     }
     return true;
   };
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (same(notes, source_notes_)) {
-    return;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (same(notes, source_notes_)) {
+      return;
+    }
+    source_notes_ = notes;
   }
   // Logged when they change rather than every tick: "retroarch.cfg was not
   // found" on a console without RetroArch is worth one line, not one per tick.
+  // After the lock, which is never held across a write to the card.
   for (const config::Diagnostic& note : notes) {
     log::Write(LevelFor(note.severity), log::Event::kConfigDiagnostic, note.Describe());
   }
-  source_notes_ = std::move(notes);
 }
 
 ipc::EngineSnapshot SdEngine::Snapshot() const {
