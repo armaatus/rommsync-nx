@@ -2255,3 +2255,54 @@ foreach(scenario IN ITEMS rows pinned margin dirs prose)
                    --repo "${CMAKE_SOURCE_DIR}")
   set_tests_properties(heap.${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
+
+# --- M9-15: what the sysmodule holds between ticks, measured -----------------
+# The heap's table above is a bound added up from constants; this is the
+# process measured. Every `operator new` in the executable is counted
+# (count_new.hpp), the sysmodule's own `SdEngine` is driven tick after tick
+# against the fixture RomM, and what is outstanding between ticks must not grow
+# with the number of ticks (#204).
+#
+# Its own executable, because replacing the global allocation functions
+# replaces them for everything linked beside them. Built with allocation
+# elision off: [expr.new]/14 lets a compiler drop a `new` whose result is
+# unused, and a count that passes because an allocation never happened passes
+# for the wrong reason. `alloc.counts` checks that the flag took. Never built
+# under a sanitizer -- ASan replaces `operator new` itself -- and if one is ever
+# added to this build, the scenarios skip rather than assert over its counts.
+add_executable(test_heap_steady test_heap_steady.cpp count_new.cpp
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/engine.cpp"
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/power.cpp")
+target_link_libraries(test_heap_steady PRIVATE rommsync::host Threads::Threads)
+target_include_directories(test_heap_steady PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/sysmodule/source")
+target_compile_definitions(test_heap_steady PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  target_compile_options(test_heap_steady PRIVATE
+    -fno-builtin-operator-new -fno-builtin-operator-delete)
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  target_compile_options(test_heap_steady PRIVATE -fno-allocation-dce)
+endif()
+
+foreach(scenario counts judge log_ring)
+  add_test(NAME alloc.${scenario} COMMAND test_heap_steady ${scenario})
+  set_tests_properties(alloc.${scenario} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+endforeach()
+
+# The two against the rig. `alloc.steady` is the acceptance's assertion; its
+# warm-up alone is `log::kTailLines` + 8 ticks, then sixteen measured.
+# `soak.smoke` is the nightly soak (.github/workflows/soak.yml) at four rounds,
+# so the soak's own code runs on every push and the nightly is never the first
+# time it does. Serial for the reason every rig test is: they negotiate as the
+# shared fixture device and download its roms.
+add_test(NAME alloc.steady COMMAND test_heap_steady steady 16)
+add_test(NAME soak.smoke COMMAND test_heap_steady soak 4)
+foreach(name alloc.steady soak.smoke)
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  set_tests_properties(${name} PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
+endforeach()
