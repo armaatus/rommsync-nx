@@ -878,7 +878,10 @@ ctest --test-dir build --output-on-failure
   overwriting it, judged by `crash::OldOrGone` -- the save's old bytes or no
   file, and no file only with the old bytes under `.backup/` -- once as the
   executor removes, once with `.backup/` unconfirmed, and once as a removal with
-  no backup the replay must catch. Every replay drives the
+  no backup the replay must catch. `execute.placed` replays a first-time restore
+  (#237), which lands on no save and is judged by `crash::AbsentOrNew` instead:
+  no file or all of it, and every file already on the card untouched. Every
+  replay drives the
   host backend; the Horizon one syncs its `.part` through the same `io::Sync`,
   and only a console runs it (#44). `execute.crash_model` is the
   replay's own check: an overwrite written in place, one with no backup, and a

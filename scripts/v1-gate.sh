@@ -198,6 +198,10 @@ T
       # `tick.migrated` replays the first tick after an upgrade from rc1 (#236):
       # a version-2 `state.db` row moved to the shared slot, and that slot's newer
       # head landing over the save. `ExecutePlan` again, so again no census row.
+      #
+      # `execute.placed` (#237, in `^execute\.`) is a first-time restore: the
+      # same `ExecutePlan` download, onto no file -- a placement only creates --
+      # replayed for no file or all of it, and nothing beside it touched.
       cat <<'T'
 ^harness\.backup$
 ^execute\.

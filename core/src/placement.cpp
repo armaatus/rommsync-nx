@@ -121,8 +121,9 @@ std::string ExtensionFor(std::string_view emulator_id, std::string_view server_f
            " is known to write";
     return {};
   }
-  *why = "the server's copy is a " + (theirs.empty() ? std::string("file with no extension") : theirs) +
-         " file, which is not a format " + std::string(emulator_id) + " writes";
+  const std::string named = theirs.empty() ? "has no extension" : "is a " + theirs + " file";
+  *why = "the server's copy " + named + ", which is not a format " + std::string(emulator_id) +
+         " writes";
   return {};
 }
 

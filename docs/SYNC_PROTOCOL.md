@@ -384,10 +384,27 @@ owns the order of one tick and M7-2 owns the schedule between ticks.
 
 **A save the client has no local file for** (`download` /
 `Save exists on server but not on client`) needs a destination the plan cannot
-supply: the server's `file_name` carries the ingest tag and the directory
-depends on the rom's platform. `ExecuteOptions::place` is where that policy is
-injected, and it needs the rom index plus the platform→folder map (M3-1); with
-none supplied the operation fails by name rather than guessing at a path.
+supply: the server's `file_name` carries the ingest tag and the folder depends
+on which emulator plays the system. `ExecuteOptions::place` is where that policy
+is injected, and the engine's is `place::Placer` (#237):
+
+- **The emulator** is `[platform.<slug>] play_with`, Tico by default (#226 D5) —
+  never the map's first folder, which is `/retroarch/saves` for every system.
+- **The folder** is that emulator's as the card is laid out this tick: Tico's
+  through `tico::Resolve` (and nothing while several accounts are undecided),
+  RetroArch's through `retroarch.cfg` (and nothing while it syncs itself).
+- **The name** is the rom's `fs_name_no_ext` with the emulator's extension.
+- **It must come back as itself.** The placed file has to be one the next scan
+  matches to the same rom in the same slot, holding bytes the target emulator
+  reads; otherwise it would be a second save of the game, uploaded on the next
+  tick while the row it came from is offered again. Placing nothing is a named
+  failure with the reason.
+- **A placement only creates.** A file already at the path is one the scan did
+  not pair with this row — skipped, or another slot's — and the operation fails
+  with `kNoLocalSave` without touching it. A missing folder is made. The bytes
+  arrive through the same stage-verify-commit as any download, and
+  `execute.placed` replays a power cut at every call of it: no file, or all of
+  it.
 
 ### Backups
 
@@ -794,7 +811,10 @@ For one local state, keyed `(rom_id, file_name)`:
 A server state no local file claimed is *placed* — and a placement may only
 **create**. Where it goes is the caller's (`sync::StateSyncOptions::place`),
 because the folder depends on the rom's platform and on which emulator the state
-belongs to; nothing said is a named failure rather than a guessed path. If there
+belongs to; nothing said is a named failure rather than a guessed path. The
+engine's is the save rule above (`place::Placer::State`), with one difference:
+the state keeps the server's name, since `(rom_id, file_name)` is what pairs it.
+If there
 is already a file at the path it names, that is keep-both too: "no local state
 claimed this row" is not "there is nothing at that path" — a state the scan
 skipped, as an ambiguity or as the loser of a duplicate name, claims nothing and

@@ -84,6 +84,13 @@ account = auto
 ; [platform.gb]
 ; emulator = mgba
 ;
+; play_with = tico or retroarch: the emulator a save this console has never
+;             held is restored for. Tico by default for every system it runs;
+;             a section with only this key keeps the built-in folders.
+;
+; [platform.snes]
+; play_with = retroarch
+;
 ; What the built-in map holds for two of them:
 ;
 ; [platform.snes]

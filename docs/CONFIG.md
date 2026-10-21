@@ -36,6 +36,7 @@ account = auto                     ; auto | legacy | a 32-digit account id; see 
 ; saves  = dirs to scan/sync for SRAM saves
 ; states = dirs to scan/sync for save states
 ; emulator = RomM emulator id for this platform's saves (optional; see below)
+; play_with = tico | retroarch: where a save the card never held goes (default tico)
 [platform.snes]
 roms   = /tico/roms/snes
 saves  = /retroarch/saves, /tico/saves/snes
@@ -212,6 +213,43 @@ The id has to be one RomM accepts — at most 50 characters, none of
 `\ / : | * ? " < >`, no control character, no space at either end. One that is
 not is dropped with a `warning` naming the line, and the built-in id stays in
 force: RomM would otherwise refuse every upload of that platform's saves.
+
+### `play_with`: where a save the console has never held goes
+
+A save already on the card is synced where it is found. A save the server holds
+and the card does not — a first-time restore — has no such place, so it goes to
+the emulator the platform is **played with**:
+
+```ini
+[platform.snes]
+play_with = retroarch      ; tico | retroarch
+```
+
+**Tico is the default** for every system Tico runs (the table above, and `ngc`,
+`wii` and `3ds`). Any other platform has no default, and a save for it is not
+placed until a `play_with` line says where. Like `emulator`, a section that sets
+only `play_with` keeps the platform's built-in folders, and `play_with =` puts
+the default back.
+
+| `play_with` | Where it goes |
+|---|---|
+| `tico` | Tico's folder for the system, from the map, in the layout the card is in: `/tico/saves/users/<account>/snes/` on Tico 0.8, `/tico/saves/snes/` before it. **Nothing** while several accounts wait for `[tico] account` to name one. |
+| `retroarch` | the folder `retroarch.cfg` names (by default `/retroarch/cores/savefiles`), in the core's own folder when it sorts by core (`Snes9x/`), or beside the rom when it keeps saves with the content — the last only with `[sources] retroarch_content_dir = true`. **Nothing** while RetroArch syncs itself, or with `[sources] retroarch = off`. |
+
+Never the map's first `saves` folder: that is `/retroarch/saves` for every
+system, which neither Tico nor a default RetroArch reads.
+
+The name is the **rom's**, with the emulator's extension —
+`Super Mario World (USA).srm`, `Game.mcd` for DuckStation — never RomM's stored
+name (`Super Mario World (USA) [2026-10-01_12-00-00].srm`). A state keeps the
+name it has on the server, because that name is what pairs it.
+
+A save is placed only when the result is the save it came from: bytes the target
+emulator reads (an isolated `tico-*` format never goes to RetroArch, nor a
+RetroArch core's save to a Tico module that is not that core), in a file the next
+sync reads back as the same rom in the same slot, and where no file is already.
+Anything else is a failed operation with the reason in the log — never a guess,
+and never a file written over.
 
 ### RetroArch: read from `retroarch.cfg`
 
