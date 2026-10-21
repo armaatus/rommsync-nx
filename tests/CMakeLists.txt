@@ -1493,6 +1493,7 @@ set(TICK_UNIT_SCENARIOS
   rescan     # a restored save stops the tick rather than negotiating without it
   canceled   # a token already fired ends the tick without a single request
   unsupported  # M10-2: a server below the floor is never negotiated with
+  newer_rule   # #232: a 409'd save becomes a download or a conflict, never another upload
 )
 
 # M6-2 (#33). These are the same executables, registered under `toggle.` because
@@ -1526,6 +1527,8 @@ set(TICK_RIG_SCENARIOS
   complete_stall   # the same on the timeout, and the next tick finds no work to redo
   complete_closed  # #235: a session closed elsewhere (400 already CANCELLED/FAILED) ends nothing
   resumes          # a reset mid-download, then a second tick: one save, one row
+  newer_download   # #232: another device uploads mid-tick; unchanged bytes take its head, backed up
+  newer_conflict   # #232: ...and changed bytes are a conflict -- never a blind upload over it
 )
 
 # M10-2 (#228): which RomM this console is talking to. `versions` and

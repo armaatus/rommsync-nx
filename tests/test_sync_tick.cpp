@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <iterator>
 #include <map>
@@ -30,9 +31,11 @@
 #include <string>
 #include <vector>
 
+#include "crash_disk.hpp"
 #include "faulty_disk.hpp"
 #include "harness.hpp"
 #include "rommsync/atomic_file.hpp"
+#include "rommsync/conflict_record.hpp"
 #include "rommsync/host/curl_http_client.hpp"
 #include "rommsync/host/file_sync.hpp"
 #include "rommsync/host/native_file_system.hpp"
@@ -45,6 +48,7 @@
 namespace {
 
 namespace auth = rommsync::auth;
+namespace conflicts = rommsync::conflicts;
 namespace crypto = rommsync::crypto;
 namespace fs = rommsync::fs;
 namespace http = rommsync::http;
@@ -791,6 +795,140 @@ void Unsupported(rig::Checks& checks) {
   checks.Expect(sync::TickOptions{}.server.supported,
                 "a caller that passes no capabilities is assumed to talk to the floor, which is "
                 "what every unit test of one stage is");
+}
+
+// --- newer_rule -----------------------------------------------------------------
+//
+// #232: what a save whose upload drew the slot guard's 409 becomes, given what a
+// second negotiation names as the slot's head. The rule is Grout's (#226 R3):
+// bytes this device has not changed since it last synced take the head as a
+// download; bytes it has changed are a conflict. **Never another upload**, and
+// never one when the server's answer is anything this build does not
+// understand. No server: it is a function of three values.
+
+void NewerRule(rig::Checks& checks) {
+  const std::string synced = "0123456789abcdef0123456789abcdef";
+  const std::string edited = "fedcba9876543210fedcba9876543210";
+  const std::string theirs = "00112233445566778899aabbccddeeff";
+
+  sync::SyncOperation head;
+  head.action = sync::Action::kUpload;
+  head.action_text = "upload";
+  head.rom_id = 4;
+  head.slot = "autosave";
+  head.save_id = 20;
+  head.reason = sync::Reason::kClientNewerNoHistory;
+  head.reason_text = sync::ReasonText(sync::Reason::kClientNewerNoHistory);
+  head.server_updated_at = "2026-10-21T09:02:14+00:00";
+  head.server_content_hash = theirs;
+
+  sync::ClientSaveState local;
+  local.rom_id = 4;
+  local.slot = "autosave";
+  local.content_hash = synced;
+
+  state::SaveRecord last;
+  last.rom_id = 4;
+  last.slot = "autosave";
+  last.content_hash = synced;
+  last.server_content_hash = synced;
+
+  // Untouched since the last sync, against the head another device wrote: the
+  // server asked for an upload (no history against that row), and the answer is
+  // to take its head.
+  {
+    const std::optional<sync::SyncOperation> resolved =
+        sync::ResolveNewerOnServer(head, &local, &last);
+    checks.Expect(resolved.has_value() && resolved->action == sync::Action::kDownload,
+                  "bytes unchanged since the last sync take the server's head as a download");
+    if (resolved.has_value()) {
+      checks.Expect(resolved->save_id == head.save_id &&
+                        resolved->server_content_hash == head.server_content_hash,
+                    "...of the row the second negotiation named, verified against its digest");
+      checks.ExpectEq(resolved->reason_text, std::string(sync::kSlotNewerDetail),
+                      "and the reason given is the guard's, not an upload's");
+    }
+  }
+
+  // Changed here since the last sync: both sides moved, and that is a conflict.
+  {
+    sync::ClientSaveState moved = local;
+    moved.content_hash = edited;
+    const std::optional<sync::SyncOperation> resolved =
+        sync::ResolveNewerOnServer(head, &moved, &last);
+    checks.Expect(resolved.has_value() && resolved->action == sync::Action::kConflict,
+                  "bytes changed since the last sync are a conflict, not a download");
+  }
+
+  // No record of a last sync, or one with no server digest: nothing says the
+  // local bytes are safe to replace silently, so it is a conflict.
+  {
+    const std::optional<sync::SyncOperation> no_row =
+        sync::ResolveNewerOnServer(head, &local, nullptr);
+    checks.Expect(no_row.has_value() && no_row->action == sync::Action::kConflict,
+                  "no baseline row is a conflict");
+    state::SaveRecord bare = last;
+    bare.server_content_hash = std::nullopt;
+    const std::optional<sync::SyncOperation> no_digest =
+        sync::ResolveNewerOnServer(head, &local, &bare);
+    checks.Expect(no_digest.has_value() && no_digest->action == sync::Action::kConflict,
+                  "and so is a row that never recorded the server's digest");
+    sync::ClientSaveState unhashed = local;
+    unhashed.content_hash = std::nullopt;
+    const std::optional<sync::SyncOperation> no_hash =
+        sync::ResolveNewerOnServer(head, &unhashed, &last);
+    checks.Expect(no_hash.has_value() && no_hash->action == sync::Action::kConflict,
+                  "and so are local bytes that were never hashed");
+  }
+
+  // What the server said, where it said more than "upload".
+  {
+    sync::SyncOperation conflict = head;
+    conflict.action = sync::Action::kConflict;
+    const std::optional<sync::SyncOperation> kept =
+        sync::ResolveNewerOnServer(conflict, &local, &last);
+    checks.Expect(kept.has_value() && kept->action == sync::Action::kConflict,
+                  "a conflict the server names stays one, whatever the baseline says");
+
+    sync::SyncOperation download = head;
+    download.action = sync::Action::kDownload;
+    download.reason = sync::Reason::kServerNewer;
+    download.reason_text = sync::ReasonText(sync::Reason::kServerNewer);
+    const std::optional<sync::SyncOperation> taken =
+        sync::ResolveNewerOnServer(download, &local, &last);
+    checks.Expect(taken.has_value() && taken->action == sync::Action::kDownload &&
+                      taken->reason_text == download.reason_text,
+                  "a download the server names, over unchanged bytes, is that download");
+    sync::ClientSaveState moved = local;
+    moved.content_hash = edited;
+    const std::optional<sync::SyncOperation> guarded =
+        sync::ResolveNewerOnServer(download, &moved, &last);
+    checks.Expect(guarded.has_value() && guarded->action == sync::Action::kConflict,
+                  "...and over changed ones, a conflict: progress never synced is not "
+                  "replaced without being recorded as one");
+
+    sync::SyncOperation nothing = head;
+    nothing.action = sync::Action::kNoOp;
+    nothing.reason = sync::Reason::kContentIdentical;
+    const std::optional<sync::SyncOperation> idle =
+        sync::ResolveNewerOnServer(nothing, &local, &last);
+    checks.Expect(idle.has_value() && idle->action == sync::Action::kNoOp,
+                  "a no_op is a no_op: the head already holds these bytes");
+  }
+
+  // Nothing to run: the failure stands and the next tick negotiates again.
+  {
+    sync::SyncOperation unknown = head;
+    unknown.action = sync::Action::kNoOp;
+    unknown.known_action = false;
+    unknown.action_text = "merge";
+    checks.Expect(!sync::ResolveNewerOnServer(unknown, &local, &last).has_value(),
+                  "an action this build does not know resolves to nothing");
+    sync::SyncOperation nameless = head;
+    nameless.save_id = std::nullopt;
+    checks.Expect(!sync::ResolveNewerOnServer(nameless, &local, &last).has_value(),
+                  "and so does a head the server names no row for");
+  }
 }
 
 // --- the rig scenarios --------------------------------------------------------
@@ -1644,6 +1782,289 @@ void Relaunched(rig::Checks& checks, http::HttpClient& client, const std::string
 
 }  // namespace
 
+// --- newer on server ------------------------------------------------------------
+//
+// #232's acceptance, against a real RomM: a second device uploads to the slot
+// between this tick's negotiate and its upload, and the tick ends in a download
+// or a conflict -- never a blind upload over that device's save -- with the
+// local bytes under `.backup/` first. Both run under `crash::Recorder`, so the
+// overwrite the resolution makes is held to the ordering every other overwrite
+// is: a power cut at any call leaves the old bytes, or the new ones beside a
+// backup of the old (docs/SYNC_PROTOCOL.md#backups).
+//
+// "Another device" is an upload with no `device_id`, which RomM records against
+// no device -- the same thing RetroArch's or Argosy's would be to this one. It
+// lands after `PassASecond`, because a version written in the same second as
+// the head it follows does not become the head (#227's same-second tie), and
+// this would then be testing the tie.
+
+/// Lets every request through, except that the first upload waits for
+/// `before` -- the other device's -- to land first.
+class Interposed final : public http::HttpClient {
+ public:
+  Interposed(http::HttpClient& inner, std::function<void()> before)
+      : inner_(inner), before_(std::move(before)) {}
+
+  http::Result Send(const http::Request& request) override {
+    if (before_ != nullptr && request.method == http::Method::kPost &&
+        request.url.find("/api/saves?") != std::string::npos) {
+      const std::function<void()> run = std::move(before_);
+      before_ = nullptr;
+      run();
+      fired = true;
+    }
+    return inner_.Send(request);
+  }
+  http::Result Download(const http::Request& request, const http::DownloadTarget& into) override {
+    return inner_.Download(request, into);
+  }
+
+  bool fired = false;
+
+ private:
+  http::HttpClient& inner_;
+  std::function<void()> before_;
+};
+
+/// A slot this device synced at `synced`, holding `local` on the card now.
+struct SyncedSlot {
+  std::string slot;
+  std::string name = "tick-newer.srm";
+  harness::Save mine;
+  sync::ClientSaveState local;
+  std::vector<sync::SaveTarget> targets;
+  state::Baseline previous;
+};
+
+bool ArrangeSynced(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                   const Fixture& fixture, Sandbox& sandbox, const harness::Rom& rom,
+                   std::string_view label, const std::string& synced, const std::string& local,
+                   SyncedSlot* out) {
+  out->slot = harness::UniqueSlot(label);
+  const std::string staged = sandbox.Host("/config/rommsync/synced.srm");
+  rig::WriteFile(staged, synced);
+  if (!harness::UploadSave(client, base, fixture, rom.id, out->slot, "m2-7", staged, out->name,
+                           /*with_device=*/true, &out->mine)) {
+    checks.Expect(false, "this device's copy was stored, with its sync row");
+    return false;
+  }
+  sandbox.SeedSave(SavePath(out->name), local);
+  // Reported newer than anything the server holds, so the plan for it is an
+  // upload -- which is the operation the guard is about.
+  out->local = harness::LocalSave(rom.id, out->name, out->slot, "m2-7", crypto::Md5Hex(local),
+                                  std::chrono::system_clock::now() + std::chrono::seconds{300},
+                                  static_cast<std::int64_t>(local.size()));
+  out->targets = {{rom.id, out->slot, SavePath(out->name), out->name}};
+
+  state::SaveRecord row;
+  row.rom_id = rom.id;
+  row.slot = out->slot;
+  row.content_hash = crypto::Md5Hex(synced);
+  row.mtime = sync::Timestamp{} + std::chrono::seconds{1'757'000'000};
+  row.file_size_bytes = static_cast<std::int64_t>(synced.size());
+  row.server_content_hash = crypto::Md5Hex(synced);
+  out->previous.Set(row);
+  return true;
+}
+
+/// Another device's upload to `slot`, a second after whatever came before it.
+bool OtherDeviceUploads(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                        const Fixture& fixture, const harness::Rom& rom, const std::string& slot,
+                        const std::string& name, const std::string& staged, harness::Save* out) {
+  harness::PassASecond();
+  const bool stored = harness::UploadSave(client, base, fixture, rom.id, slot, "m2-7", staged,
+                                          name, /*with_device=*/false, out);
+  checks.Expect(stored, "the other device's upload landed");
+  return stored;
+}
+
+/// Bytes unchanged since this device last synced them, and a head another
+/// device wrote -- twice: once before the tick, so negotiate plans the upload
+/// #227 found every device meets after another one writes, and once more inside
+/// it, so the head the plan named is no longer the head. The tick must take the
+/// newest, as a download.
+void NewerDownload(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                   const Fixture& fixture, const harness::Rom& rom) {
+  Sandbox sandbox(checks, "tick-newer-download");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const std::string mine = "the bytes this device synced\n";
+  const std::string before = "another device's save, before the tick\n";
+  const std::string during = "another device's save, during the tick\n";
+
+  SyncedSlot arranged;
+  if (!ArrangeSynced(checks, client, base, fixture, sandbox, rom, "m10-6-download", mine, mine,
+                     &arranged)) {
+    return;
+  }
+  std::vector<std::int64_t> planted = {arranged.mine.id};
+  const auto sweep = [&]() {
+    for (const std::int64_t id : planted) {
+      harness::DeleteSave(client, base, fixture, id);
+    }
+  };
+
+  const std::string first = sandbox.Host("/config/rommsync/before.srm");
+  const std::string second = sandbox.Host("/config/rommsync/during.srm");
+  rig::WriteFile(first, before);
+  rig::WriteFile(second, during);
+  harness::Save earlier;
+  if (!OtherDeviceUploads(checks, client, base, fixture, rom, arranged.slot, arranged.name, first,
+                          &earlier)) {
+    sweep();
+    return;
+  }
+  planted.push_back(earlier.id);
+
+  harness::Save later;
+  Interposed racing(client, [&]() {
+    if (OtherDeviceUploads(checks, client, base, fixture, rom, arranged.slot, arranged.name,
+                           second, &later)) {
+      planted.push_back(later.id);
+    }
+  });
+
+  sync::TickResult tick;
+  {
+    crash::Recorder recorder(sandbox.root());
+    tick = sync::RunTick(racing, *files, TokenFor(base, fixture), {arranged.local},
+                         arranged.targets, arranged.previous, OptionsAt(1'757'000'600));
+    crash::ExpectSurvives(checks, recorder,
+                          {SavePath(arranged.name), mine, during, harness::kBackupDir},
+                          rig::ScratchDir() + "/crash-newer-download",
+                          "a 409 resolved as a download");
+  }
+
+  checks.Expect(racing.fired, "the other device's upload landed between negotiate and upload");
+  checks.ExpectEq(tick.resolved.refused, std::size_t{1}, "the slot guard refused the upload");
+  checks.Expect(tick.resolved.renegotiated, "the tick asked the server again, once");
+  checks.ExpectEq(tick.resolved.resolved, std::size_t{1}, "and resolved the refusal");
+  checks.Expect(tick.outcome == sync::TickOutcome::kCompleted,
+                std::string("the tick completed: ") + sync::ToString(tick.outcome) +
+                    (tick.executed.warnings.empty() ? std::string()
+                                                    : " -- " + tick.executed.warnings[0]));
+  if (tick.executed.operations.size() == 1 && tick.negotiated.plan.operations.size() == 1) {
+    const sync::OperationResult& done = tick.executed.operations[0];
+    checks.Expect(done.outcome == sync::OperationOutcome::kDownloaded,
+                  std::string("unchanged bytes take the head as a download: ") +
+                      sync::ToString(done.outcome) + " -- " + done.message);
+    checks.Expect(tick.negotiated.plan.operations[0].save_id == std::optional<std::int64_t>(later.id),
+                  "of the head as it is now, not the one the first plan named");
+  } else {
+    checks.Expect(false, "the tick carries the one operation this run arranged");
+  }
+  checks.ExpectEq(sandbox.Read(SavePath(arranged.name)), during,
+                  "the card holds the other device's newest save");
+  checks.Expect(sandbox.HasBackupOf(mine), "and this device's bytes are under .backup/");
+
+  // Never a blind upload: the slot holds this device's first copy and the
+  // other device's two, and nothing else.
+  checks.ExpectEq(SaveRowsFor(client, base, fixture, rom.id, arranged.slot, nullptr), 3,
+                  "nothing was uploaded over the other device's save");
+
+  // The download was confirmed against the head, so the guard is satisfied and
+  // the next tick has nothing to do -- the loop #227 found ends here.
+  sync::ClientSaveState now;
+  if (LocalSaveOnCard(checks, *files, sandbox, rom.id, arranged.name, arranged.slot, &now)) {
+    const sync::TickResult next =
+        sync::RunTick(client, *files, TokenFor(base, fixture), {now}, arranged.targets,
+                      StoredBaseline(*files).value, OptionsAt(1'757'000'601));
+    checks.Expect(next.outcome == sync::TickOutcome::kCompleted && next.resolved.refused == 0,
+                  std::string("the next tick draws no 409: ") + sync::ToString(next.outcome));
+    checks.Expect(next.executed.operations.size() == 1 &&
+                      next.executed.operations[0].outcome == sync::OperationOutcome::kNoOp,
+                  "and has nothing to do");
+  }
+  sweep();
+}
+
+/// Bytes changed here since the last sync, and another device's upload landing
+/// between negotiate and upload: both sides moved, so it is a conflict -- the
+/// head on the card, the local bytes under `.backup/`, and an entry in the
+/// conflict history.
+void NewerConflict(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                   const Fixture& fixture, const harness::Rom& rom) {
+  Sandbox sandbox(checks, "tick-newer-conflict");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const std::string mine = "the bytes this device last synced\n";
+  const std::string edited = "this device played on since, and saved\n";
+  const std::string theirs = "another device's save, during the tick\n";
+
+  SyncedSlot arranged;
+  if (!ArrangeSynced(checks, client, base, fixture, sandbox, rom, "m10-6-conflict", mine, edited,
+                     &arranged)) {
+    return;
+  }
+  std::vector<std::int64_t> planted = {arranged.mine.id};
+  const auto sweep = [&]() {
+    for (const std::int64_t id : planted) {
+      harness::DeleteSave(client, base, fixture, id);
+    }
+  };
+
+  const std::string staged = sandbox.Host("/config/rommsync/theirs.srm");
+  rig::WriteFile(staged, theirs);
+  harness::Save other;
+  Interposed racing(client, [&]() {
+    if (OtherDeviceUploads(checks, client, base, fixture, rom, arranged.slot, arranged.name,
+                           staged, &other)) {
+      planted.push_back(other.id);
+    }
+  });
+
+  sync::TickResult tick;
+  {
+    crash::Recorder recorder(sandbox.root());
+    tick = sync::RunTick(racing, *files, TokenFor(base, fixture), {arranged.local},
+                         arranged.targets, arranged.previous, OptionsAt(1'757'000'700));
+    crash::ExpectSurvives(checks, recorder,
+                          {SavePath(arranged.name), edited, theirs, harness::kBackupDir},
+                          rig::ScratchDir() + "/crash-newer-conflict",
+                          "a 409 resolved as a conflict");
+  }
+
+  checks.Expect(racing.fired, "the other device's upload landed between negotiate and upload");
+  checks.ExpectEq(tick.resolved.refused, std::size_t{1}, "the slot guard refused the upload");
+  checks.ExpectEq(tick.resolved.resolved, std::size_t{1}, "and the tick resolved it");
+  checks.Expect(tick.outcome == sync::TickOutcome::kCompleted,
+                std::string("the tick completed: ") + sync::ToString(tick.outcome) +
+                    (tick.executed.warnings.empty() ? std::string()
+                                                    : " -- " + tick.executed.warnings[0]));
+  if (tick.executed.operations.size() == 1 && tick.negotiated.plan.operations.size() == 1) {
+    const sync::OperationResult& done = tick.executed.operations[0];
+    checks.Expect(done.outcome == sync::OperationOutcome::kKeptBoth,
+                  std::string("changed bytes against a newer head are a conflict: ") +
+                      sync::ToString(done.outcome) + " -- " + done.message);
+    checks.Expect(tick.negotiated.plan.operations[0].action == sync::Action::kConflict,
+                  "and the plan the baseline and the history read says so");
+  } else {
+    checks.Expect(false, "the tick carries the one operation this run arranged");
+  }
+  checks.ExpectEq(sandbox.Read(SavePath(arranged.name)), theirs,
+                  "the server's head is on the card");
+  checks.Expect(sandbox.HasBackupOf(edited), "and this device's progress is under .backup/");
+  checks.ExpectEq(SaveRowsFor(client, base, fixture, rom.id, arranged.slot, nullptr), 2,
+                  "nothing was uploaded over the other device's save");
+
+  // The conflict reaches the history the overlay reads, with the guard's own
+  // sentence as the reason and the head's digest as the server side.
+  conflicts::History history(sandbox.Host("/config/rommsync/conflicts.db"));
+  const std::size_t recorded =
+      conflicts::RecordSaves(&history, tick.negotiated.plan, tick.executed, {arranged.local});
+  checks.ExpectEq(recorded, std::size_t{1}, "one conflict is recorded");
+  if (history.size() == 1) {
+    const conflicts::Entry& entry = history.entries()[0];
+    checks.Expect(entry.event == conflicts::Event::kConflict && entry.restorable(),
+                  "as a conflict whose local bytes can be restored");
+    checks.ExpectEq(entry.reason, std::string(sync::kSlotNewerDetail),
+                    "with the slot guard's own sentence as the reason");
+    checks.Expect(entry.server_content_hash == std::optional<std::string>(crypto::Md5Hex(theirs)),
+                  "and the head's digest as the server's side");
+  }
+  sweep();
+}
+
 int main(int argc, char** argv) {
   const std::string scenario = argc > 1 ? argv[1] : "recovery";
 
@@ -1664,7 +2085,7 @@ int main(int argc, char** argv) {
   // The eight that need no server, so they stay checked with docker stopped.
   if (scenario == "recovery" || scenario == "durable" || scenario == "backupdir" ||
       scenario == "offline" || scenario == "rescan" || scenario == "canceled" ||
-      scenario == "disabled" || scenario == "unsupported") {
+      scenario == "disabled" || scenario == "unsupported" || scenario == "newer_rule") {
     if (scenario == "recovery") {
       Recovery(checks);
     } else if (scenario == "durable") {
@@ -1679,6 +2100,8 @@ int main(int argc, char** argv) {
       Disabled(checks);
     } else if (scenario == "unsupported") {
       Unsupported(checks);
+    } else if (scenario == "newer_rule") {
+      NewerRule(checks);
     } else {
       Canceled(checks);
     }
@@ -1818,6 +2241,10 @@ int main(int argc, char** argv) {
     Scheduled(checks, *client, base, fixture, rom,
               R"({"mode":"drop","bytes":16,"path":"/api/sync/negotiate","count":9})",
               "a reset mid-negotiation");
+  } else if (scenario == "newer_download") {
+    NewerDownload(checks, *client, base, fixture, rom);
+  } else if (scenario == "newer_conflict") {
+    NewerConflict(checks, *client, base, fixture, rom);
   } else if (scenario == "resumes") {
     Resumes(checks, *client, base, fixture, rom);
   } else if (scenario == "relaunched") {

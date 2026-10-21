@@ -186,6 +186,12 @@ T
       # FAT may keep is swept and judged: old bytes or new, and never new
       # without the old under `.backup/`. `execute.crash_model` is the replay's
       # own check, and is in `^execute\.` already.
+      #
+      # `tick.newer_download` and `tick.newer_conflict` replay the same way over
+      # the overwrite a tick makes when RomM's slot guard refuses an upload and
+      # the tick takes the server's head instead (#232). It goes through
+      # `ExecutePlan`, so the census below has no new row; the replays are what
+      # hold the resolution to the ordering.
       cat <<'T'
 ^harness\.backup$
 ^execute\.
@@ -193,6 +199,8 @@ T
 ^states\.keeps_both$
 ^states\.crash$
 ^conflicts\.crash$
+^tick\.newer_download$
+^tick\.newer_conflict$
 ^tick\.backupdir$
 ^tick\.durable$
 T

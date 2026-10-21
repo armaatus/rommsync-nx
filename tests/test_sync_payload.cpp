@@ -509,6 +509,35 @@ void EncodesAnEmptyLibrary(checks::Checks& c) {
            "saves is an empty array, not a missing field");
 }
 
+/// `rom_ids` (#232): absent unless asked for, an array of ids when it is, and
+/// refused past RomM's own bound rather than sent to be refused there.
+void EncodesTheRomScope(checks::Checks& c) {
+  sync::SyncNegotiatePayload payload;
+  payload.saves.push_back(SampleSave());
+  {
+    const sync::Encoded unscoped = sync::EncodeNegotiateRequest(payload);
+    const json::ParseResult document = json::Parse(unscoped.body);
+    c.Expect(document.ok() && document.value.Find("rom_ids") == nullptr,
+             "an unscoped negotiation sends no rom_ids at all");
+  }
+  payload.rom_ids = std::vector<std::int64_t>{4, 9};
+  {
+    const sync::Encoded scoped = sync::EncodeNegotiateRequest(payload);
+    const json::ParseResult document = json::Parse(scoped.body);
+    const json::Value* ids = document.ok() ? document.value.Find("rom_ids") : nullptr;
+    c.Expect(ids != nullptr && ids->is_array() && ids->size() == 2 &&
+                 ids->elements()[0].is_integer() && ids->elements()[0].integer() == 4 &&
+                 ids->elements()[1].integer() == 9,
+             "a scoped one sends them as an array of integers: " + scoped.body);
+  }
+  payload.rom_ids = std::vector<std::int64_t>(sync::kMaxNegotiateRomIds + 1, 1);
+  const sync::Encoded too_many = sync::EncodeNegotiateRequest(payload);
+  c.Expect(!too_many.ok() && too_many.error.field == "rom_ids",
+           "more than RomM's 500 is refused here, by name");
+  payload.rom_ids = std::vector<std::int64_t>{0};
+  c.Expect(!sync::EncodeNegotiateRequest(payload).ok(), "and so is a rom id that is not one");
+}
+
 /// A file name RomM is entitled to store and a JSON encoder is entitled to get
 /// wrong. Built by concatenation this would end the string early and turn the
 /// rest of the entry into keys the server reads at face value.
@@ -678,6 +707,7 @@ int main() {
   EncodesTheSnapshotShape(c);
   EncodesTheAbsentFieldsAsNull(c);
   EncodesAnEmptyLibrary(c);
+  EncodesTheRomScope(c);
   QuotesRatherThanConcatenates(c);
   RefusesWhatItCannotSendFaithfully(c);
   FormatsTimestampsAsRomMReadsThem(c);

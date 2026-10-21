@@ -346,6 +346,22 @@ Encoded EncodeNegotiateRequest(const SyncNegotiatePayload& payload) {
     return encoded;
   }
 
+  if (payload.rom_ids.has_value()) {
+    // RomM's own bounds (`maxItems`, `exclusiveMinimum`), checked here so a body
+    // it would refuse whole is never sent.
+    if (payload.rom_ids->size() > kMaxNegotiateRomIds) {
+      encoded.error = Fail("rom_ids", "more than " + std::to_string(kMaxNegotiateRomIds) +
+                                          " roms in one negotiation");
+      return encoded;
+    }
+    for (const std::int64_t rom_id : *payload.rom_ids) {
+      if (rom_id <= 0) {
+        encoded.error = Fail("rom_ids", "a rom id is not positive");
+        return encoded;
+      }
+    }
+  }
+
   std::string body("{\"device_id\":");
   body += payload.device_id.has_value() ? json::Quote(*payload.device_id) : "null";
   body += ",\"saves\":[";
@@ -378,7 +394,18 @@ Encoded EncodeNegotiateRequest(const SyncNegotiatePayload& payload) {
     body += '}';
   }
 
-  body += "]}";
+  body += ']';
+  if (payload.rom_ids.has_value()) {
+    body += ",\"rom_ids\":[";
+    for (std::size_t index = 0; index < payload.rom_ids->size(); ++index) {
+      if (index != 0) {
+        body += ',';
+      }
+      body += std::to_string((*payload.rom_ids)[index]);
+    }
+    body += ']';
+  }
+  body += '}';
   encoded.body = std::move(body);
   return encoded;
 }

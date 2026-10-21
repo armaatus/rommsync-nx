@@ -202,7 +202,22 @@ struct SyncNegotiatePayload {
   /// nothing is how a client asks "what am I missing?", and it is the read-only
   /// shape the probe uses (docs/API_CONTRACT.md).
   std::vector<ClientSaveState> saves;
+
+  /// The roms this negotiation is about (`rom_ids`, RomM 5.3+), or absent for
+  /// all of them -- and absent is not sent at all.
+  ///
+  /// A negotiation offers every server save this device has no history for,
+  /// reported or not, so one that reports a few saves without this is answered
+  /// with a download for every other save in the library. The scope is what
+  /// keeps a narrow question a narrow answer (`sync-negotiate-rom-ids-scope.json`).
+  ///
+  /// At most `kMaxNegotiateRomIds` positive ids; the encoder refuses more, or a
+  /// non-positive one, rather than sending a body RomM answers with a 422.
+  std::optional<std::vector<std::int64_t>> rom_ids;
 };
+
+/// RomM 5.4.0's `maxItems` on `SyncNegotiatePayload.rom_ids`.
+inline constexpr std::size_t kMaxNegotiateRomIds = 500;
 
 /// A request body, or the reason there isn't one. `body` is empty on failure and
 /// must not be sent -- check `ok()`.
@@ -606,6 +621,17 @@ struct Negotiation {
 Negotiation Negotiate(http::HttpClient& client, const auth::StoredToken& token,
                       const std::vector<ClientSaveState>& saves,
                       const NegotiateOptions& options = {});
+
+/// The same call, scoped to `rom_ids` (`SyncNegotiatePayload::rom_ids`).
+///
+/// A name of its own rather than an overload, because `Negotiate(c, t, s, {})`
+/// would then be ambiguous. The one caller today is #232's second negotiation
+/// (sync_resolve.hpp), which asks about a handful of saves and must not be
+/// answered with the whole library.
+Negotiation NegotiateRoms(http::HttpClient& client, const auth::StoredToken& token,
+                          const std::vector<ClientSaveState>& saves,
+                          const std::vector<std::int64_t>& rom_ids,
+                          const NegotiateOptions& options = {});
 
 // --- step 3: complete ---------------------------------------------------------
 //

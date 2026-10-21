@@ -4,6 +4,7 @@
 // request and refuses what it cannot read.
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -403,9 +404,13 @@ auth::Parsed<SyncPlan> ParseNegotiateResponse(std::string_view body) {
   return parsed;
 }
 
-Negotiation Negotiate(http::HttpClient& client, const auth::StoredToken& token,
-                      const std::vector<ClientSaveState>& saves,
-                      const NegotiateOptions& options) {
+namespace {
+
+/// Both public spellings: `rom_ids` null is the unscoped negotiation.
+Negotiation NegotiateWith(http::HttpClient& client, const auth::StoredToken& token,
+                          const std::vector<ClientSaveState>& saves,
+                          const std::vector<std::int64_t>* rom_ids,
+                          const NegotiateOptions& options) {
   if (token.server_url.empty() || token.access_token.empty()) {
     return Refuse(NegotiateError::kNotRegistered, "this console is not paired");
   }
@@ -443,6 +448,9 @@ Negotiation Negotiate(http::HttpClient& client, const auth::StoredToken& token,
   SyncNegotiatePayload payload;
   payload.device_id = token.device_id;
   payload.saves = saves;
+  if (rom_ids != nullptr) {
+    payload.rom_ids = *rom_ids;
+  }
   const Encoded encoded = EncodeNegotiateRequest(payload);
   if (!encoded.ok()) {
     // The payload's own fields -- a blank `device_id` -- which the loop above
@@ -517,6 +525,21 @@ Negotiation Negotiate(http::HttpClient& client, const auth::StoredToken& token,
     waited += backoff;
     backoff = backoff * 2 > options.max_backoff ? options.max_backoff : backoff * 2;
   }
+}
+
+}  // namespace
+
+Negotiation Negotiate(http::HttpClient& client, const auth::StoredToken& token,
+                      const std::vector<ClientSaveState>& saves,
+                      const NegotiateOptions& options) {
+  return NegotiateWith(client, token, saves, nullptr, options);
+}
+
+Negotiation NegotiateRoms(http::HttpClient& client, const auth::StoredToken& token,
+                          const std::vector<ClientSaveState>& saves,
+                          const std::vector<std::int64_t>& rom_ids,
+                          const NegotiateOptions& options) {
+  return NegotiateWith(client, token, saves, &rom_ids, options);
 }
 
 }  // namespace rommsync::sync

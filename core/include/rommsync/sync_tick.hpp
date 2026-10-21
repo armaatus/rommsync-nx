@@ -56,6 +56,7 @@
 #include "rommsync/sync.hpp"
 #include "rommsync/sync_execute.hpp"
 #include "rommsync/sync_finish.hpp"
+#include "rommsync/sync_resolve.hpp"
 
 namespace rommsync::sync {
 
@@ -333,8 +334,19 @@ struct TickOptions {
 /// the one-line answer for the scheduler and `answer` the one for `auth::Gate`.
 struct TickResult {
   RecoveryReport recovered;
+
+  /// The plan, as executed. **An upload the slot guard refused (#232) is
+  /// replaced here by what the tick resolved it to** -- a download of the
+  /// server's head, or a conflict -- and its result in `executed` with it, so
+  /// the two still pair by position and say what happened to the save
+  /// (sync_resolve.hpp). `resolved` says whether that happened.
   Negotiation negotiated;
   ExecutionReport executed;
+
+  /// The one second negotiation a tick may make, for the uploads RomM's slot
+  /// guard answered with a 409. Empty when none was.
+  ResolveReport resolved;
+
   TickCompletion finished;
 
   TickOutcome outcome = TickOutcome::kCompleted;

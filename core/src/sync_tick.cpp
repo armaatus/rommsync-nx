@@ -239,6 +239,18 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
   result.executed =
       ExecutePlan(client, files, token, result.negotiated.plan, targets, execute);
 
+  // Before the baseline is written, because the baseline is written from the
+  // plan and the report this changes: an upload the slot guard refused becomes
+  // a download of the server's head, or a conflict, at the same index -- never
+  // another upload, and never more than one second negotiation (#232).
+  ResolveOptions resolve;
+  resolve.negotiate = negotiate;
+  resolve.execute = execute;
+  resolve.complete = options.finish.complete;
+  resolve.complete.cancel = options.cancel;
+  result.resolved = ResolveRefusedUploads(client, files, token, reported, targets, previous,
+                                          &result.negotiated.plan, &result.executed, resolve);
+
   // Always, including after a cancellation and after a 401. The baseline is
   // local and is the expensive thing to lose; the completion call is the cheap
   // one, and with the token plumbed a cancelled tick abandons it without a
