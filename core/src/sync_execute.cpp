@@ -442,7 +442,8 @@ bool KeepsLocal(const ExecuteOptions& options, const SyncOperation& operation) {
   return false;
 }
 
-/// `POST /api/saves?...&overwrite=false` with the local file as `saveFile`.
+/// `POST /api/saves?...&content_hash=<md5>&overwrite=false` with the local file
+/// as `saveFile`.
 OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
                        const auth::StoredToken& token, const SyncPlan& plan,
                        const SyncOperation& operation, const SaveTarget* target,
@@ -471,6 +472,21 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
   }
   url += "&session_id=" + std::to_string(plan.session_id);
   url += "&device_id=" + http::EncodeQueryValue(token.device_id);
+  if (options.content_hash) {
+    // The file is hashed here, as it goes, rather than taken from the scan: the
+    // card may have moved on since step 0, and RomM keeps this digest as proof
+    // of what this device holds. A report matching it later reads as "this side
+    // did not change", so it has to be the digest of the bytes that went up --
+    // a stale one would be a proof of something false (#234). A save that
+    // cannot be hashed is not uploaded without one.
+    const state::HashOutcome digest = state::HashFile(source);
+    if (!digest.ok()) {
+      return Fail(operation, OperationError::kUnreadableCard,
+                  "the local save " + target->sd_path +
+                      " could not be hashed to upload: " + digest.message);
+    }
+    url += "&content_hash=" + digest.content_hash;
+  }
   // `overwrite=false` is RomM's slot guard, asked for by name: a slot that holds
   // a save this device has not synced -- another device's, since the plan was
   // made or before it -- answers 409 instead of being superseded. Only a player
@@ -716,7 +732,13 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
                     std::string(kSavesPath) + "/" + std::to_string(save_id) + "/downloaded"),
              token, options.timeout, options.cancel);
   confirm.headers.push_back({"Content-Type", "application/json"});
-  confirm.body = "{\"device_id\":" + json::Quote(token.device_id) + "}";
+  // The digest of the bytes now on the card, verified equal to the plan's above,
+  // is what records this device's baseline (#234): a claim about the card that
+  // is true by construction, never one about a copy this device does not hold.
+  confirm.body = "{\"device_id\":" + json::Quote(token.device_id) +
+                 (options.content_hash ? ",\"content_hash\":" + json::Quote(digest.content_hash)
+                                       : std::string()) +
+                 "}";
   const http::Result confirmed = client.Send(confirm);
   if (const auto refused = Refused(confirmed, "the download confirmation")) {
     // Counted failed on purpose, even though the bytes are correct: as far as

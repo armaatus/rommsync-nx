@@ -440,6 +440,20 @@ struct ExecuteOptions {
   /// that fills it is #240's.
   std::vector<std::pair<std::int64_t, std::optional<std::string>>> keep_local;
 
+  /// Whether an upload and a `/downloaded` carry `content_hash`: the MD5 of the
+  /// file as it is uploaded, and of the verified bytes a download put on the
+  /// card (#234). RomM 5.4 keeps it as this device's baseline for the row, so a
+  /// later mtime-only touch -- Tico's atomic rewrites -- reads as unchanged
+  /// rather than as a conflict.
+  ///
+  /// `RunTick` sets it from `server::ServerCapabilities::hash_baselines`, which
+  /// is true on every server a tick executes against (a server below the 5.4.0
+  /// floor ends the tick `kUnsupported` first). The digest is always the bytes'
+  /// own MD5, never a ZIP's per-entry hash: RomM holds this device's baseline
+  /// only against what the same device reports later, so a function that
+  /// differs from the server's costs a suppression and can never invent one.
+  bool content_hash = true;
+
   /// Optional, not owned; must outlive the call. Checked between operations and
   /// passed to every request, so a shutdown ends the tick at an operation
   /// boundary rather than mid-write.

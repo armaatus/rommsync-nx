@@ -236,6 +236,7 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
 
   ExecuteOptions execute = options.execute;
   execute.cancel = options.cancel;
+  execute.content_hash = options.server.hash_baselines;
   result.executed =
       ExecutePlan(client, files, token, result.negotiated.plan, targets, execute);
 

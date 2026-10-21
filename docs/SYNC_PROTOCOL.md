@@ -193,9 +193,25 @@ For each `SyncOperationSchema`. The action is `no_op` — with the underscore:
 | action | do |
 |---|---|
 | `no_op` | nothing |
-| `upload` | `POST /api/saves?rom_id=&emulator=&slot=&session_id=&device_id=&overwrite=false`, multipart `saveFile` = local bytes; a **409** is resolved below |
-| `download` | `GET /api/saves/{save_id}/content` → **back up existing local file** → write to the file's SD path → `POST /api/saves/{save_id}/downloaded {device_id}` |
+| `upload` | `POST /api/saves?rom_id=&emulator=&slot=&session_id=&device_id=&content_hash=&overwrite=false`, multipart `saveFile` = local bytes; a **409** is resolved below |
+| `download` | `GET /api/saves/{save_id}/content` → **back up existing local file** → write to the file's SD path → `POST /api/saves/{save_id}/downloaded {device_id, content_hash}` |
 | `conflict` | resolve by policy (below) — **always back up the loser first** |
+
+**Both carry `content_hash`** (#234): the MD5 of the file hashed as it is
+uploaded, and of the verified bytes a download put on the card. RomM 5.4 keeps
+it as this device's baseline on that save row, and a later report that matches
+it proves this side did not change -- so an mtime-only touch (Tico's atomic
+rewrites) against a row that moved in place negotiates as `download`, not
+`conflict` (`tick.baseline_moved`, `tick.baseline_downloaded`). A baseline can
+only ever remove a conflict, never create one, and the one way it could remove a
+*real* one is a digest of bytes the server does not hold; hashing at the moment
+of upload, and confirming only the verified digest, is what rules that out
+(`harness::BaselineAudit`). It is the bytes' own MD5 even for a ZIP, whose
+server digest hashes the entries instead: RomM holds a device's baseline only
+against that device's later reports, so the different function costs the
+suppression and nothing else. A
+baseline lives on one row, and another device's upload is a new head with no
+history for this device -- that case is #232's 409 (`tick.baseline_other_row`).
 
 Three traps in the operation itself:
 

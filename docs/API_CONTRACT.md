@@ -543,12 +543,12 @@ re-send its whole buffer forever.
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/api/saves` | list; filter `rom_id, platform_id, device_id, slot` |
-| POST | `/api/saves` | upload; query `rom_id*, emulator, slot, device_id, session_id, overwrite, autocleanup, autocleanup_limit`; multipart field **`saveFile`** (+ optional `screenshotFile`) |
+| POST | `/api/saves` | upload; query `rom_id*, emulator, slot, device_id, content_hash, session_id, overwrite, autocleanup, autocleanup_limit`; multipart field **`saveFile`** (+ optional `screenshotFile`) |
 | PUT | `/api/saves/{id}` | replace one save's bytes in place; query `device_id` |
 | GET | `/api/saves/{id}` | one save → `SaveSchema`; query `device_id` — see `device_syncs` below |
 | GET | `/api/saves/{id}/content` | download raw save bytes; query `device_id`, `session_id` — **do not send them**, see below |
 | GET | `/api/saves/identifiers` | lightweight id/hash listing |
-| POST | `/api/saves/{id}/downloaded` | `{device_id}` — record that this device now holds this save |
+| POST | `/api/saves/{id}/downloaded` | `{device_id, content_hash}` — record that this device now holds this save; `content_hash` becomes the baseline when it equals the row's, or when the device's sync row already names the version it was served |
 | POST | `/api/saves/delete` | `{saves: [id, …]}` |
 | GET | `/api/states` | list; filter `rom_id, platform_id` — **no `device_id`, no `slot`** |
 | POST | `/api/states` | upload; query `rom_id*, emulator`; multipart field **`stateFile`** (+ optional `screenshotFile`) |
@@ -962,7 +962,7 @@ the issue that acts on it.
 | Identical bytes (same `content_hash`) create no version; the existing row is **promoted to head**. | Capture `saves-post-identical.json`: re-uploading the first version's bytes answers with the first version's `id`, and the slot still holds two rows. | #232, #236 |
 | `emulator` at most 50 characters and unchanged by filename sanitising, else 422 / 400. | Captures `saves-post-422-emulator-too-long.json` (51 characters, pydantic `string_too_long`) and `saves-post-400-emulator-not-a-folder-name.json` (`probe/emulator`, `"Invalid emulator name: probe/emulator"`). | #229 |
 | Uploading for a ROM the user cannot see is 404. | **Not captured**: the fixture has one user, who sees everything (`assert_rom_visible` in `add_save`). | — |
-| `content_hash` is MD5 of the bytes, **except a ZIP**, whose contents are hashed. | **Not captured**: no scenario uploads a zip (`hash_save_content`). The MD5 half is what every capture's `content_hash` already shows. | #234, #238 |
+| `content_hash` is MD5 of the bytes, **except a ZIP**, whose contents are hashed. | **Not captured**: no scenario uploads a zip (`hash_save_content`). The MD5 half is what every capture's `content_hash` already shows. The client reports the plain MD5 for a ZIP too (#234): the device's own digest is stored as `last_sync_hash` and only ever compared with that device's later reports (`compare_save_state`), so the mismatch loses a suppression and cannot invent one. | #234, #238 |
 | `AUTOSAVE_SLOT = "autosave"` is where a client with no slot of its own files progress. | **Not captured**: a constant, not a behaviour; the slot name is an ordinary string to the API. | #236 |
 | `GET /api/saves` and `GET /api/states` take a repeatable `rom_ids` (5.3). | Saves: capture `saves-list-rom-ids.json`, and the probe asserts every row is on one of the two roms it named. States: snapshot only. | #241 |
 | New `SaveSchema` fields `is_favorite`, `labels`. | Capture `saves-post.json` against 5.2.0's. | — |
