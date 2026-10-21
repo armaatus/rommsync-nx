@@ -174,6 +174,13 @@ check_image_budget() {
   grep -q 'past its' <<<"$out" ||
     { echo "$out" >&2; fail "a 4 KiB image budget failed, but not on the image's size"; }
 
+  # The .ovl's ceiling, the same way (#211): nx-ovlloader reads the whole file
+  # into its heap without checking that it fits.
+  out="$(image_budget --ovl-budget 4096 2>&1)" &&
+    { echo "$out" >&2; fail "a 4 KiB .ovl ceiling passed; the overlay's size is not being held"; }
+  grep -q 'ovl-rommsync.ovl is .* past the' <<<"$out" ||
+    { echo "$out" >&2; fail "a 4 KiB .ovl ceiling failed, but not on the .ovl's size"; }
+
   # The .bss tie, against a main.cpp that declares a 4 KiB heap over the one linked:
   # the check has to read the constant out of the source it was built from, or
   # a heap that grew without the constant moving would go unnoticed.
