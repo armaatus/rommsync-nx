@@ -1743,12 +1743,13 @@ set_tests_properties(artifacts.parser PROPERTIES TIMEOUT 60)
 # settings an upgrade was supposed to keep.
 set(PACKAGE_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_package.sh")
 
-# All four of these stub the two Switch artifacts -- four bytes of magic is all
-# the script inspects -- so they need neither Docker nor a cross-compiler and
-# none of them ever skips.
+# These stub the two Switch artifacts -- four bytes of magic is all the script
+# inspects -- or, for `toolbox`, need none at all, so they need neither Docker
+# nor a cross-compiler and none of them ever skips.
 foreach(scenario
-        layout          # the unpacked tree is exactly the six paths #32 and #33 specify
-        refuses         # a wrong .nsp, an unsigned .ovl, a missing input
+        layout          # the unpacked tree is exactly the install layout, flags/ included
+        toolbox         # every toolbox.json ovl-sysmodules skips or aborts on is refused (#211)
+        refuses        # a wrong .nsp, an unsigned .ovl, a missing input
         deterministic   # the same inputs, the same bytes
         upgrade)        # unzipping over an install keeps config.ini and the rest
   add_test(NAME package.${scenario}

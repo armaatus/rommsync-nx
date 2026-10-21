@@ -4,14 +4,17 @@
 # produce the same bytes, and that unzipping over an existing install does not
 # take a user's settings with it.
 #
-#   test_package.sh layout         the unpacked tree is exactly the six paths
-#                                  #32 and #33 specify, with the title id
+#   test_package.sh layout         the unpacked tree is exactly the paths
+#                                  #32, #33 and #211 specify, with the title id
 #                                  directory taken from sys-rommsync.json rather
 #                                  than typed here, and nothing else in it. The
 #                                  sixth is toolbox.json, which ovl-sysmodules
 #                                  parses -- so it is asserted as JSON with the
 #                                  three fields that overlay requires, not just
 #                                  as a name in the list.
+#   test_package.sh toolbox        every toolbox.json ovl-sysmodules would skip, or
+#                                  abort on, is refused by the check that reads
+#                                  the packaged one (#211).
 #   test_package.sh refuses        a .nsp that is not PFS0 and an .ovl with no
 #                                  ULTR signature are refused, and no archive is
 #                                  left behind. Both build, zip and install
@@ -84,6 +87,69 @@ run_package() {
 
 # --- the tree ------------------------------------------------------------------
 
+# The layout, path by path AND in order. The order is not decoration: it is
+# half of what makes two runs byte-identical, and `deterministic` cannot see
+# it -- that phase compares two runs of the same script, so it stays green
+# through any reordering of ENTRIES. This is the only place the order is
+# pinned.
+#
+# `flags/` is a directory entry, deliberately (#211): ovl-sysmodules has
+# `mkdir`ed it before writing boot2.flag only since its #6 ("autostart can't be
+# enabled if the flags folder doesn't exist"), and builds without that fix are
+# still in the wild. An empty directory costs nothing and enables nothing --
+# boot2.flag inside it is what does that, and it is not shipped.
+expected_entries() {
+  printf '%s\n' \
+    "README.txt" \
+    "LICENSE" \
+    "atmosphere/contents/$1/exefs.nsp" \
+    "atmosphere/contents/$1/toolbox.json" \
+    "atmosphere/contents/$1/flags/" \
+    "config/rommsync/config.ini.example" \
+    "switch/.overlays/ovl-rommsync.ovl"
+}
+
+# assert_archive ZIP TID -- the archive, read as an archive. The same assertions
+# over the stubbed build `layout` packages and the real one `builds` does, so
+# what CI ships is held to what the stubs are.
+assert_archive() {
+  local zip="$1" tid="$2"
+  [ -s "$zip" ] || fail "no $zip"
+
+  # Read off the archive rather than off the unpacked tree: an entry named
+  # `/etc/passwd` or `../../atmosphere` is normalised away by unzip and would be
+  # invisible in a `find` of the result. This is the only place it can be seen.
+  local entries
+  entries="$(unzip -Z1 "$zip")" || fail "cannot list $zip"
+
+  # Junk a macOS or Windows zip tool adds, which Ultrahand filters both when it
+  # builds a zip and again when it scans one -- which says how often it turns up.
+  local entry
+  while IFS= read -r entry; do
+    case "$entry" in
+      /*)     fail "absolute path in the archive: $entry" ;;
+      ../*|*/../*|*/..|..) fail "a .. entry in the archive: $entry" ;;
+      *\\*)   fail "a backslash in an archive path: $entry" ;;
+      __MACOSX/*|*/.DS_Store|.DS_Store|._*|*/._*|Thumbs.db|*/Thumbs.db)
+              fail "editor/OS junk in the archive: $entry" ;;
+    esac
+  done <<<"$entries"
+
+  local expected
+  expected="$(expected_entries "$tid")"
+  [ "$entries" = "$expected" ] || {
+    echo "--- in the archive ---"; printf '%s\n' "$entries"
+    echo "--- expected ---";       printf '%s\n' "$expected"
+    fail "the archive is not the install layout"
+  }
+
+  # A directory entry, by the zip's own record of it and not only by a trailing
+  # slash in its name: zipinfo prints the entry's mode, and a directory's starts
+  # with `d`.
+  unzip -Z "$zip" "atmosphere/contents/$tid/flags/" | grep -q '^d' ||
+    fail "atmosphere/contents/$tid/flags/ is not a directory entry"
+}
+
 phase_layout() {
   bash -n "$PACKAGE" || fail "scripts/package.sh does not parse"
 
@@ -96,42 +162,10 @@ phase_layout() {
   run_package --out "$out" > "$manifest" || fail "packaging failed"
 
   local zip="$out/rommsync-nx-$VERSION.zip"
-  [ -s "$zip" ] || fail "no $zip"
-
-  # Read off the archive rather than off the unpacked tree: an entry named
-  # `/etc/passwd` or `../../atmosphere` is normalised away by unzip and would be
-  # invisible in a `find` of the result. This is the only place it can be seen.
-  local entries
-  entries="$(unzip -Z1 "$zip")" || fail "cannot list $zip"
-
-  local entry
-  while IFS= read -r entry; do
-    case "$entry" in
-      /*)     fail "absolute path in the archive: $entry" ;;
-      ../*|*/../*|*/..) fail "a .. entry in the archive: $entry" ;;
-      *\\*)   fail "a backslash in an archive path: $entry" ;;
-      __MACOSX/*|*/.DS_Store|.DS_Store) fail "editor/OS junk in the archive: $entry" ;;
-    esac
-  done <<<"$entries"
-
-  # The layout, path by path AND in order. The order is not decoration: it is
-  # half of what makes two runs byte-identical, and `deterministic` cannot see
-  # it -- that phase compares two runs of the same script, so it stays green
-  # through any reordering of ENTRIES. This is the only place the order is
-  # pinned.
-  local expected
-  expected="$(printf '%s\n' \
-    "README.txt" \
-    "LICENSE" \
-    "atmosphere/contents/$tid/exefs.nsp" \
-    "atmosphere/contents/$tid/toolbox.json" \
-    "config/rommsync/config.ini.example" \
-    "switch/.overlays/ovl-rommsync.ovl")"
-  [ "$entries" = "$expected" ] || {
-    echo "--- in the archive ---"; printf '%s\n' "$entries"
-    echo "--- expected ---";       printf '%s\n' "$expected"
-    fail "the archive is not the install layout"
-  }
+  assert_archive "$zip" "$tid"
+  local expected entries
+  expected="$(expected_entries "$tid")"
+  entries="$(unzip -Z1 "$zip")"
 
   # The manifest the script prints is what docs/INSTALL.md (#35) will be checked
   # against, so it has to name the same paths the archive holds.
@@ -178,9 +212,11 @@ phase_layout() {
 
   # boot2.flag is what makes Atmosphere launch the sysmodule at boot. Shipping
   # it contradicts "installed disabled first" (M8-2), and creating it is
-  # ovl-sysmodules' job. Asserted on the name rather than on the flags/
-  # directory, and #33 settled why there is no such directory to assert on:
-  # ovl-sysmodules `mkdir`s it itself before writing the flag into it.
+  # ovl-sysmodules' job. The directory it goes in arrives, empty (#211).
+  [ -d "$tree/atmosphere/contents/$tid/flags" ] ||
+    fail "unpacking did not create atmosphere/contents/$tid/flags/"
+  [ -z "$(ls -A "$tree/atmosphere/contents/$tid/flags")" ] ||
+    fail "atmosphere/contents/$tid/flags/ arrives holding something"
   [ ! -e "$tree/atmosphere/contents/$tid/flags/boot2.flag" ] ||
     fail "the archive ships boot2.flag; the sysmodule must arrive disabled"
   grep -q 'boot2' <<<"$entries" &&
@@ -224,6 +260,69 @@ phase_layout() {
 }
 
 # --- what it refuses to ship ---------------------------------------------------
+
+# --- toolbox.json, read the way the overlay that parses it would ----------------
+
+# Every way a toolbox.json can be wrong that ovl-sysmodules either skips in
+# silence or -- built -fno-exceptions over nlohmann/json, with no try/catch --
+# aborts on, taking every other sysmodule's entry with it (#211). Each is a
+# file the generator does not write today; this is what keeps it that way, by
+# showing the check refuses each one rather than trusting that it would.
+phase_toolbox() {
+  SCRATCH="$(mktemp -d)"
+  local check="$REPO_ROOT/tests/toolbox_check.py"
+  local tid=4200000000524D53 version=1.2.3 dir out
+  dir="$SCRATCH/$tid"
+  mkdir -p "$dir"
+
+  # toolbox_case NAME JSON [ARGS...] -- 0 when the check accepts it.
+  toolbox_case() {
+    printf '%s\n' "$2" > "$dir/toolbox.json"
+    out="$(python3 "$check" "$dir/toolbox.json" "$tid" "$version" "${@:3}" 2>&1)"
+  }
+  local good='{"name": "sys-rommsync", "tid": "4200000000524D53", "version": "1.2.3", "requires_reboot": false}'
+  toolbox_case good "$good" || { echo "$out" >&2; fail "a correct toolbox.json was refused"; }
+  toolbox_case good-npdm "$good" --program-id 0x4200000000524D53 ||
+    { echo "$out" >&2; fail "a toolbox.json agreeing with the NPDM was refused"; }
+
+  local name json
+  while IFS='|' read -r name json; do
+    [ -n "$name" ] || continue
+    toolbox_case "$name" "$json" && fail "toolbox.json with $name was accepted: $json"
+    grep -q '^FAIL: ' <<<"$out" || { echo "$out" >&2; fail "$name was refused without a reason"; }
+  done <<'EOF'
+requires_reboot as a string|{"name": "sys-rommsync", "tid": "4200000000524D53", "version": "1.2.3", "requires_reboot": "false"}
+requires_reboot as a number|{"name": "sys-rommsync", "tid": "4200000000524D53", "version": "1.2.3", "requires_reboot": 0}
+tid as a number|{"name": "sys-rommsync", "tid": 4200000000524, "version": "1.2.3", "requires_reboot": false}
+name as a bool|{"name": true, "tid": "4200000000524D53", "version": "1.2.3", "requires_reboot": false}
+version as a number|{"name": "sys-rommsync", "tid": "4200000000524D53", "version": 1.2, "requires_reboot": false}
+no name|{"tid": "4200000000524D53", "version": "1.2.3", "requires_reboot": false}
+no requires_reboot|{"name": "sys-rommsync", "tid": "4200000000524D53", "version": "1.2.3"}
+a fifth key|{"name": "sys-rommsync", "tid": "4200000000524D53", "version": "1.2.3", "requires_reboot": false, "author": "x"}
+a duplicated key|{"name": "sys-rommsync", "tid": "4200000000524D53", "version": "1.2.3", "requires_reboot": false, "requires_reboot": false}
+a 15-digit tid|{"name": "sys-rommsync", "tid": "420000000524D53", "version": "1.2.3", "requires_reboot": false}
+a 0x-prefixed tid|{"name": "sys-rommsync", "tid": "0x4200000000524D53", "version": "1.2.3", "requires_reboot": false}
+a lowercase tid beside an uppercase directory|{"name": "sys-rommsync", "tid": "4200000000524d53", "version": "1.2.3", "requires_reboot": false}
+another version|{"name": "sys-rommsync", "tid": "4200000000524D53", "version": "1.2.2", "requires_reboot": false}
+requires_reboot true|{"name": "sys-rommsync", "tid": "4200000000524D53", "version": "1.2.3", "requires_reboot": true}
+an array|[{"name": "sys-rommsync", "tid": "4200000000524D53", "version": "1.2.3", "requires_reboot": false}]
+a trailing comma|{"name": "sys-rommsync", "tid": "4200000000524D53", "version": "1.2.3", "requires_reboot": false,}
+EOF
+
+  # The same good file, in a directory that is not its tid: Atmosphere loads
+  # the directory, so the two have to name the same program.
+  mkdir -p "$SCRATCH/0100000000000352"
+  printf '%s\n' "$good" > "$SCRATCH/0100000000000352/toolbox.json"
+  python3 "$check" "$SCRATCH/0100000000000352/toolbox.json" "$tid" "$version" >/dev/null 2>&1 &&
+    fail "a toolbox.json naming $tid was accepted inside 0100000000000352/"
+
+  # ...and a tid the built NPDM does not carry: the toggle would launch a
+  # program id that is not this process.
+  toolbox_case npdm "$good" --program-id 0x4200000000524D54 &&
+    fail "a toolbox.json disagreeing with the NPDM's program id was accepted"
+
+  echo "ok: toolbox.json is held to its exact keys, types, tid, directory and program id"
+}
 
 phase_refuses() {
   SCRATCH="$(mktemp -d)"
@@ -346,8 +445,9 @@ phase_upgrade() {
   after="$(cd "$sd" && find . -type f -exec cksum {} \; | sort)"
 
   # Everything that was there before is still there, byte for byte -- including
-  # the boot2.flag that says the sysmodule is enabled, which an archive shipping
-  # a flags/ directory could not promise.
+  # the boot2.flag that says the sysmodule is enabled, inside the flags/
+  # directory the archive now also carries: a directory entry unpacked over a
+  # directory leaves what is in it alone.
   local line path
   while IFS= read -r line; do
     # `cksum` prints `crc size path`, so the path is everything after the second
@@ -428,9 +528,24 @@ phase_builds() {
   local zip="$SCRATCH/dist/rommsync-nx-$VERSION.zip"
   [ -s "$zip" ] || { cat "$log" >&2; fail "no $zip"; }
 
+  assert_archive "$zip" "$tid"
+
   local sd="$SCRATCH/sd"
   mkdir -p "$sd"
   unzip -qq "$zip" -d "$sd" || fail "cannot unpack $zip"
+
+  # toolbox.json's tid against the program id the kernel will actually give
+  # the process -- read out of the built NPDM, not out of the JSON that
+  # generated it (#211).
+  local npdm_id
+  npdm_id="$("${PYTHON:-python3}" "$REPO_ROOT/scripts/npdm-check.py" \
+                  --nsp "$SCRATCH/sysmodule/sys-rommsync.nsp" --print |
+                sed -n 's/^program_id: //p')"
+  [ -n "$npdm_id" ] || fail "npdm-check.py read no program id out of the built .nsp"
+  "${PYTHON:-python3}" "$REPO_ROOT/tests/toolbox_check.py" \
+      "$sd/atmosphere/contents/$tid/toolbox.json" "$tid" "$VERSION" \
+      --program-id "$npdm_id" ||
+    fail "the packaged toolbox.json disagrees with the build it ships beside"
 
   # The renames are the point: the build produced sys-rommsync.nsp, and what a
   # user installs is exefs.nsp under the title id.
@@ -446,9 +561,10 @@ phase_builds() {
 
 case "${1:-}" in
   layout)        phase_layout ;;
+  toolbox)       phase_toolbox ;;
   refuses)       phase_refuses ;;
   deterministic) phase_deterministic ;;
   upgrade)       phase_upgrade ;;
   builds)        phase_builds ;;
-  *) echo "usage: $0 {layout|refuses|deterministic|upgrade|builds}" >&2; exit 2 ;;
+  *) echo "usage: $0 {layout|toolbox|refuses|deterministic|upgrade|builds}" >&2; exit 2 ;;
 esac
