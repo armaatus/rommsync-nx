@@ -57,6 +57,7 @@
 #include "rommsync/log.hpp"
 #include "rommsync/play_sessions.hpp"
 #include "rommsync/rom_index.hpp"
+#include "rommsync/server_capabilities.hpp"
 #include "rommsync/state_db.hpp"
 #include "rommsync/version.hpp"
 // Named directly rather than through `engine.hpp`, because the heap table below
@@ -249,6 +250,14 @@ constexpr size_t kPlatformJsonBytes = 800;
 /// the width.
 constexpr size_t kRomJsonBytes = 2560;
 
+/// What `GET /api/heartbeat` weighs on the wire (M10-2, #228). Measured against
+/// the fixture: 1,166 bytes on RomM 5.2.0, about 1.6 KiB on 5.4.0, which added
+/// sections. It is the server's whole configuration and grows with its platform
+/// folders, so the estimate is ten times the measurement. Like the two above it
+/// is not a bound anything enforces; the parse it feeds is
+/// (`server::kMaxSystemBytes`).
+constexpr size_t kHeartbeatJsonBytes = 16 * 1024;
+
 /// How many entries fsdev caches per open `DIR`, against libnx's default of 32
 /// (M9-2, #207).
 ///
@@ -360,8 +369,14 @@ constexpr size_t kHeapRomPageResponse =
     kRomPageRows * kRomJsonBytes + kRomJsonBytes * kJsonDocumentPerTextByte;
 constexpr size_t kHeapDirectoryListing =
     kMaxListingsHeld * rommsync::fs::kMaxDirectoryEntries * kDirectoryEntryBytes;
-constexpr size_t kHeapListResponse = RoundUpToKiB(
-    std::max({kHeapPlatformsResponse, kHeapRomPageResponse, kHeapDirectoryListing}));
+// The heartbeat a tick reads first (M10-2, #228): its body, and the one member
+// of it that is parsed -- the walk past the rest builds nothing. Read on the
+// worker at the top of a tick and freed before the rom index is fetched, so it
+// is one more thing held one at a time.
+constexpr size_t kHeapHeartbeat =
+    kHeartbeatJsonBytes + rommsync::server::kMaxSystemBytes * kJsonDocumentPerTextByte;
+constexpr size_t kHeapListResponse = RoundUpToKiB(std::max(
+    {kHeapPlatformsResponse, kHeapRomPageResponse, kHeapDirectoryListing, kHeapHeartbeat}));
 // Beside whichever of those the tick holds: the index, and the page whose rows
 // are on their way into it, before it is freed.
 constexpr size_t kHeapRomIndex =
@@ -419,6 +434,8 @@ static_assert(kHeapRomPageResponse <= kHeapPlatformsResponse,
               "a rom page is now the largest response; it was chosen not to be (M9-19)");
 static_assert(kHeapDirectoryListing <= kHeapPlatformsResponse,
               "a listing is now the largest buffer; it was chosen not to be (M9-19)");
+static_assert(kHeapHeartbeat <= kHeapPlatformsResponse,
+              "the heartbeat is now the largest response the worker holds (#228)");
 static_assert(kHeapListResponse == 0x35400,
               "a response or listing bound moved; retotal the table");
 // The reservation that makes "its text, once" true has to reach every response
