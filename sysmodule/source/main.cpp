@@ -41,6 +41,7 @@
 #include "boot_wait.hpp"
 #include "card.hpp"
 #include "engine.hpp"
+#include "handle_budget.hpp"
 #include "http/http_wire.hpp"
 #include "http/ssl_http_client.hpp"
 #include "ipc/server.hpp"
@@ -633,9 +634,10 @@ void Log(const std::string& line) { Log(rommsync::log::Level::kInfo, line); }
 extern "C" {
 
 // A sysmodule has no applet session and wants one FS session, not the several
-// libnx opens for homebrew.
+// libnx opens for homebrew. The count is `handle_budget.hpp`'s, because each
+// session is a row in the handle table the npdm declares (#210).
 u32 __nx_applet_type = AppletType_None;
-u32 __nx_fs_num_sessions = 1;
+u32 __nx_fs_num_sessions = rommsync::sysmodule::handles::kFsSessions;
 
 // How many directory entries fsdev caches per open `DIR` (M9-2, #207). libnx
 // declares this weak and defaults it to 32, which is 784 bytes an entry -- about

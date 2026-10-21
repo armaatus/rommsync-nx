@@ -6,7 +6,9 @@
 #                       ELF: every `svc` instruction the image contains is a
 #                       capability the NPDM grants, ACI0 and ACID agree, the
 #                       ACID carries AcidFlag_Production and pool partition 2,
-#                       and no @PLACEHOLDER@ reached the artifact.
+#                       no @PLACEHOLDER@ reached the artifact, and the
+#                       filesystem mask, handle table and address space are the
+#                       ones M9-11 (#210) decided -- on both ACI0 and ACID.
 #
 # The parser half is `npdm.parser` in tests/CMakeLists.txt -- the same script's
 # --self-test, which reads no artifact and so runs everywhere. This entry cannot:

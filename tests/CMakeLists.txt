@@ -1658,6 +1658,17 @@ add_test(NAME npdm.parser
          COMMAND ${Python3_EXECUTABLE} "${NPDM_CHECK}" --self-test)
 set_tests_properties(npdm.parser PROPERTIES TIMEOUT 60)
 
+# M9-11 (#210): the three grants that were devkitPro's template until somebody
+# decided them -- the filesystem mask (SdCard only, not the `FormatSdCard` and
+# `CorruptSaveData` 0xFFFF... carried), the handle table (derived in
+# sysmodule/source/handle_budget.hpp) and the address space type. Read from the
+# config npdmtool is handed, so it runs on every push where `npdm.svcs` below
+# cannot; `npdm.svcs` asks the same of the NPDM npdmtool actually wrote.
+add_test(NAME npdm.grants
+         COMMAND ${Python3_EXECUTABLE} "${NPDM_CHECK}"
+                 --json "${CMAKE_SOURCE_DIR}/sysmodule/sys-rommsync.json")
+set_tests_properties(npdm.grants PROPERTIES TIMEOUT 60)
+
 # The real diff, over a real cross-compile. Its SKIP_RETURN_CODE is unwrapped
 # for the reason the long note above gives -- there is no NPDM without
 # npdmtool, and npdmtool is in the devkitpro image the host runner does not
