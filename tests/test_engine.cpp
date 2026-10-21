@@ -1597,6 +1597,84 @@ class SlowCard final : public fs::FileSystem {
   mutable bool held_ = false;
 };
 
+/// The bytes `SeedRestorable` lays out: what a sync overwrote, and what it
+/// wrote over them.
+constexpr const char* kRestorePrevious = "the bytes this console had\n";
+constexpr const char* kRestoreServerCopy = "the server's copy\n";
+
+/// One overwrite on `console`'s card, with its backup present and its entry in
+/// the history, before the engine boots. Answers the entry's id.
+std::int64_t SeedRestorable(checks::Checks& c, Console& console) {
+  // Switched off, so the worker's only work is the restore: a tick here would
+  // be a second thing on the card and a different scenario.
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini", "[sync]\nenabled = false\n"),
+           "a card with sync switched off");
+  const std::string save = harness::SavePath("game.srm");
+  const std::string backup = std::string(harness::kBackupDir) + "/4-retroarch-srm-1757000000.srm";
+  c.Expect(console.sandbox.SeedSave(save, kRestoreServerCopy),
+           "the save a sync wrote is on the card");
+  c.Expect(console.sandbox.Write(backup, kRestorePrevious),
+           "and so is the backup of what it replaced");
+  conflicts::History history(console.directory + conflicts::kHistoryFileName);
+  history.Load();
+  conflicts::Entry entry;
+  entry.kind = conflicts::EntryKind::kSave;
+  entry.event = conflicts::Event::kReplaced;
+  entry.rom_id = 4;
+  entry.rom_name = "Game";
+  entry.file_name = "game.srm";
+  entry.slot = "retroarch-srm";
+  entry.when = 1'757'000'000;
+  entry.sd_path = save;
+  entry.backup_sd_path = backup;
+  const auto appended = history.Append(entry);
+  c.Expect(appended.ok(), "the overwrite is in the history");
+  return appended.id;
+}
+
+/// M9-6 (#209), found in review: a restore pressed while the worker is still
+/// in its boot wait for the network runs now, not when the wait ends.
+///
+/// `RunWorker` waits up to `kNetworkWaitBudget` -- two minutes -- for `nifm` on
+/// a console that booted without Wi-Fi, and again after every wake from sleep
+/// until it has seen the network once. A restore is a copy between two files
+/// on the card and needs no network at all, so handing it to a worker parked
+/// in that wait would draw "Restoring..." for two minutes over nothing.
+void RestoreDuringBootWait(checks::Checks& c) {
+  Console console(c, "engine-restore-boot-wait");
+  const std::int64_t entry_id = SeedRestorable(c, console);
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseCard(card.get());
+  std::atomic<int> probes{0};
+  // The network never comes up, so the worker stays in the wait for the
+  // whole of this scenario unless something gets it out.
+  console.engine.UseNetworkProbe([&probes] {
+    ++probes;
+    return false;
+  });
+  console.engine.StartWorker();
+  for (int waited = 0; waited < 200 && probes.load() == 0; ++waited) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  }
+  c.Expect(probes.load() > 0, "the worker is in its wait for a network that is not there");
+
+  const auto start = std::chrono::steady_clock::now();
+  console.Restore(entry_id);
+  const ipc::RestoreState done = console.AwaitRestore(entry_id);
+  c.Expect(done.phase == ipc::RestorePhase::kDone,
+           std::string("the restore runs while the worker waits for the network: ") +
+               ipc::ToString(done.phase));
+  c.Expect(std::chrono::steady_clock::now() - start < std::chrono::seconds{5},
+           "and does not wait out the two-minute boot budget");
+  c.Expect(done.report.outcome == conflicts::RestoreOutcome::kRestored,
+           std::string("and it restored: ") + conflicts::ToString(done.report.outcome) + " -- " +
+               done.report.message);
+  c.ExpectEq(console.sandbox.Read(harness::SavePath("game.srm")), std::string(kRestorePrevious),
+             "the bytes are back on the card");
+}
+
 /// M9-6 (#209): a restore that takes as long as the card does holds no IPC
 /// call for that long.
 ///
@@ -1610,35 +1688,10 @@ class SlowCard final : public fs::FileSystem {
 /// while the copy is demonstrably still running.
 void RestoreIsPolled(checks::Checks& c) {
   Console console(c, "engine-restore-polled");
-  // Switched off, so the worker's only work is the restore: a tick here would
-  // be a second thing on the card and a different scenario.
-  c.Expect(console.sandbox.Write("/config/rommsync/config.ini", "[sync]\nenabled = false\n"),
-           "a card with sync switched off");
-
-  const std::string previous = "the bytes this console had\n";
-  const std::string server_copy = "the server's copy\n";
+  const std::string previous = kRestorePrevious;
+  const std::string server_copy = kRestoreServerCopy;
   const std::string save = harness::SavePath("game.srm");
-  const std::string backup = std::string(harness::kBackupDir) + "/4-retroarch-srm-1757000000.srm";
-  c.Expect(console.sandbox.SeedSave(save, server_copy), "the save a sync wrote is on the card");
-  c.Expect(console.sandbox.Write(backup, previous), "and so is the backup of what it replaced");
-  std::int64_t entry_id = 0;
-  {
-    conflicts::History history(console.directory + conflicts::kHistoryFileName);
-    history.Load();
-    conflicts::Entry entry;
-    entry.kind = conflicts::EntryKind::kSave;
-    entry.event = conflicts::Event::kReplaced;
-    entry.rom_id = 4;
-    entry.rom_name = "Game";
-    entry.file_name = "game.srm";
-    entry.slot = "retroarch-srm";
-    entry.when = 1'757'000'000;
-    entry.sd_path = save;
-    entry.backup_sd_path = backup;
-    const auto appended = history.Append(entry);
-    c.Expect(appended.ok(), "the overwrite is in the history");
-    entry_id = appended.id;
-  }
+  const std::int64_t entry_id = SeedRestorable(c, console);
 
   SlowCard card(rommsync::host::MakeNativeFileSystem(console.sandbox.root().string()));
   console.Boot();
@@ -3039,6 +3092,8 @@ int main(int argc, char** argv) {
     RestoreDuringSync(checks);
   } else if (scenario == "restore_polled") {
     RestoreIsPolled(checks);
+  } else if (scenario == "restore_boot_wait") {
+    RestoreDuringBootWait(checks);
   } else if (scenario == "syncnow") {
     SyncNowStarts(checks);
   } else if (scenario == "unreachable") {

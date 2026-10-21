@@ -1351,6 +1351,47 @@ void Overlay(checks::Checks& c) {
              "and nothing is polled for a restore this screen did not start");
   }
 
+  // **A sysmodule that is slow to answer is not one that went away** (#209,
+  // found in review). The press's answer ran out of the client's budget, so
+  // whether the restore was taken is unknown -- but the session was never
+  // dropped, so nothing about the screen is stale. It keeps its rows and its
+  // entry, never sends the restore twice, and asks where it stands.
+  {
+    overlay::ConflictsModel model = OneRestorable(55);
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kRestore,
+             "the press goes out");
+    model.OnUnreachable(overlay::Link::kNotResponding);
+    overlay::ConflictsView view = model.Render();
+    c.Expect(view.link == overlay::Link::kNotResponding && !view.headline.empty(),
+             "the screen says the sysmodule is not responding");
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
+             "and asks it nothing more while it is not");
+    model.OnLinkRestored();
+    const overlay::ConflictsModel::Command next = model.Next();
+    c.Expect(next.kind == overlay::ConflictsModel::Command::Kind::kRestoreState,
+             "once it answers again, the screen asks where the restore stands -- it does not "
+             "press again for the user");
+    c.ExpectEq(model.loaded(), std::size_t{1}, "and the history it had loaded is still there");
+    conflicts::RestoreReport report;
+    report.outcome = conflicts::RestoreOutcome::kRestored;
+    model.OnRestoreState(Done(55, report));
+    view = model.Render();
+    c.Expect(view.mode == overlay::ConflictsMode::kDetail &&
+                 view.headline.find("Restored") != std::string::npos,
+             "so the outcome lands on the entry it was for: " + view.headline);
+  }
+
+  // ...while a page that ran out of budget is simply asked for again.
+  {
+    overlay::ConflictsModel model;
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kListConflicts,
+             "the first page goes out");
+    model.OnUnreachable(overlay::Link::kNotResponding);
+    model.OnLinkRestored();
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kListConflicts,
+             "and is asked again once the sysmodule answers");
+  }
+
   // The sysmodule forgot the restore -- it restarted mid-copy. The screen does
   // not wait for ever and does not claim an outcome it never heard.
   {
