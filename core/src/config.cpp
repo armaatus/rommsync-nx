@@ -1271,10 +1271,9 @@ LoadResult ParseConfig(std::string_view text) {
         defaults != DefaultPlatforms().end()) {
       // A section that sets only `emulator` or `play_with` is not a folder map,
       // so it does not replace one. "mGBA for GB" must not also mean "stop
-      // syncing GB", and
-      // nobody reading that one line could tell that it did -- nor a refused or
-      // emptied `emulator` line. A section with no lines at all is still the
-      // documented way to unmap a platform.
+      // syncing GB", and nobody reading that one line could tell that it did --
+      // nor a refused or emptied `emulator` line. A section with no lines at
+      // all is still the documented way to unmap a platform.
       result.value.platforms[slug] = defaults->second;
       continue;
     }

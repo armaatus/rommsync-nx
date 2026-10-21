@@ -689,6 +689,52 @@ void Placing(rig::Checks& checks) {
     checks.Expect(baseline.state_rows().empty(),
                   "and nothing was recorded as paired that is not");
   }
+
+  // Into a folder nothing has made yet (#237): the emulator makes a system's
+  // folder the first time it saves one, which for a placement is after.
+  {
+    Sandbox sandbox(checks, "states-placing-folder");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    ScriptedClient client;
+    client.listing = "[" + kServerRow + "]";
+    client.content = std::string(40, 'z');
+    const std::string target = "/tico/states/users/0123456789abcdef0123456789abcdef/nes/Game.state";
+    sync::StateSyncOptions options = OptionsAt(kStamp);
+    options.place = [&target](const sync::ServerState&) {
+      rommsync::place::Placement placement;
+      placement.sd_path = target;
+      return placement;
+    };
+    state::Baseline baseline;
+    const sync::StateSyncReport report =
+        sync::SyncStates(client, *files, token, StatesOn(true), index, &baseline, options);
+    checks.ExpectEq(report.completed, 1, "a state is placed into a folder that was not there");
+    checks.ExpectEq(sandbox.Read(target), std::string(40, 'z'), "with the server's bytes");
+  }
+
+  // And a placement that says why it places nothing carries the reason.
+  {
+    Sandbox sandbox(checks, "states-placing-reason");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    ScriptedClient client;
+    client.listing = "[" + kServerRow + "]";
+    sync::StateSyncOptions options = OptionsAt(kStamp);
+    options.place = [](const sync::ServerState&) {
+      rommsync::place::Placement placement;
+      placement.reason = "RetroArch syncs its own states itself";
+      return placement;
+    };
+    state::Baseline baseline;
+    const sync::StateSyncReport report =
+        sync::SyncStates(client, *files, token, StatesOn(true), index, &baseline, options);
+    checks.Expect(report.operations.size() == 1 &&
+                      report.operations.front().error == sync::StateError::kNoPlacement &&
+                      report.operations.front().message.find("syncs its own") !=
+                          std::string::npos,
+                  "the reason reaches the result");
+  }
 }
 
 // --- listing ------------------------------------------------------------------
@@ -1082,6 +1128,31 @@ void Crash(rig::Checks& checks, http::HttpClient& client, const std::string& bas
     crash::ExpectSurvives(checks, recorder,
                           {StatePath(name), mine, theirs, harness::kBackupDir},
                           rig::ScratchDir() + "/crash-state", "a state download over a state");
+  }
+
+  // #237: the same state reaching a console that has never held it, placed in
+  // Tico's folder -- no file, or all of it, and nothing beside it touched.
+  {
+    Sandbox fresh(checks, "states-crash-placed");
+    const std::unique_ptr<fs::FileSystem> card =
+        rommsync::host::MakeNativeFileSystem(fresh.root().string());
+    const std::string target = "/tico/states/gb/" + name;
+    fresh.MakeDirs("/tico/states/gb");
+    fresh.Write("/tico/states/gb/other.state", "another game's state, beside it");
+    sync::StateSyncOptions options = OptionsAt(kStamp);
+    options.place = [&target](const sync::ServerState&) {
+      rommsync::place::Placement placement;
+      placement.sd_path = target;
+      return placement;
+    };
+    state::Baseline none;
+    crash::Recorder recorder(fresh.root());
+    const sync::StateSyncReport placed =
+        sync::SyncStates(client, *card, token, StatesOn(true), index, &none, options);
+    checks.ExpectEq(placed.completed, 1, "the state was placed on a card that never held it");
+    checks.ExpectEq(fresh.Read(target), theirs, "with the server's bytes");
+    crash::ExpectCreated(checks, recorder, crash::Created{target, theirs},
+                         rig::ScratchDir() + "/crash-state-placed", "a state placement");
   }
 
   harness::DeleteState(client, base, fixture, state_id);

@@ -1,5 +1,6 @@
 #include "rommsync/placement.hpp"
 
+#include "rommsync/config_text.hpp"
 #include "rommsync/save_scan.hpp"
 #include "rommsync/save_source.hpp"
 
@@ -12,14 +13,18 @@
 namespace rommsync::place {
 namespace {
 
-std::string LowerAscii(std::string_view text) {
-  std::string out(text);
-  for (char& character : out) {
-    if (character >= 'A' && character <= 'Z') {
-      character = static_cast<char>(character - 'A' + 'a');
-    }
-  }
-  return out;
+using config::text::LowerAscii;
+
+/// A name the server supplied that a path join may take: one component, no
+/// control character. Its own check, not `sync::IsSingleFileName`'s, because
+/// that one lets a backslash through for the server's sake and a FAT card
+/// reads one as a separator.
+bool Joinable(std::string_view name) {
+  return !name.empty() && name != "." && name != ".." &&
+         name.find_first_of("/\\") == std::string_view::npos &&
+         std::none_of(name.begin(), name.end(), [](char character) {
+           return static_cast<unsigned char>(character) < 0x20;
+         });
 }
 
 /// A libretro core RomM's table names. Its saves are RetroArch's SRAM format,
@@ -129,26 +134,13 @@ std::string ExtensionFor(std::string_view emulator_id, std::string_view server_f
 
 }  // namespace
 
-Placement Place(const roms::Rom& rom, std::string_view emulator_id,
-                std::string_view server_file_name, const Layout& layout) {
+namespace {
+
+/// `<folder>[/<CoreFolder>]/<name>`, for a `name` already checked `Joinable`.
+Placement JoinUnder(const Layout& layout, std::string_view emulator_id, std::string_view name) {
   if (layout.folder.empty() || layout.folder.front() != '/') {
     return Refuse("there is no folder to put it in");
   }
-  // The rom's name comes off the server's filesystem, and this is the call that
-  // joins it into a path on the card.
-  const std::string_view stem = rom.fs_name_no_ext;
-  if (stem.empty() || stem == "." || stem == ".." ||
-      stem.find_first_of("/\\") != std::string_view::npos ||
-      std::any_of(stem.begin(), stem.end(),
-                  [](char character) { return static_cast<unsigned char>(character) < 0x20; })) {
-    return Refuse("the rom's name is not one a file can be called");
-  }
-  std::string why;
-  const std::string extension = ExtensionFor(emulator_id, server_file_name, &why);
-  if (extension.empty()) {
-    return Refuse(why);
-  }
-
   std::string path = layout.folder;
   while (path.size() > 1 && path.back() == '/') {
     path.pop_back();
@@ -157,12 +149,12 @@ Placement Place(const roms::Rom& rom, std::string_view emulator_id,
     if (!IsLibretro(emulator_id)) {
       // `RetroArchCoreFolder` would hand the id back unchanged, and a folder
       // named after it is one RetroArch never reads.
-      return Refuse("RetroArch sorts saves by core, and RomM's core table has no folder for " +
+      return Refuse("RetroArch sorts by core, and RomM's core table has no folder for " +
                     std::string(emulator_id));
     }
     path += "/" + scan::RetroArchCoreFolder(emulator_id);
   }
-  path += "/" + std::string(stem) + extension;
+  path += "/" + std::string(name);
   if (path.size() > config::kMaxPathLength) {
     return Refuse("the path would be longer than the " + std::to_string(config::kMaxPathLength) +
                   " characters this client writes");
@@ -170,6 +162,23 @@ Placement Place(const roms::Rom& rom, std::string_view emulator_id,
   Placement placed;
   placed.sd_path = std::move(path);
   return placed;
+}
+
+}  // namespace
+
+Placement Place(const roms::Rom& rom, std::string_view emulator_id,
+                std::string_view server_file_name, const Layout& layout) {
+  // The rom's name comes off the server's filesystem, and this is the call that
+  // joins it into a path on the card.
+  if (!Joinable(rom.fs_name_no_ext)) {
+    return Refuse("the rom's name is not one a file can be called");
+  }
+  std::string why;
+  const std::string extension = ExtensionFor(emulator_id, server_file_name, &why);
+  if (extension.empty()) {
+    return Refuse(why);
+  }
+  return JoinUnder(layout, emulator_id, rom.fs_name_no_ext + extension);
 }
 
 bool Compatible(std::string_view server_emulator, std::string_view target_emulator) {
@@ -219,8 +228,9 @@ Placer::Target Placer::TargetFor(const roms::Rom& rom, std::string_view server_e
         break;
       }
     }
-    const std::string root = tico::RootOf(target.map_folder);
-    if (target.map_folder.empty() || root.empty()) {
+    const std::string root =
+        target.map_folder.empty() ? std::string() : tico::RootOf(target.map_folder);
+    if (root.empty()) {
       target.reason = slug + " is played in Tico and the folder map lists no Tico folder for its " +
                       what;
       return target;
@@ -398,33 +408,18 @@ Placement Placer::State(std::int64_t rom_id, std::string_view file_name,
     return Refuse("rom " + std::to_string(rom_id) +
                   " is not in this console's copy of the library");
   }
-  // The server's name, kept: a state pairs on it. Held to the bar the scan
-  // holds a local one to, and to the one a path join needs.
-  if (file_name.empty() || !sync::IsSingleFileName(file_name) ||
-      file_name.find('\\') != std::string_view::npos ||
-      std::any_of(file_name.begin(), file_name.end(),
-                  [](char character) { return static_cast<unsigned char>(character) < 0x20; })) {
+  // The server's name, kept: a state pairs on it, and this is the call that
+  // joins it into a path.
+  if (!Joinable(file_name)) {
     return Refuse("the state's name is not one a file can be called");
   }
   const Target target = TargetFor(*rom, emulator, false);
   if (!target.reason.empty()) {
     return Refuse(target.reason);
   }
-  std::string path = target.layout.folder;
-  while (path.size() > 1 && path.back() == '/') {
-    path.pop_back();
-  }
-  if (target.layout.by_core) {
-    if (!IsLibretro(target.emulator_id)) {
-      return Refuse("RetroArch sorts states by core, and RomM's core table has no folder for " +
-                    target.emulator_id);
-    }
-    path += "/" + scan::RetroArchCoreFolder(target.emulator_id);
-  }
-  path += "/" + std::string(file_name);
-  if (path.size() > config::kMaxPathLength) {
-    return Refuse("the path would be longer than the " + std::to_string(config::kMaxPathLength) +
-                  " characters this client writes");
+  Placement placed = JoinUnder(target.layout, target.emulator_id, file_name);
+  if (!placed.ok()) {
+    return placed;
   }
   if (target.layout.play_with == config::PlayWith::kRetroArch &&
       retroarch_.savestates_in_content_dir) {
@@ -441,8 +436,6 @@ Placement Placer::State(std::int64_t rom_id, std::string_view file_name,
   if (const std::string why = ReadsBackAs(*rom, file_name, target, false); !why.empty()) {
     return Refuse(why);
   }
-  Placement placed;
-  placed.sd_path = std::move(path);
   return placed;
 }
 

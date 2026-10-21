@@ -56,7 +56,9 @@ struct Placement {
   std::string sd_path;
 
   /// Why there is no path, in a sentence for the log and the overlay. Never
-  /// quotes a server string: the rom and the slot are the caller's to name.
+  /// quotes the server's file name or slot -- whatever another client chose --
+  /// and the rom is the caller's to name. An emulator id RomM accepted may be
+  /// named.
   std::string reason;
 
   bool ok() const { return !sd_path.empty(); }
