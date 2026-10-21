@@ -531,6 +531,7 @@ foreach(scenario
         roundtrip  # the payloads, through both real codecs
         version    # a contract mismatch, end to end
         errors     # a refusal is not a transport failure, and neither is a bad payload
+        timeout    # a sysmodule that does not answer holds no frame past one budget
         portable   # the half of a screen that must keep compiling on a host
         draw)      # what the status screen actually asks to be drawn
   add_test(NAME overlay.${scenario} COMMAND test_overlay_native ${scenario})

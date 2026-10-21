@@ -28,15 +28,20 @@
 // by argv[1], so a red run names the behaviour that broke. Nothing here needs a
 // server, so nothing here skips.
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "checks.hpp"
@@ -71,10 +76,57 @@ namespace sysmodule = rommsync::sysmodule;
 /// bound the request, dispatch it, bound the response, and answer with the
 /// `Result` the real mapping produces.
 ///
-/// The knobs are the three things a *healthy* sysmodule cannot be asked to do
-/// on demand and that the overlay has code for anyway -- answer a payload from
-/// another build, answer one that will not parse, and claim a length that is
-/// not the one it wrote. Everything else goes through `ipc::Dispatch`.
+/// A sysmodule that does not answer until it is told to (M9-6, #209).
+///
+/// What a wedged IPC thread looks like from the overlay's side: the call goes
+/// out and nothing comes back. `Handle` runs on `IpcClient`'s worker, so this
+/// blocks *that* thread -- which is the whole claim under test: the draw thread
+/// is not the one that waits.
+class Hold {
+ public:
+  void Arm() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    armed_ = true;
+    entered_ = false;
+  }
+
+  void Release() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      armed_ = false;
+    }
+    changed_.notify_all();
+  }
+
+  /// The far side's half: wait here while armed.
+  void Pass() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!armed_) {
+      return;
+    }
+    entered_ = true;
+    changed_.notify_all();
+    changed_.wait(lock, [this] { return !armed_; });
+  }
+
+  /// A call is being held right now, or was within `budget`.
+  bool AwaitEntered(std::chrono::milliseconds budget) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return changed_.wait_for(lock, budget, [this] { return entered_; });
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  bool armed_ = false;
+  bool entered_ = false;
+};
+
+/// The knobs are the things a *healthy* sysmodule cannot be asked to do on
+/// demand and that the overlay has code for anyway -- answer a payload from
+/// another build, answer one that will not parse, claim a length that is not
+/// the one it wrote, and not answer at all. Everything else goes through
+/// `ipc::Dispatch`.
 class HostSysmodule : public hostswitch::Server {
  public:
   explicit HostSysmodule(ipc::ServiceCore& core) : core_(core) {}
@@ -86,13 +138,19 @@ class HostSysmodule : public hostswitch::Server {
   /// The reply's length word, when it is to disagree with what was written.
   std::optional<std::uint64_t> claim_length;
 
-  int calls = 0;
+  /// Armed, every call blocks before it is dispatched. See `Hold`.
+  Hold hold;
+
+  /// Atomic because a call the overlay gave up on is still running on the
+  /// client's worker while the test reads this.
+  std::atomic<int> calls{0};
   std::uint32_t last_command = 0;
   std::string last_request;
 
   Result Handle(u32 command_id, const void* request, std::size_t request_size, void* response,
                 std::size_t capacity, u64* length) override {
     ++calls;
+    hold.Pass();
     last_command = command_id;
     last_request.assign(static_cast<const char*>(request), request_size);
     *length = 0;
@@ -380,7 +438,7 @@ int RunWire(Checks& checks) {
     ipc::ConfigResult result;
     const Result rc = client.SetConfig(huge, &result);
     checks.Expect(R_FAILED(rc), "an over-long request fails");
-    checks.ExpectEq(console.sysmodule().calls, before,
+    checks.ExpectEq(console.sysmodule().calls.load(), before,
                     "...without reaching the sysmodule at all");
   }
   return checks.failures();
@@ -712,6 +770,141 @@ int RunErrors(Checks& checks) {
                   "and a port that will not re-open is 'not running'");
     checks.Expect(!client.open(), "the session is dropped rather than kept");
   }
+  return checks.failures();
+}
+
+// --- overlay.timeout ----------------------------------------------------------
+
+/// The budget these scenarios give a call. Short, so a red run is quick; the
+/// device's is `IpcClient::kCallBudget`.
+constexpr std::chrono::milliseconds kTestBudget{60};
+
+/// How long a call that is meant to return at once may take on a loaded CI
+/// runner. Well under any budget a frame could notice.
+constexpr std::chrono::milliseconds kPrompt{40};
+
+/// Generous, for the waits that are not the claim: a thread starting, a late
+/// answer arriving.
+constexpr std::chrono::milliseconds kPatience{5000};
+
+using Clock = std::chrono::steady_clock;
+
+std::chrono::milliseconds Since(Clock::time_point start) {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start);
+}
+
+/// M9-6 (#209): a sysmodule that does not answer holds the overlay's draw
+/// thread for one budget, once, and then not at all.
+///
+/// Before this, `IpcClient::Call` was `serviceDispatchOut` on the draw thread,
+/// and a call into a wedged sysmodule blocked there **forever** -- the overlay
+/// frozen on the panel, holding exclusive input, with nothing a user can press.
+int RunTimeout(Checks& checks) {
+  Console console;
+  console.Start();
+  overlay::IpcClient client(kTestBudget);
+  overlay::ScreenFrame frame(client);
+  checks.Expect(frame.Ready() == overlay::Link::kOk, "the handshake passes while it answers");
+
+  // The bound. The call comes back at the budget with a `Result` of its own,
+  // while the far side is still sitting on it.
+  console.sysmodule().hold.Arm();
+  {
+    const Clock::time_point start = Clock::now();
+    ipc::Status status;
+    status.queue_depth = 1234;
+    const Result rc = client.GetStatus(&status);
+    const std::chrono::milliseconds took = Since(start);
+    checks.Expect(console.sysmodule().hold.AwaitEntered(kPatience),
+                  "the call reached the sysmodule, which is sitting on it");
+    checks.ExpectEq(rc, overlay::NotResponding(), "a call past its budget is NotResponding");
+    checks.Expect(took >= kTestBudget, "...after the budget, not before it");
+    checks.Expect(took < kTestBudget + kPatience, "...and not long after it");
+    checks.ExpectEq(status.queue_depth, static_cast<std::int64_t>(1234),
+                    "the caller's struct is left alone");
+    ipc::Error refusal = ipc::Error::kOk;
+    checks.Expect(!overlay::DecodeError(rc, &refusal),
+                  "it is not a refusal the sysmodule named -- nothing was answered");
+  }
+
+  // What it means, and what it does not do. **The session is not dropped**:
+  // the worker is still inside a call on it, and closing a handle another
+  // thread is dispatching on is the one thing worse than waiting.
+  checks.Expect(frame.Diagnose(overlay::NotResponding()) == overlay::Link::kNotResponding,
+                "Diagnose names it 'not responding', not 'not running'");
+  checks.Expect(client.open(), "...and keeps the session the call is still on");
+  checks.Expect(client.busy(), "the client knows a call is still out");
+  {
+    const overlay::StatusView view = overlay::RenderUnreachable(overlay::Link::kNotResponding);
+    checks.Expect(!view.headline.empty() && !view.hint.empty(),
+                  "kNotResponding renders a headline and something to do about it");
+    checks.Expect(view.headline != overlay::RenderUnreachable(overlay::Link::kNotRunning).headline,
+                  "...and it is not the 'not running' sentence: it is running, and stuck");
+  }
+
+  // **Once, and then not at all.** While the first call is still out, every
+  // later one is answered at once without being sent -- one session answers one
+  // request at a time -- so the frames after the first are not held either.
+  {
+    const int before = console.sysmodule().calls.load();
+    for (int frame_number = 0; frame_number < 5; ++frame_number) {
+      const Clock::time_point start = Clock::now();
+      ipc::ConfigView view;
+      const Result rc = client.GetConfig(&view);
+      checks.ExpectEq(rc, overlay::NotResponding(), "a frame while it is stuck is answered...");
+      checks.Expect(Since(start) < kPrompt, "...at once, not after another budget");
+    }
+    checks.ExpectEq(console.sysmodule().calls.load(), before,
+                    "and nothing more was sent into a session that has not answered");
+  }
+
+  // The handshake is bounded the same way. A fresh client whose first call --
+  // command 0 -- is held is "not responding", not "unreadable": `Ready` must not
+  // drop and reopen a session a worker is still dispatching on.
+  //
+  // Declared out here rather than in a block: its destructor waits for the call
+  // it still has out, and that call is released below.
+  overlay::IpcClient fresh(kTestBudget);
+  overlay::ScreenFrame fresh_frame(fresh);
+  checks.Expect(fresh_frame.Ready() == overlay::Link::kNotResponding,
+                "a handshake that is not answered is kNotResponding");
+  checks.Expect(fresh.open(), "...on a session that is kept");
+
+  // It recovers by itself, and the late answer goes nowhere. The `Status` the
+  // sysmodule finally sends is not handed to whichever call comes next -- a
+  // `GetConfig` that decoded a `Status` would be a `MalformedResponse`, and one
+  // that *could* decode it would be worse.
+  console.sysmodule().hold.Release();
+  {
+    Result rc = overlay::NotResponding();
+    ipc::ConfigView view;
+    const Clock::time_point start = Clock::now();
+    while (rc == overlay::NotResponding() && Since(start) < kPatience) {
+      rc = client.GetConfig(&view);
+    }
+    checks.ExpectEq(rc, Result{0}, "once it answers, the next call goes through");
+    checks.Expect(!client.busy(), "and nothing is left out");
+    checks.Expect(frame.Ready() == overlay::Link::kOk, "the screen is back without a reopen");
+  }
+
+  // An exit with a call still out waits for it: the worker cannot be left
+  // running into an overlay that is about to be unloaded. libtesla releases
+  // input before `exitServices` (tesla.hpp's tail), so this waits holding none.
+  {
+    console.sysmodule().hold.Arm();
+    ipc::Status status;
+    checks.ExpectEq(client.GetStatus(&status), overlay::NotResponding(), "a call is left out");
+    std::thread releaser([&console] {
+      std::this_thread::sleep_for(std::chrono::milliseconds{100});
+      console.sysmodule().hold.Release();
+    });
+    client.Shutdown();
+    releaser.join();
+    checks.Expect(!client.open(), "Shutdown closes the session once the call is back");
+    checks.Expect(!client.busy(), "...with nothing left out");
+  }
+  fresh.Shutdown();
+  checks.ExpectEq(hostswitch::OpenSessions(), 0, "every session this scenario opened is closed");
   return checks.failures();
 }
 
@@ -1084,6 +1277,9 @@ int main(int argc, char** argv) {
   }
   if (scenario == "errors") {
     return RunErrors(checks);
+  }
+  if (scenario == "timeout") {
+    return RunTimeout(checks);
   }
   if (scenario == "portable") {
     return RunPortable(checks);
