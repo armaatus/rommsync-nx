@@ -77,6 +77,52 @@ toolchain_check_libnx() {
   esac
 }
 
+# --- running something in it ----------------------------------------------------
+#
+# The ctest entries that need the toolchain (`ctest -L toolchain`) reach it one
+# of two ways. On a workstation they `docker run` the pinned image over a copy of
+# the tree. In CI they are already inside it -- the `switch-build` job's
+# container is the pin, and it has no Docker to start another (M9-12, #211) --
+# so tests/toolchain_suite.sh sets ROMMSYNC_IN_TOOLCHAIN=1 and the same command
+# runs in place. Explicit rather than sniffed: a devkitPro installed natively on
+# a laptop is not the pin, and must not be mistaken for it.
+
+# toolchain_here -- is this shell inside the pinned image already?
+toolchain_here() { [ "${ROMMSYNC_IN_TOOLCHAIN:-}" = 1 ]; }
+
+# toolchain_missing -- prints why the toolchain cannot be reached, and succeeds,
+# when it cannot; fails silently when it can. For a test's skip message.
+toolchain_missing() {
+  if toolchain_here; then
+    [ -x "${DEVKITPRO:-/opt/devkitpro}/devkitA64/bin/aarch64-none-elf-gcc" ] && return 1
+    echo "ROMMSYNC_IN_TOOLCHAIN=1, but there is no devkitA64 here"
+    return 0
+  fi
+  command -v docker >/dev/null 2>&1 || { echo "no docker"; return 0; }
+  docker info >/dev/null 2>&1 || { echo "docker daemon not running"; return 0; }
+  docker image inspect "$DEVKITPRO_IMAGE" >/dev/null 2>&1 ||
+    { echo "$DEVKITPRO_IMAGE not pulled (docker pull $DEVKITPRO_IMAGE)"; return 0; }
+  return 1
+}
+
+# toolchain_run DIR SCRIPT [ARG...] -- `bash -lc SCRIPT` with DIR as its working
+# directory, inside the pinned toolchain, ARGs as its "$@". A login shell either
+# way, because the image's /etc/profile.d is what puts devkitPro on PATH.
+#
+# --user so a container build leaves files this user can delete: Docker Desktop
+# maps ownership back on macOS, but on Linux the default root would leave a
+# temp directory rm -rf cannot clear.
+toolchain_run() {
+  local dir="$1" script="$2"
+  shift 2
+  if toolchain_here; then
+    ( cd "$dir" && bash -lc "$script" _ "$@" )
+  else
+    docker run --rm --user "$(id -u):$(id -g)" -v "$dir:/work" -w /work \
+      "$DEVKITPRO_IMAGE" bash -lc "$script" _ "$@"
+  fi
+}
+
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   set -euo pipefail
   case "${1:-}" in

@@ -37,7 +37,6 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # The pinned image (#199), named in one place.
 # shellcheck source=../scripts/toolchain.sh
 . "$REPO_ROOT/scripts/toolchain.sh"
-IMAGE="$DEVKITPRO_IMAGE"
 SKIP=77
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -140,12 +139,11 @@ check_unwind_tables() {
       fail "no objects in $target/build; the unwind-table check would pass vacuously"
     expected=$(( expected + ${#objects[@]} ))
   done
-  report="$(docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work "$IMAGE" \
-      bash -lc 'for t in "$@"; do for o in "$t"/build/*.o; do
+  report="$(toolchain_run "$SCRATCH" 'for t in "$@"; do for o in "$t"/build/*.o; do
                   sections="$("$DEVKITPRO"/devkitA64/bin/aarch64-none-elf-readelf -SW "$o")" ||
                     { echo "unreadable $o"; continue; }
                   if grep -q "\.eh_frame" <<<"$sections"; then echo "unwind $o"; else echo "clean $o"; fi
-                done; done' _ "$@")" || fail "the container inspecting the objects failed"
+                done; done' "$@")" || fail "the toolchain inspecting the objects failed"
   [ "$(grep -c '^clean \|^unwind ' <<<"$report")" -eq "$expected" ] ||
     fail "inspected $(grep -c '^clean \|^unwind ' <<<"$report") of $expected objects:
 $report"
@@ -160,8 +158,7 @@ $(sed -n 's/^unwind //p' <<<"$report")"
 # inside the pinned image: the same script, run the same way, that the
 # `switch-build` job runs over its own checkout. The ceilings live there, once.
 image_budget() {
-  docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work "$IMAGE" \
-    bash -lc 'bash scripts/image-budget.sh "$@"' _ "$@"
+  toolchain_run "$SCRATCH" 'bash scripts/image-budget.sh "$@"' "$@"
 }
 
 # The budget, applied, and then shown to bite. A ceiling nothing has ever seen
@@ -193,10 +190,8 @@ check_image_budget() {
 }
 
 phase_builds() {
-  command -v docker >/dev/null 2>&1 || skip "no docker"
-  docker info >/dev/null 2>&1 || skip "docker daemon not running"
-  docker image inspect "$IMAGE" >/dev/null 2>&1 ||
-    skip "$IMAGE not pulled (docker pull $IMAGE)"
+  local missing
+  missing="$(toolchain_missing)" && skip "$missing"
 
   # The overlay does not build without libultrahand, and an un-initialised
   # submodule is an empty directory rather than a missing one -- so this is
@@ -236,11 +231,7 @@ phase_builds() {
 
   local log
   log="$SCRATCH/build.log"
-  # --user so the build leaves files this user can delete afterwards. Docker
-  # Desktop maps ownership back on macOS, but on Linux the default root would
-  # leave a temp directory rm -rf cannot clear.
-  if ! docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work "$IMAGE" \
-        bash -lc 'make -C sysmodule -j"$(nproc)" && make -C overlay -j"$(nproc)"' \
+  if ! toolchain_run "$SCRATCH" 'make -C sysmodule -j"$(nproc)" && make -C overlay -j"$(nproc)"' \
         >"$log" 2>&1; then
     cat "$log" >&2
     fail "devkitA64 build failed"
@@ -313,8 +304,7 @@ phase_builds() {
   # other, and sysmodule/README.md plans an http/ beside core/src/http.cpp. The
   # guard is in switch.mk; this is what says it still fires.
   : >"$SCRATCH/sysmodule/source/json.cpp"
-  if docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work "$IMAGE" \
-        bash -lc 'make -C sysmodule' >"$log" 2>&1; then
+  if toolchain_run "$SCRATCH" 'make -C sysmodule' >"$log" 2>&1; then
     fail "a source shadowing core/src/json.cpp built without complaint"
   fi
   grep -q 'share a basename' "$log" ||
@@ -329,10 +319,8 @@ phase_builds() {
 # --- the M0-1 probe ------------------------------------------------------------
 
 phase_tlsprobe() {
-  command -v docker >/dev/null 2>&1 || skip "no docker"
-  docker info >/dev/null 2>&1 || skip "docker daemon not running"
-  docker image inspect "$IMAGE" >/dev/null 2>&1 ||
-    skip "$IMAGE not pulled (docker pull $IMAGE)"
+  local missing
+  missing="$(toolchain_missing)" && skip "$missing"
 
   SCRATCH="$(mktemp -d)"
   cp "$REPO_ROOT/VERSION" "$REPO_ROOT/switch.mk" "$SCRATCH/"
@@ -348,8 +336,7 @@ phase_tlsprobe() {
   done
 
   local log="$SCRATCH/build.log"
-  if ! docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work "$IMAGE" \
-        bash -lc 'make -C tlsprobe -j"$(nproc)"' >"$log" 2>&1; then
+  if ! toolchain_run "$SCRATCH" 'make -C tlsprobe -j"$(nproc)"' >"$log" 2>&1; then
     cat "$log" >&2
     fail "the tlsprobe build failed"
   fi
@@ -390,9 +377,8 @@ phase_tlsprobe() {
 
   # The number this target exists to produce, printed on every run so a change
   # in it is visible in the log rather than only on someone's console.
-  docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work "$IMAGE" \
-    bash -lc '/opt/devkitpro/devkitA64/bin/aarch64-none-elf-size \
-      tlsprobe/rommsync-tlsprobe.elf'
+  toolchain_run "$SCRATCH" \
+    '"$DEVKITPRO"/devkitA64/bin/aarch64-none-elf-size tlsprobe/rommsync-tlsprobe.elf'
 
   echo "ok: the M0-1 probe builds as an NRO carrying $version, without core/"
 }

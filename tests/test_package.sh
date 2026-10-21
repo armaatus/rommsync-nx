@@ -45,7 +45,6 @@ PACKAGE="$REPO_ROOT/scripts/package.sh"
 # The pinned image (#199), named in one place.
 # shellcheck source=../scripts/toolchain.sh
 . "$REPO_ROOT/scripts/toolchain.sh"
-IMAGE="$DEVKITPRO_IMAGE"
 SKIP=77
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -382,10 +381,8 @@ phase_upgrade() {
 # --- the real thing ------------------------------------------------------------
 
 phase_builds() {
-  command -v docker >/dev/null 2>&1 || skip "no docker"
-  docker info >/dev/null 2>&1 || skip "docker daemon not running"
-  docker image inspect "$IMAGE" >/dev/null 2>&1 ||
-    skip "$IMAGE not pulled (docker pull $IMAGE)"
+  local missing
+  missing="$(toolchain_missing)" && skip "$missing"
   [ -f "$REPO_ROOT/overlay/lib/libultrahand/ultrahand.mk" ] ||
     skip "overlay/lib/libultrahand is empty (git submodule update --init --recursive)"
 
@@ -421,8 +418,7 @@ phase_builds() {
   # Packaged inside the container, not on this host: #34's release job runs the
   # script there, and "zip is not installed in the image" is a failure that
   # would otherwise only appear on a tag.
-  if ! docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work "$IMAGE" \
-        bash -lc 'make -C sysmodule -j"$(nproc)" && make -C overlay -j"$(nproc)" \
+  if ! toolchain_run "$SCRATCH" 'make -C sysmodule -j"$(nproc)" && make -C overlay -j"$(nproc)" \
                   && scripts/package.sh' >"$log" 2>&1; then
     cat "$log" >&2
     fail "the devkitA64 build-and-package failed"

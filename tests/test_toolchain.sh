@@ -229,12 +229,9 @@ EOF
 }
 
 phase_libnx() {
-  command -v docker >/dev/null 2>&1 || skip "no docker"
-  docker info >/dev/null 2>&1 || skip "docker daemon not running"
-  docker image inspect "$DEVKITPRO_IMAGE" >/dev/null 2>&1 ||
-    skip "$DEVKITPRO_IMAGE not pulled (docker pull $DEVKITPRO_IMAGE)"
-  docker run --rm -v "$REPO_ROOT/scripts:/scripts:ro" "$DEVKITPRO_IMAGE" \
-    bash -lc 'bash /scripts/toolchain.sh libnx' ||
+  local missing
+  missing="$(toolchain_missing)" && skip "$missing"
+  toolchain_run "$REPO_ROOT/scripts" 'bash toolchain.sh libnx' ||
     fail "$DEVKITPRO_IMAGE's libnx is not one toolchain.sh accepts (output above)"
 }
 

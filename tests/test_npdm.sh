@@ -26,7 +26,6 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # The pinned image (#199), named in one place.
 # shellcheck source=../scripts/toolchain.sh
 . "$REPO_ROOT/scripts/toolchain.sh"
-IMAGE="$DEVKITPRO_IMAGE"
 SKIP=77
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -37,10 +36,8 @@ cleanup() { [ -n "$SCRATCH" ] && rm -rf "$SCRATCH"; return 0; }
 trap cleanup EXIT
 
 phase_svcs() {
-  command -v docker >/dev/null 2>&1 || skip "no docker"
-  docker info >/dev/null 2>&1 || skip "docker daemon not running"
-  docker image inspect "$IMAGE" >/dev/null 2>&1 ||
-    skip "$IMAGE not pulled (docker pull $IMAGE)"
+  local missing
+  missing="$(toolchain_missing)" && skip "$missing"
 
   # A copy, not the worktree, for the reasons tests/test_switch_build.sh gives
   # in full: the container builds as root and three worktrees may be running
@@ -61,8 +58,7 @@ phase_svcs() {
   done
 
   local log="$SCRATCH/build.log"
-  if ! docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work "$IMAGE" \
-        bash -lc 'make -C sysmodule -j"$(nproc)"' >"$log" 2>&1; then
+  if ! toolchain_run "$SCRATCH" 'make -C sysmodule -j"$(nproc)"' >"$log" 2>&1; then
     cat "$log" >&2
     fail "the sysmodule cross-compile failed"
   fi
