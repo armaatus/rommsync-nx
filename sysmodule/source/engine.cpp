@@ -1814,6 +1814,7 @@ void SdEngine::RunOneTick() {
     case sync::TickOutcome::kCanceled:
     case sync::TickOutcome::kDisabled:
     case sync::TickOutcome::kRescanNeeded:
+    case sync::TickOutcome::kUnsupported:
       break;
   }
 
@@ -1888,6 +1889,7 @@ void SdEngine::RunOneTick() {
     case sync::TickOutcome::kOffline:
     case sync::TickOutcome::kRefused:
     case sync::TickOutcome::kUnauthorized:
+    case sync::TickOutcome::kUnsupported:
       last_sync_result_ = ipc::SyncResult::kFailed;
       break;
   }

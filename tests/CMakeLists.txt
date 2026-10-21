@@ -1479,6 +1479,7 @@ set(TICK_UNIT_SCENARIOS
   offline    # an unreachable server: the card is byte-for-byte what it was
   rescan     # a restored save stops the tick rather than negotiating without it
   canceled   # a token already fired ends the tick without a single request
+  unsupported  # M10-2: a server below the floor is never negotiated with
 )
 
 # M6-2 (#33). These are the same executables, registered under `toggle.` because

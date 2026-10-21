@@ -231,6 +231,9 @@ void Scheduler::Finished(TickOutcome outcome, http::Error transport) {
 
     case TickOutcome::kOffline:
     case TickOutcome::kRefused:
+    // A server too old to sync with (#228) is a refusal that an upgrade lifts:
+    // backed off like one, so the console asks again without hammering it.
+    case TickOutcome::kUnsupported:
       rescans_ = 0;
       break;
 

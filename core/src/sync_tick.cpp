@@ -152,6 +152,8 @@ const char* ToString(TickOutcome outcome) {
       return "disabled";
     case TickOutcome::kRescanNeeded:
       return "rescan_needed";
+    case TickOutcome::kUnsupported:
+      return "unsupported";
   }
   return "unknown";
 }
@@ -194,6 +196,14 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
 
   if (Canceled(options.cancel)) {
     result.outcome = TickOutcome::kCanceled;
+    return result;
+  }
+
+  if (!options.server.supported) {
+    // After the sweep, which is local and only ever puts a save back, and
+    // before the one request that would offer the card's saves to a server too
+    // old to arbitrate them (`TickOutcome::kUnsupported`).
+    result.outcome = TickOutcome::kUnsupported;
     return result;
   }
 

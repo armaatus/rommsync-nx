@@ -51,6 +51,7 @@
 #include "rommsync/auth_gate.hpp"
 #include "rommsync/file_system.hpp"
 #include "rommsync/http.hpp"
+#include "rommsync/server_capabilities.hpp"
 #include "rommsync/state_db.hpp"
 #include "rommsync/sync.hpp"
 #include "rommsync/sync_execute.hpp"
@@ -231,6 +232,18 @@ enum class TickOutcome {
   /// tick, which is harmless, and it only ever happens after a crash mid-commit.
   /// A caller that sweeps *before* it scans never sees this.
   kRescanNeeded,
+
+  /// The server is older than `server::kMinimumVersion` (M10-2, #228). **Nothing
+  /// was negotiated** and no save was offered to it: what a 5.2 or a 5.3 lacks
+  /// is what keeps one device's upload from silently superseding another's, so
+  /// syncing with one is worse than not syncing (#226 D1).
+  ///
+  /// The sweep has run, because it is local and it is what puts back a save an
+  /// interrupted commit parked -- a server being too old is no reason to leave a
+  /// player's save stranded as `.old`. Nothing after it does. The scheduler
+  /// treats it as `kRefused`: it does not change by asking again soon, and it
+  /// does change the day the server is upgraded, which the next tick notices.
+  kUnsupported,
 };
 
 /// Stable, log-friendly name. Never null.
@@ -282,6 +295,19 @@ struct TickOptions {
   /// further down anyway -- no backup, no overwrite. A tick that can still do
   /// half its work does it.
   bool create_backup_dir = true;
+
+  /// What the server can do, as `server::ReadServer` read it (M10-2, #228).
+  ///
+  /// The one struct every version-dependent behaviour in a tick asks, so it is
+  /// carried in here rather than re-derived per stage. One that is not
+  /// `supported` ends the tick `TickOutcome::kUnsupported` before negotiate --
+  /// decided **here** and not only by the caller that read it, for the reason
+  /// `enabled` is: a second caller that forgot to ask must not sync with a 5.2.
+  ///
+  /// It defaults to the floor, which has every flag set: a caller with no
+  /// server to have asked -- every unit test of one stage -- is not talking to
+  /// an old one. The engine always passes what it read.
+  server::ServerCapabilities server = server::CapabilitiesFor(server::kMinimumVersion);
 
   NegotiateOptions negotiate;
   ExecuteOptions execute;

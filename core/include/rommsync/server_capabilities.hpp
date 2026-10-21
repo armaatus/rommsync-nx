@@ -115,6 +115,10 @@ struct ServerCapabilities {
 /// header for what an unparseable version means.
 ServerCapabilities CapabilitiesFor(std::string_view version_text);
 
+/// The same, for a release this client names itself -- `kMinimumVersion`, as
+/// the capabilities a caller with no server to ask is assumed to have.
+ServerCapabilities CapabilitiesFor(const Version& version);
+
 /// `SYSTEM.VERSION` out of a heartbeat body, without parsing the rest of it.
 ///
 /// `value` is empty, and `ok()`, when the body is a JSON object that carries no

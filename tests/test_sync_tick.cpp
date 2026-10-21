@@ -39,6 +39,7 @@
 #include "rommsync/md5.hpp"
 #include "rommsync/state_db.hpp"
 #include "rommsync/scheduler.hpp"
+#include "rommsync/server_capabilities.hpp"
 #include "rommsync/sync_tick.hpp"
 
 namespace {
@@ -49,6 +50,7 @@ namespace fs = rommsync::fs;
 namespace http = rommsync::http;
 namespace io = rommsync::io;
 namespace json = rommsync::json;
+namespace server = rommsync::server;
 namespace state = rommsync::state;
 namespace sync = rommsync::sync;
 
@@ -727,6 +729,68 @@ void Disabled(rig::Checks& checks) {
                     sync::ToString(resumed.outcome));
   checks.ExpectEq(resumed.recovered.partials_removed, static_cast<std::size_t>(1),
                   "and this one did sweep the leftover the parked tick left alone");
+}
+
+/// M10-2 (#228): a server below `server::kMinimumVersion` is refused before
+/// negotiate, by the tick itself and not only by the engine that read the
+/// version -- the treatment `enabled` gets, for its reason: a second caller
+/// that forgot to ask is not a console that syncs with a 5.2.
+void Unsupported(rig::Checks& checks) {
+  Sandbox sandbox(checks, "tick-unsupported");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const std::string bytes = "a save a 5.2 server must not be offered\n";
+  sandbox.SeedSave(SavePath("old-server.srm"), bytes);
+  const std::string partial = http::PartialPathFor(io::TempPathFor(SavePath("old-server.srm")));
+  sandbox.Write(partial, "half a body");
+
+  auth::StoredToken token;
+  token.server_url = kNowhere;
+  token.access_token = "not-a-token";
+  token.device_id = "fixture-unsupported";
+
+  sync::ClientSaveState local;
+  local.rom_id = 1;
+  local.file_name = "old-server.srm";
+  local.slot = "tick-unsupported";
+  local.emulator = "m10-2";
+  local.content_hash = "0123456789abcdef0123456789abcdef";
+  local.updated_at = std::chrono::system_clock::now();
+  local.file_size_bytes = static_cast<std::int64_t>(bytes.size());
+
+  for (const char* old : {"5.2.0", "5.3.1"}) {
+    sync::TickOptions options = OptionsAt(1'757'000'400);
+    options.server = server::CapabilitiesFor(old);
+    CountingClient client;
+    const sync::TickResult refused =
+        sync::RunTick(client, *files, token, {local}, {}, /*previous=*/{}, options);
+    checks.Expect(refused.outcome == sync::TickOutcome::kUnsupported,
+                  std::string("RomM ") + old + " ends the tick as unsupported: " +
+                      sync::ToString(refused.outcome));
+    checks.ExpectEq(client.requests, 0,
+                    std::string("and no negotiate call is made to ") + old);
+    checks.Expect(!refused.ok(), "an unsupported tick is not a completed one");
+    checks.Expect(refused.answer == auth::Answer::kSilent,
+                  "and says nothing about the credentials");
+  }
+  checks.ExpectEq(sandbox.Read(SavePath("old-server.srm")), bytes, "the save is untouched");
+  // The sweep is local and puts back what an interrupted commit parked; a too
+  // old server is no reason to leave a player's save stranded as `.old`.
+  checks.Expect(!sandbox.Exists(partial), "the sweep still ran: it needs no server");
+
+  sync::TickOptions current = OptionsAt(1'757'000'401);
+  current.server = server::CapabilitiesFor("5.4.0");
+  CountingClient reachable;
+  const sync::TickResult asked =
+      sync::RunTick(reachable, *files, token, {local}, {}, /*previous=*/{}, current);
+  checks.Expect(reachable.requests > 0, "a 5.4.0 server is negotiated with");
+  checks.Expect(asked.outcome == sync::TickOutcome::kOffline,
+                std::string("and it is the missing server that stops it: ") +
+                    sync::ToString(asked.outcome));
+
+  checks.Expect(sync::TickOptions{}.server.supported,
+                "a caller that passes no capabilities is assumed to talk to the floor, which is "
+                "what every unit test of one stage is");
 }
 
 // --- the rig scenarios --------------------------------------------------------
@@ -1597,10 +1661,10 @@ int main(int argc, char** argv) {
   // returned its own count would copy the number out before the audit ran.
   rig::Checks checks;
 
-  // The seven that need no server, so they stay checked with docker stopped.
+  // The eight that need no server, so they stay checked with docker stopped.
   if (scenario == "recovery" || scenario == "durable" || scenario == "backupdir" ||
       scenario == "offline" || scenario == "rescan" || scenario == "canceled" ||
-      scenario == "disabled") {
+      scenario == "disabled" || scenario == "unsupported") {
     if (scenario == "recovery") {
       Recovery(checks);
     } else if (scenario == "durable") {
@@ -1613,6 +1677,8 @@ int main(int argc, char** argv) {
       Rescan(checks);
     } else if (scenario == "disabled") {
       Disabled(checks);
+    } else if (scenario == "unsupported") {
+      Unsupported(checks);
     } else {
       Canceled(checks);
     }

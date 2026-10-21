@@ -316,6 +316,10 @@ ServerCapabilities CapabilitiesFor(std::string_view version_text) {
   return caps;
 }
 
+ServerCapabilities CapabilitiesFor(const Version& version) {
+  return CapabilitiesFor(ToString(version));
+}
+
 auth::Parsed<std::string> ParseHeartbeatVersion(std::string_view body) {
   auth::Parsed<std::string> out;
   const std::optional<std::string_view> system = TopLevelMember(body, "SYSTEM", &out.error);
