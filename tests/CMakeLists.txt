@@ -1633,7 +1633,8 @@ set_tests_properties(switch.ci_requires_artifacts PROPERTIES TIMEOUT 60)
 add_test(NAME switch.builds
          COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" builds)
 set_tests_properties(switch.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600
-                     RUN_SERIAL TRUE)
+                     RUN_SERIAL TRUE
+                     ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
 
 # The M0-1 probe (tlsprobe/README.md). Same image, same reason it may skip as
 # switch.builds above -- and the same enforcement elsewhere: the `switch-build`
@@ -1641,7 +1642,8 @@ set_tests_properties(switch.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600
 add_test(NAME switch.tlsprobe
          COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" tlsprobe)
 set_tests_properties(switch.tlsprobe PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600
-                     RUN_SERIAL TRUE)
+                     RUN_SERIAL TRUE
+                     ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
 
 # --- M9-8: the toolchain and libultrahand are pinned -------------------------
 # Every Switch build pulled devkitpro/devkita64's moving tag and compiled a
@@ -1721,6 +1723,17 @@ add_test(NAME npdm.svcs COMMAND "${BASH_PROGRAM}" "${NPDM_TEST}" svcs)
 set_tests_properties(npdm.svcs PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900
                      RUN_SERIAL TRUE
                      ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
+
+# --- M9-12: what the console's loaders read out of the artifacts -------------
+# libnx's LNY2 stamp in MOD0, the overlay's NACP by Ultrahand's route, and the
+# build marker -- each a failure that builds green and is silent on a console
+# (#211). `switch.builds` runs scripts/artifact-check.py over a real build; this
+# is the script's own vectors, hand-built from the formats, so the offsets it
+# rests on are checked on every push and not only where a cross-compile can run.
+add_test(NAME artifacts.parser
+         COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/scripts/artifact-check.py"
+                 --self-test)
+set_tests_properties(artifacts.parser PROPERTIES TIMEOUT 60)
 
 # --- the release zip: scripts/package.sh -------------------------------------
 # The install layout is the one thing about this project a user meets before

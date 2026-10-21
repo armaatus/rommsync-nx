@@ -295,10 +295,29 @@ phase_builds() {
   grep -q 'rommsync::overlay::Render' "$ovl_lst" ||
     fail "the status screen's view model is not linked into the overlay"
 
-  # The overlay's NACP is where a user sees a version, and switch_rules will
-  # happily bake devkitPro's 1.0.0 default in if nothing sets APP_VERSION.
-  LC_ALL=C grep -aq "$version" "$SCRATCH/overlay/ovl-rommsync.nacp" ||
-    fail "the overlay NACP does not carry $version"
+  # What the console's loaders read out of the files themselves (M9-12, #211),
+  # each silent on a console when wrong. scripts/artifact-check.py says why
+  # each one matters; the short form:
+  #
+  #   lny2     libnx's HOS 21.0.0 stamp in MOD0. Ultrahand reads it off the
+  #            card and hides an overlay without it on Atmosphere >= 1.10.0.
+  #   nacp     the NACP parses by getOverlayInfo's route, with the name and the
+  #            version the menu shows -- switch_rules would happily bake
+  #            devkitPro's 1.0.0 default in if nothing set APP_VERSION, and an
+  #            entry whose NACP does not parse is skipped without a word.
+  #   version  ROMMSYNC_NX_VERSION=<VERSION> is a string in both, so a file
+  #            from a bug report says what it is, and --gc-sections cannot have
+  #            eaten the marker.
+  #
+  # The overlay has no NPDM to check: it runs inside nx-ovlloader's process,
+  # with nx-ovlloader's capabilities. npdm.svcs is the sysmodule's half.
+  local check="$REPO_ROOT/scripts/artifact-check.py"
+  "${PYTHON:-python3}" "$check" lny2 "$nsp" "$ovl" ||
+    fail "a shipped artifact lacks libnx's LNY2 stamp"
+  "${PYTHON:-python3}" "$check" nacp "$ovl" --title ovl-rommsync --version "$version" ||
+    fail "the overlay's NACP is not one Ultrahand would list as ovl-rommsync $version"
+  "${PYTHON:-python3}" "$check" version "$nsp" "$ovl" --version "$version" ||
+    fail "a shipped artifact does not say it is $version"
 
   # Two sources with the same basename produce one object and silently drop the
   # other, and sysmodule/README.md plans an http/ beside core/src/http.cpp. The
@@ -348,6 +367,9 @@ phase_tlsprobe() {
   # offset. A .nro without it is a file hbmenu will not launch.
   [ "$(dd if="$nro" bs=1 skip=16 count=4 2>/dev/null)" = "NRO0" ] ||
     fail "rommsync-tlsprobe.nro has no NRO0 magic"
+  # hbmenu launches it on the same HOS 21.0.0 kernel the shipped two run on.
+  "${PYTHON:-python3}" "$REPO_ROOT/scripts/artifact-check.py" lny2 "$nro" ||
+    fail "the probe lacks libnx's LNY2 stamp"
 
   # The probe asks for version.hpp without compiling core/ (ROMMSYNC_WANT_VERSION
   # in tlsprobe/Makefile). If that knob stops working the probe still builds and
