@@ -937,12 +937,17 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
       // shape of a shared library, not something the user can act on.
       continue;
     }
-    const std::string sd_path = options.place != nullptr ? options.place(server) : std::string();
+    const place::Placement placement =
+        options.place != nullptr ? options.place(server) : place::Placement{};
+    const std::string& sd_path = placement.sd_path;
     if (sd_path.empty()) {
       if (!record(Fail(server.rom_id, server.file_name, StateAction::kPlace,
                        StateError::kNoPlacement,
-                       "the server holds a state this console does not, and nothing said where a "
-                       "new one should go"))) {
+                       placement.reason.empty()
+                           ? "the server holds a state this console does not, and nothing said "
+                             "where a new one should go"
+                           : "the server holds a state this console does not, and none was "
+                             "placed: " + placement.reason))) {
         break;
       }
       continue;

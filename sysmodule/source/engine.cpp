@@ -22,6 +22,7 @@
 #include "rommsync/list_service.hpp"
 #include "rommsync/log.hpp"
 #include "rommsync/pairing.hpp"
+#include "rommsync/placement.hpp"
 #include "rommsync/play_sessions.hpp"
 #include "rommsync/retroarch_cfg.hpp"
 #include "rommsync/rom_index.hpp"
@@ -1476,29 +1477,6 @@ std::vector<play::SaveObservation> ObservationsOf(const std::vector<scan::SaveFi
   return observations;
 }
 
-/// Where a save or a state the console has no local copy of should be written.
-///
-/// Empty when there is nowhere to put it, which is what `ExecuteOptions::place`
-/// and `StateSyncOptions::place` both document as "fail this one rather than
-/// guessing" -- and it is the honest answer for a rom this client's index does
-/// not hold, or a platform the user never mapped a folder for.
-///
-/// **The server's file name is never trusted.** A `file_name` carrying a
-/// separator, or one that is `.` or `..`, would let a sync plan name a path
-/// outside the folder the user mapped; `sync::Validate` refuses the same shapes
-/// on the way in, and this refuses them again on the way out because this is the
-/// call that turns a name into a path.
-std::string PlaceUnder(const std::vector<std::string>& folders, std::string_view file_name) {
-  if (folders.empty() || file_name.empty() || file_name == "." || file_name == ".." ||
-      file_name.find('/') != std::string_view::npos ||
-      file_name.find('\\') != std::string_view::npos) {
-    return {};
-  }
-  // The first entry is the write target; the rest are only ever consulted when
-  // asking whether something is already there (config.hpp).
-  return folders.front() + "/" + std::string(file_name);
-}
-
 /// Write the one line that says why this console could not reach its server.
 ///
 /// Split on `http::Error::kTls` and nothing else, because that is where the
@@ -1918,24 +1896,14 @@ bool SdEngine::RunOneTick() {
     options.finish.play_sessions.push_back(buffered.session);
   }
   const roms::RomIndex* index = &library.index;
-  // One placement rule, applied to the two folder lists. Saves and states are
-  // placed the same way -- find the rom, find the platform the user mapped, put
-  // it in the first folder -- and the only thing that differs is which list.
-  // Written once so the two cannot drift into placing a state where a save goes.
-  const auto placer = [index, config](std::vector<std::string> config::PlatformFolders::*which) {
-    return [index, config, which](std::int64_t rom_id,
-                                  const std::string& file_name) -> std::string {
-      const roms::Rom* rom = index->ById(rom_id);
-      if (rom == nullptr) {
-        return {};
-      }
-      const config::PlatformFolders* folders = config->Platform(rom->platform_fs_slug);
-      return folders == nullptr ? std::string() : PlaceUnder(folders->*which, file_name);
-    };
-  };
-  options.execute.place = [place = placer(&config::PlatformFolders::saves)](
-                              const sync::SyncOperation& operation) {
-    return place(operation.rom_id, operation.file_name);
+  // A save or a state the card has never held goes to the emulator the
+  // platform is played in, in the layout the card is in this tick, under the
+  // name that emulator loads (#237) -- one placer for both, so the two cannot
+  // drift into placing a state where a save goes. It reads the card only when
+  // something is placed, and lives as long as both halves of the tick.
+  place::Placer placer(*config, retroarch_cfg.value, library.index, *files);
+  options.execute.place = [&placer](const sync::SyncOperation& operation) {
+    return placer.Save(operation);
   };
 
   // **Every save byte this tick writes happens under this**, so a restore
@@ -1993,9 +1961,8 @@ bool SdEngine::RunOneTick() {
     state_options.backup_dir = sync::kBackupDir;
     state_options.cancel = cancel.get();
     state_options.retroarch = retroarch_cfg.value;
-    state_options.place = [place = placer(&config::PlatformFolders::states)](
-                              const sync::ServerState& server) {
-      return place(server.rom_id, server.file_name);
+    state_options.place = [&placer](const sync::ServerState& server) {
+      return placer.State(server.rom_id, server.file_name, server.emulator);
     };
     states = sync::SyncStates(*client, *files, token, *config, library.index, &baseline,
                               state_options);

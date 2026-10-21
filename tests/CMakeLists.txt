@@ -962,6 +962,7 @@ set(EXECUTE_RIG_SCENARIOS
   upload          # overwrite=false, session_id and device_id -- and no 409 into a fresh slot
   download        # verify, back up, commit, confirm -- in that order
   crash           # M9-14: ...and a power cut at every call of it loses nothing
+  placed          # M10-11: a first-time restore makes its folder and writes over nothing, all or none
   conflict        # both sides changed: keep both, lose nothing
   same_timestamp  # ...and the no-history conflict, resolved the same way
   truncate        # a clean short body never replaces a save

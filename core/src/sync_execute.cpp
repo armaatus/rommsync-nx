@@ -609,7 +609,9 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   // `file_name` is tagged and the directory depends on the rom's platform.
   SaveTarget placed;
   if (target == nullptr) {
-    const std::string sd_path = options.place != nullptr ? options.place(operation) : std::string();
+    const place::Placement placement =
+        options.place != nullptr ? options.place(operation) : place::Placement{};
+    const std::string& sd_path = placement.sd_path;
     if (sd_path.empty()) {
       return Fail(operation, OperationError::kNoLocalSave,
                   "there is no local save for this (rom_id, slot) and nothing said where a new "

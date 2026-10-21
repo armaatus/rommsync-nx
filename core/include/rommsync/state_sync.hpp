@@ -60,6 +60,7 @@
 #include "rommsync/config.hpp"
 #include "rommsync/file_system.hpp"
 #include "rommsync/http.hpp"
+#include "rommsync/placement.hpp"
 #include "rommsync/rom_index.hpp"
 #include "rommsync/save_scan.hpp"
 #include "rommsync/state_db.hpp"
@@ -305,13 +306,15 @@ struct StateSyncOptions {
   retroarch::Settings retroarch;
 
   /// Where a server state the client has no local file for should be written,
-  /// SD-root absolute. Returning an empty string -- or leaving this null --
-  /// fails that one with `kNoPlacement` rather than guessing.
+  /// SD-root absolute. A placement with no path -- or leaving this null -- fails
+  /// that one with `kNoPlacement` and the placement's reason rather than
+  /// guessing. A missing folder is made; a file already at the path is
+  /// keep-both, untouched.
   ///
   /// Injected for `ExecuteOptions::place`'s reasons: the directory depends on
   /// the rom's platform and on which emulator the state belongs to, and neither
-  /// is something this file can work out from the row alone.
-  std::function<std::string(const ServerState&)> place;
+  /// is something this file can work out from the row alone (`place::Placer`).
+  std::function<place::Placement(const ServerState&)> place;
 
   /// Optional, not owned; must outlive the call. Checked between states and
   /// passed to every request, so a shutdown ends the run at a boundary rather

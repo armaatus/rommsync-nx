@@ -47,6 +47,7 @@ namespace fs = rommsync::fs;
 namespace http = rommsync::http;
 namespace io = rommsync::io;
 namespace json = rommsync::json;
+namespace place = rommsync::place;
 namespace sync = rommsync::sync;
 
 using harness::Fixture;
@@ -1211,7 +1212,11 @@ void Download(rig::Checks& checks, http::HttpClient& client, const std::string& 
   {
     const std::string fresh = "placed.srm";
     sync::ExecuteOptions placing = OptionsAt(1'757'000'008);
-    placing.place = [&fresh](const sync::SyncOperation&) { return SavePath(fresh); };
+    placing.place = [&fresh](const sync::SyncOperation&) {
+      place::Placement placement;
+      placement.sd_path = SavePath(fresh);
+      return placement;
+    };
     const sync::ExecutionReport placed = sync::ExecutePlan(
         client, *files, TokenFor(base, fixture), plan, /*targets=*/{}, placing);
     checks.ExpectEq(placed.completed, 1,
@@ -1335,6 +1340,130 @@ void Crash(rig::Checks& checks, http::HttpClient& client, const std::string& bas
     checks.ExpectEq(sandbox.Read(SavePath(name)), previous, "and the save is untouched");
     crash::ExpectSurvives(checks, recorder, expected, rig::ScratchDir() + "/crash-download",
                           "a download whose backup the card would not confirm");
+  }
+
+  harness::DeleteSave(client, base, fixture, server.id);
+}
+
+// --- placed -------------------------------------------------------------------
+//
+// #237: a save the console has never held, written where `place` says. A
+// placement creates: it makes the folder an emulator has not made yet, never
+// writes over a file the scan did not pair with the row -- and a power cut at
+// any call leaves no file or the whole save, never a part of one.
+
+void Placed(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+            const Fixture& fixture, const harness::Rom& rom) {
+  const std::string slot = harness::UniqueSlot("m10-11-placed");
+  const std::string server_bytes = "a save this console has never held\n";
+
+  harness::Save server;
+  {
+    Sandbox upload(checks, "execute-placed-upload");
+    const std::string staged = upload.Host("/config/rommsync/server-copy.srm");
+    rig::WriteFile(staged, server_bytes);
+    if (!harness::UploadSave(client, base, fixture, rom.id, slot, "m10-11", staged, "placed.srm",
+                             /*with_device=*/false, &server)) {
+      checks.Expect(false, "the server copy was stored");
+      return;
+    }
+  }
+  // The device reports nothing for the slot: the server's copy is a download
+  // with no local file to match.
+  sync::SyncNegotiatePayload payload;
+  payload.device_id = fixture.device_id;
+  sync::SyncPlan plan;
+  if (!PlanFor(checks, client, base, fixture, payload, {slot}, &plan)) {
+    harness::DeleteSave(client, base, fixture, server.id);
+    return;
+  }
+  const auto placing = [](std::string sd_path, std::int64_t at) {
+    sync::ExecuteOptions options = OptionsAt(at);
+    options.place = [sd_path](const sync::SyncOperation&) {
+      place::Placement placement;
+      placement.sd_path = sd_path;
+      return placement;
+    };
+    return options;
+  };
+
+  // Into a folder nothing has made yet: Tico's account folder for a system
+  // never played on this console.
+  {
+    Sandbox sandbox(checks, "execute-placed-folder");
+    const auto files = rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    const std::string target = "/tico/saves/users/0123456789abcdef0123456789abcdef/gb/gb240p.srm";
+    sandbox.MakeDirs("/tico/saves/users/0123456789abcdef0123456789abcdef");
+    const sync::ExecutionReport report = sync::ExecutePlan(
+        client, *files, TokenFor(base, fixture), plan, /*targets=*/{},
+        placing(target, 1'757'000'301));
+    checks.ExpectEq(report.completed, 1,
+                    "the placement completed" +
+                        (report.warnings.empty() ? std::string() : ": " + report.warnings[0]) +
+                        (report.operations.empty() ? std::string()
+                                                   : " / " + report.operations[0].message));
+    checks.ExpectEq(sandbox.Read(target), server_bytes, "into the folder it made for it");
+  }
+
+  // Onto a file the scan did not pair with this row: someone else's save.
+  {
+    Sandbox sandbox(checks, "execute-placed-taken");
+    const auto files = rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    const std::string target = SavePath("taken.srm");
+    const std::string theirs = "a save the scan skipped, or one in another slot\n";
+    sandbox.SeedSave(target, theirs);
+    const sync::ExecutionReport report = sync::ExecutePlan(
+        client, *files, TokenFor(base, fixture), plan, /*targets=*/{},
+        placing(target, 1'757'000'302));
+    checks.ExpectEq(report.failed, 1, "a placement onto a file is a failed operation");
+    if (!report.operations.empty()) {
+      checks.Expect(report.operations[0].error == sync::OperationError::kNoLocalSave,
+                    std::string("...named as having nowhere to go: ") +
+                        sync::ToString(report.operations[0].error) + " -- " +
+                        report.operations[0].message);
+      checks.Expect(report.operations[0].backup_sd_path.empty(),
+                    "nothing was backed up, because nothing was about to be replaced");
+    }
+    checks.ExpectEq(sandbox.Read(target), theirs, "and the file is exactly as it was");
+    checks.Expect(!sandbox.Exists(io::TempPathFor(target)), "with nothing staged beside it");
+  }
+
+  // `place` refusing, with its reason carried into the result.
+  {
+    Sandbox sandbox(checks, "execute-placed-refused");
+    const auto files = rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    sync::ExecuteOptions options = OptionsAt(1'757'000'303);
+    options.place = [](const sync::SyncOperation&) {
+      place::Placement placement;
+      placement.reason = "Tico keeps saves for more than one account here";
+      return placement;
+    };
+    const sync::ExecutionReport report =
+        sync::ExecutePlan(client, *files, TokenFor(base, fixture), plan, /*targets=*/{}, options);
+    checks.ExpectEq(report.failed, 1, "a refused placement is a failed operation");
+    if (!report.operations.empty()) {
+      checks.Expect(report.operations[0].error == sync::OperationError::kNoLocalSave &&
+                        report.operations[0].message.find("more than one account") !=
+                            std::string::npos,
+                    "whose message says why: " + report.operations[0].message);
+    }
+  }
+
+  // A power cut at every call of a placement.
+  {
+    Sandbox sandbox(checks, "execute-placed-crash");
+    const auto files = rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    const std::string target = "/tico/saves/gb/gb240p.srm";
+    sandbox.MakeDirs("/tico/saves/gb");
+    sandbox.Write("/tico/saves/gb/other.srm", "another game's save, beside it\n");
+    crash::Recorder recorder(sandbox.root());
+    const sync::ExecutionReport report = sync::ExecutePlan(
+        client, *files, TokenFor(base, fixture), plan, /*targets=*/{},
+        placing(target, 1'757'000'304));
+    checks.ExpectEq(report.completed, 1, "the placement completed");
+    checks.ExpectEq(sandbox.Read(target), server_bytes, "the save holds the server's bytes");
+    crash::ExpectCreated(checks, recorder, crash::Created{target, server_bytes},
+                         rig::ScratchDir() + "/crash-placed", "a placement");
   }
 
   harness::DeleteSave(client, base, fixture, server.id);
@@ -2179,6 +2308,8 @@ int main(int argc, char** argv) {
     Download(checks, *client, base, fixture, rom);
   } else if (scenario == "crash") {
     Crash(checks, *client, base, fixture, rom);
+  } else if (scenario == "placed") {
+    Placed(checks, *client, base, fixture, rom);
   } else if (scenario == "conflict") {
     Conflict(checks, *client, base, fixture, rom);
   } else if (scenario == "same_timestamp") {

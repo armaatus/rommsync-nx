@@ -711,4 +711,48 @@ inline Verdict ExpectSurvives(checks::Checks& c, const Recorder& recorder,
   return verdict;
 }
 
+/// The invariant for a placement: a save written where there was none (#237).
+struct Created {
+  std::string save;       ///< SD path; nothing is there before
+  std::string new_bytes;  ///< what the placement puts there
+};
+
+/// After any power cut and the boot sweep: the save is absent or holds its new
+/// bytes in full -- never a part of them, which the emulator would load as a
+/// corrupt save and the next tick would upload -- and every file that was on
+/// the card before is still there, unchanged.
+inline Judge AbsentOrNew(const Created& expected) {
+  return [expected](const Tree& after, const Snapshot& before) -> std::string {
+    const auto save = after.find(RelativeOf(expected.save));
+    if (save != after.end() && save->second != expected.new_bytes) {
+      return "the placed save is there and is not its new bytes (" +
+             std::to_string(save->second.size()) + " bytes)";
+    }
+    for (const auto& [path, bytes] : before.files) {
+      const auto now = after.find(path);
+      if (now == after.end()) return "the placement cost " + path;
+      if (now->second != bytes) return "the placement changed " + path;
+    }
+    return {};
+  };
+}
+
+/// Replay `recorder`'s log against `AbsentOrNew(expected)` and report into `c`,
+/// refusing a vacuous pass as `ExpectSurvives` does.
+inline Verdict ExpectCreated(checks::Checks& c, const Recorder& recorder, const Created& expected,
+                             const std::string& scratch, const std::string& what) {
+  const std::string parent = DirOf(expected.save);
+  const std::string save_dir = parent.empty() ? std::string("/") : parent;
+  const Verdict verdict =
+      Replay(recorder, {save_dir}, {save_dir}, scratch, AbsentOrNew(expected));
+  std::cout << "  " << what << ": " << verdict.points << " cuts, " << verdict.states
+            << " cards, " << verdict.failures << " lost\n";
+  c.Expect(verdict.unmodelled.empty(), what + ": the replay followed every call: " +
+                                           verdict.unmodelled);
+  c.Expect(verdict.states > 1, what + ": the replay saw more than one card");
+  c.ExpectEq(verdict.failures, std::size_t{0},
+             what + ": no power cut leaves a part of the save -- " + verdict.first);
+  return verdict;
+}
+
 }  // namespace crash

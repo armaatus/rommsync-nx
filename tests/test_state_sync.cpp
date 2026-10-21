@@ -670,7 +670,11 @@ void Placing(rig::Checks& checks) {
     client.content = std::string(40, 'z');
 
     sync::StateSyncOptions options = OptionsAt(kStamp);
-    options.place = [](const sync::ServerState& server) { return StatePath(server.file_name); };
+    options.place = [](const sync::ServerState& server) {
+      rommsync::place::Placement placement;
+      placement.sd_path = StatePath(server.file_name);
+      return placement;
+    };
 
     // An index the local file does NOT match, so the scan claims nothing and the
     // server row reaches the placement branch with a file already at its path.
@@ -951,7 +955,9 @@ void RoundTrip(rig::Checks& checks, http::HttpClient& client, const std::string&
     // says which folder it belongs in -- that is the caller's, exactly as
     // `sync::ExecuteOptions::place` is.
     options.place = [](const sync::ServerState& server) {
-      return StatePath(server.file_name);
+      rommsync::place::Placement placement;
+      placement.sd_path = StatePath(server.file_name);
+      return placement;
     };
 
     state::Baseline baseline;

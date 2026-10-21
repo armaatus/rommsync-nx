@@ -74,6 +74,7 @@
 #include "rommsync/config.hpp"
 #include "rommsync/file_system.hpp"
 #include "rommsync/http.hpp"
+#include "rommsync/placement.hpp"
 #include "rommsync/sync.hpp"
 #include "rommsync/token_store.hpp"
 
@@ -224,7 +225,8 @@ enum class OperationError {
   /// An `upload` with no local file to send, or a `download` with nowhere to
   /// put one. The second is a save the client has never seen: placing it needs
   /// the rom's platform folder and a name the server cannot supply, which is
-  /// `ExecuteOptions::place`'s job.
+  /// `ExecuteOptions::place`'s job -- and a placement that names a file already
+  /// on the card has nowhere to put it either. Nothing was written.
   kNoLocalSave,
 
   /// A `download` or `conflict` whose operation carries no `save_id`. The
@@ -435,15 +437,22 @@ struct ExecuteOptions {
   std::function<Timestamp()> now;
 
   /// Where a save the client has no local file for should be written, given the
-  /// operation. Returning an empty string -- or leaving this null -- fails that
-  /// operation with `kNoLocalSave` rather than guessing.
+  /// operation. A placement with no path -- or leaving this null -- fails that
+  /// operation with `kNoLocalSave` and the placement's reason rather than
+  /// guessing.
   ///
   /// It is injected because the answer is not in the plan and not on the card:
-  /// the server's `file_name` is tagged and the directory depends on the rom's
-  /// platform, so placing a save needs the rom index and the platform folder map
-  /// (M3-1). Guessing at it would write a file no emulator loads, under a name
-  /// the next tick would upload back to the server as a second save.
-  std::function<std::string(const SyncOperation&)> place;
+  /// the server's `file_name` is tagged and the folder depends on the emulator
+  /// the platform is played in and how the card is laid out this tick -- which
+  /// is `place::Placer` (#237). Guessing at it would write a file no emulator
+  /// loads, under a name the next tick would upload back as a second save.
+  ///
+  /// **A placement only creates.** A file already at the path is one the scan
+  /// did not pair with this `(rom_id, slot)` -- skipped, or another slot's -- and
+  /// the operation fails with `kNoLocalSave` without touching it. The folder is
+  /// made when it is missing: Tico makes a system's folder the first time it
+  /// saves one, which for a first-time restore is after.
+  std::function<place::Placement(const SyncOperation&)> place;
 
   /// The saves whose upload may supersede a newer server copy: the
   /// `(rom_id, slot)` pairs a player chose "Keep local" for on the overlay's
