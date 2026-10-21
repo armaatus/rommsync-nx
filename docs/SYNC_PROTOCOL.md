@@ -738,5 +738,11 @@ bounds.
   work that did not happen, and calling it completed tells RomM the client did
   something it cannot name.
 - One backup per overwrite, always, before writing.
+- A card that refuses -- full, failing, or gone -- costs the incoming save and
+  never the one on the card: a refused transfer leaves the save as it was, a
+  refused backup stops the overwrite, and neither advances the baseline. The
+  operation's message says which (`the card is full`, `the card refused the
+  write`). `tick.download_full`, `tick.download_eio` and `tick.backup_full` hold
+  this with the refusal forced through `io::Disk` (#202).
 - Verify a downloaded save against the MD5 in `content_hash` /
   `server_content_hash`, and its length against `file_size_bytes`.

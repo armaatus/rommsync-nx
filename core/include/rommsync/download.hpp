@@ -947,7 +947,7 @@ struct DrainResult {
 ///
 /// Per entry: `GET /api/roms/{id}` -> refuse a disc set or a rom missing from
 /// the server -> name the file -> `config::Config::DestinationFor` -> is it
-/// already on the card?
+/// already on the card? -> can the card hold it?
 /// -> stream the content to `<destination>.tmp.part`, which the backend renames
 /// onto `<destination>.tmp` -> `kVerifying` -> hash it -> `io::CommitStaged`
 /// onto the destination -> `kDone`. The queue is written after every one of
@@ -996,6 +996,15 @@ struct DrainResult {
 /// `verify_hash = false` nor a library with no `sha1_hash` and no `md5_hash` is
 /// a failure -- the rom is on the card and the user asked for it -- but the
 /// entry's `message` records that it was not verified, and never claims it was.
+///
+/// **A rom the card cannot hold is refused before it starts, and a card that
+/// refuses mid-transfer is named.** `fs::FileSystem::VolumeOf` is asked once per
+/// rom: past the volume's per-file ceiling (4 GiB - 1 on FAT32) or past its free
+/// space is `kFailed` with a sentence and not one content request. A write the
+/// card refuses anyway is `kFailed` too, saying whether the card was full, the
+/// file too large, or the write simply refused (`http::ErrorForWrite`), and the
+/// partial goes with it. None of them is retried: asking the server again
+/// changes nothing until the user frees space or checks the card (#202).
 ///
 /// **`[downloads] enabled = false` idles; it does not drop the queue.** The
 /// answer is `kDisabled` and the file is not even opened, so switching downloads

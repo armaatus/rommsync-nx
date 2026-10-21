@@ -20,6 +20,7 @@
 #include "rommsync/ipc.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/md5.hpp"
+#include "rommsync/overlay_status_view.hpp"
 #include "rommsync/rom_index.hpp"
 #include "rommsync/sha1.hpp"
 #include "rommsync/sync.hpp"
@@ -1185,11 +1186,24 @@ Verdict Judge(const http::Result& result, Reason* why) {
         say("the download was stopped");
         return Verdict::kCanceled;
       case http::Error::kInvalidRequest:
-      case http::Error::kWriteFailed:
-        // Neither gets better by trying again: one is this client building a
-        // request wrong, the other is the card refusing the write -- a mapped
-        // folder that does not exist is the ordinary way to reach it.
+        // This client building a request wrong, which trying again repeats.
         say(std::string("the transfer could not be made: ") + http::ToString(result.error));
+        return Verdict::kFatal;
+      // The card's refusals. None gets better by asking the server again, and
+      // each is a different thing for a user to do, so each is its own sentence
+      // -- "could not write the destination file" was true of all three and
+      // useful for none (#202). Fatal discards the partial, which for a full
+      // card is also the space the next attempt needs.
+      case http::Error::kDiskFull:
+        say("the card is full; free some space on it and queue this rom again");
+        return Verdict::kFatal;
+      case http::Error::kFileTooLarge:
+        say("this rom is larger than one file on this card can be (FAT32 stops at 4 GiB)");
+        return Verdict::kFatal;
+      case http::Error::kWriteFailed:
+        // A mapped folder that does not exist is the ordinary way to reach it;
+        // a failing card, or one half out of its slot, is the other.
+        say("the card refused the write; check the card and queue this rom again");
         return Verdict::kFatal;
       default:
         say(std::string("the transfer did not complete: ") + http::ToString(result.error));
@@ -1656,7 +1670,16 @@ class Drainer {
       return *present;
     }
 
-    // 6. The bytes.
+    // 6. Can the card hold it? Asked before the first byte moves, because the
+    // two answers that say no -- past the format's per-file ceiling, past the
+    // space left -- are otherwise learned at the end of the transfer they make
+    // pointless (#202).
+    const std::optional<Step> room = RoomOnTheCard(&entry);
+    if (room.has_value()) {
+      return *room;
+    }
+
+    // 7. The bytes.
     return Transfer(std::move(entry), detail);
   }
 
@@ -1772,6 +1795,60 @@ class Drainer {
                     "already on the card, with the bytes the server's hash describes");
     }
     return std::nullopt;
+  }
+
+  /// Nothing when the card can take this rom, so the caller carries on.
+  ///
+  /// An answer the backend does not have refuses nothing (`fs::Volume`), and
+  /// neither does a rom whose size the server does not know: a refusal built on
+  /// a guess would block a download that works. What an earlier attempt already
+  /// put on the card counts towards the rom, so a resume onto a nearly full card
+  /// is asked only for the bytes it still needs.
+  ///
+  /// A refusal is `kFailed`, terminal, and takes the earlier attempt's bytes with
+  /// it -- `Judge`'s answer for a card that filled mid-transfer, for the same
+  /// reasons: retrying cannot change it, and those bytes are space the user has
+  /// to find before queueing the rom again.
+  std::optional<Step> RoomOnTheCard(QueueEntry* entry) {
+    if (entry->size_bytes <= 0) {
+      return std::nullopt;
+    }
+    std::string directory;
+    std::string leaf;
+    if (!fs::SplitPath(entry->destination, &directory, &leaf)) {
+      return std::nullopt;
+    }
+    const fs::Volume volume = filesystem_.VolumeOf(directory);
+    const auto size = static_cast<std::uint64_t>(entry->size_bytes);
+
+    std::string why;
+    if (volume.max_file_bytes != 0 && size > volume.max_file_bytes) {
+      why = "this rom is " + overlay::FormatBytes(entry->size_bytes);
+      // FAT32's sentence for an unknown card held to its ceiling too: on the
+      // console that is the only reason the ceiling is there (`card.cpp`).
+      const bool fat = volume.format == fs::Format::kFat32 ||
+                       volume.max_file_bytes == fs::kFat32MaxFileBytes;
+      why += fat ? ", and a file on a FAT32 card stops at 4 GiB"
+                 : ", and one file on this card can be at most " +
+                       overlay::FormatBytes(static_cast<std::int64_t>(volume.max_file_bytes));
+    } else if (volume.free_bytes >= 0) {
+      // With `resume` off the in-flight file is truncated, not built on.
+      const std::int64_t partial = config_.downloads.resume ? PartialBytes(staging_) : 0;
+      const std::int64_t have = std::max(FileSizeBytes(staging_), partial);
+      const std::int64_t needed = entry->size_bytes - std::min(have, entry->size_bytes);
+      if (needed > volume.free_bytes) {
+        why = "the card has " + overlay::FormatBytes(volume.free_bytes) +
+              " free, and this rom needs " + overlay::FormatBytes(needed) +
+              "; free some space and queue it again";
+      }
+    }
+    if (why.empty()) {
+      return std::nullopt;
+    }
+    io::Remove(staging_);
+    DiscardPartial(staging_);
+    entry->bytes_done = 0;
+    return Settle(std::move(*entry), QueueState::kFailed, std::move(why));
   }
 
   Verdict FetchDetail(QueueEntry* entry, RomDetail* out, Reason* why) {

@@ -106,6 +106,9 @@ struct Transfer {
   /// yet said whether they are still part of the file.
   bool restart_needed = false;
   bool write_failed = false;
+  /// `errno` as the refused write left it, so a full card is named as one
+  /// (`http::ErrorForWrite`) rather than as any other refusal.
+  int write_errno = 0;
 
   /// The caller's progress sink, or null. Borrowed from the `DownloadTarget`,
   /// which must outlive the call, and set only by `Download` -- so a `Send`
@@ -175,14 +178,17 @@ std::size_t OnBodyToFile(char* data, std::size_t size, std::size_t nmemb, void* 
           ftruncate(fileno(transfer->file), 0) != 0 ||
           std::fseek(transfer->file, 0, SEEK_SET) != 0) {
         transfer->write_failed = true;
+        transfer->write_errno = errno;
         return 0;  // aborts the transfer with CURLE_WRITE_ERROR
       }
       transfer->resume_from = 0;
     }
   }
 
+  errno = 0;
   if (io::Write(transfer->file, data, length) != length) {
     transfer->write_failed = true;
+    transfer->write_errno = errno;
     return 0;
   }
   transfer->received += length;
@@ -253,7 +259,8 @@ Error Classify(CURLcode code, const Transfer& transfer) {
     case CURLE_WRITE_ERROR:
       // Our write callback is the only thing that can short-change libcurl, and
       // it only does so when the destination file refused the bytes.
-      return transfer.write_failed ? Error::kWriteFailed : Error::kTransport;
+      return transfer.write_failed ? http::ErrorForWrite(transfer.write_errno)
+                                   : Error::kTransport;
     default:
       return Error::kTransport;
   }
@@ -424,8 +431,9 @@ class CurlHttpClient final : public http::HttpClient {
     transfer.progress = target.progress ? &target.progress : nullptr;
     transfer.file = OpenPartial(partial_path, resuming);
     if (transfer.file == nullptr) {
-      result.error = Error::kWriteFailed;
-      result.message = "could not open " + partial_path + ": " + std::strerror(errno);
+      const int why = errno;
+      result.error = http::ErrorForWrite(why);
+      result.message = "could not open " + partial_path + ": " + std::strerror(why);
       return result;
     }
 
@@ -446,7 +454,11 @@ class CurlHttpClient final : public http::HttpClient {
       transfer.resume_from = 0;
     }
 
+    // A real full card often shows here first rather than in the callback:
+    // stdio held the last buffer, and the flush is what the card refused.
+    errno = 0;
     const bool flushed = std::fflush(transfer.file) == 0 && fsync(fileno(transfer.file)) == 0;
+    const int flush_errno = errno;
     const std::uint64_t written = transfer.resume_from + transfer.received;
     std::fclose(transfer.file);
     transfer.file = nullptr;
@@ -477,8 +489,8 @@ class CurlHttpClient final : public http::HttpClient {
       return result;
     }
     if (!flushed) {
-      result.error = Error::kWriteFailed;
-      result.message = "could not flush " + partial_path;
+      result.error = http::ErrorForWrite(flush_errno);
+      result.message = "could not flush " + partial_path + ": " + std::strerror(flush_errno);
       return result;
     }
 

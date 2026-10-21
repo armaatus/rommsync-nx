@@ -343,7 +343,7 @@ ctest --test-dir build --output-on-failure
   ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md) hard rule).
 - The `http.*` tests cover the native `HttpClient` backend end to end: `get`,
   `status`, `post_json`, `post_form`, `multipart`, `download`, `progress`,
-  `range`, `drop`, `resume`, `resume_no_range`, `resume_empty_body`,
+  `range`, `drop`, `disk`, `resume`, `resume_no_range`, `resume_empty_body`,
   `resume_stale_range`, `range_expected_size`, `not_found`, `truncate`, `stall`,
   `cancel`. One CTest entry each, so a red run names the behaviour rather than
   "the http tests". They run `RUN_SERIAL` because they share one RomM fixture,
@@ -773,6 +773,32 @@ ctest --test-dir build --output-on-failure
   anyway. Neither needs Docker or a rig. The engine's half of the same contract
   is `engine.sleeps` (a save write in flight at `SleepReady`, no rig) and
   `engine.sleep_download` (a 120 MiB rom in flight, which needs one).
+- **A card that will not take the bytes** (M9-13, #202): full, refusing, gone,
+  or formatted so that one file stops at 4 GiB. Every write the engine makes --
+  `io::WriteAtomically`, `io::CopyAtomically`, `io::CommitStaged`, the download
+  worker, the save executor and both HTTP backends' `.part` sinks -- goes through
+  `io::Disk` (`core/include/rommsync/disk.hpp`), and `tests/faulty_disk.hpp` is a
+  decorator over it that refuses on cue: `ENOSPC` part way through a file (a
+  *short* write, as a full card does it), `EIO`, or a card that is gone for
+  every open, write, rename and remove until the decorator goes out of scope.
+  RomM stays real; only the card's answer is invented. Where each one runs:
+
+  | Test | What it holds | Runs |
+  |---|---|---|
+  | `card.resolve`, `card.list`, `card.bounded`, `card.mkdir`, `card.volume` | `sysmodule/source/card.cpp` itself, host-compiled and rooted at a scratch directory through `MakeSdCardAt`. Until #202 it was built only by devkitPro. | everywhere, no rig |
+  | `http.disk`, `wire.disk` | both backends name `ENOSPC` as `kDiskFull`, `EFBIG` as `kFileTooLarge`, anything else as `kWriteFailed`, and leave no file at the destination | everywhere the rig runs |
+  | `download.fullcard`, `download.cardgone` | a full card and a refusing one: the destination untouched, no `.part`/`.tmp`/`.old` left, the entry failed with a sentence that says which. A card gone for every write ends the drain `kStoreFailed`, loses nothing, and the next drain finishes the rom | everywhere the rig runs |
+  | `download.toolarge` | a rom past the volume's per-file ceiling, or past its free space, is refused before a single content request | everywhere the rig runs |
+  | `tick.download_full`, `tick.download_eio`, `tick.backup_full` | the save and the baseline survive a full card under the transfer or under the backup, and the next tick completes | everywhere the rig runs |
+  | `card.fat32` | **a real FAT32 image**, by `tests/test_fat_volume.sh`: the host backend reads it as FAT32, a byte at 4 GiB is `EFBIG`, filling it is `ENOSPC`, and a download onto it is `kDiskFull` -- the check that the decorator's errnos are the ones a card really produces. The image is sparse, so nothing near 4 GiB is written | **macOS** (`hdiutil`, no privileges) always; **Linux** only with `dosfstools` and passwordless `sudo -n` for the loop mount -- GitHub's runners have both -- and **Skipped**, saying which was missing, otherwise |
+
+  A Skipped `card.fat32` is a check that did not run, not one that passed.
+  What none of these reach is Horizon's own errno for a full card: whether
+  `fsdev` translates the filesystem's "not enough space" to `ENOSPC` is
+  unverified, and a console that reports it as anything else gets the generic
+  "the card refused the write" sentence rather than "full". The free-space check
+  before a download starts does not depend on it -- `statvfs` over `fsdev` reads
+  `fsFsGetFreeSpace` -- which is why it is there.
 - The `package.*` group covers `scripts/package.sh`, which turns those two build
   outputs into the zip a user unpacks onto their SD card. `package.layout`,
   `package.refuses`, `package.deterministic` and `package.upgrade` stub the two

@@ -48,6 +48,13 @@ enum class Error {
 /// Stable, log-friendly name for an error. Never null.
 const char* ToString(Error error);
 
+/// The `Error` a refused write to the destination is, from the `errno` the
+/// refusal left: `kDiskFull` for ENOSPC, `kFileTooLarge` for EFBIG, and
+/// `kWriteFailed` for everything else. One mapping rather than one per backend,
+/// because the two backends are held to the same scenarios (`http.disk`,
+/// `wire.disk`) and the sentence a user reads depends on which it is (#202).
+Error ErrorForWrite(int error_number);
+
 struct Header {
   std::string name;
   std::string value;

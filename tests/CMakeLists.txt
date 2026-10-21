@@ -2168,8 +2168,8 @@ set_tests_properties(card.fat32 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180 RUN_S
 # heard of still being answered (#208).
 #
 # `power.cpp` is the portable half and is compiled here; `power_psc.cpp` is the
-# libnx one and is compiled by nothing but devkitPro, which is `card.cpp`'s
-# arrangement for `card.cpp`'s reason.
+# libnx one and is compiled by nothing but devkitPro, which is `main.cpp`'s
+# arrangement for `main.cpp`'s reason.
 add_executable(test_power test_power.cpp
   "${CMAKE_SOURCE_DIR}/sysmodule/source/power.cpp")
 target_link_libraries(test_power PRIVATE rommsync::host Threads::Threads)

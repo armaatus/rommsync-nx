@@ -53,6 +53,20 @@ std::string Describe(const std::string& path, std::string_view what) {
   return path + ": " + std::string(what);
 }
 
+/// "could not be written completely", and what the card said when it was the
+/// card that refused -- "the card is full" is the half of the sentence a user
+/// can act on (#202). `written` is false when the write or the flush failed,
+/// which is when `refused` holds the `errno` they left; a close or a sync that
+/// failed after them says nothing `errno` can be trusted for.
+std::string Incomplete(bool written, int refused) {
+  std::string sentence = "could not be written completely";
+  if (!written) {
+    sentence += ": ";
+    sentence += Explain(RefusalOf(refused));
+  }
+  return sentence;
+}
+
 /// Overwrite whatever is at `path` with zeroes, then unlink it.
 ///
 /// Best-effort, and `Shred` says how little that is worth: without an `fsync`
@@ -186,6 +200,7 @@ WriteResult WriteAtomically(const std::string& path, std::string_view contents) 
             Describe(temp, "could not be created (does the directory exist?)")};
   }
 
+  errno = 0;
   const std::size_t written = Write(file, contents.data(), contents.size());
   // The flush has to happen while the handle is still open: fclose reports a
   // failed flush too, but by then there is nothing left to distinguish "the
@@ -193,6 +208,8 @@ WriteResult WriteAtomically(const std::string& path, std::string_view contents) 
   // after the close, by path, because that is the contract both platforms can
   // hold (`FileSync`).
   const bool flushed = written == contents.size() && std::fflush(file) == 0;
+  // Read before `fclose` can overwrite it: what the card said, if it said no.
+  const int refused = flushed ? 0 : errno;
   const bool closed = std::fclose(file) == 0;
   // After the close and before the commit below, which is the only ordering
   // that means anything: the bytes have to be on the card before the rename
@@ -200,7 +217,7 @@ WriteResult WriteAtomically(const std::string& path, std::string_view contents) 
   const bool synced = flushed && closed && Synced(temp);
   if (!flushed || !closed || !synced) {
     Remove(temp);
-    return {WriteError::kWriteFailed, Describe(temp, "could not be written completely")};
+    return {WriteError::kWriteFailed, Describe(temp, Incomplete(flushed, refused))};
   }
 
   // Everything above touched only the temp file, so a failure up to this point
@@ -257,17 +274,24 @@ CopyResult CopyAtomically(const std::string& from, const std::string& to) {
   char buffer[4096];
   std::uint64_t copied = 0;
   bool short_write = false;
+  int refused = 0;
   std::size_t got = 0;
   while ((got = std::fread(buffer, 1, sizeof(buffer), source)) > 0) {
+    errno = 0;
     if (Write(destination, buffer, got) != got) {
       short_write = true;
+      refused = errno;
       break;
     }
     copied += got;
   }
   const bool read_failed = std::ferror(source) != 0;
   std::fclose(source);
+  errno = 0;
   const bool flushed = std::fflush(destination) == 0;
+  if (!short_write && !flushed) {
+    refused = errno;
+  }
   const bool closed = std::fclose(destination) == 0;
 
   if (read_failed) {
@@ -284,7 +308,7 @@ CopyResult CopyAtomically(const std::string& from, const std::string& to) {
   if (short_write || !flushed || !closed || !synced) {
     Remove(temp);
     result.error = CopyError::kWriteFailed;
-    result.message = Describe(temp, "could not be written completely");
+    result.message = Describe(temp, Incomplete(!short_write && flushed, refused));
     return result;
   }
 

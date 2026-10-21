@@ -6,6 +6,8 @@
 #include <string>
 #include <string_view>
 
+#include "rommsync/disk.hpp"
+
 namespace rommsync::http {
 namespace {
 
@@ -27,6 +29,19 @@ bool EqualsIgnoreCase(std::string_view a, std::string_view b) {
 
 }  // namespace
 
+Error ErrorForWrite(int error_number) {
+  switch (io::RefusalOf(error_number)) {
+    case io::Refusal::kFull:
+      return Error::kDiskFull;
+    case io::Refusal::kFileTooLarge:
+      return Error::kFileTooLarge;
+    case io::Refusal::kNone:
+    case io::Refusal::kRefused:
+      break;
+  }
+  return Error::kWriteFailed;
+}
+
 const char* ToString(Error error) {
   switch (error) {
     case Error::kNone:           return "ok";
@@ -37,7 +52,7 @@ const char* ToString(Error error) {
     case Error::kTimeout:        return "timed out";
     case Error::kCanceled:       return "canceled";
     case Error::kTruncated:      return "body ended early";
-    case Error::kWriteFailed:    return "could not write the destination file";
+    case Error::kWriteFailed:    return "the card refused the write to the destination file";
     case Error::kDiskFull:       return "the card is full";
     case Error::kFileTooLarge:   return "the file is too large for the card's format";
     case Error::kTransport:      return "transport failure";

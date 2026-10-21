@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -701,12 +702,14 @@ class FileWriter final : public BodyWriter {
       // The server ignored `Range` and is sending the whole resource.
       // Appending would splice it into itself, so the bytes already on disk go.
       if (status_ != 206 && !Restart()) {
-        *error = Error::kWriteFailed;
+        *error = http::ErrorForWrite(errno);
         return false;
       }
     }
+    errno = 0;
     if (size != 0 && (file_ == nullptr || io::Write(file_, data, size) != size)) {
-      *error = Error::kWriteFailed;
+      // The `errno` the card left, so a full one is named as one (#202).
+      *error = http::ErrorForWrite(errno);
       return false;
     }
     received_ += size;
@@ -725,7 +728,10 @@ class FileWriter final : public BodyWriter {
     // response never confirmed the bytes already on disk. Counting them would
     // let an empty 200 promote a stale partial file.
     if (staged_unconfirmed_) resume_from_ = 0;
+    errno = 0;
     bool flushed = file_ == nullptr || std::fflush(file_) == 0;
+    // Where a real full card often shows first: stdio held the last buffer.
+    flush_errno_ = errno;
     Close();
     if (flushed) {
       if (const io::FileSync sync = io::GetFileSync(); sync != nullptr) {
@@ -736,6 +742,7 @@ class FileWriter final : public BodyWriter {
   }
 
   std::uint64_t resume_from() const { return resume_from_; }
+  int flush_errno() const { return flush_errno_; }
   std::uint64_t received() const { return received_; }
   std::string& error_body() { return error_body_; }
 
@@ -775,6 +782,7 @@ class FileWriter final : public BodyWriter {
   std::uint64_t body_length_ = 0;
   std::uint64_t received_ = 0;
   std::string error_body_;
+  int flush_errno_ = 0;
 };
 
 }  // namespace
@@ -1201,7 +1209,7 @@ Result WireHttpClient::Download(const Request& request, const DownloadTarget& ta
 
   FileWriter writer(partial_path, resuming, target.progress ? &target.progress : nullptr);
   if (!writer.Open(resuming, already_have)) {
-    result.error = Error::kWriteFailed;
+    result.error = http::ErrorForWrite(errno);
     result.message = "could not open " + partial_path;
     return result;
   }
@@ -1231,7 +1239,7 @@ Result WireHttpClient::Download(const Request& request, const DownloadTarget& ta
     return result;
   }
   if (!flushed) {
-    result.error = Error::kWriteFailed;
+    result.error = http::ErrorForWrite(writer.flush_errno());
     result.message = "could not flush " + partial_path;
     return result;
   }

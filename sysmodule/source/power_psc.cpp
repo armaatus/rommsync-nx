@@ -2,8 +2,8 @@
 //
 // `power.hpp` states the contract and `power.cpp` is the loop; this is the part
 // that names libnx, and the only part of the three a laptop cannot run. It is
-// compiled by devkitPro and by nothing else -- `card.cpp`'s arrangement, for
-// `card.cpp`'s reason -- so what stands behind it is `switch.builds` compiling
+// compiled by devkitPro and by nothing else -- `main.cpp`'s arrangement, for
+// `main.cpp`'s reason -- so what stands behind it is `switch.builds` compiling
 // it and the static checks in `tests/test_sysmodule_boot.py` reading the grant
 // out of the npdm.
 //

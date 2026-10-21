@@ -385,6 +385,14 @@ part is what *did not* happen as a result:
   complete body that may not be the right one, with no backup beside it, and
   nothing after the fact can tell — so it costs one re-fetch to say no.
 
+- **A rom that will not fit is refused before it starts.** Before the first
+  byte of a download moves, the sysmodule asks the card how much space is left;
+  a rom bigger than that fails at once, and the queue screen says how much is
+  free and how much the rom needs. A card that fills up *during* a download
+  anyway fails the rom with "the card is full" and deletes the partial file, so
+  the space it took comes back. The rom already on the card under that name, if
+  there is one, is not touched.
+
 A full card also stops the client's own records being written, and one of those
 has a line of its own:
 
@@ -493,7 +501,7 @@ screen shows it waiting, and it never turns into a file.
 **What is happening.** The sysmodule drains the queue on the same thread that
 runs the sync tick, and it does it **last** — a sync that is due and a list page
 the overlay is waiting for both go first. So a rom that is not moving is usually
-one of five things, and the queue screen names which:
+one of six things, and the queue screen names which:
 
 1. **`[downloads] enabled = false`.** Nothing is opened and nothing is lost;
    switching it back on resumes exactly what was there.
@@ -510,6 +518,16 @@ one of five things, and the queue screen names which:
    of the queue, or terminating the sysmodule all stop the transfer where it
    stands. The bytes already on the card are kept as a `.part`, so the next
    attempt resumes rather than starting over — that is the `stopped` line.
+
+6. **The card cannot hold it.** A rom bigger than the space left on the card,
+   or over **4 GiB** -- the largest file FAT32 holds, and the card is held to
+   that limit unless the console can tell it is not FAT32, which it usually
+   cannot -- fails before it starts, and the row says which. A card that refused
+   a write part way through says "the card refused the write"; that one is worth
+   checking the card for. All three are failed rather than retried, because
+   trying again changes nothing until you do: free space (or check the card) and
+   queue the rom again. This version does not split a file over 4 GiB into the
+   pieces Horizon can store; a rom that size has to reach the card some other way.
 
 **The fix.** Read the row on the overlay's queue screen first; it carries the
 reason for that rom. For 3, the drain is already retrying and nothing needs
