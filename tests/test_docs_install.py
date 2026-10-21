@@ -45,9 +45,9 @@ import sys
 # level rather than to "anything with a slash in it".
 SD_PREFIXES = ("atmosphere/", "switch/", "config/")
 
-# The one directory a shipped path may grow that the archive does not contain:
-# `flags/`, which ovl-sysmodules creates to write boot2.flag into. The archive
-# deliberately holds no flags/ entry (#33), so this cannot be derived from the
+# The one directory whose contents the guide names and the archive does not
+# ship: `flags/`, which the archive carries empty (#211) and ovl-sysmodules
+# writes boot2.flag into. What may sit in it is not derivable from the
 # manifest -- but the title id directory ABOVE it still is, which is what keeps
 # a moved title id red here too.
 RUNTIME_SUBDIRS = ("flags",)

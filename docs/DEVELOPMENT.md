@@ -251,7 +251,8 @@ console rather than loudly here:
   installed homebrew set (`sysmodule/README.md`), so it will move, and every
   other copy of it is how a move lands in one place only.
 - **No `flags/boot2.flag`, and no `config.ini`.** The sysmodule ships disabled
-  (#33), and an upgrade is this same zip unpacked over the top — replacing a
+  (#33) — `flags/` itself ships, empty, for the older ovl-sysmodules that do
+  not create it (#211) — and an upgrade is this same zip unpacked over the top — replacing a
   user's settings is not something a release may do. `token.dat`, `device.dat`,
   `state.db`, `queue.json` and `rommsync.log` are not in the archive either, so
   they survive — the log in particular, because the failure a user is about to
@@ -260,13 +261,23 @@ console rather than loudly here:
   permissions — so the checksums a release publishes describe the build and not
   one upload.
 
-`ctest -R package` is what holds all of it: four scenarios against stubbed
-artifacts that need no toolchain, plus `package.builds`, which packages a real
-devkitPro build inside the same container. `switch-build` runs the script on
-every push as well, so a failure specific to packaging *inside* the container is
-not something a tag discovers first. `tests/toolbox_check.py` is the part that
-reads `toolbox.json` the way ovl-sysmodules does, so a field that overlay
-requires cannot quietly go missing.
+`ctest -R package` is what holds all of it: five scenarios that need no
+toolchain, plus `package.builds`, which packages a real devkitPro build inside
+the same container. `switch-build` runs the script on every push as well, and
+`package.builds` with it (see [the toolchain's ctest entries](#the-toolchains-ctest-entries)),
+so a failure specific to packaging *inside* the container is not something a tag
+discovers first. The script also refuses an archive whose listing is anything
+but its own entries, so a `__MACOSX/` or a `._exefs.nsp` cannot ship.
+
+`tests/toolbox_check.py` is the part that reads `toolbox.json` the way
+ovl-sysmodules does, and it is strict where that overlay is fatal: ovl-sysmodules
+builds `-fno-exceptions` over nlohmann/json, which then aborts on a wrong-typed
+value, and its `gui_main.cpp` catches nothing — so `"requires_reboot": "false"`
+takes down the whole overlay and every other module's entry with it. The check
+holds the exact four keys, each key's JSON type, a 16-hex-digit `tid` equal to
+its directory's name, and, in `package.builds`, equal to the program id
+`scripts/npdm-check.py` reads out of the built NPDM. `package.toolbox` feeds it
+each malformed file in turn.
 
 ## The two switches
 
@@ -283,10 +294,11 @@ that does nothing.
 console; the two are meant to agree, and changing one means changing the other.
 
 **`ovl-rommsync` never writes `boot2.flag`.** It may read it to explain a
-silence. Creating it is ovl-sysmodules' job — that overlay `mkdir`s the `flags/`
-directory itself before writing the flag into it, which is why the archive ships
-no `flags/` entry and does not need to — and two overlays writing one flag is how
-they come to disagree about what is on.
+silence. Creating it is ovl-sysmodules' job, and two overlays writing one flag
+is how they come to disagree about what is on. The archive ships the `flags/`
+directory empty, as a zip directory entry (#211): current ovl-sysmodules
+`mkdir`s it before writing the flag, but builds older than its #6 fix do not,
+and their toggle then does nothing.
 
 ### What the sysmodule has to survive
 

@@ -14,10 +14,11 @@ INSTALL
 
 Unzip this archive onto the ROOT of your SD card, keeping the folder
 structure. It merges with what is already there, adding six files and
-changing nothing else:
+one empty folder, and changing nothing else:
 
   atmosphere/contents/@TITLE_ID@/exefs.nsp   the sysmodule
   atmosphere/contents/@TITLE_ID@/toolbox.json  what ovl-sysmodules lists it by
+  atmosphere/contents/@TITLE_ID@/flags/      empty: the sysmodule is off
   switch/.overlays/ovl-rommsync.ovl                the overlay
   config/rommsync/config.ini.example               a starting configuration
   README.txt                                       this file
@@ -30,8 +31,8 @@ Then, in order:
 
   1. The sysmodule ships DISABLED. There is no flags/boot2.flag in this
      archive, so nothing runs until you enable it -- use ovl-sysmodules,
-     which is also how you stop it again. It creates that flag, and the
-     flags/ folder around it, itself; do not make either by hand.
+     which is also how you stop it again. It creates that flag in the
+     empty flags/ folder this archive ships; do not make it by hand.
   2. Copy config/rommsync/config.ini.example to config/rommsync/config.ini
      and set [server] url to your RomM.
   3. Open ovl-rommsync from the Ultrahand overlay menu and pair. You type a

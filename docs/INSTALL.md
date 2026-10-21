@@ -59,13 +59,14 @@ Unzip the release onto the **root** of your SD card, keeping the folder
 structure. There is no wrapper directory: the archive merges into the
 `atmosphere/` and `switch/` folders your card already has.
 
-Six files land, and nothing else changes:
+Six files and one empty folder land, and nothing else changes:
 
 ```
 README.txt
 LICENSE
 atmosphere/contents/4200000000524D53/exefs.nsp
 atmosphere/contents/4200000000524D53/toolbox.json
+atmosphere/contents/4200000000524D53/flags/
 config/rommsync/config.ini.example
 switch/.overlays/ovl-rommsync.ovl
 ```
@@ -89,13 +90,14 @@ switch/.overlays/ovl-rommsync.ovl
 - `README.txt` and `LICENSE` land at the **root** of the card under those names,
   so an unrelated `README.txt` or `LICENSE` already sitting there is replaced.
 
-There is **no `flags/` directory** in the archive at all — not an empty one, not
-one holding a disabled flag. `atmosphere/contents/4200000000524D53/` arrives
-holding those two files and nothing else. ovl-sysmodules creates `flags/` itself
-the first time you turn the boot toggle on, so there is nothing for the zip to
-carry.
+The `flags/` folder arrives **empty**. Nothing in it means the sysmodule does
+not start at boot; ovl-sysmodules puts `boot2.flag` there the first time you
+turn the boot toggle on. Current ovl-sysmodules would create the folder itself,
+but older builds — still in the wild — write the flag without creating it, and
+the toggle then silently does nothing. Shipping the folder costs nothing and
+removes that.
 
-That is deliberate. `flags/boot2.flag` is what makes Atmosphère launch the
+There is no `boot2.flag` in the archive, and that is deliberate. `flags/boot2.flag` is what makes Atmosphère launch the
 sysmodule at boot, so shipping it would mean the next boot after you unpacked
 the zip started a sysmodule that has no server, no token, and a folder map you
 have not checked yet — reading and writing save folders before you had any
@@ -123,8 +125,8 @@ is the single most common way this goes wrong.
 They are not two spellings of the same thing. `boot2.flag` is ovl-sysmodules'
 to write: do not create it by hand, and rommsync-nx never writes it itself —
 two overlays writing the same flag is how they end up disagreeing about what is
-on. It creates the `flags/` directory too, which is why the archive does not
-ship one.
+on. The archive ships the empty `flags/` directory it goes in, and nothing
+inside it.
 
 ovl-sysmodules also lists `sys-rommsync` in its **Dynamic** section, which means
 its `A` button starts and stops the process there and then, without a reboot —
