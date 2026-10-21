@@ -246,6 +246,8 @@ const char* ToString(OperationError error) {
       return "forbidden";
     case OperationError::kRefused:
       return "refused";
+    case OperationError::kNewerOnServer:
+      return "newer_on_server";
     case OperationError::kUnverified:
       return "unverified";
     case OperationError::kCommitFailed:
@@ -275,6 +277,7 @@ auth::Answer AnswerOf(OperationError error) {
     case OperationError::kBackupFailed:
     case OperationError::kTransferFailed:
     case OperationError::kRefused:
+    case OperationError::kNewerOnServer:
     case OperationError::kUnverified:
     case OperationError::kCommitFailed:
     case OperationError::kUnconfirmed:
@@ -429,7 +432,17 @@ OperationError BackUp(fs::FileSystem& files, const ExecuteOptions& options,
                      backup_sd_path, message);
 }
 
-/// `POST /api/saves?...&overwrite=true` with the local file as `saveFile`.
+/// Whether the player chose "Keep local" for this save (`ExecuteOptions::keep_local`).
+bool KeepsLocal(const ExecuteOptions& options, const SyncOperation& operation) {
+  for (const auto& key : options.keep_local) {
+    if (key.first == operation.rom_id && key.second == operation.slot) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// `POST /api/saves?...&overwrite=false` with the local file as `saveFile`.
 OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
                        const auth::StoredToken& token, const SyncPlan& plan,
                        const SyncOperation& operation, const SaveTarget* target,
@@ -444,10 +457,10 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
                 "the local save " + target->sd_path + " could not be opened to upload");
   }
 
-  // `overwrite=true` is not optional; see `Refused`. `session_id` ties the
-  // upload to this negotiation and `device_id` is what writes the `device_syncs`
-  // row the *next* negotiation arbitrates against -- skip either and the device
-  // stays in the no-history branch forever (docs/API_CONTRACT.md).
+  // `session_id` ties the upload to this negotiation and `device_id` is what
+  // writes the `device_syncs` row the *next* negotiation arbitrates against --
+  // skip either and the device stays in the no-history branch forever
+  // (docs/API_CONTRACT.md).
   std::string url = http::JoinUrl(token.server_url, kSavesPath) +
                     "?rom_id=" + std::to_string(operation.rom_id);
   if (operation.emulator.has_value()) {
@@ -458,7 +471,11 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
   }
   url += "&session_id=" + std::to_string(plan.session_id);
   url += "&device_id=" + http::EncodeQueryValue(token.device_id);
-  url += "&overwrite=true";
+  // `overwrite=false` is RomM's slot guard, asked for by name: a slot that holds
+  // a save this device has not synced -- another device's, since the plan was
+  // made or before it -- answers 409 instead of being superseded. Only a player
+  // who chose "Keep local" for this save lifts it (#232).
+  url += KeepsLocal(options, operation) ? "&overwrite=true" : "&overwrite=false";
 
   http::Request request =
       Authed(http::Method::kPost, std::move(url), token, options.timeout, options.cancel);
@@ -473,16 +490,16 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
 
   const http::Result result = client.Send(request);
   if (const auto refused = Refused(result, "the upload")) {
-    std::string message = refused->second;
-    if (result.response.status == 409) {
-      // The one status worth spelling out, and only here: RomM answers it when
-      // this device has no sync row for the slot's current save, which is
-      // exactly the state the plan calls `Client save is newer (no sync
-      // history)`. A plan executed as issued must never draw one, so seeing it
-      // means the request went out without `overwrite=true`.
-      message += "; the slot has a newer save and the upload did not say overwrite=true";
+    if (refused->first == OperationError::kRefused && result.response.status == 409) {
+      // The slot guard, and the one refusal worth its own name: the slot holds a
+      // save this device has not synced, and the remedy is the tick's -- ask the
+      // server for its head and take it -- not another post (sync_resolve.hpp).
+      return Fail(operation, OperationError::kNewerOnServer,
+                  refused->second +
+                      "; the slot holds a newer save than this device last synced, so nothing "
+                      "was uploaded over it");
     }
-    return Fail(operation, refused->first, std::move(message));
+    return Fail(operation, refused->first, refused->second);
   }
 
   OperationResult uploaded;

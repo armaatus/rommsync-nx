@@ -57,6 +57,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "rommsync/auth.hpp"
@@ -218,10 +219,20 @@ enum class OperationError {
   /// ended early.
   kTransferFailed,
 
-  /// The server answered a status this operation could not proceed from. A
-  /// `409` on an upload is the one worth recognising: it means the request went
-  /// out without `overwrite=true`.
+  /// The server answered a status this operation could not proceed from.
   kRefused,
+
+  /// `409 Slot has a newer save since your last sync` on an upload: RomM's slot
+  /// guard (#232). The slot holds a save this device has not synced -- another
+  /// device's upload, or RetroArch's, since this device last synced it -- and
+  /// uploading over it would supersede that save without anyone choosing to.
+  /// **Nothing was uploaded and nothing local was touched.**
+  ///
+  /// Kept apart from `kRefused` because it is the one refusal with a remedy the
+  /// tick applies itself: `RunTick` asks the server again which copy is the head
+  /// and takes it -- a download, or a conflict -- and never re-posts the upload
+  /// (sync_resolve.hpp). Here, inside one plan, it is only named.
+  kNewerOnServer,
 
   /// 401 -- the server has stopped accepting this console's token.
   ///
@@ -406,6 +417,19 @@ struct ExecuteOptions {
   /// (M3-1). Guessing at it would write a file no emulator loads, under a name
   /// the next tick would upload back to the server as a second save.
   std::function<std::string(const SyncOperation&)> place;
+
+  /// The saves whose upload may supersede a newer server copy: the
+  /// `(rom_id, slot)` pairs a player chose "Keep local" for on the overlay's
+  /// conflict screen, and **nothing else** (#232).
+  ///
+  /// Every other upload goes out with `overwrite=false` and meets RomM's slot
+  /// guard, which is the protection a shared slot needs: a save another device
+  /// wrote since this one last synced is answered with a 409
+  /// (`OperationError::kNewerOnServer`) rather than silently replaced. The
+  /// override is the player's to make, per save, knowing what it replaces --
+  /// never the engine's. Empty, which is every tick today; the overlay choice
+  /// that fills it is #240's.
+  std::vector<std::pair<std::int64_t, std::optional<std::string>>> keep_local;
 
   /// Optional, not owned; must outlive the call. Checked between operations and
   /// passed to every request, so a shutdown ends the tick at an operation

@@ -583,12 +583,108 @@ void Counting(rig::Checks& checks) {
   }
 }
 
+// --- overwrite ----------------------------------------------------------------
+//
+// #232: an upload respects RomM's slot guard. `overwrite=false` unless the
+// player chose "Keep local" for that save, and the 409 the guard answers with
+// is named as itself -- a newer save in the slot -- rather than as a bare
+// refusal, because the tick resolves it (sync_tick.hpp) and a refusal it does
+// not. Needs no server: what is being checked is the request that leaves and
+// how the answer is read, so a client that records the one and scripts the
+// other is the whole of it.
+
+/// Records every request and answers each with `status` and `body`.
+class Scripted final : public http::HttpClient {
+ public:
+  Scripted(int status, std::string body) : status_(status), body_(std::move(body)) {}
+
+  http::Result Send(const http::Request& request) override {
+    urls.push_back(request.url);
+    http::Result result;
+    result.response.status = status_;
+    result.response.body = body_;
+    return result;
+  }
+  http::Result Download(const http::Request& request, const http::DownloadTarget&) override {
+    urls.push_back(request.url);
+    http::Result result;
+    result.error = http::Error::kConnectFailed;
+    return result;
+  }
+
+  std::vector<std::string> urls;
+
+ private:
+  int status_;
+  std::string body_;
+};
+
+void Overwrite(rig::Checks& checks) {
+  Sandbox sandbox(checks, "execute-overwrite");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  auth::StoredToken token;
+  token.server_url = "http://127.0.0.1:1";
+  token.access_token = "not-used";
+  token.device_id = "this-console";
+
+  const std::string bytes = "the bytes this console has\n";
+  sandbox.SeedSave(SavePath("guarded.srm"), bytes);
+  sandbox.SeedSave(SavePath("kept.srm"), bytes);
+  sync::SyncPlan plan;
+  plan.session_id = 1;
+  plan.operations.push_back(OperationOf(sync::Action::kUpload, 7, "guarded"));
+  plan.operations.push_back(OperationOf(sync::Action::kUpload, 8, "kept"));
+  const std::vector<sync::SaveTarget> targets = {
+      {7, std::string("guarded"), SavePath("guarded.srm"), "guarded.srm"},
+      {8, std::string("kept"), SavePath("kept.srm"), "kept.srm"}};
+
+  // Accepted, so what is being read is the request alone.
+  {
+    Scripted accepted(201, R"({"id":41})");
+    sync::ExecuteOptions options = OptionsAt(1'757'000'000);
+    options.keep_local = {{8, std::string("kept")}};
+    const sync::ExecutionReport report =
+        sync::ExecutePlan(accepted, *files, token, plan, targets, options);
+    checks.ExpectEq(report.completed, 2, "both uploads are accepted");
+    if (accepted.urls.size() == 2) {
+      checks.Expect(accepted.urls[0].find("overwrite=false") != std::string::npos &&
+                        accepted.urls[0].find("overwrite=true") == std::string::npos,
+                    "an upload the plan asked for respects the slot guard: " + accepted.urls[0]);
+      checks.Expect(accepted.urls[1].find("overwrite=true") != std::string::npos,
+                    "and only an explicit Keep local overrides it: " + accepted.urls[1]);
+    } else {
+      checks.Expect(false, "one request per upload, got " + std::to_string(accepted.urls.size()));
+    }
+  }
+
+  // Refused with the guard's own answer.
+  {
+    Scripted guarded(409, R"({"detail":"Slot has a newer save since your last sync"})");
+    sync::SyncPlan one = plan;
+    one.operations.resize(1);
+    const sync::ExecutionReport report =
+        sync::ExecutePlan(guarded, *files, token, one, targets, OptionsAt(1'757'000'001));
+    checks.ExpectEq(report.failed, 1, "a 409 is not an upload that happened");
+    if (report.operations.size() == 1) {
+      const sync::OperationResult& done = report.operations[0];
+      checks.Expect(done.error == sync::OperationError::kNewerOnServer,
+                    std::string("...and is named as a newer save in the slot: ") +
+                        sync::ToString(done.error) + " -- " + done.message);
+      checks.Expect(sync::AnswerOf(done.error) == auth::Answer::kSilent,
+                    "and says nothing about the pairing");
+    }
+    checks.ExpectEq(guarded.urls.size(), static_cast<std::size_t>(1),
+                    "and it is not re-posted with overwrite=true behind the server's back");
+    checks.ExpectEq(sandbox.Read(SavePath("guarded.srm")), bytes, "the local save is untouched");
+  }
+}
+
 // --- upload -------------------------------------------------------------------
 //
-// A plan executed as issued must never be refused by the server that issued it.
-// `overwrite=true` is what makes that true: without it RomM answers `409 Slot
-// has a newer save since your last sync` for exactly the no-sync-history case
-// the plan calls an upload.
+// An upload that respects RomM's slot guard: `overwrite=false`, `session_id`
+// and `device_id`. Into a fresh slot the guard has nothing to say, so the plan
+// executes as issued.
 
 void Upload(rig::Checks& checks, http::HttpClient& client, const std::string& base,
             const Fixture& fixture, const harness::Rom& rom) {
@@ -1168,12 +1264,15 @@ void Corrupted(rig::Checks& checks, http::HttpClient& client, const std::string&
 
 // --- occupied -------------------------------------------------------------------
 //
-// The state `overwrite=true` exists for, which a fresh slot never reaches: the
-// server holds a save for this `(rom_id, slot)` and this device has no sync row
-// for it. That is `upload` / `Client save is newer (no sync history)`, and RomM
-// answers the same POST without the flag with a 409 -- refusing the very
-// operation it just planned. The scenario asserts both halves, because a test
-// that only shows the flag working cannot tell you the flag is doing anything.
+// The state RomM's slot guard exists for: the server holds a save for this
+// `(rom_id, slot)` that this device has no sync row for -- another device's. That
+// is `upload` / `Client save is newer (no sync history)`, and since #232 the
+// executor sends `overwrite=false`, so the guard answers 409 and **nothing is
+// uploaded over the other device's save**: the operation is named
+// `kNewerOnServer` and left to the tick, which resolves it (sync_resolve.hpp,
+// `tick.newer_*`). Only an explicit "Keep local" sends `overwrite=true`, and the
+// second half of the scenario is that override, in the one state where it does
+// anything.
 //
 // It also pins what the flag does *not* do. It does not stop a slot accreting a
 // row per upload: RomM matches the existing row by a second-granularity datetime
@@ -1217,44 +1316,42 @@ void Occupied(rig::Checks& checks, http::HttpClient& client, const std::string& 
                 std::string("the client's newer save is an upload: ") +
                     sync::ToString(plan.operations[0].action));
   checks.Expect(plan.operations[0].reason == sync::Reason::kClientNewerNoHistory,
-                std::string("...with the reason overwrite=true exists for: ") +
+                std::string("...with the reason the slot guard is about: ") +
                     plan.operations[0].reason_text);
 
-  // The same request the executor is about to make, minus the one flag. This is
-  // the assertion the acceptance criterion is really about: without it, nothing
-  // here would notice `overwrite=true` being dropped.
+  // The plan executed as issued meets the guard. Nothing goes up over the other
+  // device's save, and nothing on the card changes.
+  const std::vector<sync::SaveTarget> targets = {{rom.id, slot, SavePath(name), name}};
   {
-    http::Request refused = harness::Authed(
-        http::Method::kPost,
-        base + "/api/saves?rom_id=" + std::to_string(rom.id) + "&emulator=m2-5&slot=" + slot +
-            "&device_id=" + fixture.device_id,
-        fixture);
-    http::FormPart part;
-    part.name = "saveFile";
-    part.file_path = sandbox.Host(SavePath(name));
-    part.file_name = name;
-    part.content_type = "application/octet-stream";
-    refused.form.push_back(part);
-    const http::Result answered = client.Send(refused);
-    checks.ExpectEq(answered.response.status, 409,
-                    "without overwrite=true RomM refuses the upload it just planned: " +
-                        answered.response.body);
+    const sync::ExecutionReport guarded = sync::ExecutePlan(
+        client, *files, TokenFor(base, fixture), plan, targets, OptionsAt(1'757'000'010));
+    checks.ExpectEq(guarded.failed, 1, "the guard refuses the upload the plan asked for");
+    if (!guarded.operations.empty()) {
+      const sync::OperationResult& refused = guarded.operations[0];
+      checks.Expect(refused.error == sync::OperationError::kNewerOnServer,
+                    std::string("...as a newer save in the slot: ") +
+                        sync::ToString(refused.error) + " -- " + refused.message);
+      checks.Expect(!refused.save_id.has_value(), "and no row was written");
+    }
+    checks.ExpectEq(sandbox.Read(SavePath(name)), bytes, "the local save is untouched");
   }
 
-  const std::vector<sync::SaveTarget> targets = {{rom.id, slot, SavePath(name), name}};
-  const sync::ExecutionReport report = sync::ExecutePlan(
-      client, *files, TokenFor(base, fixture), plan, targets, OptionsAt(1'757'000'011));
+  // "Keep local": the player's override, and the only thing that sends the flag.
+  sync::ExecuteOptions keep = OptionsAt(1'757'000'011);
+  keep.keep_local = {{rom.id, slot}};
+  const sync::ExecutionReport report =
+      sync::ExecutePlan(client, *files, TokenFor(base, fixture), plan, targets, keep);
 
   checks.ExpectEq(report.completed, 1,
-                  "and with it the plan executes as issued" +
+                  "with Keep local the upload goes over the guard" +
                       (report.warnings.empty() ? std::string() : ": " + report.warnings[0]));
   if (report.operations.empty()) {
     harness::DeleteSave(client, base, fixture, occupant.id);
     return;
   }
   const sync::OperationResult& done = report.operations[0];
-  checks.Expect(done.error != sync::OperationError::kRefused,
-                "no 409 for the operation the server itself planned: " + done.message);
+  checks.Expect(done.error == sync::OperationError::kNone,
+                "no 409 for an upload the player chose: " + done.message);
 
   // What `overwrite=true` actually does to the occupant, measured rather than
   // assumed -- and **this scenario asserted the wrong thing until it went red in
@@ -1296,10 +1393,9 @@ void Occupied(rig::Checks& checks, http::HttpClient& client, const std::string& 
   const std::int64_t uploaded_id = *done.save_id;
   planted.push_back(uploaded_id);
 
-  // What the acceptance criterion is actually about, and what does hold however
-  // the tag falls: the plan executed as issued, the bytes that went up are this
-  // device's, and the row carries the sync history the next negotiation
-  // arbitrates against.
+  // What does hold however the tag falls: the upload the player chose landed,
+  // the bytes that went up are this device's, and the row carries the sync
+  // history the next negotiation arbitrates against.
   harness::Save written;
   checks.Expect(harness::ReadSave(client.Send(harness::Authed(
                                       http::Method::kGet,
@@ -1317,8 +1413,9 @@ void Occupied(rig::Checks& checks, http::HttpClient& client, const std::string& 
   // clock RomM stamps its tag from, so the tag it computes cannot be the one it
   // computed above.
   harness::PassASecond();
-  const sync::ExecutionReport again = sync::ExecutePlan(
-      client, *files, TokenFor(base, fixture), plan, targets, OptionsAt(1'757'000'012));
+  keep.now = OptionsAt(1'757'000'012).now;
+  const sync::ExecutionReport again =
+      sync::ExecutePlan(client, *files, TokenFor(base, fixture), plan, targets, keep);
   checks.ExpectEq(again.completed, 1, "the same plan re-executed is still accepted");
   if (again.operations.empty() || !again.operations[0].save_id.has_value()) {
     checks.Expect(false, "the re-executed upload reports the row it wrote");
@@ -1643,9 +1740,11 @@ int main(int argc, char** argv) {
 
   // The two that need no server, so they stay checked with docker stopped.
   if (scenario == "naming" || scenario == "staging" || scenario == "counting" ||
-      scenario == "crash_model") {
+      scenario == "crash_model" || scenario == "overwrite") {
     if (scenario == "naming") {
       Naming(checks);
+    } else if (scenario == "overwrite") {
+      Overwrite(checks);
     } else if (scenario == "staging") {
       Staging(checks);
     } else if (scenario == "crash_model") {

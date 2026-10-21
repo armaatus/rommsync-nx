@@ -946,6 +946,7 @@ set(EXECUTE_UNIT_SCENARIOS
   staging  # the streamed copy and the two-rename commit an overwrite goes through
   counting # no-op, a downgraded action, and the two refusals that need no server
   crash_model # M9-14: a power cut at every call of an overwrite, and the replay's own check
+  overwrite # #232: overwrite=false unless Keep local, and a 409 named as a newer save in the slot
 )
 foreach(scenario IN LISTS EXECUTE_UNIT_SCENARIOS)
   add_test(NAME execute.${scenario} COMMAND test_sync_execute ${scenario})
@@ -954,14 +955,14 @@ endforeach()
 
 
 set(EXECUTE_RIG_SCENARIOS
-  upload          # overwrite=true, session_id and device_id -- and no 409
+  upload          # overwrite=false, session_id and device_id -- and no 409 into a fresh slot
   download        # verify, back up, commit, confirm -- in that order
   crash           # M9-14: ...and a power cut at every call of it loses nothing
   conflict        # both sides changed: keep both, lose nothing
   same_timestamp  # ...and the no-history conflict, resolved the same way
   truncate        # a clean short body never replaces a save
   corrupted       # ...and neither do the right number of the wrong bytes
-  occupied        # overwrite=true, in the state it exists for: a 409 without it
+  occupied        # #232: the slot guard answers 409, and only Keep local goes over it
   dropped         # a TCP reset mid-download costs a tick, not a save
   collision       # two saves of one rom, one second, two backups
   revoked         # M1-4: a 401 stops the plan where it stands, and touches no save
