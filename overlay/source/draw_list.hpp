@@ -6,7 +6,7 @@
 // non-virtual inline methods -- there is no fake to pass it, so every row
 // position, every clip and every bar width was unreachable from any test. The
 // seam is a pure-data command and a sink: on a console `RendererDrawList`
-// (`status_screen.cpp`) replays each command into the real renderer, and in a
+// (`palette.hpp`) replays each command into the real renderer, and in a
 // host test a recorder keeps them and the test asserts on what was asked for.
 //
 // This is the shape `masagrator/Status-Monitor-Deux` uses between its logic and

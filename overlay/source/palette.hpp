@@ -10,6 +10,7 @@
 
 #include <tesla.hpp>
 
+#include <cstdint>
 #include <string>
 
 #include "draw_list.hpp"
@@ -64,5 +65,30 @@ Palette CurrentPalette();
 /// libtesla already declines a non-positive width.
 void DrawBounded(tsl::gfx::Renderer* renderer, const std::string& text, s32 x, s32 y,
                  s32 font_size, tsl::Color color, s32 max_width);
+
+/// A painter's commands, replayed into the real renderer.
+///
+/// The whole of what is left on this side of the `DrawList` seam: no geometry,
+/// no conditionals, nothing a test would want to reach (`draw_list.hpp`).
+/// Adding anything here is moving layout back out of a `*_paint.cpp`, where it
+/// can be asserted, into the half that has never run. Here rather than in each
+/// painted screen since the log screen (#209) made it two: one adapter, so the
+/// one guard it goes through is in one place.
+class RendererDrawList : public DrawList {
+ public:
+  explicit RendererDrawList(tsl::gfx::Renderer* renderer) : renderer_(renderer) {}
+
+  /// Through `DrawBounded`, which is what makes `DrawList`'s "zero means zero"
+  /// true on a console: libtesla reads `drawString`'s `maxWidth = 0` as *no
+  /// limit*.
+  void String(const std::string& text, std::int32_t x, std::int32_t y, std::int32_t font_size,
+              Rgba4444 color, std::int32_t wrap_width) override;
+
+  void Rect(std::int32_t x, std::int32_t y, std::int32_t width, std::int32_t height,
+            Rgba4444 color) override;
+
+ private:
+  tsl::gfx::Renderer* renderer_;
+};
 
 }  // namespace rommsync::overlay

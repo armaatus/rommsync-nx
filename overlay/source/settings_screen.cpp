@@ -8,6 +8,7 @@
 #include "ipc_client.hpp"
 #include "library_screen.hpp"
 #include "lifecycle.hpp"
+#include "log_screen.hpp"
 #include "pairing_screen.hpp"
 #include "palette.hpp"
 #include "rommsync/auth.hpp"
@@ -123,6 +124,9 @@ bool SettingsScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidAn
         // `GetPairState` and shows a code that is already on its way (#27).
         // "Re-pair" is the destructive way in, and it is the button.
         tsl::changeTo<PairingScreen>(client_);
+        return true;
+      case Destination::kLog:
+        tsl::changeTo<LogScreen>(client_);
         return true;
       case Destination::kNone:
         break;

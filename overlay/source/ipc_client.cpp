@@ -346,4 +346,9 @@ Result IpcClient::GetRestoreState(ipc::RestoreState* state) {
                        ipc::DecodeRestoreState, state);
 }
 
+Result IpcClient::GetLog(std::int32_t lines, ipc::LogTail* tail) {
+  return CallAndDecode(ipc::Command::kGetLog, ipc::EncodeLogRequest(lines), ipc::DecodeLogTail,
+                       tail);
+}
+
 }  // namespace rommsync::overlay

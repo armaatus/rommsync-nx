@@ -69,6 +69,11 @@ enum class Destination {
   /// (conflict_log.hpp). The `[sync]` section below still reports the value, so
   /// a user who cannot find the screen can see why in the same place.
   kConflicts,
+
+  /// The end of `rommsync.log`, read off the sysmodule (`GetLog`) rather than
+  /// the card (M9-6, #209) -- the first thing a bug report needs, on the one
+  /// console with no keyboard and no card reader.
+  kLog,
 };
 const char* ToString(Destination destination);
 

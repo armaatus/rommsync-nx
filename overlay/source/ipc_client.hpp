@@ -214,6 +214,11 @@ class IpcClient {
   Result RestoreBackup(std::int64_t entry_id, ipc::RestoreState* state);
   Result GetRestoreState(ipc::RestoreState* state);
 
+  /// The last `lines` lines of the sysmodule's log, from memory (M7-3, #38).
+  /// The log screen's, since #209 wired it: until then it was the one command
+  /// the sysmodule dispatched with nothing here to send it.
+  Result GetLog(std::int32_t lines, ipc::LogTail* tail);
+
  private:
   /// Where the one call is. `kDone` with `abandoned_` set is a late answer
   /// nobody is waiting for, which the next `Call` drops.

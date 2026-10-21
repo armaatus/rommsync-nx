@@ -18,36 +18,6 @@
 namespace rommsync::overlay {
 namespace {
 
-/// `PaintStatus`'s commands, replayed into the real renderer.
-///
-/// The whole of what is left on this side of the seam: no geometry, no
-/// conditionals, nothing a test would want to reach (`draw_list.hpp`). Adding
-/// anything here is moving layout back out of `status_paint.cpp`, where it can
-/// be asserted, and into the half that has never run.
-class RendererDrawList : public DrawList {
- public:
-  explicit RendererDrawList(tsl::gfx::Renderer* renderer) : renderer_(renderer) {}
-
-  /// Through `DrawBounded`, which is what makes `DrawList`'s "zero means zero"
-  /// true on a console: libtesla reads `drawString`'s `maxWidth = 0` as *no
-  /// limit* (`palette.hpp`). Every other screen goes through the same function.
-  void String(const std::string& text, std::int32_t x, std::int32_t y, std::int32_t font_size,
-              Rgba4444 color, std::int32_t wrap_width) override {
-    DrawBounded(renderer_, text, static_cast<s32>(x), static_cast<s32>(y),
-                static_cast<s32>(font_size), tsl::Color(color),
-                static_cast<s32>(wrap_width));
-  }
-
-  void Rect(std::int32_t x, std::int32_t y, std::int32_t width, std::int32_t height,
-            Rgba4444 color) override {
-    renderer_->drawRect(static_cast<s32>(x), static_cast<s32>(y), static_cast<s32>(width),
-                        static_cast<s32>(height), tsl::Color(color));
-  }
-
- private:
-  tsl::gfx::Renderer* renderer_;
-};
-
 /// Polls between two looks at the card, while the sysmodule is not answering.
 ///
 /// `update()` runs once a frame, and three `stat`s a frame on an SD card is a

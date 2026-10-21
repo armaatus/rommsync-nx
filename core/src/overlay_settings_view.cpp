@@ -80,6 +80,10 @@ SettingsSection Menu(const config::SyncConfig& sync) {
   // destructive way in and is a button rather than a row; this is how a user
   // reads a code that is already on its way (#27).
   section.rows.push_back(Navigate("Pairing", "the pairing code", Destination::kPairing));
+  // Last, because it is the row a user is sent to rather than one they browse:
+  // docs/TROUBLESHOOTING.md names the event tag to look for, and this is where
+  // it is read without pulling the card (#209).
+  section.rows.push_back(Navigate("Log", "what the sysmodule last said", Destination::kLog));
   return section;
 }
 
@@ -380,6 +384,8 @@ const char* ToString(Destination destination) {
       return "pairing";
     case Destination::kConflicts:
       return "conflicts";
+    case Destination::kLog:
+      return "log";
   }
   return "none";
 }
