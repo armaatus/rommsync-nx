@@ -72,6 +72,32 @@ jobs:
             exit 1
           fi
 
+  # Has the nightly soak (.github/workflows/soak.yml) passed in the last three
+  # days? A schedule can stop without a word -- GitHub disables one after 60
+  # days of repository inactivity -- and a nightly that fails every night is a
+  # red X on a page nobody opens. This makes either a red build on main, which
+  # is the page people do look at (M9-15, #204).
+  #
+  # On pushes to main only. On a pull request it would fail every PR for a
+  # reason none of them caused, and hold up work that has nothing to do with
+  # the soak; on main it says the same thing without blocking anyone.
+  soak-fresh:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The script measures a soak that has never passed from the day
+          # soak.yml was added, and only history can say when that was.
+          fetch-depth: 0
+      - name: The soak has passed recently
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/soak-fresh.sh 3
+
   # The primary rig (docs/TESTING.md): the core engine built natively and run
   # against a REAL RomM in Docker, reached through the fault proxy so the
   # failure paths are exercised too.

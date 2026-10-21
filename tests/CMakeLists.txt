@@ -2306,3 +2306,13 @@ foreach(name alloc.steady soak.smoke)
   endif()
   set_tests_properties(${name} PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
 endforeach()
+
+# The nightly soak's two halves that are not the soak itself: the workflow that
+# runs it on a schedule and keeps what it measured, and the check on main that
+# goes red when it has stopped passing (scripts/soak-fresh.sh). Neither needs a
+# network or a token, so neither skips.
+set(SOAK_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_soak.sh")
+foreach(phase workflow fresh)
+  add_test(NAME soak.${phase} COMMAND "${BASH_PROGRAM}" "${SOAK_TEST}" ${phase})
+  set_tests_properties(soak.${phase} PROPERTIES TIMEOUT 60)
+endforeach()
