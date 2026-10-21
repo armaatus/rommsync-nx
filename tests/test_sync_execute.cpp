@@ -925,7 +925,11 @@ void Delete(rig::Checks& checks) {
     const std::string bytes = "a save the scan never reported\n";
     sandbox.SeedSave(SavePath(name), bytes);
     sync::ExecuteOptions options = DeleteOptionsAt(kWhen);
-    options.place = [&name](const sync::SyncOperation&) { return SavePath(name); };
+    options.place = [&name](const sync::SyncOperation&) {
+      place::Placement placement;
+      placement.sd_path = SavePath(name);
+      return placement;
+    };
     const sync::ExecutionReport report =
         sync::ExecutePlan(client, *files, token, DeletePlan(24, "unscanned"), {}, options);
     checks.Expect(report.operations.size() == 1 &&

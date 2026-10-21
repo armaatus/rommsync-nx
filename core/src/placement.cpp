@@ -385,10 +385,9 @@ Placement Placer::Save(const sync::SyncOperation& operation) {
     return placed;
   }
   const std::string leaf = placed.sd_path.substr(placed.sd_path.rfind('/') + 1);
-  const scan::Source source = target.layout.play_with == config::PlayWith::kTico
-                                  ? scan::Source::kTico
-                                  : scan::Source::kRetroArch;
-  const std::string slot = scan::SlotFor(scan::ToString(source), leaf);
+  // The slot the scan gives the file under `[sync] slot` (#236): `autosave` for
+  // a `.srm` whichever emulator's folder it is in, `autosave-<ext>` otherwise.
+  const std::string slot = scan::SlotFor(config_.sync.slot, leaf);
   if (slot != *operation.slot) {
     // The server's slot is not quoted: it is whatever another client chose.
     return Refuse("the scan would read it back in slot \"" + slot +

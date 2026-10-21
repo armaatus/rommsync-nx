@@ -246,6 +246,7 @@ roms::RomIndex Library() {
   index.Add(MakeRom(5, "Shared", "dreamcast"));
   index.Add(MakeRom(6, "Ps2 Game", "ps2"));
   index.Add(MakeRom(7, "Game (USA)", "snes"));
+  index.Add(MakeRom(8, "Gba Game", "gba"));
   return index;
 }
 
@@ -263,11 +264,11 @@ sync::SyncOperation Download(std::int64_t rom_id, std::optional<std::string> slo
   return operation;
 }
 
-/// The slot the scan gives a file called `name` in a folder of `source`. Asked
-/// of the scan rather than written out, so these scenarios follow the slot rule
-/// wherever #236 takes it.
-std::string ScanSlot(scan::Source source, const std::string& name) {
-  return scan::SlotFor(scan::ToString(source), name);
+/// The slot the scan gives a file called `name` under the default `[sync]
+/// slot`. Asked of the scan rather than written out, so these scenarios follow
+/// the slot rule wherever it goes (#236).
+std::string ScanSlot(const std::string& name) {
+  return scan::SlotFor(config::Defaults().sync.slot, name);
 }
 
 /// Writes the placed file, scans the card, and says whether the scan read it
@@ -296,8 +297,10 @@ bool ReadsBack(Card& card, const config::Config& config, const retroarch::Settin
 void Saves(checks::Checks& c) {
   const roms::RomIndex index = Library();
   const retroarch::Settings ra_defaults;
-  const std::string tico_srm = ScanSlot(scan::Source::kTico, "x.srm");
-  const std::string ra_srm = ScanSlot(scan::Source::kRetroArch, "x.srm");
+  // One slot for a `.srm` whichever emulator's folder it is in (#236), so the
+  // two names below are the same slot and a save crosses between them.
+  const std::string tico_srm = ScanSlot("x.srm");
+  const std::string ra_srm = ScanSlot("x.srm");
   const std::string tagged = " [2026-10-01_12-00-00]";
   const sync::SyncOperation smw =
       Download(1, tico_srm, "snes9x", "Super Mario World (USA)" + tagged + ".srm");
@@ -346,6 +349,43 @@ void Saves(checks::Checks& c) {
     }
   }
 
+  // Another client's save in the shared slot reaches Tico (#236 + #237): what
+  // RetroArch's Cloud Sync uploads (`saves/Snes9x/<rom>.srm` -> `autosave`,
+  // `snes9x`), what the web player uploads (`autosave`, no emulator), and an
+  // mGBA `.sav` some other client filed under `autosave`.
+  {
+    Card card("tico-from-others");
+    const config::Config config = config::Defaults();
+    c.ExpectEq(ScanSlot("x.srm"), std::string("autosave"),
+               "a .srm is in RomM's shared autosave slot, whichever folder it is in");
+    place::Placer placer(config, ra_defaults, index, card.files());
+    struct Other {
+      const char* who;
+      sync::SyncOperation operation;
+      std::string expected;
+      std::int64_t rom_id;
+    };
+    const std::vector<Other> others = {
+        {"RetroArch's Cloud Sync",
+         Download(1, "autosave", "snes9x", "Super Mario World (USA)" + tagged + ".srm"),
+         "/tico/saves/snes/Super Mario World (USA).srm", 1},
+        {"the web player, which names no emulator",
+         Download(7, "autosave", "", "Game (USA)" + tagged + ".srm"),
+         "/tico/saves/snes/Game (USA).srm", 7},
+        {"a .sav under autosave", Download(8, "autosave", "mgba", "Gba Game" + tagged + ".sav"),
+         "/tico/saves/gba/Gba Game.srm", 8},
+    };
+    for (const Other& other : others) {
+      const place::Placement placed = placer.Save(other.operation);
+      c.ExpectEq(placed.sd_path, other.expected,
+                 std::string(other.who) + "'s save goes to Tico's folder: " + placed.reason);
+      std::string said;
+      c.Expect(ReadsBack(card, config, ra_defaults, index, placed.sd_path, other.rom_id,
+                         "autosave", &said),
+               std::string(other.who) + ": read back in the slot it came from: " + said);
+    }
+  }
+
   // Several accounts and none named: whose is not guessed.
   {
     Card card("tico-two");
@@ -386,7 +426,7 @@ void Saves(checks::Checks& c) {
     c.ExpectEq(placer.Save(Download(2, ra_srm, "", "x.srm")).sd_path,
                std::string("/retroarch/cores/savefiles/Gambatte/Gb Game.srm"),
                "one with no emulator goes to the platform's core");
-    c.Expect(!placer.Save(Download(1, tico_srm, "snes9x", "x.srm")).ok(),
+    c.Expect(!placer.Save(Download(1, ScanSlot("x.rtc"), "snes9x", "x.srm")).ok(),
              "a slot the RetroArch folder would not read back is not placed there");
 
     const config::LoadResult overridden = config::ParseConfig(
@@ -467,14 +507,14 @@ void Saves(checks::Checks& c) {
     refused(placer.Save(Download(99, tico_srm, "snes9x", "x.srm")), "a rom not in the index");
     refused(placer.Save(Download(1, std::nullopt, "snes9x", "x.srm")),
             "an archival save, which pairs with nothing");
-    refused(placer.Save(Download(1, "autosave", "snes9x", "x.srm")),
+    refused(placer.Save(Download(1, ScanSlot("x.rtc"), "snes9x", "x.srm")),
             "a slot the scan would not give it back in");
-    refused(placer.Save(Download(3, ScanSlot(scan::Source::kTico, "x.mcd"), "mednafen_psx_hw",
-                                 "Psx Game.srm")),
+    refused(placer.Save(Download(1, ScanSlot("x.sav"), "snes9x", "x.sav")),
+            "a .sav in a slot of its own, which renaming to .srm would move out of it");
+    refused(placer.Save(Download(3, ScanSlot("x.mcd"), "mednafen_psx_hw", "Psx Game.srm")),
             "a RetroArch psx save is not a DuckStation card (#226 D3)");
     refused(placer.Save(Download(6, tico_srm, "pcsx2", "x.ps2")), "a platform nothing maps");
-    refused(placer.Save(Download(4, ScanSlot(scan::Source::kTico, "x.bin"), "tico-flycast",
-                                 "Shared.bin")),
+    refused(placer.Save(Download(4, ScanSlot("x.bin"), "tico-flycast", "Shared.bin")),
             "a name dc and dreamcast share in Tico's one dc folder, which the scan would "
             "skip as ambiguous");
 
