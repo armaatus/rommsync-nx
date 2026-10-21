@@ -1531,6 +1531,11 @@ set(TICK_RIG_SCENARIOS
   resumes          # a reset mid-download, then a second tick: one save, one row
   newer_download   # #232: another device uploads mid-tick; unchanged bytes take its head, backed up
   newer_conflict   # #232: ...and changed bytes are a conflict -- never a blind upload over it
+  baseline_touch      # #234: the same bytes under a newer mtime are a no_op
+  baseline_moved      # #234: ...and, the server's row moved in place, a download -- not a conflict
+  baseline_downloaded # #234: ...the same from a /downloaded baseline
+  baseline_conflict   # #234: real progress against a moved row is still a conflict
+  baseline_other_row  # #234: ...and against another device's new row (#227), never suppressed
 )
 
 # M10-2 (#228): which RomM this console is talking to. `versions` and

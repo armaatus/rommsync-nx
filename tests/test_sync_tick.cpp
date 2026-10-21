@@ -2211,6 +2211,342 @@ void NewerConflict(rig::Checks& checks, http::HttpClient& client, const std::str
   sweep();
 }
 
+// --- baselines ----------------------------------------------------------------
+//
+// #234: every upload and every `/downloaded` carries `content_hash`, and RomM
+// 5.4 keeps it as this device's baseline for that save row. A report matching
+// the baseline proves "this side did not change", so an mtime-only touch --
+// Tico rewriting a save atomically -- stops reading as a change.
+//
+// Each tick here runs through `harness::BaselineAudit`, which fails the run if
+// either call leaves without the digest, or an upload's digest is not the MD5
+// of the bytes it streams. The hazard the scenarios are written against is the
+// other direction: a baseline that suppresses a conflict that is real. RomM can
+// only remove a conflict with one, never create one (`compare_save_state`), so
+// that would take a digest of bytes the server does not hold -- which the audit
+// rules out -- or a baseline read against the wrong row, which is
+// `baseline_other_row`.
+
+/// A tick through the audit, with its findings reported.
+sync::TickResult AuditedTick(rig::Checks& checks, http::HttpClient& client, fs::FileSystem& files,
+                             const std::string& base, const Fixture& fixture,
+                             const sync::ClientSaveState& local,
+                             const std::vector<sync::SaveTarget>& targets,
+                             state::Baseline previous, std::int64_t at, const std::string& what,
+                             std::size_t uploads, std::size_t confirmations) {
+  harness::BaselineAudit audit(client);
+  sync::TickResult tick = sync::RunTick(audit, files, TokenFor(base, fixture), {local}, targets,
+                                        std::move(previous), OptionsAt(at));
+  for (const std::string& violation : audit.violations) {
+    checks.Expect(false, what + ": " + violation);
+  }
+  checks.ExpectEq(audit.uploaded.size(), uploads, what + ": uploads that carried a content_hash");
+  checks.ExpectEq(audit.confirmed.size(), confirmations,
+                  what + ": confirmations that carried a content_hash");
+  return tick;
+}
+
+/// The one operation this run arranged, as the plan named it and as it went.
+bool OnlyOperation(rig::Checks& checks, const sync::TickResult& tick, const std::string& what,
+                   sync::Action* action, sync::OperationResult* done) {
+  if (tick.negotiated.plan.operations.size() != 1 || tick.executed.operations.size() != 1) {
+    checks.Expect(false, what + ": the tick carries the one operation this run arranged" +
+                             (tick.executed.warnings.empty() ? std::string()
+                                                             : " -- " + tick.executed.warnings[0]));
+    return false;
+  }
+  *action = tick.negotiated.plan.operations[0].action;
+  *done = tick.executed.operations[0];
+  return true;
+}
+
+/// Move a save's mtime two minutes past now and leave its bytes alone: what an
+/// atomic rewrite of the same bytes looks like from the scan.
+void TouchMtime(const Sandbox& sandbox, const std::string& sd_path) {
+  std::error_code error;
+  std::filesystem::last_write_time(
+      sandbox.Host(sd_path),
+      std::filesystem::file_time_type::clock::now() + std::chrono::minutes{2}, error);
+}
+
+/// Tick one of every baseline scenario: the card's only copy, uploaded through
+/// the audit, so the slot has one row and this device's baseline is on it.
+bool UploadedOnce(rig::Checks& checks, http::HttpClient& client, fs::FileSystem& files,
+                  const std::string& base, const Fixture& fixture, Sandbox& sandbox,
+                  const harness::Rom& rom, std::string_view label, UploadFixture* arranged,
+                  std::int64_t* row) {
+  if (!ArrangeUpload(checks, files, sandbox, rom, label, arranged)) {
+    return false;
+  }
+  const sync::TickResult first =
+      AuditedTick(checks, client, files, base, fixture, arranged->local, arranged->targets, {},
+                  1'757'000'800, "the first tick", 1, 0);
+  sync::Action action = sync::Action::kNoOp;
+  sync::OperationResult done;
+  if (!OnlyOperation(checks, first, "the first tick", &action, &done)) {
+    return false;
+  }
+  checks.Expect(done.outcome == sync::OperationOutcome::kUploaded && done.save_id.has_value(),
+                std::string("the first tick uploads the card's only copy: ") + done.message);
+  if (!done.save_id.has_value()) {
+    return false;
+  }
+  *row = *done.save_id;
+  return true;
+}
+
+/// The acceptance as #234 words it: the same bytes under a newer mtime negotiate
+/// as `no_op`. RomM's "content is identical" answers this one before any
+/// baseline is read, so it is the floor rather than the proof -- `baseline_moved`
+/// and `baseline_downloaded` are the cases only a baseline settles.
+void BaselineTouch(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                   const Fixture& fixture, const harness::Rom& rom) {
+  Sandbox sandbox(checks, "tick-baseline-touch");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  UploadFixture arranged;
+  std::int64_t row = 0;
+  if (!UploadedOnce(checks, client, *files, base, fixture, sandbox, rom, "m10-8-touch", &arranged,
+                    &row)) {
+    harness::DeleteSave(client, base, fixture, row);
+    return;
+  }
+
+  TouchMtime(sandbox, SavePath(arranged.name));
+  sync::ClientSaveState touched;
+  if (LocalSaveOnCard(checks, *files, sandbox, rom.id, arranged.name, arranged.slot, &touched)) {
+    checks.Expect(touched.updated_at > arranged.local.updated_at, "the touch moved the mtime");
+    const sync::TickResult second =
+        AuditedTick(checks, client, *files, base, fixture, touched, arranged.targets,
+                    StoredBaseline(*files).value, 1'757'000'801, "the touched tick", 0, 0);
+    sync::Action action = sync::Action::kUpload;
+    sync::OperationResult done;
+    if (OnlyOperation(checks, second, "the touched tick", &action, &done)) {
+      checks.Expect(action == sync::Action::kNoOp,
+                    std::string("an mtime-only touch negotiates as no_op: ") +
+                        sync::ToString(action));
+    }
+  }
+  checks.ExpectEq(sandbox.Read(SavePath(arranged.name)), arranged.bytes, "the card is untouched");
+  checks.ExpectEq(SaveRowsFor(client, base, fixture, rom.id, arranged.slot, nullptr), 1,
+                  "and nothing went up twice");
+  harness::DeleteSave(client, base, fixture, row);
+}
+
+/// The server's copy moved in place since this device uploaded, and the card's
+/// bytes only had their mtime touched. Without a baseline both sides "changed
+/// since the last sync" and RomM says conflict; with the digest this device
+/// uploaded, its side is proven unchanged and the answer is a download.
+void BaselineMoved(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                   const Fixture& fixture, const harness::Rom& rom) {
+  Sandbox sandbox(checks, "tick-baseline-moved");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  UploadFixture arranged;
+  std::int64_t row = 0;
+  if (!UploadedOnce(checks, client, *files, base, fixture, sandbox, rom, "m10-8-moved", &arranged,
+                    &row)) {
+    harness::DeleteSave(client, base, fixture, row);
+    return;
+  }
+
+  // In place, by no device: the row this device's baseline is on moves forward.
+  const std::string theirs = "the server's copy, moved on in place\n";
+  const std::string staged = sandbox.Host("/config/rommsync/moved.srm");
+  rig::WriteFile(staged, theirs);
+  harness::PassASecond();
+  harness::Save moved;
+  if (!harness::ReplaceSave(client, base, fixture, row, staged, arranged.name, &moved)) {
+    checks.Expect(false, "the server's copy was replaced in place");
+    harness::DeleteSave(client, base, fixture, row);
+    return;
+  }
+
+  TouchMtime(sandbox, SavePath(arranged.name));
+  sync::ClientSaveState touched;
+  if (LocalSaveOnCard(checks, *files, sandbox, rom.id, arranged.name, arranged.slot, &touched)) {
+    const sync::TickResult second =
+        AuditedTick(checks, client, *files, base, fixture, touched, arranged.targets,
+                    StoredBaseline(*files).value, 1'757'000'802, "the touched tick", 0, 1);
+    sync::Action action = sync::Action::kConflict;
+    sync::OperationResult done;
+    if (OnlyOperation(checks, second, "the touched tick", &action, &done)) {
+      checks.Expect(action == sync::Action::kDownload,
+                    std::string("unchanged bytes under a newer mtime take the server's move as a "
+                                "download, not a conflict: ") +
+                        sync::ToString(action));
+      checks.Expect(done.outcome == sync::OperationOutcome::kDownloaded, done.message);
+    }
+  }
+  checks.ExpectEq(sandbox.Read(SavePath(arranged.name)), theirs, "the card holds the server's copy");
+  checks.Expect(sandbox.HasBackupOf(arranged.bytes), "and the bytes it replaced are under .backup/");
+  harness::DeleteSave(client, base, fixture, row);
+}
+
+/// The `/downloaded` half: a copy this device took from the server, moved in
+/// place afterwards, with the card's copy only touched. The confirmation's
+/// digest is the baseline that proves the card did not change.
+void BaselineDownloaded(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                        const Fixture& fixture, const harness::Rom& rom) {
+  Sandbox sandbox(checks, "tick-baseline-downloaded");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  DownloadFixture arranged;
+  if (!ArrangeDownload(checks, client, base, fixture, sandbox, rom, "m10-8-downloaded",
+                       &arranged)) {
+    return;
+  }
+  const std::int64_t row = arranged.server.id;
+  const sync::TickResult first =
+      AuditedTick(checks, client, *files, base, fixture, arranged.local, arranged.targets, {},
+                  1'757'000'803, "the first tick", 0, 1);
+  sync::Action action = sync::Action::kNoOp;
+  sync::OperationResult done;
+  if (!OnlyOperation(checks, first, "the first tick", &action, &done) ||
+      done.outcome != sync::OperationOutcome::kDownloaded) {
+    checks.Expect(false, "the first tick downloads the server's copy: " + done.message);
+    harness::DeleteSave(client, base, fixture, row);
+    return;
+  }
+  checks.Expect(sandbox.HasBackupOf(arranged.previous),
+                "the first download backed up the bytes it replaced");
+  // The card now holds the server's bytes, and the audit judges what comes next
+  // from them.
+  sandbox.Reseed(SavePath(arranged.name), arranged.server_bytes);
+
+  const std::string theirs = "the server's copy, moved on after the download\n";
+  const std::string staged = sandbox.Host("/config/rommsync/moved.srm");
+  rig::WriteFile(staged, theirs);
+  harness::PassASecond();
+  harness::Save moved;
+  if (!harness::ReplaceSave(client, base, fixture, row, staged, arranged.name, &moved)) {
+    checks.Expect(false, "the server's copy was replaced in place");
+    harness::DeleteSave(client, base, fixture, row);
+    return;
+  }
+
+  TouchMtime(sandbox, SavePath(arranged.name));
+  sync::ClientSaveState touched;
+  if (LocalSaveOnCard(checks, *files, sandbox, rom.id, arranged.name, arranged.slot, &touched)) {
+    const sync::TickResult second =
+        AuditedTick(checks, client, *files, base, fixture, touched, arranged.targets,
+                    StoredBaseline(*files).value, 1'757'000'804, "the touched tick", 0, 1);
+    if (OnlyOperation(checks, second, "the touched tick", &action, &done)) {
+      checks.Expect(action == sync::Action::kDownload,
+                    std::string("a downloaded copy only touched since takes the move as a "
+                                "download, not a conflict: ") +
+                        sync::ToString(action));
+    }
+  }
+  checks.ExpectEq(sandbox.Read(SavePath(arranged.name)), theirs, "the card holds the server's copy");
+  checks.Expect(sandbox.HasBackupOf(arranged.server_bytes),
+                "and the bytes it replaced are under .backup/");
+  harness::DeleteSave(client, base, fixture, row);
+}
+
+/// What a baseline must never do: hide progress. The card's bytes really
+/// changed while the server's copy moved in place, so both sides changed and it
+/// is a conflict -- the baseline proves nothing about a side whose digest no
+/// longer matches it.
+void BaselineConflict(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                      const Fixture& fixture, const harness::Rom& rom) {
+  Sandbox sandbox(checks, "tick-baseline-conflict");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  UploadFixture arranged;
+  std::int64_t row = 0;
+  if (!UploadedOnce(checks, client, *files, base, fixture, sandbox, rom, "m10-8-conflict",
+                    &arranged, &row)) {
+    harness::DeleteSave(client, base, fixture, row);
+    return;
+  }
+
+  const std::string theirs = "the server's copy, moved on in place\n";
+  const std::string staged = sandbox.Host("/config/rommsync/moved.srm");
+  rig::WriteFile(staged, theirs);
+  harness::PassASecond();
+  harness::Save moved;
+  if (!harness::ReplaceSave(client, base, fixture, row, staged, arranged.name, &moved)) {
+    checks.Expect(false, "the server's copy was replaced in place");
+    harness::DeleteSave(client, base, fixture, row);
+    return;
+  }
+
+  const std::string progress = "this console played on, and saved\n";
+  sandbox.Reseed(SavePath(arranged.name), progress);
+  TouchMtime(sandbox, SavePath(arranged.name));
+  sync::ClientSaveState played;
+  if (LocalSaveOnCard(checks, *files, sandbox, rom.id, arranged.name, arranged.slot, &played)) {
+    const sync::TickResult second =
+        AuditedTick(checks, client, *files, base, fixture, played, arranged.targets,
+                    StoredBaseline(*files).value, 1'757'000'805, "the played tick", 0, 1);
+    sync::Action action = sync::Action::kNoOp;
+    sync::OperationResult done;
+    if (OnlyOperation(checks, second, "the played tick", &action, &done)) {
+      checks.Expect(action == sync::Action::kConflict,
+                    std::string("real progress against a moved server copy is a conflict: ") +
+                        sync::ToString(action));
+      checks.Expect(done.outcome == sync::OperationOutcome::kKeptBoth, done.message);
+    }
+  }
+  checks.Expect(sandbox.HasBackupOf(progress), "and the progress is under .backup/");
+  harness::DeleteSave(client, base, fixture, row);
+}
+
+/// #227's finding, held to the same rule: a baseline lives on one row, and
+/// another device's upload is a new row -- the head -- that this device has no
+/// history with. The baseline on the superseded row must not be what answers
+/// for the card. Real progress here meets the slot guard (#232) and ends a
+/// conflict, with nothing uploaded over the other device's save.
+void BaselineOtherRow(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                      const Fixture& fixture, const harness::Rom& rom) {
+  Sandbox sandbox(checks, "tick-baseline-other-row");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  UploadFixture arranged;
+  std::int64_t row = 0;
+  if (!UploadedOnce(checks, client, *files, base, fixture, sandbox, rom, "m10-8-other-row",
+                    &arranged, &row)) {
+    harness::DeleteSave(client, base, fixture, row);
+    return;
+  }
+
+  const std::string theirs = "another device's save, a new row\n";
+  const std::string staged = sandbox.Host("/config/rommsync/theirs.srm");
+  rig::WriteFile(staged, theirs);
+  harness::Save other;
+  if (!OtherDeviceUploads(checks, client, base, fixture, rom, arranged.slot, arranged.name, staged,
+                          &other)) {
+    harness::DeleteSave(client, base, fixture, row);
+    return;
+  }
+
+  const std::string progress = "this console played on, and saved\n";
+  sandbox.Reseed(SavePath(arranged.name), progress);
+  TouchMtime(sandbox, SavePath(arranged.name));
+  sync::ClientSaveState played;
+  if (LocalSaveOnCard(checks, *files, sandbox, rom.id, arranged.name, arranged.slot, &played)) {
+    // One upload, refused by the guard; then the head, taken keep-both.
+    const sync::TickResult second =
+        AuditedTick(checks, client, *files, base, fixture, played, arranged.targets,
+                    StoredBaseline(*files).value, 1'757'000'806, "the played tick", 1, 1);
+    checks.ExpectEq(second.resolved.refused, std::size_t{1}, "the slot guard refused the upload");
+    sync::Action action = sync::Action::kNoOp;
+    sync::OperationResult done;
+    if (OnlyOperation(checks, second, "the played tick", &action, &done)) {
+      checks.Expect(done.outcome == sync::OperationOutcome::kKeptBoth,
+                    std::string("real progress against another device's row is a conflict: ") +
+                        sync::ToString(done.outcome) + " -- " + done.message);
+    }
+  }
+  checks.ExpectEq(sandbox.Read(SavePath(arranged.name)), theirs, "the head is on the card");
+  checks.Expect(sandbox.HasBackupOf(progress), "and the progress is under .backup/");
+  checks.ExpectEq(SaveRowsFor(client, base, fixture, rom.id, arranged.slot, nullptr), 2,
+                  "and nothing was uploaded over the other device's save");
+  harness::DeleteSave(client, base, fixture, row);
+  harness::DeleteSave(client, base, fixture, other.id);
+}
+
 int main(int argc, char** argv) {
   const std::string scenario = argc > 1 ? argv[1] : "recovery";
 
@@ -2394,6 +2730,16 @@ int main(int argc, char** argv) {
     NewerDownload(checks, *client, base, fixture, rom);
   } else if (scenario == "newer_conflict") {
     NewerConflict(checks, *client, base, fixture, rom);
+  } else if (scenario == "baseline_touch") {
+    BaselineTouch(checks, *client, base, fixture, rom);
+  } else if (scenario == "baseline_moved") {
+    BaselineMoved(checks, *client, base, fixture, rom);
+  } else if (scenario == "baseline_downloaded") {
+    BaselineDownloaded(checks, *client, base, fixture, rom);
+  } else if (scenario == "baseline_conflict") {
+    BaselineConflict(checks, *client, base, fixture, rom);
+  } else if (scenario == "baseline_other_row") {
+    BaselineOtherRow(checks, *client, base, fixture, rom);
   } else if (scenario == "resumes") {
     Resumes(checks, *client, base, fixture, rom);
   } else if (scenario == "relaunched") {
