@@ -614,8 +614,36 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
     const std::string& sd_path = placement.sd_path;
     if (sd_path.empty()) {
       return Fail(operation, OperationError::kNoLocalSave,
-                  "there is no local save for this (rom_id, slot) and nothing said where a new "
-                  "one should go");
+                  placement.reason.empty()
+                      ? "there is no local save for this (rom_id, slot) and nothing said where a "
+                        "new one should go"
+                      : "there is no local save for this (rom_id, slot), and none was placed: " +
+                            placement.reason);
+    }
+    // **A placement only creates.** "No local save matched" is not "nothing is
+    // at that path": a save the scan skipped, or one it read in another slot,
+    // still sits there, and writing over it on the strength of a row this
+    // console has no history for is not a restore. Asked before anything is
+    // fetched; the backup below still covers a file that appears meanwhile.
+    const std::string resolved = files.Resolve(sd_path);
+    if (resolved.empty()) {
+      return Fail(operation, OperationError::kUnreadableCard,
+                  "the save path " + sd_path + " is not a path on this card");
+    }
+    if (io::Exists(resolved)) {
+      return Fail(operation, OperationError::kNoLocalSave,
+                  "there is no local save for this (rom_id, slot), and " + sd_path +
+                      " is already a file this sync did not pair with it; it was not touched");
+    }
+    // The emulator makes a system's folder the first time it saves one, which
+    // for a save the console has never held is after this.
+    const std::size_t parent = sd_path.rfind('/');
+    if (parent != std::string::npos && parent > 0) {
+      const fs::MakeDirResult made = files.CreateDirectory(sd_path.substr(0, parent));
+      if (!made.ok()) {
+        return Fail(operation, OperationError::kUnreadableCard,
+                    "the folder for " + sd_path + " could not be made: " + made.message);
+      }
     }
     placed.rom_id = operation.rom_id;
     placed.slot = operation.slot;

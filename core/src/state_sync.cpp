@@ -970,6 +970,19 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
       }
       continue;
     }
+    // The emulator's folder for the system may not exist yet: a state the
+    // console has never held is often for a system it has never run.
+    if (const std::size_t parent = sd_path.rfind('/'); parent != std::string::npos && parent > 0) {
+      const fs::MakeDirResult made = files.CreateDirectory(sd_path.substr(0, parent));
+      if (!made.ok()) {
+        if (!record(Fail(server.rom_id, server.file_name, StateAction::kPlace,
+                         StateError::kUnreadableCard,
+                         "the folder for " + sd_path + " could not be made: " + made.message))) {
+          break;
+        }
+        continue;
+      }
+    }
     StateOperationResult result =
         Fetch(client, files, token, server, sd_path, StateAction::kPlace, options,
               &report.warnings);
