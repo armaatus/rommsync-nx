@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <set>
 #include <string>
@@ -931,7 +932,13 @@ LoadResult ParseConfig(std::string_view text) {
       // Above the first section because it is about the whole file, and so it
       // is read before a single key it governs.
       int version = 0;
-      if (!ParseInt(value, &version) || version < 1) {
+      if (!ParseInt(value, &version) && !value.empty() &&
+          value.find_first_not_of("0123456789") == std::string_view::npos) {
+        // Digits past what an `int` holds: no typo makes one, and reading the
+        // file as version 1 would be the misparse refusing exists to prevent.
+        version = std::numeric_limits<int>::max();
+      }
+      if (version < 1) {
         diags.Add(Severity::kWarning, line_number, "", "version",
                   "expected the whole number of the format this file is written in, got '" +
                       Redact(value) + "'; it is read as version " +
@@ -949,7 +956,7 @@ LoadResult ParseConfig(std::string_view text) {
         refused.version = version;
         Diagnostics only;
         only.Add(Severity::kError, line_number, "", "version",
-                 "is " + std::to_string(version) +
+                 "is " + std::string(value) +
                      ": this config.ini was written by a newer release than this "
                      "sys-rommsync, which reads version " +
                      std::to_string(kConfigVersion) +

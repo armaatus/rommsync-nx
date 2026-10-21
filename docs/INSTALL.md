@@ -308,7 +308,9 @@ queue) it rebuilds. The full list is in
 v1.0.0-rc1 predates all of that: it reads a newer file as best it can. The one
 setting that reads differently there is a `[platform.<slug>]` section holding
 only `emulator =` — rc1 ignores that key, so the section maps no folders and
-the platform is skipped. Remove such a section before going back to rc1.
+the platform is skipped. Remove such a section before going back to rc1. rc1
+also reports the `version = 1` line as a warning ("nothing it configures"),
+which is harmless.
 
 ---
 

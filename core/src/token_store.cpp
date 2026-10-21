@@ -35,6 +35,10 @@ std::int64_t RecordVersion(const json::Value& document) {
   return version->is_integer() ? version->integer() : -1;
 }
 
+/// `ParseStoredToken` past the JSON parse, so `LoadToken` can ask the document
+/// its version and read it without parsing the file twice.
+Parsed<StoredToken> FromDocument(const json::Value& document);
+
 }  // namespace
 
 const char* ToString(StoreError error) {
@@ -88,15 +92,22 @@ std::string SerializeStoredToken(const StoredToken& token) {
 }
 
 Parsed<StoredToken> ParseStoredToken(std::string_view text) {
-  Parsed<StoredToken> parsed;
   json::ParseResult document = json::Parse(text);
   if (!document.ok()) {
+    Parsed<StoredToken> parsed;
     parsed.error = std::move(document.error);
     return parsed;
   }
+  return FromDocument(document.value);
+}
+
+namespace {
+
+Parsed<StoredToken> FromDocument(const json::Value& document) {
+  Parsed<StoredToken> parsed;
   // Before any field: a later format is one whose fields this build would
   // misread, and "missing server_url" is the wrong sentence for it.
-  const std::int64_t version = RecordVersion(document.value);
+  const std::int64_t version = RecordVersion(document);
   if (version < 1 || version > kTokenFormatVersion) {
     parsed.error.field = "version";
     parsed.error.message =
@@ -107,7 +118,7 @@ Parsed<StoredToken> ParseStoredToken(std::string_view text) {
   }
 
   StoredToken token;
-  json::Reader reader(document.value, "token record");
+  json::Reader reader(document, "token record");
   reader.Required("server_url", &token.server_url);
   reader.Required("access_token", &token.access_token);
   reader.Required("device_id", &token.device_id);
@@ -121,6 +132,8 @@ Parsed<StoredToken> ParseStoredToken(std::string_view text) {
   parsed.value = std::move(token);
   return parsed;
 }
+
+}  // namespace
 
 StoreResult SaveToken(const std::string& path, const StoredToken& token) {
   // Refused here rather than on the way back in: a record that cannot be read
@@ -206,9 +219,14 @@ LoadedToken ReadRecord(const std::string& path, io::ReadError* how) {
     return loaded;
   }
 
-  Parsed<StoredToken> parsed = ParseStoredToken(read.contents);
+  json::ParseResult document = json::Parse(read.contents);
+  Parsed<StoredToken> parsed;
+  if (document.ok()) {
+    parsed = FromDocument(document.value);
+  } else {
+    parsed.error = std::move(document.error);
+  }
   if (!parsed.ok()) {
-    const json::ParseResult document = json::Parse(read.contents);
     if (document.ok() && RecordVersion(document.value) > kTokenFormatVersion) {
       // Its own error rather than `kMalformed`: nothing is wrong with the file,
       // and the remedy is a release, not a re-pair -- though a re-pair is also

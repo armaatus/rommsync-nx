@@ -15,6 +15,10 @@
 //     check off for the file, and the reading half is then what says whether
 //     the migration covers rc1.
 //
+// The older direction *is* the fixtures: for every file but `state.db`, rc1
+// wrote the first format there has ever been, so there is nothing older to
+// read. `state.db`'s version 1 predates rc1 and is test_state_db's.
+//
 // The newer direction is the downgrade: a file written by a release this build
 // predates. Each file's answer is its policy (docs/ARCHITECTURE.md, "Formats
 // across releases"): what can be rebuilt is discarded and rebuilt, what cannot
@@ -155,6 +159,21 @@ void ConfigIni(checks::Checks& c) {
   c.Expect(gb != nullptr && gb_default != nullptr && gb->saves == gb_default->saves &&
                gb->roms == gb_default->roms,
            "config.ini rc1: an emulator-only section keeps gb's built-in folders");
+  // ...and the first folder line added to that section carries the rest of the
+  // folders in force with it, rather than making it a map of one folder.
+  std::string folded;
+  rs::config::Edit folder;
+  folder.assignments.push_back({"platform.gb", "roms", "/roms/gb", false});
+  c.Expect(rs::config::ApplyEdit(upgraded, folder, &folded, &notes),
+           "config.ini rc1: a folder edit to the emulator-only section");
+  const rs::config::LoadResult carried = rs::config::ParseConfig(folded);
+  const rs::config::PlatformFolders* gb_now = carried.value.Platform("gb");
+  c.Expect(gb_now != nullptr && gb_default != nullptr && gb_now->roms.size() == 1 &&
+               gb_now->roms[0] == "/roms/gb" && gb_now->saves == gb_default->saves &&
+               gb_now->states == gb_default->states,
+           "config.ini rc1: carries gb's built-in saves and states beside the new roms");
+  c.ExpectEq(std::string(carried.value.EmulatorOverride("gb")), std::string("mgba"),
+             "config.ini rc1: and keeps the emulator");
 
   // Version 1 spelled out is the same file.
   const rs::config::LoadResult explicit_one = rs::config::ParseConfig("version = 1\n" + rc1);
@@ -183,6 +202,12 @@ void ConfigIni(checks::Checks& c) {
   c.Expect(!refused.value.configured(), "config.ini newer: none of it is in force");
   c.ExpectEq(refused.value.sync.interval_min, rs::config::Defaults().sync.interval_min,
              "config.ini newer: not even the keys this build knows");
+
+  // A number past anything an `int` holds is no typo either.
+  const rs::config::LoadResult huge = rs::config::ParseConfig("version = 99999999999\n" + rc1);
+  c.Expect(huge.newer() && !huge.value.configured(),
+           "config.ini: an enormous version is refused, not read as version 1 -- " +
+               huge.DescribeDiagnostics());
 
   std::string untouched = "sentinel";
   std::vector<rs::config::Diagnostic> why;
