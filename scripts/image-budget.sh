@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The sysmodule's memory budget, measured off the linked image (M9-15, #204).
 #
-#   scripts/image-budget.sh [--root DIR] [--image-budget BYTES]
+#   scripts/image-budget.sh [--root DIR] [--image-budget BYTES] [--ovl-budget BYTES]
 #
 # Run inside devkitpro/devkita64, after `make -C sysmodule` and `make -C overlay`:
 # the `switch-build` CI job runs it over its checkout, and `ctest -R
@@ -30,9 +30,14 @@
 #   .eh_frame     under EH_FRAME_CEILING in the sysmodule (#200).
 #   .text         under TEXT_CEILING in both targets: a revert to -O2 overshoots
 #                 in both (#200).
+#   .ovl          the overlay's file, under OVL_BUDGET (#211). Not the
+#                 sysmodule's pool at all: nx-ovlloader reads the whole file
+#                 into its own heap, and see the ceiling below for why that
+#                 needs one.
 #
-# `--image-budget` exists so a test can show the ceiling bites. The CI step
-# passes no flag, and `ctest -R switch.ci_requires_artifacts` refuses one.
+# `--image-budget` and `--ovl-budget` exist so a test can show each ceiling
+# bites. The CI step passes no flag, and `ctest -R switch.ci_requires_artifacts`
+# refuses one.
 set -euo pipefail
 
 # The budget for the whole mapped image: 2.25 MiB.
@@ -50,6 +55,18 @@ BSS_OTHER=$(( 64 * 1024 ))
 EH_FRAME_CEILING=$(( 32 * 1024 ))
 TEXT_CEILING=$(( 640 * 1024 ))
 
+# The overlay's .ovl, as a file: 1 MiB.
+#
+# nx-ovlloader loads an overlay by reading the whole file into a heap that
+# defaults to 4 MB, and that heap is also everything the overlay allocates while
+# it runs -- libultrahand's font, theme and list state among it. Its loadNro()
+# still carries "todo: Detect whether NRO fits into heap or not", so an overlay
+# that has outgrown it does not fail with a size: it fails as a short read
+# (2347-0004) that looks like the loader's fault. Measured at 647,228 bytes
+# when this was set (after #200's -Os); 1 MiB leaves ~390 KiB of growth, and
+# going past it is a decision made here, with its reason beside it.
+OVL_BUDGET=$(( 1024 * 1024 ))
+
 ROOT=.
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -59,19 +76,23 @@ while [ $# -gt 0 ]; do
       # `if`, which is false: the ceiling would pass without being applied.
       [[ "${2:-}" =~ ^[0-9]+$ ]] || { echo "--image-budget takes a byte count" >&2; exit 2; }
       IMAGE_BUDGET="$2"; shift 2 ;;
-    *) echo "usage: $0 [--root DIR] [--image-budget BYTES]" >&2; exit 2 ;;
+    --ovl-budget)
+      [[ "${2:-}" =~ ^[0-9]+$ ]] || { echo "--ovl-budget takes a byte count" >&2; exit 2; }
+      OVL_BUDGET="$2"; shift 2 ;;
+    *) echo "usage: $0 [--root DIR] [--image-budget BYTES] [--ovl-budget BYTES]" >&2; exit 2 ;;
   esac
 done
 
 BIN="${DEVKITPRO:-/opt/devkitpro}/devkitA64/bin"
 SYSMODULE="$ROOT/sysmodule/sys-rommsync.elf"
 OVERLAY="$ROOT/overlay/ovl-rommsync.elf"
+OVL="$ROOT/overlay/ovl-rommsync.ovl"
 MAIN="$ROOT/sysmodule/source/main.cpp"
 
 failures=0
 error() { echo "::error::$*" >&2; failures=$(( failures + 1 )); }
 
-for file in "$SYSMODULE" "$OVERLAY" "$MAIN"; do
+for file in "$SYSMODULE" "$OVERLAY" "$OVL" "$MAIN"; do
   [ -s "$file" ] || { echo "::error::no $file; build sysmodule and overlay first" >&2; exit 1; }
 done
 [ -x "$BIN/aarch64-none-elf-size" ] ||
@@ -110,6 +131,7 @@ bss="$(section "$SYSMODULE" .bss)"
 eh="$(section "$SYSMODULE" .eh_frame)"
 text="$(section "$SYSMODULE" .text)"
 ovl_text="$(section "$OVERLAY" .text)"
+ovl_bytes="$(wc -c <"$OVL" | tr -d '[:space:]')"
 for value in bss eh text ovl_text; do
   [ -n "${!value}" ] || { echo "::error::no $value section in the linked image" >&2; exit 1; }
 done
@@ -135,6 +157,10 @@ fi
 if [ "$ovl_text" -ge "$TEXT_CEILING" ]; then
   error "the overlay's .text is $ovl_text bytes, past $TEXT_CEILING -- is switch.mk still -Os? (#200)"
 fi
+if [ "$ovl_bytes" -gt "$OVL_BUDGET" ]; then
+  error "ovl-rommsync.ovl is $ovl_bytes bytes, past the $OVL_BUDGET nx-ovlloader's" \
+        "heap is budgeted to read (scripts/image-budget.sh, #211)"
+fi
 
 # Printed whether or not it passed, so the number is in every build's log and a
 # change in it is visible on the PR that made it, not only when it fails.
@@ -150,6 +176,7 @@ report() {
   echo "| \`.eh_frame\` | $eh | $EH_FRAME_CEILING |"
   echo "| sysmodule \`.text\` | $text | $TEXT_CEILING |"
   echo "| overlay \`.text\` | $ovl_text | $TEXT_CEILING |"
+  echo "| overlay \`.ovl\` (file) | $ovl_bytes | $OVL_BUDGET |"
 }
 report
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
