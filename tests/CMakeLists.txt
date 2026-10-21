@@ -2295,6 +2295,7 @@ set(ENGINE_RIG_SCENARIOS
   server_deleted # #233: a save deleted in RomM, removed or kept as config.ini says, logged and listed
   interop      # #236: RetroArch's Cloud Sync save reaches Tico's folder, and the Switch's reaches RetroArch
   upgrade      # #236: rc1's state.db and tico-srm rows: no data lost, no duplicate upload
+  placement    # #237: a first-time restore lands in Tico's folder under the rom's name, and stays one save
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})

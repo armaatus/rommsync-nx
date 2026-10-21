@@ -4510,6 +4510,105 @@ int Upgrade(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// #237: a save this console has never held, restored by a real tick. It lands
+/// in Tico's folder for the system under the rom's own name -- not in
+/// `/retroarch/saves` under RomM's datetime-tagged one -- and the next tick
+/// reads it back as the save it came from, so nothing goes up again.
+int Placement(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom),
+           "the fixture library has nova.nes");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  ClearSlots(client, base, fixture, rom.id);
+  const std::string device_id =
+      harness::CreateDevice(c, client, base, fixture, "engine-placement");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+
+  // Another device's save, as it reaches RomM: the shared slot, FCEUmm's id,
+  // and the datetime tag RomM stamps on the stored name. Unique bytes per run:
+  // RomM remembers what a slot lost.
+  const std::string server_bytes =
+      "nova's save, from another device " + harness::UniqueSlot("placement") + "\n";
+  harness::Save server;
+  {
+    harness::Sandbox staging(c, "engine-placement-upload");
+    const std::string staged = staging.Host("/config/rommsync/server-copy.srm");
+    rig::WriteFile(staged, server_bytes);
+    c.Expect(harness::UploadSave(client, base, fixture, rom.id, "autosave", "fceumm", staged,
+                                 "nova.srm", /*with_device=*/false, &server),
+             "another device's save is on the server");
+  }
+  const std::vector<std::int64_t> before = SaveIdsFor(client, base, fixture, rom.id);
+
+  rlog::Reset();
+  const TickLines ticks;
+  Console console(c, "engine-placement");
+  if (!PointAtTheRig(console, c, base, fixture, device_id)) {
+    return c.failures();
+  }
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseCard(card.get());
+  console.engine.UseServer(&client, std::string());
+  console.Boot();
+  console.engine.StartWorker();
+
+  // Counted at the sink (`TickLines`). Partial is a tick that reached the
+  // server too: whatever else the shared fixture offers is not this test's.
+  const auto tick = [&console, &ticks, &c](int number) {
+    const int before_tick = ticks.ticks();
+    c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, "a tick is asked for");
+    const std::chrono::steady_clock::time_point by =
+        std::chrono::steady_clock::now() + std::chrono::seconds{120};
+    while ((ticks.ticks() <= before_tick || console.Status().sync_in_progress) &&
+           std::chrono::steady_clock::now() < by) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    }
+    const ipc::Status status = console.Status();
+    c.Expect(ticks.ticks() > before_tick &&
+                 (status.last_sync_result == ipc::SyncResult::kOk ||
+                  status.last_sync_result == ipc::SyncResult::kPartial),
+             "tick " + std::to_string(number) + " ran and reached the server: " +
+                 ipc::ToString(status.last_sync_result));
+  };
+
+  tick(1);
+  const std::string placed = "/tico/saves/nes/nova.srm";
+  c.ExpectEq(console.sandbox.Read(placed), server_bytes,
+             "the save is in Tico's nes folder under the rom's name" + Rendered(console.Log()));
+  for (const char* folder : {"/retroarch/saves", "/retroarch/cores/savefiles"}) {
+    std::error_code error;
+    const std::filesystem::path real = console.sandbox.Host(folder);
+    bool empty = true;
+    for (auto it = std::filesystem::recursive_directory_iterator(real, error);
+         !error && it != std::filesystem::recursive_directory_iterator(); it.increment(error)) {
+      empty = empty && !it->is_regular_file();
+    }
+    c.Expect(empty, std::string("and nothing was written under ") + folder);
+  }
+  c.Expect(!console.sandbox.Exists("/tico/saves/nes/" + server.file_name),
+           "nor under the server's tagged name");
+
+  // The next tick reads it back as the save it came from: nothing to upload.
+  tick(2);
+  c.ExpectEq(SaveIdsFor(client, base, fixture, rom.id).size(), before.size(),
+             "the placed save is the server's own, so no tick sends it back as another");
+  c.ExpectEq(console.sandbox.Read(placed), server_bytes, "and it is left as it is");
+
+  ClearSlots(client, base, fixture, rom.id);
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
 /// The scenarios that need the docker RomM, by name. A table rather than a
 /// second `if` chain, so the list of them is written down once.
 struct RigScenario {
@@ -4539,6 +4638,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"server_deleted", ServerDeleted},
       {"interop", Interop},
       {"upgrade", Upgrade},
+      {"placement", Placement},
   };
   for (const RigScenario& scenario : kRigScenarios) {
     if (name == scenario.name) {
