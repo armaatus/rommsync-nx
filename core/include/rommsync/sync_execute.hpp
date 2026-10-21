@@ -26,10 +26,17 @@
 //     meant. So a download stages at `io::TempPathFor(<save>)`, is verified
 //     against `server_content_hash`, and only then displaces the file -- after
 //     the backup.
-//   - **`overwrite=true` is not optional on an upload.** Without it RomM
-//     answers `409 Slot has a newer save since your last sync` for exactly the
-//     no-sync-history case the plan just told the client to upload, so a plan
-//     executed as issued would be refused by the server that issued it.
+//   - **An upload goes out with `overwrite=false`, and a plan executed as
+//     issued can be refused by the server that issued it.** RomM answers
+//     `409 Slot has a newer save since your last sync` whenever the slot holds
+//     a save this device has not synced -- another device's, written before the
+//     plan (on 5.4.0 every other device's upload is a new head row, and
+//     negotiate then plans `upload` / no sync history) or since. That 409 is
+//     the protection a shared slot needs, so it is kept rather than lifted:
+//     the upload is `OperationError::kNewerOnServer` here, and the tick
+//     resolves it against the server's head (sync_resolve.hpp, #232). Only a
+//     player's explicit "Keep local" sends `overwrite=true`
+//     (`ExecuteOptions::keep_local`).
 //   - **A download that is never confirmed did not happen, as far as
 //     arbitration is concerned.** `POST /api/saves/{id}/downloaded` is what
 //     writes this device's sync row; skip it and every later negotiation for
@@ -37,7 +44,7 @@
 //
 // There is no retry inside a tick, deliberately, and for two reasons that have
 // both been written down wrong at some point. **A re-posted upload does
-// duplicate the save**, `overwrite=true` included: RomM matches an existing
+// duplicate the save**, whatever `overwrite` says: RomM matches an existing
 // slot row by a second-granularity datetime tag it computes at ingest, so a
 // retry a second later gets a name that matches nothing and becomes a second
 // row (docs/API_CONTRACT.md, verified against a live 5.2.0; the revision of this
@@ -46,7 +53,9 @@
 // plan describes a state the server may have moved on from, so the arbiter of
 // that is a fresh negotiation rather than this client -- which is what
 // docs/SYNC_PROTOCOL.md's failure rules already say: count the operation
-// failed, leave that save alone, let the next tick negotiate again.
+// failed, leave that save alone, let the next tick negotiate again. The one
+// failure a tick does negotiate again for itself, once, is the slot guard's 409
+// (sync_resolve.hpp) -- and what it runs then is never another upload.
 // `sync_tick.hpp` owns the order of one tick and M7-2 the schedule between
 // them.
 #pragma once

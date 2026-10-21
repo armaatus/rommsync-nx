@@ -539,8 +539,8 @@ def sync_scenarios(s, base, cap, rom_id, version):
         # RomM plans this upload and then refuses to accept it: with a device_id
         # and a slot, add_save wants a sync row at least as new as the save it is
         # replacing, and a device that has never synced has none. Capture the
-        # refusal -- a client executing the server's own plan has to send
-        # overwrite=true, and this is the error it gets when it forgets.
+        # refusal: it is RomM's slot guard, which the client keeps on purpose
+        # (overwrite=false) and resolves against the server's head (#232).
         refused = s.post(f"{base}/api/saves",
                          params={"rom_id": rom_id, "emulator": "probe-emulator",
                                  "slot": slot, "device_id": newcomer,

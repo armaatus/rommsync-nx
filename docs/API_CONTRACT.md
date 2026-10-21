@@ -641,15 +641,18 @@ cleanly and early cannot be told from a complete one, because RomM's own
 `Content-Length` is what the shortening removed. That is the shape
 `server/testing/fault_proxy.py`'s `truncate` mode produces on purpose.
 
-**An upload needs `overwrite=true`, and the flag does exactly one thing.** With
-a `device_id` and a `slot`, `POST /api/saves` answers `409 {"detail": "Slot has a
+**`overwrite` does exactly one thing: it decides the slot guard's 409.** With a
+`device_id` and a `slot`, `POST /api/saves` answers `409 {"detail": "Slot has a
 newer save since your last sync"}` when this device has no sync row for the
-slot's current save — which is exactly the state negotiate calls `Client save is
-newer (no sync history)` and tells the client to upload. The flag clears that
-check and nothing else; it is read well before the row is looked up.
-`execute.occupied` arranges the state and asserts the 409 on the flagless
-request, then asserts the same upload succeeds with the flag. A previous
-revision said the flag did a *second* thing — see below; it does not.
+slot's current save, or an older one — which includes the state negotiate calls
+`Client save is newer (no sync history)` and tells the client to upload.
+`overwrite=true` clears that check and nothing else; it is read well before the
+row is looked up. The client sends `overwrite=false` and resolves the 409 against
+the server's head instead (#232, docs/SYNC_PROTOCOL.md#the-slot-guard-and-the-409-232);
+only a player's Keep local sends `true`. `execute.occupied` arranges the state
+and asserts the 409 on the client's own upload, then the same upload succeeding
+under Keep local. A previous revision said the flag did a *second* thing — see
+below; it does not.
 
 **Verified — whether an upload replaces a row or adds one is decided by the
 clock, not by the flag.** RomM stamps a slot upload with a second-granularity

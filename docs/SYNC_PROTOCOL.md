@@ -193,18 +193,9 @@ For each `SyncOperationSchema`. The action is `no_op` — with the underscore:
 | action | do |
 |---|---|
 | `no_op` | nothing |
-| `upload` | `POST /api/saves?rom_id=&emulator=&slot=&session_id=&device_id=&overwrite=true`, multipart `saveFile` = local bytes |
+| `upload` | `POST /api/saves?rom_id=&emulator=&slot=&session_id=&device_id=&overwrite=false`, multipart `saveFile` = local bytes; a **409** is resolved below |
 | `download` | `GET /api/saves/{save_id}/content` → **back up existing local file** → write to the file's SD path → `POST /api/saves/{save_id}/downloaded {device_id}` |
 | `conflict` | resolve by policy (below) — **always back up the loser first** |
-
-**`overwrite=true` is not optional on an upload.** Given a `device_id` and a
-`slot`, RomM refuses the post with `409 {"detail": "Slot has a newer save since
-your last sync"}` whenever this device has no sync row for the slot's current
-save, or one older than it. That is precisely the plan's own
-`upload` / `Client save is newer (no sync history)` case — the first upload after
-a re-pair, or from a device registered this boot. Executing a plan the server
-just issued must not be rejected by the server, so send `overwrite=true` and let
-negotiate be the arbiter.
 
 Three traps in the operation itself:
 
@@ -213,7 +204,7 @@ Three traps in the operation itself:
   operation echoes that. Match the operation back to your local file on
   `(rom_id, slot)` and keep your own path; writing the server's name to the SD
   produces a file no emulator will load.
-- **`overwrite=true` clears the 409 and nothing else. It does not stop a slot
+- **`overwrite` decides the 409 and nothing else. It does not stop a slot
   accreting a row per upload.** This page has now had this wrong twice, in both
   directions, so here is the mechanism rather than the conclusion: RomM stamps a
   slot upload with a **second-granularity** datetime tag and then looks the
@@ -235,6 +226,47 @@ Three traps in the operation itself:
 Pass `session_id` on uploads so the server ties them to this session, and
 `device_id` so the sync history that the *next* negotiation arbitrates against is
 written. Track `operations_completed` / `operations_failed`.
+
+### The slot guard, and the 409 (#232)
+
+**An upload goes out with `overwrite=false`.** Given a `device_id` and a `slot`,
+RomM then refuses the post with `409 {"detail": "Slot has a newer save since
+your last sync"}` whenever the slot's newest save — written by any device or
+emulator — is newer than this device's last sync of it. That is the protection a
+shared slot needs: without it, a RetroArch or Argosy upload landing between this
+tick's negotiate and its upload would be silently superseded. So the guard is
+kept, and only a player's explicit **Keep local** for one save sends
+`overwrite=true` (`ExecuteOptions::keep_local`; the overlay choice is #240's).
+
+On 5.4.0 the 409 is not only a race. Every other device's upload is a new row
+and becomes the head, this device has no sync row against it, and negotiate
+falls back to timestamps and plans `upload` / `Client save is newer (no sync
+history)` — even for bytes this device sent itself (#227). So a 409 is what a
+device meets after any other device writes the slot, and the tick resolves it
+rather than counting it failed forever (`sync::ResolveRefusedUploads`,
+[`sync_resolve.hpp`](../core/include/rommsync/sync_resolve.hpp)):
+
+1. **Negotiate once more**, for the refused saves only, scoped with `rom_ids`.
+   The first plan may name a head that has since been replaced, and downloading
+   that row would fetch — and confirm — a superseded save. Never more than one
+   second negotiation per tick.
+2. **Decide** with Grout's rule (#226 R3): local bytes whose MD5 equals the
+   server digest `state.db` recorded at the last sync take the head as a
+   **download**; anything else — changed bytes, no row, no digest — is a
+   **conflict**. A conflict the server names stays one; a `no_op` stays one.
+   **Never another upload.**
+3. **Execute** that through `ExecutePlan`, so it is fetched, verified, backed up
+   and committed exactly as a planned download is, and merge it into the tick's
+   plan and report at the refused operation's index — the baseline, the conflict
+   history and `complete`'s counts then describe what happened to the save. The
+   second session is completed with its own counts.
+
+The server stays the source of truth: the 409 *is* its verdict, and both answers
+put its head on the card. What the client decides is only whether the local
+bytes it replaces were progress never synced — and those are recorded as a
+conflict, with the guard's own sentence as the reason. `tick.newer_download` and
+`tick.newer_conflict` have a second device upload between negotiate and upload
+against the real RomM, under the crash replay.
 
 ### The order every overwrite goes through
 

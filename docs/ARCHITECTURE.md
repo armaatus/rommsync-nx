@@ -199,7 +199,11 @@ scheduler fires
   → build SyncNegotiatePayload.saves[]
   → POST /api/sync/negotiate  → {session_id, operations[]}
   → for each op:
-        upload   → POST /api/saves?...&overwrite=true (multipart saveFile)
+        upload   → POST /api/saves?...&overwrite=false (multipart saveFile)
+                 → 409 (the slot holds a save this device has not synced):
+                   negotiate once more for those saves, then take the head --
+                   a download if the bytes are the last-synced ones, else a
+                   conflict; never another upload (sync::ResolveRefusedUploads)
         download → GET /api/saves/{id} for the size
                  → GET /api/saves/{id}/content → stage → verify MD5
                  → back up the local file → commit → POST .../downloaded

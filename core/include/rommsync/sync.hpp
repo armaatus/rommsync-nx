@@ -311,7 +311,8 @@ Action ClassifyAction(std::string_view action, bool* recognized = nullptr);
 /// obeying it: the two `conflict` reasons are different situations with
 /// different things to tell a user, `kUntracked` is a `no_op` the user asked
 /// for rather than one the bytes earned, and the three no-history reasons are
-/// the ones that say an upload will need `overwrite=true`.
+/// the ones whose upload meets RomM's slot guard when the slot is occupied
+/// (sync_resolve.hpp).
 enum class Reason {
   /// A string this build does not know. First, so it is what a
   /// default-constructed operation carries.
