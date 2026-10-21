@@ -111,6 +111,14 @@ struct WriteResult {
   /// files hold bearer tokens.
   std::string message;
 
+  /// False when the commit happened and the platform would not confirm the
+  /// *name* is on the card: `FileSync` refused the destination's directory.
+  /// `ok()` stays true -- the rename did happen, and calling it a failure would
+  /// describe a commit that did not occur. For the caller whose next step
+  /// depends on that name surviving a power cut, which is `sync::BackUpFirst`
+  /// before an overwrite in a different directory (#203).
+  bool name_durable = true;
+
   bool ok() const { return error == WriteError::kNone; }
 };
 
@@ -190,8 +198,15 @@ WriteResult WriteAtomically(const std::string& path, std::string_view contents);
 /// `PreviousPathFor(path)` first and put back if the second rename fails.
 ///
 /// On success the destination's *directory* is handed to `FileSync` as well, so
-/// the published name is as durable as the bytes behind it. Best effort: the
-/// rename has happened either way.
+/// the published name is as durable as the bytes behind it. The rename has
+/// happened either way, so a refusal there is not a failed commit: it is
+/// `name_durable == false` on a successful one, and the caller decides.
+///
+/// **The staged file must already be durable.** `CommitStaged` does not sync
+/// it: `WriteAtomically` and `CopyAtomically` do before they call it, and a
+/// download's staging is synced by the HTTP backend that wrote it. A rename that
+/// publishes bytes nothing synced is a save that can come back empty after a
+/// power cut -- which is the case tests/crash_disk.hpp exists to catch.
 ///
 /// `staged` is consumed: it is renamed away on success and removed on failure,
 /// so a caller never has to decide what to do with a half-committed pair. That
@@ -257,6 +272,10 @@ struct CopyResult {
   /// Bytes that reached the destination. Zero on every failure.
   std::uint64_t bytes_copied = 0;
 
+  /// `WriteResult::name_durable` of the commit that published the copy: false
+  /// when the copy is in place and the card would not confirm its name.
+  bool name_durable = true;
+
   bool ok() const { return error == CopyError::kNone; }
 };
 
@@ -274,6 +293,10 @@ struct CopyResult {
 ///
 /// It is a copy and not a move: the point of the caller is that both files
 /// exist afterwards.
+///
+/// A copy whose name the card would not confirm is still a successful copy,
+/// with `name_durable` false; `sync::BackUpFirst` refuses to count it as a
+/// backup.
 ///
 /// **Durability is `FileSync`'s**, and worth restating here because of what this
 /// one copies. Without a hook installed, a card yanked between the copy and the

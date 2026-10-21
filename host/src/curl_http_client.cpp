@@ -457,11 +457,21 @@ class CurlHttpClient final : public http::HttpClient {
     // A real full card often shows here first rather than in the callback:
     // stdio held the last buffer, and the flush is what the card refused.
     errno = 0;
-    const bool flushed = std::fflush(transfer.file) == 0 && fsync(fileno(transfer.file)) == 0;
-    const int flush_errno = errno;
+    const bool flushed = std::fflush(transfer.file) == 0;
+    int flush_errno = errno;
     const std::uint64_t written = transfer.resume_from + transfer.received;
     std::fclose(transfer.file);
     transfer.file = nullptr;
+    // Durable through `io::Disk`, after the close and before the rename below
+    // publishes the file -- the order `io::CommitStaged` relies on. It used to be
+    // an `fsync` on the descriptor here, which was just as durable and invisible
+    // to the seam: the crash replay saw a staged save renamed into place with
+    // bytes nothing had synced, and could not tell it from one nothing had (#203).
+    errno = 0;
+    const bool synced = flushed && io::Sync(partial_path);
+    if (flushed && !synced) {
+      flush_errno = errno;
+    }
 
     result.response.body = std::move(transfer.error_body);
     if (!result.ok()) {
@@ -488,9 +498,10 @@ class CurlHttpClient final : public http::HttpClient {
       }
       return result;
     }
-    if (!flushed) {
+    if (!flushed || !synced) {
       result.error = http::ErrorForWrite(flush_errno);
-      result.message = "could not flush " + partial_path + ": " + std::strerror(flush_errno);
+      result.message = std::string(flushed ? "could not make durable " : "could not flush ") +
+                       partial_path + ": " + std::strerror(flush_errno);
       return result;
     }
 

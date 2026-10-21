@@ -395,6 +395,18 @@ OperationError BackUpFirst(fs::FileSystem& files, const std::string& backup_dir,
       *message = "the previous bytes could not be preserved: " + copied.message;
       return OperationError::kBackupFailed;
     }
+    if (!copied.name_durable) {
+      // The copy is in place and the card would not confirm its *name*. The
+      // overwrite this protects is in another directory, and a power cut can
+      // keep that and lose this (#203) -- so it is not a backup yet, and the
+      // overwrite does not happen. The copy goes: the save it duplicates is
+      // untouched, and a file no history records is litter the next attempt
+      // would only step past.
+      io::Remove(destination);
+      *message = "the previous bytes were copied to " + backup_path +
+                 ", and the card would not confirm the copy is on it";
+      return OperationError::kBackupFailed;
+    }
     *backup_sd_path = backup_path;
     return OperationError::kNone;
   }

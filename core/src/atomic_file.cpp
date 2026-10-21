@@ -177,17 +177,24 @@ WriteResult CommitStaged(const std::string& staged, const std::string& path) {
   }
   Remove(previous);
 
-  // Best effort, and after the fact on purpose: the rename has happened, so
-  // reporting a failure here would describe a commit that did not occur. What it
-  // buys is the *name* being as durable as the bytes already are -- see
-  // `DirectoryOf`. A platform whose hook commits the whole device (Horizon's
-  // does) has already done this and pays for it twice, which is cheaper than the
-  // alternative of a second hook nobody would remember to call.
+  // After the fact on purpose: the rename has happened, so reporting a failure
+  // here would describe a commit that did not occur. What it buys is the *name*
+  // being as durable as the bytes already are -- see `DirectoryOf`. A platform
+  // whose hook commits the whole device (Horizon's does) has already done this
+  // and pays for it twice, which is cheaper than the alternative of a second
+  // hook nobody would remember to call.
+  //
+  // Not ignored, though. It used to be, and the crash replay found what that
+  // cost: a backup whose directory the card would not confirm was counted as a
+  // backup, and the save overwrite in *another* directory could survive a power
+  // cut that the backup's name did not (#203). So the answer goes back to the
+  // caller, and the one that depends on it -- `sync::BackUpFirst` -- reads it.
+  WriteResult committed;
   const std::string directory = DirectoryOf(path);
   if (!directory.empty()) {
-    Synced(directory);
+    committed.name_durable = Synced(directory);
   }
-  return {};
+  return committed;
 }
 
 WriteResult WriteAtomically(const std::string& path, std::string_view contents) {
@@ -319,6 +326,7 @@ CopyResult CopyAtomically(const std::string& from, const std::string& to) {
     return result;
   }
   result.bytes_copied = copied;
+  result.name_durable = committed.name_durable;
   return result;
 }
 

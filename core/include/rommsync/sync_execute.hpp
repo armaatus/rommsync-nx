@@ -281,6 +281,14 @@ auth::Answer AnswerOf(OperationError error);
 /// failure is a refusal to go on -- including a missing `backup_dir`, which
 /// `core/` cannot create and which therefore stops the overwrite instead of
 /// proceeding without a copy.
+///
+/// **A backup counts once it would survive a power cut, not once it is
+/// written.** The copy's bytes are synced before its rename and its directory
+/// after it (`io::CommitStaged`); a card that will not confirm that directory is
+/// `kBackupFailed`, and the copy is removed. The overwrite that follows lands in
+/// a different directory, and without this a power cut could keep the
+/// overwrite and lose the backup's name -- the ordering property
+/// docs/SYNC_PROTOCOL.md#backups states, and tests/crash_disk.hpp replays.
 OperationError BackUpFirst(fs::FileSystem& files, const std::string& backup_dir,
                            const std::string& sd_path, std::int64_t rom_id,
                            std::string_view discriminator, std::string_view file_name,
