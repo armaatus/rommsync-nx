@@ -29,6 +29,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -1562,6 +1563,310 @@ void UploadFault(rig::Checks& checks, http::HttpClient& client, const std::strin
                   what + ": the server holds the rows this tick can account for -- a second one "
                          "would be the re-post there is deliberately no retry for");
   for (const std::int64_t id : ids) {
+    harness::DeleteSave(client, base, fixture, id);
+  }
+}
+
+// --- isolated -----------------------------------------------------------------
+//
+// #238's acceptance, on the live 5.4.0. The systems whose Tico format no libretro
+// core reads sync under their own `tico-*` ids, and a RetroArch lineage's save
+// for one of them is never put on the card -- not over DuckStation's card when
+// RomM pairs the two in one slot, not through #232's resolution of the 409 that
+// pairing draws, and not as a first-time restore into the folder DuckStation
+// reads.
+
+/// The one operation the plan holds for `slot`, and what became of it.
+bool OperationIn(const sync::TickResult& tick, const std::string& slot,
+                 const sync::OperationResult** out) {
+  for (std::size_t at = 0; at < tick.executed.operations.size(); ++at) {
+    const sync::OperationResult& done = tick.executed.operations[at];
+    if (done.slot.has_value() && *done.slot == slot) {
+      *out = &done;
+      return true;
+    }
+  }
+  return false;
+}
+
+/// `emulator` of the server's save `id`, as RomM stored it.
+std::string StoredEmulator(http::HttpClient& client, const std::string& base,
+                           const Fixture& fixture, std::int64_t id) {
+  const http::Result got = client.Send(harness::Authed(
+      http::Method::kGet, base + "/api/saves/" + std::to_string(id), fixture));
+  const json::ParseResult parsed = json::Parse(got.response.body);
+  return got.successful() && parsed.ok() ? harness::Field(parsed.value, "emulator")
+                                         : std::string("<unreadable: ") + got.response.body + ">";
+}
+
+void Isolated(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+              const Fixture& fixture) {
+  harness::Rom rom;
+  if (!harness::FindRom(client, base, fixture, "Synthetic Nested Game", &rom)) {
+    checks.Expect(false, "the fixture's psx rom is there");
+    return;
+  }
+  Sandbox sandbox(checks, "tick-isolated");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const std::string folder = "/tico/saves/psx";
+  sandbox.MakeDirs(folder);
+
+  const std::string matched = harness::UniqueSlot("m10-12-matched");
+  const std::string refused = harness::UniqueSlot("m10-12-409");
+  const std::string beetle = harness::UniqueSlot("m10-12-beetle");
+  const std::string own = harness::UniqueSlot("m10-12-own");
+  const std::string card = "DuckStation's card, the only copy of this progress\n";
+  const std::string kept = "DuckStation's card, newer than anything on RomM\n";
+  const std::string retroarch = "a Beetle PSX .srm, which is not a DuckStation card\n";
+  const std::string switched = "DuckStation's card from another Switch\n";
+
+  const std::string staged_retroarch = sandbox.Host("/config/rommsync/beetle.srm");
+  const std::string staged_switch = sandbox.Host("/config/rommsync/other.mcd");
+  rig::WriteFile(staged_retroarch, retroarch);
+  rig::WriteFile(staged_switch, switched);
+  std::vector<std::int64_t> planted;
+  const auto sweep = [&]() {
+    for (const std::int64_t id : planted) {
+      harness::DeleteSave(client, base, fixture, id);
+    }
+  };
+  // Other devices: RetroArch's Beetle core into the slots this Switch's cards
+  // are in and one it has never seen, and another Switch's DuckStation.
+  for (const std::string& slot : {matched, refused, beetle}) {
+    harness::Save stored;
+    if (!harness::UploadSave(client, base, fixture, rom.id, slot, "mednafen_psx_hw",
+                             staged_retroarch, "Synthetic Nested Game.srm", false, &stored)) {
+      checks.Expect(false, "RetroArch's save was stored in " + slot);
+      sweep();
+      return;
+    }
+    planted.push_back(stored.id);
+  }
+  harness::Save other;
+  if (!harness::UploadSave(client, base, fixture, rom.id, own, "tico-duckstation", staged_switch,
+                           "Synthetic Nested Game.mcd", false, &other)) {
+    checks.Expect(false, "the other Switch's card was stored");
+    sweep();
+    return;
+  }
+  planted.push_back(other.id);
+
+  const std::string matched_path = folder + "/Matched.mcd";
+  const std::string refused_path = folder + "/Refused.mcd";
+  sandbox.SeedSave(matched_path, card);
+  sandbox.SeedSave(refused_path, kept);
+  const auto now = std::chrono::system_clock::now();
+  // Older than RetroArch's upload, so the plan is a download over the card; and
+  // newer, so it is an upload the slot guard refuses and #232 resolves.
+  const std::vector<sync::ClientSaveState> reported = {
+      harness::LocalSave(rom.id, "Matched.mcd", matched, "tico-duckstation", crypto::Md5Hex(card),
+                         now - std::chrono::hours{1}, static_cast<std::int64_t>(card.size())),
+      harness::LocalSave(rom.id, "Refused.mcd", refused, "tico-duckstation", crypto::Md5Hex(kept),
+                         now + std::chrono::seconds{300}, static_cast<std::int64_t>(kept.size()))};
+  const std::vector<sync::SaveTarget> targets = {
+      {rom.id, matched, matched_path, "Matched.mcd"}, {rom.id, refused, refused_path, "Refused.mcd"}};
+
+  sync::TickOptions options = OptionsAt(1'757'000'800);
+  options.recover_dirs = {folder, harness::kBackupDir};
+  // A placer that puts anything of this run's into DuckStation's folder -- one
+  // that does not refuse a Beetle save itself, as `place::Placer` would -- so
+  // what is under test is the executor's own check, with `reads_as` saying
+  // what the scan reads that folder as.
+  const std::int64_t rom_id = rom.id;
+  options.execute.place = [&, rom_id](const sync::SyncOperation& operation) {
+    rommsync::place::Placement placement;
+    if (operation.rom_id != rom_id || !operation.slot.has_value()) {
+      placement.reason = "another scenario's leftover: not this run's to place";
+    } else if (*operation.slot == beetle) {
+      placement.sd_path = folder + "/Beetle.mcd";
+    } else if (*operation.slot == own) {
+      placement.sd_path = folder + "/Own.mcd";
+    } else {
+      placement.reason = "not one of this run's first-time restores";
+    }
+    return placement;
+  };
+  const rommsync::config::Config config = rommsync::config::Defaults();
+  options.execute.reads_as = [&config](const sync::SyncOperation&, const std::string& sd_path) {
+    return rommsync::scan::EmulatorAt(sd_path, "psx", config);
+  };
+
+  const sync::TickResult tick =
+      sync::RunTick(client, *files, TokenFor(base, fixture), reported, targets, {}, options);
+
+  const sync::OperationResult* done = nullptr;
+  checks.Expect(OperationIn(tick, matched, &done) && done->error == sync::OperationError::kOtherEmulator,
+                std::string("a Beetle save paired with DuckStation's card is refused: ") +
+                    (done == nullptr ? "no operation" : done->message));
+  checks.ExpectEq(sandbox.Read(matched_path), card, "and the card is untouched");
+
+  done = nullptr;
+  checks.ExpectEq(tick.resolved.refused, std::size_t{1},
+                  "the newer card's upload met the slot guard");
+  checks.Expect(OperationIn(tick, refused, &done) && done->error == sync::OperationError::kOtherEmulator,
+                std::string("and the 409's resolution does not take RetroArch's save either: ") +
+                    (done == nullptr ? "no operation" : done->message));
+  checks.ExpectEq(sandbox.Read(refused_path), kept, "the newer card is untouched");
+  checks.ExpectEq(SaveRowsFor(client, base, fixture, rom.id, refused, nullptr), 1,
+                  "and nothing was uploaded over RetroArch's save");
+
+  done = nullptr;
+  checks.Expect(OperationIn(tick, beetle, &done) && done->error == sync::OperationError::kOtherEmulator,
+                std::string("a Beetle save is not placed where DuckStation reads: ") +
+                    (done == nullptr ? "no operation" : done->message));
+  checks.Expect(!sandbox.Exists(folder + "/Beetle.mcd"), "nothing is on the card for it");
+  checks.Expect(!sandbox.HasBackupOf(card) && !sandbox.HasBackupOf(kept),
+                "and no card needed a backup, because none was overwritten");
+
+  done = nullptr;
+  checks.Expect(OperationIn(tick, own, &done) &&
+                    done->outcome == sync::OperationOutcome::kDownloaded,
+                std::string("another Switch's DuckStation card is restored: ") +
+                    (done == nullptr ? "no operation" : done->message));
+  checks.ExpectEq(sandbox.Read(folder + "/Own.mcd"), switched, "into DuckStation's folder");
+  sweep();
+}
+
+/// #238's first acceptance item: a Tico 0.8 card holding a save for each system
+/// whose format is isolated, scanned by the engine's own scanner and uploaded by
+/// a real tick, lands on RomM under the `tico-*` id that names its module -- and
+/// PPSSPP's save folder is a named skip that uploads nothing.
+///
+/// The fixture's library has psx roms and no n64, dc, nds, saturn or psp ones,
+/// and growing it costs every worktree a re-scan (`lists.platforms` makes the
+/// same trade). So the other systems borrow a rom each, relabelled in the index
+/// the scan matches against: RomM files a save by `rom_id` and takes `emulator`
+/// as given, which is what this checks. The slots are this run's own, since the
+/// slot is #236's and not what is being tested.
+void IsolatedIds(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                 const Fixture& fixture) {
+  struct System {
+    const char* rom;       ///< the fixture rom it borrows
+    const char* platform;  ///< RomM's slug for it here
+    const char* folder;    ///< Tico's folder
+    const char* extension;
+    const char* emulator;  ///< what RomM must hold
+  };
+  const System kSystems[] = {
+      {"Synthetic Nested Game", "psx", "psx", ".mcd", "tico-duckstation"},
+      {"nova.nes", "n64", "n64", ".eep", "tico-mupen64plus"},
+      {"240pee.nes", "dreamcast", "dc", ".bin", "tico-flycast"},
+      {"240pee_mb.gba", "nds", "nds", ".dsv", "tico-drastic"},
+      {"synthetic-large.gba", "saturn", "saturn", ".bkr", "tico-yabasanshiro"},
+      {"gb240p.gb", "psp", "psp", "", "tico-ppsspp"},
+  };
+  const std::string account = "0123456789abcdef0123456789abcdef";
+  const std::string saves = "/tico/saves/users/" + account;
+
+  Sandbox sandbox(checks, "tick-isolated-ids");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  rommsync::roms::RomIndex index;
+  std::int64_t psp_rom = 0;
+  for (const System& system : kSystems) {
+    harness::Rom rom;
+    if (!harness::FindRom(client, base, fixture, system.rom, &rom)) {
+      checks.Expect(false, std::string("the fixture holds ") + system.rom);
+      return;
+    }
+    const std::string stem = rommsync::scan::BaseName(rom.fs_name);
+    rommsync::roms::Rom entry;
+    entry.id = rom.id;
+    entry.fs_name_no_ext = stem;
+    entry.fs_name_no_tags = stem;
+    entry.platform_fs_slug = system.platform;
+    index.Add(entry);
+    const std::string directory = saves + "/" + system.folder;
+    if (*system.extension == '\0') {
+      // PPSSPP: a folder per game at the SAVEDATA level.
+      psp_rom = rom.id;
+      sandbox.MakeDirs(directory + "/ULUS10041");
+      sandbox.Write(directory + "/ULUS10041/DATA.BIN", "a PPSSPP save\n");
+      continue;
+    }
+    sandbox.MakeDirs(directory);
+    sandbox.SeedSave(directory + "/" + stem + system.extension,
+                     std::string(system.emulator) + " bytes for #238\n");
+    if (std::string(system.platform) == "n64") {
+      // Mupen64Plus splits a cart's save by type: each file is a save of its own.
+      for (const char* other : {".sra", ".fla", ".mpk"}) {
+        sandbox.SeedSave(directory + "/" + stem + other,
+                         std::string("tico-mupen64plus ") + other + " bytes for #238\n");
+      }
+    }
+    if (std::string(system.platform) == "psx") {
+      // DuckStation's second card: a second save of the rom.
+      sandbox.SeedSave(directory + "/" + stem + "_2.mcd", "DuckStation's card 2 for #238\n");
+    }
+  }
+
+  const rommsync::config::Config config = rommsync::config::Defaults();
+  const rommsync::scan::ScanResult scanned = rommsync::scan::ScanSaves(
+      config, rommsync::retroarch::Settings{}, index, *files, state::Baseline{});
+  checks.ExpectEq(scanned.saves.size(), std::size_t{9},
+                  "a save per isolated system, four for N64 and two cards for psx: " +
+                      scanned.DescribeSkipped());
+  // The slots the scan gives them under #236's rule, before this run swaps in
+  // its own: N64's four files are four saves, and card 2 is not card 1.
+  std::set<std::string> slots;
+  for (const rommsync::scan::SaveFile& save : scanned.saves) {
+    slots.insert(save.platform_fs_slug + "/" + save.slot);
+  }
+  const std::set<std::string> kSlots = {
+      "psx/autosave-mcd",  "psx/autosave-mcd-card2", "n64/autosave-eep",
+      "n64/autosave-sra",  "n64/autosave-fla",       "n64/autosave-mpk",
+      "dreamcast/autosave-bin", "nds/autosave-dsv",  "saturn/autosave-bkr"};
+  checks.Expect(slots == kSlots, "each isolated save is in a slot of its own");
+  bool named = false;
+  for (const rommsync::scan::Skip& skip : scanned.skipped) {
+    named = named || (skip.reason == rommsync::scan::SkipReason::kSaveFolder &&
+                      skip.sd_path == saves + "/psp/ULUS10041");
+  }
+  checks.Expect(named, "PPSSPP's save folder is the named skip: " + scanned.DescribeSkipped());
+
+  std::vector<sync::ClientSaveState> reported;
+  std::vector<sync::SaveTarget> targets;
+  std::map<std::string, std::string> expected;  // slot -> emulator
+  for (const rommsync::scan::SaveFile& save : scanned.saves) {
+    const std::string slot = harness::UniqueSlot("m10-12-" + save.platform_fs_slug);
+    sync::ClientSaveState state = save.ToClientSaveState();
+    state.slot = slot;
+    reported.push_back(state);
+    targets.push_back({save.rom_id, slot, save.sd_path, save.file_name});
+    for (const System& system : kSystems) {
+      if (save.platform_fs_slug == system.platform) {
+        expected[slot] = system.emulator;
+      }
+    }
+  }
+
+  sync::TickOptions options = OptionsAt(1'757'000'900);
+  options.recover_dirs = {harness::kBackupDir};
+  const sync::TickResult tick =
+      sync::RunTick(client, *files, TokenFor(base, fixture), reported, targets, {}, options);
+
+  std::vector<std::int64_t> uploaded;
+  for (const auto& [slot, emulator] : expected) {
+    const sync::OperationResult* done = nullptr;
+    if (!OperationIn(tick, slot, &done) || done->outcome != sync::OperationOutcome::kUploaded ||
+        !done->save_id.has_value()) {
+      checks.Expect(false, emulator + "'s save was uploaded: " +
+                               (done == nullptr ? std::string("no operation") : done->message));
+      continue;
+    }
+    uploaded.push_back(*done->save_id);
+    checks.ExpectEq(StoredEmulator(client, base, fixture, *done->save_id), emulator,
+                    "RomM holds the save under " + emulator);
+  }
+  std::size_t uploads = 0;
+  for (const sync::SyncOperation& operation : tick.negotiated.plan.operations) {
+    checks.Expect(!(operation.rom_id == psp_rom && operation.action == sync::Action::kUpload),
+                  "nothing of PPSSPP's was offered to RomM");
+    uploads += operation.action == sync::Action::kUpload ? 1 : 0;
+  }
+  checks.ExpectEq(uploads, expected.size(), "and nothing but the isolated saves went up");
+  for (const std::int64_t id : uploaded) {
     harness::DeleteSave(client, base, fixture, id);
   }
 }
@@ -3161,6 +3466,10 @@ int main(int argc, char** argv) {
     Deleted(checks, *client, base, fixture, rom, rommsync::config::OnServerDelete::kRemove);
   } else if (scenario == "deleted_keep") {
     Deleted(checks, *client, base, fixture, rom, rommsync::config::OnServerDelete::kKeep);
+  } else if (scenario == "isolated") {
+    Isolated(checks, *client, base, fixture);
+  } else if (scenario == "isolated_ids") {
+    IsolatedIds(checks, *client, base, fixture);
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;

@@ -313,6 +313,15 @@ Two folder layouts behave differently here, and it matters:
 - `ambiguous` — move the save into a per-platform folder and map that folder for
   that platform in `config.ini` ([CONFIG.md](CONFIG.md#defaults--the-folder-map)).
   A folder that belongs to one platform is what resolves it.
+- `save folder` — a PSP save. PPSSPP keeps each game's save as a folder, and
+  PSP saves are not synced yet; nothing to fix
+  ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#formats-only-one-emulator-reads)).
+
+A PS1, N64, Dreamcast, NDS or Saturn save that **is** matched can still be
+refused at the download, with `other_emulator` in a `save.failed` line: the
+server's copy came from RetroArch, whose format for that system Tico's module
+does not read, so it is never written over the card. It syncs with the same
+module on another Switch only.
 
 ---
 

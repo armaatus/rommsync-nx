@@ -199,6 +199,14 @@ enum class SkipReason {
   /// folder would not list -- so none of them is (`tico::Resolve`). Once per
   /// folder, not per file: its files were never read.
   kTicoAccount,
+
+  /// A folder in Tico's psp folder: PPSSPP keeps each game's save as a folder
+  /// (`<GAMEFOLDER>/` at the SAVEDATA level), and M10 syncs no PSP save (#238).
+  /// RomM and RetroArch hold those as a `PSP-<folder>.zip`, and the adapter that
+  /// would bundle one -- hashed by RomM's per-entry ZIP rule, #234 -- comes after
+  /// #44 captures real folders. One skip per folder; its files were never read.
+  /// The module's own `backups/` is not one.
+  kSaveFolder,
 };
 
 /// Stable, log-friendly name. Never null.
@@ -355,7 +363,15 @@ struct ScanResult {
 ///
 /// In every folder, `*.tmp`, `*.png` and `*.restart` are passed over without a
 /// skip: an emulator's half-written file, a state's screenshot, DuckStation's
-/// restart marker -- never a save. Subfolders (Tico's `backups/`) are not read.
+/// restart marker -- never a save. Subfolders (Tico's `backups/`) are not read;
+/// one in Tico's psp folder is a `kSaveFolder` skip, since that is where PPSSPP
+/// keeps its saves (#238).
+///
+/// **The systems whose Tico format no libretro core reads** -- psx, n64, dc,
+/// nds, saturn and psp -- are reported under their `tico-*` ids (#226 D3), so
+/// they meet only the same module on another Switch. Each N64 file (`.eep`,
+/// `.sra`, `.fla`, `.mpk`) is a save of its own in its own slot, and DuckStation's
+/// cards are matched as `MemoryCardName` names them.
 ///
 /// Everything else comes from `config::Config::SaveScanDirs()`, so one physical
 /// folder listed under a dozen platforms is walked **once** and yields one
@@ -432,6 +448,26 @@ std::string MigratedSlot(std::string_view slot, std::string_view old_slot);
 /// Also nullopt when there is nothing to list.
 std::optional<std::vector<std::string>> EmulatorFilter(const config::Config& config,
                                                        const std::vector<SaveFile>& saves);
+
+/// The name DuckStation gives memory card `card` (1 or 2) of the rom whose
+/// `fs_name_no_ext` is `rom_name`, in Tico's psx folder (#226 R5, #238): the
+/// rom's name without a trailing ` (Disc N)` -- every disc of a game shares one
+/// card -- with `_2` for card 2, and `.mcd`. `Two Disc (USA) (Disc 1)`, 2 ->
+/// `Two Disc (USA)_2.mcd`.
+///
+/// The scan reads that name back the other way: a `.mcd` there whose name is not
+/// exactly one rom's is tried as card 2 (`<name>_2`) and as the first disc's
+/// (`<name> (Disc 1)`), and card 2 is synced in the slot `<slot>-card2`, since
+/// the two cards of one rom are two saves. [verify on #44]
+std::string MemoryCardName(std::string_view rom_name, int card);
+
+/// The rom a save called `file_name`, in a folder implying `platform_hint`, is
+/// matched to -- the scan's own rule, for a caller that has to know what the
+/// scan will read a file back as (`place::Placer`): `RomIndex::Find` on the base
+/// name, and in Tico's psx folder (`memory_cards`) DuckStation's card names as
+/// `MemoryCardName` describes them. `*card` is 2 for a card-2 reading, else 1.
+roms::Match MatchSave(const roms::RomIndex& index, std::string_view file_name,
+                      std::string_view platform_hint, bool memory_cards, int* card);
 
 /// Which platform each save directory implies, keyed by directory.
 ///

@@ -336,7 +336,9 @@ An `account` that is not `auto`, `legacy` or 32 hex digits is a `warning`, and
 warning.
 
 **What is never synced**, in any folder: Tico's `backups/` folders (the scan
-reads no subfolder), `*.tmp` (Tico writes a save there and renames it; one a
+reads no subfolder), PSP saves — PPSSPP keeps each game's as a folder in Tico's
+psp folder, and each is skipped as a *save folder* until an adapter exists
+([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#formats-only-one-emulator-reads)), `*.tmp` (Tico writes a save there and renames it; one a
 crash left behind is never uploaded), `*.png` (a state's screenshot) and
 `*.restart` (DuckStation's). Snes9x's `.rtc` clock is synced beside its `.srm`,
 as a save of its own in its own slot (`autosave-rtc`; see below).

@@ -1378,6 +1378,135 @@ void Tico(::checks::Checks& checks) {
   }
 }
 
+// --- isolated -----------------------------------------------------------------
+//
+// #238: the systems whose Tico format no libretro core reads. Each syncs under its
+// own `tico-*` id; PPSSPP's per-game folders are a named skip rather than
+// silence; and DuckStation names its cards the way #226 R5 found -- one card for
+// every disc, without the disc tag, and card 2 as `<name>_2.mcd`.
+
+void Isolated(::checks::Checks& checks) {
+  roms::RomIndex index;
+  index.Add(MakeRom(1, "Psx Game", "psx"));
+  index.Add(MakeRom(2, "Two Disc (USA) (Disc 1)", "psx"));
+  index.Add(MakeRom(3, "Two Disc (USA) (Disc 2)", "psx"));
+  index.Add(MakeRom(4, "N64 Game", "n64"));
+  index.Add(MakeRom(5, "Dc Game", "dreamcast"));
+  index.Add(MakeRom(6, "Nds Game", "nds"));
+  index.Add(MakeRom(7, "Saturn Game", "saturn"));
+  index.Add(MakeRom(8, "Psp Game", "psp"));
+  index.Add(MakeRom(9, "Card_2", "psx"));
+  index.Add(MakeRom(10, "Twin (Disc 1)", "psx"));
+  index.Add(MakeRom(11, "Twin (Disc 1)", "psx"));
+  // As RomM strips them: both discs reduce to `Untagged`, which is the card's
+  // name -- an ambiguity by the tag-stripped name, and disc 1's card by
+  // DuckStation's.
+  for (const auto& [id, disc] : {std::pair<std::int64_t, const char*>{12, "Untagged (Disc 1)"},
+                                 std::pair<std::int64_t, const char*>{13, "Untagged (Disc 2)"}}) {
+    roms::Rom rom = MakeRom(id, disc, "psx");
+    rom.fs_name_no_tags = "Untagged";
+    index.Add(rom);
+  }
+
+  const std::string saves = "/tico/saves/users/" + kAccountA;
+  RetroArchCard card("isolated");
+  card.files.AddDirectory("/tico/saves", "users");
+  card.files.AddDirectory("/tico/saves/users", kAccountA);
+  card.Save(saves + "/psx", "Psx Game.mcd");
+  card.Save(saves + "/psx", "Psx Game_2.mcd");
+  card.Save(saves + "/psx", "Two Disc (USA).mcd");
+  card.Save(saves + "/psx", "Two Disc (USA)_2.mcd");
+  card.Save(saves + "/psx", "Card_2.mcd");
+  card.Save(saves + "/psx", "Twin.mcd");
+  card.Save(saves + "/psx", "Nobody_2.mcd");
+  card.Save(saves + "/psx", "Untagged.mcd");
+  card.Save(saves + "/n64", "N64 Game.eep");
+  card.Save(saves + "/n64", "N64 Game.sra");
+  card.Save(saves + "/n64", "N64 Game.fla");
+  card.Save(saves + "/n64", "N64 Game.mpk");
+  card.Save(saves + "/dc", "Dc Game.bin");
+  card.Save(saves + "/nds", "Nds Game.dsv");
+  card.Save(saves + "/saturn", "Saturn Game.bkr");
+  // PPSSPP: one folder per game at the SAVEDATA level, its files inside, and
+  // the module's rotating backups/ beside them.
+  card.Save(saves + "/psp/ULUS10041", "PARAM.SFO");
+  card.Save(saves + "/psp/ULUS10041", "DATA.BIN");
+  card.Save(saves + "/psp/backups", "Psp Game.1");
+  // The layout before 0.8.0 holds a PSP folder too, and is outside it now.
+  card.Save("/tico/saves/psp/NPJH50505", "DATA.BIN");
+
+  const scan::ScanResult result =
+      scan::ScanSaves(TicoConfig(""), kRetroArchDefaults, index, card.files, kFirstTick);
+
+  struct Row {
+    const char* file;
+    std::int64_t rom_id;
+    const char* emulator;
+    const char* slot;
+  };
+  const Row kRows[] = {
+      {"psx/Psx Game.mcd", 1, "tico-duckstation", "autosave-mcd"},
+      {"psx/Psx Game_2.mcd", 1, "tico-duckstation", "autosave-mcd-card2"},
+      {"psx/Two Disc (USA).mcd", 2, "tico-duckstation", "autosave-mcd"},
+      {"psx/Two Disc (USA)_2.mcd", 2, "tico-duckstation", "autosave-mcd-card2"},
+      {"psx/Card_2.mcd", 9, "tico-duckstation", "autosave-mcd"},
+      {"psx/Untagged.mcd", 12, "tico-duckstation", "autosave-mcd"},
+      {"n64/N64 Game.eep", 4, "tico-mupen64plus", "autosave-eep"},
+      {"n64/N64 Game.sra", 4, "tico-mupen64plus", "autosave-sra"},
+      {"n64/N64 Game.fla", 4, "tico-mupen64plus", "autosave-fla"},
+      {"n64/N64 Game.mpk", 4, "tico-mupen64plus", "autosave-mpk"},
+      {"dc/Dc Game.bin", 5, "tico-flycast", "autosave-bin"},
+      {"nds/Nds Game.dsv", 6, "tico-drastic", "autosave-dsv"},
+      {"saturn/Saturn Game.bkr", 7, "tico-yabasanshiro", "autosave-bkr"},
+  };
+  for (const Row& row : kRows) {
+    const std::string path = saves + "/" + row.file;
+    const scan::SaveFile* save = SaveAt(result, path);
+    if (save == nullptr) {
+      checks.Expect(false, path + " was scanned: " + result.DescribeSkipped());
+      continue;
+    }
+    checks.ExpectEq(save->rom_id, row.rom_id, path + " is its rom's");
+    checks.ExpectEq(save->emulator, std::string(row.emulator), path + "'s emulator id");
+    checks.ExpectEq(save->slot, std::string(row.slot), path + "'s slot");
+  }
+  // Card 2 goes up under the name DuckStation gives it, not the rom's.
+  if (const scan::SaveFile* two = SaveAt(result, saves + "/psx/Two Disc (USA)_2.mcd")) {
+    checks.ExpectEq(two->server_name, std::string("Two Disc (USA)_2.mcd"),
+                    "card 2's upload name is DuckStation's");
+  }
+  checks.ExpectEq(result.saves.size(), std::size_t{13},
+                  "every isolated save, and no PSP file: " + result.DescribeSkipped());
+
+  checks.Expect(SkippedFor(result, saves + "/psp/ULUS10041", scan::SkipReason::kSaveFolder),
+                "a PPSSPP save folder is a named skip: " + result.DescribeSkipped());
+  checks.Expect(SkippedFor(result, "/tico/saves/psp/NPJH50505", scan::SkipReason::kSaveFolder),
+                "and so is one left in the layout before 0.8.0, which is not read either");
+  checks.Expect(SkippedFor(result, saves + "/psx/Twin.mcd", scan::SkipReason::kAmbiguous),
+                "a card two disc-1 roms could own is not guessed");
+  checks.Expect(SkippedFor(result, saves + "/psx/Nobody_2.mcd", scan::SkipReason::kUnmatched),
+                "a card 2 of no rom is unmatched");
+  checks.ExpectEq(result.skipped_total, std::size_t{4},
+                  "and nothing else -- backups/ is litter, not a save folder: " +
+                      result.DescribeSkipped());
+  for (const scan::Skip& skip : result.skipped) {
+    if (skip.reason == scan::SkipReason::kSaveFolder) {
+      checks.Expect(skip.message.find("PPSSPP") != std::string::npos,
+                    "the skip says whose folder it is: " + skip.message);
+    }
+  }
+  checks.ExpectEq(std::string(scan::ToString(scan::SkipReason::kSaveFolder)),
+                  std::string("save folder"), "and is named for the log");
+
+  // Where #237 places a card for a rom: Tico's name for it.
+  checks.ExpectEq(scan::MemoryCardName("Psx Game", 1), std::string("Psx Game.mcd"),
+                  "card 1 is the rom's name");
+  checks.ExpectEq(scan::MemoryCardName("Two Disc (USA) (Disc 2)", 1),
+                  std::string("Two Disc (USA).mcd"), "without the disc tag: one card per game");
+  checks.ExpectEq(scan::MemoryCardName("Two Disc (USA) (Disc 1)", 2),
+                  std::string("Two Disc (USA)_2.mcd"), "and card 2 is _2");
+}
+
 // --- library ------------------------------------------------------------------
 
 void Library(::checks::Checks& checks, http::HttpClient& client, const std::string& base,
@@ -1713,7 +1842,7 @@ int main(int argc, char** argv) {
   if (scenario == "names" || scenario == "ambiguous" || scenario == "walked_once" ||
       scenario == "unusable" || scenario == "truncated" || scenario == "hashing" ||
       scenario == "sources" || scenario == "grown" || scenario == "retroarch" ||
-      scenario == "tico") {
+      scenario == "tico" || scenario == "isolated") {
     if (scenario == "names") {
       Names(checks);
     } else if (scenario == "ambiguous") {
@@ -1732,6 +1861,8 @@ int main(int argc, char** argv) {
       RetroArch(checks);
     } else if (scenario == "tico") {
       Tico(checks);
+    } else if (scenario == "isolated") {
+      Isolated(checks);
     } else {
       Unusable(checks);
     }

@@ -284,6 +284,18 @@ enum class OperationError {
   /// touched.
   kUnverified,
 
+  /// A `download` or `conflict` whose server copy was written by an emulator
+  /// whose save format the local file's does not share (`scan::Interchangeable`,
+  /// #238): a Beetle `.srm` for DuckStation's card, a `tico-*` save for a
+  /// RetroArch folder, or an isolated format placed where nothing says who reads
+  /// it. Refused before anything is fetched; **nothing local was touched**.
+  ///
+  /// RomM pairs on `(rom_id, slot)` whatever wrote the save, so this is the
+  /// client's own guard behind the `emulators` filter rather than a server
+  /// fault, and it is counted failed on purpose: the plan asked for something
+  /// this client will not do, every tick, until one of the two saves moves.
+  kOtherEmulator,
+
   /// The verified bytes could not be moved onto the save, or a save a `delete`
   /// names could not be removed. `io::PreviousPathFor` and the backup are both
   /// worth looking at; the message says which.
@@ -454,6 +466,18 @@ struct ExecuteOptions {
   /// saves one, which for a first-time restore is after.
   std::function<place::Placement(const SyncOperation&)> place;
 
+  /// The emulator id a save written at `sd_path` -- the path `place` chose --
+  /// will be read back as by the next tick's scan (`scan::EmulatorAt`), or "",
+  /// for a placement that does not name one itself (`place::Placement::emulator`).
+  ///
+  /// A download is written only where its format is read (#238): a matched
+  /// save's lineage is the one `reported` gave it, and a placed one's is the
+  /// placement's, else this. With neither, a `tico-*` save is not placed, since
+  /// nothing then says it would land where its own module reads; any other is
+  /// placed as before. Checked before the placement's folder is made.
+  /// `place::Placer` always names its emulator, so the engine leaves this null.
+  std::function<std::string(const SyncOperation&, const std::string& sd_path)> reads_as;
+
   /// The saves whose upload may supersede a newer server copy: the
   /// `(rom_id, slot)` pairs a player chose "Keep local" for on the overlay's
   /// conflict screen, and **nothing else** (#232).
@@ -502,6 +526,10 @@ struct ExecuteOptions {
   /// player wrote to since is progress the ruling never saw. Null, or a save
   /// reported with no digest, is nothing to check against, and the delete is
   /// refused before anything is copied.
+  ///
+  /// It is also the emulator a matched download is held to (#238): a save
+  /// reported under one id takes no copy whose format is another's
+  /// (`scan::Interchangeable`). Null, a `tico-*` copy is written over nothing.
   const std::vector<ClientSaveState>* reported = nullptr;
 
   /// Optional, not owned; must outlive the call. Checked between operations and

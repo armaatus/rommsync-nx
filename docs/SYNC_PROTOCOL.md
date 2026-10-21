@@ -54,9 +54,19 @@ For each file under the configured save/state dirs:
    `[tico] account` naming one is one skip for the whole `users/`, never a
    guess; a file left in the old folder is *outside layout*. In every folder,
    `*.tmp`, `*.png` and `*.restart` are not saves and are passed over, and no
-   subfolder — Tico's `backups/` — is read.
+   subfolder — Tico's `backups/` — is read. A subfolder of Tico's psp folder is
+   where PPSSPP keeps a game's save, so it is a *save folder* skip by name rather
+   than silence: PSP saves are not synced until the `PSP-<folder>.zip` adapter
+   (#238, after #44).
 1. Strip the save/state suffix to get the base name (`Game (USA).srm` → `Game (USA)`).
 2. Match to a rom by `fs_name_no_ext` (exact), falling back to `fs_name_no_tags`.
+   In Tico's psx folder a `.mcd` that is not exactly one rom's name is read as
+   DuckStation names its cards (#238): `<name>_2.mcd` is card 2 of `<name>`,
+   and one card serves every disc of a game, so `<name>.mcd` may be the card of
+   the rom `<name> (Disc 1)`. Card 2 is a second save of the rom, in its own
+   slot `autosave-mcd-card2` and uploaded as `<name>_2.mcd`
+   (`scan::MemoryCardName` is the same rule the other way, which `place::Placer`
+   places a card by).
 3. Scope by platform when the path implies one (Tico's per-system folders do;
    RetroArch's flat `saves/` doesn't — match by name across the library then).
 4. Ambiguous match (same base name on two platforms, no platform hint) → skip and
@@ -84,7 +94,9 @@ For each file under the configured save/state dirs:
    otherwise the built-in table: the libretro core id where the bytes are
    RetroArch-compatible (`snes9x`, `gambatte`, `genesis_plus_gx`), a `tico-*`
    id where they are not (`tico-duckstation`, `tico-ppsspp`), and `null` for a
-   system neither table knows. The same id goes on a state's upload.
+   system neither table knows. The same id goes on a state's upload. A `tico-*`
+   id is an **isolated format**: it syncs Switch to Switch and never with a
+   RetroArch core — see [Formats only one emulator reads](#formats-only-one-emulator-reads).
 7. Validate the record before emitting it. A save the encoder would refuse — an
    mtime of 0 from a console with an unset clock, a name the server would read
    as a path — is skipped with a reason, because `EncodeNegotiateRequest` stops
@@ -516,6 +528,56 @@ The arbitration is per `(device, save)`. Sync history is written by an upload
 carrying `device_id` and by `POST /api/saves/{id}/downloaded` — a download the
 client never confirms leaves the device looking like it has never seen the save,
 which puts every later comparison in the no-sync-history branch above.
+
+### Formats only one emulator reads
+
+Six of Tico's systems write saves no libretro core reads — DuckStation's `.mcd`
+card, Mupen64Plus's split N64 files, PPSSPP's folders, and whatever Flycast,
+DraStic and YabaSanshiro write [#44 verifies]. They sync under a `tico-*`
+emulator id (step 0, item 6) and **only with the same module on another
+Switch** (#226 D3). Adapters that would rewrite one format into the other are
+filed after #44 has captured real files; until one is proven byte for byte,
+isolation is what keeps a progress-destroying guess off the card.
+
+The id alone does not do it. RomM pairs saves on `(rom_id, slot)` whatever
+wrote them (`sync-negotiate-pairs-across-emulators.json`), and the `emulators`
+filter (#236) is one list per request: a console that reads RetroArch's psx
+core beside DuckStation names both, so a plan can still offer a Beetle `.srm`
+for DuckStation's card. So `ExecutePlan` asks before it fetches anything
+(`scan::Interchangeable`): **a `tico-*` save is never written where anything
+else reads, and nothing else is ever written over one.** A matched save is read
+as the emulator step 0 reported for it; a first-time restore as the emulator
+its placement was made for (`place::Placement::emulator` — `place::Placer`
+already places only where `place::Compatible` allows, #237, and this is the
+executor's own check behind it), else as what the scan would report for the
+path (`ExecuteOptions::reads_as`, `scan::EmulatorAt`). With nothing to say,
+a `tico-*` save is not placed at all, and the check comes before the
+placement's folder is made. A refusal is `OperationError::kOtherEmulator`: nothing fetched, nothing
+backed up, nothing touched, and counted failed — the plan asked for something
+this client will not do, and it will ask again until one of the two saves
+moves. The same holds inside #232's resolution of a 409, which executes through
+the same path. Two libretro cores in one slot are not this rule's: that is RomM's
+pairing and #236's filter.
+
+| System | Tico module | Emulator id | Syncs with | Status in M10 |
+|---|---|---|---|---|
+| NES | FCEUmm | `fceumm` | RetroArch `fceumm`, the web player | full [verify bytes] |
+| SNES | Snes9x | `snes9x` | RetroArch `snes9x`, the web player | full (`.rtc` in a slot of its own) |
+| GB / GBC | Gambatte | `gambatte` | RetroArch `gambatte` | full [verify RTC] |
+| GBA | mGBA | `mgba` | RetroArch `mgba`, the web player | full [verify] |
+| Genesis / SMS / GG / Sega CD | Genesis Plus GX | `genesis_plus_gx` | RetroArch `genesis_plus_gx` | full [verify `.brm`] |
+| Arcade | FinalBurn Neo | `fbneo` | RetroArch `fbneo` | full [verify] |
+| PS1 | DuckStation | `tico-duckstation` | DuckStation on another Switch | Switch-only: `<game>.mcd`, card 2 `<game>_2.mcd` (own slot), one card for every disc, kept under disc 1's rom; a first-time restore is placed under those names, and a card kept under a later disc's rom is not placed |
+| N64 | Mupen64Plus | `tico-mupen64plus` | Mupen64Plus on another Switch | Switch-only: `.eep`, `.sra`, `.fla`, `.mpk` each a save in its own slot (`autosave-eep` …) |
+| Dreamcast | Flycast | `tico-flycast` | Flycast on another Switch | Switch-only, for a file named after its rom [verify on #44: Flycast may name VMUs by game id] |
+| NDS | DraStic | `tico-drastic` | DraStic on another Switch | Switch-only (`.dsv` likely) [verify on #44] |
+| Saturn | YabaSanshiro | `tico-yabasanshiro` | YabaSanshiro on another Switch | Switch-only [verify the file name on #44] |
+| PSP | PPSSPP | `tico-ppsspp` | — | not synced: its saves are folders, a *save folder* skip; the `PSP-<folder>.zip` adapter needs #44 and RomM's per-entry ZIP hash (#234) |
+
+"Full" needs the other device on the same core for that system. A RetroArch save
+for an isolated system — Beetle PSX, `mupen64plus_next`, RetroArch's `ppsspp` —
+still syncs between RetroArch installs, the Switch's own included; it is only
+never written into Tico's folder, nor Tico's into RetroArch's.
 
 ### A save deleted on the server
 

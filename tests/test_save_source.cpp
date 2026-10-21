@@ -274,6 +274,64 @@ void Layouts(checks::Checks& c) {
              std::string("mgba"), "and a folder whose layout is unknown");
 }
 
+/// #238: which lineage may be written where. A `tico-*` format is read by its own
+/// module and nothing else, so it meets only itself; everything else is the
+/// pairing RomM already does, and not this rule's to narrow.
+void Isolation(checks::Checks& c) {
+  c.Expect(scan::IsIsolated("tico-duckstation") && scan::IsIsolated("tico-ppsspp"),
+           "a tico-* id is an isolated format");
+  c.Expect(!scan::IsIsolated("snes9x") && !scan::IsIsolated("mednafen_psx_hw") &&
+               !scan::IsIsolated(""),
+           "a libretro core, or no id at all, is not");
+
+  struct Row {
+    const char* local;
+    const char* server;
+    bool may;
+    const char* why;
+  };
+  const Row kRows[] = {
+      {"tico-duckstation", "tico-duckstation", true, "the same module's card"},
+      {"tico-duckstation", "mednafen_psx_hw", false, "a Beetle .srm onto DuckStation's card"},
+      {"tico-duckstation", "pcsx_rearmed", false, "any RetroArch psx core onto it"},
+      {"pcsx_rearmed", "tico-duckstation", false, "DuckStation's card taken by a RetroArch core"},
+      {"mupen64plus_next", "tico-mupen64plus", false, "a split N64 save into RetroArch's .srm"},
+      {"tico-duckstation", "", false, "a save nobody named, onto an isolated format"},
+      {"", "tico-mupen64plus", false, "an isolated format into a folder nobody named"},
+      {"tico-flycast", "tico-drastic", false, "two isolated formats are not each other"},
+      {"snes9x", "snes9x", true, "one core, one lineage"},
+      {"pcsx_rearmed", "mednafen_psx_hw", true,
+       "two RetroArch cores: RomM's pairing, not this rule's"},
+      {"snes9x", "", true, "an unnamed save into a libretro folder, as before #238"},
+      {"", "", true, "nothing named on either side"},
+  };
+  for (const Row& row : kRows) {
+    c.Expect(scan::Interchangeable(row.local, row.server) == row.may,
+             std::string(row.may ? "may: " : "may not: ") + row.why);
+  }
+
+  const config::Config defaults = config::Defaults();
+  c.ExpectEq(scan::EmulatorAt("/tico/saves/psx/Game.mcd", "psx", defaults),
+             std::string("tico-duckstation"), "Tico's psx folder is DuckStation's");
+  c.ExpectEq(scan::EmulatorAt("/tico/saves/users/0123456789abcdef0123456789abcdef/psx/Game.mcd",
+                              "psx", defaults),
+             std::string("tico-duckstation"), "and so is an account's");
+  c.ExpectEq(scan::EmulatorAt("/tico/saves/dc/Game.bin", "dreamcast", defaults),
+             std::string("tico-flycast"), "RomM's spelling of the platform, Tico's folder");
+  c.ExpectEq(scan::EmulatorAt("/retroarch/saves/Game.srm", "psx", defaults),
+             std::string("pcsx_rearmed"), "RetroArch's flat folder is its psx default");
+  c.ExpectEq(scan::EmulatorAt("/retroarch/saves/Beetle PSX HW/Game.srm", "psx", defaults),
+             std::string("mednafen_psx_hw"), "and a core folder is that core");
+  c.ExpectEq(scan::EmulatorAt("/somewhere/Game.srm", "psx", defaults), std::string(),
+             "a folder neither emulator owns names nothing");
+  c.ExpectEq(scan::EmulatorAt("Game.srm", "psx", defaults), std::string(),
+             "nor does a bare name");
+  config::Config overridden = defaults;
+  overridden.emulators["psx"] = "swanstation";
+  c.ExpectEq(scan::EmulatorAt("/tico/saves/psx/Game.mcd", "psx", overridden),
+             std::string("swanstation"), "the override is what the scan would report");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -287,6 +345,8 @@ int main(int argc, char** argv) {
     Ids(c);
   } else if (scenario == "layouts") {
     Layouts(c);
+  } else if (scenario == "isolation") {
+    Isolation(c);
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;

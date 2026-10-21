@@ -113,6 +113,39 @@ SaveSource ResolveSource(const SaveSource& folder, std::string_view platform_fs_
 /// Switch build's defaults]. A `Source::kUnknown` folder has none.
 std::string DefaultEmulatorId(Source source, std::string_view platform_fs_slug);
 
+// --- isolated formats (#238) --------------------------------------------------
+
+/// True for an id whose save format only that emulator reads: a `tico-*` id
+/// (#226 D3). DuckStation's `.mcd`, Mupen64Plus's split N64 files, PPSSPP's
+/// folders, and Flycast's, DraStic's and YabaSanshiro's files are not what any
+/// libretro core reads, so a save under one of these ids syncs Switch to Switch
+/// and nowhere else until an adapter is proven against #44's captures.
+bool IsIsolated(std::string_view emulator_id);
+
+/// True when bytes RomM holds under emulator `server` may be written where this
+/// client's scan reads a save as `local`. Either may be "", which is `null`:
+/// nobody said.
+///
+/// An isolated format meets only itself: a `tico-*` save is never written where
+/// anything else reads, and nothing else -- an unnamed save included -- is ever
+/// written over one. Everything else is allowed, as it was before #238: two
+/// libretro cores sharing a slot is RomM's pairing and the `emulators` filter's
+/// to narrow (#236), not this rule's.
+bool Interchangeable(std::string_view local, std::string_view server);
+
+/// The emulator id the scan would report for a save at `sd_path` of a rom on
+/// `platform_fs_slug`: `ResolveSource` over `SourceOf` of the file's folder.
+/// Empty when nothing says, or when `sd_path` has no folder.
+///
+/// What a save placed at `sd_path` will be read back as on the next tick, and so
+/// the lineage a download landing there joins -- the question `Interchangeable`
+/// is asked about a first-time restore (`sync::ExecuteOptions::reads_as`), for a
+/// placer that does not name its emulator. From the path alone, so a folder the
+/// scan reads by configuration rather than by name -- RetroArch's content dir
+/// under `/tico/roms` -- reads as its path says; `place::Placer` names its own.
+std::string EmulatorAt(std::string_view sd_path, std::string_view platform_fs_slug,
+                       const config::Config& config);
+
 // --- RomM's rule for an id ----------------------------------------------------
 
 /// RomM's `EMULATOR_MAX_LENGTH`, in characters.

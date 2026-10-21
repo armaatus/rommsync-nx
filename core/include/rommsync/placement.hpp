@@ -61,6 +61,12 @@ struct Placement {
   /// named.
   std::string reason;
 
+  /// The emulator the file at `sd_path` is written for, and so what the next
+  /// scan reads it back as: the lineage the executor holds the server's copy to
+  /// (#238, `scan::Interchangeable`). Empty when the placer does not say, and
+  /// `sync::ExecuteOptions::reads_as` is asked instead.
+  std::string emulator;
+
   bool ok() const { return !sd_path.empty(); }
 };
 
@@ -135,9 +141,10 @@ class Placer {
   Target TargetFor(const roms::Rom& rom, std::string_view server_emulator, bool saves);
 
   /// The rom the scan would match `file_name` in `target`'s folder to, or why
-  /// it would match none. Empty reason: `rom` is the match.
+  /// it would match none. Empty reason: `rom` is the match, as DuckStation's
+  /// card `card` where the folder is Tico's psx (#238).
   std::string ReadsBackAs(const roms::Rom& rom, std::string_view file_name, const Target& target,
-                          bool saves) const;
+                          bool saves, int card = 1) const;
 
   const config::Config& config_;
   const retroarch::Settings& retroarch_;

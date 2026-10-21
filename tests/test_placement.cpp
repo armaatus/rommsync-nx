@@ -609,6 +609,62 @@ void States(checks::Checks& c) {
 
 }  // namespace
 
+/// #238: DuckStation's cards, placed under the names the scan reads back -- one
+/// card for every disc, named for the game, and card 2 as `_2` in its own slot
+/// -- and a card kept under a disc-2 rom placed nowhere, since the game's name
+/// is disc 1's card. Every placement is read back by the scan.
+void Cards(checks::Checks& c) {
+  roms::RomIndex index;
+  index.Add(MakeRom(1, "Psx Game", "psx"));
+  index.Add(MakeRom(2, "Two Disc (USA) (Disc 1)", "psx"));
+  index.Add(MakeRom(3, "Two Disc (USA) (Disc 2)", "psx"));
+  const retroarch::Settings ra_defaults;
+  const config::Config config = config::Defaults();
+  const std::string card1 = ScanSlot("x.mcd");
+  const std::string card2 = card1 + "-card2";
+  const std::string tagged = " [2026-10-01_12-00-00].mcd";
+
+  Card card("cards");
+  card.MakeDirs("/tico/saves/psx");
+  place::Placer placer(config, ra_defaults, index, card.files());
+
+  struct Row {
+    std::int64_t rom_id;
+    const std::string& slot;
+    const char* path;  ///< "" for placed nowhere
+    int read_back_as;  ///< the rom the scan must read it back as
+  };
+  const Row kRows[] = {
+      {1, card1, "/tico/saves/psx/Psx Game.mcd", 1},
+      {1, card2, "/tico/saves/psx/Psx Game_2.mcd", 1},
+      {2, card1, "/tico/saves/psx/Two Disc (USA).mcd", 2},
+      {2, card2, "/tico/saves/psx/Two Disc (USA)_2.mcd", 2},
+      {3, card1, "", 0},
+      {3, card2, "", 0},
+  };
+  for (const Row& row : kRows) {
+    const place::Placement placed =
+        placer.Save(Download(row.rom_id, row.slot, "tico-duckstation", "Card" + tagged));
+    const std::string what = "rom " + std::to_string(row.rom_id) + " in " + row.slot;
+    if (*row.path == '\0') {
+      c.Expect(!placed.ok() && !placed.reason.empty(),
+               what + ": a disc-2 card is not placed over disc 1's: " + placed.sd_path);
+      continue;
+    }
+    c.ExpectEq(placed.sd_path, std::string(row.path), what + ": " + placed.reason);
+    c.ExpectEq(placed.emulator, std::string("tico-duckstation"),
+               what + ": the placement names who reads it");
+    std::string said;
+    c.Expect(ReadsBack(card, config, ra_defaults, index, placed.sd_path, row.read_back_as,
+                       row.slot, &said),
+             what + ": read back as the same card: " + said);
+  }
+
+  // A RetroArch core's save is not a DuckStation card, whatever slot it is in.
+  c.Expect(!placer.Save(Download(1, card1, "mednafen_psx_hw", "Card.srm")).ok(),
+           "a Beetle save is not placed in DuckStation's folder");
+}
+
 int main(int argc, char** argv) {
   const std::string scenario = argc > 1 ? argv[1] : "config";
   checks::Checks c;
@@ -620,6 +676,8 @@ int main(int argc, char** argv) {
     Saves(c);
   } else if (scenario == "states") {
     States(c);
+  } else if (scenario == "cards") {
+    Cards(c);
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;

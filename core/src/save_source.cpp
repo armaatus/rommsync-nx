@@ -236,6 +236,26 @@ std::string DefaultEmulatorId(Source source, std::string_view platform_fs_slug) 
                                                                      : std::string(id);
 }
 
+bool IsIsolated(std::string_view emulator_id) {
+  return emulator_id.rfind("tico-", 0) == 0;
+}
+
+bool Interchangeable(std::string_view local, std::string_view server) {
+  if (IsIsolated(local) || IsIsolated(server)) {
+    return local == server;
+  }
+  return true;
+}
+
+std::string EmulatorAt(std::string_view sd_path, std::string_view platform_fs_slug,
+                       const config::Config& config) {
+  const std::size_t slash = sd_path.rfind('/');
+  if (slash == std::string_view::npos || slash == 0) {
+    return {};
+  }
+  return ResolveSource(SourceOf(sd_path.substr(0, slash)), platform_fs_slug, config).emulator_id;
+}
+
 bool ValidEmulatorId(std::string_view id, std::string* why) {
   if (id.empty()) {
     *why = "is empty";

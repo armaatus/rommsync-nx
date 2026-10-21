@@ -332,7 +332,7 @@ Placer::Target Placer::TargetFor(const roms::Rom& rom, std::string_view server_e
 }
 
 std::string Placer::ReadsBackAs(const roms::Rom& rom, std::string_view file_name,
-                                const Target& target, bool saves) const {
+                                const Target& target, bool saves, int card) const {
   // The platform the scan takes the folder to imply. Tico's folder implies the
   // map's platform for it; RetroArch's own folders and core folders imply none
   // unless the map lists them under one; a rom folder implies the platforms
@@ -355,7 +355,11 @@ std::string Placer::ReadsBackAs(const roms::Rom& rom, std::string_view file_name
     const auto found = hints.find(target.map_folder);
     hint = found == hints.end() ? std::string() : found->second;
   }
-  const roms::Match match = index_.Find(scan::BaseName(file_name), hint);
+  // Tico's psx folder is read the way DuckStation names its cards (#238).
+  const bool memory_cards = saves && target.layout.play_with == config::PlayWith::kTico &&
+                            scan::TicoSlugFor(hint) == "psx";
+  int read_card = 1;
+  const roms::Match match = scan::MatchSave(index_, file_name, hint, memory_cards, &read_card);
   if (!match.matched()) {
     return "the scan would not read it back as this rom's (" + match.reason +
            "), so it would come back as a file nobody syncs";
@@ -363,8 +367,23 @@ std::string Placer::ReadsBackAs(const roms::Rom& rom, std::string_view file_name
   if (match.rom->id != rom.id) {
     return "the scan would read it back as another rom's";
   }
+  if (read_card != card) {
+    return "the scan would read it back as another of the game's memory cards";
+  }
   return {};
 }
+
+namespace {
+
+/// DuckStation's card number for a save in `slot`: the scan files card 2 in
+/// `<slot>-card2` (#238).
+int CardOfSlot(std::string_view slot) {
+  constexpr std::string_view kCard2 = "-card2";
+  return slot.size() > kCard2.size() && slot.substr(slot.size() - kCard2.size()) == kCard2 ? 2
+                                                                                            : 1;
+}
+
+}  // namespace
 
 Placement Placer::Save(const sync::SyncOperation& operation) {
   const roms::Rom* rom = index_.ById(operation.rom_id);
@@ -380,23 +399,40 @@ Placement Placer::Save(const sync::SyncOperation& operation) {
   if (!target.reason.empty()) {
     return Refuse(target.reason);
   }
-  Placement placed = Place(*rom, target.emulator_id, operation.file_name, target.layout);
+  // DuckStation names a card after the game, not the disc, and card 2 `_2`
+  // (#238): `scan::MemoryCardName`, which is the scan's own rule turned round.
+  const bool duckstation = target.emulator_id == "tico-duckstation" &&
+                           target.layout.play_with == config::PlayWith::kTico;
+  const int card = duckstation ? CardOfSlot(*operation.slot) : 1;
+  Placement placed =
+      !duckstation ? Place(*rom, target.emulator_id, operation.file_name, target.layout)
+      : Joinable(rom->fs_name_no_ext)
+          ? JoinUnder(target.layout, target.emulator_id,
+                      scan::MemoryCardName(rom->fs_name_no_ext, card))
+          : Refuse("the rom's name is not one a file can be called");
   if (!placed.ok()) {
     return placed;
   }
   const std::string leaf = placed.sd_path.substr(placed.sd_path.rfind('/') + 1);
   // The slot the scan gives the file under `[sync] slot` (#236): `autosave` for
-  // a `.srm` whichever emulator's folder it is in, `autosave-<ext>` otherwise.
-  const std::string slot = scan::SlotFor(config_.sync.slot, leaf);
+  // a `.srm` whichever emulator's folder it is in, `autosave-<ext>` otherwise --
+  // and `-card2` after it for DuckStation's second card (#238).
+  std::string slot = scan::SlotFor(config_.sync.slot, leaf);
+  if (card > 1) {
+    slot += "-card" + std::to_string(card);
+  }
   if (slot != *operation.slot) {
     // The server's slot is not quoted: it is whatever another client chose.
     return Refuse("the scan would read it back in slot \"" + slot +
                   "\", not the one the server keeps it in, so the next sync would upload it "
                   "as a second save");
   }
-  if (const std::string why = ReadsBackAs(*rom, leaf, target, true); !why.empty()) {
+  // A card kept under a disc-2 rom is named for the game, which the scan reads
+  // back as disc 1's: refused here, so it never lands on disc 1's card.
+  if (const std::string why = ReadsBackAs(*rom, leaf, target, true, card); !why.empty()) {
     return Refuse(why);
   }
+  placed.emulator = target.emulator_id;
   return placed;
 }
 

@@ -768,6 +768,172 @@ void ContentHash(rig::Checks& checks) {
                   "which are the server's");
 }
 
+// --- isolated -----------------------------------------------------------------
+//
+// #238: a save in a format only its own emulator reads -- a `tico-*` id -- is
+// never written where anything else reads, and nothing else is ever written over
+// one. RomM pairs saves on `(rom_id, slot)` whatever wrote them, so the plan can
+// hand this client a Beetle `.srm` for DuckStation's card; the refusal happens
+// before a byte moves, which `NeverCalled` asserts. `tick.isolated` is the same
+// thing against a live 5.4.0.
+
+/// A download or a conflict of the server's copy, written by `emulator`.
+/// A placement at `sd_path`, naming the emulator it writes for -- or not, when
+/// `emulator` is empty, so the executor asks `reads_as`.
+rommsync::place::Placement PlacedAt(std::string sd_path, std::string emulator) {
+  rommsync::place::Placement placement;
+  placement.sd_path = std::move(sd_path);
+  placement.emulator = std::move(emulator);
+  return placement;
+}
+
+sync::SyncOperation FetchOf(sync::Action action, std::int64_t rom_id, const std::string& slot,
+                            const std::string& emulator) {
+  sync::SyncOperation operation = OperationOf(action, rom_id, slot);
+  operation.save_id = 5;
+  operation.emulator = emulator;
+  operation.server_content_hash = "0931bd07b94c9c07f0645fa14e9a5092";
+  operation.reason = action == sync::Action::kConflict ? sync::Reason::kBothChanged
+                                                       : sync::Reason::kServerNewerNoHistory;
+  operation.reason_text = sync::ReasonText(operation.reason);
+  return operation;
+}
+
+void Isolated(rig::Checks& checks) {
+  Sandbox sandbox(checks, "execute-isolated");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  auth::StoredToken token;
+  token.server_url = "http://127.0.0.1:1";
+  token.access_token = "not-used";
+  token.device_id = "this-console";
+
+  const std::string card = "DuckStation's memory card\n";
+  const std::string retroarch = "a RetroArch core's save\n";
+  sandbox.SeedSave(SavePath("Card.mcd"), card);
+  sandbox.SeedSave(SavePath("Kept.mcd"), card);
+  sandbox.SeedSave(SavePath("Core.srm"), retroarch);
+  const std::vector<sync::ClientSaveState> reported = {
+      harness::LocalSave(7, "Card.mcd", "card", "tico-duckstation", crypto::Md5Hex(card),
+                         std::chrono::system_clock::now(), 26),
+      harness::LocalSave(8, "Kept.mcd", "kept", "tico-duckstation", crypto::Md5Hex(card),
+                         std::chrono::system_clock::now(), 26),
+      harness::LocalSave(9, "Core.srm", "core", "pcsx_rearmed", crypto::Md5Hex(retroarch),
+                         std::chrono::system_clock::now(), 24)};
+  const std::vector<sync::SaveTarget> targets = {
+      {7, std::string("card"), SavePath("Card.mcd"), "Card.mcd"},
+      {8, std::string("kept"), SavePath("Kept.mcd"), "Kept.mcd"},
+      {9, std::string("core"), SavePath("Core.srm"), "Core.srm"}};
+
+  // Everything the refusals need is local, so none of them sends a request.
+  {
+    sync::SyncPlan plan;
+    plan.session_id = 1;
+    plan.operations.push_back(FetchOf(sync::Action::kDownload, 7, "card", "mednafen_psx_hw"));
+    plan.operations.push_back(FetchOf(sync::Action::kConflict, 8, "kept", "pcsx_rearmed"));
+    plan.operations.push_back(FetchOf(sync::Action::kDownload, 9, "core", "tico-duckstation"));
+    sync::SyncOperation unnamed = FetchOf(sync::Action::kDownload, 7, "card", "");
+    unnamed.emulator.reset();
+    plan.operations.push_back(unnamed);
+    // Never seen here, placed where DuckStation reads: a Beetle save.
+    plan.operations.push_back(FetchOf(sync::Action::kDownload, 10, "placed", "mednafen_psx_hw"));
+    // ...and one whose placement says itself who reads it, so `reads_as` is
+    // not asked.
+    plan.operations.push_back(FetchOf(sync::Action::kDownload, 13, "named", "mednafen_psx_hw"));
+
+    sync::ExecuteOptions options = OptionsAt(1'757'000'000);
+    options.reported = &reported;
+    options.place = [](const sync::SyncOperation& operation) {
+      return PlacedAt(SavePath("sub/" + *operation.slot + ".mcd"),
+                      *operation.slot == "named" ? "tico-duckstation" : "");
+    };
+    std::vector<std::string> asked;
+    options.reads_as = [&asked](const sync::SyncOperation&, const std::string& sd_path) {
+      asked.push_back(sd_path);
+      return std::string("tico-duckstation");
+    };
+    NeverCalled client(checks);
+    const sync::ExecutionReport report =
+        sync::ExecutePlan(client, *files, token, plan, targets, options);
+
+    checks.ExpectEq(report.failed, 6, "every write across formats is refused");
+    for (const sync::OperationResult& done : report.operations) {
+      checks.Expect(done.error == sync::OperationError::kOtherEmulator,
+                    std::string("...as another emulator's save: ") + sync::ToString(done.error) +
+                        " -- " + done.message);
+      checks.Expect(done.backup_sd_path.empty(), "and no backup was needed: " + done.message);
+    }
+    checks.Expect(sync::AnswerOf(sync::OperationError::kOtherEmulator) == auth::Answer::kSilent,
+                  "a refusal says nothing about the pairing");
+    checks.ExpectEq(std::string(sync::ToString(sync::OperationError::kOtherEmulator)),
+                    std::string("other_emulator"), "and is named for the log");
+    checks.ExpectEq(sandbox.Read(SavePath("Card.mcd")), card, "DuckStation's card is untouched");
+    checks.ExpectEq(sandbox.Read(SavePath("Kept.mcd")), card, "on a conflict too");
+    checks.ExpectEq(sandbox.Read(SavePath("Core.srm")), retroarch,
+                    "and a RetroArch core never takes DuckStation's card");
+    checks.Expect(!sandbox.Exists(SavePath("sub")),
+                  "nothing is placed for a first restore -- not even its folder");
+    checks.Expect(asked == std::vector<std::string>{SavePath("sub/placed.mcd")},
+                  "reads_as is asked once, for the placement that named no emulator");
+    checks.Expect(!sandbox.HasBackupOf(card) && !sandbox.HasBackupOf(retroarch),
+                  "and nothing went under .backup/");
+  }
+
+  // With nothing to say what a placed file is read as, an isolated format is not
+  // placed at all: it cannot be shown to land where its own module reads.
+  {
+    sync::SyncPlan plan;
+    plan.session_id = 2;
+    plan.operations.push_back(FetchOf(sync::Action::kDownload, 11, "blind", "tico-mupen64plus"));
+    sync::ExecuteOptions options = OptionsAt(1'757'000'001);
+    options.reported = &reported;
+    options.place = [](const sync::SyncOperation&) { return PlacedAt(SavePath("blind.eep"), ""); };
+    NeverCalled client(checks);
+    const sync::ExecutionReport report =
+        sync::ExecutePlan(client, *files, token, plan, targets, options);
+    checks.Expect(report.failed == 1 && report.operations.size() == 1 &&
+                      report.operations[0].error == sync::OperationError::kOtherEmulator,
+                  "an isolated save is not placed blind");
+    checks.Expect(!sandbox.Exists(SavePath("blind.eep")), "and nothing is on the card");
+
+    // ...and with no `reported` to say what the card is, none is written over one.
+    sync::SyncPlan matched;
+    matched.session_id = 2;
+    matched.operations.push_back(FetchOf(sync::Action::kDownload, 7, "card", "tico-duckstation"));
+    const sync::ExecutionReport unreported = sync::ExecutePlan(
+        client, *files, token, matched, targets, OptionsAt(1'757'000'001));
+    checks.Expect(unreported.failed == 1 && unreported.operations.size() == 1 &&
+                      unreported.operations[0].error == sync::OperationError::kOtherEmulator,
+                  "an isolated save is not written over a card nothing reported");
+    checks.ExpectEq(sandbox.Read(SavePath("Card.mcd")), card, "which is untouched");
+  }
+
+  // The same module's card is a save like any other: verified, backed up, written.
+  {
+    sync::SyncPlan plan;
+    plan.session_id = 3;
+    plan.operations.push_back(FetchOf(sync::Action::kDownload, 7, "card", "tico-duckstation"));
+    plan.operations.push_back(FetchOf(sync::Action::kDownload, 12, "fresh", "tico-duckstation"));
+    sync::ExecuteOptions options = OptionsAt(1'757'000'002);
+    options.reported = &reported;
+    // The placement names its emulator, as `place::Placer` does; no `reads_as`.
+    options.place = [](const sync::SyncOperation&) {
+      return PlacedAt(SavePath("Fresh.mcd"), "tico-duckstation");
+    };
+    SaveServer server("the server copy, verified\n");
+    const sync::ExecutionReport report =
+        sync::ExecutePlan(server, *files, token, plan, targets, options);
+    checks.ExpectEq(report.completed, 2,
+                    "DuckStation's own card downloads, and is placed" +
+                        (report.warnings.empty() ? std::string() : ": " + report.warnings[0]));
+    checks.ExpectEq(sandbox.Read(SavePath("Card.mcd")), std::string("the server copy, verified\n"),
+                    "over the local card");
+    checks.Expect(sandbox.HasBackupOf(card), "whose bytes went under .backup/ first");
+    checks.ExpectEq(sandbox.Read(SavePath("Fresh.mcd")),
+                    std::string("the server copy, verified\n"), "and where DuckStation reads");
+  }
+}
+
 // --- delete -------------------------------------------------------------------
 //
 // M10-7 (#233). 5.4.0 answers `delete` for a save whose slot was emptied on the
@@ -2259,7 +2425,7 @@ int main(int argc, char** argv) {
   // The two that need no server, so they stay checked with docker stopped.
   if (scenario == "naming" || scenario == "staging" || scenario == "counting" ||
       scenario == "crash_model" || scenario == "overwrite" || scenario == "content_hash" ||
-      scenario == "delete" || scenario == "crash_delete") {
+      scenario == "delete" || scenario == "crash_delete" || scenario == "isolated") {
     if (scenario == "naming") {
       Naming(checks);
     } else if (scenario == "overwrite") {
@@ -2274,6 +2440,8 @@ int main(int argc, char** argv) {
       Delete(checks);
     } else if (scenario == "crash_delete") {
       CrashDelete(checks);
+    } else if (scenario == "isolated") {
+      Isolated(checks);
     } else {
       Counting(checks);
     }

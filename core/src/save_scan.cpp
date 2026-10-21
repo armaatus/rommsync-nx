@@ -126,6 +126,8 @@ const char* ToString(SkipReason reason) {
       return "outside layout";
     case SkipReason::kTicoAccount:
       return "tico account";
+    case SkipReason::kSaveFolder:
+      return "save folder";
   }
   return "unknown";
 }
@@ -237,6 +239,42 @@ std::optional<std::vector<std::string>> EmulatorFilter(const config::Config& con
   return std::vector<std::string>(ids.begin(), ids.end());
 }
 
+namespace {
+
+/// ` (Disc 1)`, ` (Disc 12)`: the tag a per-disc rom's name ends in, and which
+/// DuckStation's one card per game leaves out. Its length, or 0 for none.
+std::size_t DiscTagLength(std::string_view name) {
+  constexpr std::string_view kOpen = " (Disc ";
+  if (name.empty() || name.back() != ')') {
+    return 0;
+  }
+  const std::size_t open = name.rfind(kOpen);
+  if (open == std::string_view::npos) {
+    return 0;
+  }
+  const std::size_t first = open + kOpen.size();
+  const std::string_view digits = name.substr(first, name.size() - 1 - first);
+  if (digits.empty()) {
+    return 0;
+  }
+  for (const char digit : digits) {
+    if (digit < '0' || digit > '9') {
+      return 0;
+    }
+  }
+  return name.size() - open;
+}
+
+}  // namespace
+
+std::string MemoryCardName(std::string_view rom_name, int card) {
+  std::string name(rom_name.substr(0, rom_name.size() - DiscTagLength(rom_name)));
+  if (card > 1) {
+    name += "_" + std::to_string(card);
+  }
+  return name + ".mcd";
+}
+
 std::map<std::string, std::string, std::less<>> PlatformHints(const config::Config& config,
                                                               Folders which) {
   std::map<std::string, std::string, std::less<>> hints;
@@ -314,7 +352,72 @@ struct ScanFolder {
 
   /// A rom folder RetroArch keeps saves beside: only its own extensions are read.
   bool beside_roms = false;
+
+  /// Tico's psp folder: a subfolder is a PPSSPP save, said as `kSaveFolder` (#238).
+  bool save_folders = false;
+
+  /// Tico's psx folder: a `.mcd` is read as DuckStation names its cards (#238).
+  bool memory_cards = false;
 };
+
+/// Tico's own folder for `tico_slug`, whatever its layout -- the module, not the
+/// id sent, decides how its files are laid out, so an `emulator` override does
+/// not change it.
+bool TicoFolderFor(const SaveSource& source, std::string_view platform_hint,
+                   std::string_view tico_slug) {
+  return source.source == Source::kTico && TicoSlugFor(platform_hint) == tico_slug;
+}
+
+/// Say `entry` of `directory` is a PSP save when it is one -- a folder in Tico's
+/// psp folder (`ppsspp`) other than the module's `backups/` or a dot-folder --
+/// and answer whether it was (#238). PSP saves are not synced yet, and a skip
+/// by name is what tells a user so.
+bool SkipSaveFolder(ScanResult* result, bool ppsspp, std::string_view directory,
+                    const fs::Entry& entry) {
+  if (!ppsspp || !entry.is_directory || entry.name.empty() || entry.name.front() == '.' ||
+      LowerAscii(entry.name) == "backups") {
+    return false;
+  }
+  RecordSkip(result, SkipReason::kSaveFolder, Join(directory, entry.name),
+             "PPSSPP keeps each game's save as a folder, and PSP saves are not synced yet "
+             "(#238); the adapter to RomM's PSP-<folder>.zip comes after the saves are captured "
+             "from a console (#44)");
+  return true;
+}
+
+/// The rom DuckStation's card `name` belongs to, when its own name is no rom's
+/// -- `first` is that lookup, unmatched or ambiguous: card 2 is `<name>_2.mcd`,
+/// and one card serves every disc of a game, so it carries no disc tag (#226
+/// R5). The disc-1 reading is tried past an ambiguity because a tag-stripped
+/// `Game` is what `Game (Disc 1)` and `Game (Disc 2)` both reduce to. `first`
+/// comes back when no reading finds a rom; an ambiguity of a reading is
+/// returned as one, never guessed past.
+roms::Match FindCard(const roms::RomIndex& index, std::string_view name,
+                     std::string_view platform_hint, roms::Match first, int* card) {
+  if (LowerAscii(sync::ExtensionOf(name)) != ".mcd") {
+    return first;
+  }
+  const std::string base = BaseName(name);
+  std::vector<std::pair<std::string, int>> readings;
+  if (base.size() > 2 && base.compare(base.size() - 2, 2, "_2") == 0) {
+    const std::string stem = base.substr(0, base.size() - 2);
+    readings.emplace_back(stem, 2);
+    readings.emplace_back(stem + " (Disc 1)", 2);
+  }
+  readings.emplace_back(base + " (Disc 1)", 1);
+  for (const auto& [reading, number] : readings) {
+    roms::Match match = index.Find(reading, platform_hint);
+    if (match.outcome == roms::MatchOutcome::kUnmatched) {
+      continue;
+    }
+    if (match.matched()) {
+      *card = number;
+      match.reason += " as DuckStation's card " + std::to_string(number);
+    }
+    return match;
+  }
+  return first;
+}
 
 /// RetroArch's own name for a save (`.srm`, and the `.rtc` beside it) or a state
 /// (`.state`, `.state1`...) -- what a rom folder may hold that is not a rom.
@@ -582,8 +685,11 @@ std::vector<ScanFolder> PlanFolders(const config::Config& config,
     fs::Listing legacy = files.List(directory);
     std::sort(legacy.entries.begin(), legacy.entries.end(),
               [](const fs::Entry& left, const fs::Entry& right) { return left.name < right.name; });
+    const bool ppsspp = TicoFolderFor(SourceOf(directory), hint_for(directory), "psp");
     for (const fs::Entry& entry : legacy.entries) {
-      if (entry.is_directory || entry.name.empty() || NeverSynced(entry.name)) {
+      // A PSP save left here is not read in either layout; said as what it is.
+      if (SkipSaveFolder(result, ppsspp, directory, entry) || entry.is_directory ||
+          entry.name.empty() || NeverSynced(entry.name)) {
         continue;
       }
       ++result->files_seen;
@@ -593,6 +699,11 @@ std::vector<ScanFolder> PlanFolders(const config::Config& config,
                      " now and does not read this one; a module installed before 0.8.0 "
                      "writes here until it is reinstalled");
     }
+  }
+
+  for (ScanFolder& folder : plan) {
+    folder.save_folders = TicoFolderFor(folder.source, folder.platform_hint, "psp");
+    folder.memory_cards = TicoFolderFor(folder.source, folder.platform_hint, "psx");
   }
   return plan;
 }
@@ -650,7 +761,8 @@ void Walk(const std::vector<ScanFolder>& folders, Folders which, const roms::Rom
     const std::string_view platform_hint = folder.platform_hint;
 
     for (const fs::Entry& entry : listing.entries) {
-      if (entry.is_directory || entry.name.empty()) {
+      if (SkipSaveFolder(result, folder.save_folders, directory, entry) || entry.is_directory ||
+          entry.name.empty()) {
         continue;  // the walk is not recursive; see file_system.hpp
       }
       if (folder.beside_roms && !IsRetroArchFile(entry.name, which)) {
@@ -667,7 +779,9 @@ void Walk(const std::vector<ScanFolder>& folders, Folders which, const roms::Rom
         return;
       }
 
-      const roms::Match match = index.Find(BaseName(entry.name), platform_hint);
+      int card = 1;
+      const roms::Match match =
+          MatchSave(index, entry.name, platform_hint, folder.memory_cards, &card);
       if (match.outcome == roms::MatchOutcome::kAmbiguous) {
         record_skip(SkipReason::kAmbiguous, sd_path, match.reason);
         continue;
@@ -698,7 +812,7 @@ void Walk(const std::vector<ScanFolder>& folders, Folders which, const roms::Rom
         continue;
       }
 
-      if (on_match(sd_path, entry, *match.rom, folder.source, record_skip)) {
+      if (on_match(sd_path, entry, *match.rom, folder.source, card, record_skip)) {
         ++emitted;
       }
     }
@@ -706,6 +820,16 @@ void Walk(const std::vector<ScanFolder>& folders, Folders which, const roms::Rom
 }
 
 }  // namespace
+
+roms::Match MatchSave(const roms::RomIndex& index, std::string_view file_name,
+                      std::string_view platform_hint, bool memory_cards, int* card) {
+  *card = 1;
+  roms::Match match = index.Find(BaseName(file_name), platform_hint);
+  if (memory_cards && !match.matched()) {
+    match = FindCard(index, file_name, platform_hint, std::move(match), card);
+  }
+  return match;
+}
 
 ScanResult ScanSaves(const config::Config& config, const retroarch::Settings& retroarch,
                      const roms::RomIndex& index, fs::FileSystem& files,
@@ -728,7 +852,7 @@ ScanResult ScanSaves(const config::Config& config, const retroarch::Settings& re
            " saves; the rest of this card was not read",
        &result,
        [&](const std::string& sd_path, const fs::Entry& entry, const roms::Rom& rom,
-           const SaveSource& folder_source, const auto& record_skip) {
+           const SaveSource& folder_source, int card, const auto& record_skip) {
          // Per rom rather than per folder: RetroArch's flat folder holds every
          // system, and the id is the platform's.
          const SaveSource source = ResolveSource(folder_source, rom.platform_fs_slug, config);
@@ -741,6 +865,12 @@ ScanResult ScanSaves(const config::Config& config, const retroarch::Settings& re
          // uploads by (#236). The card's own name only if the stem could not be
          // a file name, so a save that synced before still does.
          save.server_name = rom.fs_name_no_ext + std::string(sync::ExtensionOf(entry.name));
+         if (card > 1) {
+           // DuckStation's second card is a second save of the rom (#238), in a
+           // slot of its own and under the name DuckStation gives it.
+           save.slot += "-card" + std::to_string(card);
+           save.server_name = MemoryCardName(rom.fs_name_no_ext, card);
+         }
          if (rom.fs_name_no_ext.empty() || !sync::IsSingleFileName(save.server_name)) {
            save.server_name = entry.name;
          }
@@ -821,7 +951,7 @@ ScanResult ScanStates(const config::Config& config, const retroarch::Settings& r
            " states; the rest of this card was not read",
        &result,
        [&](const std::string& sd_path, const fs::Entry& entry, const roms::Rom& rom,
-           const SaveSource& folder_source, const auto& record_skip) {
+           const SaveSource& folder_source, int /*card*/, const auto& record_skip) {
          StateFile file;
          file.rom_id = rom.id;
          file.sd_path = sd_path;

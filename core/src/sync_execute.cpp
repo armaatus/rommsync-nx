@@ -29,6 +29,7 @@
 #include "rommsync/disk.hpp"
 #include "rommsync/http.hpp"
 #include "rommsync/json.hpp"
+#include "rommsync/save_source.hpp"
 #include "rommsync/state_db.hpp"
 
 namespace rommsync::sync {
@@ -254,6 +255,8 @@ const char* ToString(OperationError error) {
       return "newer_on_server";
     case OperationError::kUnverified:
       return "unverified";
+    case OperationError::kOtherEmulator:
+      return "other_emulator";
     case OperationError::kCommitFailed:
       return "commit_failed";
     case OperationError::kUnconfirmed:
@@ -283,6 +286,7 @@ auth::Answer AnswerOf(OperationError error) {
     case OperationError::kRefused:
     case OperationError::kNewerOnServer:
     case OperationError::kUnverified:
+    case OperationError::kOtherEmulator:
     case OperationError::kCommitFailed:
     case OperationError::kUnconfirmed:
     case OperationError::kCanceled:
@@ -590,6 +594,54 @@ ServerSave DescribeServerSave(http::HttpClient& client, const auth::StoredToken&
   return described;
 }
 
+/// Why the server's copy may not be written at `target`, or empty when it may
+/// (#238). Asked before anything is fetched, and for a placement before its
+/// folder is made: a refusal costs no request and leaves nothing behind.
+///
+/// A matched save is read as what step 0 reported for its `(rom_id, slot)`. A
+/// placed one (`placement` set) as the emulator the placement says it wrote
+/// for, else as what `reads_as` says of its path. With none of them to ask,
+/// nothing says who reads the file, so an isolated format is not written there
+/// and anything else is held to the rules it had before.
+std::string OtherEmulator(const SyncOperation& operation, const SaveTarget& target,
+                          const place::Placement* placement, const ExecuteOptions& options) {
+  const std::string server = operation.emulator.value_or(std::string());
+  const bool placed = placement != nullptr;
+  const char* const outcome =
+      placed ? "; nothing was placed" : "; the local file was not touched";
+  std::string local;
+  bool known = true;
+  if (placed && !placement->emulator.empty()) {
+    local = placement->emulator;
+  } else if (placed && options.reads_as != nullptr) {
+    local = options.reads_as(operation, target.sd_path);
+  } else if (!placed && options.reported != nullptr) {
+    for (const ClientSaveState& save : *options.reported) {
+      if (save.rom_id == target.rom_id && save.slot == target.slot) {
+        local = save.emulator.value_or(std::string());
+        break;
+      }
+    }
+  } else {
+    known = false;
+  }
+  if (!known) {
+    if (!scan::IsIsolated(server)) {
+      return {};
+    }
+    return "the server's copy is " + server + "'s, a format only that emulator reads, and " +
+           "nothing says who reads " + target.sd_path + outcome;
+  }
+  if (scan::Interchangeable(local, server)) {
+    return {};
+  }
+  const auto name = [](const std::string& id) {
+    return id.empty() ? std::string("an unnamed emulator") : id;
+  };
+  return "the server's copy is " + name(server) + "'s and " + target.sd_path + " is read as " +
+         name(local) + "'s, which is not the same save format (#238)" + outcome;
+}
+
 /// The download half of `download` and of `conflict`: fetch, verify, back up,
 /// commit, confirm. The two differ in what they are called and in nothing else
 /// -- keeping both *is* writing the server's copy over a local file whose
@@ -635,6 +687,16 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
                   "there is no local save for this (rom_id, slot), and " + sd_path +
                       " is already a file this sync did not pair with it; it was not touched");
     }
+    placed.rom_id = operation.rom_id;
+    placed.slot = operation.slot;
+    placed.sd_path = sd_path;
+    // A format only one emulator reads is never placed where another reads it
+    // (#238) -- asked before the folder is made, so a refusal leaves nothing.
+    if (std::string why = OtherEmulator(operation, placed, &placement, options); !why.empty()) {
+      OperationResult refused = Fail(operation, OperationError::kOtherEmulator, std::move(why));
+      refused.sd_path = sd_path;
+      return refused;
+    }
     // The emulator makes a system's folder the first time it saves one, which
     // for a save the console has never held is after this.
     const std::size_t parent = sd_path.rfind('/');
@@ -645,14 +707,18 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
                     "the folder for " + sd_path + " could not be made: " + made.message);
       }
     }
-    placed.rom_id = operation.rom_id;
-    placed.slot = operation.slot;
-    placed.sd_path = sd_path;
     // The extension the backup would take, from the path the caller chose. The
     // server's `file_name` is never used for this: it carries RomM's ingest tag.
     const std::size_t leaf = sd_path.rfind('/');
     placed.file_name = leaf == std::string::npos ? sd_path : sd_path.substr(leaf + 1);
     target = &placed;
+  } else if (std::string why = OtherEmulator(operation, *target, nullptr, options);
+             !why.empty()) {
+    // Nor is one written over a save another emulator reads (#238) -- whatever
+    // the slot pairing put in the plan.
+    OperationResult refused = Fail(operation, OperationError::kOtherEmulator, std::move(why));
+    refused.sd_path = target->sd_path;
+    return refused;
   }
 
   const std::string destination = files.Resolve(target->sd_path);

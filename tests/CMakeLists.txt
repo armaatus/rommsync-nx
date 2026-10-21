@@ -951,6 +951,7 @@ set(EXECUTE_UNIT_SCENARIOS
   content_hash # #234: an upload and a /downloaded carry the MD5 of the bytes that moved
   delete   # M10-7: a server delete is backed up, then removed -- or kept, or refused
   crash_delete # M10-7: ...and a power cut at every call of it leaves the save or its backup
+  isolated # #238: a tico-* save is never written where another emulator reads, nor over by one
 )
 foreach(scenario IN LISTS EXECUTE_UNIT_SCENARIOS)
   add_test(NAME execute.${scenario} COMMAND test_sync_execute ${scenario})
@@ -1045,6 +1046,7 @@ set(SCAN_UNIT_SCENARIOS
   grown        # the index is reserved from total; a library that grows mid-fetch stops there
   retroarch    # flat, sorted, beside the content and cloud-synced, as retroarch.cfg says
   tico         # Tico 0.7.9 and 0.8.0 with one and two accounts; litter is never a save
+  isolated     # #238: tico-* ids, DuckStation's cards, and PPSSPP's folders as a named skip
 )
 foreach(scenario IN LISTS SCAN_UNIT_SCENARIOS)
   add_test(NAME scan.${scenario} COMMAND test_save_scan ${scenario})
@@ -1064,6 +1066,7 @@ set(SOURCE_SCENARIOS
   tico_table       # every Tico slug's module and id; isolated formats are tico-*
   ids              # RomM's rule for an emulator id, refused before it is sent
   layouts          # what a folder alone says, and what the platform adds
+  isolation        # #238: a tico-* format meets only itself, and what a path reads as
 )
 foreach(scenario IN LISTS SOURCE_SCENARIOS)
   add_test(NAME source.${scenario} COMMAND test_save_source ${scenario})
@@ -1086,6 +1089,7 @@ set(PLACE_SCENARIOS
   names    # folder, core folder, the rom's name and the emulator's extension
   saves    # Tico's layouts and RetroArch's, read back by the scan -- and every refusal
   states   # the same rule for a state, under the name it pairs on
+  cards    # #238: DuckStation's cards under the game's name, card 2 apart, never disc 2 over disc 1
 )
 foreach(scenario IN LISTS PLACE_SCENARIOS)
   add_test(NAME place.${scenario} COMMAND test_placement ${scenario})
@@ -1566,6 +1570,8 @@ set(TICK_RIG_SCENARIOS
   deleted          # M10-7: deleted in RomM -> backed up and removed, and never re-uploaded
   deleted_keep     # ...and under on_server_delete = keep, left on the card, never re-uploaded
   migrated         # #236: rc1's v2 row moves to the shared slot; its newer head lands, backed up
+  isolated         # #238: a RetroArch save for a tico-* format never lands on the card
+  isolated_ids     # #238: psx, n64, dc, nds and saturn upload under their tico-* ids; psp does not
 )
 
 # M10-2 (#228): which RomM this console is talking to. `versions` and
