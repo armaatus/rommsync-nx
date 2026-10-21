@@ -1002,18 +1002,37 @@ void Carried(rig::Checks& checks, http::HttpClient& client, const std::string& b
       fixture));
   checks.Expect(listed.successful(), "the sessions read back: HTTP " +
                                          std::to_string(listed.response.status));
+  // Found by the id the ingest answered with. 5.2.0 also stamped the row with
+  // the `sync_session_id` that carried it and this used to match on that;
+  // 5.4.0 dropped the field from `PlaySessionSchema` (#235), so what is left to
+  // prove is that the row the ingest named exists under this device and holds
+  // the session this tick derived.
+  const std::optional<std::int64_t> row_id =
+      ingest->results.empty() ? std::nullopt : ingest->results[0].id;
+  checks.Expect(row_id.has_value(), "the ingest names the row it created");
   const json::ParseResult page = json::Parse(listed.response.body);
   bool matched = false;
-  if (page.ok() && page.value.is_array()) {
+  if (row_id.has_value() && page.ok() && page.value.is_array()) {
     for (const json::Value& row : page.value.elements()) {
-      const json::Value* sync_session = row.Find("sync_session_id");
-      if (sync_session != nullptr && sync_session->is_integer() &&
-          sync_session->integer() == parsed.value.session_id) {
-        matched = true;
+      const json::Value* id = row.Find("id");
+      if (id == nullptr || !id->is_integer() || id->integer() != *row_id) {
+        continue;
       }
+      matched = true;
+      const json::Value* device = row.Find("device_id");
+      checks.Expect(device != nullptr && device->is_string() &&
+                        device->string() == fixture.device_id,
+                    "the row is this device's");
+      const json::Value* rom_id = row.Find("rom_id");
+      checks.Expect(rom_id != nullptr && rom_id->is_integer() && rom_id->integer() == rom.id,
+                    "on the rom whose save derived it");
+      const json::Value* duration = row.Find("duration_ms");
+      checks.Expect(duration != nullptr && duration->is_integer() &&
+                        duration->integer() == derived.sessions[0].duration_ms,
+                    "with the duration this tick derived");
     }
   }
-  checks.Expect(matched, "and the row RomM wrote is attached to the sync session that carried it");
+  checks.Expect(matched, "and the row RomM wrote reads back by this device");
 }
 
 // --- buffered (rig) -----------------------------------------------------------
