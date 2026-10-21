@@ -166,6 +166,16 @@ enum class Event {
   /// line is what says it went out with a transfer or a save write still in
   /// flight. Ordinarily a console sleeps and writes nothing here at all.
   kPower,
+
+  /// Which RomM this console is talking to, read off its heartbeat (M10-2,
+  /// #228). Once a boot and once a pairing -- the first question about any
+  /// sync problem is which server answered it.
+  kServerVersion,
+
+  /// The server is older than `server::kMinimumVersion`, so the tick was refused
+  /// before anything was asked of it (#228). Written every tick until the
+  /// server is upgraded, because the remedy is not on the console.
+  kServerUnsupported,
 };
 
 /// Every event, in declaration order. The guide and the emitted set are both
@@ -177,6 +187,7 @@ inline constexpr std::array kAllEvents = {
     Event::kNetOffline,  Event::kNetTls,      Event::kScanSkipped,
     Event::kSyncRefused, Event::kSyncTick,    Event::kSaveFailed,
     Event::kDownload,    Event::kPlayFailed,  Event::kPower,
+    Event::kServerVersion, Event::kServerUnsupported,
 };
 
 /// Stable tag -- `net.offline`. Never null.

@@ -105,6 +105,8 @@ and a log is not worth it. A save is never in that position; see
 | `download.drain` | how one pass at the download queue ended — how many roms came down, and what stopped it | [A queued rom never arrives](#a-queued-rom-never-arrives) |
 | `play.failed` | play time could not be recorded — no save is at risk | [The SD card is full](#the-sd-card-is-full) |
 | `power.sleep` | the console went to sleep while this client was still busy | [The console slept mid-sync](#the-console-slept-mid-sync) |
+| `server.version` | which RomM release the server says it runs — once a boot and once a pairing | [What to attach to a bug report](#what-to-attach-to-a-bug-report) |
+| `server.unsupported` | the server is older than RomM 5.4.0, so nothing is synced with it | [RomM is too old](#romm-is-too-old) |
 
 The overlay shows the end of the log under **Settings → Log**, read off the
 sysmodule over IPC — `GetLog`, command 16 in
@@ -492,6 +494,43 @@ that RomM itself answers there rather than a proxy, a portal or a redirect.
 
 ---
 
+## RomM is too old
+
+**Symptom.** The overlay's status screen says **RomM is too old to sync with**,
+its `RomM` row names the version with "(too old)" after it, and nothing syncs.
+
+**Log line.** One on every sync attempt, until the server is upgraded:
+
+```
+4 error server.unsupported RomM 5.2.0 is older than 5.4.0, the oldest this build syncs with; nothing is synced until it is upgraded
+5 info sync.tick outcome=unsupported completed=0 failed=0 states_completed=0 states_failed=0 baseline=not stored
+```
+
+**What is happening.** Before a sync asks the server anything, `sys-rommsync`
+reads which RomM release it is — RomM says so, unauthenticated, at
+`/api/heartbeat`. Below **5.4.0** it stops there: no save is offered to the
+server and none is downloaded from it. That is deliberate, not a missing
+feature. A RomM before 5.4 cannot tell this console that a save was deleted on
+the server, cannot keep two devices' saves of one game apart, and cannot record
+which version each device last synced — so syncing with one is how a save from
+another device gets silently replaced. Downloading roms is not affected.
+
+**The fix.** Upgrade RomM to 5.4.0 or later. Nothing needs doing on the console:
+it asks again on every sync attempt while the server is too old, so the next
+sync after the upgrade runs normally — no reboot and no re-pairing — and says
+which release it found:
+
+```
+9 info server.version RomM 5.4.0
+```
+
+The first
+start of RomM 5.4 after an upgrade runs its database migrations, which RomM's
+release notes put at 15–20 minutes on a large library; the console reads that
+time as the server being unreachable and retries.
+
+---
+
 ## A queued rom never arrives
 
 **Symptom.** You queued a rom from the overlay's library screen, the queue
@@ -578,7 +617,7 @@ there is nothing to turn off.
 
 ## What to attach to a bug report
 
-Four things, and the log has three of them:
+Five things, and the log has four of them:
 
 1. **The version.** The first line of the log, and also on the overlay's status
    screen:
@@ -599,13 +638,21 @@ Four things, and the log has three of them:
    called `token` is one the redactor blanks, and blanking it would lose the one
    thing this line is for — whether this console has credentials at all.
 
-3. **The last tick.** What the sync did, or did not:
+3. **The server's version**, written once a boot and again after a pairing —
+   the first question about any sync problem is which RomM answered it. It is
+   also the `RomM` row on the overlay's status screen:
+
+   ```
+   5 info server.version RomM 5.4.0
+   ```
+
+4. **The last tick.** What the sync did, or did not:
 
    ```
    14 info sync.tick outcome=partial completed=3 failed=1 states_completed=0 states_failed=0 baseline=stored
    ```
 
-4. **The log tail.** The last twenty or thirty lines of
+5. **The log tail.** The last twenty or thirty lines of
    `sdmc:/config/rommsync/rommsync.log`, and `rommsync.log.old` beside it if the
    failure is older than the current file.
 

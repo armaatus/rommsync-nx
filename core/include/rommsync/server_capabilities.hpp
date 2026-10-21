@@ -113,7 +113,8 @@ struct ServerCapabilities {
 
 /// The capabilities of a server reporting `version_text`. Never fails: see the
 /// header for what an unparseable version means.
-ServerCapabilities CapabilitiesFor(std::string_view version_text);
+ServerCapabilities CapabilitiesFor(std::string_view version_text,
+                                   const Version& floor = kMinimumVersion);
 
 /// The same, for a release this client names itself -- `kMinimumVersion`, as
 /// the capabilities a caller with no server to ask is assumed to have.
@@ -162,6 +163,7 @@ struct Probe {
 /// it does not change on a second attempt. `policy.cancel` ends it at the next
 /// boundary.
 Probe ReadServer(http::HttpClient& client, std::string_view base_url,
-                 const sync::CallPolicy& policy = {});
+                 const sync::CallPolicy& policy = {},
+                 const Version& floor = kMinimumVersion);
 
 }  // namespace rommsync::server

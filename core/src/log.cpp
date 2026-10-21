@@ -341,6 +341,10 @@ const char* ToString(Event event) {
       return "play.failed";
     case Event::kPower:
       return "power.sleep";
+    case Event::kServerVersion:
+      return "server.version";
+    case Event::kServerUnsupported:
+      return "server.unsupported";
   }
   return "unknown";
 }

@@ -47,6 +47,10 @@ SECTIONS = [
     "The SD card is full",
     "`config.ini` complaints",
     "The server refused the sync",
+    # M10-2 (#228). `server.unsupported` is a tag the code writes, and the remedy
+    # is on the server rather than on the console, so it has a section of its own
+    # rather than a paragraph under "refused".
+    "RomM is too old",
     # M9-5 (#197). Not one of #38's twelve: that issue was written when nothing
     # in the sysmodule drained the download queue, so "a rom never arrives" had
     # no failure mode to describe. It has one now, and `download.drain` is a tag

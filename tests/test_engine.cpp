@@ -86,7 +86,9 @@
 #include "rommsync/host/native_file_system.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/log.hpp"
+#include "rommsync/overlay_status_view.hpp"
 #include "rommsync/pairing.hpp"
+#include "rommsync/server_capabilities.hpp"
 #include "rommsync/sha1.hpp"
 #include "rommsync/token_store.hpp"
 
@@ -115,12 +117,15 @@ class Console {
  public:
   Console(checks::Checks& checks, std::string_view name) : sandbox(checks, name) {
     directory = sandbox.Host(harness::kConfigDir) + "/";
+    engine.UseMinimumServerVersion(harness::kFixtureFloor);
   }
 
   /// A second console over a card another one wrote -- a reboot. It keeps its
   /// own sandbox so the teardown audit still has one, and never looks at it.
   Console(checks::Checks& checks, std::string_view name, std::string existing)
-      : sandbox(checks, name), directory(std::move(existing)) {}
+      : sandbox(checks, name), directory(std::move(existing)) {
+    engine.UseMinimumServerVersion(harness::kFixtureFloor);
+  }
 
   void Boot() {
     engine.Load(directory);
@@ -1407,6 +1412,14 @@ class HeldServer final : public http::HttpClient {
  public:
   http::Result Send(const http::Request& request) override {
     ++requests_;
+    if (request.url.find("/api/heartbeat") != std::string::npos) {
+      // A server the floor accepts (#228), so the tick gets as far as the
+      // negotiation this server exists to hold.
+      http::Result result;
+      result.response.status = 200;
+      result.response.body = R"({"SYSTEM":{"VERSION":"5.4.0"}})";
+      return result;
+    }
     if (request.url.find("/api/roms") != std::string::npos) {
       http::Result result;
       result.response.status = 200;
@@ -2942,6 +2955,7 @@ int DrainShutdown(http::HttpClient& client, const std::string& base) {
     // way to stop its worker -- while the card it wrote to is still here to look
     // at afterwards.
     auto engine = std::make_unique<sysmodule::SdEngine>();
+    engine->UseMinimumServerVersion(harness::kFixtureFloor);
     engine->UseCard(card.get());
     engine->UseServer(&slow, std::string());
     engine->Load(directory);
@@ -3093,6 +3107,131 @@ int SleepDownload(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// M10-2 (#228): the engine reads which RomM it is talking to before it asks
+/// that RomM anything, refuses one below the floor without a negotiate, and
+/// says so on the status screen and in the log.
+///
+/// Two halves, so it means the same thing on both fixture versions. The first
+/// raises the floor past whatever the fixture runs, which makes the refusal
+/// deterministic: every request the console made is recorded, and none of them
+/// may be a negotiate. The second runs at the build's own floor and holds the
+/// answer to the fixture's version -- refused on 5.2.0, the full capability
+/// set on 5.4.0 -- which is the one place the real floor meets a real server.
+int RommVersion(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  rig::DisarmFault(client, base);
+  const rommsync::server::Probe asked = rommsync::server::ReadServer(client, base);
+  c.Expect(asked.ok() && asked.capabilities.known,
+           "the fixture says which RomM it is: " + asked.message);
+  const std::string fixture_version = asked.capabilities.version;
+
+  struct Run {
+    std::string name;
+    rommsync::server::Version floor;
+  };
+  const Run runs[] = {
+      {"above", rommsync::server::Version{99, 0, 0}},
+      {"floor", rommsync::server::kMinimumVersion},
+  };
+  for (const Run& run : runs) {
+    rommsync::log::Reset();
+    Console console(c, "engine-romm-" + run.name);
+    console.engine.UseMinimumServerVersion(run.floor);
+    c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                   "[server]\nurl = " + base +
+                                       "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                       "on_boot = false\n"),
+             run.name + ": the console points at the rig");
+    auth::StoredToken token;
+    token.server_url = base;
+    token.access_token = fixture.token;
+    token.device_id = fixture.device_id;
+    token.scopes = {"roms.read"};
+    c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+             run.name + ": with the fixture pairing on the card");
+
+    // Every request recorded, none slowed.
+    Throttled recorded(client, std::chrono::milliseconds{0});
+    const std::unique_ptr<fs::FileSystem> card =
+        rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+    console.Boot();
+    c.ExpectEq(console.Status().server_version, std::string(),
+               run.name + ": before a tick nothing has been asked");
+    console.engine.UseServer(&recorded, token.access_token);
+    console.engine.UseCard(card.get());
+    console.engine.StartWorker();
+
+    const auto tick = [&console, &c, &run](int number) {
+      const std::int64_t before = console.Status().last_sync_at;
+      c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted,
+               run.name + ": tick " + std::to_string(number) + " is asked for");
+      ipc::Status status = console.Status();
+      for (int waited = 0;
+           waited < 400 && (status.sync_in_progress ||
+                            status.last_sync_result == ipc::SyncResult::kNever ||
+                            (number > 1 && status.last_sync_at == before && waited < 80));
+           ++waited) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{25});
+        status = console.Status();
+      }
+      return status;
+    };
+    const auto count = [&recorded](std::string_view path) {
+      int n = 0;
+      for (const Throttled::Sent& sent : recorded.sent()) {
+        n += sent.url.find(path) != std::string::npos ? 1 : 0;
+      }
+      return n;
+    };
+
+    const ipc::Status first = tick(1);
+    const ipc::LogTail tail = console.Log();
+    const bool refused = run.floor > rommsync::server::ParseVersion(fixture_version).value_or(
+                                         rommsync::server::Version{});
+    c.ExpectEq(first.server_version, fixture_version,
+               run.name + ": the status names the fixture's version");
+    if (refused) {
+      c.Expect(!first.server_supported, run.name + ": and says it is too old");
+      c.Expect(first.last_sync_result == ipc::SyncResult::kFailed,
+               run.name + ": the tick is a failed one");
+      c.Expect(first.online, run.name + ": the server was reached, so it is not offline");
+      c.ExpectEq(count("/api/sync/negotiate"), 0,
+                 run.name + ": and no negotiate call was made");
+      c.ExpectEq(count("/api/roms"), 0, run.name + ": nor was the library asked for");
+      c.Expect(Logged(tail, "server.unsupported"),
+               run.name + ": the refusal is a named event:" + Rendered(tail));
+      bool summarised = false;
+      for (const std::string& line : tail.lines) {
+        summarised = summarised || line.find("sync.tick outcome=unsupported") != std::string::npos;
+      }
+      c.Expect(summarised, run.name + ": and the tick ends saying so:" + Rendered(tail));
+      c.ExpectEq(rommsync::overlay::Render(first, 0).headline,
+                 std::string("RomM is too old to sync with"),
+                 run.name + ": which is the overlay's headline");
+    } else {
+      c.Expect(first.server_supported, run.name + ": a supported server is not refused");
+      c.Expect(count("/api/sync/negotiate") > 0, run.name + ": and is negotiated with");
+      c.Expect(Logged(tail, "server.version"),
+               run.name + ": the version read is on the record:" + Rendered(tail));
+    }
+    c.ExpectEq(count("/api/heartbeat"), 1, run.name + ": the first tick asked once");
+
+    // The second tick: a supported server is not asked again this boot; a
+    // refused one is, so an upgrade is noticed without a reboot.
+    const ipc::Status second = tick(2);
+    c.ExpectEq(count("/api/heartbeat"), refused ? 2 : 1,
+               run.name + (refused ? ": a refused server is asked again on the next tick"
+                                   : ": a supported server is asked once a boot"));
+    c.ExpectEq(second.server_supported, !refused, run.name + ": and the answer stands");
+  }
+  return c.failures();
+}
+
 /// The scenarios that need the docker RomM, by name. A table rather than a
 /// second `if` chain, so the list of them is written down once.
 struct RigScenario {
@@ -3115,6 +3254,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"repoints", DrainRepointed},
       {"shutdown", DrainShutdown},
       {"sleep_download", SleepDownload},
+      {"romm_version", RommVersion},
   };
   for (const RigScenario& scenario : kRigScenarios) {
     if (name == scenario.name) {

@@ -167,6 +167,13 @@ void SdEngine::UseCard(fs::FileSystem* filesystem) {
   lists_.UseCard(filesystem);
 }
 
+void SdEngine::UseMinimumServerVersion(server::Version floor) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  server_floor_ = floor;
+  // What was read was judged against the old floor.
+  server_read_ = false;
+}
+
 bool SdEngine::PumpLists() { return lists_.Pump(); }
 
 void SdEngine::Load(const std::string& config_dir) {
@@ -493,9 +500,15 @@ ipc::EngineSnapshot SdEngine::Snapshot() const {
     // live probe: `GetStatus` is polled every frame and may not go near the
     // network (`ipc.hpp`), so what the screen draws is the last tick's evidence
     // rather than a fresh answer nobody asked for.
+    //
+    // A tick refused for the server's version reached the server too -- it
+    // answered its heartbeat -- and "Not reached" beside "RomM is too old" would
+    // send a user to their Wi-Fi for a problem on the server (#228).
     snapshot.online = last_sync_result_ == ipc::SyncResult::kOk ||
                       last_sync_result_ == ipc::SyncResult::kPartial ||
-                      last_sync_result_ == ipc::SyncResult::kServerDisabled;
+                      last_sync_result_ == ipc::SyncResult::kServerDisabled || server_too_old_;
+    snapshot.server_version = server_caps_.version;
+    snapshot.server_supported = !server_too_old_;
   }
   // M3-2 (#19): these two come off the queue on the card rather than being the
   // zero a console with no engine reports. `pending()` counts what the worker
@@ -659,6 +672,12 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
       if (server_ != nullptr) {
         lists_.UseServer(server_, list_token_);
       }
+      // A different server is a different RomM (#228): what the old one said
+      // about its version is not drawn beside the new one, and the next tick
+      // asks.
+      server_caps_ = server::ServerCapabilities{};
+      server_read_ = false;
+      server_too_old_ = false;
     }
     // Every other write to `attempt_` notifies, and this one has the longest
     // wait to cut short: the thread is parked in `AwaitNextPoll` until the
@@ -1543,6 +1562,90 @@ void SdEngine::RunOneTick() {
     return;
   }
 
+  // M10-2 (#228): which RomM this is, before anything is asked of it. Once a
+  // boot and once a pairing -- see `server_caps_` -- and every tick while the
+  // answer is "too old".
+  server::ServerCapabilities caps;
+  {
+    bool read = false;
+    server::Version floor;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      read = server_read_;
+      caps = server_caps_;
+      floor = server_floor_;
+    }
+    if (!read) {
+      sync::CallPolicy policy;
+      policy.cancel = cancel.get();
+      const server::Probe probe = server::ReadServer(*client, config->server.url, policy, floor);
+      if (!probe.ok()) {
+        // The heartbeat is unauthenticated, so nothing here is evidence about
+        // the credentials and `auth::Gate` hears nothing. A link that is down
+        // or a RomM having a bad minute is `kOffline`, the way the library
+        // fetch below treats one; an answer that is not a heartbeat at all is
+        // somebody else answering the URL, which does not change by asking
+        // again soon.
+        StampPlayWindow();
+        sync::TickOutcome outcome = sync::TickOutcome::kRefused;
+        if (probe.transport == http::Error::kCanceled) {
+          outcome = sync::TickOutcome::kCanceled;
+        } else if (probe.transient()) {
+          outcome = sync::TickOutcome::kOffline;
+          if (probe.transport != http::Error::kNone) {
+            LogTransportFailure(probe.transport, "GET /api/heartbeat", probe.message);
+          } else {
+            log::Warn(log::Event::kNetOffline, "GET /api/heartbeat: " + probe.message);
+          }
+        } else {
+          log::Warn(log::Event::kSyncRefused, "GET /api/heartbeat: " + probe.message);
+        }
+        LogTickEnd(outcome);
+        std::lock_guard<std::mutex> lock(mutex_);
+        scheduler_.Finished(outcome, probe.transport);
+        if (outcome != sync::TickOutcome::kCanceled) {
+          RecordFailedTickLocked();
+        }
+        return;
+      }
+      caps = probe.capabilities;
+      if (caps.supported) {
+        // Said once per read rather than per tick: it is the answer to "which
+        // server", and a log that repeated it every half hour would push the
+        // lines that answer anything else out of the ring.
+        log::Info(log::Event::kServerVersion,
+                  caps.known ? "RomM " + caps.version
+                             : "RomM did not give a version it can read (\"" + caps.version +
+                                   "\"); treated as the newest");
+      }
+      std::lock_guard<std::mutex> lock(mutex_);
+      server_caps_ = caps;
+      // A refused server is not remembered as read, so the next tick asks
+      // again and an upgrade is noticed without a reboot.
+      server_read_ = caps.supported;
+    }
+  }
+  if (!caps.supported) {
+    // Before the library and before the scan: nothing a tick would ask a 5.2 or
+    // a 5.3 is worth its requests, and `sync::RunTick` would refuse the
+    // negotiate anyway (`TickOutcome::kUnsupported`).
+    StampPlayWindow();
+    log::Error(log::Event::kServerUnsupported,
+               "RomM " + caps.version + " is older than " +
+                   server::ToString(server::kMinimumVersion) +
+                   ", the oldest this build syncs with; nothing is synced until it is upgraded");
+    LogTickEnd(sync::TickOutcome::kUnsupported);
+    std::lock_guard<std::mutex> lock(mutex_);
+    scheduler_.Finished(sync::TickOutcome::kUnsupported);
+    RecordFailedTickLocked();
+    server_too_old_ = true;
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    server_too_old_ = false;
+  }
+
   // Step 0, the half `sync::RunTick` deliberately does not own: the library the
   // scan matches against, and the scan itself.
   //
@@ -1653,6 +1756,10 @@ void SdEngine::RunOneTick() {
   // true against a second caller (M6-2, #33). The scheduler never gets this far
   // with it off, which is the other half of the same promise.
   options.enabled = config->sync.enabled;
+  // What the heartbeat said, for every stage that asks (#228). Already known
+  // to be supported -- the refusal above returned -- and passed anyway, so the
+  // tick's own gate is the same fact rather than a default.
+  options.server = caps;
   options.execute.backup_dir = sync::kBackupDir;
   options.finish.state_sd_path = sync::kStateSdPath;
   options.cancel = cancel.get();
@@ -2163,6 +2270,10 @@ void SdEngine::CommitGrant(const std::shared_ptr<PairingAttempt>& attempt,
     if (server_ != nullptr) {
       lists_.UseServer(server_, list_token_);
     }
+    // Once a pairing (#228): the first tick on these credentials asks the
+    // server which RomM it is, rather than trusting what an earlier pairing's
+    // server said.
+    server_read_ = false;
   }
   // A paired console usually has a tick due: `[sync] on_boot` fired long before
   // there were credentials to fire it with -- and a queue too, if a drain gave

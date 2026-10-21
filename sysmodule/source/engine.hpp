@@ -71,6 +71,7 @@
 #include "rommsync/play_sessions.hpp"
 #include "rommsync/retroarch_cfg.hpp"
 #include "rommsync/scheduler.hpp"
+#include "rommsync/server_capabilities.hpp"
 #include "rommsync/sync_tick.hpp"
 #include "rommsync/token_store.hpp"
 #include "sized_thread.hpp"
@@ -338,6 +339,16 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// It is also what a **tick** reads and writes every save through, so a
   /// console with none never gets past the scan.
   void UseCard(fs::FileSystem* filesystem);
+
+  /// The oldest RomM a tick will sync with. `server::kMinimumVersion` unless
+  /// this is called, and the console never calls it (M10-2, #228).
+  ///
+  /// **A test seam, and a temporary one.** The fixture's default is RomM 5.2.0
+  /// until #235 moves it, and every engine scenario that ticks against it would
+  /// otherwise be refused before it reached what it tests. Those scenarios
+  /// lower the floor to the fixture's; `engine.romm_version` raises it past the
+  /// fixture to make the refusal deterministic. #235 removes the lowering.
+  void UseMinimumServerVersion(server::Version floor);
 
   /// Drive one list page fetch, from a thread that is **not** the IPC one.
   ///
@@ -1070,6 +1081,30 @@ class SdEngine : public ipc::Engine, public power::Sink {
   std::int64_t downloaded_ = 0;
   std::int64_t conflicts_ = 0;
   std::int64_t failed_ = 0;
+
+  /// Which RomM the console is talking to, as the last heartbeat it read said
+  /// (M10-2, #228). Guarded by `mutex_`.
+  ///
+  /// **Read once a boot and once a pairing**: `server_read_` is false until the
+  /// first tick asks, and `CommitGrant` and a `server.url` change set it false
+  /// again, so the next tick asks the server it is now paired with. A server
+  /// below the floor is the exception -- it is asked again every tick, because
+  /// the remedy is upgrading it and a console that only noticed the upgrade at
+  /// its next reboot would keep refusing a server that now works.
+  ///
+  /// Read on the worker, at the top of a tick, and never on the pairing thread:
+  /// that thread has nothing to decide with it yet (#245 will), and the worker
+  /// already owns every other request a tick makes.
+  server::ServerCapabilities server_caps_;
+  bool server_read_ = false;
+
+  /// The last tick was refused because the server is below the floor. What
+  /// `Status::server_supported` reports -- a finding about a tick, never a
+  /// default, so it starts false.
+  bool server_too_old_ = false;
+
+  /// `UseMinimumServerVersion`'s value.
+  server::Version server_floor_ = server::kMinimumVersion;
 
   /// The transport a tick runs on, and the token the *lists* read with. Both
   /// null/empty until `UseServer`.

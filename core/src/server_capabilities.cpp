@@ -298,14 +298,14 @@ std::string ToString(const Version& version) {
          std::to_string(version.patch);
 }
 
-ServerCapabilities CapabilitiesFor(std::string_view version_text) {
+ServerCapabilities CapabilitiesFor(std::string_view version_text, const Version& floor) {
   ServerCapabilities caps;
   caps.version = std::string(version_text.substr(0, kMaxVersionBytes));
   const std::optional<Version> parsed = ParseVersion(version_text);
   caps.known = parsed.has_value();
   // Unknown reads as the newest: see the header.
   const Version version = parsed.value_or(Version{kMaxComponent, 0, 0});
-  caps.supported = version >= kMinimumVersion;
+  caps.supported = version >= floor;
   caps.rom_ids = version >= kRomIdsSince;
   caps.slot_cap = version >= kRomIdsSince;
   caps.delete_action = version >= kDeleteActionSince;
@@ -364,7 +364,7 @@ bool Probe::transient() const {
 }
 
 Probe ReadServer(http::HttpClient& client, std::string_view base_url,
-                 const sync::CallPolicy& policy) {
+                 const sync::CallPolicy& policy, const Version& floor) {
   Probe probe;
   if (policy.cancel != nullptr && policy.cancel->canceled()) {
     probe.transport = http::Error::kCanceled;
@@ -388,19 +388,19 @@ Probe ReadServer(http::HttpClient& client, std::string_view base_url,
     const http::Result sent = client.Send(request);
     if (!sent.ok()) {
       probe.transport = sent.error;
-      probe.message = std::string("GET /api/heartbeat: ") + http::ToString(sent.error) + " (" +
+      probe.message = std::string("the server's version could not be read: ") + http::ToString(sent.error) + " (" +
                       sent.message + ")";
     } else if (!sent.successful()) {
       probe.status = sent.response.status;
-      probe.message = "GET /api/heartbeat answered " + std::to_string(sent.response.status);
+      probe.message = "the heartbeat was refused with status " + std::to_string(sent.response.status);
     } else {
       const auth::Parsed<std::string> version = ParseHeartbeatVersion(sent.response.body);
       if (version.ok()) {
-        probe.capabilities = CapabilitiesFor(version.value);
+        probe.capabilities = CapabilitiesFor(version.value, floor);
         return probe;
       }
       probe.shape = version.error;
-      probe.message = "GET /api/heartbeat is not a RomM heartbeat: " + version.error.Describe();
+      probe.message = "the answer is not a RomM heartbeat: " + version.error.Describe();
     }
 
     if (!probe.transient() || probe.transport == http::Error::kCanceled ||

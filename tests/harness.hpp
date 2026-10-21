@@ -49,6 +49,7 @@
 #include "rig.hpp"
 #include "scratch.hpp"
 #include "rommsync/json.hpp"
+#include "rommsync/server_capabilities.hpp"
 #include "rommsync/sync.hpp"
 #include "rommsync/state_sync.hpp"
 #include "rommsync/sync_execute.hpp"
@@ -71,6 +72,15 @@ inline constexpr const char* kConfigDir = "/config/rommsync";
 inline constexpr const char* kBackupDir = "/config/rommsync/.backup";
 inline constexpr const char* kSavesDir = "/retroarch/saves";
 inline constexpr const char* kStatesDir = "/retroarch/states";
+
+/// The oldest RomM the fixture may be, as an `SdEngine` floor (M10-2, #228).
+///
+/// The build refuses anything below `server::kMinimumVersion` (5.4.0), and the
+/// fixture's default is still 5.2.0 until #235 moves it -- so every engine
+/// scenario that ticks against the fixture lowers the floor to this, or it
+/// would be refused before it reached what it tests. `engine.romm_version` is
+/// the one that keeps the real floor. **#235 deletes this** with the 5.2.0 job.
+inline constexpr rommsync::server::Version kFixtureFloor{5, 2, 0};
 
 /// A save path on the card. `/retroarch/saves` is a real entry in the default
 /// folder map (config.cpp), not a path invented by a test.

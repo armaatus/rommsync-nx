@@ -2234,6 +2234,7 @@ set(ENGINE_RIG_SCENARIOS
   log_faults   # M7-3: the four transport failures the guide documents, as the proxy makes them
   server_disabled  # #235: sync off in RomM reaches the status screen as the server's switch
   drains       # M9-5: a rom queued over IPC becomes a file on the card
+  romm_version # M10-2: the server's version is read first, and below the floor nothing is asked
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
@@ -2437,7 +2438,7 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   target_compile_options(test_heap_steady PRIVATE -fno-allocation-dce)
 endif()
 
-foreach(scenario counts judge log_ring page_parse)
+foreach(scenario counts judge log_ring page_parse heartbeat)
   add_test(NAME alloc.${scenario} COMMAND test_heap_steady ${scenario})
   set_tests_properties(alloc.${scenario} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 endforeach()

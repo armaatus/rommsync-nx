@@ -66,6 +66,7 @@
 #include "rommsync/list_service.hpp"
 #include "rommsync/log.hpp"
 #include "rommsync/rom_index.hpp"
+#include "rommsync/server_capabilities.hpp"
 #include "rommsync/token_store.hpp"
 
 namespace auth = rommsync::auth;
@@ -184,6 +185,7 @@ class Console {
     token.device_id = fixture.device_id;
     ok = ok && auth::SaveToken(directory + auth::kTokenFileName, token).ok();
     card = rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    engine.UseMinimumServerVersion(harness::kFixtureFloor);
     engine.UseCard(card.get());
     engine.UseServer(&client, std::string());
     engine.Load(directory);
@@ -632,6 +634,53 @@ void Soak(checks::Checks& c, http::HttpClient& client, const std::string& base,
 
 }  // namespace
 
+/// M10-2 (#228): what reading the server's version costs on the heap, and that
+/// it does not grow with the heartbeat.
+///
+/// The heartbeat is the server's whole configuration and widens with the
+/// library -- every platform folder is in it -- and a whole-document parse
+/// would hold ~11x its text (#217). `ParseHeartbeatVersion` walks the body and
+/// parses only `SYSTEM`, so what it allocates is that member's document and the
+/// version string: the same for the fixture's 1 KiB heartbeat as for one with
+/// four thousand platforms in it. Measured here as a peak over the bytes
+/// outstanding before the call; the body itself is the caller's, already held.
+void HeartbeatCost(checks::Checks& c) {
+  const std::string head = R"({"SYSTEM":{"VERSION":"5.4.0","GIT_BRANCH":null,)"
+                           R"("SHOW_SETUP_WIZARD":false},"FILESYSTEM":{"FS_PLATFORMS":[)";
+  const auto body_with = [&head](int platforms) {
+    std::string body = head;
+    for (int i = 0; i < platforms; ++i) {
+      body += (i == 0 ? "\"" : ",\"") + std::string("platform-") + std::to_string(i) + "\"";
+    }
+    body += R"(]},"OIDC":{"ENABLED":false,"PROVIDER":""}})";
+    return body;
+  };
+  const auto peak_of = [&c](const std::string& body) {
+    count_new::ResetPeak();
+    const std::int64_t before = count_new::Now().outstanding_bytes;
+    const auto read = rommsync::server::ParseHeartbeatVersion(body);
+    const std::int64_t peak = count_new::Now().peak_bytes - before;
+    c.Expect(read.ok() && read.value == "5.4.0", "the heartbeat reads: " + read.error.Describe());
+    return peak;
+  };
+  const std::string small = body_with(4);
+  const std::string large = body_with(4000);
+  const std::int64_t small_peak = peak_of(small);
+  const std::int64_t large_peak = peak_of(large);
+  std::cout << "heartbeat of " << small.size() << " bytes: parse peaks " << small_peak
+            << " bytes over what was held\n"
+            << "heartbeat of " << large.size() << " bytes: parse peaks " << large_peak
+            << " bytes over what was held\n";
+  c.Expect(small_peak > 0, "the parse allocates something, so the counter saw it");
+  c.ExpectEq(large_peak, small_peak,
+             "the cost does not move with the rest of the body -- only SYSTEM is parsed");
+  // A whole-document parse of `large` would be hundreds of KiB; the bound is
+  // the member's own, `kMaxSystemBytes`, and what RomM sends under it is three
+  // fields. 4 KiB is an order of magnitude over what this measures on libc++.
+  c.Expect(large_peak < 4 * 1024, "and it is a few hundred bytes, not a document: " +
+                                      std::to_string(large_peak));
+}
+
 int main(int argc, char** argv) {
   const std::string scenario = argc > 1 ? argv[1] : "counts";
   // Refused rather than clamped: a mistyped round count on the soak workflow's
@@ -653,9 +702,11 @@ int main(int argc, char** argv) {
 
   rig::Checks checks;
   if (scenario == "counts" || scenario == "judge" || scenario == "log_ring" ||
-      scenario == "page_parse") {
+      scenario == "page_parse" || scenario == "heartbeat") {
     if (scenario == "counts") {
       Counts(checks);
+    } else if (scenario == "heartbeat") {
+      HeartbeatCost(checks);
     } else if (scenario == "judge") {
       JudgeRule(checks);
     } else if (scenario == "page_parse") {
