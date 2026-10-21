@@ -18,16 +18,6 @@ namespace {
 /// swapping it mid-write is supported.
 std::atomic<FileSync> g_file_sync{nullptr};
 
-/// Put the closed file at `path` on the card, if the platform said how.
-///
-/// Called after the handle is closed and before the rename that publishes the
-/// file: flushing and closing move the bytes from stdio to the OS, and this is
-/// what moves them from the OS to the card. Through `io::Disk` rather than
-/// straight to the hook, so the durability point is in the same seam -- and the
-/// same recorded sequence -- as the writes it makes durable (#203). With no hook
-/// installed the answer is "yes" and the promise stays the weaker one.
-bool Synced(const std::string& path) { return Sync(path); }
-
 /// The directory `path` is in, or empty when the path names no directory.
 ///
 /// For the second half of durability: `rename` publishes a *name*, and on POSIX
@@ -192,7 +182,7 @@ WriteResult CommitStaged(const std::string& staged, const std::string& path) {
   WriteResult committed;
   const std::string directory = DirectoryOf(path);
   if (!directory.empty()) {
-    committed.name_durable = Synced(directory);
+    committed.name_durable = Sync(directory);
   }
   return committed;
 }
@@ -220,7 +210,7 @@ WriteResult WriteAtomically(const std::string& path, std::string_view contents) 
   // After the close and before the commit below, which is the only ordering
   // that means anything: the bytes have to be on the card before the rename
   // publishes them.
-  const bool synced = flushed && closed && Synced(temp);
+  const bool synced = flushed && closed && Sync(temp);
   if (!flushed || !closed || !synced) {
     Remove(temp);
     return {WriteError::kWriteFailed, Describe(temp, Incomplete(flushed, refused))};
@@ -310,7 +300,7 @@ CopyResult CopyAtomically(const std::string& from, const std::string& to) {
   // -- which is the whole point of this copy: the previous bytes have to be on
   // the card before the save they came from is overwritten. Syncing a temp file
   // that is about to be deleted would just be a slow way to fail.
-  const bool synced = !short_write && flushed && closed && Synced(temp);
+  const bool synced = !short_write && flushed && closed && Sync(temp);
   if (short_write || !flushed || !closed || !synced) {
     Remove(temp);
     result.error = CopyError::kWriteFailed;

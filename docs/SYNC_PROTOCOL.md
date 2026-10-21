@@ -300,17 +300,20 @@ promise stands: no reader ever sees half a file, and nothing about power cuts.
 **What proves it.** `tests/crash_disk.hpp` records every call an overwrite makes
 through `io::Disk`, cuts the record at every call, and enumerates what a card
 that does not journal may keep: per directory, any prefix of the names changed
-since its last sync; per file, the data written since its last sync lost, torn,
-short, or complete. Each card is swept as the next boot would sweep it, and
+since its last sync; per file, the data written since its last sync lost,
+truncated, torn, short, out of order, or complete. Each card is swept as the next boot would sweep it, and
 judged against the property above. `execute.crash` (a download),
 `states.crash` (a state) and `conflicts.crash` (a restore) are the three paths
-that land on a save, each also run with `.backup/` unconfirmed;
+that land on a save; the first and last also run with `.backup/` unconfirmed
+(the state path shares `BackUpFirst`, so it shares that answer);
 `execute.crash_model` shows the replay catches an overwrite written in place,
 one with no backup, and a rename of bytes nothing synced. The `backup` row of
 `scripts/v1-gate.sh` counts them. What the model assumes — a sync that says yes
 did persist, a directory's own updates land in order, no flying writes — is
 listed at the top of that header; a kernel-level injector such as lazyfs is the
-check on those assumptions, and is not in the suite.
+check on those assumptions, and is not in the suite. Every replay drives the
+host backend; the Horizon one (`http_wire.cpp`) syncs its `.part` through the
+same `io::Sync`, and nothing off a console runs it under the replay (#44).
 
 **`state.db` keeps the same rename protocol, and gets no A/B slots — decided,
 not deferred.** A flying write (a sector written whole, to the wrong place) can

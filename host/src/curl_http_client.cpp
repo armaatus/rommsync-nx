@@ -470,7 +470,8 @@ class CurlHttpClient final : public http::HttpClient {
     errno = 0;
     const bool synced = flushed && io::Sync(partial_path);
     if (flushed && !synced) {
-      flush_errno = errno;
+      // A hook may refuse without saying why; a refusal is still an I/O one.
+      flush_errno = errno != 0 ? errno : EIO;
     }
 
     result.response.body = std::move(transfer.error_body);

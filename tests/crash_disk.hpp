@@ -23,8 +23,10 @@
 //     folder two different races.
 //   - **data**: per file written since its last successful `Sync`, one of
 //     *lost* (nothing since the sync landed -- in cache, never persisted),
+//     *truncated* (a "w" open's emptying landed and no byte after it),
 //     *torn* (the first half of those bytes), *short* (all but the second half
-//     of the last write), or *all*.
+//     of the last write), *out of order* (the last write landed and none
+//     before it), or *all*.
 //
 // Each distinct card is written to a scratch directory, the engine's own boot
 // sweep (`sync::RecoverStaging`) runs over it, and a judge reads what is left.
@@ -198,13 +200,18 @@ class Recorder final : public rommsync::io::Disk {
   int Rename(const std::string& from, const std::string& to) override {
     std::lock_guard<std::mutex> hold(mutex_);
     const int answer = Inner().Rename(from, to);
-    std::string a;
-    std::string b;
-    if (answer == 0 && Under(from, &a) && Under(to, &b)) {
+    std::string from_relative;
+    std::string to_relative;
+    const bool from_under = Under(from, &from_relative);
+    const bool to_under = Under(to, &to_relative);
+    if (answer == 0 && from_under != to_under) {
+      unmodelled_ = "a rename with one end outside the root: " + from + " -> " + to;
+    }
+    if (answer == 0 && from_under && to_under) {
       Op op;
       op.kind = Op::Kind::kRename;
-      op.path = a;
-      op.to = b;
+      op.path = from_relative;
+      op.to = to_relative;
       log_.push_back(std::move(op));
     }
     return answer;
@@ -302,11 +309,13 @@ struct Pending {
 inline std::string Apply(std::string content, const std::vector<Pending>& pending,
                          std::uint64_t budget) {
   for (const Pending& write : pending) {
+    // Before the truncate check: a truncate after the budget is spent is a
+    // later call landing when an earlier one did not, which a prefix is not.
+    if (budget == 0) break;
     if (write.truncate) {
       content.clear();
       continue;
     }
-    if (budget == 0) break;
     const std::size_t take =
         static_cast<std::size_t>(std::min<std::uint64_t>(budget, write.bytes.size()));
     budget -= take;
@@ -330,8 +339,14 @@ struct Inode {
     for (const Pending& write : pending) total += write.bytes.size();
     out.insert(Apply(durable, pending, total / 2));  // torn
     for (std::size_t last = pending.size(); last-- > 0;) {
-      if (pending[last].truncate) continue;
+      if (pending[last].truncate) {
+        // On FAT a file's size is directory metadata, and it can land before
+        // any of the data written after it.
+        out.insert(std::string());  // truncated
+        continue;
+      }
       out.insert(Apply(durable, pending, total - (pending[last].bytes.size() + 1) / 2));  // short
+      out.insert(Apply(durable, {pending[last]}, UINT64_MAX));  // out of order
       break;
     }
     return out;
@@ -649,7 +664,9 @@ inline Judge OldOrNew(const Overwrite& expected) {
 inline Verdict ExpectSurvives(checks::Checks& c, const Recorder& recorder,
                               const Overwrite& expected, const std::string& scratch,
                               const std::string& what) {
-  const std::string save_dir = DirOf(expected.save);
+  // `DirOf` answers "" for a file at the root, which is "/" as an SD path.
+  const std::string parent = DirOf(expected.save);
+  const std::string save_dir = parent.empty() ? std::string("/") : parent;
   const Verdict verdict = Replay(recorder, {save_dir, expected.backup_dir}, {save_dir}, scratch,
                                  OldOrNew(expected));
   std::cout << "  " << what << ": " << verdict.points << " cuts, " << verdict.states

@@ -808,12 +808,16 @@ ctest --test-dir build --output-on-failure
   remove and sync an overwrite makes on real files. `crash::Replay` then cuts the
   log at every call and enumerates what a card that does not journal may keep --
   per directory, any prefix of the names changed since its last sync; per file,
-  the data since its last sync lost, torn, short or complete -- writes each
+  the data since its last sync lost, truncated, torn, short, out of order or
+  complete -- writes each
   distinct card to scratch, runs `sync::RecoverStaging` over it as the next boot
   would, and judges it. `execute.crash` (a download), `states.crash` (a state)
   and `conflicts.crash` (a restore) are the three paths the gate's census says
-  land on a save; each also runs once with the card refusing to confirm
-  `.backup/`, which must stop the overwrite. `execute.crash_model` is the
+  land on a save; `execute.crash` and `conflicts.crash` also run once with the
+  card refusing to confirm `.backup/`, which must stop the overwrite (the state
+  path shares `BackUpFirst`, so it shares that answer). Every replay drives the
+  host backend; the Horizon one syncs its `.part` through the same `io::Sync`,
+  and only a console runs it (#44). `execute.crash_model` is the
   replay's own check: an overwrite written in place, one with no backup, and a
   rename of bytes nothing synced must each be caught, or a green run means
   nothing. None needs privileges, and all run the same on a Mac and on Linux.
