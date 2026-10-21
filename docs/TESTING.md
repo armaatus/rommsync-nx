@@ -1195,8 +1195,9 @@ them in full; in short:
   `SslStream::Wait` assumes, whether `sslConnectionSetIoTimeout` [16.0.0+] does
   anything, and **who owns the descriptor** when
   `socketSslConnectionSetSocketDescriptor` returns `-1` with `errno == ENOENT` —
-  if the service did not take it, every failed handshake leaks an fd against a
-  `handle_table_size` of 64, and closing it on a guess would be a double close.
+  if the service did not take it, every failed handshake leaks a socket against
+  bsd's own limit (a socket is not a kernel handle, so not against
+  `handle_table_size`; #210), and closing it on a guess would be a double close.
   The answers go in
   [DEVELOPMENT.md](DEVELOPMENT.md#m0-1-the-measurement-and-the-decision), beside
   the measurement they correct.

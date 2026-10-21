@@ -509,8 +509,8 @@ FS_PERMISSION_NAMES = {
 FS_SD_CARD = 1 << 21
 FS_PERMISSIONS = FS_SD_CARD
 
-# 39-bit (`AddressSpaceType_64Bit`). 1 is the 36-bit layout 1.0.0 shipped and
-# later firmware keeps for compatibility; sysmodule/README.md says why 3.
+# 39-bit (`AddressSpaceType_64Bit`, 2.0.0+). 1 is the 36-bit layout 1.0.0
+# shipped, kept for compatibility; sysmodule/README.md says why 3.
 ADDRESS_SPACE_TYPE = 3
 ADDRESS_SPACE_NAMES = {0: "32-bit", 1: "36-bit (deprecated)", 2: "32-bit, no alias region",
                        3: "39-bit"}

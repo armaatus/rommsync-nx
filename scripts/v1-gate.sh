@@ -604,7 +604,8 @@ row_note() {
          called it.
       3. who owns the descriptor when socketSslConnectionSetSocketDescriptor
          returns -1 with errno == ENOENT? If the service did not take it, every
-         failed handshake leaks an fd against a handle_table_size of 64. The
+         failed handshake leaks a socket against bsd's own limit -- a socket
+         is not a kernel handle, so not against handle_table_size (#210). The
          backend closes nothing and says so in a comment, because closing on a
          guess is a double close.
     The answers go in docs/DEVELOPMENT.md, beside the measurement they correct,
