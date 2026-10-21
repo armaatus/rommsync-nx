@@ -343,11 +343,11 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// The oldest RomM a tick will sync with. `server::kMinimumVersion` unless
   /// this is called, and the console never calls it (M10-2, #228).
   ///
-  /// **A test seam, and a temporary one.** The fixture's default is RomM 5.2.0
-  /// until #235 moves it, and every engine scenario that ticks against it would
-  /// otherwise be refused before it reached what it tests. Those scenarios
-  /// lower the floor to the fixture's; `engine.romm_version` raises it past the
-  /// fixture to make the refusal deterministic. #235 removes the lowering.
+  /// **A test seam.** The fixture runs RomM 5.4.0, which the floor accepts, so
+  /// the only way to see a refusal against a real server is to raise the floor
+  /// past it: `engine.romm_version` does, and `engine.romm_forgotten` moves it
+  /// while a heartbeat is in flight. Nothing lowers it any more -- the 5.2.0
+  /// fixture that once needed that went with #235.
   void UseMinimumServerVersion(server::Version floor);
 
   /// Drive one list page fetch, from a thread that is **not** the IPC one.

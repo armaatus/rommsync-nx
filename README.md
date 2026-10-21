@@ -11,8 +11,9 @@ save sync via RomM's device-sync protocol, running as a background **sysmodule**
 you control from an **Ultrahand / Tesla overlay**.
 
 > Status: **planning / server-side groundwork complete.** The Switch components
-> are specced and issue-tracked but not yet implemented. The RomM 5.2.0 API this
-> targets is captured and verified — see [`docs/API_CONTRACT.md`](docs/API_CONTRACT.md).
+> are specced and issue-tracked but not yet implemented. It targets RomM 5.4.0 or
+> later and refuses to sync with anything older; that API is captured and
+> verified — see [`docs/API_CONTRACT.md`](docs/API_CONTRACT.md).
 >
 > **Test-first, hardware-last.** No real Switch and no production RomM is touched
 > until a v1 is fully proven off-console — on a native host harness against a
@@ -62,7 +63,7 @@ this client knows how to have, the line it writes in
 ```
         Nintendo Switch (Atmosphère)                    Your server
  ┌───────────────────────────────────────┐      ┌───────────────────────┐
- │  ovl-rommsync (.ovl overlay)           │      │   RomM 5.2.0           │
+ │  ovl-rommsync (.ovl overlay)           │      │   RomM 5.4.0 or later  │
  │     │  IPC (tipc)                      │      │   (HTTPS, public URL)  │
  │     ▼                                  │ HTTPS│                        │
  │  sys-rommsync (sysmodule)  ────────────┼─────▶│  /api/auth/device/*    │

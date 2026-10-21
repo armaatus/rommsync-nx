@@ -118,7 +118,7 @@ struct ServerCapabilities {
 /// header for what an unparseable version means.
 ///
 /// `floor` decides `supported` and nothing else. It is `kMinimumVersion` for
-/// every caller but a test that has to sync with an older fixture
+/// every caller but a test that raises it past the fixture to see a refusal
 /// (`SdEngine::UseMinimumServerVersion`).
 ServerCapabilities CapabilitiesFor(std::string_view version_text,
                                    const Version& floor = kMinimumVersion);

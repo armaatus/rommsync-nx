@@ -60,8 +60,8 @@ body:
     id: romm-version
     attributes:
       label: RomM version
-      description: If relevant. The contract targets RomM 5.2.0.
-      placeholder: "5.2.0"
+      description: The status screen's RomM row shows it. rommsync-nx syncs with RomM 5.4.0 or later.
+      placeholder: "5.4.0"
   - type: textarea
     id: logs
     attributes:

@@ -185,7 +185,6 @@ class Console {
     token.device_id = fixture.device_id;
     ok = ok && auth::SaveToken(directory + auth::kTokenFileName, token).ok();
     card = rommsync::host::MakeNativeFileSystem(sandbox.root().string());
-    engine.UseMinimumServerVersion(harness::kFixtureFloor);
     engine.UseCard(card.get());
     engine.UseServer(&client, std::string());
     engine.Load(directory);

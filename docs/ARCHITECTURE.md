@@ -1,8 +1,10 @@
 # Architecture
 
 Two on-console components plus shared state on the SD card. The server is stock
-RomM 5.2.0 — we add nothing server-side except (optionally) an HTTPS reverse
-proxy and a dedicated user/token (see [SECURITY.md](SECURITY.md)).
+RomM 5.4.0 or later — an older one is refused before any save is offered to it
+([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#before-step-0--which-romm-this-is)) — and we
+add nothing server-side except (optionally) an HTTPS reverse proxy and a
+dedicated user/token (see [SECURITY.md](SECURITY.md)).
 
 ## Components
 

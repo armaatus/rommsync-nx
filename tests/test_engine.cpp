@@ -117,15 +117,12 @@ class Console {
  public:
   Console(checks::Checks& checks, std::string_view name) : sandbox(checks, name) {
     directory = sandbox.Host(harness::kConfigDir) + "/";
-    engine.UseMinimumServerVersion(harness::kFixtureFloor);
   }
 
   /// A second console over a card another one wrote -- a reboot. It keeps its
   /// own sandbox so the teardown audit still has one, and never looks at it.
   Console(checks::Checks& checks, std::string_view name, std::string existing)
-      : sandbox(checks, name), directory(std::move(existing)) {
-    engine.UseMinimumServerVersion(harness::kFixtureFloor);
-  }
+      : sandbox(checks, name), directory(std::move(existing)) {}
 
   void Boot() {
     engine.Load(directory);
@@ -2955,7 +2952,6 @@ int DrainShutdown(http::HttpClient& client, const std::string& base) {
     // way to stop its worker -- while the card it wrote to is still here to look
     // at afterwards.
     auto engine = std::make_unique<sysmodule::SdEngine>();
-    engine->UseMinimumServerVersion(harness::kFixtureFloor);
     engine->UseCard(card.get());
     engine->UseServer(&slow, std::string());
     engine->Load(directory);
@@ -3111,12 +3107,13 @@ int SleepDownload(http::HttpClient& client, const std::string& base) {
 /// that RomM anything, refuses one below the floor without a negotiate, and
 /// says so on the status screen and in the log.
 ///
-/// Two halves, so it means the same thing on both fixture versions. The first
-/// raises the floor past whatever the fixture runs, which makes the refusal
-/// deterministic: every request the console made is recorded, and none of them
-/// may be a negotiate. The second runs at the build's own floor and holds the
-/// answer to the fixture's version -- refused on 5.2.0, the full capability
-/// set on 5.4.0 -- which is the one place the real floor meets a real server.
+/// Two halves. The fixture runs a RomM the floor accepts, so the first raises
+/// the floor past it, which is the only way to see a refusal from a real
+/// server: every request the console made is recorded, and none of them may be
+/// a negotiate. The second runs at the build's own floor and holds the answer
+/// to the fixture's version -- the full capability set on 5.4.0, and a refusal
+/// if a fixture below the floor is ever started -- which is the one place the
+/// real floor meets a real server.
 int RommVersion(http::HttpClient& client, const std::string& base) {
   rig::Checks c;
   harness::Fixture fixture;
