@@ -292,10 +292,12 @@ static_assert(kHeapPeak == 0x14F800, "the table above no longer sums to its peak
 // arithmetic gave neither. M9-4 (#208) took 40 KiB of it for the PSC watcher's
 // thread, which is the row above.
 //
-// **It grew by 0x10000 in M9-10 (#201)**, from 0x150000, for the download's
-// 64 KiB read chunk: the margin could not absorb it and stay a margin. That is
-// 64 KiB of resident `.bss` bought for a quarter of the `ssl` round trips per
-// rom, which is the trade #201 argues.
+// **It grew by 0x10000 in M9-10 (#201)**, from 0x150000, when the transfer row
+// went from 16 KiB to 80: 48 KiB of it is the download's bigger read chunk and
+// 16 KiB is the pairing thread's buffer, which was always allocated and never
+// counted. The margin could not absorb that and stay a margin. It is 64 KiB of
+// resident `.bss` bought for, at best, a quarter of the `ssl` round trips per
+// rom -- "at best" being #44's to measure (`http/http_wire.hpp`).
 //
 // **It grew by 0x90000 in M9-2**, from 0xC0000: 576 KiB more `.bss` in a
 // resident image that was ~2.00 MiB, against an Atmosphere third-party sysmodule

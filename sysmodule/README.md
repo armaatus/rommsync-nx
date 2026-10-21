@@ -161,8 +161,8 @@ guess, and is still wrong to make now.
   `source/http/ssl_http_client.hpp` needs **116 KiB**, and libnx's default needs
   **2.25 MiB** and cannot fit at all — so `socketInitializeDefault()` is the one
   call this process must never make. Add the transfer buffers to that -- a
-  download's 64 KiB, the receive window's worth, beside an API call's 16 KiB --
-  because roms stream to file and never sit in RAM whole.
+  download's 64 KiB, the receive window's worth, beside an API call's 16 KiB.
+  Roms stream to file and never sit in RAM whole.
 
   `main_thread_stack_size` went from the template's `0x4000` to `0x8000` for a
   reason that is not the transport: the main thread is where `SdEngine::Load`

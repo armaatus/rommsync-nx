@@ -21,7 +21,8 @@ Runs under Atmosphère with a tight heap.
 - TLS is the project's biggest technical risk. Use the Horizon `ssl` system
   service through libnx; see `docs/DEVELOPMENT.md#tls-in-a-sysmodule` and issue
   M0-1 before choosing anything else.
-- **Heap discipline:** size for one in-flight download buffer plus a TLS context.
+- **Heap discipline:** size for the in-flight buffers -- one download's, one API
+  call's (`http/http_wire.hpp`) -- plus a TLS context.
   Stream to file; never hold a whole rom in RAM.
 - **Never block boot.** Every network call has a timeout and is offline-safe.
 - **`__appInit` runs before global constructors, and before there is anywhere to

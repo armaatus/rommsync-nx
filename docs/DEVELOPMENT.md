@@ -577,7 +577,8 @@ a sysmodule pays for a TLS request is therefore:
    M9-2 (#207), which found the table wrong by more than its own margin — two
    thread stacks budgeted at a quarter of what devkitA64 gives them, and an open
    `DIR` costing ~24 KiB with no term at all — and M9-10 (#201) added 64 KiB to
-   it for the download's read chunk (item 2). The default socket config does not
+   it: 48 KiB for the download's bigger read chunk and 16 KiB for the pairing
+   thread's buffer, which the table had never counted (item 2). The default socket config does not
    fit in it and never will; the sysmodule's leaves ~1.3 MiB. **Never call
    `socketInitializeDefault()` from the sysmodule** — that single line is the
    difference between a working engine and one that dies at `socketInitialize`.
@@ -595,7 +596,9 @@ a sysmodule pays for a TLS request is therefore:
    to be). Every `sslConnectionRead` is an IPC round trip to the `ssl`
    sysmodule, so the buffer a download reads into is the IPC count per rom:
    65,536 round trips per GiB at 16 KiB, which NPShopSwitch measured holding a
-   shipping sysmodule's HTTPS installs under 1 MB/s. Since M9-10 (#201) a
+   shipping sysmodule's HTTPS installs under 1 MB/s. At 64 KiB it is 16,384 —
+   *if* one `sslConnectionRead` returns more than a TLS record's 16 KiB, which
+   nothing off a console can tell (`tlsprobe` now reports it). Since M9-10 (#201) a
    download reads **64 KiB** at a time (`kDownloadBufferSize`,
    `sysmodule/source/http/http_wire.hpp`) and an API call keeps 16 KiB; two
    requests can be in flight — the worker's and the pairing thread's — and only
@@ -689,7 +692,7 @@ No auto-boot sysmodule was installed on any console for this spike, and no
 console was involved in it at all.
 
 Budget note: sysmodules declare their heap in `config.json`/`npdm`; size it for
-one in-flight download buffer + the bsd transfer memory above + the `state.db`
+the in-flight buffers (a download's and an API call's) + the bsd transfer memory above + the `state.db`
 baseline, and stream to file rather than buffering whole roms in RAM. The
 baseline is the one item that grows with the library rather than being a fixed
 buffer — its text and then its parsed rows, bounded by `state::kMaxStateBytes`

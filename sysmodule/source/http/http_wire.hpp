@@ -116,14 +116,17 @@ inline constexpr std::size_t kTransferBufferSize = 16 * 1024;
 /// 65,536 round trips per GiB of rom; NPShopSwitch, a shipping boot2 sysmodule,
 /// measured the same choice holding its HTTPS installs under 1 MB/s
 /// (nps_http_ssl.cpp). The old justification -- "a TLS record's worth" -- was
-/// true of TLS framing and beside the point: the record size bounds nothing a
-/// read returns, the IPC cost is per call, and only the second scales with a rom.
+/// about TLS framing, and framing is not the cost: the IPC is per call, and only
+/// the call count scales with a rom.
 ///
 /// **64 KiB, because that is the receive window.** A read can only return what
 /// the socket has buffered, and `SocketBudget::tcp_rx_buf_max_size` caps that at
 /// 64 KiB (`ssl_http_client.hpp`), so a larger buffer is heap the read has
-/// nothing to fill from. 16,384 round trips per GiB, a quarter of before. The
-/// window and this move together, and `main.cpp` holds them to it.
+/// nothing to fill from. That is 16,384 round trips per GiB, a quarter of
+/// before -- **at best**: it assumes one `sslConnectionRead` hands back more
+/// than one TLS record, which NPShopSwitch's speed-up implies and nothing off a
+/// console can show. `tlsprobe` reports the largest read it saw, and #44 asks
+/// for it. The window and this move together, and `main.cpp` holds them to it.
 ///
 /// One download is in flight at a time -- the worker drains the queue one rom
 /// after another (`download::Drain`) -- and a redirect frees one hop's buffer

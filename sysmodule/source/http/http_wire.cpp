@@ -446,8 +446,8 @@ class Budget {
 class Reader {
  public:
   /// `buffer` is the exchange's one in-flight buffer, owned by the caller and
-  /// on the heap: 16 KiB on a thread stack is most of the stack this process
-  /// gives a thread (`sysmodule/sys-rommsync.json`), and a download's is 64.
+  /// on the heap: a download's 64 KiB is half an engine thread's stack
+  /// (`sized_thread.hpp`), and stack is not where a peak this size belongs.
   Reader(Connection& connection, Budget& budget, char* buffer, std::size_t size)
       : connection_(connection), budget_(budget), buffer_(buffer), size_(size) {}
 
