@@ -1,17 +1,17 @@
 {
   "session": {
-    "id": 13,
-    "device_id": "3fee6201-685b-4554-a380-cc7167033f84",
+    "id": 14,
+    "device_id": "7eee3f5f-73bf-4043-aa58-0f6bfde84101",
     "user_id": 1,
     "status": "COMPLETED",
-    "initiated_at": "2026-10-21T08:44:01+00:00",
-    "completed_at": "2026-10-21T08:44:01+00:00",
+    "initiated_at": "2026-10-21T09:02:16+00:00",
+    "completed_at": "2026-10-21T09:02:16+00:00",
     "operations_planned": 4,
     "operations_completed": 0,
     "operations_failed": 0,
     "error_message": null,
-    "created_at": "2026-10-21T08:44:01+00:00",
-    "updated_at": "2026-10-21T08:44:01+00:00"
+    "created_at": "2026-10-21T09:02:16+00:00",
+    "updated_at": "2026-10-21T09:02:16+00:00"
   },
   "play_session_ingest": null
 }

@@ -38,6 +38,10 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 # question of the file and of the daemon, and a value changed in one place only
 # would leave one of them agreeing with nothing.
 readonly MAX_REQUESTS=0
+# ...and the slot cap. server/probe_contract.py proves pruning against this
+# number, so a compose file that moved it alone would turn contract.captures red
+# with nothing here saying why.
+readonly SLOT_CAP=10
 
 # The romm service's block of the compose file, by indentation: see
 # phase_recycling for why that and not `docker compose config`.
@@ -151,23 +155,27 @@ phase_slot_cap() {
   # RomM 5.3 prunes every slot to MAX_SAVES_PER_SLOT versions on upload. Left to
   # its default, a test that counts versions is testing RomM's release notes.
   romm_block \
-    | grep -qE '^[[:space:]]*MAX_SAVES_PER_SLOT:[[:space:]]*"[0-9]+"[[:space:]]*$' \
+    | grep -qE "^[[:space:]]*MAX_SAVES_PER_SLOT:[[:space:]]*\"$SLOT_CAP\"[[:space:]]*$" \
     || fail "the romm service in server/testing/docker-compose.yml does not set
-  MAX_SAVES_PER_SLOT to a number. RomM 5.3+ prunes each slot to it, and a
-  default that moves between releases makes every pruning test depend on which
-  RomM it ran against (#227)."
+  MAX_SAVES_PER_SLOT: \"$SLOT_CAP\"
+  RomM 5.3+ prunes each slot to it, and a default that moves between releases
+  makes every pruning test depend on which RomM it ran against (#227). Moving it
+  means moving the 13-upload pruning scenario in server/probe_contract.py too."
   echo "rig.slot_cap ok"
 }
 
 phase_version_live() {
   local want container image
+  # The container first: with no stack running there is nothing to be wrong
+  # about, and this skips like every other rig test rather than failing a
+  # checkout that has not generated .env yet.
+  find_romm_container
+  [ -n "$container" ] || { echo "this worktree's RomM is not running -- skipping"; exit "$SKIP"; }
+
   # The environment first, as contract.captures reads it: `ROMM_VERSION=5.4.0
   # ctest` is a claim about the server, and this is where it is checked.
   want="${ROMM_VERSION:-$(sed -n 's/^ROMM_VERSION=//p' "$REPO_ROOT/.env" 2>/dev/null | head -1)}"
   [ -n "$want" ] || fail "no ROMM_VERSION in .env -- regenerate it with ./scripts/orca/env.sh"
-
-  find_romm_container
-  [ -n "$container" ] || { echo "this worktree's RomM is not running -- skipping"; exit "$SKIP"; }
   image="$(docker inspect --format '{{.Config.Image}}' "$container" 2>/dev/null)"
   [ "$image" = "rommapp/romm:$want" ] || fail \
 "$container runs $image, but ROMM_VERSION asks for rommapp/romm:$want.

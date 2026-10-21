@@ -1,5 +1,5 @@
 {
-  "id": "9ab113b9-e7e7-4f9a-b2ec-4500bad8e939",
+  "id": "c4ef65e7-a0bc-4edd-b264-ce9afdfc739c",
   "user_id": 1,
   "name": "probe_contract.py",
   "platform": "switch",
@@ -13,7 +13,7 @@
   "sync_enabled": true,
   "sync_config": null,
   "capabilities": null,
-  "last_seen": "2026-10-21T08:43:56+00:00",
-  "created_at": "2026-10-21T08:43:56+00:00",
-  "updated_at": "2026-10-21T08:43:56+00:00"
+  "last_seen": "2026-10-21T09:02:11+00:00",
+  "created_at": "2026-10-21T09:02:11+00:00",
+  "updated_at": "2026-10-21T09:02:11+00:00"
 }

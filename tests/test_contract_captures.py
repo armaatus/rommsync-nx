@@ -126,8 +126,7 @@ def main() -> int:
     args = ap.parse_args()
 
     env = read_env(os.path.join(args.repo, ".env"))
-    version = os.environ.get("ROMM_VERSION") or env.get("ROMM_VERSION") or ROOT_CAPTURES_VERSION
-    committed = captures_dir(args.repo, version)
+    expected = os.environ.get("ROMM_VERSION") or env.get("ROMM_VERSION")
     base = env.get("ROMM_BASE_URL")
     fixture_auth = os.path.join(args.repo, "server", "testing", "fixture-auth.env")
 
@@ -144,6 +143,11 @@ def main() -> int:
         print(f"RomM at {base} is not answering ({exc}) -- skipping")
         return SKIP
     running = (heartbeat.get("SYSTEM") or {}).get("VERSION")
+    # A .env older than ROMM_VERSION names nothing; the server is then the only
+    # word on which captures apply, which is better than guessing a default
+    # that #235 is about to move.
+    version = expected or running
+    committed = captures_dir(args.repo, version)
     if running != version:
         print(f"RomM at {base} is {running}, and this run expects {version} (ROMM_VERSION).\n"
               f"Recreate the stack for {version} (docs/TESTING.md#choosing-the-romm-version), "
