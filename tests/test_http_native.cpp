@@ -140,26 +140,54 @@ int Status(http::HttpClient& client, const std::string& base) {
   return checks.failures();
 }
 
-// A JSON POST against the endpoint the device-code flow (M1) actually starts on.
-int PostJson(http::HttpClient& client, const std::string& base) {
-  rig::Checks checks;
-
+/// `POST /api/auth/device/init`, as `post_json` sends it.
+http::Request DeviceInit(const std::string& base, const std::string& identifier) {
   http::Request request;
   request.method = http::Method::kPost;
   request.url = base + "/api/auth/device/init";
   request.headers.push_back({"Content-Type", "application/json"});
-  request.body =
-      R"({"client_device_identifier":"rommsync-nx-http-test","name":"http test",)"
-      R"("client":"rommsync-nx","platform":"switch","client_version":"0.0.0",)"
-      R"("requested_scopes":["me.read"]})";
+  request.body = R"({"client_device_identifier":")" + identifier + R"(","name":"http test",)"
+                 R"("client":"rommsync-nx","platform":"switch","client_version":"0.0.0",)"
+                 R"("requested_scopes":["me.read"]})";
+  return request;
+}
 
-  const http::Result result = client.Send(request);
+// A JSON POST against the endpoint the device-code flow (M1) actually starts on.
+int PostJson(http::HttpClient& client, const std::string& base) {
+  rig::Checks checks;
+
+  const http::Result result = client.Send(DeviceInit(base, "rommsync-nx-http-test"));
   checks.ExpectOk(result, "POST /api/auth/device/init");
   checks.ExpectEq(result.response.status, 201, "status");
   checks.Expect(!rig::JsonString(result.response.body, "device_code").empty(),
                 "RomM returned a device_code");
   // Nothing approves the code, so it expires on its own and no state leaks.
   return checks.failures();
+}
+
+// RomM allows ten device inits a minute per client IP, and every rig test is
+// one IP: the fault proxy's. `pair.*`, `device.*` and `engine.*` open a code
+// each, so by the time `post_json` runs in a full suite the minute may already
+// be spent -- which is how it failed, intermittently, from #235 on. This is that
+// suite made deterministic: spend the window first, then run `post_json`.
+int PostJsonSpentWindow(http::HttpClient& client, const std::string& base) {
+  rig::Checks checks;
+  constexpr int kInitsPerWindow = 10;  // RomM's AUTHORIZE_RATE_LIMIT
+  bool refused = false;
+  for (int sent = 0; sent <= kInitsPerWindow && !refused; ++sent) {
+    const http::Result spent = client.Send(DeviceInit(base, "rommsync-nx-http-spend"));
+    checks.ExpectOk(spent, "spending the init window");
+    refused = spent.response.status == 429;
+    if (!refused && spent.response.status != 201) {
+      checks.ExpectEq(spent.response.status, 201, "an init inside the window");
+      return checks.failures();
+    }
+  }
+  checks.Expect(refused, "RomM refuses the eleventh init in a minute (docs/AUTH.md)");
+  if (!refused) {
+    return checks.failures();
+  }
+  return checks.failures() + PostJson(client, base);
 }
 
 // A form-urlencoded POST: RomM's token endpoint, which is also how every
@@ -1071,6 +1099,8 @@ int main(int argc, char** argv) {
     failures = Status(*client, base);
   } else if (scenario == "post_json") {
     failures = PostJson(*client, base);
+  } else if (scenario == "post_json_spent") {
+    failures = PostJsonSpentWindow(*client, base);
   } else if (scenario == "post_form") {
     failures = PostForm(*client, base);
   } else if (scenario == "multipart") {

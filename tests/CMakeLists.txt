@@ -686,6 +686,16 @@ foreach(scenario IN LISTS HTTP_SCENARIOS)
   set_tests_properties(http.${scenario} PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 endforeach()
 
+# `post_json` once RomM's device-init window is already spent -- the state a
+# full suite can leave it in by the time `post_json` runs, made deterministic.
+# Only here, not in `wire.*`: what it holds is the test's own handling of a 429,
+# the same code in both binaries, and it costs a whole rate-limit window.
+add_test(NAME http.post_json_spent COMMAND test_http_native post_json_spent)
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(http.post_json_spent PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+set_tests_properties(http.post_json_spent PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
+
 # --- refusing a leaf rather than adopting one --------------------------------
 # #169. `scratch::Dir()` memoizes in a function-local static, so the fork this
 # needs -- plant a leaf under the CHILD's pid that the child cannot empty, and
