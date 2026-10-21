@@ -125,12 +125,20 @@ class SdCard final : public fs::FileSystem {
       }
       ReadStat(child, &entry);
 
-      listing.entries.push_back(std::move(entry));
-      std::push_heap(listing.entries.begin(), listing.entries.end(), ByNameDescending);
-      if (listing.entries.size() > fs::kMaxDirectoryEntries) {
-        std::pop_heap(listing.entries.begin(), listing.entries.end(), ByNameDescending);
-        listing.entries.pop_back();
+      // Never one past the bound: pushed and then popped back, the vector has
+      // already doubled to twice the bound -- with both buffers live while it
+      // moved -- and the bound is a heap term (main.cpp, M9-19). At the bound an
+      // entry either replaces the largest name kept or is dropped.
+      if (listing.entries.size() < fs::kMaxDirectoryEntries) {
+        listing.entries.push_back(std::move(entry));
+        std::push_heap(listing.entries.begin(), listing.entries.end(), ByNameDescending);
+      } else {
         truncated = true;
+        if (entry.name < listing.entries.front().name) {
+          std::pop_heap(listing.entries.begin(), listing.entries.end(), ByNameDescending);
+          listing.entries.back() = std::move(entry);
+          std::push_heap(listing.entries.begin(), listing.entries.end(), ByNameDescending);
+        }
       }
     }
     ::closedir(directory);

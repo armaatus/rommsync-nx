@@ -59,9 +59,23 @@ const char* ToString(ListError error);
 /// The same reasoning as `config::kMaxPlatformSections`: this runs on a
 /// sysmodule heap measured in megabytes, over a FAT32 card that gets yanked
 /// mid-write, and a corrupt directory region is a plausible source of an
-/// unbounded loop. A save folder with four thousand files in it is already far
-/// past anything a human arranged.
-inline constexpr std::size_t kMaxDirectoryEntries = 4096;
+/// unbounded loop.
+///
+/// **512: `state::kMaxRecords`, and a number the heap holds** (M9-19, #217). A
+/// folder holding more files than the baseline can record saves gains nothing
+/// from listing past them, and an entry costs ~148 bytes -- 56 of `Entry` on
+/// aarch64, half again while the vector last grew, and its name's heap string.
+/// Two listings at this bound fit under the largest response the heap table
+/// already budgets (`sysmodule/source/main.cpp`), so it costs nothing of its
+/// own; 4,096 did not, and was never costed.
+///
+/// A power of two, because a vector that never grows past it then never
+/// allocates past it either -- `std::vector` doubles from one -- and a backend's
+/// `List` stops at it rather than pushing one more and popping it back.
+inline constexpr std::size_t kMaxDirectoryEntries = 512;
+static_assert((kMaxDirectoryEntries & (kMaxDirectoryEntries - 1)) == 0,
+              "kMaxDirectoryEntries must be a power of two, or a listing at the bound "
+              "allocates room past it");
 
 /// **A truncated listing keeps the lexicographically first entries, not the
 /// first ones `readdir` happened to hand over.** Which entries survive the

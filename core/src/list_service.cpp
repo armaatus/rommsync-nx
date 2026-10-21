@@ -125,16 +125,41 @@ std::string Shorten(std::string_view text) {
 }
 
 json::Error ParseRomPage(std::string_view body, RomPage* out) {
-  const json::ParseResult document = json::Parse(body);
+  // A row at a time, never the page (`json::ParseEach`): a parsed row weighs
+  // ~11x its text, so a page of `ipc::kMaxPageSize` rows held as one document is
+  // more than the sysmodule's whole heap (M9-19, #217).
+  RomPage page;
+  const json::ParseResult document =
+      json::ParseEach(body, "items", [&page](const json::Value& item, std::size_t index) {
+        const std::string where = "items[" + std::to_string(index) + "].";
+        json::Reader reader(item, "rom");
+        RomRow rom;
+        reader.Required("id", &rom.id);
+        reader.Required("fs_name", &rom.fs_name);
+        reader.Required("platform_fs_slug", &rom.platform_fs_slug);
+        reader.Required("fs_size_bytes", &rom.size_bytes);
+        reader.Required("has_multiple_files", &rom.has_multiple_files);
+        if (!reader.ok()) {
+          return At(where, reader.error());
+        }
+        // `name` alone is read leniently: see `ReadDrawnText`.
+        if (json::Error error = ReadDrawnText(item, "name", &rom.name); !error.ok()) {
+          return At(where, error);
+        }
+        if (rom.id <= 0) {
+          return Fail(where + "id", "must be a positive rom id");
+        }
+        page.roms.push_back(std::move(rom));
+        return json::Error{};
+      });
   if (!document.ok()) {
     return document.error;
   }
 
-  // The envelope first, and by name. A body that is a bare array -- which is
-  // what the endpoint looks like it should answer, and what `/api/platforms`
-  // really does answer -- fails here rather than producing an empty page, and
-  // an empty page is what a truncated response must never be able to look like.
-  RomPage page;
+  // The envelope, and by name. A body that is a bare array -- which is what the
+  // endpoint looks like it should answer, and what `/api/platforms` really does
+  // answer -- fails here rather than producing an empty page, and an empty page
+  // is what a truncated response must never be able to look like.
   json::Reader envelope(document.value, "rom list");
   envelope.Required("total", &page.total);
   if (!envelope.ok()) {
@@ -145,37 +170,48 @@ json::Error ParseRomPage(std::string_view body, RomPage* out) {
     return Fail("items", "expected an array of roms");
   }
 
-  page.roms.reserve(items->size());
-  std::size_t index = 0;
-  for (const json::Value& item : items->elements()) {
-    const std::string where = "items[" + std::to_string(index++) + "].";
-    json::Reader reader(item, "rom");
-    RomRow rom;
-    reader.Required("id", &rom.id);
-    reader.Required("fs_name", &rom.fs_name);
-    reader.Required("platform_fs_slug", &rom.platform_fs_slug);
-    reader.Required("fs_size_bytes", &rom.size_bytes);
-    reader.Required("has_multiple_files", &rom.has_multiple_files);
-    if (!reader.ok()) {
-      return At(where, reader.error());
-    }
-    // `name` alone is read leniently: see `ReadDrawnText`.
-    if (json::Error error = ReadDrawnText(item, "name", &rom.name); !error.ok()) {
-      return At(where, error);
-    }
-    if (rom.id <= 0) {
-      return Fail(where + "id", "must be a positive rom id");
-    }
-    page.roms.push_back(std::move(rom));
-  }
-
   *out = std::move(page);
   return {};
 }
 
 json::Error ParsePlatforms(std::string_view body, std::vector<PlatformRow>* out,
                            bool* truncated) {
-  const json::ParseResult document = json::Parse(body);
+  // Streamed for the reason `ParseRomPage` is: `kMaxPlatforms` rows held as one
+  // document would be ~2.3 MiB (M9-19, #217). The rows past the bound are still
+  // parsed -- a malformed one still fails the list -- and only counted.
+  std::vector<PlatformRow> platforms;
+  std::size_t seen = 0;
+  const json::ParseResult document = json::ParseEach(
+      body, "", [&platforms, &seen](const json::Value& item, std::size_t index) {
+        ++seen;
+        if (platforms.size() >= kMaxPlatforms) {
+          return json::Error{};
+        }
+        const std::string where = "[" + std::to_string(index) + "].";
+        json::Reader reader(item, "platform");
+        PlatformRow platform;
+        reader.Required("id", &platform.id);
+        reader.Required("fs_slug", &platform.fs_slug);
+        reader.Required("name", &platform.name);
+        reader.Required("rom_count", &platform.rom_count);
+        if (!reader.ok()) {
+          return At(where, reader.error());
+        }
+        // What RomM's own UI draws: `custom_name` when the user renamed the
+        // platform and `name` otherwise. Optional, because a platform is still a
+        // platform without it -- unlike the four above, none of which the browser
+        // can draw a row or descend into a list without.
+        std::string display_name;
+        if (ReadDrawnText(item, "display_name", &display_name, false).ok() &&
+            !display_name.empty()) {
+          platform.name = std::move(display_name);
+        }
+        if (platform.id <= 0) {
+          return Fail(where + "id", "must be a positive platform id");
+        }
+        platforms.push_back(std::move(platform));
+        return json::Error{};
+      });
   if (!document.ok()) {
     return document.error;
   }
@@ -183,40 +219,9 @@ json::Error ParsePlatforms(std::string_view body, std::vector<PlatformRow>* out,
     return Fail("", "expected an array of platforms");
   }
 
-  std::vector<PlatformRow> platforms;
   if (truncated != nullptr) {
-    *truncated = document.value.size() > kMaxPlatforms;
+    *truncated = seen > kMaxPlatforms;
   }
-  std::size_t index = 0;
-  for (const json::Value& item : document.value.elements()) {
-    if (platforms.size() >= kMaxPlatforms) {
-      break;
-    }
-    const std::string where = "[" + std::to_string(index++) + "].";
-    json::Reader reader(item, "platform");
-    PlatformRow platform;
-    reader.Required("id", &platform.id);
-    reader.Required("fs_slug", &platform.fs_slug);
-    reader.Required("name", &platform.name);
-    reader.Required("rom_count", &platform.rom_count);
-    if (!reader.ok()) {
-      return At(where, reader.error());
-    }
-    // What RomM's own UI draws: `custom_name` when the user renamed the
-    // platform and `name` otherwise. Optional, because a platform is still a
-    // platform without it -- unlike the four above, none of which the browser
-    // can draw a row or descend into a list without.
-    std::string display_name;
-    if (ReadDrawnText(item, "display_name", &display_name, false).ok() &&
-        !display_name.empty()) {
-      platform.name = std::move(display_name);
-    }
-    if (platform.id <= 0) {
-      return Fail(where + "id", "must be a positive platform id");
-    }
-    platforms.push_back(std::move(platform));
-  }
-
   *out = std::move(platforms);
   return {};
 }

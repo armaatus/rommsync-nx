@@ -654,6 +654,15 @@ a sysmodule pays for a TLS request is therefore:
    ~200 KiB, and `/api/roms?limit=64` is ~136 KiB. And there are **two** worker
    threads to come, not one — M1-6's pairing thread and M7-2's scheduler — each
    paying its stack out of this heap.
+
+   M9-19 (#217) found the response term short by ten times: a parsed
+   `json::Value` document weighs ~11× its text on aarch64's libstdc++, so a
+   200-row rom page held as one was ~4.6 MiB. A page is now parsed a row at a time
+   (`json::ParseEach`) and its body reserved to its `Content-Length`, so a
+   response costs its text once and one row beside it. The same issue derived
+   the three bounds that had been set beside the heap rather than from it — the
+   rom index's page (64) and size (1,024 roms), and a directory listing (512
+   entries) — and `main.cpp` holds each as a row or a pinned term.
 2. **The in-flight buffers** — ours to size. Roms stream to file and never sit
    in RAM whole (hard rule 2's sibling: nothing is buffered that does not have
    to be). Every `sslConnectionRead` is an IPC round trip to the `ssl`

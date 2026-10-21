@@ -176,12 +176,19 @@ class NativeFileSystem final : public fs::FileSystem {
       // surviving set depend on the card's directory layout -- which
       // `file_system.hpp` forbids, because the scanner's duplicate-slot rule
       // then changes its mind between ticks.
-      listing.entries.push_back(std::move(entry));
-      std::push_heap(listing.entries.begin(), listing.entries.end(), ByNameDescending);
-      if (listing.entries.size() > fs::kMaxDirectoryEntries) {
-        std::pop_heap(listing.entries.begin(), listing.entries.end(), ByNameDescending);
-        listing.entries.pop_back();
+      // And never one past it, as in `card.cpp`: at the bound an entry
+      // replaces the largest name kept or is dropped, so the vector is not
+      // doubled past the bound on the way.
+      if (listing.entries.size() < fs::kMaxDirectoryEntries) {
+        listing.entries.push_back(std::move(entry));
+        std::push_heap(listing.entries.begin(), listing.entries.end(), ByNameDescending);
+      } else {
         truncated = true;
+        if (entry.name < listing.entries.front().name) {
+          std::pop_heap(listing.entries.begin(), listing.entries.end(), ByNameDescending);
+          listing.entries.back() = std::move(entry);
+          std::push_heap(listing.entries.begin(), listing.entries.end(), ByNameDescending);
+        }
       }
     }
 

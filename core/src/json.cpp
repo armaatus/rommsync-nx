@@ -118,6 +118,11 @@ class Parser {
  public:
   explicit Parser(std::string_view text) : text_(text) {}
 
+  /// The parser `ParseEach` runs: the array at `each_key` -- the root when it is
+  /// empty -- goes to `each` an element at a time instead of into the result.
+  Parser(std::string_view text, std::string_view each_key, const EachElement& each)
+      : text_(text), each_key_(each_key), each_(&each) {}
+
   ParseResult Run() {
     ParseResult result;
     SkipWhitespace();
@@ -127,7 +132,8 @@ class Parser {
       return result;
     }
     Value root;
-    if (!ParseValue(0, &root)) {
+    const bool streamed = each_ != nullptr && each_key_.empty();
+    if (!(streamed ? ParseEach(0, &root) : ParseValue(0, &root))) {
       result.error = error_;
       return result;
     }
@@ -240,6 +246,48 @@ class Parser {
     }
   }
 
+  /// `ParseArray` for the one array `ParseEach` streams: each element is parsed,
+  /// handed over and destroyed before the next is read, so `out` stays an empty
+  /// array. Anything that is not an array is parsed the ordinary way.
+  bool ParseEach(int depth, Value* out) {
+    if (depth >= kMaxDepth || at_ >= text_.size() || text_[at_] != '[') {
+      return ParseValue(depth, out);
+    }
+    out->type_ = Type::kArray;
+    ++at_;  // '['
+    SkipWhitespace();
+    if (at_ < text_.size() && text_[at_] == ']') {
+      ++at_;
+      return true;
+    }
+    for (std::size_t index = 0;; ++index) {
+      SkipWhitespace();
+      {
+        Value element;
+        if (!ParseValue(depth + 1, &element)) {
+          return false;
+        }
+        if (Error refused = (*each_)(element, index); !refused.ok()) {
+          error_ = std::move(refused);
+          return false;
+        }
+      }
+      SkipWhitespace();
+      if (at_ >= text_.size()) {
+        return Fail("unterminated array");
+      }
+      if (text_[at_] == ',') {
+        ++at_;
+        continue;
+      }
+      if (text_[at_] == ']') {
+        ++at_;
+        return true;
+      }
+      return Fail("expected ',' or ']' in an array");
+    }
+  }
+
   bool ParseObject(int depth, Value* out) {
     out->type_ = Type::kObject;
     ++at_;  // '{'
@@ -272,7 +320,10 @@ class Parser {
       }
       ++at_;
       SkipWhitespace();
-      if (!ParseValue(depth + 1, &member.value)) {
+      const bool streamed =
+          depth == 0 && each_ != nullptr && !each_key_.empty() && member.key == each_key_;
+      if (!(streamed ? ParseEach(depth + 1, &member.value)
+                     : ParseValue(depth + 1, &member.value))) {
         return false;
       }
       out->members_.push_back(std::move(member));
@@ -476,12 +527,19 @@ class Parser {
   }
 
   std::string_view text_;
+  std::string_view each_key_;
+  const EachElement* each_ = nullptr;
   std::size_t at_ = 0;
   Error error_;
 };
 
 ParseResult Parse(std::string_view text) {
   Parser parser(text);
+  return parser.Run();
+}
+
+ParseResult ParseEach(std::string_view text, std::string_view key, const EachElement& each) {
+  Parser parser(text, key, each);
   return parser.Run();
 }
 

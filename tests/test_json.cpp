@@ -377,6 +377,77 @@ void QuotesWhatItIsGiven(checks::Checks& c) {
   }
 }
 
+/// `ParseEach`: one array handed over an element at a time (M9-19, #217). What
+/// it must keep is everything `Parse` promises -- the strictness, the rest of the
+/// document -- while never holding the array it streams.
+void StreamsOneArray(checks::Checks& c) {
+  std::vector<std::int64_t> seen;
+  std::vector<std::size_t> indices;
+  const json::EachElement collect = [&](const json::Value& element, std::size_t index) {
+    const json::Value* id = element.Find("id");
+    seen.push_back(id != nullptr ? id->integer() : -1);
+    indices.push_back(index);
+    return json::Error{};
+  };
+
+  const json::ParseResult page = json::ParseEach(
+      R"({"items":[{"id":1},{"id":2},{"id":3}],"total":3,"nested":{"items":[9]}})", "items",
+      collect);
+  c.Expect(page.ok(), "an envelope parses: " + page.error.Describe());
+  c.Expect(seen == std::vector<std::int64_t>{1, 2, 3}, "every element, in order");
+  c.Expect(indices == std::vector<std::size_t>{0, 1, 2}, "each with its index");
+  const json::Value* items = page.value.Find("items");
+  c.Expect(items != nullptr && items->is_array() && items->size() == 0,
+           "and the streamed array is left present and empty");
+  const json::Value* total = page.value.Find("total");
+  c.Expect(total != nullptr && total->integer() == 3, "the rest of the document is kept");
+  const json::Value* nested = page.value.Find("nested");
+  c.Expect(nested != nullptr && nested->Find("items") != nullptr &&
+               nested->Find("items")->size() == 1,
+           "and only the top-level member is streamed, not a nested one of the same name");
+
+  seen.clear();
+  const json::ParseResult bare = json::ParseEach(R"([{"id":7},{"id":8}])", "", collect);
+  c.Expect(bare.ok() && bare.value.is_array() && bare.value.size() == 0,
+           "an empty key streams the root array");
+  c.Expect(seen == std::vector<std::int64_t>{7, 8}, "element by element");
+
+  seen.clear();
+  const json::ParseResult object = json::ParseEach(R"({"items":{"id":1}})", "items", collect);
+  c.Expect(object.ok() && seen.empty(), "something other than an array is not streamed");
+  c.Expect(object.value.Find("items") != nullptr && object.value.Find("items")->is_object(),
+           "it is held, so the caller's shape check refuses it by name");
+
+  // Strict exactly as `Parse` is, including past elements already handed over.
+  seen.clear();
+  c.Expect(!json::ParseEach(R"({"items":[{"id":1},{"id":2,}]})", "items", collect).ok(),
+           "a malformed element fails the document");
+  c.ExpectEq(seen.size(), std::size_t{1}, "after the elements before it were handed over");
+  c.Expect(!json::ParseEach(R"({"items":[{"id":1}],"items":[]})", "items", collect).ok(),
+           "a duplicate key is still refused");
+  c.Expect(!json::ParseEach(R"({"items":[{"id":1}]} x)", "items", collect).ok(),
+           "and so is content after the document");
+  c.Expect(!json::ParseEach(R"({"items":[{"id":1})", "items", collect).ok(),
+           "and a body cut short");
+
+  // The caller's refusal stops the walk and is the error.
+  seen.clear();
+  const json::ParseResult refused =
+      json::ParseEach(R"([{"id":1},{"id":2},{"id":3}])", "",
+                      [&](const json::Value& element, std::size_t) {
+                        seen.push_back(element.Find("id")->integer());
+                        json::Error error;
+                        if (seen.size() == 2) {
+                          error.field = "[1].id";
+                          error.message = "not this one";
+                        }
+                        return error;
+                      });
+  c.Expect(!refused.ok(), "a refused element fails the parse");
+  c.ExpectEq(refused.error.field, std::string("[1].id"), "with the caller's own error");
+  c.ExpectEq(seen.size(), std::size_t{2}, "and nothing after it is read");
+}
+
 }  // namespace
 
 int main() {
@@ -385,5 +456,6 @@ int main() {
   Rejects(c);
   ReaderReportsTheField(c);
   QuotesWhatItIsGiven(c);
+  StreamsOneArray(c);
   return c.failures() == 0 ? 0 : 1;
 }

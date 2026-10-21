@@ -631,7 +631,17 @@ class StringWriter final : public BodyWriter {
  public:
   explicit StringWriter(std::string* body) : body_(body) {}
 
-  bool Begin(const Response&, Error*) override { return true; }
+  /// Room for the whole body before any of it arrives, so appending never
+  /// doubles it (`kMaxReservedBodyBytes`).
+  bool Begin(const Response& head, Error*) override {
+    if (const std::string* declared = http::FindHeader(head.headers, "Content-Length")) {
+      std::uint64_t length = 0;
+      if (ParseDecimal(Trim(*declared), &length) && length <= kMaxReservedBodyBytes) {
+        body_->reserve(static_cast<std::size_t>(length));
+      }
+    }
+    return true;
+  }
 
   bool Write(const char* data, std::size_t size, Error*) override {
     body_->append(data, size);

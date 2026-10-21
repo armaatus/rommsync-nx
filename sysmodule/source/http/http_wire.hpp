@@ -133,6 +133,24 @@ inline constexpr std::size_t kTransferBufferSize = 16 * 1024;
 /// before the next hop allocates its own, so this costs the heap once.
 inline constexpr std::size_t kDownloadBufferSize = 64 * 1024;
 
+/// The largest `Content-Length` an API body is given room for up front (M9-19,
+/// #217).
+///
+/// `Send` holds its body in a `std::string`, and appended a read at a time that
+/// string doubles: a body ends up holding as much as twice its length, and three
+/// times while the last reallocation has both buffers live. The heap table in
+/// `main.cpp` budgets every buffered response at its text, once, so the body is
+/// reserved to the length the server declared before the first byte lands.
+///
+/// Up to here and no further, because the number is the server's: a
+/// `Content-Length` of a gigabyte on a ten-byte body would otherwise be an
+/// allocation this process makes on a stranger's say-so, and on a
+/// `-fno-exceptions` build a failed one is `std::terminate`. 256 KiB is above
+/// every response the table budgets -- `main.cpp` asserts it -- so a body past
+/// it is one the heap was never sized for, and growing it the old way is no
+/// worse than it was.
+inline constexpr std::size_t kMaxReservedBodyBytes = 256 * 1024;
+
 /// How much of a failed download's body is kept, matching the native backend.
 /// A 404 from RomM is a short JSON document and worth surfacing; anything
 /// longer is a page that must not reach a log line or the destination file.

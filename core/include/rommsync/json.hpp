@@ -30,6 +30,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -147,6 +148,28 @@ struct ParseResult {
 /// Parse a whole document. Trailing content other than whitespace is an error,
 /// so a truncated body followed by a second one cannot be read as the first.
 ParseResult Parse(std::string_view text);
+
+/// Called with each element of the array `ParseEach` streams, in order, fully
+/// parsed and valid only for the call. A non-ok return stops the parse and is
+/// its error.
+using EachElement = std::function<Error(const Value& element, std::size_t index)>;
+
+/// `Parse`, with one array handed over an element at a time instead of held.
+///
+/// A parsed `Value` weighs about eleven times the text it came from -- a node is
+/// ~100 bytes and a RomM row is ~100 nodes -- so a 64-row page held as one
+/// document is ~1.5 MiB, on a sysmodule whose whole heap is 1.4 MiB (M9-19,
+/// #217). Streamed, the peak is the text and one element.
+///
+/// `key` names a member of the top-level object; empty means the top-level value
+/// is itself the array. In the result that array is present and **empty**, so a
+/// reader of the rest of the document still sees that it was an array. Anything
+/// else at `key` -- an object, a string -- is parsed and held as `Parse` would,
+/// and a caller's shape check refuses it by name the way it always did. Every
+/// element is still parsed in full, so the strictness above is unchanged: a
+/// malformed element fails the document, even after earlier ones were handed
+/// over -- which is why a caller keeps what it reads only once this returns ok.
+ParseResult ParseEach(std::string_view text, std::string_view key, const EachElement& each);
 
 /// `value` as a JSON string literal, quotes included.
 ///
