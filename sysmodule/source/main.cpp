@@ -120,6 +120,12 @@ namespace {
 //     read and dropped before the next (`json::ParseEach`), where the whole
 //     page used to be one document -- at ~11 times its text, a 200-row page was
 //     ~4.6 MiB of `json::Value`s that no row of this table had ever counted.
+//     Both hold for the response RomM sends, and the gaps are named rather than
+//     budgeted: a chunked body declares no length and still doubles (RomM 5.2.0
+//     behind its nginx sends `Content-Length`, measured); a body of the wrong
+//     shape -- a bare array where the envelope belongs -- is parsed whole before
+//     it is refused; and the rows a list page becomes are the list service's
+//     snapshot, which has no row yet. M9-20 (#246) owns all three.
 //
 //     **The row is the largest of three things the worker holds one at a
 //     time**: the platforms list, a rom page, and the directory listings --

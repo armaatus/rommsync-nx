@@ -196,8 +196,8 @@ struct Skip {
 /// How many saves one tick will report, and how many skips it will spell out.
 ///
 /// Both bounds are the `config::kMaxDiagnostics` reasoning: a flat `saves/`
-/// holding four thousand files nobody has roms for must cost one log line and a
-/// count, not four thousand strings on a sysmodule heap. The *count* is always
+/// holding hundreds of files nobody has roms for must cost one log line and a
+/// count, not hundreds of strings on a sysmodule heap. The *count* is always
 /// exact -- only the spelling out is bounded.
 /// `kMaxSaves` is `state::kMaxRecords` and not a round number of its own.
 ///

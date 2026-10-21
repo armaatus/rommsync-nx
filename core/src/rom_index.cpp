@@ -250,7 +250,10 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
   // is on *requests*, so a pathological page size ends the fetch with a
   // truncated index rather than with a tick that never finishes.
   constexpr int kMaxPages = 256;
-  const int page_size = std::clamp(options.page_size, 1, 500);
+  // No larger than the default, because the default is a heap term rather than
+  // a preference (`kDefaultPageSize`): a caller asking for more would be asking
+  // for a page the heap was not sized for.
+  const int page_size = std::clamp(options.page_size, 1, kDefaultPageSize);
 
   std::int64_t offset = 0;
   std::size_t room = 0;
