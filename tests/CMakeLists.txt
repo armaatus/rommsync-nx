@@ -591,6 +591,18 @@ if(NOT ROMMSYNC_REQUIRE_RIG)
 endif()
 set_tests_properties(rig.recycling_live PROPERTIES TIMEOUT 60)
 
+# Which RomM the rig is (#227). The slot cap is pinned in the file so pruning is
+# deterministic across releases, and the running image is checked against the
+# ROMM_VERSION .env names -- a stack started before it changed would otherwise
+# answer every rig test for the wrong server.
+add_test(NAME rig.slot_cap COMMAND "${BASH_PROGRAM}" "${RIG_FIXTURE_TEST}" slot_cap)
+add_test(NAME rig.version_live
+         COMMAND "${BASH_PROGRAM}" "${RIG_FIXTURE_TEST}" version_live)
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(rig.version_live PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+set_tests_properties(rig.slot_cap rig.version_live PROPERTIES TIMEOUT 60)
+
 # --- the native HttpClient against the real rig ------------------------------
 # One CTest entry per scenario, selected by argv[1], so a red run names the
 # behaviour that broke. The scratch directory is per build tree, because three
@@ -1505,9 +1517,14 @@ add_test(NAME orca.env_replaces_dead_venv
 add_test(NAME orca.env_setup_fails_fast
          COMMAND "${BASH_PROGRAM}" "${ORCA_ENV_TEST}" setup_fails_fast)
 
+# The RomM version the fixture runs (#227): chosen once per worktree, and kept
+# across the regenerations compose.sh and seed.sh do on their own.
+add_test(NAME orca.env_romm_version
+         COMMAND "${BASH_PROGRAM}" "${ORCA_ENV_TEST}" romm_version)
+
 set_tests_properties(orca.env_concurrent_writers orca.env_never_partial
                      orca.env_picks_python orca.env_replaces_dead_venv
-                     orca.env_setup_fails_fast
+                     orca.env_setup_fails_fast orca.env_romm_version
                      PROPERTIES TIMEOUT 60)
 
 # --- the Switch targets: sysmodule/, overlay/ and switch.mk ------------------

@@ -283,8 +283,36 @@ case "${1:-}" in
     echo "PASS: .env is never observed partially written"
     ;;
 
+  romm_version)
+    make_fixture
+    # Which RomM the fixture runs is a property of the worktree, not of one
+    # shell: compose.sh sources .env over the caller's environment, so a version
+    # that lived only in `ROMM_VERSION=... compose.sh up` would be overwritten
+    # by whatever .env said before compose ever read it.
+    env -u ROMM_VERSION "$FIXTURE/scripts/orca/env.sh" >/dev/null 2>&1 || fail "first run failed"
+    default="$(sed -n 's/^ROMM_VERSION=//p' "$FIXTURE/.env")"
+    [ -n "$default" ] || fail "env.sh wrote no ROMM_VERSION: $(cat "$FIXTURE/.env")"
+    # The compose file falls back to the same version when .env has none, and
+    # two defaults that disagree start one RomM and test against another.
+    grep -q "image: rommapp/romm:\${ROMM_VERSION:-$default}" "$REPO_ROOT/server/testing/docker-compose.yml" \
+      || fail "env.sh defaults to $default, and server/testing/docker-compose.yml does not"
+
+    ROMM_VERSION=9.9.9 "$FIXTURE/scripts/orca/env.sh" >/dev/null 2>&1 || fail "run with ROMM_VERSION failed"
+    [ "$(sed -n 's/^ROMM_VERSION=//p' "$FIXTURE/.env")" = 9.9.9 ] \
+      || fail "ROMM_VERSION=9.9.9 in the environment was not written to .env"
+
+    # Regenerating is routine -- compose.sh and seed.sh both do it -- and must
+    # not quietly move a worktree back onto the default RomM.
+    env -u ROMM_VERSION "$FIXTURE/scripts/orca/env.sh" >/dev/null 2>&1 || fail "re-run failed"
+    [ "$(sed -n 's/^ROMM_VERSION=//p' "$FIXTURE/.env")" = 9.9.9 ] \
+      || fail "a plain re-run reset ROMM_VERSION to $(sed -n 's/^ROMM_VERSION=//p' "$FIXTURE/.env")"
+    [ "$(grep -c '^ROMM_VERSION=' "$FIXTURE/.env")" = 1 ] \
+      || fail ".env carries ROMM_VERSION more than once: $(cat "$FIXTURE/.env")"
+    echo "PASS: .env names the RomM version, from the environment, else as it was, else $default"
+    ;;
+
   *)
-    echo "usage: $0 concurrent|readable|python|venv|setup_fails_fast" >&2
+    echo "usage: $0 concurrent|readable|python|venv|setup_fails_fast|romm_version" >&2
     exit 2
     ;;
 esac
