@@ -170,6 +170,10 @@ production RomM or a real library.
       already running* with **no second `SyncNow`** reaching the sysmodule — the
       screen refuses that press itself, so the two cases are told apart by what
       the sysmodule saw, not by what the panel says.
+    - **A** with auto-sync on, **from inside a game** — Tico's library screen
+      counts (M10-16, #242). Expect *Syncs when the game closes*, no move to
+      *Syncing*, and no `sync.tick` in the log while the game stays open. Close
+      the game: within a few seconds one `sync.tick` follows, and only one.
     - **Runtime pause is not the boot flag.** Turn auto-sync off here, then leave
       the overlay and confirm `sys-rommsync` is still resident and the status
       screen still answers. A screen that reads *sys-rommsync is not running*

@@ -822,6 +822,15 @@ bounds.
 
 - Offline / unreachable server → abort the tick cleanly, change nothing, retry
   next schedule. Missed ticks are harmless.
+- **No tick runs while a game is in the foreground** (M10-16, #242). A game
+  holds its save in memory and writes it when it closes — Tico does on exit —
+  so a save downloaded under it is overwritten with the old copy, which the next
+  tick uploads as the newest, and a save uploaded under it is the one from
+  before the session. A tick that falls due is held and the sysmodule asks
+  again every few seconds (`pmdmntGetApplicationProcessId`); one tick runs once
+  the game has closed, however many fell due. "Sync now" during a game is that
+  same tick (`SyncOutcome::kDeferred`). The download queue is not held — a rom is
+  not a save. `engine.foreground` holds this against the real RomM.
 - Partial plan failure → complete with the accurate `operations_failed`; leave
   unsynced files for next tick. Never leave a half-written save (write to temp,
   fsync, rename). An `action` this build does not recognise is counted with
