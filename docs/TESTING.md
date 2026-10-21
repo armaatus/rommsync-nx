@@ -129,7 +129,8 @@ the one `#156` was measured through. **That residue is 5.2.0-only** (#235):
 opened it — so a second run's negotiate leaves this one's session alone, and
 only the cleanup above could end it, which the claim files already prevent.
 The `RUN_SERIAL` lines in `tests/CMakeLists.txt` that cite #76 still stand for
-the fault proxy, which is shared whatever RomM does with sessions.
+the rest of the shared fixture — one library whose saves the rig tests upload
+and delete, and a per-IP rate limit — whatever RomM does with sessions.
 
 Two `ctest`s at once broke a second thing, on disk rather than on the wire, and
 for the same reason (#151). `ROMMSYNC_TEST_SCRATCH` is per build tree, so it kept

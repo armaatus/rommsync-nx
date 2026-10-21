@@ -745,8 +745,9 @@ fires it is the scheduler's (M7-2) and the overlay's (M4-2).
 first means the accounting succeeded — a retry landing after the first attempt
 got through looks exactly like it — and the other two mean the counts will never
 be recorded. `kSuperseded` is every `Session is already <status>` but
-`COMPLETED`: on 5.4.0, a session closed on purpose (#235). In all three the transfers already happened and the baseline is on
-the card, so the answer is the next tick's own negotiation.
+`COMPLETED`: on 5.4.0, a session closed on purpose (#235). In all three the
+transfers already happened and the baseline is on the card, so the answer is the
+next tick's own negotiation.
 
 ### What the tick says it did
 

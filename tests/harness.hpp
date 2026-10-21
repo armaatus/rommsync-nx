@@ -880,6 +880,12 @@ inline http::Result Negotiate(::checks::Checks& checks, http::HttpClient& client
 /// passing every time locally (issue #76). It was the only scenario that
 /// completed its session, so it was the only one that could notice.
 ///
+/// **That race is 5.2.0's.** 5.4.0 cancels nothing on negotiate -- a session
+/// belongs to the negotiation that opened it (#235) -- so a session left open
+/// stays open until RomM's 24-hour cleanup fails it, and races nothing. It is
+/// still closed here, so the fixture device's history does not fill with open
+/// sessions; the call sites that cite #76 describe the 5.2.0 reason.
+///
 /// Best effort by design: this is cleanup, and a scenario must not fail because
 /// tidying up did not work. Takes the negotiate response so a caller cannot
 /// close a session it did not open.

@@ -1374,7 +1374,7 @@ void CompleteClosed(rig::Checks& checks, http::HttpClient& client, const std::st
         rommsync::host::MakeNativeFileSystem(sandbox.root().string());
     UploadFixture arranged;
     if (!ArrangeUpload(checks, *files, sandbox, rom, "m10-9-closed", &arranged)) {
-      return;
+      continue;
     }
 
     sync::TickOptions options = OptionsAt(1'757'000'750);

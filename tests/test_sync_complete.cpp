@@ -952,8 +952,8 @@ void Session(rig::Checks& checks, http::HttpClient& client, const std::string& b
   // existed. Both are asserted rather than assumed because both are on the
   // ordinary path: `CompleteSession` retries a 5xx, so a first attempt that
   // reached RomM before the connection died makes the *second* one land here --
-  // and a tick that gave up on a negotiation completes an id the next negotiate
-  // already cancelled (docs/API_CONTRACT.md).
+  // and on 5.2.0 a tick that gave up on a negotiation completed an id the next
+  // negotiate had already cancelled -- which 5.4.0 no longer does; see below.
   const sync::Completion again = sync::CompleteSession(
       client, TokenFor(base, fixture), plan.session_id, tick.counts, {},
       FinishInstantly().complete);

@@ -848,7 +848,7 @@ inline std::string DiscoverLargeAsset(http::HttpClient& client, const std::strin
       continue;
     }
     for (std::string& linked : detail::AssetLinks(css.response.body, "/assets/", "")) {
-      if (linked.size() > 3 && linked.substr(linked.size() - 4) != ".css") {
+      if (linked.size() >= 4 && linked.substr(linked.size() - 4) != ".css") {
         candidates.push_back(std::move(linked));
       }
     }
