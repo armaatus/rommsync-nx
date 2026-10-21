@@ -509,14 +509,16 @@ add_test(NAME overlay.settings COMMAND test_overlay_settings)
 # `<switch.h>`, and `sysmodule/source/ipc` as `"result.hpp"`.
 add_executable(test_overlay_native
   test_overlay_native.cpp
+  count_new.cpp
   "${CMAKE_SOURCE_DIR}/tests/hostswitch/switch.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/card_probe.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/conflicts_pump.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/ipc_client.cpp"
+  "${CMAKE_SOURCE_DIR}/overlay/source/lifecycle.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/screen_frame.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/status_paint.cpp"
   "${CMAKE_SOURCE_DIR}/sysmodule/source/ipc/result.cpp")
-target_link_libraries(test_overlay_native PRIVATE rommsync::core)
+target_link_libraries(test_overlay_native PRIVATE rommsync::core Threads::Threads)
 target_include_directories(test_overlay_native PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}"
   "${CMAKE_SOURCE_DIR}/tests/hostswitch"
@@ -525,6 +527,16 @@ target_include_directories(test_overlay_native PRIVATE
 target_compile_definitions(test_overlay_native PRIVATE
   ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
   ROMMSYNC_OVERLAY_SOURCE_DIR="${CMAKE_SOURCE_DIR}/overlay/source")
+# `overlay.cycles` balances the heap across repeated open/close cycles with
+# `count_new.hpp` (#209), so allocation elision is off here for the reason it is
+# off for `test_heap_steady` below: a count that passes because a `new` never
+# happened passes for the wrong reason.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  target_compile_options(test_overlay_native PRIVATE
+    -fno-builtin-operator-new -fno-builtin-operator-delete)
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  target_compile_options(test_overlay_native PRIVATE -fno-allocation-dce)
+endif()
 
 foreach(scenario
         card       # the card the status screen reads when nothing answers
@@ -534,6 +546,8 @@ foreach(scenario
         errors     # a refusal is not a transport failure, and neither is a bad payload
         timeout    # a sysmodule that does not answer holds no frame past one budget
         restore    # a restore that is still copying holds no frame at all
+        cycles     # every exit path gives back everything, the same way, every time
+        hidden     # polling is by showing, because update() stops while hidden
         portable   # the half of a screen that must keep compiling on a host
         draw)      # what the status screen actually asks to be drawn
   add_test(NAME overlay.${scenario} COMMAND test_overlay_native ${scenario})

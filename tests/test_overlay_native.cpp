@@ -45,6 +45,7 @@
 #include <vector>
 
 #include "checks.hpp"
+#include "count_new.hpp"
 #include "fake_engine.hpp"
 #include "scratch.hpp"
 
@@ -60,6 +61,7 @@
 #include "conflicts_pump.hpp"
 #include "draw_list.hpp"
 #include "ipc_client.hpp"
+#include "lifecycle.hpp"
 #include "prompts.hpp"
 #include "result.hpp"
 #include "screen_frame.hpp"
@@ -1011,6 +1013,328 @@ int RunRestore(Checks& checks) {
   return checks.failures();
 }
 
+// --- overlay.cycles -----------------------------------------------------------
+
+std::string WithoutComment(const std::string& line);  // overlay.portable's, below
+
+/// Every `requestForeground` the lifecycle made, in order. A plain function
+/// rather than a lambda with captures, because on a console it is libtesla's
+/// free function and `Lifecycle` takes a function pointer.
+std::vector<bool>& ForegroundCalls() {
+  static std::vector<bool> calls;
+  return calls;
+}
+void RecordForeground(bool enabled) { ForegroundCalls().push_back(enabled); }
+
+/// `RommsyncOverlay`, minus `tsl::Overlay`: the client and the lifecycle it
+/// owns, declared in the same order `main.cpp` declares them.
+struct OverlayUnderTest {
+  overlay::IpcClient client{kTestBudget};
+  overlay::Lifecycle lifecycle{client, &RecordForeground};
+};
+
+/// One way libtesla's loop ends, as our overlay's hooks see it.
+///
+/// Read off `tsl::loop` in the pinned `tesla.hpp`. Every `break` out of its
+/// outer loop -- B at the root of the gui stack (`shouldClose`), a close
+/// requested while hidden (`shouldCloseAfter`), another overlay being launched
+/// (`launchingOverlay`), and the launch combo pressed over a notification while
+/// hidden (`exitAfterPrompt`) -- lands on one tail: `requestForeground(false)`,
+/// `exitScreen()`, `exitServices()`, `delete overlay`. What differs between them
+/// is only how many times the overlay was shown first, and `RunCycles` greps
+/// that tail so the table cannot drift from the library. The fifth row is the
+/// path nothing in the pinned library takes and a bump could: the overlay
+/// deleted without `exitServices` -- which the destructor has to cover, because
+/// nx-ovlloader's process never exits and anything left open is open for the
+/// life of the console (libtesla#37, Ultrahand#278).
+struct ExitPath {
+  const char* name;
+  int shows;
+  bool exit_services;
+};
+
+constexpr ExitPath kExitPaths[] = {
+    {"B at the root (shouldClose)", 1, true},
+    {"closed while hidden (shouldCloseAfter)", 2, true},
+    {"another overlay launched (launchingOverlay)", 1, true},
+    {"the combo over a hidden notification (exitAfterPrompt)", 0, true},
+    {"deleted without exitServices", 1, false},
+};
+
+/// How many times each path is driven. Enough that a counted resource leaking
+/// one per open runs out where Ultrahand#278's "sixth attempt" would.
+constexpr int kCycles = 8;
+
+/// `text` with every `//` comment removed, line by line.
+std::string CodeOnly(const std::string& text) {
+  std::string out;
+  std::size_t at = 0;
+  while (at < text.size()) {
+    std::size_t end = text.find('\n', at);
+    if (end == std::string::npos) {
+      end = text.size();
+    }
+    out += WithoutComment(text.substr(at, end - at));
+    out += '\n';
+    at = end + 1;
+  }
+  return out;
+}
+
+std::string ReadWhole(const std::filesystem::path& path) {
+  std::ifstream file(path);
+  return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+}
+
+bool IsIdentifier(char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+/// `word` as a whole token: `return`, and not `returning` or `returnPath`.
+std::size_t CountWord(const std::string& haystack, std::string_view word) {
+  std::size_t count = 0;
+  for (std::size_t at = haystack.find(word); at != std::string::npos;
+       at = haystack.find(word, at + word.size())) {
+    const bool starts = at == 0 || !IsIdentifier(haystack[at - 1]);
+    const std::size_t after = at + word.size();
+    const bool ends = after >= haystack.size() || !IsIdentifier(haystack[after]);
+    if (starts && ends) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+std::size_t Count(const std::string& haystack, std::string_view needle) {
+  std::size_t count = 0;
+  for (std::size_t at = haystack.find(needle); at != std::string::npos;
+       at = haystack.find(needle, at + needle.size())) {
+    ++count;
+  }
+  return count;
+}
+
+/// M9-6 (#209): every way the overlay closes gives back everything it took,
+/// and does it the same way.
+///
+/// nx-ovlloader branches back to `loadNro` when `main` returns, so the process
+/// never exits and nothing the kernel would reclaim at exit is reclaimed. The
+/// corpus rule is nx-ovlloader#41's: *normal teardown is safe; every other path
+/// leaks state only a reboot clears.* So the claim is per path, and per cycle.
+int RunCycles(Checks& checks) {
+  // The table above against the library it describes. A bump that grew a
+  // second exit -- a `return` out of the loop, a second `delete`, or the tail
+  // reordered so `exitServices` ran before input was released -- fails here
+  // rather than on the sixth open of somebody's console.
+  {
+    const std::string tesla = CodeOnly(ReadWhole(std::filesystem::path(ROMMSYNC_OVERLAY_SOURCE_DIR) /
+                                                 ".." / "lib" / "libultrahand" / "libtesla" /
+                                                 "include" / "tesla.hpp"));
+    const std::size_t begin = tesla.find("overlay = new TOverlay();");
+    const std::size_t end = tesla.find("delete overlay;", begin);
+    checks.Expect(begin != std::string::npos && end != std::string::npos,
+                  "the pinned tesla.hpp still creates and deletes the overlay in tsl::loop");
+    if (begin != std::string::npos && end != std::string::npos) {
+      const std::string loop = tesla.substr(begin, end - begin);
+      checks.ExpectEq(Count(tesla, "delete overlay;"), std::size_t{1},
+                      "the overlay is deleted in exactly one place");
+      checks.ExpectEq(Count(loop, "overlay->exitServices();"), std::size_t{1},
+                      "and exitServices is called in exactly one, before it");
+      checks.ExpectEq(CountWord(loop, "return"), std::size_t{0},
+                      "nothing returns out of tsl::loop between creating the overlay and its "
+                      "tail, so every exit reaches exitServices");
+      const std::size_t release = loop.rfind("hlp::requestForeground(false);");
+      const std::size_t screen = loop.rfind("overlay->exitScreen();");
+      const std::size_t services = loop.rfind("overlay->exitServices();");
+      checks.Expect(release != std::string::npos && release < screen && screen < services,
+                    "and the tail releases input and the panel before exitServices, so a "
+                    "Shutdown waiting on a stuck call holds neither");
+    }
+  }
+
+  // And `main.cpp` against the lifecycle: the four hooks go through it, so the
+  // host scenario below is the device's teardown and not a copy of it.
+  {
+    const std::string main = CodeOnly(ReadWhole(std::filesystem::path(ROMMSYNC_OVERLAY_SOURCE_DIR) /
+                                                "main.cpp"));
+    for (const char* wired : {"lifecycle_.Start()", "lifecycle_.Shown()", "lifecycle_.Stop()"}) {
+      checks.Expect(main.find(wired) != std::string::npos,
+                    std::string("main.cpp's hooks call ") + wired);
+    }
+    checks.Expect(main.find("client_.Close()") == std::string::npos,
+                  "and none of them closes the session around the lifecycle");
+  }
+
+  Console console;
+  console.Start();
+  const int workers_before = overlay::IpcClient::Workers();
+  std::optional<count_new::Snapshot> after_first_round;
+
+  for (int cycle = 0; cycle < kCycles; ++cycle) {
+    for (const ExitPath& path : kExitPaths) {
+      const std::string where = std::string(path.name) + ", cycle " + std::to_string(cycle);
+      ForegroundCalls().clear();
+      const int teardowns = overlay::Lifecycle::Teardowns();
+      {
+        auto under_test = std::make_unique<OverlayUnderTest>();
+        under_test->lifecycle.Start();  // initServices
+        // **Released before anything else**, on every open: a fresh instance
+        // after one that crashed holding input otherwise inherits it, and
+        // neither libtesla nor libultrahand gives it back (#209).
+        checks.Expect(ForegroundCalls() == std::vector<bool>{false},
+                      "the overlay gives input back the moment it starts: " + where);
+
+        overlay::ScreenFrame frame(under_test->client);
+        for (int show = 0; show < path.shows; ++show) {
+          under_test->lifecycle.Shown();
+          checks.Expect(frame.Ready() == overlay::Link::kOk, "a showing can talk: " + where);
+          ipc::Status status;
+          checks.Expect(R_SUCCEEDED(under_test->client.GetStatus(&status)),
+                        "and polls: " + where);
+        }
+        // One call that ran out of budget and is still out when the overlay
+        // closes -- the worst case for a teardown, released a moment later.
+        if (path.shows > 0) {
+          console.sysmodule().hold.Arm();
+          ipc::Status status;
+          checks.ExpectEq(under_test->client.GetStatus(&status), overlay::NotResponding(),
+                          "a call is left out: " + where);
+          std::thread releaser([&console] {
+            std::this_thread::sleep_for(std::chrono::milliseconds{20});
+            console.sysmodule().hold.Release();
+          });
+          if (path.exit_services) {
+            under_test->lifecycle.Stop();  // exitServices
+          }
+          under_test.reset();  // delete overlay
+          releaser.join();
+        } else {
+          if (path.exit_services) {
+            under_test->lifecycle.Stop();
+          }
+          under_test.reset();
+        }
+      }
+      checks.ExpectEq(overlay::Lifecycle::Teardowns(), teardowns + 1,
+                      "the one teardown ran exactly once: " + where);
+      checks.ExpectEq(hostswitch::OpenSessions(), 0, "no session is left open: " + where);
+      checks.ExpectEq(overlay::IpcClient::Workers(), workers_before,
+                      "no worker thread is left running: " + where);
+      checks.Expect(ForegroundCalls() == std::vector<bool>{false},
+                    "and teardown does not touch input -- libtesla's tail releases it: " + where);
+    }
+    // The heap, once the first round has paid for whatever is allocated once
+    // per process. Every round after it must give back exactly what it took.
+    if (count_new::kActive) {
+      const count_new::Snapshot now = count_new::Now();
+      if (!after_first_round.has_value()) {
+        after_first_round = now;
+      } else {
+        checks.ExpectEq(now.outstanding, after_first_round->outstanding,
+                        "round " + std::to_string(cycle) +
+                            " of open/close leaves as many blocks allocated as round 0 did");
+        checks.ExpectEq(now.outstanding_bytes, after_first_round->outstanding_bytes,
+                        "...and as many bytes");
+      }
+    }
+  }
+  return checks.failures();
+}
+
+// --- overlay.hidden -----------------------------------------------------------
+
+/// M9-6 (#209): `update()` does not run while the overlay is hidden.
+///
+/// `tsl::loop` waits on the combo event with no timeout, so the process stays
+/// resident with its gui stack frozen -- and a screen that counted frames to
+/// decide when to poll again comes back from a hide mid-count, drawing what it
+/// read before the hide as though it were current. `Cadence` is the one clock a
+/// screen polls by, and it is due on the first frame of every showing.
+int RunHidden(Checks& checks) {
+  Console console;
+  console.Start();
+  overlay::IpcClient client(kTestBudget);
+  overlay::Lifecycle lifecycle(client, &RecordForeground);
+  lifecycle.Start();
+  lifecycle.Shown();
+
+  overlay::Cadence every_thirty(30);
+  checks.Expect(every_thirty.Due(), "the first frame polls, rather than drawing nothing");
+  int skipped = 0;
+  while (!every_thirty.Due() && skipped < 100) {
+    ++skipped;
+  }
+  checks.ExpectEq(skipped, 29, "and then once every thirty frames");
+
+  // Ten frames in, the overlay is hidden and shown again. However long it was
+  // hidden, nothing ran in between -- so the count says ten frames and the
+  // clock on the wall says anything at all.
+  for (int frame = 0; frame < 10; ++frame) {
+    checks.Expect(!every_thirty.Due(), "mid-cadence frames do not poll");
+  }
+  lifecycle.Shown();
+  checks.Expect(every_thirty.Due(),
+                "the first frame after a showing polls, whatever the count said: a screen "
+                "that assumed its polling continued while hidden would draw stale data here");
+  checks.Expect(!every_thirty.Due(), "and the cadence starts again from that poll");
+
+  // A cadence of one is every frame, which is what the status screen polls at.
+  overlay::Cadence every_frame(1);
+  for (int frame = 0; frame < 5; ++frame) {
+    checks.Expect(every_frame.Due(), "a cadence of one polls every frame");
+  }
+
+  // A press asks for a poll on the next frame rather than waiting out the count.
+  for (int frame = 0; frame < 3; ++frame) {
+    every_thirty.Due();
+  }
+  every_thirty.Expire();
+  checks.Expect(every_thirty.Due(), "Expire makes the next frame poll");
+
+  // **No screen keeps a frame count of its own.** A member a screen increments
+  // or decrements is a clock that stops while the overlay is hidden and
+  // resumes as though it had not; `Cadence` is the one that knows about
+  // showings. A grep, because none of the screens' `update()`s is reachable
+  // from a test.
+  for (const std::filesystem::directory_entry& entry :
+       std::filesystem::directory_iterator(ROMMSYNC_OVERLAY_SOURCE_DIR)) {
+    const std::string name = entry.path().filename().string();
+    if (name.find("_screen.") == std::string::npos) {
+      continue;
+    }
+    std::ifstream file(entry.path());
+    std::string line;
+    int number = 0;
+    while (std::getline(file, line)) {
+      ++number;
+      const std::string code = WithoutComment(line);
+      for (std::size_t at = code.find("++"); at != std::string::npos; at = code.find("++", at + 2)) {
+        const bool member_before = at > 0 && code[at - 1] == '_';
+        const std::size_t after = code.find_first_not_of(
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_", at + 2);
+        const bool member_after = after != std::string::npos && after > at + 2 &&
+                                  code[after - 1] == '_';
+        checks.Expect(!member_before && !member_after,
+                      name + ":" + std::to_string(number) +
+                          " counts frames in a member of its own; poll through Cadence, which "
+                          "knows the overlay was hidden (lifecycle.hpp)");
+      }
+      for (std::size_t at = code.find("--"); at != std::string::npos; at = code.find("--", at + 2)) {
+        const bool member_before = at > 0 && code[at - 1] == '_';
+        const std::size_t after = code.find_first_not_of(
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_", at + 2);
+        const bool member_after = after != std::string::npos && after > at + 2 &&
+                                  code[after - 1] == '_';
+        checks.Expect(!member_before && !member_after,
+                      name + ":" + std::to_string(number) +
+                          " counts frames in a member of its own; poll through Cadence");
+      }
+    }
+  }
+  lifecycle.Stop();
+  return checks.failures();
+}
+
 // --- overlay.portable ---------------------------------------------------------
 
 /// The files that are only host-compilable because they name no libultrahand
@@ -1026,6 +1350,7 @@ int RunRestore(Checks& checks) {
 constexpr const char* kPortableFiles[] = {
     "draw_list.hpp",    "prompts.hpp",      "screen_frame.hpp",   "screen_frame.cpp",
     "status_paint.hpp", "status_paint.cpp", "conflicts_pump.hpp", "conflicts_pump.cpp",
+    "lifecycle.hpp",    "lifecycle.cpp",
 };
 
 /// What none of them may name. `card_probe` and `ipc_client` are deliberately
@@ -1381,6 +1706,12 @@ int main(int argc, char** argv) {
   if (scenario == "errors") {
     return RunErrors(checks);
   }
+  if (scenario == "cycles") {
+    return RunCycles(checks);
+  }
+  if (scenario == "hidden") {
+    return RunHidden(checks);
+  }
   if (scenario == "restore") {
     return RunRestore(checks);
   }
@@ -1394,6 +1725,6 @@ int main(int argc, char** argv) {
     return RunDraw(checks);
   }
   std::cerr << "usage: test_overlay_native "
-               "<card|wire|roundtrip|version|errors|portable|draw>\n";
+               "<card|wire|roundtrip|version|errors|timeout|restore|cycles|hidden|portable|draw>\n";
   return 2;
 }
