@@ -4201,20 +4201,20 @@ bool PointAtTheRig(Console& console, rig::Checks& c, const std::string& base,
 }
 
 /// Press Sync now and wait for that tick to end.
-bool TickOnce(Console& console, rig::Checks& c, const std::string& what) {
-  const int before = TicksLogged(console.Log());
+bool TickOnce(Console& console, const TickLines& ticks, rig::Checks& c, const std::string& what) {
+  const int before = ticks.ticks();
   if (console.SyncNow() != ipc::SyncOutcome::kAccepted) {
     c.Expect(false, what + ": Sync now starts a tick");
     return false;
   }
   const std::chrono::steady_clock::time_point deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds{120};
-  while ((TicksLogged(console.Log()) <= before || console.Status().sync_in_progress) &&
+  while ((ticks.ticks() <= before || console.Status().sync_in_progress) &&
          std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds{25});
   }
   const ipc::Status status = console.Status();
-  const bool ran = TicksLogged(console.Log()) > before && !status.sync_in_progress;
+  const bool ran = ticks.ticks() > before && !status.sync_in_progress;
   c.Expect(ran && status.last_sync_result == ipc::SyncResult::kOk,
            what + ": the tick ran clean -- " + ipc::ToString(status.last_sync_result) +
                Rendered(console.Log()));
@@ -4247,6 +4247,7 @@ int Interop(http::HttpClient& client, const std::string& base) {
   const std::string stamp = harness::UniqueSlot("interop");
 
   rlog::Reset();
+  const TickLines ticks;
   Console console(c, "engine-interop");
   if (!PointAtTheRig(console, c, base, fixture, device_id)) {
     return c.failures();
@@ -4270,7 +4271,7 @@ int Interop(http::HttpClient& client, const std::string& base) {
   console.engine.StartWorker();
 
   // RetroArch -> Switch.
-  TickOnce(console, c, "RetroArch to Switch");
+  TickOnce(console, ticks, c, "RetroArch to Switch");
   c.ExpectEq(console.sandbox.Read(save), retroarch,
              "RetroArch's save is in Tico's gba folder, under Tico's own name");
   c.Expect(console.sandbox.HasBackupOf(older), "with the Switch's own bytes under .backup/");
@@ -4282,7 +4283,7 @@ int Interop(http::HttpClient& client, const std::string& base) {
   harness::PassASecond();
   const std::string played = "the switch played on from there " + stamp + "\n";
   console.sandbox.Reseed(save, played);
-  TickOnce(console, c, "Switch to RetroArch");
+  TickOnce(console, ticks, c, "Switch to RetroArch");
   const http::Result served =
       AsRetroArch(client, base, http::Method::kGet, "saves/mGBA/240pee_mb.srm");
   c.Expect(served.successful() && served.response.body == played,
@@ -4401,6 +4402,7 @@ int Upgrade(http::HttpClient& client, const std::string& base) {
   const std::string stamp = harness::UniqueSlot("upgrade");
 
   rlog::Reset();
+  const TickLines ticks;
   Console console(c, "engine-upgrade");
   if (!PointAtTheRig(console, c, base, fixture, device_id)) {
     return c.failures();
@@ -4456,7 +4458,7 @@ int Upgrade(http::HttpClient& client, const std::string& base) {
   console.engine.UseServer(&client, fixture.token);
   console.engine.UseCard(card.get());
   console.engine.StartWorker();
-  TickOnce(console, c, "the first tick after the upgrade");
+  TickOnce(console, ticks, c, "the first tick after the upgrade");
 
   const std::vector<ServerRow> empty_rows = RowsFor(client, base, fixture, empty.rom_id, "autosave");
   c.Expect(empty_rows.size() == 1 && empty_rows[0].content_hash == crypto::Md5Hex(empty.bytes) &&
@@ -4492,7 +4494,7 @@ int Upgrade(http::HttpClient& client, const std::string& base) {
            "state.db is version 3, with nothing left under the old slot:\n" + state_db);
 
   // The second tick: nothing to send.
-  TickOnce(console, c, "the second tick");
+  TickOnce(console, ticks, c, "the second tick");
   for (const Game& game : games) {
     c.ExpectEq(RowsFor(client, base, fixture, game.rom_id, "autosave").size(), std::size_t{1},
                std::string(game.rom_file) + ": no duplicate upload on the second tick");
