@@ -2249,6 +2249,7 @@ set(ENGINE_RIG_SCENARIOS
   drains       # M9-5: a rom queued over IPC becomes a file on the card
   romm_version # M10-2: the server's version is read first, and below the floor nothing is asked
   tico_accounts  # #231: two Tico accounts and none named reach the settings screen
+  foreground   # #242: no tick under a running game, and one after it closes
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})

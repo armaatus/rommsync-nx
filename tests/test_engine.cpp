@@ -56,6 +56,9 @@
 //                acknowledgement, and nothing goes out until MinimumAwake
 //   sleep_download -- M9-4: a rom in flight at SleepReady is stopped, and the worker
 //                is back from download::Drain before the acknowledgement
+//   foreground -- M10-16: nothing reaches the server or the card while a game
+//                runs, and one tick runs once it closes
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -85,6 +88,7 @@
 #include "rommsync/host/curl_http_client.hpp"
 #include "rommsync/host/native_file_system.hpp"
 #include "rommsync/ipc.hpp"
+#include "rommsync/json.hpp"
 #include "rommsync/log.hpp"
 #include "rommsync/overlay_status_view.hpp"
 #include "rommsync/pairing.hpp"
@@ -3416,6 +3420,162 @@ int TicoAccounts(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// Every save row RomM holds for `rom_id`, by id.
+std::vector<std::int64_t> SaveIdsFor(http::HttpClient& client, const std::string& base,
+                                     const harness::Fixture& fixture, std::int64_t rom_id) {
+  const http::Result listed = client.Send(harness::Authed(
+      http::Method::kGet, base + "/api/saves?rom_id=" + std::to_string(rom_id), fixture));
+  const rommsync::json::ParseResult parsed = rommsync::json::Parse(listed.response.body);
+  std::vector<std::int64_t> ids;
+  if (listed.successful() && parsed.ok() && parsed.value.is_array()) {
+    for (const rommsync::json::Value& save : parsed.value.elements()) {
+      ids.push_back(harness::Number(save, "id"));
+    }
+  }
+  return ids;
+}
+
+/// How many `sync.tick` lines the log holds: one per tick that ran, whatever
+/// ended it (`LogTickEnd`).
+int TicksLogged(const ipc::LogTail& tail) {
+  int ticks = 0;
+  for (const std::string& line : tail.lines) {
+    ticks += line.find(" sync.tick ") != std::string::npos ? 1 : 0;
+  }
+  return ticks;
+}
+
+/// M10-16 (#242): nothing is downloaded, placed or uploaded while a game runs,
+/// and **one** tick runs once it closes.
+///
+/// Against the real RomM, on a device of its own with no history, so the tick
+/// that finally runs has something real to do: the save on the card is not on
+/// the server, and negotiate plans its upload. That is what makes "nothing was
+/// uploaded while the game ran" a claim about a tick that *would* have, rather
+/// than about one with nothing to send. The game is a fake foreground probe --
+/// `pm:dmnt` is the console's half and no host can reach it.
+///
+/// Two ticks fall due under the game -- the boot tick and two presses -- and one
+/// runs after it, which is #37's coalescing doing what it already did for a
+/// suspend.
+int Foreground(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom),
+           "the fixture library has nova.nes");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  const std::string device_id =
+      harness::CreateDevice(c, client, base, fixture, "engine-foreground");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+  const std::vector<std::int64_t> before = SaveIdsFor(client, base, fixture, rom.id);
+
+  rlog::Reset();
+  Console console(c, "engine-foreground");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = " + base +
+                                     "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                     // The boot tick is the scheduled one, and it
+                                     // falls due the instant the worker starts --
+                                     // under the game.
+                                     "on_boot = true\nstates = false\n"),
+           "the console points at the rig");
+  auth::StoredToken token;
+  token.server_url = base;
+  token.access_token = fixture.token;
+  token.device_id = device_id;
+  token.scopes = {"roms.read"};
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+           "paired, as a device RomM has never seen sync");
+
+  // Tico's layout rather than RetroArch's: what is under test is the hold, not
+  // which folder a save is found in.
+  const std::string save = "/tico/saves/nes/nova.srm";
+  console.sandbox.MakeDirs("/tico/saves/nes");
+  const std::string played = "what the game had on the card when it started\n";
+  c.Expect(console.sandbox.Write(save, played), "a save on the card the server does not have");
+
+  std::atomic<bool> running{true};
+  Throttled counted(client, std::chrono::milliseconds{0});
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseForegroundProbe([&running] { return running.load(); },
+                                    std::chrono::milliseconds{50});
+  console.engine.UseServer(&counted, token.access_token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kDeferred,
+           "Sync now under the game is taken, and says it waits for the game");
+  std::this_thread::sleep_for(std::chrono::milliseconds{500});
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kDeferred,
+           "and a second press is the same held tick, not a tick already running");
+  // Twenty of the worker's re-polls, and every one of them finds the game.
+  std::this_thread::sleep_for(std::chrono::seconds{1});
+
+  c.ExpectEq(counted.sent().size(), std::size_t{0},
+             "nothing reached the server while the game ran: no negotiate, no upload, no "
+             "download");
+  const std::vector<std::int64_t> during = SaveIdsFor(client, base, fixture, rom.id);
+  c.ExpectEq(during.size(), before.size(), "so RomM holds no new save for the rom");
+  c.ExpectEq(console.sandbox.Read(save), played, "and the save on the card is untouched");
+  c.Expect(!console.sandbox.Exists("/config/rommsync/state.db"),
+           "no tick recorded a baseline, because no tick ran");
+  c.Expect(!console.sandbox.Exists("/config/rommsync/play.db"),
+           "and none stamped the play window: a held tick did not look at the saves, so "
+           "the session the game is in is not cut in half (#39)");
+  const ipc::Status held = console.Status();
+  c.Expect(!held.sync_in_progress, "the status screen does not draw a held tick as syncing");
+  c.Expect(held.last_sync_result == ipc::SyncResult::kNever, "nor as one that ran");
+  const ipc::LogTail held_log = console.Log();
+  c.ExpectEq(TicksLogged(held_log), 0, "the log has no tick in it:" + Rendered(held_log));
+  c.Expect(Logged(held_log, "sync.held"), "and says why:" + Rendered(held_log));
+
+  // The game closes.
+  running = false;
+  const ipc::Status after = Until(
+      console,
+      [](const ipc::Status& status) {
+        return status.last_sync_result != ipc::SyncResult::kNever && !status.sync_in_progress;
+      },
+      std::chrono::seconds{60});
+  c.Expect(after.last_sync_result == ipc::SyncResult::kOk ||
+               after.last_sync_result == ipc::SyncResult::kPartial,
+           std::string("a tick runs once it has, and reaches the server: ") +
+               ipc::ToString(after.last_sync_result));
+  // Long enough for a second tick to show itself if the held ones had been
+  // queued rather than coalesced.
+  std::this_thread::sleep_for(std::chrono::seconds{1});
+  const ipc::LogTail done_log = console.Log();
+  c.ExpectEq(TicksLogged(done_log), 1,
+             "exactly one: the boot tick and both presses were the same tick" +
+                 Rendered(done_log));
+
+  std::vector<std::int64_t> uploaded;
+  for (const std::int64_t id : SaveIdsFor(client, base, fixture, rom.id)) {
+    if (std::find(before.begin(), before.end(), id) == before.end()) {
+      uploaded.push_back(id);
+    }
+  }
+  c.ExpectEq(uploaded.size(), std::size_t{1}, "and that tick uploaded the save, once");
+  c.ExpectEq(console.sandbox.Read(save), played, "which it read and did not rewrite");
+
+  for (const std::int64_t id : uploaded) {
+    harness::DeleteSave(client, base, fixture, id);
+  }
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
 /// The scenarios that need the docker RomM, by name. A table rather than a
 /// second `if` chain, so the list of them is written down once.
 struct RigScenario {
@@ -3439,6 +3599,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"shutdown", DrainShutdown},
       {"sleep_download", SleepDownload},
       {"romm_version", RommVersion},
+      {"foreground", Foreground},
       {"tico_accounts", TicoAccounts},
   };
   for (const RigScenario& scenario : kRigScenarios) {

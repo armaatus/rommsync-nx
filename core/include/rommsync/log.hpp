@@ -176,6 +176,11 @@ enum class Event {
   /// before anything was asked of it (#228). Written every tick until the
   /// server is upgraded, because the remedy is not on the console.
   kServerUnsupported,
+  /// A tick fell due while a game was running, and waits for it to close
+  /// (M10-16, #242). Once per hold, not once per re-check: a game played for
+  /// three hours is one line. The tick that runs afterwards ends `sync.tick` as
+  /// every tick does.
+  kSyncHeld,
 };
 
 /// Every event, in declaration order. The guide and the emitted set are both
@@ -188,6 +193,7 @@ inline constexpr std::array kAllEvents = {
     Event::kSyncRefused, Event::kSyncTick,    Event::kSaveFailed,
     Event::kDownload,    Event::kPlayFailed,  Event::kPower,
     Event::kServerVersion, Event::kServerUnsupported,
+    Event::kSyncHeld,
 };
 
 /// Stable tag -- `net.offline`. Never null.

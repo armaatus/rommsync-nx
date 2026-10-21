@@ -402,9 +402,12 @@ inline http::Result PostJson(http::HttpClient& client, const std::string& url,
 /// process negotiates as the fixture device, so turning *that* one off would
 /// fail whichever test was mid-tick on it. The fixture token can do this
 /// because pairing granted `devices.write`. `DeleteDevice` removes it.
-inline std::string CreateSyncDisabledDevice(rig::Checks& checks, http::HttpClient& client,
-                                            const std::string& base, const Fixture& fixture,
-                                            const std::string& name) {
+/// A second device of the fixture user's, with sync on -- a console with no
+/// history at all, so its first tick uploads what is on its card rather than
+/// negotiating against whatever the fixture device has done (#242).
+inline std::string CreateDevice(rig::Checks& checks, http::HttpClient& client,
+                                const std::string& base, const Fixture& fixture,
+                                const std::string& name) {
   const http::Result created =
       PostJson(client, base + "/api/devices", fixture,
                "{\"name\":" + json::Quote(name + "-" + std::to_string(getpid())) +
@@ -413,6 +416,13 @@ inline std::string CreateSyncDisabledDevice(rig::Checks& checks, http::HttpClien
   checks.Expect(created.successful() && !device_id.empty(),
                 "RomM registers a second device: HTTP " +
                     std::to_string(created.response.status));
+  return device_id;
+}
+
+inline std::string CreateSyncDisabledDevice(rig::Checks& checks, http::HttpClient& client,
+                                            const std::string& base, const Fixture& fixture,
+                                            const std::string& name) {
+  const std::string device_id = CreateDevice(checks, client, base, fixture, name);
   if (device_id.empty()) {
     return {};
   }

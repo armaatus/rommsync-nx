@@ -63,6 +63,9 @@ SECTIONS = [
     # meet, and it needs a section saying that a single one is the client
     # working rather than a fault to report.
     "The console slept mid-sync",
+    # M10-16 (#242). `sync.held` is a tag the code writes, and "my save did not
+    # sync" while a game is open is the one thing a user will see of it.
+    "Nothing syncs while a game is open",
     "What to attach to a bug report",
     "What this page cannot tell you yet",
 ]

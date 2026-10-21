@@ -107,6 +107,7 @@ and a log is not worth it. A save is never in that position; see
 | `power.sleep` | the console went to sleep while this client was still busy | [The console slept mid-sync](#the-console-slept-mid-sync) |
 | `server.version` | which RomM release the server says it runs — once a boot and once a pairing | [What to attach to a bug report](#what-to-attach-to-a-bug-report) |
 | `server.unsupported` | the server is older than RomM 5.4.0, so nothing is synced with it | [RomM is too old](#romm-is-too-old) |
+| `sync.held` | a sync fell due while a game was open, and waits for it to close | [Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open) |
 
 The overlay shows the end of the log under **Settings → Log**, read off the
 sysmodule over IPC — `GetLog`, command 16 in
@@ -612,6 +613,37 @@ line after putting the console to sleep during a sync is the client working.
 
 **Nothing here needs fixing on the console.** There is no setting for it, and
 there is nothing to turn off.
+
+---
+
+## Nothing syncs while a game is open
+
+**Symptom.** You pressed "Sync now" from the overlay during a game and it said
+*Syncs when the game closes*, or the log shows a sync waiting and nothing after it:
+
+```
+21 info sync.held a game is running; the interval tick waits until it closes
+```
+
+**What it means, and why it is not a bug.** While a game — a retail game, Tico,
+or RetroArch launched over a title — is open, `sys-rommsync` downloads, places
+and uploads no save. A game keeps its save in memory and writes it when it
+closes, so a newer save downloaded under it would be overwritten with the old
+one the moment you quit, and a save uploaded under it would be the one from
+before you started playing. Tico's library screen counts as a game too: it is
+the same application its emulators run in.
+
+**What happens next.** One sync runs within a few seconds of the game closing,
+however many fell due while it was open, and ends with the usual `sync.tick`
+line. A "Sync now" pressed during the game is that same sync. Downloads from
+the queue are not held — a rom is not a save — so a rom queued from the overlay
+mid-game still comes down.
+
+**When to report it.** If a `sync.held` line is never followed by a `sync.tick`
+after you have closed the game and gone back to the HOME Menu, attach the log
+([What to attach to a bug report](#what-to-attach-to-a-bug-report)). RetroArch
+started from the album rather than over a title is not seen as a game, which is
+a known gap rather than this failing.
 
 ---
 

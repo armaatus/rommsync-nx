@@ -150,6 +150,19 @@ inline constexpr std::chrono::milliseconds kNoDownloadDeadline =
 /// ever find out.
 inline constexpr std::chrono::milliseconds kQuiesceBudget{3'000};
 
+/// How often the worker asks whether the game has closed, **while a tick is
+/// held for it** and at no other time (M10-16, #242).
+///
+/// A poll, because nothing on Horizon says when an application exits without
+/// taking something from another process: `pmdmntHookToCreateApplicationProcess`
+/// is a single hook Atmosphere's own `dmnt:cht` holds, and pm does not start an
+/// application it is hooked for until the hooker says so; `pm:shell`'s process
+/// event is `ns`'s. So the answer is `pmdmntGetApplicationProcessId`, asked on a
+/// timer. Five seconds is one IPC round trip to `pm` -- nothing beside a game
+/// that is drawing sixty frames a second -- and is how late the sync after a
+/// game is, at most. A console with no tick held never asks at all.
+inline constexpr std::chrono::milliseconds kForegroundPollInterval{5'000};
+
 /// What a pairing attempt needs that neither `core/` nor this file can supply.
 ///
 /// Both are platform facilities. `core/` may not name a transport (hard rule 4),
@@ -310,6 +323,35 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// and returns.
   using NetworkProbe = std::function<bool()>;
   void UseNetworkProbe(NetworkProbe probe);
+
+  /// Whether an application -- a retail game, Tico, RetroArch launched over a
+  /// title -- is in the foreground right now (M10-16, #242).
+  ///
+  /// **A tick never runs while it says yes.** A game holds its save in memory
+  /// and writes it when it closes -- Tico on exit -- so a download placed under
+  /// it is overwritten with the old copy, which the next tick uploads as the
+  /// newest; and an upload under it sends the save as it was before the
+  /// session. So a tick that falls due is handed back to the scheduler
+  /// (`sync::Scheduler::Defer`), the worker asks again every `poll`, and the
+  /// first answer of no runs **one** tick for everything that fell due.
+  ///
+  /// Injected for `NetworkProbe`'s reason: `pm:dmnt` is libnx and this file
+  /// names no libnx type. Null -- what a host build and a console whose `pm:dmnt`
+  /// did not come up pass -- is "nothing is running", which is the client as it
+  /// was before #242 rather than one that never syncs. Called on the worker and
+  /// on the IPC thread (`application_running`), never under `mutex_`, so it has
+  /// to be safe from both; a libnx service call is.
+  ///
+  /// The download queue and the list pages are **not** held: a rom is not a
+  /// save, and the overlay is used from inside a game, so a rom queued there
+  /// that waited for the game to close would be the queue screen not working.
+  using ForegroundProbe = std::function<bool()>;
+  void UseForegroundProbe(ForegroundProbe probe,
+                          std::chrono::milliseconds poll = kForegroundPollInterval);
+
+  /// The probe's answer, now. `ipc::ServiceCore::SyncNow` reads it to say a
+  /// press is held rather than started (`ipc::SyncOutcome::kDeferred`).
+  bool application_running() const override;
 
   /// The network the library is read over, and the token to read it with.
   ///
@@ -1126,6 +1168,16 @@ class SdEngine : public ipc::Engine, public power::Sink {
 
   /// Whether the console is on a network. Null means "up".
   NetworkProbe network_probe_;
+
+  /// Whether a game is in the foreground, and how often to ask while a tick
+  /// waits for it (#242). Null means "nothing is running". Both guarded by
+  /// `mutex_`, and the probe is copied out and called outside it.
+  ForegroundProbe foreground_probe_;
+  std::chrono::milliseconds foreground_poll_ = kForegroundPollInterval;
+
+  /// A tick is being held for a running game. Only the worker touches it; it
+  /// is what makes `sync.held` one line per game rather than one per re-check.
+  bool holding_ = false;
 
   /// Bumped by every command that gives the worker something to do, under
   /// `mutex_`, and read by the worker as part of its wait predicate.

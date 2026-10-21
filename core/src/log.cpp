@@ -345,6 +345,8 @@ const char* ToString(Event event) {
       return "server.version";
     case Event::kServerUnsupported:
       return "server.unsupported";
+    case Event::kSyncHeld:
+      return "sync.held";
   }
   return "unknown";
 }

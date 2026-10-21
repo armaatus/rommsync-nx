@@ -142,6 +142,23 @@ void SdEngine::UseNetworkProbe(NetworkProbe probe) {
   network_probe_ = std::move(probe);
 }
 
+void SdEngine::UseForegroundProbe(ForegroundProbe probe, std::chrono::milliseconds poll) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  foreground_probe_ = std::move(probe);
+  foreground_poll_ = poll;
+}
+
+bool SdEngine::application_running() const {
+  ForegroundProbe probe;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    probe = foreground_probe_;
+  }
+  // Outside the lock: on a console this is a service call to `pm`, and
+  // `mutex_` guards what the frame-polled commands read.
+  return probe && probe();
+}
+
 void SdEngine::Wake() {
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -965,14 +982,41 @@ void SdEngine::RunWorker() {
     // gives this thread work bumps it under `mutex_`, so a notification that
     // lands while the lock is released below cannot be missed. See `wakes_`.
     const std::uint64_t decided_at = wakes_;
-    const sync::Decision decision = scheduler_.Poll();
+    sync::Decision decision = scheduler_.Poll();
     if (decision.run()) {
-      sync_in_progress_ = true;
+      // Asked only now, when a tick is actually due: a console with nothing to
+      // run never asks `pm` anything (#242).
       lock.unlock();
-      RunOneTick();
+      const bool game = application_running();
       lock.lock();
-      sync_in_progress_ = false;
-      continue;
+      if (!game) {
+        holding_ = false;
+        sync_in_progress_ = true;
+        lock.unlock();
+        RunOneTick();
+        lock.lock();
+        sync_in_progress_ = false;
+        continue;
+      }
+      // **Held, not run, and not lost.** A game holds its save in memory and
+      // writes it when it closes, so a download placed under it is overwritten
+      // and an upload under it sends the save from before the session (#242).
+      // The scheduler gets the tick back, and the loop below re-asks every
+      // `foreground_poll_` -- the one deadline this adds, and only while a tick
+      // is owed. However many fall due meanwhile, one runs when the game closes.
+      scheduler_.Defer(decision.trigger);
+      const bool first = !holding_;
+      holding_ = true;
+      if (first) {
+        // Outside the lock: a log line is a write to the card.
+        lock.unlock();
+        log::Info(log::Event::kSyncHeld,
+                  std::string("a game is running; the ") + sync::ToString(decision.trigger) +
+                      " tick waits until it closes");
+        lock.lock();
+      }
+      decision = sync::Decision{};
+      decision.sleep_for = foreground_poll_;
     }
 
     // A list page is one request and somebody is looking at a screen waiting for
