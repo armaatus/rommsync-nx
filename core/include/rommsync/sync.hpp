@@ -878,7 +878,7 @@ enum class CompleteError {
   /// FastAPI's own is `{"detail":"Not Found"}`.
   ///
   /// **This is not what a stale session id looks like** -- a session RomM
-  /// cancelled still exists, and answers `kSuperseded` below. Reaching here
+  /// closed still exists, and answers `kSuperseded` below. Reaching here
   /// means an id that was never a session, or a server that is not RomM.
   kNoSuchSession,
 
@@ -895,13 +895,18 @@ enum class CompleteError {
   /// one would be reporting counts nothing confirmed.
   kAlreadyCompleted,
 
-  /// 400 `Session is already CANCELLED` -- another negotiation took this device.
+  /// 400 `Session is already <any status but COMPLETED>` -- something other
+  /// than this tick closed the session.
   ///
-  /// The other half of the same 400, and the reachable one: each
-  /// `POST /api/sync/negotiate` cancels the device's previous `IN_PROGRESS`
-  /// session (docs/API_CONTRACT.md), so a tick that gave up on one negotiation
-  /// and made another is completing a session RomM has already ended. Verified
-  /// against the live 5.2.0.
+  /// The other half of the same 400. The name is 5.2.0's: there, each
+  /// `POST /api/sync/negotiate` cancelled the device's previous `IN_PROGRESS`
+  /// session, so a tick that gave up on one negotiation and made another was
+  /// completing a session RomM had already ended -- CANCELLED, verified live.
+  /// 5.4.0 cancels nothing and completes a session its 24-hour cleanup expired
+  /// (#235, docs/API_CONTRACT.md), so what still reaches here is a session
+  /// closed on purpose: cancelled before an upgrade, or FAILED by whatever ran
+  /// it. Every such status is read as this one, a status a later RomM adds
+  /// included.
   ///
   /// Apart from `kAlreadyCompleted` because the two say opposite things about
   /// the accounting: that one means the counts were recorded, this one means
@@ -915,8 +920,9 @@ enum class CompleteError {
 
   /// `CallPolicy::cancel` fired. Neither a failure of the server nor of the
   /// body: the call was stopped rather than answered, which is what a shutdown
-  /// looks like, and the session it would have closed is one the next negotiate
-  /// cancels anyway.
+  /// looks like, and the session it would have closed is one RomM closes
+  /// itself -- the next negotiate cancelled it on 5.2.0, the 24-hour cleanup
+  /// fails it on 5.4.0.
   kCanceled,
 
   kUnreachable,     ///< the exchange never completed -- offline, stalled, dropped
@@ -931,9 +937,10 @@ const char* ToString(CompleteError error);
 /// `ShouldRetry(NegotiateError)` picks, for the same reason.
 ///
 /// **Retrying this is cheap and losing it is not.** A `complete` that never
-/// lands leaves the session `IN_PROGRESS`, which the next negotiate cancels --
-/// so the cost is a session RomM shows as cancelled in a history a user reads,
-/// not a corrupted anything.
+/// lands leaves the session `IN_PROGRESS` until RomM closes it -- at the next
+/// negotiate on 5.2.0, after 24 hours on 5.4.0 -- so the cost is a session RomM
+/// shows as cancelled or failed in a history a user reads, not a corrupted
+/// anything.
 bool ShouldRetry(CompleteError error);
 
 /// What this error says about the credentials, for `auth::Gate`. The same
@@ -966,10 +973,13 @@ struct Completion {
 /// The counts are the ones the *execution* produced, not the plan's totals:
 /// `sync::CountsFor` (sync_finish.hpp) derives them from an `ExecutionReport`.
 ///
-/// **Only the last session id is worth completing.** Each negotiate cancels the
-/// device's previous `IN_PROGRESS` session, verified against a live 5.2.0
-/// (docs/API_CONTRACT.md), so a tick that gave up on one negotiation and made
-/// another must complete the second id.
+/// **Complete the id the plan carried.** On 5.2.0 each negotiate cancelled the
+/// device's previous `IN_PROGRESS` session, so only the last id was worth
+/// completing. 5.4.0 cancels nothing: every session stays completable until it
+/// is completed, and one nobody completes is failed by RomM's cleanup after 24
+/// hours -- and can still be completed after that (#235). The one this client
+/// cannot complete is a session whose negotiate response it never received,
+/// because it never learned the id; that one ends as the cleanup's FAILED.
 /// `play_sessions` rides along on the request that is already being made, which
 /// is the whole reason this client prefers it to `POST /api/play-sessions`: a
 /// console on battery spends no second request on play time.

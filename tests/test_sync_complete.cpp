@@ -1402,8 +1402,9 @@ void Refused(rig::Checks& checks, http::HttpClient& client, const std::string& b
   checks.Expect(row != nullptr && row->content_hash == *local.content_hash,
                 "so the next tick does not re-upload a save the server already has");
 
-  // The session was never closed, which is not a corrupted anything: the next
-  // negotiate cancels it (docs/API_CONTRACT.md).
+  // The session was never closed, which is not a corrupted anything: 5.4.0's
+  // cleanup fails it after 24 hours (docs/API_CONTRACT.md). Closed here so the
+  // fixture device does not collect open ones.
   harness::Complete(client, base, fixture, plan.session_id, 1, 0);
   if (save_id != 0) {
     harness::DeleteSave(client, base, fixture, save_id);

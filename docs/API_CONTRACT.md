@@ -333,13 +333,18 @@ ticked, so a 403 here is a scope missing from a pairing that otherwise works,
 and reporting it as a revocation sends the user looking for something that did
 not happen. Read `scopes` back off the token instead of meeting it here.
 
-**Verified — negotiating twice cancels the first session.** Each
-`POST /api/sync/negotiate` opens a session, and RomM cancels the device's
+**5.2.0 only — negotiating twice cancels the first session.** Each
+`POST /api/sync/negotiate` opens a session, and 5.2.0 cancels the device's
 previous `IN_PROGRESS` one when it does: two negotiations in a row leave the
 first `CANCELLED` with a `completed_at`, and exactly one row is ever in progress
-per device. So a retried negotiation — a stall the client gave up on, a tick that
-died before `complete` — does not accumulate open sessions, and only the last
-`session_id` is worth posting uploads and `complete` against.
+per device. **5.4.0 cancels nothing** (#235): a session belongs to the
+negotiation that opened it, several can be open at once, every one stays
+completable, and one nobody completes is failed by a scheduled cleanup after 24
+hours (`error_message` `"No completion was reported before this session
+expired"`) — and can *still* be completed after that. So on 5.4.0 a retried
+negotiation whose first response never arrived leaves that first session open
+until the cleanup fails it; the client never learned its id and cannot close
+it. The client completes the id its plan carried, which is right on both.
 
 **The `server_content_hash` is whatever some client uploaded.** RomM stores the
 digest it is given, so a save another tool put there can come back carrying a
@@ -427,15 +432,22 @@ land here — and it means the accounting succeeded, which is the opposite of wh
 a bare "the server refused the body" would say. `sync::CompleteError` therefore
 carries `kAlreadyCompleted` for it, separately from `kRejected`.
 
-**Verified — completing a session another negotiation cancelled is also a
-`400`, with a different detail: `{"detail":"Session is already CANCELLED"}`.**
-This is the *reachable* half of the pair. Each negotiate cancels the device's
-previous `IN_PROGRESS` session (above), so a tick that gave up on one
-negotiation and made another is completing a session RomM has already ended. It
-says the opposite of the `COMPLETED` detail about the accounting — those counts
-were never recorded and never will be — so `sync::CompleteError` carries
-`kSuperseded` for it, apart from both `kAlreadyCompleted` and `kRejected`.
-Nothing about the body is wrong; the answer is the next tick's own negotiation.
+**Verified — completing a session something else closed is also a `400`, with
+a different detail: `{"detail":"Session is already CANCELLED"}`.** It is one
+f-string in RomM — `Session is already {status}` — so `FAILED` arrives the same
+way. On 5.2.0 `CANCELLED` was the *reachable* one: each negotiate cancelled the
+device's previous session (above), so a tick that gave up on one negotiation and
+made another was completing a session RomM had already ended. On 5.4.0 nothing
+cancels a session and `complete` reopens one the cleanup expired, so what still
+answers this is a session closed on purpose — cancelled by a 5.2.0 before the
+upgrade, or `FAILED` by whatever ran it. Either way it says the opposite of the
+`COMPLETED` detail about the accounting — those counts were never recorded and
+never will be — so `sync::CompleteError` carries `kSuperseded` for every status
+but `COMPLETED` (matched as the detail's prefix, after `COMPLETED`), apart from
+both `kAlreadyCompleted` and `kRejected`. Nothing about the body is wrong; the
+answer is the next tick's own negotiation. `tick.complete_closed` forces both
+statuses through the proxy, since a healthy 5.4.0 will not produce either for a
+session this client opened.
 
 **Verified — an unknown session id is a `404`
 `{"detail":"Sync session with ID N not found"}`.** A session RomM *cancelled*

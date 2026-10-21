@@ -308,7 +308,8 @@ struct TickResult {
   auth::Answer answer = auth::Answer::kSilent;
 
   /// The completion call was told the session is not this tick's to close:
-  /// already completed, cancelled by a later negotiation, or unknown.
+  /// already completed, closed by something else (CANCELLED, FAILED), or
+  /// unknown.
   ///
   /// **Never a reason to re-run the plan.** `kAlreadyCompleted` means the
   /// accounting succeeded -- a retry landing after the first attempt got through

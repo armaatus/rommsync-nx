@@ -131,8 +131,9 @@ things about the answer are worth stating here rather than leaving to the code:
   `403` is a scope the user did not approve — which is a working pairing, not a
   dead one, and is why the two are separate errors. None of the four gets better
   by retrying. Everything else — no response, a `5xx`, a `429` — retries with
-  backoff, and RomM cancels the session a retried negotiation superseded, so the
-  abandoned ones do not pile up ([API_CONTRACT.md](API_CONTRACT.md#save-sync--negotiate--execute--complete)).
+  backoff. A session a retried negotiation abandoned was cancelled by 5.2.0 at
+  the next negotiate; 5.4.0 leaves it open until its 24-hour cleanup fails it
+  ([API_CONTRACT.md](API_CONTRACT.md#save-sync--negotiate--execute--complete)).
 
 The plan also covers saves the client did **not** report: any server save this
 device has no sync history for comes back as a `download`, for any rom. That is
@@ -743,7 +744,8 @@ fires it is the scheduler's (M7-2) and the overlay's (M4-2).
 `TickResult::session_gone`, and none of them is a reason to re-run the plan. The
 first means the accounting succeeded — a retry landing after the first attempt
 got through looks exactly like it — and the other two mean the counts will never
-be recorded. In all three the transfers already happened and the baseline is on
+be recorded. `kSuperseded` is every `Session is already <status>` but
+`COMPLETED`: on 5.4.0, a session closed on purpose (#235). In all three the transfers already happened and the baseline is on
 the card, so the answer is the next tick's own negotiation.
 
 ### What the tick says it did
