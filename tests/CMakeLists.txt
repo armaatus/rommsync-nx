@@ -1453,6 +1453,7 @@ set(SCHEDULER_SCENARIOS
   skew      # a wall clock corrected in either direction: no storm, no stall
   failures  # backoff after a failed tick, floor again after a success
   server_disabled  # #235: sync off in RomM keeps the interval, never the backoff
+  held      # #242: ticks due under a running game are held, and one runs after it
   tls       # a handshake failure is capped rather than retried forever
   idle      # a day switched off costs no wakeups; a day offline costs tens of ticks
   pairing   # PairingSession polls on the shared curve, not on one of its own
