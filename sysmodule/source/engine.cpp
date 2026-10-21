@@ -817,6 +817,18 @@ bool SdEngine::AwaitNetwork() {
   // would otherwise keep asking `nifm` for two minutes with `Quiesce` waiting on
   // a park that cannot come until the budget runs out (M9-4, #208).
   while (!stopping_ && !suspended_ && std::chrono::steady_clock::now() < deadline) {
+    if (restore_pending_) {
+      // A restore is a copy between two files on the card and needs no
+      // network, so it does not wait out this budget: a console that booted
+      // without Wi-Fi would otherwise draw "Restoring..." for two minutes over
+      // nothing (#209). Run here, on the worker, as `RunWorker` would.
+      restore_pending_ = false;
+      const std::int64_t entry_id = restore_.entry_id;
+      lock.unlock();
+      RunRestore(entry_id);
+      lock.lock();
+      continue;
+    }
     lock.unlock();
     // Outside the lock: `nifm` is a service call and `mutex_` guards state the
     // frame-polled commands read.
@@ -827,7 +839,8 @@ bool SdEngine::AwaitNetwork() {
     }
     // `wait_for` rather than a sleep, so a shutdown cuts this short instead of
     // costing the destructor the rest of the poll interval.
-    wake_.wait_for(lock, kNetworkPollInterval, [this] { return stopping_ || suspended_; });
+    wake_.wait_for(lock, kNetworkPollInterval,
+                   [this] { return stopping_ || suspended_ || restore_pending_; });
   }
   // False when the budget ran out, the process is going away, or the console
   // went to sleep. Only the last of those is worth another go, and `RunWorker`

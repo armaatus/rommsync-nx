@@ -210,6 +210,7 @@ void ConflictsModel::Reset() {
   restored_ = false;
   last_restore_ = {};
   issued_ = Command::Kind::kNone;
+  stale_ = false;
 }
 
 const ipc::ConflictRow* ConflictsModel::Current() const {
@@ -394,9 +395,6 @@ void ConflictsModel::OnRefused(ipc::Error error) {
     report.outcome = conflicts::RestoreOutcome::kWriteFailed;
     report.message = ipc::ToString(error);
     FinishRestore(report);
-    if (opened_ != 0) {
-      mode_ = ConflictsMode::kDetail;
-    }
     return;
   }
   if (refused == Command::Kind::kListConflicts) {
@@ -409,13 +407,36 @@ void ConflictsModel::OnUnreachable(Link link, std::uint32_t sysmodule_interface)
   if (link == Link::kOk) {
     return;
   }
+  link_ = link;
+  sysmodule_interface_ = sysmodule_interface;
+  if (link == Link::kNotResponding) {
+    // **Slow is not gone** (#209). The client kept the session, so the
+    // sysmodule on the far side is the one that answered every page here and
+    // nothing loaded is stale -- only the command that ran out of budget is in
+    // doubt, and its answer was dropped.
+    switch (issued_) {
+      case Command::Kind::kListConflicts:
+        loading_ = false;  // asked again once it answers
+        break;
+      case Command::Kind::kRestore:
+        // It may have been taken. Asked about, never sent again: a second
+        // press the user did not make is a second overwrite of their save.
+        restore_wanted_ = 0;
+        awaiting_ = true;
+        break;
+      case Command::Kind::kRestoreState:
+      case Command::Kind::kNone:
+        break;
+    }
+    issued_ = Command::Kind::kNone;
+    return;
+  }
   issued_ = Command::Kind::kNone;
   loading_ = false;
   restore_wanted_ = 0;
   restoring_ = 0;
   awaiting_ = false;
-  link_ = link;
-  sysmodule_interface_ = sysmodule_interface;
+  stale_ = true;
 }
 
 void ConflictsModel::OnLinkRestored() {
@@ -423,7 +444,11 @@ void ConflictsModel::OnLinkRestored() {
     return;
   }
   link_ = Link::kOk;
-  Reset();
+  if (stale_) {
+    // The session was dropped on the way, so the sysmodule answering now may
+    // not be the one that answered the pages here.
+    Reset();
+  }
 }
 
 void ConflictsModel::MoveSelection(int delta) {
@@ -683,7 +708,8 @@ ConflictsView ConflictsModel::Render() const {
   }
   if (lost_ != 0 && lost_ == entry.id) {
     view.headline = "sys-rommsync lost track of this restore";
-    view.hint = "It restarted before answering. Check the file before restoring again.";
+    view.hint = "It may not have run, or it restarted before it finished. Check the file "
+                "before restoring again.";
     view.tone = Tone::kWarn;
     return view;
   }

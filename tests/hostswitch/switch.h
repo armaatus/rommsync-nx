@@ -6,8 +6,9 @@
 // exceptions that are the seam's own and are marked as such: `Module_Kernel` /
 // `KernelError_SessionClosed`, which is how a sysmodule exiting under a live
 // session is modelled, and `hostswitch::OpenSessions`, which is how
-// `overlay.cycles` balances what an open/close cycle took (M9-6, #209). Anything else that wants adding is either a file that
-// does not belong on this seam or a sign the seam has moved -- say so in
+// `overlay.cycles` balances what an open/close cycle took (M9-6, #209).
+// Anything else that wants adding is either a file that does not belong on
+// this seam or a sign the seam has moved -- say so in
 // `overlay/AGENTS.md` rather than growing this header. `tesla.hpp` in particular
 // is deliberately absent: `tsl::gfx::Renderer` is `final` with non-virtual
 // inline methods and cannot be faked, which is why the screens are split at

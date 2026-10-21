@@ -277,11 +277,17 @@ class ConflictsModel {
 
   /// The command did not reach the sysmodule, or its answer could not be read.
   /// `link` must not be `kOk`; it is `ScreenFrame::Diagnose`'s verdict.
+  ///
+  /// `kNotResponding` is the one that keeps everything (#209): the session was
+  /// never dropped, so only the command that ran out of budget is in doubt. A
+  /// page is asked for again, and a restore is asked *about* rather than sent
+  /// twice.
   void OnUnreachable(Link link, std::uint32_t sysmodule_interface = 0);
 
-  /// The link came back. Everything loaded is dropped and the list is read
-  /// again from the start: a page from before the outage is not a page this
-  /// session would answer with.
+  /// The link came back. After an outage that dropped the session, everything
+  /// loaded is dropped too and the list is read again from the start: a page
+  /// from before it is not a page this session would answer with. After a
+  /// sysmodule that was merely slow, nothing is.
   void OnLinkRestored();
 
   /// Move the selection by `delta` rows, clamped at both ends. Also what asks
@@ -375,6 +381,10 @@ class ConflictsModel {
   Command::Kind issued_ = Command::Kind::kNone;
 
   Link link_ = Link::kOk;
+
+  /// An outage since the last `Reset` dropped the session, so what is loaded
+  /// came from a sysmodule that may since have been replaced.
+  bool stale_ = false;
 
   /// What `GetInterfaceVersion` last answered, for `kIncompatible`'s hint.
   std::uint32_t sysmodule_interface_ = 0;

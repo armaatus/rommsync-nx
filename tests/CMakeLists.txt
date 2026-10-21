@@ -496,9 +496,10 @@ add_test(NAME overlay.settings COMMAND test_overlay_settings)
 # `DrawList` instead of a `tsl::gfx::Renderer` -- and two reach libnx and get
 # `tests/hostswitch/switch.h` instead, which stubs only what those two files
 # name. M9-6 (#209) added `conflicts_pump.cpp`, `lifecycle.cpp` and
-# `log_paint.cpp`, each split out of a screen so the claim about it runs. `sysmodule/source/ipc/result.cpp` is
-# the far side's `Error` -> `Result` mapping, compiled in so the overlay's
-# inverse is tested against the real one rather than against a copy of it.
+# `log_paint.cpp`, each split out of a screen so the claim about it runs.
+# `sysmodule/source/ipc/result.cpp` is the far side's `Error` -> `Result`
+# mapping, compiled in so the overlay's inverse is tested against the real
+# one rather than against a copy of it.
 #
 # `tesla.hpp` is deliberately NOT stubbed. `tsl::gfx::Renderer` is `final` with
 # non-virtual inline methods, so there is no faking it, and stubbing the whole
