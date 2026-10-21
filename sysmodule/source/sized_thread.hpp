@@ -47,8 +47,10 @@ namespace rommsync::sysmodule {
 ///   * `json::Parser` is the one recursion in the tree, bounded by
 ///     `json::kMaxDepth`, which was 64 at ~496 bytes a level -- so ~31 KiB of
 ///     that worst case was JSON nesting the *server* chooses. M9-18 (#216)
-///     lowered the limit to 16 for the main thread's sake, which takes ~20 KiB
-///     off each figure below; the constant was not shrunk with it;
+///     lowered the limit to 16 for the main thread's sake. The two figures
+///     below are #207's, taken at 64; 48 fewer levels at #216's measured 432
+///     bytes put each ~20 KiB lower (~39 and ~19 KiB), not re-walked, and the
+///     constant was not shrunk with them;
 ///   * the deepest chain reachable from `RunWorker` totals ~59 KiB, and from
 ///     `DrivePairing` ~39 KiB.
 ///

@@ -30,8 +30,9 @@ break by accident.
   heap is `0x160000` (1.4 MiB). The deepest parse is budgeted to **half** of that
   32 KiB in `sysmodule/source/stack_budget.hpp`, which is why `json::kMaxDepth`
   is 16 rather than 64: at 64 the parse alone was the whole stack (#216), and
-  `stack.fit` fails if either number moves out from under the other. A worker thread does not get this
-  number at all — it gets `sysmodule::kThreadStackBytes`, 128 KiB out of the heap
+  `stack.fit` fails if either number moves out from under the other. A worker
+  thread does not get this number at all — it gets
+  `sysmodule::kThreadStackBytes`, 128 KiB out of the heap
   rather than out of the npdm (`sysmodule/source/sized_thread.hpp`, M9-2 #207) —
   so the budget to write against is unchanged either way. A chunk size picked for
   how it felt on a desktop — 32 KiB, 64 KiB — is a stack overflow on the console

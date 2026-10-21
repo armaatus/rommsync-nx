@@ -34,19 +34,23 @@ phase_measured() {
   docker image inspect "$IMAGE" >/dev/null 2>&1 ||
     skip "$IMAGE not pulled (docker pull $IMAGE)"
 
-  # A copy, for tests/test_switch_build.sh's reasons: the container builds as
-  # root, and three worktrees may run this at once. A copy also means the extra
-  # flags never reach an object a later `make` in the worktree would reuse --
-  # make tracks no flags, so a .o built here would be taken as up to date.
+  # A copy, for tests/test_switch_build.sh's reasons: three worktrees may run
+  # this at once, and a build in the tree leaves objects behind. Here that is
+  # sharper: make tracks no flags, so a .o built with the flags below would be
+  # taken as up to date by the next ordinary `make` in the worktree.
   SCRATCH="$(mktemp -d)"
   cp "$REPO_ROOT/VERSION" "$REPO_ROOT/switch.mk" "$SCRATCH/"
   cp -R "$REPO_ROOT/core" "$REPO_ROOT/sysmodule" "$SCRATCH/"
   rm -rf "$SCRATCH/sysmodule/build"
 
   local log="$SCRATCH/build.log"
-  if ! docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work "$IMAGE" \
-        bash -lc 'make -C sysmodule -j"$(nproc)" DEFINES="-fstack-usage -fcallgraph-info=su"' \
-        >"$log" 2>&1; then
+  # Through the environment rather than on make's command line: a command-line
+  # DEFINES would override every `DEFINES +=` switch.mk or a Makefile makes,
+  # and the frames measured would stop being the frames that ship. From the
+  # environment it is only the starting value those lines append to.
+  if ! docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work \
+        -e DEFINES="-fstack-usage -fcallgraph-info=su" "$IMAGE" \
+        bash -lc 'make -C sysmodule -j"$(nproc)"' >"$log" 2>&1; then
     cat "$log" >&2
     fail "the sysmodule cross-compile failed"
   fi

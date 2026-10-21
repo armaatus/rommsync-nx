@@ -77,6 +77,9 @@ BOUNDED = re.compile(r"rommsync::json::")
 # whole inner heap is 0x160000 -- so 32 levels bounds every one of them.
 TREE = re.compile(r"std::_Rb_tree<")
 TREE_LEVELS = 32
+# The JSON reader's recursions are three and four functions. One much larger is
+# not one of them, whatever it is named.
+MAX_RECURSION = 8
 # ...and the parser's own cycle is told apart from the destructor's by name.
 PARSER = re.compile(r"rommsync::json::Parser::Parse(Value|Object|Array)\(")
 
@@ -90,7 +93,9 @@ INDIRECT = (
 NODE = re.compile(r'^node: \{ title: "(?P<title>[^"]*)" label: "(?P<label>(?:[^"\\]|\\.)*)"')
 EDGE = re.compile(r'^edge: \{ sourcename: "(?P<source>[^"]*)" targetname: "(?P<target>[^"]*)"')
 FRAME = re.compile(r"\\n(\d+) bytes \((?:static|dynamic)")
-DYNAMIC = re.compile(r"\\n\d+ bytes \((?:dynamic)")
+# `dynamic` without `,bounded` is an alloca or a VLA whose size GCC cannot
+# bound, so the figure beside it is a floor and no budget can hold it.
+UNBOUNDED = re.compile(r"\\n\d+ bytes \(dynamic\)")
 
 
 def fail(message):
@@ -150,6 +155,7 @@ class Graph:
         self.frame = {}
         self.label = {}
         self.calls = {}
+        self.unbounded = set()
 
     def add(self, text):
         for line in text.splitlines():
@@ -160,6 +166,8 @@ class Graph:
                 frame = FRAME.search(label)
                 if frame:
                     self.frame[title] = max(self.frame.get(title, 0), int(frame.group(1)))
+                if UNBOUNDED.search(label):
+                    self.unbounded.add(title)
                 continue
             edge = EDGE.match(line)
             if edge:
@@ -280,6 +288,11 @@ def measure(graph, depth):
                                "-fcallgraph-info=su?")
         return result
     components = strongly_connected(graph, roots)
+    reachable = {m for component in components for m in component}
+    for title in sorted(graph.unbounded & reachable):
+        result.problems.append("`%s` has a stack frame GCC cannot bound (an alloca or a "
+                               "variable-length array) and is reachable from main; no budget "
+                               "holds a frame whose size is decided at run time" % graph.name(title))
     owner = {}
     for number, component in enumerate(components):
         for member in component:
@@ -299,10 +312,14 @@ def measure(graph, depth):
             level[number], own[number] = 0, TREE_LEVELS * heaviest_cycle(graph, component)
             result.tree = max(result.tree, own[number])
             continue
-        if not all(BOUNDED.search(n) for n in names):
+        if not all(BOUNDED.search(n) for n in names) or len(component) > MAX_RECURSION:
+            # Not costed: there is no number to give it, and enumerating the
+            # cycles of a large accidental component is exponential.
             result.problems.append("a recursion on the main thread that json::kMaxDepth does not "
                                    "bound, so no stack size is safe against it: "
-                                   + " -> ".join(names))
+                                   + " -> ".join(names[:MAX_RECURSION]))
+            level[number], own[number] = 0, 0
+            continue
         level[number], own[number] = heaviest_cycle(graph, component), 0
         if any(PARSER.search(n) for n in names):
             parser.add(number)
@@ -361,6 +378,9 @@ def report(graph, measured, depth):
     print("measured: at kMaxDepth %d that chain is %d bytes; the deepest chain that does not "
           "parse is %d bytes" % (depth, worst_case(depth, measured.level, measured.rest),
                                  measured.other_rest))
+    if measured.tree:
+        print("measured: the costliest red-black tree recursion is %d bytes at %d levels"
+              % (measured.tree, TREE_LEVELS))
     for title in measured.chain:
         print("  %6d  %s" % (graph.frame.get(title, 0), graph.name(title)[:150]))
 
@@ -485,6 +505,11 @@ def phase_measured(repo, directory):
         return fail("no .ci files in %s; build with DEFINES=\"-fstack-usage "
                     "-fcallgraph-info=su\"" % directory)
     depth = max_depth(repo)
+    stack = npdm_stack(repo)
+    if depth is None:
+        return fail("no `inline constexpr int kMaxDepth = N;` in %s" % JSON_HPP)
+    if stack is None:
+        return fail("%s has no main_thread_stack_size" % NPDM)
     numbers = budget(repo)
     measured = measure(graph, depth)
     report(graph, measured, depth)
@@ -500,7 +525,6 @@ def phase_measured(repo, directory):
                          "the levels themselves and %s budgets %d; raise kMainRestBytes and see "
                          "whether `stack.fit` still passes (#216)"
                          % (measured.rest, BUDGET, numbers.get("kMainRestBytes", 0)))
-    stack = npdm_stack(repo)
     if measured.other_rest > stack // 2:
         failures += fail("the main thread's deepest chain that parses nothing is %d bytes, more "
                          "than half its %s stack (#216)" % (measured.other_rest, hex(stack)))
@@ -605,6 +629,18 @@ def phase_walk():
     measured = measure(graph, 4)
     check("unbounded recursion reported",
           [p for p in measured.problems if "does not bound" in p] != [], True)
+
+    # A frame GCC cannot size is one no budget holds.
+    graph = Graph()
+    graph.add(_fixture().replace('"%s\\nfile.cpp:1:1\\n2000 bytes (static)"' % RESTORE[1],
+                                 '"%s\\nfile.cpp:1:1\\n2000 bytes (dynamic)"' % RESTORE[1]))
+    check("unbounded frame reported",
+          [p for p in measure(graph, 4).problems if "cannot bound" in p] != [], True)
+    graph = Graph()
+    graph.add(_fixture().replace('"%s\\nfile.cpp:1:1\\n2000 bytes (static)"' % RESTORE[1],
+                                 '"%s\\nfile.cpp:1:1\\n2000 bytes (dynamic,bounded)"'
+                                 % RESTORE[1]))
+    check("bounded dynamic frame counted", measure(graph, 4).problems, [])
 
     # A destructor heavier than the parser breaks the shared-budget argument.
     graph = Graph()
