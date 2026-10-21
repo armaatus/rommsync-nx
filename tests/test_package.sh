@@ -7,11 +7,11 @@
 #   test_package.sh layout         the unpacked tree is exactly the paths
 #                                  #32, #33 and #211 specify, with the title id
 #                                  directory taken from sys-rommsync.json rather
-#                                  than typed here, and nothing else in it. The
-#                                  sixth is toolbox.json, which ovl-sysmodules
-#                                  parses -- so it is asserted as JSON with the
-#                                  three fields that overlay requires, not just
-#                                  as a name in the list.
+#                                  than typed here, and nothing else in it. One
+#                                  is toolbox.json, which ovl-sysmodules parses
+#                                  -- so it is asserted as JSON with the fields
+#                                  that overlay requires, not just as a name in
+#                                  the list.
 #   test_package.sh toolbox        every toolbox.json ovl-sysmodules would skip, or
 #                                  abort on, is refused by the check that reads
 #                                  the packaged one (#211).
@@ -259,8 +259,6 @@ phase_layout() {
   echo "ok: the archive is exactly the install layout, under $tid"
 }
 
-# --- what it refuses to ship ---------------------------------------------------
-
 # --- toolbox.json, read the way the overlay that parses it would ----------------
 
 # Every way a toolbox.json can be wrong that ovl-sysmodules either skips in
@@ -313,16 +311,22 @@ EOF
   # the directory, so the two have to name the same program.
   mkdir -p "$SCRATCH/0100000000000352"
   printf '%s\n' "$good" > "$SCRATCH/0100000000000352/toolbox.json"
-  python3 "$check" "$SCRATCH/0100000000000352/toolbox.json" "$tid" "$version" >/dev/null 2>&1 &&
+  out="$(python3 "$check" "$SCRATCH/0100000000000352/toolbox.json" "$tid" "$version" 2>&1)" &&
     fail "a toolbox.json naming $tid was accepted inside 0100000000000352/"
+  grep -q '^FAIL: .*sits in' <<<"$out" ||
+    { echo "$out" >&2; fail "the misplaced toolbox.json was refused, but not for its directory"; }
 
   # ...and a tid the built NPDM does not carry: the toggle would launch a
   # program id that is not this process.
   toolbox_case npdm "$good" --program-id 0x4200000000524D54 &&
     fail "a toolbox.json disagreeing with the NPDM's program id was accepted"
+  grep -q "^FAIL: .*program id" <<<"$out" ||
+    { echo "$out" >&2; fail "the NPDM mismatch was refused, but not for the program id"; }
 
   echo "ok: toolbox.json is held to its exact keys, types, tid, directory and program id"
 }
+
+# --- what it refuses to ship ---------------------------------------------------
 
 phase_refuses() {
   SCRATCH="$(mktemp -d)"

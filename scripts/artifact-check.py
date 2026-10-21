@@ -50,6 +50,7 @@ import os
 import re
 import struct
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -76,6 +77,15 @@ NACP_DISPLAY_VERSION = 0x3060
 
 class Failure(Exception):
     """The file is not the shape it claims, or a check ran and said no."""
+
+
+def _cstring(blob):
+    return blob.split(b"\0", 1)[0].decode("utf-8", "replace")
+
+
+def _read(path):
+    with open(path, "rb") as handle:
+        return handle.read()
 
 
 # --- the containers ----------------------------------------------------------
@@ -293,6 +303,8 @@ def _nro(text, title=b"ovl-fixture", version=b"9.9.9", ultr=True):
     struct.pack_into("<I", blob, 0x20, 0)
     nacp = bytearray(NACP_SIZE)
     nacp[: len(title)] = title
+    # 0x3060 typed out rather than NACP_DISPLAY_VERSION: a vector built from the
+    # parser's own constant would agree with it however wrong it was.
     nacp[0x3060 : 0x3060 + len(version)] = version
     aset = bytearray(0x38)
     aset[0:4] = b"ASET"
@@ -301,8 +313,6 @@ def _nro(text, title=b"ovl-fixture", version=b"9.9.9", ultr=True):
 
 
 def self_test():
-    import tempfile
-
     failures = []
 
     def expect(what, ok):
@@ -310,9 +320,14 @@ def self_test():
             failures.append(what)
 
     def raises(what, call):
+        # Only a refusal this script words counts: a struct.error from reading
+        # the wrong offset is a parser bug that happens to say no.
         try:
             call()
-        except (Failure, struct.error, IndexError):
+        except (Failure, npdm_check.Failure):
+            return
+        except Exception as error:  # noqa: BLE001 -- reported, not swallowed
+            failures.append("%s raised %s, not a Failure" % (what, type(error).__name__))
             return
         failures.append(what + " was accepted")
 
@@ -337,7 +352,8 @@ def self_test():
             "main.npdm": b"META", "main": _nso(_text(), b"\0junk" + marker, (True, False, True))}))
         # Text compressed and rodata not: each segment's own flag bit decides.
         expect("LNY2 in a compressed NSO inside a PFS0", check_lny2(good_nsp) == "LNY2 version 1")
-        expect("the marker in a compressed NSO", check_version(good_nsp, "9.9.9"))
+        expect("the marker in a compressed NSO",
+               check_version(good_nsp, "9.9.9") == "ROMMSYNC_NX_VERSION=9.9.9")
         raw_nso = write("raw.nso", _nso(_text(), marker, (False, False, False)))
         expect("LNY2 in an uncompressed NSO", check_lny2(raw_nso) == "LNY2 version 1")
 
@@ -355,9 +371,11 @@ def self_test():
         ovl = _nro(_text() + marker)
         good_ovl = write("good.ovl", ovl)
         expect("LNY2 in an NRO", check_lny2(good_ovl) == "LNY2 version 1")
-        expect("the marker in an NRO", check_version(good_ovl, "9.9.9"))
+        expect("the marker in an NRO",
+               check_version(good_ovl, "9.9.9") == "ROMMSYNC_NX_VERSION=9.9.9")
         expect("the marker read back without --version", check_version(good_ovl, None) == "9.9.9")
-        expect("the NACP read back", check_nacp(good_ovl, "ovl-fixture", "9.9.9"))
+        expect("the NACP read back",
+               check_nacp(good_ovl, "ovl-fixture", "9.9.9") == "NACP 'ovl-fixture' 9.9.9")
         raises("an NRO without LNY2", lambda: check_lny2(write("old.ovl", _nro(_text(lny2=False)))))
         raises("a NACP with another version",
                lambda: check_nacp(good_ovl, "ovl-fixture", "9.9.1"))
@@ -425,15 +443,6 @@ def main():
             print("FAIL: %s: %s" % (path, failure), file=sys.stderr)
             status = 1
     return status
-
-
-def _cstring(blob):
-    return blob.split(b"\0", 1)[0].decode("utf-8", "replace")
-
-
-def _read(path):
-    with open(path, "rb") as handle:
-        return handle.read()
 
 
 if __name__ == "__main__":

@@ -295,11 +295,11 @@ console rather than loudly here:
   other copy of it is how a move lands in one place only.
 - **No `flags/boot2.flag`, and no `config.ini`.** The sysmodule ships disabled
   (#33) — `flags/` itself ships, empty, for the older ovl-sysmodules that do
-  not create it (#211) — and an upgrade is this same zip unpacked over the top — replacing a
-  user's settings is not something a release may do. `token.dat`, `device.dat`,
-  `state.db`, `queue.json` and `rommsync.log` are not in the archive either, so
-  they survive — the log in particular, because the failure a user is about to
-  report is usually the one they upgraded to fix.
+  not create it (#211) — and an upgrade is this same zip unpacked over the
+  top — replacing a user's settings is not something a release may do.
+  `token.dat`, `device.dat`, `state.db`, `queue.json` and `rommsync.log` are not
+  in the archive either, so they survive — the log in particular, because the
+  failure a user is about to report is usually the one they upgraded to fix.
 - **The archive is byte-deterministic** — fixed entry order, timestamps and
   permissions — so the checksums a release publishes describe the build and not
   one upload.

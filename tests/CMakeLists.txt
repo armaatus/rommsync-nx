@@ -1698,9 +1698,10 @@ set(NPDM_CHECK "${CMAKE_SOURCE_DIR}/scripts/npdm-check.py")
 # rather than from the artifact. It reads nothing that has to be compiled, so
 # it runs on every runner -- which matters more here than usual: the entry
 # below it runs only inside the devkitPro image, so without this the byte
-# offsets this all rests on would be checked in one CI job and on no laptop. The fixtures are chosen so that a
-# parser reading the wrong offset gets a wrong answer rather than a lucky one;
-# each one of them is a mutation that survived before it was chosen.
+# offsets this all rests on would be checked in one CI job and on no laptop.
+# The fixtures are chosen so that a parser reading the wrong offset gets a wrong
+# answer rather than a lucky one; each one of them is a mutation that survived
+# before it was chosen.
 add_test(NAME npdm.parser
          COMMAND ${Python3_EXECUTABLE} "${NPDM_CHECK}" --self-test)
 set_tests_properties(npdm.parser PROPERTIES TIMEOUT 60)
@@ -1759,7 +1760,7 @@ set(PACKAGE_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_package.sh")
 foreach(scenario
         layout          # the unpacked tree is exactly the install layout, flags/ included
         toolbox         # every toolbox.json ovl-sysmodules skips or aborts on is refused (#211)
-        refuses        # a wrong .nsp, an unsigned .ovl, a missing input
+        refuses         # a wrong .nsp, an unsigned .ovl, a missing input
         deterministic   # the same inputs, the same bytes
         upgrade)        # unzipping over an install keeps config.ini and the rest
   add_test(NAME package.${scenario}
@@ -1776,8 +1777,9 @@ endforeach()
 #
 # It now has the same enforcement elsewhere that switch.builds has: `switch-build`
 # runs scripts/package.sh on every push and this entry with the `toolchain`
-# label (#211), and the `release` job runs the script again on a tag (#34). That is what keeps a failure specific to packaging in the container
-# -- a missing `zip`, say -- from first appearing on a tag. `release.ci` is what
+# label (#211), and the `release` job runs the script again on a tag (#34).
+# That is what keeps a failure specific to packaging in the container -- a
+# missing `zip`, say -- from first appearing on a tag. `release.ci` is what
 # says that step is still there.
 add_test(NAME package.builds
          COMMAND "${BASH_PROGRAM}" "${PACKAGE_TEST}" builds)

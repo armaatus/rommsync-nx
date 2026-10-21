@@ -97,8 +97,9 @@ but older builds — still in the wild — write the flag without creating it, a
 the toggle then silently does nothing. Shipping the folder costs nothing and
 removes that.
 
-There is no `boot2.flag` in the archive, and that is deliberate. `flags/boot2.flag` is what makes Atmosphère launch the
-sysmodule at boot, so shipping it would mean the next boot after you unpacked
+There is no `boot2.flag` in the archive, and that is deliberate.
+`flags/boot2.flag` is what makes Atmosphère launch the sysmodule at boot, so
+shipping it would mean the next boot after you unpacked
 the zip started a sysmodule that has no server, no token, and a folder map you
 have not checked yet — reading and writing save folders before you had any
 chance to look at which ones. Installed first, started when you say so.
