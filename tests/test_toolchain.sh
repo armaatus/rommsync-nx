@@ -29,6 +29,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TOOLCHAIN="$REPO_ROOT/scripts/toolchain.sh"
 CI="$REPO_ROOT/.github/workflows/ci.yml"
 SKIP=77
+
+SCRATCH=""
+cleanup() { [ -n "$SCRATCH" ] && rm -rf "$SCRATCH"; return 0; }
+trap cleanup EXIT
 # Split so this file's own text is not one of the hits phase_pins counts.
 LATEST="devkitpro/devkita64"':latest'
 
@@ -96,6 +100,7 @@ ${bad}Moving the pin is scripts/toolchain.sh plus every line above; see docs/DEV
     fail "switch-build-canary does not build against :latest"
   grep -qxF '    continue-on-error: true' <<<"$canary" ||
     fail "switch-build-canary is not allowed to fail; a devkitPro release would block every PR"
+  local target
   for target in sysmodule overlay tlsprobe; do
     grep -q -- "make -C $target" <<<"$canary" ||
       fail "switch-build-canary does not build $target"
@@ -153,7 +158,7 @@ phase_submodule() {
 # --- the libnx floor ----------------------------------------------------------
 
 phase_floor() {
-  local version want got
+  local version floor want got
   # version  floor   expected (0 = at least, 1 = below, 2 = unreadable)
   while read -r version floor want; do
     [ "$version" = - ] && version=""
@@ -178,6 +183,40 @@ EOF
   echo "ok: version_at_least orders 4.9 below 4.10 and refuses what it cannot read"
 }
 
+# The check as CI runs it -- executed, under its own `set -e` -- against a stub
+# dkp-pacman, so the failures it exists to explain can be produced on any host.
+# A red switch-build whose only output is an exit status is the regression:
+# the comparison's non-zero status once ended the script before either
+# ::error:: line could print.
+phase_check() {
+  local stub out rc pkg want_rc want_text
+  SCRATCH="$(mktemp -d)"
+  stub="$SCRATCH/bin"
+  mkdir -p "$stub"
+  while IFS='|' read -r pkg want_rc want_text; do
+    printf '#!/bin/sh\n[ "$1 $2" = "-Q libnx" ] || exit 1\necho "%s"\n' "$pkg" \
+      >"$stub/dkp-pacman"
+    chmod +x "$stub/dkp-pacman"
+    out="$(PATH="$stub:$PATH" bash "$TOOLCHAIN" libnx 2>&1)"
+    rc=$?
+    [ "$rc" = "$want_rc" ] ||
+      fail "toolchain.sh libnx exited $rc for '$pkg', expected $want_rc: $out"
+    grep -qF -- "$want_text" <<<"$out" ||
+      fail "toolchain.sh libnx said '$out' for '$pkg'; expected it to say '$want_text'"
+  done <<'EOF'
+libnx 4.12.0-1|0|ok: libnx 4.12.0-1 >= 4.10.0
+libnx 4.9.3-1|1|::error::libnx 4.9.3-1 is below 4.10.0
+libnx garbage|1|::error::cannot read a libnx version out of 'libnx garbage'
+EOF
+  # ...and no dkp-pacman at all is a failure that says where it is, not a pass.
+  printf '#!/bin/sh\nexit 1\n' >"$stub/dkp-pacman"
+  out="$(PATH="$stub:$PATH" bash "$TOOLCHAIN" libnx 2>&1)" &&
+    fail "toolchain.sh libnx passed with no libnx to ask about"
+  grep -qF 'not inside a devkitPro image' <<<"$out" ||
+    fail "toolchain.sh libnx failed silently without dkp-pacman: '$out'"
+  echo "ok: toolchain.sh libnx passes 4.12, and says why it refuses 4.9 and garbage"
+}
+
 phase_libnx() {
   command -v docker >/dev/null 2>&1 || skip "no docker"
   docker info >/dev/null 2>&1 || skip "docker daemon not running"
@@ -185,13 +224,14 @@ phase_libnx() {
     skip "$DEVKITPRO_IMAGE not pulled (docker pull $DEVKITPRO_IMAGE)"
   docker run --rm -v "$REPO_ROOT/scripts:/scripts:ro" "$DEVKITPRO_IMAGE" \
     bash -lc 'bash /scripts/toolchain.sh libnx' ||
-    fail "$DEVKITPRO_IMAGE ships a libnx below $LIBNX_FLOOR"
+    fail "$DEVKITPRO_IMAGE's libnx is not one toolchain.sh accepts (output above)"
 }
 
 case "${1:-}" in
   pins)      load_toolchain; phase_pins ;;
   submodule) phase_submodule ;;
   floor)     load_toolchain; phase_floor ;;
+  check)     load_toolchain; phase_check ;;
   libnx)     load_toolchain; phase_libnx ;;
-  *)         echo "usage: $0 {pins|submodule|floor|libnx}" >&2; exit 2 ;;
+  *)         echo "usage: $0 {pins|submodule|floor|check|libnx}" >&2; exit 2 ;;
 esac

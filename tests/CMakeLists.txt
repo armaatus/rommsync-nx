@@ -1607,7 +1607,8 @@ set(TOOLCHAIN_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_toolchain.sh")
 foreach(scenario
         pins        # every file naming the image names the pin; :latest only in the canary
         submodule   # the libultrahand gitlink is the tag .gitmodules records
-        floor)      # the libnx comparison orders 4.9 below 4.10
+        floor       # the libnx comparison orders 4.9 below 4.10
+        check)      # ...and the check CI runs says why it refused, against a stub pacman
   add_test(NAME toolchain.${scenario}
            COMMAND "${BASH_PROGRAM}" "${TOOLCHAIN_TEST}" ${scenario})
   set_tests_properties(toolchain.${scenario} PROPERTIES TIMEOUT 60)
