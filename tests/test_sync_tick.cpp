@@ -1311,6 +1311,63 @@ void CompleteFault(rig::Checks& checks, http::HttpClient& client, const std::str
   harness::CloseOpenSessions(client, base, fixture);
 }
 
+/// A session something other than this tick already closed, answered with
+/// RomM's own `400 "Session is already <status>"`.
+///
+/// Forced by the proxy because a healthy 5.4.0 no longer produces it for a
+/// session this client negotiated: negotiate cancels nothing any more (#235),
+/// and the scheduled cleanup's FAILED is the one closed state `complete` may
+/// reopen. What is left is a session closed on purpose -- CANCELLED by a 5.2.0
+/// before the server was upgraded, FAILED by whatever ran it -- and both are
+/// terminal: the counts will never be recorded, a retry is refused the same
+/// way, and the transfers already landed. So the tick is completed, not
+/// unreported, and the completion is tried once.
+void CompleteClosed(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                    const Fixture& fixture, const harness::Rom& rom) {
+  for (const std::string status : {"CANCELLED", "FAILED"}) {
+    const std::string what = "a session already " + status;
+    Sandbox sandbox(checks, "tick-closed-" + status);
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    UploadFixture arranged;
+    if (!ArrangeUpload(checks, *files, sandbox, rom, "m10-9-closed", &arranged)) {
+      return;
+    }
+
+    sync::TickOptions options = OptionsAt(1'757'000'750);
+    Impatient(&options);
+    {
+      harness::Fault fault(
+          checks, client, base,
+          R"({"mode":"status","status":400,"body":"{\"detail\":\"Session is already )" + status +
+              R"(\"}","path":"/api/sync/sessions","count":9})");
+      const sync::TickResult tick = sync::RunTick(client, *files, TokenFor(base, fixture),
+                                                  {arranged.local}, arranged.targets,
+                                                  /*previous=*/{}, options);
+      checks.ExpectEq(tick.executed.completed, 1, what + ": the upload itself completed");
+      checks.Expect(tick.finished.reported.error == sync::CompleteError::kSuperseded,
+                    what + ": the completion is named as closed elsewhere, got " +
+                        sync::ToString(tick.finished.reported.error) + " -- " +
+                        tick.finished.reported.message);
+      checks.ExpectEq(tick.finished.reported.attempts, 1, what + ": and is not retried");
+      checks.Expect(tick.session_gone, what + ": the session is not this tick's to close");
+      checks.Expect(tick.outcome == sync::TickOutcome::kCompleted,
+                    what + ": so the tick is completed rather than unreported: " +
+                        sync::ToString(tick.outcome));
+      checks.Expect(tick.finished.stored.ok(),
+                    what + ": with the baseline on the card: " + tick.finished.stored.message);
+    }
+    SaveSurvived(checks, sandbox, arranged.name, arranged.bytes, what);
+
+    std::vector<std::int64_t> ids;
+    SaveRowsFor(client, base, fixture, rom.id, arranged.slot, &ids);
+    for (const std::int64_t id : ids) {
+      harness::DeleteSave(client, base, fixture, id);
+    }
+    harness::CloseOpenSessions(client, base, fixture);
+  }
+}
+
 // --- resumes ------------------------------------------------------------------
 //
 // The acceptance in full: a reset mid-download, then a second tick that finishes
@@ -1636,6 +1693,8 @@ int main(int argc, char** argv) {
     CompleteFault(checks, *client, base, fixture, rom,
                   R"({"mode":"stall","seconds":3,"path":"/api/sync/sessions","count":9})",
                   /*then_normally=*/true, "a stall at complete");
+  } else if (scenario == "complete_closed") {
+    CompleteClosed(checks, *client, base, fixture, rom);
   } else if (scenario == "sched_stall") {
     // A negotiate that stops moving: the tick fails on the stall timeout rather
     // than hanging, and the schedule backs off rather than retrying at once.

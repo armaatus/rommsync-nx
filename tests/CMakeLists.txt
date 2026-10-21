@@ -1489,6 +1489,7 @@ set(TICK_RIG_SCENARIOS
   backup_full      # M9-13: ...or fills under the backup, which stops the overwrite
   complete_drop    # the accounting is lost and the baseline is not
   complete_stall   # the same on the timeout, and the next tick finds no work to redo
+  complete_closed  # #235: a session closed elsewhere (400 already CANCELLED/FAILED) ends nothing
   resumes          # a reset mid-download, then a second tick: one save, one row
 )
 

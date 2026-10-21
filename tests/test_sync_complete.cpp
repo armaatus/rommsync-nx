@@ -972,11 +972,13 @@ void Session(rig::Checks& checks, http::HttpClient& client, const std::string& b
                     sync::ToString(missing.error) + " -- " + missing.message);
   checks.Expect(!sync::ShouldRetry(missing.error), "...and is not worth another attempt");
 
-  // And the stale id a tick actually ends up holding, which is a different
-  // answer from both of those: negotiate twice and the first session is
-  // CANCELLED, so completing it is a 400 whose detail says the counts were
-  // never recorded rather than that the body was wrong. This is the reachable
-  // path -- a tick that gave up on one negotiation and made another is in it.
+  // And an earlier id after a later negotiation. On 5.2.0 every negotiate
+  // cancelled the device's previous session, so this was the 400 `kSuperseded`
+  // names. 5.4.0 cancels nothing: a session belongs to the negotiation that
+  // opened it, two can be open at once, and the earlier one still completes
+  // (`sync-complete-earlier-session.json`, #235). What the client owes that is
+  // to read the answer as the success it is -- no warning about a status it did
+  // not expect, no retry -- and to leave the later session completable too.
   {
     sync::SyncNegotiatePayload empty;
     empty.device_id = fixture.device_id;
@@ -986,16 +988,25 @@ void Session(rig::Checks& checks, http::HttpClient& client, const std::string& b
         PlanFor(checks, client, base, fixture, empty, {}, &second)) {
       checks.Expect(first.session_id != second.session_id,
                     "negotiating twice opens a second session");
-      const sync::Completion stale =
+      const sync::Completion earlier =
           sync::CompleteSession(client, TokenFor(base, fixture), first.session_id,
                                 tick.counts, {}, FinishInstantly().complete);
-      checks.Expect(stale.error == sync::CompleteError::kSuperseded,
-                    std::string("a session a later negotiation cancelled is named apart from a "
-                                "refused body: ") +
-                        sync::ToString(stale.error) + " -- " + stale.message);
-      checks.Expect(!sync::ShouldRetry(stale.error),
-                    "...and is not retried: the next tick negotiates its own session");
-      harness::Complete(client, base, fixture, second.session_id, 0, 0);
+      checks.Expect(earlier.ok(), std::string("the earlier session still completes: ") +
+                                      sync::ToString(earlier.error) + " -- " + earlier.message);
+      checks.ExpectEq(earlier.attempts, 1, "...on the first attempt");
+      if (earlier.ok()) {
+        checks.ExpectEq(earlier.value.session.status, std::string("COMPLETED"),
+                        "...as COMPLETED");
+        checks.Expect(earlier.value.warnings.empty(),
+                      "...with nothing to warn about: " +
+                          (earlier.value.warnings.empty() ? std::string()
+                                                          : earlier.value.warnings[0]));
+      }
+      const sync::Completion later =
+          sync::CompleteSession(client, TokenFor(base, fixture), second.session_id, {}, {},
+                                FinishInstantly().complete);
+      checks.Expect(later.ok(), std::string("and so does the later one: ") +
+                                    sync::ToString(later.error) + " -- " + later.message);
     }
   }
 
