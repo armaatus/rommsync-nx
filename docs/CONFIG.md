@@ -181,6 +181,11 @@ Where RetroArch keeps saves is RetroArch's setting, so every sync reads it from
 | `sort_savefiles_by_content_enable = true` | nothing: that layout is not read, and a `warning` says so |
 | `cloud_sync_enable = true` (with `cloud_sync_sync_saves`) | nothing, unless `[sources] retroarch = on`: **RetroArch syncs itself** |
 
+A folder holds at most 512 entries as far as the client is concerned, the first
+by name. A sorted RetroArch folder past that still has every core folder RomM's
+table names read; a rom folder past it is read only as far as that, and the
+skip says so. At most 64 RetroArch core folders are read in one sync.
+
 RetroArch's folders are read before the map's, so when the map's
 `/retroarch/saves` still holds an older copy of a save, the copy RetroArch
 actually reads is the one that syncs. The map's entry for the folder

@@ -185,6 +185,15 @@ class FakeFileSystem final : public fs::FileSystem {
     return (root_ / relative).string();
   }
 
+  /// The listing `fs::kMaxDirectoryEntries` cuts: what was added is what was
+  /// kept, and the backend says more was there.
+  void MarkTruncated(const std::string& directory) {
+    fs::Listing& listing = listings_[directory];
+    listing.error = fs::ListError::kTooManyEntries;
+    listing.message = directory + ": more than " + std::to_string(fs::kMaxDirectoryEntries) +
+                      " entries; the first by name are kept";
+  }
+
   int CallsFor(const std::string& directory) const {
     const auto found = calls_.find(directory);
     return found == calls_.end() ? 0 : found->second;
@@ -998,6 +1007,54 @@ void RetroArch(::checks::Checks& checks) {
     const scan::ScanResult both = scan::ScanSaves(forced, syncing, index, card.files, kFirstTick);
     checks.ExpectEq(both.saves.size(), std::size_t{3},
                     "[sources] retroarch = on reads RetroArch's folders anyway");
+  }
+
+  // #217's listing bound: a cut listing keeps the first names, and a capital
+  // sorts before `mGBA`. RetroArch's own folder still finds every core RomM's
+  // table names; the plan of core folders is bounded; and beside the roms only
+  // a core the table names is a core.
+  {
+    RetroArchCard card("ra-bound");
+    card.Save(kSaves, "Aaa Stale.srm");
+    card.Save(kSaves, "Bbb Stale.srm");
+    card.files.AddFile(kSaves + "/mGBA", "Gba Game.srm", 64, kMtime);  // past the cut
+    card.files.MarkTruncated(kSaves);
+    const scan::ScanResult cut =
+        scan::ScanSaves(defaults, kRetroArchDefaults, index, card.files, kFirstTick);
+    const scan::SaveFile* gba = FindSave(cut, "Gba Game.srm");
+    checks.Expect(gba != nullptr && gba->emulator == "mgba",
+                  "bound: a core folder the cut listing dropped is still read, by RomM's table");
+    checks.Expect(SkippedFor(cut, kSaves, scan::SkipReason::kDirectoryFailed),
+                  "bound: and the cut itself is said");
+
+    RetroArchCard many("ra-many");
+    for (int i = 0; i < 70; ++i) {
+      std::string name = "Core" + std::to_string(100 + i);
+      many.Save(kSaves + "/" + name, "Gba Game.srm");
+    }
+    const scan::ScanResult capped =
+        scan::ScanSaves(defaults, kRetroArchDefaults, index, many.files, kFirstTick);
+    std::size_t cores = 0;
+    for (const std::string& folder : capped.folders) {
+      cores += folder.rfind(kSaves + "/Core", 0) == 0 ? 1 : 0;
+    }
+    checks.ExpectEq(cores, scan::kMaxRetroArchFolders,
+                    "bound: no more core folders are read than the plan's bound");
+    checks.Expect(SkippedFor(capped, kSaves + "/Core169", scan::SkipReason::kDirectoryFailed),
+                  "bound: and the ones past it are said, by name");
+
+    retroarch::Settings beside;
+    beside.savefiles_in_content_dir = true;
+    config::Config opted = defaults;
+    opted.sources.retroarch_content_dir = true;
+    RetroArchCard roms("ra-bound-roms");
+    roms.Save("/tico/roms/psx", "Psx Game.cue");
+    roms.Save("/tico/roms/psx/Psx Game", "Psx Game.srm");  // a multi-disc game's folder
+    roms.Save("/tico/roms/psx/PCSX-ReARMed", "Psx Game.srm");
+    const scan::ScanResult disc = scan::ScanSaves(opted, beside, index, roms.files, kFirstTick);
+    const scan::SaveFile* psx = FindSave(disc, "Psx Game.srm");
+    checks.Expect(disc.saves.size() == 1 && psx != nullptr && psx->emulator == "pcsx_rearmed",
+                  "bound: beside the roms, a game's folder is not a core; the core's is");
   }
 
   // States follow their own four settings through the same rules.

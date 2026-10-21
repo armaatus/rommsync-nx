@@ -220,6 +220,15 @@ struct Skip {
 inline constexpr std::size_t kMaxSaves = state::kMaxRecords;
 inline constexpr std::size_t kMaxSkipsReported = 64;
 
+/// How many RetroArch core folders one scan reads, on top of the folder map's
+/// own: sort-by-core expands one folder into one per core (`ScanSaves`).
+///
+/// A bound because the plan of folders is held for the whole walk beside a
+/// listing, on the sysmodule heap. RomM's table names under forty distinct
+/// folders and a console runs a handful of cores, so 64 is reached only by a
+/// card whose save folder is something other than RetroArch's.
+inline constexpr std::size_t kMaxRetroArchFolders = 64;
+
 /// How many states one tick will report.
 ///
 /// A share of `state::kMaxRecords` rather than a bound of its own, because the
@@ -303,10 +312,16 @@ struct ScanResult {
 ///   - with sort-by-core on, the folders one level under it, each through
 ///     RomM's core table (`RetroArchCoreId`), and a file directly in it is a
 ///     `kOutsideLayout` skip; a folder starting with `.` (`.netplay`) is not a
-///     core;
+///     core. At most `kMaxRetroArchFolders` of them. When the folder is past
+///     `fs::kMaxDirectoryEntries`, every folder RomM's table names is read
+///     as well, since the cut keeps the first names and a core folder may not
+///     be among them;
 ///   - with `savefiles_in_content_dir`, the map's `roms` folders instead -- only
 ///     with `[sources] retroarch_content_dir` on, and only RetroArch's own
-///     `.srm`/`.rtc` (`.state`, `.stateN`) in them;
+///     `.srm`/`.rtc` (`.state`, `.stateN`) in them. Sorted, only a subfolder
+///     RomM's table names is a core there. **A rom folder past
+///     `fs::kMaxDirectoryEntries` is read only as far as its listing reaches**,
+///     with a `kDirectoryFailed` skip saying so: the bound counts the roms;
 ///   - with a per-content-directory layout, nothing: it is not read.
 ///
 /// The folder map's own entry for that folder is not read a second time, flat,

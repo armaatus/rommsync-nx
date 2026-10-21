@@ -488,7 +488,11 @@ static_assert(kHeapPeak == 0x148800, "the table above no longer sums to its peak
 // response parsed whole with `json::Parse` -- negotiate above all, whose
 // document is the same ~11x its text -- the list service's per-cursor snapshots
 // (`kMaxCursors` of up to `kMaxPlatforms` rows each), and the scan's own
-// `ScanResult`. They live in the margin today, which is what a margin is not for.
+// `ScanResult` -- with, since M10-4 (#230), the plan of folders it walks: the
+// map's, and at most `scan::kMaxRetroArchFolders` RetroArch core folders, a few
+// hundred bytes each, held beside one listing. `retroarch.cfg` is streamed and
+// costs one line at a time (`retroarch::kMaxLineBytes`), freed before the scan.
+// They live in the margin today, which is what a margin is not for.
 constexpr size_t kInnerHeapSize = 0x160000;
 constexpr size_t kHeapMargin = kInnerHeapSize - kHeapPeak;
 

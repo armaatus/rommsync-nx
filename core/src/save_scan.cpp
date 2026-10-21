@@ -295,7 +295,7 @@ SaveSource RetroArchFlat(const std::string& directory) {
 /// A folder one level under a sorted RetroArch folder: a core RomM's table
 /// knows, or RetroArch's with no guessed id -- `SourceOf`'s rule for a leaf it
 /// does not know, applied to a folder that is RetroArch's by configuration.
-SaveSource RetroArchCore(const std::string& directory, std::string_view leaf) {
+SaveSource RetroArchCoreSource(const std::string& directory, std::string_view leaf) {
   SaveSource source;
   source.source = Source::kRetroArch;
   source.folder = directory;
@@ -320,8 +320,28 @@ std::vector<ScanFolder> PlanFolders(const config::Config& config,
   // folder, and reading it twice makes every save in it a duplicate of itself.
   std::set<std::string> planned;
   const auto add = [&plan, &planned](ScanFolder folder) {
-    if (planned.insert(LowerAscii(folder.directory)).second) {
-      plan.push_back(std::move(folder));
+    if (!planned.insert(LowerAscii(folder.directory)).second) {
+      return false;
+    }
+    plan.push_back(std::move(folder));
+    return true;
+  };
+  // RetroArch's core folders, bounded: the plan is held for the whole walk,
+  // beside a listing, so it cannot grow with what a card happens to hold.
+  std::size_t core_folders = 0;
+  const auto add_core = [&](const std::string& path, std::string_view leaf,
+                            const ScanFolder& base) {
+    if (planned.count(LowerAscii(path)) > 0) {
+      return;  // listed and named by the table both, or one folder in two cases
+    }
+    if (core_folders >= kMaxRetroArchFolders) {
+      RecordSkip(result, SkipReason::kDirectoryFailed, path,
+                 "past the " + std::to_string(kMaxRetroArchFolders) +
+                     " RetroArch core folders one scan reads; its saves are not read");
+      return;
+    }
+    if (add({path, RetroArchCoreSource(path, leaf), base.platform_hint, base.beside_roms})) {
+      ++core_folders;
     }
   };
 
@@ -398,6 +418,25 @@ std::vector<ScanFolder> PlanFolders(const config::Config& config,
                 [](const fs::Entry& left, const fs::Entry& right) {
                   return left.name < right.name;
                 });
+      // `fs::kMaxDirectoryEntries` keeps the first names, and a capital sorts
+      // before a lowercase letter: four hundred stale `Game.srm`s left from
+      // before sorting was on are enough to push `mGBA/` out of the listing. So
+      // a cut listing of RetroArch's own folder also reads every core folder
+      // RomM's table names, whether the listing reached it or not -- a missing
+      // one costs an empty `List`, and a core RomM does not know past the cut is
+      // the one thing lost, said by the skip above. A rom folder gets no such
+      // help: hundreds of roms are its normal state, and every core in the
+      // table under every rom folder is more than the bound below allows.
+      //
+      // Collected and sorted before any is planned, so the order -- which
+      // decides a slot two core folders contest -- is by name whether or not
+      // the listing was cut.
+      std::vector<std::string> cores;
+      if (listing.error == fs::ListError::kTooManyEntries && !base.beside_roms) {
+        for (const RetroArchCore& core : RetroArchCores()) {
+          cores.emplace_back(core.folder);
+        }
+      }
       for (const fs::Entry& entry : listing.entries) {
         if (entry.name.empty()) {
           continue;
@@ -405,9 +444,13 @@ std::vector<ScanFolder> PlanFolders(const config::Config& config,
         const std::string path = Join(base.directory, entry.name);
         if (entry.is_directory) {
           // `.netplay` is where a netplay *client* keeps the host's saves, and
-          // nothing that starts with a dot is a core.
-          if (entry.name.front() != '.') {
-            add({path, RetroArchCore(path, entry.name), base.platform_hint, base.beside_roms});
+          // nothing that starts with a dot is a core. Beside the roms only a
+          // core RomM's table knows is one: a folder there is far more often a
+          // multi-disc game than a core nobody has heard of.
+          const bool core = entry.name.front() != '.' &&
+                            (!base.beside_roms || !RetroArchCoreId(entry.name).empty());
+          if (core) {
+            cores.push_back(entry.name);
           }
           continue;
         }
@@ -418,6 +461,10 @@ std::vector<ScanFolder> PlanFolders(const config::Config& config,
         RecordSkip(result, SkipReason::kOutsideLayout, path,
                    std::string("RetroArch sorts ") + (saves ? "saves" : "states") +
                        " by core here and reads them from the core's folder, not this file");
+      }
+      std::sort(cores.begin(), cores.end());
+      for (const std::string& leaf : cores) {
+        add_core(Join(base.directory, leaf), leaf, base);  // a repeat is dropped by `add`
       }
     }
   }
