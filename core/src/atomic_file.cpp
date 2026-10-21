@@ -22,12 +22,11 @@ std::atomic<FileSync> g_file_sync{nullptr};
 ///
 /// Called after the handle is closed and before the rename that publishes the
 /// file: flushing and closing move the bytes from stdio to the OS, and this is
-/// what moves them from the OS to the card. With no hook installed the answer is
-/// "yes" and the promise stays the weaker one.
-bool Synced(const std::string& path) {
-  const FileSync hook = g_file_sync.load(std::memory_order_relaxed);
-  return hook == nullptr || hook(path);
-}
+/// what moves them from the OS to the card. Through `io::Disk` rather than
+/// straight to the hook, so the durability point is in the same seam -- and the
+/// same recorded sequence -- as the writes it makes durable (#203). With no hook
+/// installed the answer is "yes" and the promise stays the weaker one.
+bool Synced(const std::string& path) { return Sync(path); }
 
 /// The directory `path` is in, or empty when the path names no directory.
 ///

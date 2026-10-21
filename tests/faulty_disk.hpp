@@ -41,8 +41,8 @@ struct Plan {
   /// that is what a full card does rather than refusing the whole buffer.
   std::uint64_t after = 0;
 
-  /// Once tripped, refuse **everything**: every open, write, rename and remove,
-  /// on every path, with `error`. A card that went away does not come back for
+  /// Once tripped, refuse **everything**: every open, write, rename, remove and
+  /// sync, on every path, with `error`. A card that went away does not come back for
   /// the queue file. Cleared only by the decorator going out of scope -- the card
   /// going back in.
   bool gone = false;
@@ -121,6 +121,16 @@ class Disk final : public rommsync::io::Disk {
       return -1;
     }
     return Inner().Remove(path);
+  }
+
+  bool Sync(const std::string& path) override {
+    std::lock_guard<std::mutex> hold(mutex_);
+    if (Gone()) {
+      errno = plan_.error;
+      ++refusals_;
+      return false;
+    }
+    return Inner().Sync(path);
   }
 
   /// Calls refused so far. A scenario asserts this is non-zero, so a fault that

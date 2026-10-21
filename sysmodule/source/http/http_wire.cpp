@@ -724,7 +724,7 @@ class FileWriter final : public BodyWriter {
     return true;
   }
 
-  /// Flush and close, and make it durable through the same `io::FileSync` every
+  /// Flush and close, and make it durable through the same `io::Sync` every
   /// atomic write in `core/` goes through -- `fsdevCommitDevice` on the console
   /// (`main.cpp`), rather than a second spelling of "make this durable".
   bool Finish() {
@@ -738,9 +738,9 @@ class FileWriter final : public BodyWriter {
     flush_errno_ = errno;
     Close();
     if (flushed) {
-      if (const io::FileSync sync = io::GetFileSync(); sync != nullptr) {
-        flushed = sync(path_);
-      }
+      // Through `io::Disk`, which asks the same hook: a sync made beside the
+      // seam is one the crash replay cannot see (#203).
+      flushed = io::Sync(path_);
     }
     return flushed;
   }

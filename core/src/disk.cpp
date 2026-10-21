@@ -4,6 +4,8 @@
 #include <cerrno>
 #include <cstdio>
 
+#include "rommsync/atomic_file.hpp"
+
 namespace rommsync::io {
 namespace {
 
@@ -22,6 +24,13 @@ class Stdio final : public Disk {
   }
 
   int Remove(const std::string& path) override { return std::remove(path.c_str()); }
+
+  // With no hook the answer is "yes" and the promise stays the weaker one
+  // (`io::FileSync`): no reader sees half a file, and nothing about power cuts.
+  bool Sync(const std::string& path) override {
+    const FileSync hook = GetFileSync();
+    return hook == nullptr || hook(path);
+  }
 };
 
 /// Null means `StdioDisk()`, so nothing has to run before the first write.
@@ -57,6 +66,8 @@ int Rename(const std::string& from, const std::string& to) {
 }
 
 int Remove(const std::string& path) { return CurrentDisk().Remove(path); }
+
+bool Sync(const std::string& path) { return CurrentDisk().Sync(path); }
 
 Refusal RefusalOf(int error_number) {
   switch (error_number) {

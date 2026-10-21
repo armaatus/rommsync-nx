@@ -22,12 +22,23 @@
 // decision that is the same for the whole process. `atomic_file.hpp`'s
 // `SetFileSync` makes the same trade for the same reason.
 //
+// **Durability goes through it too** (#203). `Sync` is `io::FileSync`'s
+// question asked through this seam rather than beside it, so a decorator sees
+// the one call that separates "written" from "on the card" in the same log as
+// the writes and renames around it. That is what lets a test replay a power cut
+// at every point of an overwrite (tests/crash_disk.hpp): a durability call made
+// behind the seam's back -- an `fsync` straight on a descriptor -- is one no
+// test can hold to, which is how the host backend's `.part` sync was found.
+//
 // **What does not go through it**, deliberately: reads (a refusal there is
 // already reachable -- a missing file -- and is tested), `log.cpp` (logging is
 // best effort and a decorator failing it would be noise), and `fflush`/`fclose`
 // (a fault injected at `Write` is deterministic; one at the flush depends on
 // stdio's buffer size). The backends still read `errno` after a failed flush,
-// because that is where a *real* full card often first shows up.
+// because that is where a *real* full card often first shows up. Nor do
+// `fseek`/`ftruncate` (a resumed rom transfer, `Shred`) or `mkdir`: no
+// save-overwrite path reaches any of them, which is the scope the crash replay
+// is held to.
 #pragma once
 
 #include <cstddef>
@@ -62,6 +73,12 @@ class Disk {
   /// `std::remove`. Zero, or non-zero with `errno` set.
   virtual int Remove(const std::string& path) = 0;
 
+  /// Put what is at `path` on the card: a closed file's bytes, or -- for a
+  /// directory -- the names a rename just published in it. `io::FileSync`'s
+  /// contract exactly (atomic_file.hpp), and the stdio `Disk` answers it by
+  /// calling the installed hook, or `true` when there is none.
+  virtual bool Sync(const std::string& path) = 0;
+
  protected:
   Disk() = default;
 };
@@ -80,12 +97,13 @@ Disk* SetDisk(Disk* disk);
 /// The installed `Disk`.
 Disk& CurrentDisk();
 
-/// The installed `Disk`'s four calls, for a call site that has no reason to
-/// hold it.
+/// The installed `Disk`'s calls, for a call site that has no reason to hold
+/// it.
 std::FILE* OpenForWriting(const std::string& path, const char* mode);
 std::size_t Write(std::FILE* file, const void* data, std::size_t size);
 int Rename(const std::string& from, const std::string& to);
 int Remove(const std::string& path);
+bool Sync(const std::string& path);
 
 /// Why the card refused a write, as far as `errno` can say.
 ///
