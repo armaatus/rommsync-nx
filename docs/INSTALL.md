@@ -43,7 +43,9 @@ you have installed homebrew on a Switch before and have never seen RomM.
   That is the overlay that starts, stops and boot-toggles sysmodules, and it is
   the only supported way to turn `sys-rommsync` on. rommsync-nx does not ship
   its own boot switch.
-- **A RomM 5.2.0 server the console can reach over the network**, and an account
+- **A RomM 5.4.0 or later server the console can reach over the network** — an
+  older one is refused before any save is offered to it
+  ([TROUBLESHOOTING.md](TROUBLESHOOTING.md#romm-is-too-old)) — and an account
   on it you can sign into from a phone or a computer. Make a dedicated RomM user
   for the Switch if you can — it is the thing you revoke later without touching
   your main account ([SECURITY.md](SECURITY.md#tokens--scopes)).

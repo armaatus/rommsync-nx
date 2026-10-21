@@ -817,7 +817,8 @@ tick runs on, so the two save writers cannot overlap -- and answers `running` at
 once; the overlay polls command 17 until it says `done`. Before that the copy
 ran on the IPC thread and held the overlay's call, and every other command, for
 as long as the card took. That change of answer made `ipc::kVersion` 3;
-`SyncResult::kServerDisabled` (M10-9, #235) made it 4.
+`SyncResult::kServerDisabled` (M10-9, #235) made it 4, and the two required
+`Status` fields M10-2 (#228) added made it 5.
 
 The overlay bounds every call anyway: `IpcClient` dispatches on a worker thread
 of its own and the draw thread waits at most `kCallBudget` (half a second) for
@@ -908,7 +909,9 @@ carries, so the overlay's greyed button and the sysmodule cannot disagree.
 `Status` carries the interface version and the build, the enable switch, the auth
 state (paired / unauthenticated / never paired), configured, online, the last
 sync's time, result and counts, whether a tick is running right now
-(`sync_in_progress`), the queue depth, and the **current download**
+(`sync_in_progress`), the queue depth, the RomM version the last heartbeat
+read and whether this build syncs with it (`server_version`,
+`server_supported`, #228), and the **current download**
 (`rom_id`, `fs_name`, `bytes_done`, `bytes_total`, state). That last field is how
 M3-5 is served: one poll per frame, not a second round trip. Per-item queue
 progress rides on the `queue` list kind (M5-4).

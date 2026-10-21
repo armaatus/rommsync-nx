@@ -11,6 +11,30 @@ The client never decides a conflict on its own. It reports what it has (hashes +
 timestamps), the server returns a per-save action, and the client obeys. This is
 what keeps *every* device and the server converged.
 
+## Before step 0 — which RomM this is
+
+A tick asks the server which release it runs before it asks it anything else:
+the unauthenticated `GET /api/heartbeat`, whose `SYSTEM.VERSION` every RomM
+sends (M10-2, #228). RomM has no capability endpoint, so every behaviour that
+differs between releases is inferred from that one string, in one place —
+`server::CapabilitiesFor` in
+[`server_capabilities.hpp`](../core/include/rommsync/server_capabilities.hpp) —
+and handed to the tick as `TickOptions::server`.
+
+**Below RomM 5.4.0 the tick stops there** (`TickOutcome::kUnsupported`): no
+library fetch, no negotiation, nothing offered or written. A 5.2 or 5.3 cannot
+answer `delete`, filter by emulator or keep per-device baselines, and without
+those another device's save is superseded silently — which is worse than not
+syncing (D1 in #226). A pre-release reads as its release (`5.4.0-beta.1` is
+5.4.0), and a version that is missing or does not parse reads as the newest, the
+rule `server/testing/provision.py` follows too. The answer is read once a boot
+and again after a pairing; a refused server is asked again every tick, so an
+upgrade is noticed without a reboot.
+
+The heartbeat is the server's whole configuration and grows with its library,
+so it is walked rather than parsed: only `SYSTEM` reaches the JSON parser,
+bounded at `server::kMaxSystemBytes` (`alloc.heartbeat` measures it).
+
 ## Step 0 — matching local files to roms
 
 For each file under the configured save/state dirs:
@@ -766,8 +790,9 @@ card; the next negotiation plans it again), `kUnreported` (the transfers landed,
 the accounting did not, and the baseline *is* on the card — the two are asked
 about in that order, because a bad minute loses both and only one of them is
 expensive), `kOffline` (nothing was written — back off), `kRefused` (an answer
-that does not change on a second attempt), `kUnauthorized`, `kRescanNeeded` and
-`kCanceled`.
+that does not change on a second attempt), `kUnauthorized`, `kRescanNeeded`,
+`kCanceled`, and `kUnsupported` (a server below RomM 5.4.0: nothing was asked of
+it — see [Before step 0](#before-step-0--which-romm-this-is)).
 `TickResult::answer` is separate and is what `auth::Gate::Observe` takes: it is
 the **last** word on the credentials rather than the worst one, because one 401
 is not a verdict and a completion the same token was accepted for is proof it

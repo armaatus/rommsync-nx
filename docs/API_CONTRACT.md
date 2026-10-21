@@ -990,7 +990,7 @@ the issue that acts on it.
 | The `filters` object is gone from `GET /api/roms`. | **Not observed.** Neither 5.2.0's `roms-list.json` nor 5.4.0's has a `filters` key; both send `filter_values`, which gained `developers` and `publishers`. Rom items gained `has_file_on_disk`, `title_id`, `save_target`, `save_target_layout` and a dozen metadata ids (shape diff of the two captures). | — |
 | `RomFileSchema.last_modified` is nullable. | Snapshot. | — |
 | The web player tells `autosave` apart from named slots (5.3). | **Not captured**: a UI change, not an API one. | — |
-| Unauthenticated `GET /api/heartbeat` returns `SYSTEM.VERSION`. | Capture `heartbeat-system.json` (`SYSTEM` only — the rest is the server's configuration). 5.2.0 sends it too, verified live: `{"VERSION": "5.2.0", ...}`. There are still no capability flags — nothing in the 5.4.0 snapshot answers "which features" — so features follow from the version. | #228 |
+| Unauthenticated `GET /api/heartbeat` returns `SYSTEM.VERSION`. | Capture `heartbeat-system.json` (`SYSTEM` only — the rest is the server's configuration). 5.2.0 sends it too, verified live: `{"VERSION": "5.2.0", ...}`. There are still no capability flags — nothing in the 5.4.0 snapshot answers "which features" — so features follow from the version. Read by `server::ReadServer` (`core/src/server_capabilities.cpp`) at the top of a tick, walking the body to `SYSTEM` only. 5.4.0's heartbeat also carries `DEVICE_INSTALL` (`ENABLED`, `EXCLUDED_PLATFORM_SLUGS`), which #245 needs. | #228 |
 
 ### Found on the way, not in R1
 
