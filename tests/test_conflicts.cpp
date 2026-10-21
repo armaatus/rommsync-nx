@@ -37,11 +37,13 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <set>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <vector>
 
+#include "crash_disk.hpp"
 #include "engine.hpp"
 #include "harness.hpp"
 #include "rig.hpp"
@@ -717,6 +719,55 @@ void Interrupted(checks::Checks& c) {
 #else
   c.Expect(false, "this scenario needs fork(); the host rig is POSIX (docs/TESTING.md)");
 #endif
+}
+
+// --- crash --------------------------------------------------------------------
+//
+// M9-14 (#203): `restore`, with a power cut at every call it makes. A restore is
+// the overwrite a *person* starts, through `CopyAtomically` rather than a
+// download, and is held to the same replay: old or new, and never new without
+// the old bytes under `.backup/`. Then again with the card refusing to confirm
+// `.backup/` itself, which must stop the restore before it writes.
+
+void Crash(checks::Checks& c) {
+  const std::string previous = "the bytes this console had, and wants back\n";
+  const std::string server = "the server's copy, which a power cut must not cost\n";
+  const std::string backup = std::string(harness::kBackupDir) + "/4-retroarch-srm-1757000000.srm";
+  const crash::Overwrite expected{SavePath("game.srm"), server, previous, harness::kBackupDir};
+
+  conflicts::RestoreOptions options;
+  options.backup_dir = harness::kBackupDir;
+  options.now = []() { return Moment(kWhen + 500); };
+
+  for (const bool confirmed : {true, false}) {
+    Sandbox sandbox(c, confirmed ? "conflicts-crash" : "conflicts-crash-unconfirmed");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    sandbox.SeedSave(SavePath("game.srm"), server);
+    sandbox.Write(backup, previous);
+    conflicts::History history(sandbox.Host(std::string(conflicts::kHistorySdPath)));
+    history.Load();
+    conflicts::Entry entry = SaveEntry(4, "game.srm");
+    entry.backup_sd_path = backup;
+    const std::int64_t id = history.Append(entry).id;
+
+    std::set<std::string> refused;
+    if (!confirmed) refused.insert(harness::kBackupDir);
+    crash::Recorder recorder(sandbox.root(), refused);
+    const conflicts::RestoreReport done = conflicts::Restore(*files, history, id, options);
+    if (confirmed) {
+      c.Expect(done.ok(), std::string("the restore ran: ") + conflicts::ToString(done.outcome) +
+                              " -- " + done.message);
+    } else {
+      c.Expect(recorder.refused() > 0, "the card refused to confirm the backup directory");
+      c.Expect(done.outcome == conflicts::RestoreOutcome::kBackupFailed,
+               std::string("a restore whose backup the card would not confirm does not run: ") +
+                   conflicts::ToString(done.outcome) + " -- " + done.message);
+      c.ExpectEq(sandbox.Read(SavePath("game.srm")), server, "and the save is untouched");
+    }
+    crash::ExpectSurvives(c, recorder, expected, rig::ScratchDir() + "/crash-restore",
+                          confirmed ? "a restore" : "a restore whose backup was not confirmed");
+  }
 }
 
 // --- service ------------------------------------------------------------------
@@ -1494,7 +1545,8 @@ int main(int argc, char** argv) {
   const std::string base = rig::BaseUrl();
 
   if (scenario == "store" || scenario == "record" || scenario == "restore" ||
-      scenario == "interrupted" || scenario == "service" || scenario == "overlay") {
+      scenario == "interrupted" || scenario == "service" || scenario == "overlay" ||
+      scenario == "crash") {
     checks::Checks checks;
     if (scenario == "store") {
       Store(checks);
@@ -1504,6 +1556,8 @@ int main(int argc, char** argv) {
       Restore(checks);
     } else if (scenario == "interrupted") {
       Interrupted(checks);
+    } else if (scenario == "crash") {
+      Crash(checks);
     } else if (scenario == "service") {
       Service(checks);
     } else {

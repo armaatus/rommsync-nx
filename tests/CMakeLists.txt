@@ -901,6 +901,7 @@ set(EXECUTE_UNIT_SCENARIOS
   naming   # the backup path carries the slot, so one rom's two saves are two files
   staging  # the streamed copy and the two-rename commit an overwrite goes through
   counting # no-op, a downgraded action, and the two refusals that need no server
+  crash_model # M9-14: a power cut at every call of an overwrite, and the replay's own check
 )
 foreach(scenario IN LISTS EXECUTE_UNIT_SCENARIOS)
   add_test(NAME execute.${scenario} COMMAND test_sync_execute ${scenario})
@@ -911,6 +912,7 @@ endforeach()
 set(EXECUTE_RIG_SCENARIOS
   upload          # overwrite=true, session_id and device_id -- and no 409
   download        # verify, back up, commit, confirm -- in that order
+  crash           # M9-14: ...and a power cut at every call of it loses nothing
   conflict        # both sides changed: keep both, lose nothing
   same_timestamp  # ...and the no-history conflict, resolved the same way
   truncate        # a clean short body never replaces a save
@@ -1116,6 +1118,7 @@ set(CONFLICT_UNIT_SCENARIOS
   record       # a tick's reports become entries -- both conflict reasons, and the state kinds
   restore      # the old bytes exactly, and a new backup written FIRST (the sandbox audit checks it)
   interrupted  # a restore killed mid-write leaves old or new, never a splice, and no .tmp
+  crash        # M9-14: a power cut at every call of a restore, and one the card would not confirm
   service      # both commands through ipc::Dispatch over a real SdEngine
   overlay      # the screen's decisions, and the greps overlay/AGENTS.md owes
 )
@@ -1250,6 +1253,7 @@ set(STATES_RIG_SCENARIOS
   upsert     # POST /api/states replaces the row with that name, in place
   roundtrip  # local -> server -> a second sandbox -> identical bytes
   overwrite  # the server's copy moved: back up first, then replace
+  crash      # M9-14: ...and a power cut at every call of it loses nothing
   truncate   # a clean short body never replaces a local state
   keeps_both # both sides moved: nothing is transferred, both survive
 )

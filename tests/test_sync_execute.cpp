@@ -27,8 +27,10 @@
 #include <thread>
 #include <vector>
 
+#include "crash_disk.hpp"
 #include "harness.hpp"
 #include "rommsync/atomic_file.hpp"
+#include "rommsync/disk.hpp"
 #include "rommsync/host/file_sync.hpp"
 #include "rommsync/host/native_file_system.hpp"
 #include "rommsync/md5.hpp"
@@ -293,6 +295,135 @@ void Staging(rig::Checks& checks) {
   checks.ExpectEq(rig::ReadFile(to), std::string("the verified bytes\n"), "onto the destination");
   checks.Expect(!std::filesystem::exists(staged), "the staged file is consumed");
   checks.Expect(!std::filesystem::exists(io::PreviousPathFor(to)), "and the .old is cleaned up");
+}
+
+// --- crash_model --------------------------------------------------------------
+//
+// M9-14 (#203). `staging` proves the two primitives an overwrite goes through
+// in the order they are *called*; this proves them in the order they *persist*,
+// by cutting the recorded calls at every point and asking what a card that
+// does not journal may have kept (tests/crash_disk.hpp).
+//
+// The first three are the replay's own check: overwrites that are wrong in the
+// three ways a rename protocol goes wrong, each of which it must catch. A
+// replay that passed them would pass anything. Then the protocol itself, and
+// then the protocol with the card refusing to confirm the backup's *name* --
+// the case the call order alone said nothing about.
+
+/// A replay of `recorder` against hard rule 2's invariant, with no checks
+/// attached: for the overwrites that are supposed to fail it.
+crash::Verdict Replayed(const crash::Recorder& recorder, const crash::Overwrite& expected) {
+  return crash::Replay(recorder, {harness::kSavesDir, harness::kBackupDir}, {harness::kSavesDir},
+                       rig::ScratchDir() + "/crash-model", crash::OldOrNew(expected));
+}
+
+/// `BackUpFirst` with the values every case below shares.
+sync::OperationError BackUpForCrash(fs::FileSystem& files, const std::string& save,
+                                    std::string* backup, std::string* message) {
+  return sync::BackUpFirst(files, harness::kBackupDir, save, 7, "slot-1", "crash.srm",
+                           1'757'000'100, backup, message);
+}
+
+void CrashModel(rig::Checks& checks) {
+  const std::string old_bytes = "the save a power cut must not cost\n";
+  const std::string new_bytes = "the server's copy, which replaces it after a backup\n";
+  const std::string save = SavePath("crash.srm");
+  const crash::Overwrite expected{save, old_bytes, new_bytes, harness::kBackupDir};
+
+  // 1. Written in place, over the save. A cut mid-write leaves half of each.
+  {
+    Sandbox sandbox(checks, "crash-in-place");
+    sandbox.Detach();  // the audit is not the subject; the replay is
+    const auto files = rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    sandbox.Write(save, old_bytes);
+    crash::Recorder recorder(sandbox.root());
+    std::string backup;
+    std::string message;
+    BackUpForCrash(*files, save, &backup, &message);
+    std::FILE* file = io::OpenForWriting(sandbox.Host(save), "wb");
+    if (file != nullptr) {
+      io::Write(file, new_bytes.data(), new_bytes.size());
+      std::fclose(file);
+      io::Sync(sandbox.Host(save));
+    }
+    const crash::Verdict verdict = Replayed(recorder, expected);
+    checks.Expect(verdict.failures > 0 && verdict.first.find("neither") != std::string::npos,
+                  "the replay catches an overwrite written in place: " + verdict.first);
+  }
+
+  // 2. Atomic and durable, and with no backup. The save survives every cut and
+  // the old bytes do not.
+  {
+    Sandbox sandbox(checks, "crash-no-backup");
+    sandbox.Detach();
+    sandbox.Write(save, old_bytes);
+    crash::Recorder recorder(sandbox.root());
+    io::WriteAtomically(sandbox.Host(save), new_bytes);
+    const crash::Verdict verdict = Replayed(recorder, expected);
+    checks.Expect(verdict.failures > 0 && verdict.first.find("no backup") != std::string::npos,
+                  "the replay catches an overwrite with no backup: " + verdict.first);
+  }
+
+  // 3. Backed up, staged, renamed -- and the staged bytes never synced. The
+  // rename can land with data blocks that did not: ext4's zero-length file.
+  {
+    Sandbox sandbox(checks, "crash-unsynced");
+    sandbox.Detach();
+    const auto files = rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    sandbox.Write(save, old_bytes);
+    crash::Recorder recorder(sandbox.root());
+    std::string backup;
+    std::string message;
+    BackUpForCrash(*files, save, &backup, &message);
+    const std::string staged = io::TempPathFor(sandbox.Host(save));
+    std::FILE* file = io::OpenForWriting(staged, "wb");
+    if (file != nullptr) {
+      io::Write(file, new_bytes.data(), new_bytes.size());
+      std::fclose(file);
+    }
+    io::CommitStaged(staged, sandbox.Host(save));
+    const crash::Verdict verdict = Replayed(recorder, expected);
+    checks.Expect(verdict.failures > 0 && verdict.first.find("neither") != std::string::npos,
+                  "the replay catches a rename that published unsynced bytes: " + verdict.first);
+  }
+
+  // 4. The protocol: `BackUpFirst`, then `WriteAtomically`, which is
+  // `CommitStaged` behind a synced temp file.
+  {
+    Sandbox sandbox(checks, "crash-protocol");
+    const auto files = rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    sandbox.SeedSave(save, old_bytes);
+    crash::Recorder recorder(sandbox.root());
+    std::string backup;
+    std::string message;
+    checks.Expect(BackUpForCrash(*files, save, &backup, &message) == sync::OperationError::kNone,
+                  "the backup is written: " + message);
+    checks.Expect(io::WriteAtomically(sandbox.Host(save), new_bytes).ok(), "and the save replaced");
+    crash::ExpectSurvives(checks, recorder, expected, rig::ScratchDir() + "/crash-model",
+                          "backup, then an atomic overwrite");
+  }
+
+  // 5. The same, with the card refusing to confirm the backup directory. The
+  // backup's bytes are on the card and its *name* may not be, and an overwrite
+  // in a different directory can land without it. `BackUpFirst` has to say no.
+  {
+    Sandbox sandbox(checks, "crash-unconfirmed");
+    const auto files = rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    sandbox.SeedSave(save, old_bytes);
+    crash::Recorder recorder(sandbox.root(), {harness::kBackupDir});
+    std::string backup;
+    std::string message;
+    const sync::OperationError backed_up = BackUpForCrash(*files, save, &backup, &message);
+    if (backed_up == sync::OperationError::kNone) {
+      io::WriteAtomically(sandbox.Host(save), new_bytes);
+    }
+    checks.Expect(recorder.refused() > 0, "the card refused to confirm the backup directory");
+    checks.Expect(backed_up == sync::OperationError::kBackupFailed,
+                  std::string("a backup whose name the card would not confirm is not one: ") +
+                      sync::ToString(backed_up) + " -- " + message);
+    crash::ExpectSurvives(checks, recorder, expected, rig::ScratchDir() + "/crash-model",
+                          "a backup the card would not confirm");
+  }
 }
 
 // --- counting -----------------------------------------------------------------
@@ -642,6 +773,88 @@ void Download(rig::Checks& checks, http::HttpClient& client, const std::string& 
   }
   checks.ExpectEq(sandbox.Read(SavePath(name)), server_bytes,
                   "and the save is left exactly as it was: no backup, no overwrite");
+
+  harness::DeleteSave(client, base, fixture, server.id);
+}
+
+// --- crash --------------------------------------------------------------------
+//
+// M9-14 (#203): `download`, with a power cut at every call it makes. The
+// overwrite's bytes arrive through the HTTP backend's `.part` file, so this is
+// the one place the backend's own durability is on the line: a staged file
+// renamed onto the save before its bytes were synced is a save that can come
+// back empty, backup or no backup.
+
+void Crash(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+           const Fixture& fixture, const harness::Rom& rom) {
+  const std::string slot = harness::UniqueSlot("m9-14-crash");
+  const std::string name = "crash.srm";
+  const std::string previous = "the local copy a power cut must not cost\n";
+  const std::string server_bytes = "the server's newer copy, which replaces it\n";
+  const crash::Overwrite expected{SavePath(name), previous, server_bytes, harness::kBackupDir};
+
+  harness::Save server;
+  {
+    Sandbox upload(checks, "execute-crash-upload");
+    const std::string staged = upload.Host("/config/rommsync/server-copy.srm");
+    rig::WriteFile(staged, server_bytes);
+    if (!harness::UploadSave(client, base, fixture, rom.id, slot, "m9-14", staged, name,
+                             /*with_device=*/false, &server)) {
+      checks.Expect(false, "the server copy was stored");
+      return;
+    }
+  }
+
+  sync::SyncNegotiatePayload payload;
+  payload.device_id = fixture.device_id;
+  payload.saves.push_back(harness::LocalSave(
+      rom.id, name, slot, "m9-14", crypto::Md5Hex(previous),
+      std::chrono::system_clock::now() - std::chrono::hours{1},
+      static_cast<std::int64_t>(previous.size())));
+  sync::SyncPlan plan;
+  if (!PlanFor(checks, client, base, fixture, payload, {slot}, &plan)) {
+    harness::DeleteSave(client, base, fixture, server.id);
+    return;
+  }
+  const std::vector<sync::SaveTarget> targets = {{rom.id, slot, SavePath(name), name}};
+
+  // The download as it runs every tick.
+  {
+    Sandbox sandbox(checks, "execute-crash");
+    const auto files = rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    sandbox.SeedSave(SavePath(name), previous);
+    crash::Recorder recorder(sandbox.root());
+    const sync::ExecutionReport report = sync::ExecutePlan(
+        client, *files, TokenFor(base, fixture), plan, targets, OptionsAt(1'757'000'201));
+    checks.ExpectEq(report.completed, 1,
+                    "the download completed" +
+                        (report.warnings.empty() ? std::string() : ": " + report.warnings[0]));
+    checks.ExpectEq(sandbox.Read(SavePath(name)), server_bytes, "the save holds the server's bytes");
+    crash::ExpectSurvives(checks, recorder, expected, rig::ScratchDir() + "/crash-download",
+                          "a download over a save");
+  }
+
+  // ...and with the card refusing to confirm `.backup/`. The overwrite must
+  // not happen, because the backup it would depend on may not survive it.
+  {
+    Sandbox sandbox(checks, "execute-crash-unconfirmed");
+    const auto files = rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    sandbox.SeedSave(SavePath(name), previous);
+    crash::Recorder recorder(sandbox.root(), {harness::kBackupDir});
+    const sync::ExecutionReport report = sync::ExecutePlan(
+        client, *files, TokenFor(base, fixture), plan, targets, OptionsAt(1'757'000'202));
+    checks.Expect(recorder.refused() > 0, "the card refused to confirm the backup directory");
+    checks.ExpectEq(report.failed, 1, "the download is a failed operation");
+    if (!report.operations.empty()) {
+      checks.Expect(report.operations[0].error == sync::OperationError::kBackupFailed,
+                    std::string("...named as the backup: ") +
+                        sync::ToString(report.operations[0].error) + " -- " +
+                        report.operations[0].message);
+    }
+    checks.ExpectEq(sandbox.Read(SavePath(name)), previous, "and the save is untouched");
+    crash::ExpectSurvives(checks, recorder, expected, rig::ScratchDir() + "/crash-download",
+                          "a download whose backup the card would not confirm");
+  }
 
   harness::DeleteSave(client, base, fixture, server.id);
 }
@@ -1429,11 +1642,14 @@ int main(int argc, char** argv) {
   rig::Checks checks;
 
   // The two that need no server, so they stay checked with docker stopped.
-  if (scenario == "naming" || scenario == "staging" || scenario == "counting") {
+  if (scenario == "naming" || scenario == "staging" || scenario == "counting" ||
+      scenario == "crash_model") {
     if (scenario == "naming") {
       Naming(checks);
     } else if (scenario == "staging") {
       Staging(checks);
+    } else if (scenario == "crash_model") {
+      CrashModel(checks);
     } else {
       Counting(checks);
     }
@@ -1470,6 +1686,8 @@ int main(int argc, char** argv) {
     Upload(checks, *client, base, fixture, rom);
   } else if (scenario == "download") {
     Download(checks, *client, base, fixture, rom);
+  } else if (scenario == "crash") {
+    Crash(checks, *client, base, fixture, rom);
   } else if (scenario == "conflict") {
     Conflict(checks, *client, base, fixture, rom);
   } else if (scenario == "same_timestamp") {

@@ -32,6 +32,7 @@
 #include <string>
 #include <vector>
 
+#include "crash_disk.hpp"
 #include "harness.hpp"
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/host/native_file_system.hpp"
@@ -1030,6 +1031,56 @@ void Overwrite(rig::Checks& checks, http::HttpClient& client, const std::string&
   harness::DeleteState(client, base, fixture, state_id);
 }
 
+/// M9-14 (#203): `overwrite`, with a power cut at every call the second run
+/// makes. A state is a save (hard rule 2) and arrives through the same `.part`
+/// staging, so it is held to the same replay.
+void Crash(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+           const Fixture& fixture, std::int64_t rom_id, const std::string& rom_base) {
+  Sandbox sandbox(checks, "states-crash");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const auth::StoredToken token = TokenFor(base, fixture);
+  const roms::RomIndex index = IndexOf(rom_id, rom_base, "gb");
+  const std::string name = rom_base + ".state";
+  const std::string mine = "the session a power cut must not cost";
+  const std::string theirs = "the session the other console pushed, which replaces it";
+
+  sandbox.SeedState(StatePath(name), mine);
+  state::Baseline baseline;
+  const sync::StateSyncReport first =
+      sync::SyncStates(client, *files, token, StatesOn(true), index, &baseline, OptionsAt(kStamp));
+  checks.ExpectEq(first.failed, 0, "the first run uploaded this console's state");
+  const state::StateRecord* row = baseline.FindState(rom_id, name);
+  if (row == nullptr) {
+    checks.Expect(false, "the first run recorded a row");
+    return;
+  }
+  const std::int64_t state_id = row->server_state_id;
+
+  PassASecond();
+  const std::string elsewhere = sandbox.Host("/elsewhere.state");
+  rig::WriteFile(elsewhere, theirs);
+  sync::ServerState replaced;
+  if (!harness::UploadState(checks, client, base, fixture, rom_id, "retroarch", elsewhere, name,
+                            &replaced)) {
+    harness::DeleteState(client, base, fixture, state_id);
+    return;
+  }
+
+  {
+    crash::Recorder recorder(sandbox.root());
+    const sync::StateSyncReport second = sync::SyncStates(client, *files, token, StatesOn(true),
+                                                          index, &baseline, OptionsAt(kStamp));
+    checks.ExpectEq(second.completed, 1, "the second run replaced the local state");
+    checks.ExpectEq(sandbox.Read(StatePath(name)), theirs, "the card holds the server's copy");
+    crash::ExpectSurvives(checks, recorder,
+                          {StatePath(name), mine, theirs, harness::kBackupDir},
+                          rig::ScratchDir() + "/crash-state", "a state download over a state");
+  }
+
+  harness::DeleteState(client, base, fixture, state_id);
+}
+
 /// A clean short body never replaces a local state.
 ///
 /// The only check a state download gets is its length, so this is the scenario
@@ -1213,6 +1264,8 @@ int main(int argc, char** argv) {
     RoundTrip(checks, *client, base, fixture, rom.id, rom_base);
   } else if (scenario == "overwrite") {
     Overwrite(checks, *client, base, fixture, rom.id, rom_base);
+  } else if (scenario == "crash") {
+    Crash(checks, *client, base, fixture, rom.id, rom_base);
   } else if (scenario == "truncate") {
     Truncate(checks, *client, base, fixture, rom.id, rom_base);
   } else if (scenario == "keeps_both") {
