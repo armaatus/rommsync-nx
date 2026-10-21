@@ -1617,32 +1617,42 @@ set_tests_properties(switch.ci_requires_artifacts PROPERTIES TIMEOUT 60)
 # wrapped in if(NOT ROMMSYNC_REQUIRE_RIG). Every other skippable test flips to a
 # failure under that option precisely so CI cannot go green on a skip -- and
 # that is the right default, so each exception needs its reason recorded rather
-# than inferred. There are four, and only two of them have this one's reason:
-# `switch.builds` and `switch.tlsprobe` are enforced by a different CI job --
-# `switch-build` in .github/workflows/ci.yml runs the same builds, in the same
-# image, on every push, and fails there -- so these entries are its local
-# equivalent, not its enforcement. `package.builds` is the third and does NOT
-# have that reason; see the note on it below. `npdm.svcs` is the fourth and does
-# not have it either: nothing in CI parses the built NPDM today, so it runs
-# where a cross-compile can and nowhere else until M9-12 (#211) makes the
-# `switch.*` job able to host it. Its parser half, `npdm.parser`, never skips.
+# than inferred. There are five, all with this one's reason, and all carrying
+# the `toolchain` label: `switch.builds`, `switch.tlsprobe`, `toolchain.libnx`,
+# `npdm.svcs` and `package.builds`.
+#
+# They skip in host-tests and run in `switch-build` instead. That job is inside
+# the pinned image already, and it runs tests/toolchain_suite.sh --here, which
+# runs exactly these five in place and treats a skip as a failure (M9-12, #211).
+# Until then the assertions in them had never run anywhere: the job built the
+# artifacts and read four bytes of each. `switch.toolchain_suite` below holds
+# the suite to this label, so an entry added here without both runs nowhere.
 #
 # So do not "fix" it by wrapping it like the others. That would fail the
 # host-tests job on a runner that has no devkitpro image -- which is every runner
 # the host job uses.
 add_test(NAME switch.builds
          COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" builds)
-set_tests_properties(switch.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600
+set_tests_properties(switch.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 LABELS toolchain
                      RUN_SERIAL TRUE
                      ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
 
 # The M0-1 probe (tlsprobe/README.md). Same image, same reason it may skip as
 # switch.builds above -- and the same enforcement elsewhere: the `switch-build`
-# job builds it on every push and checks the NRO magic there.
+# job runs this entry, in the image, on every push.
 add_test(NAME switch.tlsprobe
          COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" tlsprobe)
-set_tests_properties(switch.tlsprobe PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600
+set_tests_properties(switch.tlsprobe PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 LABELS toolchain
                      RUN_SERIAL TRUE
+                     ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
+
+# The suite the `switch-build` job runs is the `toolchain` label, no more and
+# no less, and it fails on a skip: checked against stubs here, so it needs no
+# image and never skips. ctest's own --show-only output is what it reads.
+add_test(NAME switch.toolchain_suite
+         COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" suite
+                 "${CMAKE_CTEST_COMMAND}" "${CMAKE_BINARY_DIR}")
+set_tests_properties(switch.toolchain_suite PROPERTIES TIMEOUT 60
                      ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
 
 # --- M9-8: the toolchain and libultrahand are pinned -------------------------
@@ -1666,12 +1676,14 @@ endforeach()
 
 # The pinned image's libnx is >= 4.10.0 -- asked of the image, not assumed.
 # Its SKIP_RETURN_CODE is unwrapped for switch.builds' reason, given at length
-# above: the host runner has no devkitpro image. The enforcement is the
-# `switch-build` job, which runs the same `scripts/toolchain.sh libnx` in the
-# container before it builds, and `toolchain.pins` says that step is there.
+# above: the host runner has no devkitpro image. The `switch-build` job runs the
+# same `scripts/toolchain.sh libnx` as a step before it builds -- the fast
+# answer, which `toolchain.pins` says is there -- and this entry again with the
+# rest of the `toolchain` label, rather than as a special case.
 add_test(NAME toolchain.libnx
          COMMAND "${BASH_PROGRAM}" "${TOOLCHAIN_TEST}" libnx)
-set_tests_properties(toolchain.libnx PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+set_tests_properties(toolchain.libnx PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300
+                     LABELS toolchain)
 
 # --- M9-3: the capabilities the NPDM grants, against the ones the image uses --
 # An SVC a process was not granted is not a soft failure on Horizon: the kernel
@@ -1684,9 +1696,9 @@ set(NPDM_CHECK "${CMAKE_SOURCE_DIR}/scripts/npdm-check.py")
 
 # The parser, against vectors hand-built from the NPDM and AArch64 formats
 # rather than from the artifact. It reads nothing that has to be compiled, so
-# it runs on every push -- which matters more here than usual: the entry below
-# it can run nowhere in CI today, so without this the byte offsets this all
-# rests on would have no coverage at all. The fixtures are chosen so that a
+# it runs on every runner -- which matters more here than usual: the entry
+# below it runs only inside the devkitPro image, so without this the byte
+# offsets this all rests on would be checked in one CI job and on no laptop. The fixtures are chosen so that a
 # parser reading the wrong offset gets a wrong answer rather than a lucky one;
 # each one of them is a mutation that survived before it was chosen.
 add_test(NAME npdm.parser
@@ -1697,8 +1709,8 @@ set_tests_properties(npdm.parser PROPERTIES TIMEOUT 60)
 # decided them -- the filesystem mask (SdCard only, not the `FormatSdCard` and
 # `CorruptSaveData` 0xFFFF... carried), the handle table (derived in
 # sysmodule/source/handle_budget.hpp) and the address space type. Read from the
-# config npdmtool is handed, so it runs on every push where `npdm.svcs` below
-# cannot; `npdm.svcs` asks the same of the NPDM npdmtool actually wrote.
+# config npdmtool is handed, so it runs on every push and on every runner;
+# `npdm.svcs` asks the same of the NPDM npdmtool actually wrote.
 add_test(NAME npdm.grants
          COMMAND ${Python3_EXECUTABLE} "${NPDM_CHECK}"
                  --json "${CMAKE_SOURCE_DIR}/sysmodule/sys-rommsync.json")
@@ -1707,10 +1719,8 @@ set_tests_properties(npdm.grants PROPERTIES TIMEOUT 60)
 # The real diff, over a real cross-compile. Its SKIP_RETURN_CODE is unwrapped
 # for the reason the long note above gives -- there is no NPDM without
 # npdmtool, and npdmtool is in the devkitpro image the host runner does not
-# have. Unlike `switch.builds` it has no equivalent elsewhere yet: the
-# `switch-build` job builds the module but does not parse what it built. M9-12
-# (#211) is where that is fixed; this entry is written so that fixing it is a
-# CI change and not a rewrite here.
+# have. The `switch-build` job runs it, in the image, with the rest of the
+# `toolchain` label (#211).
 set(NPDM_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_npdm.sh")
 add_test(NAME npdm.svcs COMMAND "${BASH_PROGRAM}" "${NPDM_TEST}" svcs)
 #
@@ -1720,7 +1730,7 @@ add_test(NAME npdm.svcs COMMAND "${BASH_PROGRAM}" "${NPDM_TEST}" svcs)
 # cross-compile in whichever of them lost. The failure is at least honest --
 # the build failing and the NPDM being wrong are two different messages here --
 # but it is a red build about nothing.
-set_tests_properties(npdm.svcs PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900
+set_tests_properties(npdm.svcs PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900 LABELS toolchain
                      RUN_SERIAL TRUE
                      ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
 
@@ -1729,7 +1739,7 @@ set_tests_properties(npdm.svcs PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900
 # build marker -- each a failure that builds green and is silent on a console
 # (#211). `switch.builds` runs scripts/artifact-check.py over a real build; this
 # is the script's own vectors, hand-built from the formats, so the offsets it
-# rests on are checked on every push and not only where a cross-compile can run.
+# rests on are checked on every runner and not only where a cross-compile can.
 add_test(NAME artifacts.parser
          COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/scripts/artifact-check.py"
                  --self-test)
@@ -1765,13 +1775,13 @@ endforeach()
 # it uses.
 #
 # It now has the same enforcement elsewhere that switch.builds has: `switch-build`
-# runs scripts/package.sh on every push, and the `release` job runs it again on a
-# tag (#34). That is what keeps a failure specific to packaging in the container
+# runs scripts/package.sh on every push and this entry with the `toolchain`
+# label (#211), and the `release` job runs the script again on a tag (#34). That is what keeps a failure specific to packaging in the container
 # -- a missing `zip`, say -- from first appearing on a tag. `release.ci` is what
 # says that step is still there.
 add_test(NAME package.builds
          COMMAND "${BASH_PROGRAM}" "${PACKAGE_TEST}" builds)
-set_tests_properties(package.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900
+set_tests_properties(package.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900 LABELS toolchain
                      RUN_SERIAL TRUE)
 
 # --- the install guide: docs/INSTALL.md --------------------------------------

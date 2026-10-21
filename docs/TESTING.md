@@ -693,9 +693,15 @@ ctest --test-dir build --output-on-failure
   Makefiles were missing. `switch.builds` runs the real devkitA64 build in the
   same `devkitpro/devkita64` image CI uses and checks that the `.nsp` is a PFS0
   archive, that the `.ovl` carries its `ULTR` signature, and that every `core/`
-  translation unit produced an aarch64 object. It skips when that image is not
-  pulled — including under `ROMMSYNC_REQUIRE_RIG`, since the host CI runner does
-  not have it and the `switch-build` job is the enforcement there.
+  translation unit produced an aarch64 object, and reads out of the built files
+  what the console's loaders read: libnx's `LNY2` stamp, the overlay's NACP, and
+  the `ROMMSYNC_NX_VERSION=` marker (`scripts/artifact-check.py`, whose own
+  vectors are `artifacts.parser`). It skips when that image is not pulled —
+  including under `ROMMSYNC_REQUIRE_RIG`, since the host CI runner does not have
+  it. The `switch-build` job runs it instead, in the image, where a skip fails:
+  see [the toolchain's ctest entries](DEVELOPMENT.md#the-toolchains-ctest-entries)
+  (#211), and `switch.toolchain_suite`, which holds that job's list to the
+  `toolchain` label.
 - The `npdm.*` pair asks what the console half is actually *allowed* to do. An
   SVC the NPDM does not grant is refused by the kernel and kills the process,
   and the linked sysmodule issued two it never declared (M9-3, #196) —
@@ -705,14 +711,12 @@ ctest --test-dir build --output-on-failure
   linked ELF, and also asserts the program id the config asked for,
   `is_retail`, pool partition 2, ACI0/ACID coherence and that no
   `@PLACEHOLDER@` reached the artifact. It needs npdmtool, so it needs the
-  `devkitpro/devkita64` image, so it skips wherever `switch.builds` does — and
-  unlike that one it has *no* equivalent in CI yet: the `switch-build` job
-  builds the module without parsing what it built, which is M9-12's (#211) to
-  fix. `npdm.parser` is the same script's `--self-test` over vectors hand-built
-  from the NPDM and AArch64 formats; it reads no artifact, so it never skips,
-  and it is the only coverage the byte offsets get until #211 lands — the
-  fixtures are chosen so that a parser reading the wrong offset gets a wrong
-  answer rather than a lucky one.
+  `devkitpro/devkita64` image, so it skips wherever `switch.builds` does, and
+  runs in the `switch-build` job beside it (#211). `npdm.parser` is the same
+  script's `--self-test` over vectors hand-built from the NPDM and AArch64
+  formats; it reads no artifact, so it never skips — the fixtures are chosen so
+  that a parser reading the wrong offset gets a wrong answer rather than a lucky
+  one.
 - The `toolchain.*` group holds the two pins the Switch build rests on and
   nothing here produces (M9-8, #199). `toolchain.pins` reads every file in the
   tree: each one naming the devkitPro image names the dated tag
@@ -724,7 +728,8 @@ ctest --test-dir build --output-on-failure
   newer than 4.10 — fails it. Those three never skip. `toolchain.libnx` asks the
   pinned image's package database for its libnx and requires 4.10.0 or later
   (HOS 21.0.0's TLS ABI); it skips without the image, like `switch.builds`, and
-  the `switch-build` job runs the same check in the container on every push.
+  the `switch-build` job runs it on every push, as a step and with the rest of
+  the `toolchain` label.
 - The `boot.*` group is the sysmodule's `__appInit`, which nothing off a console
   can execute -- which is how three separate bugs sat in twenty lines through
   every green run (M9-1, #195). Half of it reads: `boot.dns`, `boot.clock`,
@@ -889,12 +894,15 @@ ctest --test-dir build --output-on-failure
 - The `package.*` group covers `scripts/package.sh`, which turns those two build
   outputs into the zip a user unpacks onto their SD card. `package.layout`,
   `package.refuses`, `package.deterministic` and `package.upgrade` stub the two
-  artifacts — four bytes of magic is all the script inspects — so they need no
-  toolchain and never skip. `package.builds` does the real cross-compile and
-  packages it *inside* the container, and skips on the same missing image
-  `switch.builds` does — and, like that one, it now has an equivalent in CI that
-  cannot skip: `switch-build` runs `scripts/package.sh` on every push and the
-  `release` job runs it again on a tag, both in that image (#34).
+  artifacts — four bytes of magic is all the script inspects — and
+  `package.toolbox` needs none, feeding `tests/toolbox_check.py` every
+  `toolbox.json` ovl-sysmodules would skip or abort on; none of them skips.
+  `package.builds` does the real cross-compile and packages it *inside* the
+  container, holds the archive to the same layout `package.layout` does and
+  `toolbox.json`'s `tid` to the built NPDM's program id, and skips on the same
+  missing image `switch.builds` does — and, like that one, runs in the
+  `switch-build` job, where it cannot skip (#211). The `release` job runs the
+  script again on a tag (#34).
 - The `release.*` group and `version.tag` cover what turns a `v*` tag into a
   downloadable release, and none of them needs Docker, a network or a tag:
   `version.tag` refuses a tag that disagrees with `VERSION` (it reads

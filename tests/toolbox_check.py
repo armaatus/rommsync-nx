@@ -49,6 +49,10 @@ KEYS = {"tid": str, "name": str, "version": str, "requires_reboot": bool}
 
 TID = re.compile(r"[0-9A-Fa-f]{16}")
 
+# Every type json.loads can hand back, by the name JSON gives it.
+JSON_TYPES = {str: "string", bool: "bool", int: "number", float: "number",
+              list: "array", dict: "object", type(None): "null"}
+
 
 def check(raw, tid, version, directory, program_id):
     """The first reason this file is not one to ship, or None."""
@@ -89,8 +93,8 @@ def check(raw, tid, version, directory, program_id):
         # comparison is on the exact type: a JSON `true` where a string belongs,
         # or a `"false"` where a bool does, is the abort described above.
         if type(doc[key]) is not kind:
-            return (f"toolbox.json's {key!r} is a JSON {type(doc[key]).__name__}, not a "
-                    f"{kind.__name__}; nlohmann aborts ovl-sysmodules on that")
+            return (f"toolbox.json's {key!r} is a JSON {JSON_TYPES[type(doc[key])]}, not a "
+                    f"{JSON_TYPES[kind]}; nlohmann aborts ovl-sysmodules on that")
 
     if not TID.fullmatch(doc["tid"]):
         return f"toolbox.json's tid {doc['tid']!r} is not 16 hex digits"

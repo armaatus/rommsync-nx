@@ -17,10 +17,10 @@
 #                                plain string compare reads 4.9 as newer than
 #                                4.10, which is exactly the floor in question.
 #   test_toolchain.sh libnx      the pinned image's libnx really is >= the floor
-#                                (HOS 21.0.0's TLS ABI; #199, #211). Needs Docker
-#                                and the image, so it skips without them; the
-#                                `switch-build` CI job runs the same check in the
-#                                container and is the enforcement there.
+#                                (HOS 21.0.0's TLS ABI; #199, #211). Needs the
+#                                image, so it skips without it; the
+#                                `switch-build` CI job runs the same check as a
+#                                step, and this entry with the `toolchain` label.
 #
 # `pins`, `submodule` and `floor` read the tree only, so they never skip.
 set -uo pipefail

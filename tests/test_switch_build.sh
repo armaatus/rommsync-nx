@@ -26,11 +26,16 @@
 #                                  lands the real backend, and retiring it
 #                                  should not touch the assertions about the two
 #                                  targets that ship (tlsprobe/README.md).
+#   test_switch_build.sh suite CTEST BUILD_DIR
+#                                  tests/toolchain_suite.sh, which switch-build
+#                                  runs, is exactly `ctest -L toolchain`, and
+#                                  fails on an entry that skips (#211).
 #
-# `ci` needs nothing but the checkout, so it runs everywhere. `builds` needs
-# Docker and the devkitpro/devkita64 image, which the host CI runner does not
-# have -- there the switch-build job itself is the enforcement, and this entry
-# is its local equivalent. It skips rather than pulling 2.7GB unasked.
+# `ci` and `suite` need nothing but the checkout, so they run everywhere.
+# `builds` and `tlsprobe` need the devkitpro/devkita64 image: through Docker on
+# a workstation, where they skip rather than pulling 2.7GB unasked, and in place
+# inside the `switch-build` job, which runs them with the rest of the
+# `toolchain` label and fails on a skip (scripts/toolchain.sh, toolchain_run).
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -102,7 +107,14 @@ phase_ci() {
     fail "switch-build passes scripts/image-budget.sh a flag; the budget lives in the script (#204)"
   fi
 
-  echo "ok: switch-build builds all three targets, packages them, requires the artifacts, and holds the image to its budget"
+  # M9-12 (#211): the entries that skip without the image run in this job, in
+  # it, where a skip is a failure. `--here` is what makes them run in place
+  # rather than look for a Docker the container does not have.
+  grep -q 'tests/toolchain_suite.sh --here' <<<"$job" ||
+    fail "switch-build does not run the toolchain's ctest entries; they would run nowhere in CI (#211)"
+
+  echo "ok: switch-build builds all three targets, packages them, requires the artifacts,\
+ holds the image to its budget, and runs the toolchain's ctest entries"
 }
 
 # --- the real cross-compile ---------------------------------------------------
@@ -412,9 +424,101 @@ phase_tlsprobe() {
   echo "ok: the M0-1 probe builds as an NRO carrying $version, without core/"
 }
 
+# --- the entries that need the toolchain, and where they run -------------------
+
+# M9-12 (#211). Every entry above that needs devkitPro skips without it, and the
+# host-tests runner never has it -- so nothing in CI ran them.
+# tests/toolchain_suite.sh is the list the switch-build job runs, in the image;
+# `ctest -L toolchain` is the list ctest knows. This holds them to each other,
+# and shows the suite cannot pass over an entry that did not.
+#
+#   test_switch_build.sh suite CTEST BUILD_DIR
+phase_suite() {
+  local ctest="$1" build="$2"
+  local suite="$REPO_ROOT/tests/toolchain_suite.sh"
+  [ -f "$suite" ] || fail "no tests/toolchain_suite.sh"
+
+  # ctest's own account of every registered entry, its labels, its skip code
+  # and its command -- not a grep of CMakeLists.txt, which would miss a loop.
+  local json labelled
+  json="$("$ctest" --test-dir "$build" --show-only=json-v1)" ||
+    fail "ctest --show-only=json-v1 failed in $build"
+  labelled="$("${PYTHON:-python3}" -c '
+import json, os, sys
+doc = json.load(sys.stdin)
+unlabelled = []
+for test in doc["tests"]:
+    props = {p["name"]: p["value"] for p in test.get("properties", [])}
+    command = test.get("command") or []
+    scripts = [a for a in command if a.endswith(".sh")]
+    if "toolchain" in (props.get("LABELS") or []):
+        print(test["name"], os.path.basename(scripts[0]) if scripts else "?", command[-1])
+    # The converse: an entry that may skip and runs a script that reaches for
+    # the toolchain is an entry this suite has to know about.
+    elif "SKIP_RETURN_CODE" in props and scripts:
+        with open(scripts[0]) as f:
+            if "toolchain_missing" in f.read():
+                unlabelled.append(test["name"])
+for name in unlabelled:
+    print("UNLABELLED", name)
+' <<<"$json")" || fail "could not read ctest's test list"
+
+  if grep -q '^UNLABELLED ' <<<"$labelled"; then
+    fail "these may skip for want of the toolchain and are not labelled \`toolchain\`, so \
+nothing in CI runs them: $(sed -n 's/^UNLABELLED //p' <<<"$labelled" | tr '\n' ' ')"
+  fi
+  [ -n "$labelled" ] || fail "no ctest entry carries the \`toolchain\` label"
+  local listed
+  listed="$(bash "$suite" --list | sort)"
+  [ "$(sort <<<"$labelled")" = "$listed" ] || {
+    echo "--- ctest -L toolchain ---"; sort <<<"$labelled"
+    echo "--- tests/toolchain_suite.sh --list ---"; echo "$listed"
+    fail "the suite the switch-build job runs is not the set ctest labels \`toolchain\`"
+  }
+
+  # The deliberate break, against a copy whose entries are stubs: a skip and a
+  # failure each fail the suite and are named, and a clean run passes.
+  SCRATCH="$(mktemp -d)"
+  mkdir -p "$SCRATCH/tests" "$SCRATCH/scripts"
+  cp "$suite" "$SCRATCH/tests/"
+  cp "$REPO_ROOT/scripts/toolchain.sh" "$SCRATCH/scripts/"
+  local script out
+  stub_entries() {  # stub_entries STATUS-FOR-test_npdm.sh
+    for script in test_toolchain.sh test_switch_build.sh test_package.sh; do
+      printf 'exit 0\n' >"$SCRATCH/tests/$script"
+    done
+    printf 'exit %s\n' "$1" >"$SCRATCH/tests/test_npdm.sh"
+  }
+
+  stub_entries 0
+  out="$(bash "$SCRATCH/tests/toolchain_suite.sh" 2>&1)" ||
+    { echo "$out" >&2; fail "the suite failed with every entry passing"; }
+
+  stub_entries 77
+  out="$(bash "$SCRATCH/tests/toolchain_suite.sh" 2>&1)" &&
+    { echo "$out" >&2; fail "the suite passed over an entry that skipped"; }
+  grep -q 'npdm.svcs skipped' <<<"$out" ||
+    { echo "$out" >&2; fail "the suite failed on a skip without naming it"; }
+
+  stub_entries 1
+  out="$(bash "$SCRATCH/tests/toolchain_suite.sh" 2>&1)" &&
+    { echo "$out" >&2; fail "the suite passed over an entry that failed"; }
+  grep -q 'npdm.svcs failed' <<<"$out" ||
+    { echo "$out" >&2; fail "the suite failed without naming the entry"; }
+
+  # ...and a job that says --here and is not in the image fails rather than
+  # running everything through a docker it does not have.
+  stub_entries 0
+  out="$(DEVKITPRO="$SCRATCH/nowhere" bash "$SCRATCH/tests/toolchain_suite.sh" --here 2>&1)" &&
+    { echo "$out" >&2; fail "--here passed with no toolchain present"; }
+
+  echo "ok: the switch-build job's suite is exactly \`ctest -L toolchain\`, and a skip in it fails"
+}
+
 case "${1:-}" in
   ci)       phase_ci ;;
   builds)   phase_builds ;;
   tlsprobe) phase_tlsprobe ;;
-  *)        echo "usage: $0 {ci|builds|tlsprobe}" >&2; exit 2 ;;
+  suite)    shift; phase_suite "$@" ;;
+  *)        echo "usage: $0 {ci|builds|tlsprobe|suite CTEST BUILD_DIR}" >&2; exit 2 ;;
 esac

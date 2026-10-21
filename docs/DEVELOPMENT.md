@@ -99,6 +99,49 @@ signatures that still compile but mean something else -- v2.0.0 changed four
 (`drawString`, `CategoryHeader`, `OverlayFrame`, `ListItem`; #199 has the
 table) -- before trusting a green `switch.builds`.
 
+### The toolchain's ctest entries
+
+Five entries need the image: `switch.builds`, `switch.tlsprobe`,
+`toolchain.libnx`, `npdm.svcs` and `package.builds`, the `toolchain` label
+(`ctest -L toolchain`). They skip without it, and the host-tests runner never
+has it, so they run in the `switch-build` job instead: that job is already
+inside the pinned image, and its last step is `tests/toolchain_suite.sh --here`,
+which runs all five in place and **fails on a skip** (M9-12, #211). Before
+that, CI read four bytes of each artifact and nothing else; the symbols, the
+NACP and the NPDM checks had never run anywhere. `switch.toolchain_suite` holds
+the suite's list to the label, so a new entry needs both.
+
+The entries reach the image through `toolchain_run` in `scripts/toolchain.sh`:
+`docker run` on a workstation, in place when `ROMMSYNC_IN_TOOLCHAIN=1` says the
+shell is inside it already. Explicit rather than sniffed, because a devkitPro
+installed natively on a laptop is not the pin.
+
+What they read out of the built files, beyond the build succeeding:
+
+- **libnx's `LNY2` stamp** in MOD0, version >= 1, on the `.nsp`, the `.ovl` and
+  the probe (`scripts/artifact-check.py lny2`). It is how a binary says it was
+  built for HOS 21.0.0's TLS ABI. Ultrahand reads it out of the `.ovl` on the
+  card and on Atmosphère >= 1.10.0 hides an overlay without it. The libnx floor
+  check says the toolchain *should* stamp it; this says it did.
+- **The overlay's NACP**, parsed by Ultrahand's `getOverlayInfo` route — the
+  NRO's size, the `ASET` header after it, the NACP that names — with the name
+  and version the menu shows. An entry whose NACP does not parse is skipped.
+- **`ROMMSYNC_NX_VERSION=<VERSION>`** as a string in both artifacts. It is
+  `kBuildMarker`, and `version()` returns its tail, so `--gc-sections` cannot
+  drop it. elf2nso LZ4-compresses every NSO segment with no switch to stop it,
+  so `strings` on the `.nsp` finds it only by luck;
+  `scripts/artifact-check.py version FILE` decompresses first, and is how a file
+  from a bug report is identified.
+- **The NPDM** against the SVCs the linked sysmodule issues (`npdm.svcs`), and
+  **toolbox.json's `tid`** against the program id read back out of that NPDM
+  (`package.builds`).
+- **The release zip's layout**, the image budget, and the `.ovl`'s 1 MiB
+  ceiling (`scripts/image-budget.sh`).
+
+The overlay has no NPDM: it runs inside nx-ovlloader's process, with
+nx-ovlloader's capabilities, so an SVC or service question about `ovl-rommsync`
+is one about nx-ovlloader's NPDM, which this repo does not build.
+
 ### What the image costs
 
 Both Switch targets live in a memory budget somebody else sets. The sysmodule's

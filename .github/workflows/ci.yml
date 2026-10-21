@@ -311,6 +311,21 @@ jobs:
       - name: Package
         run: scripts/package.sh
 
+      # The ctest entries that need this image -- `ctest -L toolchain` -- run
+      # here, in it (M9-12, #211). They skip on every runner host-tests uses, so
+      # until this step their assertions had run nowhere: the symbols in the
+      # linked images, the NPDM's grants against the SVCs the sysmodule issues,
+      # libnx's LNY2 stamp that Ultrahand reads off the card, the overlay's
+      # NACP, toolbox.json against the built NPDM, the release zip's layout.
+      # `--here` runs them in place, since this container has no Docker to start
+      # the image again, and fails on a skip, since in here nothing they need
+      # can be missing. Each builds its own copy of the tree, so this is a few
+      # minutes; host-tests takes longer, and runs beside it.
+      #
+      # Last, for the reason Package is after the upload.
+      - name: The toolchain's ctest entries
+        run: bash tests/toolchain_suite.sh --here
+
   # The same three builds against `:latest`, so a devkitPro release that breaks
   # us is learned here, as one red job, rather than as a red required check on
   # an unrelated PR the day the pin moves (#199; ovl-sysmodules#32 is what that

@@ -39,8 +39,8 @@
 # the devkitpro/devkita64 image, exactly like `switch.builds`, and skips rather
 # than pulling 2.7GB unasked -- which means that on a machine without it,
 # nothing here exercises the packaging in the container. CI does: `switch-build`
-# runs scripts/package.sh on every push and the `release` job runs it on a tag
-# (#34), both in this image.
+# runs scripts/package.sh and this entry on every push, in place inside the
+# image (#211), and the `release` job runs the script on a tag (#34).
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

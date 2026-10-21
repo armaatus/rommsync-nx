@@ -13,8 +13,8 @@
 # The parser half is `npdm.parser` in tests/CMakeLists.txt -- the same script's
 # --self-test, which reads no artifact and so runs everywhere. This entry cannot:
 # an NPDM only exists once npdmtool has run, and npdmtool is in the container.
-# It therefore skips on every runner this project has today, which is M9-12's
-# (#211) problem to fix and not a reason to invent a second mechanism here.
+# It skips without the image, and the `switch-build` job runs it inside the
+# image with the rest of the `toolchain` label, where a skip fails (#211).
 #
 # This is the sysmodule's NPDM and only the sysmodule's. `ovl-rommsync` has none:
 # an overlay runs inside nx-ovlloader's process and inherits its capabilities, so
