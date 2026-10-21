@@ -7,6 +7,7 @@
 // and a refused body are all answers that do not change on a second attempt.
 #include "rommsync/sync_tick.hpp"
 
+#include <algorithm>
 #include <string>
 #include <utility>
 #include <vector>
@@ -207,9 +208,31 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
     return result;
   }
 
+  // A save RomM deleted and `[sync] on_server_delete = keep` left is not
+  // offered while it still holds the bytes that were deleted (#233). RomM's
+  // memory of a deletion is bounded, and it reads the same bytes rewritten with
+  // a later mtime as progress -- an emulator that writes its save on closing
+  // would upload it straight back. New bytes are offered. Copied only when one
+  // is withheld: the tick that carries this vector is the heap's peak.
+  std::vector<ClientSaveState> without_kept;
+  const std::vector<ClientSaveState>* offered = &reported;
+  const auto withheld = [&previous](const ClientSaveState& save) {
+    const state::SaveRecord* row = previous.Find(save.rom_id, save.slot);
+    return row != nullptr && row->deleted_on_server && save.content_hash.has_value() &&
+           *save.content_hash == row->content_hash;
+  };
+  if (std::any_of(reported.begin(), reported.end(), withheld)) {
+    for (const ClientSaveState& save : reported) {
+      if (!withheld(save)) {
+        without_kept.push_back(save);
+      }
+    }
+    offered = &without_kept;
+  }
+
   NegotiateOptions negotiate = options.negotiate;
   negotiate.cancel = options.cancel;
-  result.negotiated = Negotiate(client, token, reported, negotiate);
+  result.negotiated = Negotiate(client, token, *offered, negotiate);
   if (!result.negotiated.ok()) {
     // The offline case, and the one the acceptance is sharpest about: nothing
     // after this point runs, so no save is touched, no backup is written and
@@ -240,7 +263,7 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
   // A `delete` (#233) is obeyed only where the heartbeat said the server means
   // one, and only on the bytes this tick reported: the server ruled on those.
   execute.delete_action = options.server.delete_action;
-  execute.reported = &reported;
+  execute.reported = offered;
   result.executed =
       ExecutePlan(client, files, token, result.negotiated.plan, targets, execute);
 
@@ -268,8 +291,10 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
   // request (sync_finish.hpp).
   FinishOptions finish = options.finish;
   finish.complete.cancel = options.cancel;
+  // `offered`, not `reported`: a withheld save is one this tick did not
+  // mention, so its marked row stands as it is.
   result.finished = FinishTick(client, files, token, result.negotiated.plan, result.executed,
-                               reported, std::move(previous), finish);
+                               *offered, std::move(previous), finish);
 
   result.session_gone = SessionGone(result.finished.reported.error);
   result.outcome = OutcomeAfter(result.executed, result.finished);

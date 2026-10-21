@@ -816,10 +816,11 @@ OperationResult Remove(fs::FileSystem& files, const SyncOperation& operation,
   result.slot = operation.slot;
   result.sd_path = target->sd_path;
 
-  if (options.on_server_delete == DeleteMode::kKeep) {
+  if (options.on_server_delete == config::OnServerDelete::kKeep) {
     result.outcome = OperationOutcome::kKept;
     result.message = Describe(operation) + ": deleted on the server; " + target->sd_path +
-                     " stays on the card ([sync] on_server_delete = keep) and is no longer tracked";
+                     " stays on the card ([sync] on_server_delete = keep), and these bytes are not "
+                     "offered to RomM again";
     return result;
   }
 
@@ -827,6 +828,18 @@ OperationResult Remove(fs::FileSystem& files, const SyncOperation& operation,
   if (source.empty()) {
     return Fail(operation, OperationError::kUnreadableCard,
                 "the save path " + target->sd_path + " is not a path on this card");
+  }
+  // Asked before anything is copied: with no digest to hold the backup to,
+  // the removal will not happen, and a copy made first would only be litter.
+  const std::string expected =
+      options.reported != nullptr ? ReportedDigest(*options.reported, *target) : std::string();
+  if (expected.empty()) {
+    OperationResult failed =
+        Fail(operation, OperationError::kUnverified,
+             "this tick reported no digest for the save, so nothing says it is the copy the "
+             "server deleted; it was left on the card");
+    failed.sd_path = target->sd_path;
+    return failed;
   }
 
   std::string message;
@@ -848,22 +861,19 @@ OperationResult Remove(fs::FileSystem& files, const SyncOperation& operation,
 
   // The backup, not the save, is what is hashed: it is the copy that has to be
   // right for the removal to be safe, and it is the bytes the removal takes.
-  if (options.reported != nullptr) {
-    const std::string expected = ReportedDigest(*options.reported, *target);
-    const state::HashOutcome digest = state::HashFile(files.Resolve(result.backup_sd_path));
-    if (expected.empty() || !digest.ok() || digest.content_hash != expected) {
-      // The server ruled on the bytes this tick reported, and these are not
-      // them: progress the ruling never saw. The save stays, and the copy goes
-      // with it -- it duplicates a file nothing replaced, so it backs up
-      // nothing, which is `BackUpFirst`'s own reasoning for an unconfirmed one.
-      io::Remove(files.Resolve(result.backup_sd_path));
-      OperationResult failed =
-          Fail(operation, OperationError::kUnverified,
-               "the save is not the bytes this tick reported, so the server's ruling is not "
-               "about it; it was left on the card");
-      failed.sd_path = target->sd_path;
-      return failed;
-    }
+  const state::HashOutcome digest = state::HashFile(files.Resolve(result.backup_sd_path));
+  if (!digest.ok() || digest.content_hash != expected) {
+    // The server ruled on the bytes this tick reported, and these are not
+    // them: progress the ruling never saw. The save stays, and the copy goes
+    // with it -- it duplicates a file nothing replaced, so it backs up
+    // nothing, which is `BackUpFirst`'s own reasoning for an unconfirmed one.
+    io::Remove(files.Resolve(result.backup_sd_path));
+    OperationResult failed =
+        Fail(operation, OperationError::kUnverified,
+             "the save is not the bytes this tick reported, so the server's ruling is not "
+             "about it; it was left on the card");
+    failed.sd_path = target->sd_path;
+    return failed;
   }
 
   if (io::Remove(source) != 0) {

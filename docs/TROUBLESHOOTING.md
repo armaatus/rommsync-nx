@@ -657,7 +657,7 @@ deleted in RomM is still on the console.
 
 ```
 22 info save.deleted delete rom 4, slot tico-srm: deleted on the server; removed /tico/saves/nes/nova.srm after backing it up to /config/rommsync/.backup/4-tico-srm-1757000901.srm
-22 info save.deleted delete rom 4, slot tico-srm: deleted on the server; /tico/saves/nes/nova.srm stays on the card ([sync] on_server_delete = keep) and is no longer tracked
+22 info save.deleted delete rom 4, slot tico-srm: deleted on the server; /tico/saves/nes/nova.srm stays on the card ([sync] on_server_delete = keep), and these bytes are not offered to RomM again
 ```
 
 **What is happening.** The save was deleted in RomM — in its web UI, or by
@@ -666,8 +666,9 @@ it — and RomM 5.4 told this console not to upload its copy again. With
 `[sync] on_server_delete = remove`, the default, the file is copied under
 `/config/rommsync/.backup/` **first** and only then removed: the server is the
 source of truth, and the backup is what makes obeying it safe. With `keep`, the
-file stays exactly as it was and is not uploaded while it holds the bytes RomM
-deleted ([CONFIG.md](CONFIG.md#on_server_delete-a-save-deleted-in-romm)).
+file stays exactly as it was and is not offered to RomM again while it holds the
+bytes RomM deleted — one `save.deleted` line, then silence; play it and the new
+progress syncs as usual ([CONFIG.md](CONFIG.md#on_server_delete-a-save-deleted-in-romm)).
 
 **Fix.** To have the save back, open the overlay's **Conflicts** screen: a
 removed save is listed as *deleted on RomM*, and restoring it puts the file back

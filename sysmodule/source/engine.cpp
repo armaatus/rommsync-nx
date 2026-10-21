@@ -1869,11 +1869,9 @@ bool SdEngine::RunOneTick() {
   // negotiation and transfer after it, so it asks again (#232 against #242).
   options.hold_resolution = [this]() { return application_running(); };
   options.execute.backup_dir = sync::kBackupDir;
-  // What a save RomM deleted does here (#233). Backed up first either way the
-  // executor removes it; `keep` never touches the file.
-  options.execute.on_server_delete = config->sync.on_server_delete == config::OnServerDelete::kKeep
-                                         ? sync::DeleteMode::kKeep
-                                         : sync::DeleteMode::kRemove;
+  // What a save RomM deleted does here (#233): backed up, then removed, unless
+  // `keep` says leave it.
+  options.execute.on_server_delete = config->sync.on_server_delete;
   options.finish.state_sd_path = sync::kStateSdPath;
   options.cancel = cancel.get();
   // The save folders and `.backup/`, and deliberately **not** `/config/rommsync`

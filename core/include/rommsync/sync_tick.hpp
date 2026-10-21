@@ -389,6 +389,10 @@ struct TickResult {
 /// where the files are. `previous` is the baseline `state::LoadBaseline` read,
 /// taken by value so a caller can `std::move` it in.
 ///
+/// One save in `reported` is not offered: one whose `previous` row is marked
+/// `deleted_on_server` and still holds its digest -- a save RomM deleted that
+/// `[sync] on_server_delete = keep` left on the card (#233).
+///
 /// **A failed negotiation returns before anything is written.** That is the
 /// offline case and it is the common one: no request that follows would work, no
 /// save is touched, no backup is written and `state.db` is not rewritten. The

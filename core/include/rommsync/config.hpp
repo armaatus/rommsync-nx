@@ -114,17 +114,19 @@ struct ServerConfig {
   std::string url;
 };
 
-/// `[sync]`.
 /// `[sync] on_server_delete`: what a save RomM deleted does on the card (#233).
 enum class OnServerDelete {
   /// Backed up under `.backup/`, then removed. The default: the server is the
   /// source of truth, and the backup is what makes obeying it safe.
   kRemove,
 
-  /// Left on the card, no longer tracked, and never uploaded while it holds
-  /// the bytes RomM deleted.
+  /// Left on the card and never offered to the server while it holds the bytes
+  /// RomM deleted (`state::SaveRecord::deleted_on_server`). New bytes are new
+  /// progress and are offered.
   kKeep,
 };
+
+/// `[sync]`.
 
 struct SyncConfig {
   bool enabled = true;

@@ -789,6 +789,15 @@ sync::SyncPlan DeletePlan(std::int64_t rom_id, const std::string& slot) {
   return plan;
 }
 
+/// `OptionsAt`, for a server that means its `delete` -- what `RunTick` copies
+/// in from `TickOptions::server`, and what a bare `ExecuteOptions` does not
+/// assume.
+sync::ExecuteOptions DeleteOptionsAt(std::int64_t unix_seconds) {
+  sync::ExecuteOptions options = OptionsAt(unix_seconds);
+  options.delete_action = true;
+  return options;
+}
+
 /// What step 0 reported for one save: only the digest matters to a delete.
 sync::ClientSaveState ReportedAs(std::int64_t rom_id, const std::string& slot,
                                  const std::string& name, const std::string& bytes) {
@@ -814,10 +823,13 @@ void Delete(rig::Checks& checks) {
     const std::string bytes = "the copy RomM deleted\n";
     sandbox.SeedSave(SavePath(name), bytes);
     const std::vector<sync::ClientSaveState> reported = {ReportedAs(21, "gone", name, bytes)};
-    sync::ExecuteOptions options = OptionsAt(kWhen);
+    sync::ExecuteOptions options = DeleteOptionsAt(kWhen);
     options.reported = &reported;
-    checks.Expect(options.on_server_delete == sync::DeleteMode::kRemove,
+    checks.Expect(options.on_server_delete == rommsync::config::OnServerDelete::kRemove,
                   "removing is the default");
+    checks.Expect(!sync::ExecuteOptions{}.delete_action && sync::ExecuteOptions{}.reported == nullptr,
+                  "and a bare ExecuteOptions obeys no delete: it has to be told the server means "
+                  "one, and given the digests to hold it to");
     const sync::ExecutionReport report = sync::ExecutePlan(
         client, *files, token, DeletePlan(21, "gone"), {{21, "gone", SavePath(name), name}},
         options);
@@ -843,9 +855,9 @@ void Delete(rig::Checks& checks) {
     const std::string bytes = "a copy the user keeps\n";
     sandbox.SeedSave(SavePath(name), bytes);
     const std::vector<sync::ClientSaveState> reported = {ReportedAs(22, "kept", name, bytes)};
-    sync::ExecuteOptions options = OptionsAt(kWhen);
+    sync::ExecuteOptions options = DeleteOptionsAt(kWhen);
     options.reported = &reported;
-    options.on_server_delete = sync::DeleteMode::kKeep;
+    options.on_server_delete = rommsync::config::OnServerDelete::kKeep;
     const sync::ExecutionReport report = sync::ExecutePlan(
         client, *files, token, DeletePlan(22, "kept"), {{22, "kept", SavePath(name), name}},
         options);
@@ -866,7 +878,7 @@ void Delete(rig::Checks& checks) {
     sandbox.SeedSave(SavePath(name), bytes);
     const std::vector<sync::ClientSaveState> reported = {
         ReportedAs(23, "changed", name, "the bytes the server deleted\n")};
-    sync::ExecuteOptions options = OptionsAt(kWhen);
+    sync::ExecuteOptions options = DeleteOptionsAt(kWhen);
     options.reported = &reported;
     const sync::ExecutionReport report = sync::ExecutePlan(
         client, *files, token, DeletePlan(23, "changed"),
@@ -879,6 +891,31 @@ void Delete(rig::Checks& checks) {
     checks.Expect(!sandbox.HasBackupOf(bytes), "and no stray copy of it is left in .backup/");
   }
 
+  // 3b. Reported with no digest -- or not reported to the executor at all.
+  // Nothing says these bytes are the ones RomM ruled on, so they stay, and no
+  // copy is made of a save that is not going anywhere.
+  {
+    const std::string name = "undigested.srm";
+    const std::string bytes = "a save step 0 could not hash\n";
+    sandbox.SeedSave(SavePath(name), bytes);
+    sync::ClientSaveState undigested = ReportedAs(28, "undigested", name, bytes);
+    undigested.content_hash.reset();
+    const std::vector<sync::ClientSaveState> reported = {undigested};
+    for (const bool with_reported : {true, false}) {
+      sync::ExecuteOptions options = DeleteOptionsAt(kWhen);
+      options.reported = with_reported ? &reported : nullptr;
+      const sync::ExecutionReport report = sync::ExecutePlan(
+          client, *files, token, DeletePlan(28, "undigested"),
+          {{28, "undigested", SavePath(name), name}}, options);
+      checks.Expect(report.operations.size() == 1 &&
+                        report.operations[0].error == sync::OperationError::kUnverified,
+                    std::string("a delete with no digest to hold it to is refused (") +
+                        (with_reported ? "none reported" : "nothing handed over") + ")");
+    }
+    checks.ExpectEq(sandbox.Read(SavePath(name)), bytes, "the save is untouched");
+    checks.Expect(!sandbox.HasBackupOf(bytes), "and nothing was copied for it");
+  }
+
   // 4. Nothing the scan reported. A delete never invents a path: `place` is
   // for a download, and a save the scan did not report -- a Tico account it
   // has not decided on (#231), a folder it could not read -- is not touched.
@@ -886,7 +923,7 @@ void Delete(rig::Checks& checks) {
     const std::string name = "unscanned.srm";
     const std::string bytes = "a save the scan never reported\n";
     sandbox.SeedSave(SavePath(name), bytes);
-    sync::ExecuteOptions options = OptionsAt(kWhen);
+    sync::ExecuteOptions options = DeleteOptionsAt(kWhen);
     options.place = [&name](const sync::SyncOperation&) { return SavePath(name); };
     const sync::ExecutionReport report =
         sync::ExecutePlan(client, *files, token, DeletePlan(24, "unscanned"), {}, options);
@@ -903,7 +940,7 @@ void Delete(rig::Checks& checks) {
     sandbox.SeedSave(SavePath(name), bytes);
     const std::vector<sync::ClientSaveState> reported = {
         ReportedAs(25, "unbacked", name, bytes)};
-    sync::ExecuteOptions options = OptionsAt(kWhen);
+    sync::ExecuteOptions options = DeleteOptionsAt(kWhen);
     options.reported = &reported;
     options.backup_dir = "/config/rommsync/no-such-dir";
     const sync::ExecutionReport report = sync::ExecutePlan(
@@ -920,7 +957,7 @@ void Delete(rig::Checks& checks) {
   {
     const std::vector<sync::ClientSaveState> reported = {
         ReportedAs(26, "vanished", "vanished.srm", "bytes")};
-    sync::ExecuteOptions options = OptionsAt(kWhen);
+    sync::ExecuteOptions options = DeleteOptionsAt(kWhen);
     options.reported = &reported;
     const sync::ExecutionReport report = sync::ExecutePlan(
         client, *files, token, DeletePlan(26, "vanished"),
@@ -940,7 +977,7 @@ void Delete(rig::Checks& checks) {
     const std::string bytes = "a save on a server that never deletes\n";
     sandbox.SeedSave(SavePath(name), bytes);
     const std::vector<sync::ClientSaveState> reported = {ReportedAs(27, "ungated", name, bytes)};
-    sync::ExecuteOptions options = OptionsAt(kWhen);
+    sync::ExecuteOptions options = DeleteOptionsAt(kWhen);
     options.reported = &reported;
     options.delete_action = false;
     const sync::ExecutionReport report = sync::ExecutePlan(
@@ -995,7 +1032,7 @@ void CrashDelete(rig::Checks& checks) {
     const auto files = rommsync::host::MakeNativeFileSystem(sandbox.root().string());
     sandbox.SeedSave(save, bytes);
     crash::Recorder recorder(sandbox.root());
-    sync::ExecuteOptions options = OptionsAt(1'757'000'600);
+    sync::ExecuteOptions options = DeleteOptionsAt(1'757'000'600);
     options.reported = &reported;
     const sync::ExecutionReport report =
         sync::ExecutePlan(client, *files, token, DeletePlan(31, "crash"), targets, options);
@@ -1013,7 +1050,7 @@ void CrashDelete(rig::Checks& checks) {
     const auto files = rommsync::host::MakeNativeFileSystem(sandbox.root().string());
     sandbox.SeedSave(save, bytes);
     crash::Recorder recorder(sandbox.root(), {harness::kBackupDir});
-    sync::ExecuteOptions options = OptionsAt(1'757'000'601);
+    sync::ExecuteOptions options = DeleteOptionsAt(1'757'000'601);
     options.reported = &reported;
     const sync::ExecutionReport report =
         sync::ExecutePlan(client, *files, token, DeletePlan(31, "crash"), targets, options);

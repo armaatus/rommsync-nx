@@ -196,6 +196,16 @@ struct SaveRecord {
   /// this field.
   std::optional<sync::Timestamp> server_updated_at;
   std::optional<std::string> server_content_hash;
+
+  /// RomM deleted this save and `[sync] on_server_delete = keep` left it on the
+  /// card (#233). While the file still holds `content_hash`, `sync::RunTick`
+  /// does not offer it to the server: RomM's own memory of the deletion is
+  /// bounded and does not cover the same bytes rewritten later, so the client
+  /// keeps the promise itself. New bytes are new progress and are offered.
+  ///
+  /// Written as `"deleted_on_server":true` only when set, so every other row is
+  /// byte-identical to the ones before it, and read as false when absent.
+  bool deleted_on_server = false;
 };
 
 /// What one save **state** looked like at the end of the last sync.

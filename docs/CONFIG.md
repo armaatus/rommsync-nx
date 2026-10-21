@@ -323,7 +323,7 @@ asks it not to upload that copy again ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#a-sav
 | value | the file on the card |
 |---|---|
 | `remove` (default) | copied under `/config/rommsync/.backup/` **first**, then removed. Listed on the **Conflicts** screen as *deleted on RomM*, from where it can be put back. |
-| `keep` | left exactly as it is, and not tracked any more. It is not uploaded while it holds the bytes RomM deleted; once you play and it changes, it is new progress and RomM decides what to do with it. |
+| `keep` | left exactly as it is. `state.db` remembers it as deleted on the server, and while the file holds those bytes it is not offered to RomM at all — not even when an emulator writes the same bytes back on closing. Once you play and it changes, it is new progress and syncs as usual. |
 
 Anything else is a `warning` and the current value stays. The overlay does not
 show or edit this key yet; set it in this file.

@@ -199,6 +199,12 @@ std::string SerializeRecord(const SaveRecord& record) {
   out += ",\"server_content_hash\":";
   out += record.server_content_hash.has_value() ? json::Quote(*record.server_content_hash)
                                                 : std::string("null");
+  if (record.deleted_on_server) {
+    // Written only when set, so every other row stays byte-identical to the
+    // ones earlier builds wrote, and an earlier build reading this one ignores a
+    // key it does not name (#233).
+    out += ",\"deleted_on_server\":true";
+  }
   out += "}";
   return out;
 }
@@ -281,6 +287,14 @@ bool ParseSaveRecord(const json::Value& object, SaveRecord* out, std::string* wh
   record.mtime = FromUnixSeconds(mtime);
   if (!ReadNullableSeconds(object, "server_updated_at", &record.server_updated_at, why)) {
     return false;
+  }
+  if (const json::Value* deleted = object.Find("deleted_on_server"); deleted != nullptr) {
+    // Optional, since #233 added it: absent is every row that predates it.
+    if (!deleted->is_bool()) {
+      *why = "field deleted_on_server: expected true or false";
+      return false;
+    }
+    record.deleted_on_server = deleted->boolean();
   }
   if (!Usable(record, why)) {
     return false;

@@ -1460,8 +1460,9 @@ void UploadFault(rig::Checks& checks, http::HttpClient& client, const std::strin
 // after that uploads nothing: the server holds no row for the slot at the end.
 
 void Deleted(rig::Checks& checks, http::HttpClient& client, const std::string& base,
-             const Fixture& fixture, const harness::Rom& rom, sync::DeleteMode mode) {
-  const bool keep = mode == sync::DeleteMode::kKeep;
+             const Fixture& fixture, const harness::Rom& rom,
+             rommsync::config::OnServerDelete mode) {
+  const bool keep = mode == rommsync::config::OnServerDelete::kKeep;
   const std::string what = keep ? "keep" : "remove";
   Sandbox sandbox(checks, keep ? "tick-deleted-keep" : "tick-deleted");
   const std::unique_ptr<fs::FileSystem> files =
@@ -1547,14 +1548,35 @@ void Deleted(rig::Checks& checks, http::HttpClient& client, const std::string& b
     checks.Expect(sandbox.HasBackupOf(arranged.bytes),
                   "remove: and its bytes are under .backup/, which is the hard rule");
   }
-  checks.Expect(StoredBaseline(*files).value.Find(rom.id, arranged.slot) == nullptr,
-                what + ": the slot is no longer tracked in state.db");
+  if (keep) {
+    const state::LoadedBaseline stored = StoredBaseline(*files);
+    const state::SaveRecord* row = stored.value.Find(rom.id, arranged.slot);
+    checks.Expect(row != nullptr && row->deleted_on_server &&
+                      row->content_hash == arranged.local.content_hash,
+                  "keep: state.db remembers the bytes RomM deleted, so they are not offered again");
+  } else {
+    checks.Expect(StoredBaseline(*files).value.Find(rom.id, arranged.slot) == nullptr,
+                  "remove: the slot is no longer tracked in state.db");
+  }
 
   // 3. The tick after: what the scan reports now -- the kept file, or nothing.
+  // The kept one is the hard case: the emulator wrote the same bytes back on
+  // closing, so its mtime is now later than the removal, and RomM by itself
+  // would read that as progress made since and plan an upload.
   std::vector<sync::ClientSaveState> reported;
   std::vector<sync::SaveTarget> targets;
   if (keep) {
-    reported.push_back(arranged.local);
+    std::error_code error;
+    std::filesystem::last_write_time(
+        sandbox.Host(SavePath(arranged.name)),
+        std::filesystem::file_time_type::clock::now() + std::chrono::hours{1}, error);
+    sync::ClientSaveState rewritten;
+    if (LocalSaveOnCard(checks, *files, sandbox, rom.id, arranged.name, arranged.slot,
+                        &rewritten)) {
+      checks.Expect(rewritten.updated_at > arranged.local.updated_at,
+                    "keep: the rewrite moved the mtime past the removal");
+      reported.push_back(rewritten);
+    }
     targets = arranged.targets;
   }
   sync::TickOptions after = OptionsAt(1'757'000'902);
@@ -1569,23 +1591,40 @@ void Deleted(rig::Checks& checks, http::HttpClient& client, const std::string& b
       ++for_slot;
       checks.Expect(done.outcome != sync::OperationOutcome::kUploaded,
                     what + ": the following tick does not upload the deleted save");
-      if (keep) {
-        checks.Expect(done.outcome == sync::OperationOutcome::kKept,
-                      "keep: the server still rules it deleted, and it is still kept: " +
-                          std::string(sync::ToString(done.outcome)));
-      }
     }
   }
-  checks.ExpectEq(for_slot, keep ? 1 : 0,
-                  what + ": the following tick plans " +
-                      (keep ? std::string("the same delete") : std::string("nothing")) +
-                      " for the slot");
+  checks.ExpectEq(for_slot, 0, what + ": the following tick plans nothing for the slot");
   if (keep) {
     checks.ExpectEq(sandbox.Read(SavePath(arranged.name)), arranged.bytes,
                     "keep: and the save is still on the card");
   }
   checks.ExpectEq(SaveRowsFor(client, base, fixture, rom.id, arranged.slot, nullptr), 0,
                   what + ": and the server holds no row for the slot -- nothing went back up");
+
+  if (keep) {
+    // 4. The player plays on. Those are new bytes RomM never ruled on -- the
+    // copy it deleted is still not offered, these are -- so they go up.
+    sandbox.Reseed(SavePath(arranged.name), "progress made after the delete\n");
+    sync::ClientSaveState played;
+    if (LocalSaveOnCard(checks, *files, sandbox, rom.id, arranged.name, arranged.slot, &played)) {
+      const sync::TickResult fourth =
+          sync::RunTick(client, *files, token, {played}, arranged.targets,
+                        StoredBaseline(*files).value, after);
+      checks.Expect(fourth.executed.operations.size() == 1 &&
+                        fourth.executed.operations[0].outcome ==
+                            sync::OperationOutcome::kUploaded,
+                    "keep: new progress on a kept save is offered, and uploaded");
+      const state::LoadedBaseline synced = StoredBaseline(*files);
+      const state::SaveRecord* row = synced.value.Find(rom.id, arranged.slot);
+      checks.Expect(row != nullptr && !row->deleted_on_server,
+                    "keep: and the save is tracked again");
+    }
+    std::vector<std::int64_t> progress;
+    SaveRowsFor(client, base, fixture, rom.id, arranged.slot, &progress);
+    for (const std::int64_t id : progress) {
+      harness::DeleteSave(client, base, fixture, id);
+    }
+  }
 }
 
 // --- download -----------------------------------------------------------------
@@ -2892,9 +2931,9 @@ int main(int argc, char** argv) {
   } else if (scenario == "relaunched") {
     Relaunched(checks, *client, base, fixture, rom);
   } else if (scenario == "deleted") {
-    Deleted(checks, *client, base, fixture, rom, sync::DeleteMode::kRemove);
+    Deleted(checks, *client, base, fixture, rom, rommsync::config::OnServerDelete::kRemove);
   } else if (scenario == "deleted_keep") {
-    Deleted(checks, *client, base, fixture, rom, sync::DeleteMode::kKeep);
+    Deleted(checks, *client, base, fixture, rom, rommsync::config::OnServerDelete::kKeep);
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;

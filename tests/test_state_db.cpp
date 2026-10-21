@@ -11,6 +11,7 @@
 // carries `reused` for no other reason than that the digest is identical either
 // way, so nothing else in the process can tell the two apart -- including a
 // test that only compared digests.
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -163,6 +164,42 @@ void EveryFieldRoundTrips(checks::Checks& c) {
   c.Expect(!archival->slot.has_value(), "and its slot is still null");
   c.Expect(!archival->server_updated_at.has_value(), "with no server history");
   c.Expect(!archival->server_content_hash.has_value(), "and no server digest");
+  c.Expect(!slotted->deleted_on_server && !archival->deleted_on_server,
+           "and neither is marked deleted on the server");
+}
+
+/// #233's mark: a save RomM deleted that `[sync] on_server_delete = keep` left.
+/// Written only when set -- every other row stays the bytes earlier builds
+/// wrote and read -- and read as false from a row that does not carry it.
+void TheDeletedMarkRoundTrips(checks::Checks& c) {
+  state::SaveRecord kept = Full();
+  kept.server_updated_at.reset();
+  kept.server_content_hash.reset();
+  kept.deleted_on_server = true;
+  state::Baseline baseline;
+  baseline.Set(kept);
+  baseline.Set(NoHistory());
+  const std::string text = state::SerializeBaseline(baseline);
+  c.ExpectEq(static_cast<int>(std::count(text.begin(), text.end(), '\n')), 3,
+             "a header and two rows");
+  c.Expect(text.find("\"deleted_on_server\":true") != std::string::npos,
+           "the mark is written on the kept row");
+  c.Expect(text.find("deleted_on_server\":false") == std::string::npos,
+           "and nowhere else, not even as false");
+
+  const state::LoadedBaseline loaded = state::ParseBaseline(text);
+  c.Expect(loaded.diagnostics.empty(), "it reads back silently -- " + loaded.DescribeDiagnostics());
+  const state::SaveRecord* marked = loaded.value.Find(12, std::optional<std::string>("autosave"));
+  c.Expect(marked != nullptr && marked->deleted_on_server, "the mark comes back");
+  const state::SaveRecord* plain = loaded.value.Find(12, std::nullopt);
+  c.Expect(plain != nullptr && !plain->deleted_on_server, "and its absence reads as false");
+
+  const state::LoadedBaseline wrong = state::ParseBaseline(
+      Header() + "{\"rom_id\":12,\"slot\":\"a\",\"content_hash\":\"" + crypto::Md5Hex("x") +
+      "\",\"mtime\":1757000000,\"file_size_bytes\":1,\"server_updated_at\":null,"
+      "\"server_content_hash\":null,\"deleted_on_server\":\"yes\"}\n");
+  c.Expect(!wrong.diagnostics.empty() && wrong.value.Find(12, std::string("a")) == nullptr,
+           "a mark of the wrong type is a row that does not read, and says so");
 }
 
 /// A slot is user data. RomM takes whatever the client sends, and a filesystem
@@ -858,6 +895,7 @@ void ALostBaselineCostsTimeNotCorrectness(checks::Checks& c) {
 int main() {
   checks::Checks c;
   EveryFieldRoundTrips(c);
+  TheDeletedMarkRoundTrips(c);
   StateRowsAreTheirOwnKind(c);
   SkipsAStateRowItCouldNotReadBack(c);
   AnUnchangedStateIsNotRehashed(c);

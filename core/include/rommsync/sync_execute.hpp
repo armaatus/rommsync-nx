@@ -71,6 +71,7 @@
 #include <vector>
 
 #include "rommsync/auth.hpp"
+#include "rommsync/config.hpp"
 #include "rommsync/file_system.hpp"
 #include "rommsync/http.hpp"
 #include "rommsync/sync.hpp"
@@ -200,20 +201,9 @@ enum class OperationOutcome {
   kRemoved,
 
   /// A `delete` under `[sync] on_server_delete = keep`: the file was left
-  /// exactly as it was, and its baseline row is dropped (sync_finish.hpp).
+  /// exactly as it was, and its baseline row is marked so the next tick does
+  /// not offer those bytes again (`state::SaveRecord::deleted_on_server`).
   kKept,
-};
-
-/// What a `delete` does to the file it names -- `[sync] on_server_delete`.
-enum class DeleteMode {
-  /// Back it up, then remove it. The default.
-  kRemove,
-
-  /// Leave it on the card. It is still reported on every tick, and the server
-  /// answers `delete` again for as long as it holds the bytes it deleted;
-  /// once the player writes to it, it is new progress and RomM plans an
-  /// upload, which is RomM's call and not this client's.
-  kKeep,
 };
 
 /// Stable, log-friendly name. Never null.
@@ -483,20 +473,23 @@ struct ExecuteOptions {
   bool send_content_hash = true;
 
   /// What a `delete` does: `[sync] on_server_delete` (#233).
-  DeleteMode on_server_delete = DeleteMode::kRemove;
+  config::OnServerDelete on_server_delete = config::OnServerDelete::kRemove;
 
   /// Whether this server's `delete` is one to obey --
   /// `server::ServerCapabilities::delete_action`, which `RunTick` copies in.
-  /// False makes a `delete` `kNotUnderstood`, the way an action this build does
-  /// not know is.
-  bool delete_action = true;
+  /// False, the default, makes a `delete` `kNotUnderstood`, the way an action
+  /// this build does not know is: the one action that removes a file is obeyed
+  /// only where a caller has said the server means it.
+  bool delete_action = false;
 
-  /// What step 0 reported, the vector `Negotiate` sent. Optional, not owned.
+  /// What step 0 reported, the vector `Negotiate` sent. Not owned; `RunTick`
+  /// sets it.
   ///
-  /// Set, a `delete` removes a save only when its backup holds the digest
-  /// reported for that `(rom_id, slot)`: the server ruled on those bytes, and a
-  /// save the player wrote to since is progress the ruling never saw. `RunTick`
-  /// always sets it. Null skips the check -- the backup is still taken first.
+  /// A `delete` removes a save only when its backup holds the digest reported
+  /// for that `(rom_id, slot)`: the server ruled on those bytes, and a save the
+  /// player wrote to since is progress the ruling never saw. Null, or a save
+  /// reported with no digest, is nothing to check against, and the delete is
+  /// refused before anything is copied.
   const std::vector<ClientSaveState>* reported = nullptr;
 
   /// Optional, not owned; must outlive the call. Checked between operations and

@@ -200,11 +200,8 @@ bool Rewrites(OperationOutcome outcome) {
   return outcome == OperationOutcome::kDownloaded || outcome == OperationOutcome::kKeptBoth;
 }
 
-/// Whether this outcome ended the slot's tracking: a `delete`, obeyed either
-/// way (#233). Removed, the row describes a file that is gone; kept, the
-/// server ruled the copy is not one to sync, and a row saying it was synced
-/// would be false. Either way the next scan hashes the file afresh if it is
-/// there, which is one save's hash and nothing else.
+/// Whether this outcome is a `delete` obeyed (#233), which rewrites the row
+/// rather than advancing it: see `AdvanceBaseline`.
 bool Untracks(OperationOutcome outcome) {
   return outcome == OperationOutcome::kRemoved || outcome == OperationOutcome::kKept;
 }
@@ -268,7 +265,25 @@ BaselineUpdate AdvanceBaseline(state::Baseline previous, const SyncPlan& plan,
       continue;
     }
     if (Untracks(done.outcome)) {
-      update.value.Erase(done.rom_id, done.slot);
+      // Removed, the row describes a file that is gone. Kept, it becomes the
+      // bytes RomM deleted, marked so `RunTick` stops offering them: the file
+      // was not touched, so what this tick reported is still what is on the
+      // card, and with nothing reported there are no facts to mark.
+      const auto save = local.find(Key{done.rom_id, done.slot});
+      if (done.outcome == OperationOutcome::kRemoved || save == local.end() ||
+          !save->second->content_hash.has_value()) {
+        update.value.Erase(done.rom_id, done.slot);
+        continue;
+      }
+      state::SaveRecord kept;
+      kept.rom_id = done.rom_id;
+      kept.slot = done.slot;
+      kept.content_hash = *save->second->content_hash;
+      kept.mtime = save->second->updated_at;
+      kept.file_size_bytes = save->second->file_size_bytes;
+      kept.deleted_on_server = true;
+      update.value.Set(std::move(kept));
+      ++update.advanced;
       continue;
     }
 
@@ -283,6 +298,8 @@ BaselineUpdate AdvanceBaseline(state::Baseline previous, const SyncPlan& plan,
     }
     record.rom_id = done.rom_id;
     record.slot = done.slot;
+    // A slot that synced again is no longer the copy RomM deleted (#233).
+    record.deleted_on_server = false;
 
     ApplyServerHalf(operation, done, local, &record, &update.warnings);
 

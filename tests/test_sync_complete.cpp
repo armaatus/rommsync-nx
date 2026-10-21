@@ -825,9 +825,11 @@ void Advance(rig::Checks& checks) {
                 "a download that cannot be read back erases the row it replaced");
   checks.Expect(!missing.warnings.empty(), "...and the loss is named");
 
-  // M10-7 (#233): a `delete`, removed or kept, stops the slot being tracked.
-  // Removed, the row describes a file that is gone; kept, the server has ruled
-  // the copy is not one to sync, and a row claiming it was synced is false.
+  // M10-7 (#233): a `delete`. Removed, the row describes a file that is gone
+  // and is erased. Kept, the row is the bytes RomM deleted, marked so the next
+  // tick does not offer them -- from what this tick reported, since the file
+  // was not touched -- and a kept save this tick did not report has no facts
+  // to mark, so it is erased too.
   for (const sync::OperationOutcome outcome :
        {sync::OperationOutcome::kRemoved, sync::OperationOutcome::kKept}) {
     const std::string what = sync::ToString(outcome);
@@ -840,8 +842,41 @@ void Advance(rig::Checks& checks) {
     const sync::BaselineUpdate untracked =
         sync::AdvanceBaseline(had_a_row, deleted_plan, deleted_report, {}, *files);
     checks.Expect(untracked.value.Find(6, std::string("gone")) == nullptr,
-                  what + ": a delete erases the slot's row");
+                  what + ": a delete with nothing reported for the slot erases its row");
     checks.Expect(untracked.warnings.empty(), what + ": ...as an ordinary outcome, not a loss");
+
+    sync::ClientSaveState local;
+    local.rom_id = 6;
+    local.slot = "gone";
+    local.file_name = "gone.srm";
+    local.content_hash = crypto::Md5Hex("the bytes RomM deleted");
+    local.updated_at = sync::Timestamp{} + std::chrono::seconds{kReportedMtime};
+    local.file_size_bytes = 22;
+    const sync::BaselineUpdate marked =
+        sync::AdvanceBaseline(had_a_row, deleted_plan, deleted_report, {local}, *files);
+    const state::SaveRecord* row = marked.value.Find(6, std::string("gone"));
+    if (outcome == sync::OperationOutcome::kRemoved) {
+      checks.Expect(row == nullptr, "removed: the row goes with the file");
+    } else {
+      checks.Expect(row != nullptr && row->deleted_on_server &&
+                        row->content_hash == *local.content_hash &&
+                        !row->server_content_hash.has_value(),
+                    "kept: the row is the reported bytes, marked deleted on the server");
+      // ...and the mark goes the moment the slot syncs again.
+      if (row != nullptr) {
+        sync::SyncPlan up;
+        up.session_id = 1;
+        up.operations.push_back(OperationOf(sync::Action::kUpload, 6, "gone"));
+        sync::ExecutionReport went;
+        went.operations.push_back(
+            ResultOf(sync::OperationOutcome::kUploaded, 6, "gone", SavePath("gone.srm")));
+        const sync::BaselineUpdate synced =
+            sync::AdvanceBaseline(marked.value, up, went, {local}, *files);
+        const state::SaveRecord* again = synced.value.Find(6, std::string("gone"));
+        checks.Expect(again != nullptr && !again->deleted_on_server,
+                      "kept: an upload of new progress clears the mark");
+      }
+    }
 
     // A delete that failed did nothing, and keeps the row so the next tick
     // negotiates the save again.

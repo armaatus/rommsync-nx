@@ -621,9 +621,6 @@ struct Overwrite {
   std::string backup_dir;  ///< SD path
 };
 
-/// After any power cut and the boot sweep: the save is its old bytes or its new
-/// ones; every backup is either one that was already there, or holds the old
-/// bytes in full; and a save holding its new bytes has a backup holding the old.
 /// Every new file under `expected.backup_dir` holds the old bytes in full, and
 /// `*backed_up` says whether there is one. A refusal, or empty.
 inline std::string BackupsHoldOld(const Tree& after, const Snapshot& before,
@@ -646,6 +643,9 @@ inline std::string BackupsHoldOld(const Tree& after, const Snapshot& before,
   return {};
 }
 
+/// After any power cut and the boot sweep: the save is its old bytes or its new
+/// ones; every backup is either one that was already there, or holds the old
+/// bytes in full; and a save holding its new bytes has a backup holding the old.
 inline Judge OldOrNew(const Overwrite& expected) {
   return [expected](const Tree& after, const Snapshot& before) -> std::string {
     const auto save = after.find(RelativeOf(expected.save));

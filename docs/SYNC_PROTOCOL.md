@@ -474,7 +474,8 @@ way it obeys an overwrite, because the file is just as gone:
    before anything is removed.
 3. **The backup is checked against the digest the tick reported.** The ruling
    was about those bytes; a save the player wrote to after the scan is progress
-   it never saw, so it stays and its stray copy is removed.
+   it never saw, so it stays and its stray copy is removed. With no digest to
+   hold it to, the delete is refused before anything is copied.
 4. **Then the file is removed**, and its directory synced. A power cut at any
    call leaves the save or its backup, never neither (`execute.crash_delete`).
 
@@ -484,12 +485,15 @@ than the removal, so the next negotiation plans its upload: progress on the
 device, which RomM then holds again.
 
 `[sync] on_server_delete = keep` leaves the file where it is instead
-([CONFIG.md](CONFIG.md#on_server_delete-a-save-deleted-in-romm)). It is still
-reported on every tick, and RomM answers `delete` again while it holds the
-deleted bytes — which is what keeps it from being uploaded. Once it is played and
-changes, it is new progress and RomM plans an upload; that is RomM's ruling to
-make. Both a removed and a kept delete count as completed in `complete`, and
-both drop the slot's row from `state.db`.
+([CONFIG.md](CONFIG.md#on_server_delete-a-save-deleted-in-romm)), and the
+**client** keeps the promise not to upload it: the slot's `state.db` row becomes
+the reported bytes marked `deleted_on_server`, and `sync::RunTick` leaves a save
+out of the negotiation while its digest is that row's. RomM's own memory is not
+enough on its own — it is bounded, and it reads the same bytes with a later mtime
+as progress, so an emulator that writes its save back on closing would have it
+uploaded straight away (`tick.deleted_keep` shows exactly that with the mark
+disabled). New bytes are offered as usual, and the first sync of the slot clears
+the mark. Both a removed and a kept delete count as completed in `complete`.
 
 A `delete` is obeyed only where `server::ServerCapabilities::delete_action` says
 the server means one (#228); elsewhere it is counted as not understood, like an
@@ -561,7 +565,8 @@ Which operations move a row:
 | `kUploaded` | advances. The local file was not touched, so the facts the tick reported are still the facts on the card. `server_content_hash` becomes the digest that was just sent — the plan's described the copy the upload replaced. |
 | `kDownloaded`, `kKeptBoth` | advances, **from the card**. The bytes changed, so the mtime, the size and the digest are all re-read; a row built from the reported ones would claim a digest for bytes nothing hashed. |
 | `kNoOp` | advances. Nothing happened and nothing stopped being true. |
-| `kRemoved`, `kKept` | **erased**. A `delete` ends the slot's tracking: removed, the row describes a file that is gone; kept, the server has ruled the copy is not one to sync. A kept file is hashed again on the next tick. |
+| `kRemoved` | **erased**: the row describes a file that is gone. |
+| `kKept` | **rewritten** from the reported facts with no server half and `deleted_on_server` set, so the next tick withholds those bytes ([above](#a-save-deleted-on-the-server)). Any later advance clears the mark. |
 | `kFailed`, `kNotUnderstood`, `kCanceled` | keeps its previous row, so the next tick retries the save. |
 
 A save whose hash failed is not moved forward — `SaveBaseline` refuses a row
