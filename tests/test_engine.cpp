@@ -3664,6 +3664,62 @@ std::vector<std::int64_t> SaveIdsFor(http::HttpClient& client, const std::string
   return ids;
 }
 
+/// Saves other consoles left on another rom, more of them than the log's tail
+/// holds lines. Deleted again when this goes.
+///
+/// **A library is never empty of other people's saves**, and a console new to
+/// RomM is offered every one of them on its first tick. Until #237 places them
+/// under a name the scan reads back, each lands under RomM's tagged name and is
+/// a `scan.skipped` line on every tick after -- so a tick writes more lines than
+/// `log::kTailLines`, and the tail no longer holds the tick before it. That is
+/// what main's long-lived fixture did to `engine.foreground` and
+/// `engine.server_deleted` with twenty-two rows `sched.*` had left behind; a
+/// scenario that counts ticks has to count them on a server like that one, not
+/// only on a fresh fixture.
+class OtherConsolesSaves {
+ public:
+  OtherConsolesSaves(rig::Checks& c, http::HttpClient& client, const std::string& base,
+                     const harness::Fixture& fixture)
+      : client_(client), base_(base), fixture_(fixture), staging_(c, "engine-other-consoles") {
+    harness::Rom rom;
+    c.Expect(harness::FindRom(client, base, fixture, "gb240p.gb", &rom),
+             "the fixture library has gb240p.gb, for other consoles' saves");
+    if (rom.id == 0) {
+      return;
+    }
+    const std::string staged = staging_.Host("/another-console.srm");
+    rig::WriteFile(staged, "a save another console uploaded\n");
+    for (std::size_t i = 0; i <= rlog::kTailLines; ++i) {
+      // A name of its own each, so no two rows can share RomM's datetime tag.
+      const std::string name = "another-console-" + std::to_string(i) + ".srm";
+      harness::Save save;
+      if (harness::UploadSave(client, base, fixture, rom.id,
+                              harness::UniqueSlot("engine-other-console"), "engine-other",
+                              staged, name, /*with_device=*/false, &save)) {
+        ids_.push_back(save.id);
+      }
+    }
+    c.ExpectEq(ids_.size(), rlog::kTailLines + 1,
+               "RomM holds more saves from other consoles than the log's tail has lines");
+  }
+
+  ~OtherConsolesSaves() {
+    for (const std::int64_t id : ids_) {
+      harness::DeleteSave(client_, base_, fixture_, id);
+    }
+  }
+
+  OtherConsolesSaves(const OtherConsolesSaves&) = delete;
+  OtherConsolesSaves& operator=(const OtherConsolesSaves&) = delete;
+
+ private:
+  http::HttpClient& client_;
+  const std::string& base_;
+  const harness::Fixture& fixture_;
+  harness::Sandbox staging_;
+  std::vector<std::int64_t> ids_;
+};
+
 /// How many `sync.tick` lines the log holds: one per tick that ran, whatever
 /// ended it (`LogTickEnd`).
 int TicksLogged(const ipc::LogTail& tail) {
@@ -3736,7 +3792,8 @@ std::size_t Negotiations(const std::vector<std::string>& urls, std::size_t from)
 /// the server, and negotiate plans its upload. That is what makes "nothing was
 /// uploaded while the game ran" a claim about a tick that *would* have, rather
 /// than about one with nothing to send. The game is a fake foreground probe --
-/// `pm:dmnt` is the console's half and no host can reach it.
+/// `pm:dmnt` is the console's half and no host can reach it. The library holds
+/// other consoles' saves too (`OtherConsolesSaves`), as a real one does.
 ///
 /// Two ticks fall due under the game -- the boot tick and two presses -- and one
 /// runs after it, which is #37's coalescing doing what it already did for a
@@ -3760,6 +3817,7 @@ int Foreground(http::HttpClient& client, const std::string& base) {
     return c.failures();
   }
   const std::vector<std::int64_t> before = SaveIdsFor(client, base, fixture, rom.id);
+  const OtherConsolesSaves others(c, client, base, fixture);
 
   rlog::Reset();
   Console console(c, "engine-foreground");
@@ -3923,7 +3981,9 @@ int Foreground(http::HttpClient& client, const std::string& base) {
 ///
 /// `keep` is the run that proves the setting reaches the tick, because removing
 /// is also what a tick does with no setting at all. Each run is a device of its
-/// own, so the first tick's upload is the only thing negotiate plans.
+/// own, so the first tick's upload is the only thing negotiate plans for
+/// nova.nes -- beside the other consoles' saves on another rom
+/// (`OtherConsolesSaves`) that a console new to RomM is offered as well.
 int ServerDeleted(http::HttpClient& client, const std::string& base) {
   rig::Checks c;
   harness::Fixture fixture;
@@ -3937,6 +3997,7 @@ int ServerDeleted(http::HttpClient& client, const std::string& base) {
   if (rom.id == 0) {
     return c.failures();
   }
+  const OtherConsolesSaves others(c, client, base, fixture);
 
   for (const bool keep : {false, true}) {
     const std::string what = keep ? "keep" : "remove";
