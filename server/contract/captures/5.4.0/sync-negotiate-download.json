@@ -5,11 +5,11 @@
       "action": "download",
       "rom_id": 4,
       "save_id": 1,
-      "file_name": "probe [2026-10-21_08-39-35].srm",
-      "slot": "probe-8c6cefe2-a",
+      "file_name": "probe [2026-10-21_08-43-56].srm",
+      "slot": "probe-21de14e8-a",
       "emulator": "probe-emulator",
       "reason": "Save exists on server but not on client",
-      "server_updated_at": "2026-10-21T08:39:35+00:00",
+      "server_updated_at": "2026-10-21T08:43:56+00:00",
       "server_content_hash": "abd8fff93894e8112c7dd17386e54a5f"
     }
   ],

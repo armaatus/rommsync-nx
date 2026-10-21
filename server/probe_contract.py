@@ -837,8 +837,11 @@ def sync_scenarios_5_4(s, base, cap, rom_id, run, created, devices):
 
     # --- auth ---------------------------------------------------------------
     hr("5.4: a malformed bearer token is a 401")
+    # Not `rmm_`-prefixed on purpose: 5.2.0 already answered 401 to a client
+    # token it did not know, and 500 to anything else -- which it then tried to
+    # decode as a JWT. That second path is the one 5.4.0 fixed.
     bogus = requests.get(f"{base}/api/devices", timeout=30,
-                         headers={"Authorization": "Bearer rmm_not-a-token"})
+                         headers={"Authorization": "Bearer not-a-token"})
     cap.record("auth-401-malformed-token",
                expect_status(bogus, 401, "a request with a malformed bearer token"))
 

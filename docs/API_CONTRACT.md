@@ -966,7 +966,7 @@ the issue that acts on it.
 | `(user, client_device_identifier)` is unique, so re-pairing reuses the device. | **Not captured**: the probe pairs once per run, always as `probe-contract-script`. Three runs against one 5.4.0 fixture got one device id, checked by hand for #227; nothing re-asserts it. | #228 |
 | `capabilities` on `POST /api/devices` and on `DeviceSchema`. | Snapshot `DeviceCreatePayload`, `DeviceSchema` (required there); capture `devices-get.json`. | #228 |
 | Remote-install endpoints and a `/devices` Socket.IO namespace. | Snapshot: `/api/devices/{device_id}/installs` and its children, `/api/devices/online`. The namespace is not in OpenAPI. | — |
-| Malformed or expired credentials → 401, not 500. | Capture `auth-401-malformed-token.json`: `Bearer rmm_not-a-token` → 401 `"Not authenticated"`. | #228 |
+| Malformed or expired credentials → 401, not 500. | Capture `auth-401-malformed-token.json`: `Bearer not-a-token` → 401. On 5.2.0 the same header, a `Bearer a.b.c` or a garbled `Basic` is a bare `500 Internal Server Error`, checked live for #227; an unknown `rmm_…` client token was already 401 there. The expired half is **not captured**: fixture tokens do not expire. | #228 |
 
 ### Play sessions, ROM list, version
 
