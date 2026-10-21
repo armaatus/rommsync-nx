@@ -1499,6 +1499,7 @@ set(TICK_UNIT_SCENARIOS
   unsupported  # M10-2: a server below the floor is never negotiated with
   newer_rule   # #232: a 409'd save becomes a download or a conflict, never another upload
   newer_bounds # #232: ...held while a game runs (#242), and never placed where step 0 found nothing
+  migrated_kept  # #236: a delete #233 kept stays withheld when rc1's row moves to the shared slot
 )
 
 # M6-2 (#33). These are the same executables, registered under `toggle.` because

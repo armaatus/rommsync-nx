@@ -388,6 +388,11 @@ LoadedBaseline ParseBaseline(std::string_view text);
 /// some other device's progress, and download over a newer local save without a
 /// conflict. Left absent, the first meeting is what it is: no sync history.
 ///
+/// **`deleted_on_server` moves with the row** (#233). It records that RomM
+/// deleted this save and the card kept it, which is about the save and not the
+/// slot: dropped, the next tick would offer the deleted bytes to the shared slot
+/// and resurrect there what the user deleted.
+///
 /// A row whose new key is already taken -- RetroArch's and Tico's `.srm` of one
 /// rom, both now `autosave` -- is dropped, the first in key order kept, which is
 /// RetroArch's: the copy the scan also reads first. So is one `slot_for` has no

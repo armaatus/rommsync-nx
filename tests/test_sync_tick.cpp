@@ -956,6 +956,90 @@ void NewerRule(rig::Checks& checks) {
   }
 }
 
+// --- migrated_kept ----------------------------------------------------------------
+//
+// #236 against #233: a save RomM deleted and `on_server_delete = keep` left is
+// withheld from negotiate while it holds the deleted bytes. Migrated from rc1's
+// `tico-srm` to the shared slot, it is still withheld: a mark lost in the move
+// would offer the deleted save to `autosave` and resurrect it there.
+
+/// Answers every negotiation with an empty plan, and keeps the bodies.
+class EmptyPlanClient final : public http::HttpClient {
+ public:
+  http::Result Send(const http::Request& request) override {
+    http::Result result;
+    result.response.status = 200;
+    if (request.url.find("/api/sync/negotiate") != std::string::npos) {
+      negotiated.push_back(request.body);
+      result.response.body =
+          R"j({"session_id":9,"operations":[],"total_upload":0,"total_download":0,)j"
+          R"j("total_conflict":0,"total_no_op":0})j";
+    } else {
+      result.response.body = "{}";
+    }
+    return result;
+  }
+  http::Result Download(const http::Request&, const http::DownloadTarget&) override {
+    http::Result result;
+    result.error = http::Error::kConnectFailed;
+    return result;
+  }
+
+  std::vector<std::string> negotiated;
+};
+
+void MigratedKept(rig::Checks& checks) {
+  Sandbox sandbox(checks, "tick-migrated-kept");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  auth::StoredToken token;
+  token.server_url = kNowhere;
+  token.access_token = "not-a-token";
+  token.device_id = "fixture-migrated-kept";
+
+  const std::string deleted = "the bytes RomM deleted and the card kept\n";
+  const std::string v2 =
+      "rommsync-state 2\n{\"rom_id\":4,\"slot\":\"tico-srm\",\"content_hash\":\"" +
+      crypto::Md5Hex(deleted) +
+      "\",\"mtime\":1757000000,\"file_size_bytes\":" + std::to_string(deleted.size()) +
+      ",\"server_updated_at\":null,\"server_content_hash\":null,\"deleted_on_server\":true}\n";
+  state::LoadedBaseline loaded = state::ParseBaseline(v2);
+  checks.ExpectEq(state::AdoptLegacySaves(
+                      &loaded,
+                      [](std::string_view old) -> std::optional<std::string> {
+                        return rommsync::scan::MigratedSlot("autosave", old);
+                      }),
+                  std::size_t{1}, "the kept delete moves to the shared slot");
+  const state::SaveRecord* row = loaded.value.Find(4, std::string("autosave"));
+  checks.Expect(row != nullptr && row->deleted_on_server, "with its mark");
+
+  sync::ClientSaveState kept;
+  kept.rom_id = 4;
+  kept.file_name = "Game.srm";
+  kept.slot = "autosave";
+  kept.content_hash = crypto::Md5Hex(deleted);
+  kept.updated_at = sync::Timestamp{} + std::chrono::seconds{1'757'000'500};
+  kept.file_size_bytes = static_cast<std::int64_t>(deleted.size());
+  sync::TickOptions options = OptionsAt(1'757'000'900);
+  options.recover_dirs.clear();
+  {
+    EmptyPlanClient client;
+    sync::RunTick(client, *files, token, {kept}, {}, loaded.value, options);
+    checks.Expect(client.negotiated.size() == 1 &&
+                      client.negotiated[0].find("\"rom_id\":4") == std::string::npos,
+                  "and negotiate is not offered the deleted bytes under the new slot");
+  }
+  {
+    sync::ClientSaveState played = kept;
+    played.content_hash = crypto::Md5Hex("new progress since the delete\n");
+    EmptyPlanClient client;
+    sync::RunTick(client, *files, token, {played}, {}, loaded.value, options);
+    checks.Expect(client.negotiated.size() == 1 &&
+                      client.negotiated[0].find("\"rom_id\":4") != std::string::npos,
+                  "while new progress is");
+  }
+}
+
 // --- newer_bounds ---------------------------------------------------------------
 //
 // What a 409's resolution must not do, whatever the server answers: run while a
@@ -2893,7 +2977,7 @@ int main(int argc, char** argv) {
   if (scenario == "recovery" || scenario == "durable" || scenario == "backupdir" ||
       scenario == "offline" || scenario == "rescan" || scenario == "canceled" ||
       scenario == "disabled" || scenario == "unsupported" || scenario == "newer_rule" ||
-      scenario == "newer_bounds") {
+      scenario == "newer_bounds" || scenario == "migrated_kept") {
     if (scenario == "recovery") {
       Recovery(checks);
     } else if (scenario == "durable") {
@@ -2910,6 +2994,8 @@ int main(int argc, char** argv) {
       Unsupported(checks);
     } else if (scenario == "newer_rule") {
       NewerRule(checks);
+    } else if (scenario == "migrated_kept") {
+      MigratedKept(checks);
     } else if (scenario == "newer_bounds") {
       NewerBounds(checks);
     } else {

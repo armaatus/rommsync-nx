@@ -721,6 +721,25 @@ void AVersion2FileIsMigratedNotDiscarded(checks::Checks& c) {
   c.Expect(refused.value.rows().size() == 1 && refused.legacy_saves.empty(),
            "leaving the archival row alone");
 
+  // #233's mark rides along: a v2 file written after #233 carries it on a row
+  // in an old slot, and the delete it records is the save's, whatever its slot.
+  state::LoadedBaseline marked = state::ParseBaseline(
+      "rommsync-state 2\n{\"rom_id\":13,\"slot\":\"tico-srm\",\"content_hash\":\"" + digest +
+      "\",\"mtime\":1757000000,\"file_size_bytes\":32768,\"server_updated_at\":null,"
+      "\"server_content_hash\":null,\"deleted_on_server\":true}\n");
+  state::AdoptLegacySaves(&marked, [](std::string_view old_slot) -> std::optional<std::string> {
+    return scan::MigratedSlot("autosave", old_slot);
+  });
+  const state::SaveRecord* kept = marked.value.Find(13, std::string("autosave"));
+  c.Expect(kept != nullptr && kept->deleted_on_server,
+           "a delete #233 kept is still kept under the new slot");
+  const state::LoadedBaseline rewritten =
+      state::ParseBaseline(state::SerializeBaseline(marked.value));
+  const state::SaveRecord* reread = rewritten.value.Find(13, std::string("autosave"));
+  c.Expect(rewritten.version == state::kFormatVersion && reread != nullptr &&
+               reread->deleted_on_server,
+           "and version 3 writes and reads the mark");
+
   const state::LoadedBaseline broken = state::ParseBaseline(v2 + "{\"rom_id\":12,\n");
   c.Expect(broken.value.empty() && broken.legacy_saves.empty(),
            "a damaged version 2 file is discarded whole, like any other");
