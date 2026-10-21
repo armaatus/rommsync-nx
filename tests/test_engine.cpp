@@ -3445,6 +3445,60 @@ int TicksLogged(const ipc::LogTail& tail) {
   return ticks;
 }
 
+/// The real client, with a game that starts the moment the armed tick asks for
+/// the library -- the one request a tick makes before it touches a save.
+///
+/// What it stands for is a user launching a game while a tick is under way: the
+/// probe said no when the tick started, and says yes before the first save is
+/// placed. Also records every URL, for "nothing more went out".
+class LaunchesMidTick final : public http::HttpClient {
+ public:
+  LaunchesMidTick(http::HttpClient& inner, std::atomic<bool>& running)
+      : inner_(inner), running_(running) {}
+
+  http::Result Send(const http::Request& request) override {
+    Record(request.url);
+    if (request.url.find("/api/roms") != std::string::npos && armed_.exchange(false)) {
+      running_ = true;
+    }
+    return inner_.Send(request);
+  }
+
+  http::Result Download(const http::Request& request,
+                        const http::DownloadTarget& target) override {
+    Record(request.url);
+    return inner_.Download(request, target);
+  }
+
+  void Arm() { armed_ = true; }
+
+  std::vector<std::string> urls() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return urls_;
+  }
+
+ private:
+  void Record(const std::string& url) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    urls_.push_back(url);
+  }
+
+  http::HttpClient& inner_;
+  std::atomic<bool>& running_;
+  std::atomic<bool> armed_{false};
+  mutable std::mutex mutex_;
+  std::vector<std::string> urls_;
+};
+
+/// How many of `urls` from `from` on asked RomM to plan a sync.
+std::size_t Negotiations(const std::vector<std::string>& urls, std::size_t from) {
+  std::size_t asked = 0;
+  for (std::size_t i = from; i < urls.size(); ++i) {
+    asked += urls[i].find("/api/sync/negotiate") != std::string::npos ? 1 : 0;
+  }
+  return asked;
+}
+
 /// M10-16 (#242): nothing is downloaded, placed or uploaded while a game runs,
 /// and **one** tick runs once it closes.
 ///
@@ -3504,7 +3558,7 @@ int Foreground(http::HttpClient& client, const std::string& base) {
   c.Expect(console.sandbox.Write(save, played), "a save on the card the server does not have");
 
   std::atomic<bool> running{true};
-  Throttled counted(client, std::chrono::milliseconds{0});
+  LaunchesMidTick counted(client, running);
   const std::unique_ptr<fs::FileSystem> card =
       rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
   console.Boot();
@@ -3522,7 +3576,7 @@ int Foreground(http::HttpClient& client, const std::string& base) {
   // Twenty of the worker's re-polls, and every one of them finds the game.
   std::this_thread::sleep_for(std::chrono::seconds{1});
 
-  c.ExpectEq(counted.sent().size(), std::size_t{0},
+  c.ExpectEq(counted.urls().size(), std::size_t{0},
              "nothing reached the server while the game ran: no negotiate, no upload, no "
              "download");
   const std::vector<std::int64_t> during = SaveIdsFor(client, base, fixture, rom.id);
@@ -3569,7 +3623,57 @@ int Foreground(http::HttpClient& client, const std::string& base) {
   c.ExpectEq(uploaded.size(), std::size_t{1}, "and that tick uploaded the save, once");
   c.ExpectEq(console.sandbox.Read(save), played, "which it read and did not rewrite");
 
+  // **A game launched while a tick is under way.** The probe said no when the
+  // tick started; the game starts as the tick fetches the library, before any
+  // save is planned. The tick has to notice before it places or sends one --
+  // the game has just read the save a download would replace.
+  harness::Rom other;
+  c.Expect(harness::FindRom(client, base, fixture, "240pee.nes", &other),
+           "the fixture library has 240pee.nes");
+  const std::vector<std::int64_t> other_before = SaveIdsFor(client, base, fixture, other.id);
+  const std::string second = "/tico/saves/nes/240pee.srm";
+  c.Expect(console.sandbox.Write(second, "a second save, new since the last tick\n"),
+           "a second save the server does not have");
+  const std::size_t asked_before = counted.urls().size();
+  counted.Arm();
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted,
+           "with no game running, Sync now starts a tick");
+  const std::chrono::steady_clock::time_point launched_by =
+      std::chrono::steady_clock::now() + std::chrono::seconds{30};
+  while (!running.load() && std::chrono::steady_clock::now() < launched_by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  c.Expect(running.load(), "the game starts while that tick fetches the library");
+  std::this_thread::sleep_for(std::chrono::seconds{1});
+  c.ExpectEq(Negotiations(counted.urls(), asked_before), std::size_t{0},
+             "the tick stops before it asks for a plan: nothing is placed or sent under the "
+             "game it now finds");
+  c.ExpectEq(SaveIdsFor(client, base, fixture, other.id).size(), other_before.size(),
+             "so the second save is not on the server yet");
+  c.ExpectEq(TicksLogged(console.Log()), 1, "and that tick did not end as one that ran");
+  c.Expect(!console.Status().sync_in_progress, "nor is it drawn as still running");
+
+  running = false;
+  const std::chrono::steady_clock::time_point ticked_by =
+      std::chrono::steady_clock::now() + std::chrono::seconds{60};
+  while (TicksLogged(console.Log()) < 2 && std::chrono::steady_clock::now() < ticked_by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  std::this_thread::sleep_for(std::chrono::seconds{1});
+  c.ExpectEq(TicksLogged(console.Log()), 2,
+             "the press it was is held, and runs once the game closes -- once");
+  std::vector<std::int64_t> other_uploaded;
+  for (const std::int64_t id : SaveIdsFor(client, base, fixture, other.id)) {
+    if (std::find(other_before.begin(), other_before.end(), id) == other_before.end()) {
+      other_uploaded.push_back(id);
+    }
+  }
+  c.ExpectEq(other_uploaded.size(), std::size_t{1}, "and uploads the second save, once");
+
   for (const std::int64_t id : uploaded) {
+    harness::DeleteSave(client, base, fixture, id);
+  }
+  for (const std::int64_t id : other_uploaded) {
     harness::DeleteSave(client, base, fixture, id);
   }
   harness::DeleteDevice(client, base, fixture, device_id);
