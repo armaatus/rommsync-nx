@@ -116,7 +116,7 @@ The two Switch targets are built separately, with devkitPro rather than CMake
 is ever run before the hardware gate in M8:
 
 ```bash
-docker run --rm -v "$PWD:/work" -w /work devkitpro/devkita64:latest \
+docker run --rm -v "$PWD:/work" -w /work devkitpro/devkita64:20260219 \
   bash -lc 'make -C sysmodule && make -C overlay'
 ```
 

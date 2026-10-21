@@ -23,7 +23,10 @@
 # It builds nothing in the worktree and leaves nothing behind.
 set -euo pipefail
 
-IMAGE="devkitpro/devkita64:latest"
+# The pinned image (#199), so the numbers are for the toolchain the builds use.
+# shellcheck source=../scripts/toolchain.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/toolchain.sh"
+IMAGE="$DEVKITPRO_IMAGE"
 
 command -v docker >/dev/null 2>&1 || { echo "no docker" >&2; exit 1; }
 docker info >/dev/null 2>&1 || { echo "docker daemon not running" >&2; exit 1; }

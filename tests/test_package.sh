@@ -42,7 +42,10 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PACKAGE="$REPO_ROOT/scripts/package.sh"
-IMAGE="devkitpro/devkita64:latest"
+# The pinned image (#199), named in one place.
+# shellcheck source=../scripts/toolchain.sh
+. "$REPO_ROOT/scripts/toolchain.sh"
+IMAGE="$DEVKITPRO_IMAGE"
 SKIP=77
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

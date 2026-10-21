@@ -58,7 +58,46 @@ with `cat`, and both substitute the same `version.hpp.in`.
   checks out with `submodules: recursive`.
 
 Recommended: build in the official devkitpro docker image
-`devkitpro/devkita64` so contributors and CI match. See `.github/workflows/ci.yml`.
+`devkitpro/devkita64`, at the tag CI pins, so contributors and CI match. See
+`.github/workflows/ci.yml`.
+
+### The toolchain pin
+
+Neither input to the Switch build is ours, and neither announces a break (#199):
+
+- **The image** is pinned to a dated tag, `DEVKITPRO_IMAGE` in
+  [`scripts/toolchain.sh`](../scripts/toolchain.sh) -- not `:latest`, which
+  moves under every build at once. The `switch-build-canary` CI job builds
+  against `:latest` on every push, with `continue-on-error`, so a devkitPro
+  release that breaks us shows up as one red, non-blocking job rather than as a
+  red required check on an unrelated PR.
+- **libultrahand** is pinned to a **tag** commit, recorded as
+  `# Pinned at tag vX.Y.Z = <sha>` in [`.gitmodules`](../.gitmodules). Upstream's
+  `main` is a pre-release "in constant revision"; its tags are its releases. The
+  library has no version macro, so the pin is the only control there is.
+
+`ctest -R toolchain` holds both: `toolchain.pins` that every file naming the
+image names the pin (the canary alone excepted), `toolchain.submodule` that the
+gitlink is the recorded tag's commit, and `toolchain.libnx` that the pinned
+image's libnx is at least `LIBNX_FLOOR` (4.10.0, HOS 21.0.0's TLS ABI). The
+`switch-build` job runs that last check in the container on every push.
+
+**Moving the image.** Pick a dated tag from
+[Docker Hub](https://hub.docker.com/r/devkitpro/devkita64/tags), preferably one
+the canary has been green on. Change `DEVKITPRO_IMAGE`; `ctest -R
+toolchain.pins` then lists every other line that still names the old one
+(ci.yml's `switch-build` and `release` containers, and the build commands in
+the README and CLAUDE.md). `docker pull` the new tag and run `ctest -R
+'toolchain|switch|package|npdm'`: the libnx floor and the real cross-compiles
+are the part that says the move is safe. Put the new libnx version
+(`scripts/toolchain.sh libnx` prints it) in the commit message.
+
+**Moving libultrahand.** Only to a tag. `git -C overlay/lib/libultrahand fetch
+--tags && git -C overlay/lib/libultrahand checkout vX.Y.Z`, stage the gitlink,
+and update the `# Pinned at tag` line. Then read upstream's changes for
+signatures that still compile but mean something else -- v2.0.0 changed four
+(`drawString`, `CategoryHeader`, `OverlayFrame`, `ListItem`; #199 has the
+table) -- before trusting a green `switch.builds`.
 
 ## Repo build layout
 

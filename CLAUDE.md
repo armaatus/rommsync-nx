@@ -37,7 +37,7 @@ ctest --test-dir build -R sync --output-on-failure   # one group
 
 # the three Switch targets, built by devkitPro rather than CMake. Nothing built
 # here runs anywhere before the M8-1 gate; see switch.mk.
-docker run --rm -v "$PWD:/work" -w /work devkitpro/devkita64:latest \
+docker run --rm -v "$PWD:/work" -w /work devkitpro/devkita64:20260219 \
   bash -lc 'make -C sysmodule && make -C overlay && make -C tlsprobe'
 
 ./scripts/orca/env.sh                            # regenerate .env

@@ -193,13 +193,24 @@ jobs:
   # the -fsyntax-only check that stood in for it while the Makefiles did not
   # exist: a real compile and link catches everything that did, plus the
   # codegen and linker errors it could not see.
+  #
+  # The image is a dated tag, never `:latest` (#199): scripts/toolchain.sh names
+  # it, `ctest -R toolchain.pins` holds this line and the release job's to it,
+  # and docs/DEVELOPMENT.md#the-toolchain-pin is how to move it.
   switch-build:
     runs-on: ubuntu-latest
-    container: devkitpro/devkita64:latest
+    container: devkitpro/devkita64:20260219
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
+
+      # Before the build, because a libnx below the floor builds perfectly well:
+      # what it produces crashes on HOS 21.0.0 and Ultrahand will not list the
+      # overlay (#199, #211). The pin is what makes this true; this is what
+      # says it still is.
+      - name: libnx is new enough for HOS 21.0.0
+        run: bash scripts/toolchain.sh libnx
 
       - name: Build sysmodule
         run: make -C sysmodule -j"$(nproc)"
@@ -262,6 +273,35 @@ jobs:
       - name: Package
         run: scripts/package.sh
 
+  # The same three builds against `:latest`, so a devkitPro release that breaks
+  # us is learned here, as one red job, rather than as a red required check on
+  # an unrelated PR the day the pin moves (#199; ovl-sysmodules#32 is what that
+  # looks like). Allowed to fail and needed by nothing: it is news, not a gate.
+  # When it goes red, the fix is either ours or a reason not to move the pin --
+  # docs/DEVELOPMENT.md#the-toolchain-pin. No artifacts and no packaging: what
+  # ships is built by switch-build, in the pinned image.
+  switch-build-canary:
+    name: switch-build (devkita64:latest, may fail)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    container: devkitpro/devkita64:latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: libnx is new enough for HOS 21.0.0
+        run: bash scripts/toolchain.sh libnx
+
+      - name: Build sysmodule
+        run: make -C sysmodule -j"$(nproc)"
+
+      - name: Build overlay
+        run: make -C overlay -j"$(nproc)"
+
+      - name: Build the TLS probe
+        run: make -C tlsprobe -j"$(nproc)"
+
   # A tag becomes something a user can download. Nothing else publishes: the
   # `if` below is what keeps this job off every other push, since the tag
   # trigger runs the whole workflow.
@@ -281,7 +321,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [static, host-tests, switch-build]
     runs-on: ubuntu-latest
-    container: devkitpro/devkita64:latest
+    container: devkitpro/devkita64:20260219
     # Every other job runs on the runner, where a `run:` step is bash. This one
     # runs in a container, where the default is `sh -e` -- and dash has no
     # `pipefail`, so seven of this job's twelve run steps died on `set: Illegal

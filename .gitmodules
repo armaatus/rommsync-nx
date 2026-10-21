@@ -5,6 +5,16 @@
 # a reviewer has to look to see which revision an .ovl was built from. CI
 # checks out with `submodules: recursive` (.github/workflows/ci.yml), which is
 # what makes the Switch build reproducible off a bare clone.
+#
+# Pinned at tag v2.5.3 = 856ddbddd796fc4a59ad2e0bf939c5963e6f9dd2
+#
+# A tag, never a `main` head: upstream calls main "a pre-release... in constant
+# revision, unlike the releases" (libultrahand#11), and v2.0.0 changed four
+# signatures in ways that still compile (#199). v2.5.3 is the newest tag and
+# what Ultrahand-Overlay itself pins. The line above is the only record of the
+# tag name -- a gitlink is a bare sha and the library has no version macro --
+# so `ctest -R toolchain.submodule` holds the gitlink to it. Moving it:
+# docs/DEVELOPMENT.md#the-toolchain-pin.
 [submodule "overlay/lib/libultrahand"]
 	path = overlay/lib/libultrahand
 	url = https://github.com/ppkantorski/libultrahand.git

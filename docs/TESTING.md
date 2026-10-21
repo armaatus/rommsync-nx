@@ -702,6 +702,18 @@ ctest --test-dir build --output-on-failure
   and it is the only coverage the byte offsets get until #211 lands — the
   fixtures are chosen so that a parser reading the wrong offset gets a wrong
   answer rather than a lucky one.
+- The `toolchain.*` group holds the two pins the Switch build rests on and
+  nothing here produces (M9-8, #199). `toolchain.pins` reads every file in the
+  tree: each one naming the devkitPro image names the dated tag
+  `scripts/toolchain.sh` pins, and the moving tag appears once, in the
+  `switch-build-canary` job, which is `continue-on-error` and needed by nothing.
+  `toolchain.submodule` holds the libultrahand gitlink to the tag commit
+  `.gitmodules` records beside it. `toolchain.floor` is the libnx version
+  comparison on literals, chosen so that a string compare — which reads 4.9 as
+  newer than 4.10 — fails it. Those three never skip. `toolchain.libnx` asks the
+  pinned image's package database for its libnx and requires 4.10.0 or later
+  (HOS 21.0.0's TLS ABI); it skips without the image, like `switch.builds`, and
+  the `switch-build` job runs the same check in the container on every push.
 - The `boot.*` group is the sysmodule's `__appInit`, which nothing off a console
   can execute -- which is how three separate bugs sat in twenty lines through
   every green run (M9-1, #195). Half of it reads: `boot.dns`, `boot.clock`,

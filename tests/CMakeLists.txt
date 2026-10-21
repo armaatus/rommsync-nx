@@ -1595,6 +1595,33 @@ add_test(NAME switch.tlsprobe
 set_tests_properties(switch.tlsprobe PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600
                      RUN_SERIAL TRUE)
 
+# --- M9-8: the toolchain and libultrahand are pinned -------------------------
+# Every Switch build pulled devkitpro/devkita64's moving tag and compiled a
+# libultrahand `main` head upstream calls a pre-release, so a break in either
+# arrived unannounced on whatever PR was open at the time (#199).
+# scripts/toolchain.sh names the image; docs/DEVELOPMENT.md#the-toolchain-pin
+# is how both pins move.
+set(TOOLCHAIN_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_toolchain.sh")
+
+# These read the tree only, so none of them ever skips.
+foreach(scenario
+        pins        # every file naming the image names the pin; :latest only in the canary
+        submodule   # the libultrahand gitlink is the tag .gitmodules records
+        floor)      # the libnx comparison orders 4.9 below 4.10
+  add_test(NAME toolchain.${scenario}
+           COMMAND "${BASH_PROGRAM}" "${TOOLCHAIN_TEST}" ${scenario})
+  set_tests_properties(toolchain.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
+# The pinned image's libnx is >= 4.10.0 -- asked of the image, not assumed.
+# Its SKIP_RETURN_CODE is unwrapped for switch.builds' reason, given at length
+# above: the host runner has no devkitpro image. The enforcement is the
+# `switch-build` job, which runs the same `scripts/toolchain.sh libnx` in the
+# container before it builds, and `toolchain.pins` says that step is there.
+add_test(NAME toolchain.libnx
+         COMMAND "${BASH_PROGRAM}" "${TOOLCHAIN_TEST}" libnx)
+set_tests_properties(toolchain.libnx PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+
 # --- M9-3: the capabilities the NPDM grants, against the ones the image uses --
 # An SVC a process was not granted is not a soft failure on Horizon: the kernel
 # refuses the call and the process dies. The linked sysmodule issued two it
