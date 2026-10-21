@@ -199,7 +199,7 @@ phase_ci() {
     fail "the release job does not check that the tag is on main"
 
   # --- it builds what it ships ---
-  grep -q 'container: devkitpro/devkita64' <<<"$job" ||
+  grep -q 'container: devkitpro/devkita64:' <<<"$job" ||
     fail "the release job does not run in the devkitPro container"
 
   # ...and a container's default shell is `sh -e`, not bash. Seven of this job's

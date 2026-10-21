@@ -80,6 +80,16 @@ phase_pins() {
   [ -z "$bad" ] || fail "these name a devkitPro image other than $DEVKITPRO_IMAGE:
 ${bad}Moving the pin is scripts/toolchain.sh plus every line above; see docs/DEVELOPMENT.md#the-toolchain-pin"
 
+  # An image named with no tag at all is `:latest` by another spelling. Prose
+  # may name the image bare; a line that runs or declares it may not. The
+  # bracketed slash keeps this line from matching itself.
+  local untagged
+  untagged="$(git -C "$REPO_ROOT" grep --untracked -n -I -E \
+      '(docker (run|pull)|container:|IMAGE=).*devkitpro[/]devkita64([^:]|$)' \
+      -- . ':!overlay/lib' || true)"
+  [ -z "$untagged" ] || fail "these run devkitpro/devkita64 with no tag, which is :latest:
+$untagged"
+
   # The builds that matter run in the pin: what a PR is checked by, and what a
   # tag publishes.
   local job
@@ -108,7 +118,8 @@ ${bad}Moving the pin is scripts/toolchain.sh plus every line above; see docs/DEV
   grep -q 'scripts/toolchain.sh libnx' <<<"$canary" ||
     fail "switch-build-canary does not check :latest's libnx floor"
   # Nothing may wait on it, or allowed-to-fail stops meaning anything.
-  if grep -qE '^    needs:.*switch-build-canary' "$CI"; then
+  # Both spellings: `needs: [a, switch-build-canary]` and a block list.
+  if grep -qE '(^ +needs:.*|^ +- +)switch-build-canary *$|needs:.*switch-build-canary' "$CI"; then
     fail "a job needs switch-build-canary"
   fi
 

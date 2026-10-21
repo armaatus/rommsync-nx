@@ -58,14 +58,16 @@ version_at_least() {
 # only record of which libnx a devkitPro image carries is pacman's database.
 # scripts/release-notes.sh reads the same thing for the release notes.
 toolchain_check_libnx() {
-  local q version
+  local q version rc=0
   q="$(dkp-pacman -Q libnx 2>/dev/null)" || {
     echo "::error::dkp-pacman cannot say which libnx this is; not inside a devkitPro image?" >&2
     return 1
   }
   version="${q#libnx }"
-  version_at_least "$version" "$LIBNX_FLOOR"
-  case $? in
+  # Captured with `||`: run directly this script is `set -e`, and a bare call
+  # returning 1 or 2 would end it before either message below could print.
+  version_at_least "$version" "$LIBNX_FLOOR" || rc=$?
+  case $rc in
     0) echo "ok: libnx $version >= $LIBNX_FLOOR" ;;
     1) echo "::error::libnx $version is below $LIBNX_FLOOR; homebrew built with it" \
             "breaks on HOS 21.0.0 and Ultrahand will not list the overlay" >&2
