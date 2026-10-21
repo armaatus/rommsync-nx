@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "rommsync/ipc.hpp"
+#include "rommsync/version.hpp"
 
 namespace rommsync::overlay {
 namespace {
@@ -344,8 +345,22 @@ StatusView Render(const ipc::Status& status, std::int64_t now_unix) {
   AddDownload(&view, status.download);
   // Last, because it is the line a user reads once and a support thread reads
   // first (`ipc::Status::build`).
-  Add(&view.lines, "Build",
-      status.build.empty() ? std::string("Unknown") : status.build);
+  //
+  // Two releases on one card is the ordinary result of a partial unzip, and
+  // while the IPC contract matches nothing else notices: the screens work until
+  // an edit names a key the older half lacks, or a file the newer half wrote is
+  // refused (#205). So a build that is not this overlay's is said here, before
+  // either -- with the remedy as the hint unless a worse problem already holds
+  // it. An empty build is no evidence of anything and is left as "Unknown".
+  const bool skewed = !status.build.empty() && status.build != rommsync::kVersion;
+  Add(&view.lines, "Build", status.build.empty() ? std::string("Unknown") : status.build,
+      skewed ? Tone::kWarn : Tone::kNeutral);
+  if (skewed) {
+    Add(&view.lines, "Overlay", rommsync::kVersion, Tone::kWarn);
+    if (view.hint.empty()) {
+      view.hint = "Install the sysmodule and overlay from the same release";
+    }
+  }
   return view;
 }
 
@@ -378,9 +393,12 @@ StatusView RenderUnreachable(Link link, std::uint32_t sysmodule_interface) {
       break;
     case Link::kIncompatible:
       view.headline = "sysmodule unreachable";
-      view.hint = "Update the sysmodule: it speaks version " +
-                  std::to_string(sysmodule_interface) + ", this overlay speaks " +
-                  std::to_string(ipc::kVersion);
+      // Whichever half is behind is the one to update. Zero is "it did not
+      // say", which only an older sysmodule does.
+      view.hint = std::string(sysmodule_interface > ipc::kVersion ? "Update the overlay"
+                                                                  : "Update the sysmodule") +
+                  ": it speaks version " + std::to_string(sysmodule_interface) +
+                  ", this overlay speaks " + std::to_string(ipc::kVersion);
       break;
   }
   // No rows at all. Every one of them would be a number this overlay does not

@@ -120,13 +120,19 @@ struct StatusView {
 /// `last_sync_at` -- a console whose clock moved, which is ordinary on a Switch
 /// that has been offline -- renders as "just now" rather than as a negative
 /// interval.
+///
+/// A `Status::build` that is not this overlay's `rommsync::kVersion` is two
+/// releases on one card (#205): the `Build` row turns to a warning, an `Overlay`
+/// row joins it, and the hint says to install both from one release unless a
+/// worse problem already holds the hint.
 StatusView Render(const ipc::Status& status, std::int64_t now_unix);
 
 /// The screen for a sysmodule that could not be asked, or could not be
 /// understood. `link` must not be `kOk`.
 ///
 /// `sysmodule_interface` is what `GetInterfaceVersion` answered, and is shown
-/// only for `kIncompatible`, where the two numbers are the whole diagnosis.
+/// only for `kIncompatible`, where the two numbers are the whole diagnosis --
+/// and where they also say which half to update: the one that is behind.
 StatusView RenderUnreachable(Link link, std::uint32_t sysmodule_interface = 0);
 
 /// What the SD card says about the two switches, for a console whose sysmodule

@@ -22,6 +22,7 @@
 #include "checks.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/overlay_status_view.hpp"
+#include "rommsync/version.hpp"
 
 namespace {
 
@@ -40,7 +41,8 @@ constexpr std::int64_t kNow = 1757030400;
 ipc::Status Healthy() {
   ipc::Status status;
   status.interface = ipc::kVersion;
-  status.build = "0.4.2";
+  // The overlay's own build: a healthy install is both halves of one release.
+  status.build = rommsync::kVersion;
   status.enabled = true;
   status.auth = ipc::AuthState::kPaired;
   status.configured = true;
@@ -121,8 +123,10 @@ void CheckHealthy(Checks& checks) {
   checks.ExpectEq(ValueOf(view, "Result"), std::string("Finished"), "how it went");
   checks.ExpectEq(ValueOf(view, "Uploaded"), std::string("2"), "uploaded");
   checks.ExpectEq(ValueOf(view, "Downloaded"), std::string("3"), "downloaded");
-  checks.ExpectEq(ValueOf(view, "Build"), std::string("0.4.2"),
+  checks.ExpectEq(ValueOf(view, "Build"), std::string(rommsync::kVersion),
                   "the build a support thread starts with");
+  checks.Expect(!HasLabel(view, "Overlay"), "and one build is one row");
+  checks.Expect(view.hint.empty(), "a healthy console has nothing to be told");
   checks.Expect(view.progress.kind == overlay::Progress::Kind::kNone,
                 "an idle console draws no bar");
 }
@@ -393,16 +397,69 @@ void CheckUnreachable(Checks& checks) {
       std::string_view(R"({"interface":1,"build":"0.4.2","enabled":"yes"})"));
   checks.Expect(!wrong_type.ok(), "a wrong-typed field does not decode either");
 
-  const overlay::StatusView old = overlay::RenderUnreachable(overlay::Link::kIncompatible, 99);
+  const overlay::StatusView old =
+      overlay::RenderUnreachable(overlay::Link::kIncompatible, ipc::kVersion - 1);
   ExpectNothingBlank(checks, old, "incompatible");
   checks.ExpectEq(old.headline, std::string("sysmodule unreachable"), "the same headline");
   // ...but a different hint, because there is something to do about this one and
   // command 0's frozen encoding is what makes it knowable (`ipc::Command`).
   checks.Expect(old.hint.find("Update the sysmodule") != std::string::npos,
                 "and 'update the sysmodule' rather than a decode failure");
-  checks.Expect(old.hint.find("99") != std::string::npos, "naming what it answered");
+  checks.Expect(old.hint.find(std::to_string(ipc::kVersion - 1)) != std::string::npos,
+                "naming what it answered");
   checks.Expect(old.hint.find(std::to_string(ipc::kVersion)) != std::string::npos,
                 "and what this overlay speaks");
+
+  // The other half of a partial update: an overlay left behind beside a newer
+  // sysmodule. Sending that user to update the sysmodule would have them
+  // reinstall the half that is already right (#205).
+  const overlay::StatusView behind = overlay::RenderUnreachable(overlay::Link::kIncompatible, 99);
+  ExpectNothingBlank(checks, behind, "incompatible, overlay older");
+  checks.Expect(behind.hint.find("Update the overlay") != std::string::npos,
+                "a newer sysmodule says to update the overlay -- " + behind.hint);
+  checks.Expect(behind.hint.find("99") != std::string::npos, "naming what it answered");
+}
+
+// --- one release, two files (#205) --------------------------------------------
+
+/// The sysmodule and the overlay are separate files, and a partial unzip or a
+/// user replacing one of them leaves two releases on one card. While the IPC
+/// contract still matches, everything works -- until an edit names a key the
+/// older half does not have, or a file the newer one wrote is refused. So the
+/// skew is said before that, on the screen that already shows the build.
+void CheckVersionSkew(Checks& checks) {
+  ipc::Status skewed = Healthy();
+  skewed.build = "0.9.0";
+  const overlay::StatusView view = RenderOverWire(checks, skewed);
+  ExpectNothingBlank(checks, view, "skewed");
+  checks.ExpectEq(view.headline, std::string("Up to date"),
+                  "a skewed install that works still says it works");
+  checks.ExpectEq(ValueOf(view, "Build"), std::string("0.9.0"), "the sysmodule's build");
+  checks.ExpectEq(ValueOf(view, "Overlay"), std::string(rommsync::kVersion),
+                  "beside the overlay's, because they differ");
+  for (const overlay::Line& line : view.lines) {
+    if (line.label == "Build" || line.label == "Overlay") {
+      checks.Expect(line.tone == overlay::Tone::kWarn, line.label + " is drawn as a warning");
+    }
+  }
+  checks.Expect(view.hint.find("same release") != std::string::npos,
+                "and the hint says what to do -- " + view.hint);
+
+  // A worse problem keeps its own hint; the rows still say it.
+  skewed.online = false;
+  const overlay::StatusView offline = RenderOverWire(checks, skewed);
+  checks.ExpectEq(offline.headline, std::string("Offline"), "the headline is the worse problem");
+  checks.Expect(offline.hint.find("same release") == std::string::npos,
+                "and so is its hint -- " + offline.hint);
+  checks.ExpectEq(ValueOf(offline, "Overlay"), std::string(rommsync::kVersion),
+                  "while the rows still show the skew");
+
+  // A sysmodule that reported no build is not a skew: there is nothing to
+  // compare, and "Unknown" already says so.
+  ipc::Status unreported = Healthy();
+  unreported.build.clear();
+  const overlay::StatusView silent = RenderOverWire(checks, unreported);
+  checks.Expect(!HasLabel(silent, "Overlay"), "an unreported build is not called a mismatch");
 }
 
 // --- the four states, not two (M6-2, #33) -------------------------------------
@@ -564,6 +621,7 @@ int main() {
   CheckConfigErrors(checks);
   CheckDownloads(checks);
   CheckUnreachable(checks);
+  CheckVersionSkew(checks);
   CheckFourStates(checks);
   CheckFormatting(checks);
 
