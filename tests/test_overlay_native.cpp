@@ -6,16 +6,22 @@
 // the view models in `core/` -- what a screen *says* -- and the greps in them
 // assert what the directory must not contain. Neither reaches the code.
 //
-// What is compiled in here, and why it is these four files:
+// What is compiled in here, and why it is these files:
 //
 //   `card_probe.cpp`   the "not installed" / "installed but not set to boot"
 //                      diagnosis. Portable already; it needed only a seam for
 //                      the `sdmc:` mount (`ProbeCardAt`).
 //   `ipc_client.cpp`   the entire client half of the IPC wire, behind the
-//                      `switch.h` shim in `tests/hostswitch/`.
+//                      `switch.h` shim in `tests/hostswitch/`, and the budget
+//                      every call is held to (M9-6, #209).
 //   `screen_frame.cpp` the version handshake and the "not running" /
-//                      "unreachable" decision every screen shares.
+//                      "unreachable" / "not responding" decision every screen
+//                      shares.
 //   `status_paint.cpp` the status screen's layout, behind the `DrawList` seam.
+//   `conflicts_pump.cpp` the conflicts screen's IPC frame (#209).
+//   `lifecycle.cpp`    start, show, and the one teardown every exit path ends
+//                      in; and `Cadence`, the clock a screen polls by (#209).
+//   `log_paint.cpp`    the log screen's layout (#209).
 //
 // The far side of the wire is the *real* dispatch table -- `ipc::Dispatch` over
 // an `ipc::ServiceCore` -- and the real `Error` -> `Result` mapping the

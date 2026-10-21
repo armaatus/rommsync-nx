@@ -491,11 +491,12 @@ add_test(NAME overlay.settings COMMAND test_overlay_settings)
 # `overlay/source/` had been built by anything but devkitPro and none of them had
 # run anywhere. `status_screen.hpp` said so in its header comment.
 #
-# Four of them are compiled in here. Two needed nothing but a seam --
+# Seven of them are compiled in here. Two needed nothing but a seam --
 # `card_probe.cpp` a parameter for the `sdmc:` mount, `status_paint.cpp` a
 # `DrawList` instead of a `tsl::gfx::Renderer` -- and two reach libnx and get
 # `tests/hostswitch/switch.h` instead, which stubs only what those two files
-# name. `sysmodule/source/ipc/result.cpp` is
+# name. M9-6 (#209) added `conflicts_pump.cpp`, `lifecycle.cpp` and
+# `log_paint.cpp`, each split out of a screen so the claim about it runs. `sysmodule/source/ipc/result.cpp` is
 # the far side's `Error` -> `Result` mapping, compiled in so the overlay's
 # inverse is tested against the real one rather than against a copy of it.
 #

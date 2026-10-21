@@ -745,7 +745,8 @@ ctest --test-dir build --output-on-failure
   process is told about a sleep early enough to matter. None of the
   eight needs Docker, a rig, or a resolver, so none of them ever skips.
 - The `overlay.card`, `overlay.wire`, `overlay.roundtrip`, `overlay.version`,
-  `overlay.errors`, `overlay.portable` and `overlay.draw` scenarios are **`overlay/source/` itself,
+  `overlay.errors`, `overlay.timeout`, `overlay.restore`, `overlay.cycles`,
+  `overlay.hidden`, `overlay.log`, `overlay.portable` and `overlay.draw` scenarios are **`overlay/source/` itself,
   compiled by a host compiler and run** (M9-7, #198). Everything else in the
   `overlay.*` group tests the view models in `core/` -- what a screen *says* --
   and greps the directory for what it must not contain; until #198 not one of
@@ -757,14 +758,26 @@ ctest --test-dir build --output-on-failure
   `ipc_client.cpp` (the whole client half of the wire),
   `screen_frame.cpp` (the version handshake, and *not running* versus
   *unreachable*), and `status_paint.cpp` (the status screen's layout, behind the
-  `DrawList` seam). The far side is the **real** `ipc::Dispatch` over a real
+  `DrawList` seam). M9-6 (#209) added three more: `conflicts_pump.cpp` (the
+  conflicts screen's IPC frame), `lifecycle.cpp` (start, show and the one
+  teardown) and `log_paint.cpp` (the log screen's layout). What those make
+  assertable: `overlay.timeout` holds the far side's answer and asserts the draw
+  thread gets `NotResponding` at the client's budget and is never held again
+  while the call is out; `overlay.restore` times every frame of the conflicts
+  screen while a restore is still copying; `overlay.cycles` drives every way the
+  pinned `tsl::loop` ends, eight times over, and balances sessions, worker
+  threads and -- through `count_new.hpp` -- the heap, after grepping
+  `tesla.hpp` for the loop's one tail; `overlay.hidden` pins that a poll is due
+  on the first frame of every showing, because `update()` does not run while
+  the overlay is hidden. The far side is the **real** `ipc::Dispatch` over a real
   `ipc::ServiceCore`, answering through the **real** `sysmodule::ToResult` --
   split into `sysmodule/source/ipc/result.cpp` so the overlay's `DecodeError` is
   held against the mapping that ships rather than against a copy of it. So an
   overlay/sysmodule contract mismatch is a red test rather than a first-boot
   surprise. `overlay.portable` is the odd one out and is a grep: it holds the
   portable half of `overlay/source/` -- `draw_list.hpp`, `prompts.hpp`,
-  `screen_frame.*`, `status_paint.*` -- to naming no `tesla.hpp`, `tsl::`,
+  `screen_frame.*`, `status_paint.*`, `conflicts_pump.*`, `lifecycle.*`,
+  `log_paint.*` -- to naming no `tesla.hpp`, `tsl::`,
   `libultrahand` or `arm_neon`, transitively through the headers they include,
   because the compile only covers the files this target happens to build and the
   *next* screen's painter is the one that would quietly leave the reach of every
@@ -772,7 +785,7 @@ ctest --test-dir build --output-on-failure
   `overlay/source/` calls `drawString` except `DrawBounded`**, the one function
   that refuses a `maxWidth` of `0` -- which libtesla reads as *no limit* while
   every screen's width arithmetic produces it to mean *no room*. None of the
-  seven needs Docker or a rig, so none of them skips.
+  twelve needs Docker or a rig, so none of them skips.
   What they do **not** reach, and why, is in the two limits below.
 - The `power.*` pair is the sleep contract without a console (M9-4, #208).
   `psc:m` is a service and cannot be reached from a laptop, but everything the

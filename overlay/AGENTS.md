@@ -59,15 +59,19 @@ Ultrahand overlay list.
   and to `overlay.portable`'s list. One that draws through `tsl::gfx::Renderer`
   directly has left the reach of every test.
 - **The parts of this directory that need no renderer are compiled and run on a
-  host.** `source/card_probe.cpp`, `source/ipc_client.cpp`,
+  host.** `source/card_probe.cpp`, `source/conflicts_pump.cpp`,
+  `source/ipc_client.cpp`, `source/lifecycle.cpp`, `source/log_paint.cpp`,
   `source/screen_frame.cpp` and `source/status_paint.cpp` are built into
   `test_overlay_native` and driven against the real `ipc::Dispatch` and the real
   `sysmodule::ToResult` — so a payload the two halves disagree about is a red
   test rather than a first-boot surprise. libnx comes from
-  `tests/hostswitch/switch.h`, which stubs **only** what the two files that
-  reach for it name — `source/ipc_client.cpp` and `source/screen_frame.cpp`;
-  the other two name no libnx symbol at all — plus the one thing the seam itself
-  has to model, a session whose sysmodule exited. A file that needs it to grow
+  `tests/hostswitch/switch.h`, which stubs **only** what the files that reach
+  for it name — `source/ipc_client.cpp` and `source/screen_frame.cpp` (the
+  rest name no libnx symbol, or only what those two headers already carry) —
+  plus the two things the seam itself has to model: a session whose sysmodule
+  exited, and a count of sessions open so `overlay.cycles` can balance them.
+  A sysmodule that does not answer needs nothing from the shim: it is a
+  `hostswitch::Server::Handle` that blocks. A file that needs it to grow
   is either one that does not belong on this seam, or a sign the seam has moved.
   Say which here rather than reaching for the stub: the value of that header is
   that it is small enough to read.
@@ -117,6 +121,29 @@ Ultrahand overlay list.
 - All IPC goes through `source/ipc_client.*`. A screen never builds a payload
   itself; if a screen needs something the client cannot answer, the command
   belongs in `docs/DEVELOPMENT.md#ipc` and in `rommsync/ipc.hpp` first.
+- **No call waits longer than `IpcClient::kCallBudget`, and no command may need
+  to** (M9-6, #209). The client dispatches on a worker thread of its own and the
+  draw thread waits at most the budget; past it the call answers
+  `NotResponding()`, `ScreenFrame::Diagnose` names it `Link::kNotResponding`
+  without touching the session, and every later call answers the same at once
+  until the one that is out comes back. So a command that can take as long as
+  the card does is a command that **starts** work and a state the screen polls
+  -- `RestoreBackup` and `GetRestoreState` are the pattern -- never one a frame
+  waits for. The one unbounded wait is `IpcClient::Shutdown`, on the way out,
+  because a worker cannot be left inside `serviceDispatchOut` when nx-ovlloader
+  unloads the overlay; libtesla has released input and the panel by then.
+- **Every exit path ends in one teardown, and it is `Lifecycle::Stop`**
+  (`source/lifecycle.*`). `main.cpp`'s hooks only forward to it, the destructor
+  runs it too, and `ctest -R overlay.cycles` greps both `main.cpp` and the
+  pinned `tesla.hpp` for exactly that. Anything a new piece of this directory
+  takes for the life of the overlay -- a session, a thread, a handle -- is given
+  back from `Stop`, and `overlay.cycles` is where it gets balanced. nx-ovlloader's
+  process never exits, so what is not given back is gone until a reboot.
+- **A screen polls by `Cadence`, never by a frame count of its own.** `update()`
+  does not run while the overlay is hidden, so a member a screen increments to
+  decide when to ask again resumes mid-count after a hide and draws what it read
+  before it. `Cadence` is due on the first frame of every showing;
+  `overlay.hidden` greps `*_screen.*` for a member incremented or decremented.
 - **Check `GetInterfaceVersion` against `ipc::kVersion` before anything else.**
   It is command 0 and its encoding is frozen, so it is the only call that is
   safe to make before knowing whether the two halves agree. A mismatch is

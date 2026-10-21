@@ -106,10 +106,11 @@ and a log is not worth it. A save is never in that position; see
 | `play.failed` | play time could not be recorded — no save is at risk | [The SD card is full](#the-sd-card-is-full) |
 | `power.sleep` | the console went to sleep while this client was still busy | [The console slept mid-sync](#the-console-slept-mid-sync) |
 
-The overlay does not show the log yet. `sys-rommsync` serves it over IPC —
-`GetLog`, command 16 in [DEVELOPMENT.md](DEVELOPMENT.md#the-command-set) — so a
-screen can be added without an SD reader, and until one is, the card is how you
-read it.
+The overlay shows the end of the log under **Settings → Log**, read off the
+sysmodule over IPC — `GetLog`, command 16 in
+[DEVELOPMENT.md](DEVELOPMENT.md#the-command-set) — so the lines above can be
+read without an SD reader. It is the last lines the sysmodule kept in memory;
+the whole log is the file on the card.
 
 ---
 

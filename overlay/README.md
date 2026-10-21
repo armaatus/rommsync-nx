@@ -44,6 +44,8 @@ client, and that rule is about ownership rather than about the link map.
   had about it, "Re-pair", and the **root menu** the other four are reached from
   ✅ M4-4. Read-only: rows are marked where M5-3 (#30) will make them editable,
   and nothing here writes `config.ini`.
+- **Log** — the end of `rommsync.log`, read off the sysmodule rather than the
+  card ✅ M9-6 (#209). The last row of the settings menu.
 
 **Y on the status screen opens Settings, and Settings opens the rest.** Before
 M4-4 the overlay had no navigation at all — `main.cpp` opened on the status
@@ -64,6 +66,9 @@ source/
   sync_screen.*       # the switch and "Sync now"; likewise
   library_screen.*    # platforms -> roms -> the queue; likewise
   settings_screen.*   # the configuration, the root menu and "Re-pair"; likewise
+  conflicts_screen.*  # what a sync overwrote, and the restore; its IPC frame is conflicts_pump.*
+  log_screen.*        # the end of the log; its layout is log_paint.*
+  lifecycle.*         # start, show and the one teardown every exit path ends in
 ```
 
 Screen files are flat here, and their basenames may not collide with anything in
@@ -169,6 +174,29 @@ production RomM or a real library.
       the overlay and confirm `sys-rommsync` is still resident and the status
       screen still answers. A screen that reads *sys-rommsync is not running*
       after this switch is the failure #24 was written around.
+
+11. **The log.** Settings → **Log**. Expect the last lines the sysmodule kept,
+    newest at the bottom, every line held to the panel's width, and a headline
+    saying how much of the log it is — *"The last N of M lines"* once a few
+    ticks have run. **B** comes back to settings.
+
+12. **A restore does not freeze the panel.** On the conflicts screen, restore
+    an entry whose save is large (a few MiB is enough on a slow card). Expect
+    *"Restoring..."* and a panel that keeps answering the stick and **B** for
+    the whole copy, then the outcome. Before M9-6 (#209) the overlay was frozen
+    inside the call for as long as the card took.
+
+13. **Hide and show.** Open the settings screen, hide the overlay with its
+    combo, change nothing, and show it again. Expect the screen to be redrawn
+    from a fresh answer on the first frame, not from what it read before the
+    hide.
+
+14. **Six opens and more.** Open and close the overlay ten times in a row, by
+    **B** at the root and by launching another overlay from Ultrahand's menu.
+    Expect the tenth to open exactly like the first, and the game underneath to
+    have its controller back every time the overlay is closed. *"Crashes 100% on
+    the sixth attempt"* (Ultrahand#278) is a counted resource running out;
+    `overlay.cycles` is the host half of this step.
 
 Record what each step actually drew in #44, including the layout constants that
 had to move — every screen file keeps them in one block at the top for exactly

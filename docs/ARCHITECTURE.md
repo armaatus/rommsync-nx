@@ -120,8 +120,9 @@ overlay.
   local size/MD5/mtime, server_content_hash, server_updated_at, backup path}`.
   Bounded at `conflicts::kMaxEntries`; the oldest entry falls off the end and
   its backup stays on the card. The overlay reads it over `ListConflicts` and
-  asks the sysmodule to put bytes back over `RestoreBackup`
-  (`core/include/rommsync/conflict_log.hpp`). `[sync] conflict_show` hides the
+  asks the sysmodule to put bytes back over `RestoreBackup`, which starts the
+  copy on the worker and answers at once; the overlay polls `GetRestoreState`
+  for the outcome (M9-6, #209; `core/include/rommsync/conflict_log.hpp`). `[sync] conflict_show` hides the
   *screen* and never the recording.
 - `sdmc:/config/rommsync/play.db` — play time this console recorded and has not
   yet handed to RomM (M7-4). `conflicts.db`'s format: a header line carrying the
