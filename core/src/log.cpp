@@ -347,6 +347,8 @@ const char* ToString(Event event) {
       return "server.unsupported";
     case Event::kSyncHeld:
       return "sync.held";
+    case Event::kSaveDeleted:
+      return "save.deleted";
   }
   return "unknown";
 }

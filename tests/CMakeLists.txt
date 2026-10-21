@@ -948,6 +948,8 @@ set(EXECUTE_UNIT_SCENARIOS
   crash_model # M9-14: a power cut at every call of an overwrite, and the replay's own check
   overwrite # #232: overwrite=false unless Keep local, and a 409 named as a newer save in the slot
   content_hash # #234: an upload and a /downloaded carry the MD5 of the bytes that moved
+  delete   # M10-7: a server delete is backed up, then removed -- or kept, or refused
+  crash_delete # M10-7: ...and a power cut at every call of it leaves the save or its backup
 )
 foreach(scenario IN LISTS EXECUTE_UNIT_SCENARIOS)
   add_test(NAME execute.${scenario} COMMAND test_sync_execute ${scenario})
@@ -1536,6 +1538,8 @@ set(TICK_RIG_SCENARIOS
   baseline_downloaded # #234: ...the same from a /downloaded baseline
   baseline_conflict   # #234: real progress against a moved row is still a conflict
   baseline_other_row  # #234: ...and against another device's new row (#227), never suppressed
+  deleted          # M10-7: deleted in RomM -> backed up and removed, and never re-uploaded
+  deleted_keep     # ...and under on_server_delete = keep, left on the card, never re-uploaded
 )
 
 # M10-2 (#228): which RomM this console is talking to. `versions` and
@@ -2262,6 +2266,7 @@ set(ENGINE_RIG_SCENARIOS
   romm_version # M10-2: the server's version is read first, and below the floor nothing is asked
   tico_accounts  # #231: two Tico accounts and none named reach the settings screen
   foreground   # #242: no tick under a running game, and one after it closes
+  server_deleted # #233: a save deleted in RomM, removed or kept as config.ini says, logged and listed
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})

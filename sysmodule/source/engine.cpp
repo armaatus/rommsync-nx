@@ -1869,6 +1869,11 @@ bool SdEngine::RunOneTick() {
   // negotiation and transfer after it, so it asks again (#232 against #242).
   options.hold_resolution = [this]() { return application_running(); };
   options.execute.backup_dir = sync::kBackupDir;
+  // What a save RomM deleted does here (#233). Backed up first either way the
+  // executor removes it; `keep` never touches the file.
+  options.execute.on_server_delete = config->sync.on_server_delete == config::OnServerDelete::kKeep
+                                         ? sync::DeleteMode::kKeep
+                                         : sync::DeleteMode::kRemove;
   options.finish.state_sd_path = sync::kStateSdPath;
   options.cancel = cancel.get();
   // The save folders and `.backup/`, and deliberately **not** `/config/rommsync`
@@ -2041,6 +2046,14 @@ bool SdEngine::RunOneTick() {
   log::WriteEach(log::Level::kError, log::Event::kSaveFailed, tick.executed.warnings);
   log::WriteEach(log::Level::kError, log::Event::kSaveFailed, tick.finished.warnings);
   log::WriteEach(log::Level::kWarn, log::Event::kSaveFailed, tick.recovered.warnings);
+  // A save leaving the card, or staying on it against the server's word, is
+  // never silent (#233). The message names the save's path and its backup.
+  for (const sync::OperationResult& operation : tick.executed.operations) {
+    if (operation.outcome == sync::OperationOutcome::kRemoved ||
+        operation.outcome == sync::OperationOutcome::kKept) {
+      log::Info(log::Event::kSaveDeleted, operation.message);
+    }
+  }
   if (states.ran) {
     log::WriteEach(log::Level::kWarn, log::Event::kScanSkipped, states.scan.DescribeSkipped());
   }
@@ -2070,7 +2083,9 @@ bool SdEngine::RunOneTick() {
     } else if (operation.outcome == sync::OperationOutcome::kDownloaded) {
       ++downloaded_;
     }
-    if (!operation.backup_sd_path.empty()) {
+    // A removal (#233) leaves a backup too, and is not an arbitration.
+    if (!operation.backup_sd_path.empty() &&
+        operation.outcome != sync::OperationOutcome::kRemoved) {
       ++conflicts_;
     }
   }

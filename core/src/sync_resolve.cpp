@@ -57,6 +57,8 @@ void Recount(ExecutionReport* report) {
       case OperationOutcome::kUploaded:
       case OperationOutcome::kDownloaded:
       case OperationOutcome::kKeptBoth:
+      case OperationOutcome::kRemoved:
+      case OperationOutcome::kKept:
         ++report->completed;
         break;
     }
@@ -73,6 +75,14 @@ std::optional<SyncOperation> ResolveNewerOnServer(const SyncOperation& head,
   }
   if (head.action == Action::kNoOp) {
     return head;
+  }
+  if (head.action == Action::kDelete) {
+    // The slot was emptied between the two negotiations (#233). A delete is
+    // the main plan's to obey, on the next tick, against what that tick's scan
+    // reports -- never this step's, which exists to take a server copy *in*.
+    // It names no save row either, so the check below would refuse it anyway;
+    // this says why rather than leaning on that.
+    return std::nullopt;
   }
   if (!head.save_id.has_value()) {
     return std::nullopt;

@@ -181,6 +181,12 @@ enum class Event {
   /// three hours is one line. The tick that runs afterwards ends `sync.tick` as
   /// every tick does.
   kSyncHeld,
+
+  /// RomM said a save this console holds was deleted on the server (M10-7,
+  /// #233), and what became of the file: removed after a backup, or kept under
+  /// `[sync] on_server_delete = keep`. The one line that explains a save
+  /// leaving the card, so it is written for every one.
+  kSaveDeleted,
 };
 
 /// Every event, in declaration order. The guide and the emitted set are both
@@ -193,7 +199,7 @@ inline constexpr std::array kAllEvents = {
     Event::kSyncRefused, Event::kSyncTick,    Event::kSaveFailed,
     Event::kDownload,    Event::kPlayFailed,  Event::kPower,
     Event::kServerVersion, Event::kServerUnsupported,
-    Event::kSyncHeld,
+    Event::kSyncHeld,    Event::kSaveDeleted,
 };
 
 /// Stable tag -- `net.offline`. Never null.

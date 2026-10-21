@@ -825,6 +825,35 @@ void Advance(rig::Checks& checks) {
                 "a download that cannot be read back erases the row it replaced");
   checks.Expect(!missing.warnings.empty(), "...and the loss is named");
 
+  // M10-7 (#233): a `delete`, removed or kept, stops the slot being tracked.
+  // Removed, the row describes a file that is gone; kept, the server has ruled
+  // the copy is not one to sync, and a row claiming it was synced is false.
+  for (const sync::OperationOutcome outcome :
+       {sync::OperationOutcome::kRemoved, sync::OperationOutcome::kKept}) {
+    const std::string what = sync::ToString(outcome);
+    sync::SyncPlan deleted_plan;
+    deleted_plan.session_id = 1;
+    deleted_plan.operations.push_back(OperationOf(sync::Action::kDelete, 6, "gone"));
+    sync::ExecutionReport deleted_report;
+    deleted_report.operations.push_back(
+        ResultOf(outcome, 6, "gone", SavePath("gone.srm")));
+    const sync::BaselineUpdate untracked =
+        sync::AdvanceBaseline(had_a_row, deleted_plan, deleted_report, {}, *files);
+    checks.Expect(untracked.value.Find(6, std::string("gone")) == nullptr,
+                  what + ": a delete erases the slot's row");
+    checks.Expect(untracked.warnings.empty(), what + ": ...as an ordinary outcome, not a loss");
+
+    // A delete that failed did nothing, and keeps the row so the next tick
+    // negotiates the save again.
+    sync::ExecutionReport failed_report;
+    failed_report.operations.push_back(
+        ResultOf(sync::OperationOutcome::kFailed, 6, "gone", SavePath("gone.srm")));
+    const sync::BaselineUpdate retried =
+        sync::AdvanceBaseline(had_a_row, deleted_plan, failed_report, {}, *files);
+    checks.Expect(retried.value.Find(6, std::string("gone")) != nullptr,
+                  what + ": a failed delete keeps the row");
+  }
+
   // The opposite path, and the opposite answer: an upload leaves the card alone,
   // so a reported digest that is missing costs the save nothing -- the row the
   // last tick stored still describes the file and is kept.

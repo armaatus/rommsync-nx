@@ -3917,6 +3917,120 @@ int Foreground(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// M10-7 (#233): a save deleted in RomM, met by the whole engine -- the setting
+/// read from `config.ini`, the tick, the log line, the conflicts screen and the
+/// status counts -- once per value of `[sync] on_server_delete`.
+///
+/// `keep` is the run that proves the setting reaches the tick, because removing
+/// is also what a tick does with no setting at all. Each run is a device of its
+/// own, so the first tick's upload is the only thing negotiate plans.
+int ServerDeleted(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom),
+           "the fixture library has nova.nes");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+
+  for (const bool keep : {false, true}) {
+    const std::string what = keep ? "keep" : "remove";
+    const std::string device_id =
+        harness::CreateDevice(c, client, base, fixture, "engine-deleted-" + what);
+    if (device_id.empty()) {
+      return c.failures();
+    }
+    const std::vector<std::int64_t> before = SaveIdsFor(client, base, fixture, rom.id);
+
+    rlog::Reset();
+    Console console(c, "engine-deleted-" + what);
+    c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                   "[server]\nurl = " + base +
+                                       "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                       "on_boot = false\nstates = false\non_server_delete = " +
+                                       what + "\n"),
+             what + ": the console points at the rig");
+    auth::StoredToken token;
+    token.server_url = base;
+    token.access_token = fixture.token;
+    token.device_id = device_id;
+    token.scopes = {"roms.read"};
+    c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+             what + ": paired");
+    const std::string save = "/tico/saves/nes/nova.srm";
+    console.sandbox.MakeDirs("/tico/saves/nes");
+    const std::string bytes = "the save that is about to be deleted in RomM (" + what + ")\n";
+    console.sandbox.SeedSave(save, bytes);
+
+    const std::unique_ptr<fs::FileSystem> card =
+        rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+    console.Boot();
+    console.engine.UseServer(&client, token.access_token);
+    console.engine.UseCard(card.get());
+    console.engine.StartWorker();
+
+    const auto tick = [&console, &c, &what](int n) {
+      c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, what + ": a tick is asked for");
+      const std::chrono::steady_clock::time_point by =
+          std::chrono::steady_clock::now() + std::chrono::seconds{60};
+      while (TicksLogged(console.Log()) < n && std::chrono::steady_clock::now() < by) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{25});
+      }
+      c.ExpectEq(TicksLogged(console.Log()), n, what + ": and it ran");
+    };
+
+    tick(1);
+    std::vector<std::int64_t> uploaded;
+    for (const std::int64_t id : SaveIdsFor(client, base, fixture, rom.id)) {
+      if (std::find(before.begin(), before.end(), id) == before.end()) {
+        uploaded.push_back(id);
+      }
+    }
+    c.ExpectEq(uploaded.size(), std::size_t{1}, what + ": the first tick uploads the save");
+    for (const std::int64_t id : uploaded) {
+      harness::DeleteSave(client, base, fixture, id);
+    }
+
+    tick(2);
+    const ipc::LogTail log = console.Log();
+    c.Expect(Logged(log, "save.deleted"), what + ": the log says RomM deleted it:" + Rendered(log));
+    const ipc::Status status = console.Status();
+    c.ExpectEq(status.conflicts, std::int64_t{0},
+               what + ": a deletion is not counted as a conflict");
+    ipc::ConflictQuery query;
+    std::string response;
+    console.Call(ipc::Command::kListConflicts, ipc::EncodeConflictQuery(query), &response);
+    const ipc::ConflictPage page = ipc::DecodeConflictPage(response).value;
+    if (keep) {
+      c.ExpectEq(console.sandbox.Read(save), bytes, "keep: the save is still on the card");
+      c.Expect(page.entries.empty(), "keep: and nothing was replaced, so nothing is listed");
+    } else {
+      c.Expect(!console.sandbox.Exists(save), "remove: the save is off the card");
+      c.Expect(console.sandbox.HasBackupOf(bytes), "remove: and its bytes are under .backup/");
+      c.Expect(page.entries.size() == 1 &&
+                   page.entries[0].entry.event == conflicts::Event::kDeleted &&
+                   page.entries[0].backup_present,
+               "remove: the conflicts screen lists it, with its backup there to restore");
+    }
+
+    // ...and the tick after that sends nothing back up.
+    tick(3);
+    std::size_t after = 0;
+    for (const std::int64_t id : SaveIdsFor(client, base, fixture, rom.id)) {
+      after += std::find(before.begin(), before.end(), id) == before.end() ? 1 : 0;
+    }
+    c.ExpectEq(after, std::size_t{0}, what + ": nothing was uploaded again");
+
+    harness::DeleteDevice(client, base, fixture, device_id);
+  }
+  return c.failures();
+}
+
 /// The scenarios that need the docker RomM, by name. A table rather than a
 /// second `if` chain, so the list of them is written down once.
 struct RigScenario {
@@ -3943,6 +4057,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"romm_version", RommVersion},
       {"foreground", Foreground},
       {"tico_accounts", TicoAccounts},
+      {"server_deleted", ServerDeleted},
   };
   for (const RigScenario& scenario : kRigScenarios) {
     if (name == scenario.name) {

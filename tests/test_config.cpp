@@ -229,6 +229,36 @@ void TicoAccountIsReadAndChecked(checks::Checks& c) {
            "a key [tico] does not have is said to be ignored");
 }
 
+/// `[sync] on_server_delete` (#233): what a save RomM deleted does on the card.
+/// `remove` -- backed up first, always -- unless the user says `keep`, and a
+/// value it is neither of leaves the default rather than guessing between them.
+void OnServerDeleteIsReadAndChecked(checks::Checks& c) {
+  c.Expect(config::Defaults().sync.on_server_delete == config::OnServerDelete::kRemove,
+           "a save RomM deleted is removed (after a backup) by default");
+
+  const auto parse = [](const std::string& line) {
+    return config::ParseConfig(WithServer("[sync]\n" + line + "\n"));
+  };
+  const config::LoadResult keep = parse("on_server_delete = Keep");
+  c.Expect(keep.value.sync.on_server_delete == config::OnServerDelete::kKeep &&
+               keep.diagnostics.empty(),
+           "keep is read, in any case: " + keep.DescribeDiagnostics());
+  const config::LoadResult remove = parse("on_server_delete = remove");
+  c.Expect(remove.value.sync.on_server_delete == config::OnServerDelete::kRemove &&
+               remove.diagnostics.empty(),
+           "remove is accepted as written");
+
+  for (const char* bad : {"on_server_delete = delete", "on_server_delete = true",
+                          "on_server_delete ="}) {
+    const config::LoadResult refused = parse(bad);
+    c.Expect(refused.value.sync.on_server_delete == config::OnServerDelete::kRemove,
+             std::string("'") + bad + "' leaves the default");
+    const config::Diagnostic* complaint = Complaint(refused, "sync", "on_server_delete");
+    c.Expect(complaint != nullptr && complaint->severity == config::Severity::kWarning,
+             std::string("and is a warning on its line: ") + refused.DescribeDiagnostics());
+  }
+}
+
 // --- the happy path ----------------------------------------------------------
 
 void AWholeFileParses(checks::Checks& c) {
@@ -914,6 +944,10 @@ void TheShippedExampleParses(checks::Checks& c) {
   c.ExpectEq(result.value.sync.states, defaults.sync.states, "so is [sync] states");
   c.ExpectEq(result.value.sync.conflict_show, defaults.sync.conflict_show,
              "so is [sync] conflict_show");
+  c.Expect(result.value.sync.on_server_delete == defaults.sync.on_server_delete,
+           "so is [sync] on_server_delete");
+  c.Expect(example.find("\non_server_delete") != std::string::npos,
+           "which the shipped example spells out, so the choice is visible");
   c.ExpectEq(result.value.downloads.enabled, defaults.downloads.enabled,
              "so is [downloads] enabled");
   c.ExpectEq(result.value.downloads.verify_hash, defaults.downloads.verify_hash,
@@ -932,6 +966,7 @@ int main() {
   DefaultsAreTheDocumentedOnes(c);
   DownloadsLandInTicosFolderNames(c);
   TicoAccountIsReadAndChecked(c);
+  OnServerDeleteIsReadAndChecked(c);
   AWholeFileParses(c);
   ItSurvivesHowPeopleActuallyWriteFiles(c);
   ABadFileStillBoots(c);

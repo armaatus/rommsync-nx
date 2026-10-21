@@ -69,6 +69,7 @@ constexpr ReasonSpelling kReasons[] = {
     {Reason::kNoChanges, "no_changes", "No changes since last sync"},
     {Reason::kAppearIdentical, "appear_identical", "Saves appear identical"},
     {Reason::kUntracked, "untracked", "Save is untracked on this device"},
+    {Reason::kDeletedOnServer, "deleted_on_server", "Save was deleted on the server"},
 };
 
 const ReasonSpelling* SpellingOf(Reason reason) {
@@ -238,6 +239,8 @@ const char* ToString(Action action) {
       return "conflict";
     case Action::kNoOp:
       return "no_op";
+    case Action::kDelete:
+      return "delete";
   }
   return "no_op";
 }
@@ -257,6 +260,9 @@ Action ClassifyAction(std::string_view action, bool* recognized) {
   }
   if (action == "no_op") {
     return Action::kNoOp;
+  }
+  if (action == "delete") {
+    return Action::kDelete;
   }
   if (recognized != nullptr) {
     *recognized = false;
@@ -373,6 +379,16 @@ auth::Parsed<SyncPlan> ParseNegotiateResponse(std::string_view body) {
   if (plan.session_id <= 0) {
     parsed.error = Fail("session_id", "is not a positive session id");
     return parsed;
+  }
+  // 5.4.0's (#233), and the one total read as optional: a body shaped like
+  // 5.2.0's has no deletions to count. Present, it is held to the type the
+  // others are -- a count that is not a number is a body that moved.
+  if (const json::Value* deletes = document.value.Find("total_delete"); deletes != nullptr) {
+    if (!deletes->is_integer()) {
+      parsed.error = Fail("total_delete", "is not an integer");
+      return parsed;
+    }
+    plan.total_delete = deletes->integer();
   }
 
   const json::Value* operations = document.value.Find("operations");

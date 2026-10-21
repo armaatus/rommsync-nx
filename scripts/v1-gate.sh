@@ -185,7 +185,9 @@ T
       # through `io::Disk`, cut at every call, and every card a non-journalling
       # FAT may keep is swept and judged: old bytes or new, and never new
       # without the old under `.backup/`. `execute.crash_model` is the replay's
-      # own check, and is in `^execute\.` already.
+      # own check, and is in `^execute\.` already -- as is `execute.crash_delete`
+      # (#233), the one save path whose "new" is no file at all: a removal, after
+      # `BackUpFirst`, judged old-or-gone and never gone without the backup.
       #
       # `tick.newer_download` and `tick.newer_conflict` replay the same way over
       # the overwrite a tick makes when RomM's slot guard refuses an upload and
@@ -241,7 +243,7 @@ core/src/download.cpp|1|0|1||not a save: rom bytes, and the queue record
 core/src/play_sessions.cpp|0|0|1||not a save: the play-session buffer M7-4 writes
 core/src/state_db.cpp|0|0|1||not a save: the sync baseline
 core/src/state_sync.cpp|1|0|0|io::CommitStaged|SAVE STATE: sync::BackUpFirst runs first
-core/src/sync_execute.cpp|1|1|0|io::CommitStaged|SAVE: sync::BackUpFirst runs first, and IS the CopyAtomically here
+core/src/sync_execute.cpp|1|1|0|io::CommitStaged|SAVE: sync::BackUpFirst runs first, and IS the CopyAtomically here; a server delete removes only after it too (#233)
 core/src/token_store.cpp|0|0|1||not a save: token.dat
 sysmodule/source/engine.cpp|0|0|1||not a save: config.ini, written back by the engine'
 

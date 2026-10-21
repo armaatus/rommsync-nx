@@ -624,6 +624,28 @@ struct Overwrite {
 /// After any power cut and the boot sweep: the save is its old bytes or its new
 /// ones; every backup is either one that was already there, or holds the old
 /// bytes in full; and a save holding its new bytes has a backup holding the old.
+/// Every new file under `expected.backup_dir` holds the old bytes in full, and
+/// `*backed_up` says whether there is one. A refusal, or empty.
+inline std::string BackupsHoldOld(const Tree& after, const Snapshot& before,
+                                  const Overwrite& expected, bool* backed_up) {
+  const std::string prefix = RelativeOf(expected.backup_dir) + "/";
+  *backed_up = false;
+  for (const auto& [path, bytes] : after) {
+    if (path.compare(0, prefix.size(), prefix) != 0) continue;
+    if (path.find('/', prefix.size()) != std::string::npos) continue;
+    const auto was = before.files.find(path);
+    if (was != before.files.end() && was->second == bytes) continue;
+    // A `.tmp` is staging nothing will ever read as a backup.
+    if (path.size() > 4 && path.compare(path.size() - 4, 4, ".tmp") == 0) continue;
+    if (bytes != expected.old_bytes) {
+      return "the backup " + path + " reads as present and does not hold the old bytes (" +
+             std::to_string(bytes.size()) + " bytes)";
+    }
+    *backed_up = true;
+  }
+  return {};
+}
+
 inline Judge OldOrNew(const Overwrite& expected) {
   return [expected](const Tree& after, const Snapshot& before) -> std::string {
     const auto save = after.find(RelativeOf(expected.save));
@@ -634,21 +656,9 @@ inline Judge OldOrNew(const Overwrite& expected) {
       return "the save is neither its old bytes nor its new ones (" +
              std::to_string(save->second.size()) + " bytes)";
     }
-    const std::string prefix = RelativeOf(expected.backup_dir) + "/";
     bool backed_up = false;
-    for (const auto& [path, bytes] : after) {
-      if (path.compare(0, prefix.size(), prefix) != 0) continue;
-      if (path.find('/', prefix.size()) != std::string::npos) continue;
-      const auto was = before.files.find(path);
-      if (was != before.files.end() && was->second == bytes) continue;
-      // A `.tmp` is staging nothing will ever read as a backup.
-      if (path.size() > 4 && path.compare(path.size() - 4, 4, ".tmp") == 0) continue;
-      if (bytes != expected.old_bytes) {
-        return "the backup " + path + " reads as present and does not hold the old bytes (" +
-               std::to_string(bytes.size()) + " bytes)";
-      }
-      backed_up = true;
-    }
+    const std::string refused = BackupsHoldOld(after, before, expected, &backed_up);
+    if (!refused.empty()) return refused;
     if (is_new && !is_old && !backed_up) {
       return "the save holds its new bytes and no backup under " + expected.backup_dir +
              " holds the old ones";
@@ -657,18 +667,40 @@ inline Judge OldOrNew(const Overwrite& expected) {
   };
 }
 
-/// Replay `recorder`'s log against `OldOrNew(expected)` and report into `c`.
+/// The same invariant for a removal (#233's `delete`), where the "new" state is
+/// no file at all: the save is its old bytes or absent, and absent only with a
+/// backup holding the old. `new_bytes` is not read.
+inline Judge OldOrGone(const Overwrite& expected) {
+  return [expected](const Tree& after, const Snapshot& before) -> std::string {
+    const auto save = after.find(RelativeOf(expected.save));
+    if (save != after.end() && save->second != expected.old_bytes) {
+      return "the save is not its old bytes (" + std::to_string(save->second.size()) +
+             " bytes)";
+    }
+    bool backed_up = false;
+    const std::string refused = BackupsHoldOld(after, before, expected, &backed_up);
+    if (!refused.empty()) return refused;
+    if (save == after.end() && !backed_up) {
+      return "the save is gone and no backup under " + expected.backup_dir +
+             " holds its bytes";
+    }
+    return {};
+  };
+}
+
+/// Replay `recorder`'s log against `judge` -- `OldOrNew(expected)` unless told
+/// otherwise -- and report into `c`.
 ///
 /// Also refuses a vacuous pass: a log with no successful sync in it, or one the
 /// model could not follow, proves nothing about durability.
 inline Verdict ExpectSurvives(checks::Checks& c, const Recorder& recorder,
                               const Overwrite& expected, const std::string& scratch,
-                              const std::string& what) {
+                              const std::string& what, const Judge& judge = nullptr) {
   // `DirOf` answers "" for a file at the root, which is "/" as an SD path.
   const std::string parent = DirOf(expected.save);
   const std::string save_dir = parent.empty() ? std::string("/") : parent;
   const Verdict verdict = Replay(recorder, {save_dir, expected.backup_dir}, {save_dir}, scratch,
-                                 OldOrNew(expected));
+                                 judge != nullptr ? judge : OldOrNew(expected));
   std::cout << "  " << what << ": " << verdict.points << " cuts, " << verdict.states
             << " cards, " << verdict.failures << " lost\n";
   c.Expect(verdict.unmodelled.empty(), what + ": the replay followed every call: " +

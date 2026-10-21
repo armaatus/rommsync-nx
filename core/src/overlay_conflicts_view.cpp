@@ -73,6 +73,8 @@ const char* EventText(conflicts::Event event, conflicts::EntryKind kind) {
       return kind == conflicts::EntryKind::kState ? "state replaced" : "save replaced";
     case conflicts::Event::kKeptBoth:
       return "both copies kept";
+    case conflicts::Event::kDeleted:
+      return "deleted on RomM";
   }
   return "overwritten";
 }

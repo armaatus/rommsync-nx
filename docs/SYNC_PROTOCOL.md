@@ -149,7 +149,8 @@ set, and the server would read it as "very old" and plan a `download` over what
 may be the only copy of the save.
 
 `POST /api/sync/negotiate` → `SyncNegotiateResponse { session_id, operations[],
-total_upload, total_download, total_conflict, total_no_op }`.
+total_upload, total_download, total_conflict, total_no_op, total_delete }` —
+`total_delete` since 5.4.0, read as zero when absent.
 
 `sync::Negotiate` makes that call and `ParseNegotiateResponse` turns the answer
 into a `SyncPlan` (M2-4). Both live in the same header as the request side. Three
@@ -196,6 +197,7 @@ For each `SyncOperationSchema`. The action is `no_op` — with the underscore:
 | `upload` | `POST /api/saves?rom_id=&emulator=&slot=&session_id=&device_id=&content_hash=&overwrite=false`, multipart `saveFile` = local bytes; a **409** is resolved below |
 | `download` | `GET /api/saves/{save_id}/content` → **back up existing local file** → write to the file's SD path → `POST /api/saves/{save_id}/downloaded {device_id, content_hash}` |
 | `conflict` | resolve by policy (below) — **always back up the loser first** |
+| `delete` | 5.4.0: **back up the local file**, then remove it — or leave it, under `[sync] on_server_delete = keep` ([below](#a-save-deleted-on-the-server)) |
 
 **Both carry `content_hash`** (#234): the MD5 of the file hashed as it is
 uploaded, and of the verified bytes a download put on the card. RomM 5.4 keeps
@@ -448,11 +450,58 @@ carrying `device_id` and by `POST /api/saves/{id}/downloaded` — a download the
 client never confirms leaves the device looking like it has never seen the save,
 which puts every later comparison in the no-sync-history branch above.
 
+### A save deleted on the server
+
+5.4.0 remembers what each slot lost (`deleted_assets`: up to 100 content hashes
+per `(rom_id, slot)`, each with when it was lost). A client that reports a slot
+the server has **emptied**, holding one of those versions written no later than
+its removal, is answered `delete` / `Save was deleted on the server`, with
+`save_id: null` — and must not upload it again. RetroArch deleting a `.srm`
+removes every version of it, so a deletion arrives from other devices as well as
+from the web UI (M10-7, #233; `compare_missing_server_save` in
+`handler/sync/comparison.py`).
+
+The client obeys it, because the server is the source of truth, and obeys it the
+way it obeys an overwrite, because the file is just as gone:
+
+1. **Only a save this tick reported.** The operation is matched on
+   `(rom_id, slot)` to the scan's own targets and never to a path invented for
+   it (`ExecuteOptions::place` is a download's). A save the scan did not report
+   — an undecided Tico account (#231), a folder it could not read — cannot be
+   removed.
+2. **Backed up first**, through the same `sync::BackUpFirst`, under the same
+   name rules a download's backup gets — so the backup is durable, name and all,
+   before anything is removed.
+3. **The backup is checked against the digest the tick reported.** The ruling
+   was about those bytes; a save the player wrote to after the scan is progress
+   it never saw, so it stays and its stray copy is removed.
+4. **Then the file is removed**, and its directory synced. A power cut at any
+   call leaves the save or its backup, never neither (`execute.crash_delete`).
+
+The removal is recorded in the conflict history as `deleted` (M7-1), so the
+overlay lists it with its backup and can restore it. A restored file is newer
+than the removal, so the next negotiation plans its upload: progress on the
+device, which RomM then holds again.
+
+`[sync] on_server_delete = keep` leaves the file where it is instead
+([CONFIG.md](CONFIG.md#on_server_delete-a-save-deleted-in-romm)). It is still
+reported on every tick, and RomM answers `delete` again while it holds the
+deleted bytes — which is what keeps it from being uploaded. Once it is played and
+changes, it is new progress and RomM plans an upload; that is RomM's ruling to
+make. Both a removed and a kept delete count as completed in `complete`, and
+both drop the slot's row from `state.db`.
+
+A `delete` is obeyed only where `server::ServerCapabilities::delete_action` says
+the server means one (#228); elsewhere it is counted as not understood, like an
+action this build does not know. Every server a tick reaches is 5.4.0 or later,
+so in practice that is everywhere.
+
 #### Finding the backup again, and putting it back
 
 A backup is only a safety net if a human can find one without an SD reader, so
 every overwrite is recorded in `conflicts.db` beside `state.db` as it happens —
-a conflict, a download that replaced a file, and the same two on the states side
+a conflict, a download that replaced a file, a save removed because RomM deleted
+it (#233), and the first two on the states side
 (`core/include/rommsync/conflict_log.hpp`, M7-1). The entry stores **the exact
 path the backup was written to**, never a name derived a second time: a
 `BackUpFirst` that had to step past an occupied name would make the two
@@ -512,6 +561,7 @@ Which operations move a row:
 | `kUploaded` | advances. The local file was not touched, so the facts the tick reported are still the facts on the card. `server_content_hash` becomes the digest that was just sent — the plan's described the copy the upload replaced. |
 | `kDownloaded`, `kKeptBoth` | advances, **from the card**. The bytes changed, so the mtime, the size and the digest are all re-read; a row built from the reported ones would claim a digest for bytes nothing hashed. |
 | `kNoOp` | advances. Nothing happened and nothing stopped being true. |
+| `kRemoved`, `kKept` | **erased**. A `delete` ends the slot's tracking: removed, the row describes a file that is gone; kept, the server has ruled the copy is not one to sync. A kept file is hashed again on the next tick. |
 | `kFailed`, `kNotUnderstood`, `kCanceled` | keeps its previous row, so the next tick retries the save. |
 
 A save whose hash failed is not moved forward — `SaveBaseline` refuses a row
@@ -890,7 +940,8 @@ bounds.
   `operations_failed` and not with `operations_completed`: the server planned
   work that did not happen, and calling it completed tells RomM the client did
   something it cannot name.
-- One backup per overwrite, always, before writing.
+- One backup per overwrite, always, before writing — and per removal, before
+  removing (#233).
 - A card that refuses -- full, failing, or gone -- costs the incoming save and
   never the one on the card: a refused transfer leaves the save as it was, a
   refused backup stops the overwrite, and neither advances the baseline. The

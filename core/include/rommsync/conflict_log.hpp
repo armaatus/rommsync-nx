@@ -141,10 +141,18 @@ enum class Event {
   /// showing as its own thing rather than folded into `kConflict`, which would
   /// have the screen offer a restore of a file nothing replaced.
   kKeptBoth,
+
+  /// **A save RomM deleted, taken off the card** (#233): a `delete`
+  /// obeyed under `[sync] on_server_delete = remove`, with the bytes under
+  /// `.backup/` first. Not an overwrite, and listed for the same reason one
+  /// is: the file is gone from where the player had it, and this is how they
+  /// find it again. Restoring it puts the file back; the next sync then
+  /// offers it to RomM as new progress, which is RomM's to accept.
+  kDeleted,
 };
 const char* ToString(Event event);
 
-/// True when this event replaced bytes, and therefore owes a backup.
+/// True when this event replaced or removed bytes, and therefore owes a backup.
 bool Overwrote(Event event);
 
 /// One overwrite, as the overlay reads it back.

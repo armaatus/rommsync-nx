@@ -29,6 +29,9 @@ on_boot       = true
 saves         = true
 states        = false              ; save states are core-specific; opt-in
 conflict_show = true               ; surface conflicts in the overlay
+; A save you deleted in RomM: remove takes it off the card, after backing it up
+; under /config/rommsync/.backup/; keep leaves it here and never uploads it.
+on_server_delete = remove
 
 [downloads]
 enabled     = true

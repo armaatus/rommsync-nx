@@ -254,6 +254,23 @@ void ApplySync(const ParseState& state, int line, std::string_view key, std::str
     return;
   }
 
+  if (key == "on_server_delete") {
+    // Two words and nothing else: `true`/`false` would leave a reader guessing
+    // which of the two a save RomM deleted gets, and that is a save (#233).
+    const std::string lowered = LowerAscii(Trim(value));
+    if (lowered == "remove") {
+      config->sync.on_server_delete = OnServerDelete::kRemove;
+    } else if (lowered == "keep") {
+      config->sync.on_server_delete = OnServerDelete::kKeep;
+    } else {
+      diags->Add(Severity::kWarning, line, state.section, key,
+                 "expected remove or keep, got " + quoted + "; keeping " +
+                     std::string(config->sync.on_server_delete == OnServerDelete::kKeep ? "keep"
+                                                                                       : "remove"));
+    }
+    return;
+  }
+
   bool* target = nullptr;
   if (key == "enabled") {
     target = &config->sync.enabled;

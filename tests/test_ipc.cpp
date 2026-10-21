@@ -193,10 +193,11 @@ int Version() {
   // finished report. 4 since M10-9 (#235): `SyncResult` gained a value a v3
   // decoder refuses. 5 since M10-2 (#228): `Status` gained the server's version
   // and whether this build syncs with it. 6 since M10-16 (#242): `SyncOutcome`
-  // gained `kDeferred`, which a v5 decoder refuses. What is frozen is command
-  // 0's *encoding*, asserted above
+  // gained `kDeferred`, which a v5 decoder refuses. 7 since M10-7 (#233): a
+  // conflict entry's `event` gained `deleted`, which a v6 decoder refuses. What
+  // is frozen is command 0's *encoding*, asserted above
   // -- not the number in it.
-  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{6},
+  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{7},
                   "the interface version this build speaks");
   checks.ExpectEq(static_cast<int>(ipc::Command::kGetInterfaceVersion), 0,
                   "GetInterfaceVersion is command 0");

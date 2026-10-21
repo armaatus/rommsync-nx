@@ -108,6 +108,7 @@ and a log is not worth it. A save is never in that position; see
 | `server.version` | which RomM release the server says it runs — once a boot and once a pairing | [What to attach to a bug report](#what-to-attach-to-a-bug-report) |
 | `server.unsupported` | the server is older than RomM 5.4.0, so nothing is synced with it | [RomM is too old](#romm-is-too-old) |
 | `sync.held` | a sync fell due while a game was open, and waits for it to close | [Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open) |
+| `save.deleted` | RomM said a save on this console was deleted on the server, and what became of the file | [A save disappeared from the card](#a-save-disappeared-from-the-card) |
 
 The overlay shows the end of the log under **Settings → Log**, read off the
 sysmodule over IPC — `GetLog`, command 16 in
@@ -644,6 +645,39 @@ after you have closed the game and gone back to the HOME Menu, attach the log
 ([What to attach to a bug report](#what-to-attach-to-a-bug-report)). RetroArch
 started from the album rather than over a title is not seen as a game, which is
 a known gap rather than this failing.
+
+---
+
+## A save disappeared from the card
+
+**Symptom.** A save that was on the console is gone after a sync, or a save you
+deleted in RomM is still on the console.
+
+**Log line.**
+
+```
+22 info save.deleted delete rom 4, slot tico-srm: deleted on the server; removed /tico/saves/nes/nova.srm after backing it up to /config/rommsync/.backup/4-tico-srm-1757000901.srm
+22 info save.deleted delete rom 4, slot tico-srm: deleted on the server; /tico/saves/nes/nova.srm stays on the card ([sync] on_server_delete = keep) and is no longer tracked
+```
+
+**What is happening.** The save was deleted in RomM — in its web UI, or by
+another device; RetroArch deleting a `.srm` removes every version RomM holds for
+it — and RomM 5.4 told this console not to upload its copy again. With
+`[sync] on_server_delete = remove`, the default, the file is copied under
+`/config/rommsync/.backup/` **first** and only then removed: the server is the
+source of truth, and the backup is what makes obeying it safe. With `keep`, the
+file stays exactly as it was and is not uploaded while it holds the bytes RomM
+deleted ([CONFIG.md](CONFIG.md#on_server_delete-a-save-deleted-in-romm)).
+
+**Fix.** To have the save back, open the overlay's **Conflicts** screen: a
+removed save is listed as *deleted on RomM*, and restoring it puts the file back
+where it was. The next sync then offers it to RomM as new progress. If a save
+you did not delete disappeared, check RomM's own history for who deleted it; the
+backup is on the card either way.
+
+**When to report it.** A save gone from the card with no `save.deleted` line
+for it, or a `save.deleted ... removed` line whose backup is not under
+`/config/rommsync/.backup/`.
 
 ---
 

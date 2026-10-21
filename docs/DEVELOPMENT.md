@@ -820,7 +820,8 @@ as long as the card took. That change of answer made `ipc::kVersion` 3;
 `SyncResult::kServerDisabled` (M10-9, #235) made it 4, the two required
 `Status` fields M10-2 (#228) added made it 5, and `SyncOutcome::kDeferred` --
 "Sync now" pressed during a game, held until it closes (M10-16, #242) -- made
-it 6.
+it 6, and a conflict entry's `deleted` event -- a save RomM deleted, taken off
+the card after a backup (M10-7, #233) -- made it 7.
 
 The overlay bounds every call anyway: `IpcClient` dispatches on a worker thread
 of its own and the draw thread waits at most `kCallBudget` (half a second) for

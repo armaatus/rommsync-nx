@@ -195,6 +195,40 @@ void EmptyCapture(checks::Checks& c) {
              std::int64_t{0}, "and the totals agree");
 }
 
+/// 5.4.0's `delete` (#233), the one capture here from `captures/5.4.0/`: a slot
+/// emptied on the server, offered back by the device that wrote it. It is the
+/// first action that removes a file from the card, so it is pinned to the bytes
+/// the probe asserted rather than to a hand-built body.
+void DeleteCapture(checks::Checks& c) {
+  const auth::Parsed<sync::SyncPlan> parsed = ParseCapture(c, "5.4.0/sync-negotiate-delete.json");
+  const sync::SyncPlan& plan = parsed.value;
+  c.ExpectEq(plan.total_delete, std::int64_t{1}, "total_delete is read");
+  const sync::SyncOperation* deleted = nullptr;
+  for (const sync::SyncOperation& operation : plan.operations) {
+    if (operation.action_text == "delete") {
+      deleted = &operation;
+    }
+  }
+  if (deleted == nullptr) {
+    c.Expect(false, "the delete capture carries a delete");
+    return;
+  }
+  c.Expect(deleted->action == sync::Action::kDelete, "delete classifies");
+  c.Expect(deleted->known_action, "...as an action this build knows, not a downgraded no_op");
+  c.Expect(deleted->reason == sync::Reason::kDeletedOnServer, "and so does its reason");
+  c.Expect(!deleted->save_id.has_value(), "a deleted slot names no save row");
+  c.Expect(!deleted->server_content_hash.has_value(), "and no server copy");
+}
+
+/// A body without `total_delete` is a plan with no deletions. The 5.2.0
+/// captures and every hand-built body here have none, and a server below the
+/// 5.4.0 floor never reaches negotiate (sync_tick.hpp) -- so absent reads as
+/// zero rather than refusing a whole plan over a count nothing acts on.
+void TotalDeleteIsOptional(checks::Checks& c) {
+  const auth::Parsed<sync::SyncPlan> parsed = ParseCapture(c, "sync-negotiate-empty.json");
+  c.ExpectEq(parsed.value.total_delete, std::int64_t{0}, "an absent total_delete is zero");
+}
+
 // --- the reason table ---------------------------------------------------------
 
 /// The complete set 5.2.0 can emit, from
@@ -227,6 +261,9 @@ const ReasonCase kReasons[] = {
     {sync::Reason::kNoChanges, sync::Action::kNoOp, "No changes since last sync"},
     {sync::Reason::kAppearIdentical, sync::Action::kNoOp, "Saves appear identical"},
     {sync::Reason::kUntracked, sync::Action::kNoOp, "Save is untracked on this device"},
+    // 5.4.0 (#233): a slot emptied on the server, held by a client that wrote
+    // its copy before the removal (`compare_missing_server_save`).
+    {sync::Reason::kDeletedOnServer, sync::Action::kDelete, "Save was deleted on the server"},
 };
 
 /// A plan carrying one operation with the given action and reason, spelled the
@@ -247,7 +284,8 @@ void EveryDocumentedReason(checks::Checks& c) {
   // silent no-op months later.
   c.ExpectEq(static_cast<int>(sync::Reason::kUnrecognized), 0,
              "kUnrecognized is what a default-constructed operation carries");
-  c.ExpectEq(static_cast<int>(sync::Reason::kUntracked), static_cast<int>(std::size(kReasons)),
+  c.ExpectEq(static_cast<int>(sync::Reason::kDeletedOnServer),
+             static_cast<int>(std::size(kReasons)),
              "the enum holds exactly the documented reasons and the unrecognised one");
 
   std::vector<std::string> slugs;
@@ -300,6 +338,7 @@ void EveryAction(checks::Checks& c) {
       {sync::Action::kDownload, "download"},
       {sync::Action::kConflict, "conflict"},
       {sync::Action::kNoOp, "no_op"},
+      {sync::Action::kDelete, "delete"},
   };
   for (const Case& scenario : kActions) {
     bool recognized = false;
@@ -313,7 +352,7 @@ void EveryAction(checks::Checks& c) {
   // The near-misses a client writes by hand. `noop` is the one worth naming: it
   // is what an obvious guess produces, and it would send every no-op through the
   // unknown branch.
-  for (const char* unknown : {"noop", "no-op", "NO_OP", "Upload", "delete", ""}) {
+  for (const char* unknown : {"noop", "no-op", "NO_OP", "Upload", "Delete", "total_delete", ""}) {
     bool recognized = true;
     c.Expect(sync::ClassifyAction(unknown, &recognized) == sync::Action::kNoOp,
              std::string("an unknown action is a no_op: ") + unknown);
@@ -575,6 +614,8 @@ int main() {
   ConflictCaptures(c);
   NoOpCapture(c);
   EmptyCapture(c);
+  DeleteCapture(c);
+  TotalDeleteIsOptional(c);
   EveryDocumentedReason(c);
   EveryAction(c);
   AnUnknownActionIsANoOp(c);

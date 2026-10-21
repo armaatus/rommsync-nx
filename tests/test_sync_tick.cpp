@@ -914,6 +914,15 @@ void NewerRule(rig::Checks& checks) {
         sync::ResolveNewerOnServer(nothing, &local, &last);
     checks.Expect(idle.has_value() && idle->action == sync::Action::kNoOp,
                   "a no_op is a no_op: the head already holds these bytes");
+
+    // #233: the slot emptied between the two negotiations. Never run here --
+    // not even with a save row named, which a real `delete` never carries.
+    sync::SyncOperation emptied = head;
+    emptied.action = sync::Action::kDelete;
+    emptied.action_text = "delete";
+    emptied.reason = sync::Reason::kDeletedOnServer;
+    checks.Expect(!sync::ResolveNewerOnServer(emptied, &local, &last).has_value(),
+                  "a delete is never something the resolution runs");
   }
 
   // Nothing to run: the failure stands and the next tick negotiates again.
@@ -1439,6 +1448,144 @@ void UploadFault(rig::Checks& checks, http::HttpClient& client, const std::strin
   for (const std::int64_t id : ids) {
     harness::DeleteSave(client, base, fixture, id);
   }
+}
+
+// --- deleted ------------------------------------------------------------------
+//
+// M10-7 (#233)'s acceptance, on the live 5.4.0: a save this console uploaded is
+// deleted through the API -- as RomM's web UI does it, or a RetroArch that
+// deleted its `.srm` -- and the next tick is answered `delete`. Removed, the
+// save's bytes are under `.backup/` and the file is off the card; kept, the file
+// is exactly as it was. Either way the slot's baseline row is gone, and the tick
+// after that uploads nothing: the server holds no row for the slot at the end.
+
+void Deleted(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+             const Fixture& fixture, const harness::Rom& rom, sync::DeleteMode mode) {
+  const bool keep = mode == sync::DeleteMode::kKeep;
+  const std::string what = keep ? "keep" : "remove";
+  Sandbox sandbox(checks, keep ? "tick-deleted-keep" : "tick-deleted");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  UploadFixture arranged;
+  if (!ArrangeUpload(checks, *files, sandbox, rom, keep ? "m10-7-keep" : "m10-7-remove",
+                     &arranged)) {
+    return;
+  }
+  const auth::StoredToken token = TokenFor(base, fixture);
+
+  // 1. The save goes up, as any save only this console has does.
+  const sync::TickResult first = sync::RunTick(client, *files, token, {arranged.local},
+                                               arranged.targets, /*previous=*/{},
+                                               OptionsAt(1'757'000'900));
+  checks.Expect(first.executed.operations.size() == 1 &&
+                    first.executed.operations[0].outcome == sync::OperationOutcome::kUploaded,
+                what + ": the first tick uploads the save");
+  std::vector<std::int64_t> ids;
+  checks.ExpectEq(SaveRowsFor(client, base, fixture, rom.id, arranged.slot, &ids), 1,
+                  what + ": and the server holds it");
+
+  // 2. Deleted on the server, and the next tick is told so.
+  for (const std::int64_t id : ids) {
+    harness::DeleteSave(client, base, fixture, id);
+  }
+  if (!keep) {
+    // 2a. The tick asks the server's capabilities, not the plan alone (#228):
+    // a `delete` from a server that does not offer one is not obeyed.
+    sync::TickOptions ungated = OptionsAt(1'757'000'910);
+    ungated.server.delete_action = false;
+    const sync::TickResult refused = sync::RunTick(client, *files, token, {arranged.local},
+                                                   arranged.targets, {}, ungated);
+    checks.ExpectEq(refused.executed.not_understood, 1,
+                    "remove: a delete the server's capabilities do not include is not obeyed");
+    checks.ExpectEq(sandbox.Read(SavePath(arranged.name)), arranged.bytes,
+                    "remove: and the save is untouched");
+
+    // 2b. The player wrote to the save after the scan reported it. The ruling
+    // was about the reported bytes, so these stay on the card.
+    const std::string progress = "progress made after the scan\n";
+    sandbox.Reseed(SavePath(arranged.name), progress);
+    const sync::TickResult moved = sync::RunTick(client, *files, token, {arranged.local},
+                                                 arranged.targets, {}, OptionsAt(1'757'000'911));
+    checks.Expect(moved.executed.operations.size() == 1 &&
+                      moved.executed.operations[0].error == sync::OperationError::kUnverified,
+                  "remove: a save that changed since the scan is not removed");
+    checks.ExpectEq(sandbox.Read(SavePath(arranged.name)), progress,
+                    "remove: and its new bytes are on the card");
+    sandbox.Reseed(SavePath(arranged.name), arranged.bytes);
+  }
+  sync::TickOptions options = OptionsAt(1'757'000'901);
+  options.execute.on_server_delete = mode;
+  const sync::TickResult second =
+      sync::RunTick(client, *files, token, {arranged.local}, arranged.targets,
+                    StoredBaseline(*files).value, options);
+  checks.Expect(second.outcome == sync::TickOutcome::kCompleted,
+                what + ": the tick that meets the delete completes: " +
+                    sync::ToString(second.outcome) +
+                    (second.executed.warnings.empty() ? std::string()
+                                                      : " -- " + second.executed.warnings[0]));
+  checks.ExpectEq(second.negotiated.plan.total_delete, std::int64_t{1},
+                  what + ": the server counts one delete");
+  if (second.executed.operations.size() != 1) {
+    checks.Expect(false, what + ": the plan carried the one operation this run created, got " +
+                             std::to_string(second.executed.operations.size()));
+  } else {
+    const sync::OperationResult& done = second.executed.operations[0];
+    checks.Expect(done.action == sync::Action::kDelete, what + ": the operation is a delete");
+    checks.Expect(done.outcome ==
+                      (keep ? sync::OperationOutcome::kKept : sync::OperationOutcome::kRemoved),
+                  what + ": obeyed as configured: " + sync::ToString(done.outcome) + " -- " +
+                      done.message);
+    checks.ExpectEq(second.finished.counts.operations_completed, 1,
+                    what + ": and counted as completed in the session it closes");
+  }
+  if (keep) {
+    checks.ExpectEq(sandbox.Read(SavePath(arranged.name)), arranged.bytes,
+                    "keep: the save is on the card, unchanged");
+    checks.Expect(!sandbox.HasBackupOf(arranged.bytes), "keep: and nothing was backed up");
+  } else {
+    checks.Expect(!sandbox.Exists(SavePath(arranged.name)), "remove: the save is off the card");
+    checks.Expect(sandbox.HasBackupOf(arranged.bytes),
+                  "remove: and its bytes are under .backup/, which is the hard rule");
+  }
+  checks.Expect(StoredBaseline(*files).value.Find(rom.id, arranged.slot) == nullptr,
+                what + ": the slot is no longer tracked in state.db");
+
+  // 3. The tick after: what the scan reports now -- the kept file, or nothing.
+  std::vector<sync::ClientSaveState> reported;
+  std::vector<sync::SaveTarget> targets;
+  if (keep) {
+    reported.push_back(arranged.local);
+    targets = arranged.targets;
+  }
+  sync::TickOptions after = OptionsAt(1'757'000'902);
+  after.execute.on_server_delete = mode;
+  const sync::TickResult third = sync::RunTick(client, *files, token, reported, targets,
+                                               StoredBaseline(*files).value, after);
+  checks.Expect(third.outcome == sync::TickOutcome::kCompleted,
+                what + ": the following tick completes: " + sync::ToString(third.outcome));
+  int for_slot = 0;
+  for (const sync::OperationResult& done : third.executed.operations) {
+    if (done.slot == arranged.slot) {
+      ++for_slot;
+      checks.Expect(done.outcome != sync::OperationOutcome::kUploaded,
+                    what + ": the following tick does not upload the deleted save");
+      if (keep) {
+        checks.Expect(done.outcome == sync::OperationOutcome::kKept,
+                      "keep: the server still rules it deleted, and it is still kept: " +
+                          std::string(sync::ToString(done.outcome)));
+      }
+    }
+  }
+  checks.ExpectEq(for_slot, keep ? 1 : 0,
+                  what + ": the following tick plans " +
+                      (keep ? std::string("the same delete") : std::string("nothing")) +
+                      " for the slot");
+  if (keep) {
+    checks.ExpectEq(sandbox.Read(SavePath(arranged.name)), arranged.bytes,
+                    "keep: and the save is still on the card");
+  }
+  checks.ExpectEq(SaveRowsFor(client, base, fixture, rom.id, arranged.slot, nullptr), 0,
+                  what + ": and the server holds no row for the slot -- nothing went back up");
 }
 
 // --- download -----------------------------------------------------------------
@@ -2744,6 +2891,10 @@ int main(int argc, char** argv) {
     Resumes(checks, *client, base, fixture, rom);
   } else if (scenario == "relaunched") {
     Relaunched(checks, *client, base, fixture, rom);
+  } else if (scenario == "deleted") {
+    Deleted(checks, *client, base, fixture, rom, sync::DeleteMode::kRemove);
+  } else if (scenario == "deleted_keep") {
+    Deleted(checks, *client, base, fixture, rom, sync::DeleteMode::kKeep);
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;

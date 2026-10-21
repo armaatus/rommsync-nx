@@ -66,6 +66,10 @@ SECTIONS = [
     # M10-16 (#242). `sync.held` is a tag the code writes, and "my save did not
     # sync" while a game is open is the one thing a user will see of it.
     "Nothing syncs while a game is open",
+    # M10-7 (#233). `save.deleted` is the one line that explains a save leaving
+    # the card, and the remedy -- the Conflicts screen -- is not where a user
+    # would look for a deletion.
+    "A save disappeared from the card",
     "What to attach to a bug report",
     "What this page cannot tell you yet",
 ]

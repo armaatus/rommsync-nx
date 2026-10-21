@@ -16,6 +16,7 @@ on_boot       = true
 saves         = true
 states        = false              ; fragile across cores; opt-in
 conflict_show = true               ; surface conflicts in the overlay
+on_server_delete = remove          ; remove | keep; a save deleted in RomM, see below
 
 [downloads]
 enabled       = true
@@ -312,6 +313,20 @@ is the state the screen exists to fix (docs/SYNC_PROTOCOL.md#conflicts).
 Turning it back on shows every conflict that happened while it was off. The
 `[sync]` section of the settings screen reports the value, so a user who cannot
 find the screen can see why in the same place.
+
+### `on_server_delete`: a save deleted in RomM
+
+RomM 5.4 tells a console when a save it holds was deleted on the server — in
+the web UI, or by another device such as RetroArch deleting its `.srm` — and
+asks it not to upload that copy again ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#a-save-deleted-on-the-server)).
+
+| value | the file on the card |
+|---|---|
+| `remove` (default) | copied under `/config/rommsync/.backup/` **first**, then removed. Listed on the **Conflicts** screen as *deleted on RomM*, from where it can be put back. |
+| `keep` | left exactly as it is, and not tracked any more. It is not uploaded while it holds the bytes RomM deleted; once you play and it changes, it is new progress and RomM decides what to do with it. |
+
+Anything else is a `warning` and the current value stays. The overlay does not
+show or edit this key yet; set it in this file.
 
 ### Where a rom lands
 

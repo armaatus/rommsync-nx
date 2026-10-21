@@ -41,6 +41,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <tuple>
 #include <vector>
 
 #include "crash_disk.hpp"
@@ -478,6 +479,77 @@ void Record(checks::Checks& c) {
                "the emulator comes off the scan and the server row -- it is NOT on "
                "StateOperationResult, which is what #36 assumed");
     c.Expect(replaced.restorable(), "a state that was replaced can be put back");
+  }
+
+  // M10-7 (#233): a save removed because RomM deleted it is listed, so the
+  // player can find its backup and put it back. A kept delete changed nothing
+  // on the card, and one with nothing to remove has no backup: neither is an
+  // entry.
+  {
+    Sandbox deleted(c, "conflicts-record-deleted");
+    const std::unique_ptr<fs::FileSystem> card =
+        rommsync::host::MakeNativeFileSystem(deleted.root().string());
+    conflicts::History removals(deleted.Host(std::string(conflicts::kHistorySdPath)));
+    removals.Load();
+
+    sync::SyncPlan delete_plan;
+    sync::ExecutionReport delete_report;
+    const std::string removed_backup =
+        std::string(harness::kBackupDir) + "/10-retroarch-srm-1757000000.srm";
+    for (const auto& [rom_id, outcome, backup] :
+         std::vector<std::tuple<std::int64_t, sync::OperationOutcome, std::string>>{
+             {10, sync::OperationOutcome::kRemoved, removed_backup},
+             {11, sync::OperationOutcome::kKept, std::string()},
+             {12, sync::OperationOutcome::kRemoved, std::string()}}) {
+      sync::SyncOperation operation;
+      operation.action = sync::Action::kDelete;
+      operation.rom_id = rom_id;
+      operation.slot = "retroarch-srm";
+      operation.file_name = "ten.srm";
+      operation.reason = sync::Reason::kDeletedOnServer;
+      operation.reason_text = sync::ReasonText(sync::Reason::kDeletedOnServer);
+      delete_plan.operations.push_back(operation);
+      sync::OperationResult result;
+      result.action = sync::Action::kDelete;
+      result.rom_id = rom_id;
+      result.slot = "retroarch-srm";
+      result.outcome = outcome;
+      result.sd_path = SavePath("ten.srm");
+      result.backup_sd_path = backup;
+      delete_report.operations.push_back(result);
+    }
+    const std::vector<sync::ClientSaveState> deleted_reported = {
+        Reported(10, "retroarch-srm", "ten.srm", "the save RomM deleted\n")};
+    c.ExpectEq(conflicts::RecordSaves(&removals, delete_plan, delete_report, deleted_reported,
+                                      options),
+               std::size_t{1}, "a removal with a backup is an entry, and nothing else is");
+    if (removals.size() == 1) {
+      const conflicts::Entry& removal = removals.entries()[0];
+      c.Expect(removal.event == conflicts::Event::kDeleted,
+               std::string("listed as a deletion: ") + conflicts::ToString(removal.event));
+      c.ExpectEq(removal.reason, std::string("Save was deleted on the server"),
+                 "with the server's sentence");
+      c.ExpectEq(removal.backup_sd_path, removed_backup, "and the backup it can be restored from");
+      c.ExpectEq(removal.local_content_hash, crypto::Md5Hex("the save RomM deleted\n"),
+                 "and the digest of the bytes that were removed");
+      c.Expect(removal.restorable(), "a removed save can be put back");
+      conflicts::History reread(deleted.Host(std::string(conflicts::kHistorySdPath)));
+      reread.Load();
+      c.Expect(reread.size() == 1 && reread.entries()[0].event == conflicts::Event::kDeleted,
+               "and conflicts.db reads the deletion back as one");
+
+      // ...and is. Nothing is at the path any more, so the restore replaces
+      // nothing and writes the bytes back.
+      c.Expect(deleted.Write(removed_backup, "the save RomM deleted\n"), "the backup is on the card");
+      conflicts::RestoreOptions restore;
+      restore.backup_dir = harness::kBackupDir;
+      restore.now = []() { return Moment(kWhen + 600); };
+      const conflicts::RestoreReport back =
+          conflicts::Restore(*card, removals, removal.id, restore);
+      c.Expect(back.ok(), "the removed save is restored: " + back.message);
+      c.ExpectEq(deleted.Read(SavePath("ten.srm")), std::string("the save RomM deleted\n"),
+                 "byte for byte");
+    }
   }
 
   // **`conflict_show` is not in the recording path at all.** Grepped rather than

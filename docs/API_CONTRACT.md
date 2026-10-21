@@ -374,6 +374,12 @@ by `ctest -R contract`. Treat an unlisted reason as a server that moved:
 | `no_op` | `No changes since last sync` | neither side moved past the sync record | |
 | `no_op` | `Saves appear identical` | no sync record, equal timestamps, hashes not comparable | |
 | `no_op` | `Save is untracked on this device` | the device's sync row is marked untracked |  |
+| `delete` | `Save was deleted on the server` | 5.4.0: the slot is empty and remembers losing the client's version, written no later than the removal (#233) | ✔ 5.4.0 |
+
+5.4.0 also emits `download` / `Client holds a version removed on the server`
+(`_held_since_removal`: the slot has a current save, and the client holds a
+version the slot lost). It is not in `sync::Reason` yet, so it arrives
+`kUnrecognized` with a warning; the `download` is obeyed regardless.
 
 An `action` or a `reason` that is not in the tables above is a server that moved.
 `ClassifyAction` pins the unknown action to `no_op` and reports it, because on a
@@ -944,7 +950,7 @@ the issue that acts on it.
 
 | Difference | Proof | Owner |
 |---|---|---|
-| New action **`delete`** and new count **`total_delete`**: the client holds a version of a slot that was emptied on the server, and must not upload it again. | Capture `sync-negotiate-delete.json`: a save uploaded, deleted through `POST /api/saves/delete`, then offered back with the same hash and an older mtime comes back `delete`, `"Save was deleted on the server"`, `save_id: null`. `total_delete` is in every negotiate capture; the snapshot's action enum gained `delete`. | #233 |
+| New action **`delete`** and new count **`total_delete`**: the client holds a version of a slot that was emptied on the server, and must not upload it again. | Capture `sync-negotiate-delete.json`: a save uploaded, deleted through `POST /api/saves/delete`, then offered back with the same hash and an older mtime comes back `delete`, `"Save was deleted on the server"`, `save_id: null`. `total_delete` is in every negotiate capture; the snapshot's action enum gained `delete`. **Honoured** since #233: `sync.plan` reads this capture, and `tick.deleted` / `tick.deleted_keep` / `engine.server_deleted` drive it on the fixture ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#a-save-deleted-on-the-server)). | #233 |
 | Request fields `rom_ids` (5.3), `restore_unlisted`, `emulators`. | Snapshot `SyncNegotiatePayload`. `emulators` behaviour: capture `sync-negotiate-emulators-filter.json` — the save `sync-negotiate-pairs-across-emulators.json` paired is filtered out, and the same client entry becomes an `upload`. `rom_ids`: capture `sync-negotiate-rom-ids-scope.json` — a device with no history, scoped to another rom, is offered nothing for the rom every probe save is on (the probe asserts it). `restore_unlisted` is **not captured**: the probe never sends it (the `restore_unlisted` branch in `endpoints/sync/__init__.py`). | #241, #229 |
 | Saves pair on **`(rom_id, slot)` across emulators**, newest row per pair, unless `emulators` is sent. A `null` slot never pairs. | Capture `sync-negotiate-pairs-across-emulators.json`: a client entry with `emulator: probe-emulator-y` against a server save written as `probe-emulator-x` in the same slot is `no_op`, `"Content is identical"`, and the operation names the **server's** emulator. The `null`-slot rule is not captured (`get_saves(slot_not_null=True)`). | #229, #236 |
 | `download` and `conflict` carry the server's datetime-tagged `file_name`. | Capture `sync-negotiate-download.json` (`probe [YYYY-MM-DD_HH-MM-SS].srm`). **Not a difference**: 5.2.0's capture of the same call carries the same tag. | #237 |

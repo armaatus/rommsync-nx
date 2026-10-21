@@ -237,6 +237,10 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
   ExecuteOptions execute = options.execute;
   execute.cancel = options.cancel;
   execute.send_content_hash = options.server.hash_baselines;
+  // A `delete` (#233) is obeyed only where the heartbeat said the server means
+  // one, and only on the bytes this tick reported: the server ruled on those.
+  execute.delete_action = options.server.delete_action;
+  execute.reported = &reported;
   result.executed =
       ExecutePlan(client, files, token, result.negotiated.plan, targets, execute);
 
@@ -249,6 +253,10 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
   resolve.hold = options.hold_resolution;
   resolve.negotiate = negotiate;
   resolve.execute = execute;
+  // Never a removal inside the resolution (#233): it only ever runs the heads
+  // `ResolveNewerOnServer` turned into a download or a conflict, and a delete
+  // that slipped past it is still not obeyed here.
+  resolve.execute.delete_action = false;
   resolve.complete = options.finish.complete;
   resolve.complete.cancel = options.cancel;
   result.resolved = ResolveRefusedUploads(client, files, token, reported, targets, previous,

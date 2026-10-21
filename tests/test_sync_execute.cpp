@@ -6,10 +6,12 @@
 // `harness::Sandbox`, so docs/SYNC_PROTOCOL.md's hard rule is audited on
 // teardown whether or not the scenario thought to look.
 //
-// Three of them need no server and must stay checked with docker stopped:
-// `naming` is the backup path that used to collide, `staging` is the two `io`
-// primitives an overwrite goes through, and `counting` is what the report says
-// about the operations that never reach the network.
+// Several need no server and must stay checked with docker stopped: `naming` is
+// the backup path that used to collide, `staging` is the two `io` primitives an
+// overwrite goes through, `counting` is what the report says about the
+// operations that never reach the network, `crash_model` is the power-cut
+// replay, and `delete` / `crash_delete` are 5.4.0's removal, which sends no
+// request at all.
 //
 // **Why every scenario filters the plan to its own slot.** Negotiate answers
 // with every save this device has no history for, which on a shared fixture
@@ -763,6 +765,267 @@ void ContentHash(rig::Checks& checks) {
                 "and the confirmation the MD5 of the verified bytes now on the card");
   checks.ExpectEq(sandbox.Read(SavePath("down.srm")), std::string("the server copy, verified\n"),
                   "which are the server's");
+}
+
+// --- delete -------------------------------------------------------------------
+//
+// M10-7 (#233). 5.4.0 answers `delete` for a save whose slot was emptied on the
+// server after this copy was written. It is the one action that takes a file off
+// the card, so it is held to hard rule 2 exactly as an overwrite is: a backup on
+// the card first, and only then the removal. Needs no server -- a delete makes
+// no request at all, which `NeverCalled` asserts -- so it stays checked with
+// docker stopped. `tick.deleted` is the same thing against a live 5.4.0.
+
+/// A one-operation `delete` plan for `slot`, spelled as RomM spells it.
+sync::SyncPlan DeletePlan(std::int64_t rom_id, const std::string& slot) {
+  sync::SyncPlan plan;
+  plan.session_id = 1;
+  sync::SyncOperation operation = OperationOf(sync::Action::kDelete, rom_id, slot);
+  operation.reason = sync::Reason::kDeletedOnServer;
+  operation.reason_text = sync::ReasonText(sync::Reason::kDeletedOnServer);
+  operation.file_name = "deleted.srm";
+  plan.operations.push_back(std::move(operation));
+  plan.total_delete = 1;
+  return plan;
+}
+
+/// What step 0 reported for one save: only the digest matters to a delete.
+sync::ClientSaveState ReportedAs(std::int64_t rom_id, const std::string& slot,
+                                 const std::string& name, const std::string& bytes) {
+  return harness::LocalSave(rom_id, name, slot, "m10-7", crypto::Md5Hex(bytes),
+                            std::chrono::system_clock::now() - std::chrono::hours{1},
+                            static_cast<std::int64_t>(bytes.size()));
+}
+
+void Delete(rig::Checks& checks) {
+  Sandbox sandbox(checks, "execute-delete");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  NeverCalled client(checks);
+  auth::StoredToken token;
+  token.server_url = "http://127.0.0.1:1";
+  token.access_token = "not-used";
+  token.device_id = "not-used";
+  constexpr std::int64_t kWhen = 1'757'000'500;
+
+  // 1. remove, the default: backed up, then gone.
+  {
+    const std::string name = "removed.srm";
+    const std::string bytes = "the copy RomM deleted\n";
+    sandbox.SeedSave(SavePath(name), bytes);
+    const std::vector<sync::ClientSaveState> reported = {ReportedAs(21, "gone", name, bytes)};
+    sync::ExecuteOptions options = OptionsAt(kWhen);
+    options.reported = &reported;
+    checks.Expect(options.on_server_delete == sync::DeleteMode::kRemove,
+                  "removing is the default");
+    const sync::ExecutionReport report = sync::ExecutePlan(
+        client, *files, token, DeletePlan(21, "gone"), {{21, "gone", SavePath(name), name}},
+        options);
+    checks.ExpectEq(report.completed, 1, "a delete is counted as work done");
+    checks.ExpectEq(report.failed, 0, "...and not as a failure");
+    if (report.operations.size() == 1) {
+      const sync::OperationResult& done = report.operations[0];
+      checks.Expect(done.outcome == sync::OperationOutcome::kRemoved,
+                    std::string("the save is removed: ") + sync::ToString(done.outcome) + " -- " +
+                        done.message);
+      checks.ExpectEq(done.sd_path, SavePath(name), "the result names the save");
+      checks.Expect(!done.backup_sd_path.empty() && sandbox.Read(done.backup_sd_path) == bytes,
+                    "and the backup it left, which holds the removed bytes: " +
+                        done.backup_sd_path);
+    }
+    checks.Expect(!sandbox.Exists(SavePath(name)), "the save is no longer on the card");
+    checks.Expect(sandbox.HasBackupOf(bytes), "and its bytes are under .backup/");
+  }
+
+  // 2. keep: nothing on the card moves, and nothing is backed up.
+  {
+    const std::string name = "kept.srm";
+    const std::string bytes = "a copy the user keeps\n";
+    sandbox.SeedSave(SavePath(name), bytes);
+    const std::vector<sync::ClientSaveState> reported = {ReportedAs(22, "kept", name, bytes)};
+    sync::ExecuteOptions options = OptionsAt(kWhen);
+    options.reported = &reported;
+    options.on_server_delete = sync::DeleteMode::kKeep;
+    const sync::ExecutionReport report = sync::ExecutePlan(
+        client, *files, token, DeletePlan(22, "kept"), {{22, "kept", SavePath(name), name}},
+        options);
+    checks.ExpectEq(report.completed, 1, "a kept delete is still the plan obeyed");
+    checks.Expect(report.operations.size() == 1 &&
+                      report.operations[0].outcome == sync::OperationOutcome::kKept,
+                  "and is named as kept");
+    checks.ExpectEq(sandbox.Read(SavePath(name)), bytes, "the save is untouched");
+    checks.Expect(!sandbox.HasBackupOf(bytes), "and nothing was backed up for it");
+  }
+
+  // 3. The save changed after the scan reported it. The server ruled on the
+  // reported bytes, not these, so they stay -- and no copy of them is left
+  // behind as a backup of something nothing replaced.
+  {
+    const std::string name = "changed.srm";
+    const std::string bytes = "progress made after the scan\n";
+    sandbox.SeedSave(SavePath(name), bytes);
+    const std::vector<sync::ClientSaveState> reported = {
+        ReportedAs(23, "changed", name, "the bytes the server deleted\n")};
+    sync::ExecuteOptions options = OptionsAt(kWhen);
+    options.reported = &reported;
+    const sync::ExecutionReport report = sync::ExecutePlan(
+        client, *files, token, DeletePlan(23, "changed"),
+        {{23, "changed", SavePath(name), name}}, options);
+    checks.ExpectEq(report.failed, 1, "a save that moved since the plan is not removed");
+    checks.Expect(report.operations.size() == 1 &&
+                      report.operations[0].error == sync::OperationError::kUnverified,
+                  "and the refusal is named");
+    checks.ExpectEq(sandbox.Read(SavePath(name)), bytes, "the save is untouched");
+    checks.Expect(!sandbox.HasBackupOf(bytes), "and no stray copy of it is left in .backup/");
+  }
+
+  // 4. Nothing the scan reported. A delete never invents a path: `place` is
+  // for a download, and a save the scan did not report -- a Tico account it
+  // has not decided on (#231), a folder it could not read -- is not touched.
+  {
+    const std::string name = "unscanned.srm";
+    const std::string bytes = "a save the scan never reported\n";
+    sandbox.SeedSave(SavePath(name), bytes);
+    sync::ExecuteOptions options = OptionsAt(kWhen);
+    options.place = [&name](const sync::SyncOperation&) { return SavePath(name); };
+    const sync::ExecutionReport report =
+        sync::ExecutePlan(client, *files, token, DeletePlan(24, "unscanned"), {}, options);
+    checks.Expect(report.operations.size() == 1 &&
+                      report.operations[0].error == sync::OperationError::kNoLocalSave,
+                  "a delete with no matched save is refused");
+    checks.ExpectEq(sandbox.Read(SavePath(name)), bytes, "and the file `place` names is untouched");
+  }
+
+  // 5. No backup, no removal: the directory is missing, which core/ cannot fix.
+  {
+    const std::string name = "unbacked.srm";
+    const std::string bytes = "a save with nowhere to be backed up\n";
+    sandbox.SeedSave(SavePath(name), bytes);
+    const std::vector<sync::ClientSaveState> reported = {
+        ReportedAs(25, "unbacked", name, bytes)};
+    sync::ExecuteOptions options = OptionsAt(kWhen);
+    options.reported = &reported;
+    options.backup_dir = "/config/rommsync/no-such-dir";
+    const sync::ExecutionReport report = sync::ExecutePlan(
+        client, *files, token, DeletePlan(25, "unbacked"),
+        {{25, "unbacked", SavePath(name), name}}, options);
+    checks.Expect(report.operations.size() == 1 &&
+                      report.operations[0].error == sync::OperationError::kBackupFailed,
+                  "a backup that cannot be written stops the removal");
+    checks.ExpectEq(sandbox.Read(SavePath(name)), bytes, "and the save is still there");
+  }
+
+  // 6. Already gone from the card between the scan and the plan: the plan's
+  // end state, reached with nothing to back up.
+  {
+    const std::vector<sync::ClientSaveState> reported = {
+        ReportedAs(26, "vanished", "vanished.srm", "bytes")};
+    sync::ExecuteOptions options = OptionsAt(kWhen);
+    options.reported = &reported;
+    const sync::ExecutionReport report = sync::ExecutePlan(
+        client, *files, token, DeletePlan(26, "vanished"),
+        {{26, "vanished", SavePath("vanished.srm"), "vanished.srm"}}, options);
+    checks.ExpectEq(report.completed, 1, "a save already gone is the delete done");
+    checks.Expect(report.operations.size() == 1 &&
+                      report.operations[0].outcome == sync::OperationOutcome::kRemoved &&
+                      report.operations[0].backup_sd_path.empty(),
+                  "with no backup, because nothing was there to protect");
+  }
+
+  // 7. A server without the capability (#228). Unreachable on a tick -- below
+  // 5.4.0 a tick ends before negotiate -- and asked anyway, so a `delete` is
+  // only ever honoured where the server says it means one.
+  {
+    const std::string name = "ungated.srm";
+    const std::string bytes = "a save on a server that never deletes\n";
+    sandbox.SeedSave(SavePath(name), bytes);
+    const std::vector<sync::ClientSaveState> reported = {ReportedAs(27, "ungated", name, bytes)};
+    sync::ExecuteOptions options = OptionsAt(kWhen);
+    options.reported = &reported;
+    options.delete_action = false;
+    const sync::ExecutionReport report = sync::ExecutePlan(
+        client, *files, token, DeletePlan(27, "ungated"),
+        {{27, "ungated", SavePath(name), name}}, options);
+    checks.ExpectEq(report.not_understood, 1, "it is not understood rather than obeyed");
+    checks.ExpectEq(sandbox.Read(SavePath(name)), bytes, "and the save is untouched");
+  }
+}
+
+// --- crash_delete ---------------------------------------------------------------
+//
+// M10-7 (#233) under M9-14's replay (#203). A removal is the one save path whose
+// "new" state is no file at all, so it is judged by `crash::OldOrGone`: after a
+// power cut at any call and the boot sweep, the save is its old bytes or absent,
+// and absent only with those bytes under `.backup/`. First the replay's own
+// check -- a removal with no backup must be caught -- then the executor, then the
+// executor on a card that will not confirm the backup's name.
+
+void CrashDelete(rig::Checks& checks) {
+  const std::string bytes = "the copy RomM deleted, which a power cut must not cost\n";
+  const std::string name = "crash-delete.srm";
+  const std::string save = SavePath(name);
+  const crash::Overwrite expected{save, bytes, std::string(), harness::kBackupDir};
+  const std::string scratch = rig::ScratchDir() + "/crash-delete";
+  NeverCalled client(checks);
+  auth::StoredToken token;
+  token.server_url = "http://127.0.0.1:1";
+  token.access_token = "not-used";
+  token.device_id = "not-used";
+  const std::vector<sync::ClientSaveState> reported = {ReportedAs(31, "crash", name, bytes)};
+  const std::vector<sync::SaveTarget> targets = {{31, "crash", save, name}};
+
+  // 1. Removed with no backup. Every cut after the unlink loses the save.
+  {
+    Sandbox sandbox(checks, "crash-delete-unbacked");
+    sandbox.Detach();  // the audit is not the subject; the replay is
+    sandbox.Write(save, bytes);
+    crash::Recorder recorder(sandbox.root());
+    io::Remove(sandbox.Host(save));
+    io::Sync(sandbox.Host(harness::kSavesDir));
+    const crash::Verdict verdict =
+        crash::Replay(recorder, {harness::kSavesDir, harness::kBackupDir}, {harness::kSavesDir},
+                      scratch, crash::OldOrGone(expected));
+    checks.Expect(verdict.failures > 0 && verdict.first.find("no backup") != std::string::npos,
+                  "the replay catches a removal with no backup: " + verdict.first);
+  }
+
+  // 2. The executor's own removal.
+  {
+    Sandbox sandbox(checks, "crash-delete");
+    const auto files = rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    sandbox.SeedSave(save, bytes);
+    crash::Recorder recorder(sandbox.root());
+    sync::ExecuteOptions options = OptionsAt(1'757'000'600);
+    options.reported = &reported;
+    const sync::ExecutionReport report =
+        sync::ExecutePlan(client, *files, token, DeletePlan(31, "crash"), targets, options);
+    checks.Expect(report.operations.size() == 1 &&
+                      report.operations[0].outcome == sync::OperationOutcome::kRemoved,
+                  "the save was removed, so the replay has a removal to cut");
+    crash::ExpectSurvives(checks, recorder, expected, scratch, "backup, then a removal",
+                          crash::OldOrGone(expected));
+  }
+
+  // 3. The card will not confirm the backup's name. `BackUpFirst` says no, so
+  // nothing is removed -- and no cut of what it did write loses the save.
+  {
+    Sandbox sandbox(checks, "crash-delete-unconfirmed");
+    const auto files = rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    sandbox.SeedSave(save, bytes);
+    crash::Recorder recorder(sandbox.root(), {harness::kBackupDir});
+    sync::ExecuteOptions options = OptionsAt(1'757'000'601);
+    options.reported = &reported;
+    const sync::ExecutionReport report =
+        sync::ExecutePlan(client, *files, token, DeletePlan(31, "crash"), targets, options);
+    checks.Expect(recorder.refused() > 0, "the card refused to confirm the backup directory");
+    checks.Expect(report.operations.size() == 1 &&
+                      report.operations[0].error == sync::OperationError::kBackupFailed,
+                  "a backup whose name the card would not confirm stops the removal");
+    checks.ExpectEq(sandbox.Read(save), bytes, "and the save is still on the card");
+    crash::ExpectSurvives(checks, recorder, expected, scratch,
+                          "a removal behind a backup the card would not confirm",
+                          crash::OldOrGone(expected));
+  }
 }
 
 // --- upload -------------------------------------------------------------------
@@ -1825,7 +2088,8 @@ int main(int argc, char** argv) {
 
   // The two that need no server, so they stay checked with docker stopped.
   if (scenario == "naming" || scenario == "staging" || scenario == "counting" ||
-      scenario == "crash_model" || scenario == "overwrite" || scenario == "content_hash") {
+      scenario == "crash_model" || scenario == "overwrite" || scenario == "content_hash" ||
+      scenario == "delete" || scenario == "crash_delete") {
     if (scenario == "naming") {
       Naming(checks);
     } else if (scenario == "overwrite") {
@@ -1836,6 +2100,10 @@ int main(int argc, char** argv) {
       Staging(checks);
     } else if (scenario == "crash_model") {
       CrashModel(checks);
+    } else if (scenario == "delete") {
+      Delete(checks);
+    } else if (scenario == "crash_delete") {
+      CrashDelete(checks);
     } else {
       Counting(checks);
     }

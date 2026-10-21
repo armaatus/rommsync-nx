@@ -873,7 +873,12 @@ ctest --test-dir build --output-on-failure
   and `conflicts.crash` (a restore) are the three paths the gate's census says
   land on a save; `execute.crash` and `conflicts.crash` also run once with the
   card refusing to confirm `.backup/`, which must stop the overwrite (the state
-  path shares `BackUpFirst`, so it shares that answer). Every replay drives the
+  path shares `BackUpFirst`, so it shares that answer). `execute.crash_delete`
+  is 5.4.0's `delete` (#233), the one path that removes a save rather than
+  overwriting it, judged by `crash::OldOrGone` -- the save's old bytes or no
+  file, and no file only with the old bytes under `.backup/` -- once as the
+  executor removes, once with `.backup/` unconfirmed, and once as a removal with
+  no backup the replay must catch. Every replay drives the
   host backend; the Horizon one syncs its `.part` through the same `io::Sync`,
   and only a console runs it (#44). `execute.crash_model` is the
   replay's own check: an overwrite written in place, one with no backup, and a

@@ -134,6 +134,8 @@ const char* EventText(Event event) {
       return "replaced";
     case Event::kKeptBoth:
       return "kept_both";
+    case Event::kDeleted:
+      return "deleted";
   }
   return "conflict";
 }
@@ -149,6 +151,10 @@ bool ReadEvent(std::string_view text, Event* out) {
   }
   if (text == "kept_both") {
     *out = Event::kKeptBoth;
+    return true;
+  }
+  if (text == "deleted") {
+    *out = Event::kDeleted;
     return true;
   }
   return false;
@@ -250,7 +256,9 @@ const char* ToString(EntryKind kind) { return KindText(kind); }
 
 const char* ToString(Event event) { return EventText(event); }
 
-bool Overwrote(Event event) { return event == Event::kConflict || event == Event::kReplaced; }
+bool Overwrote(Event event) {
+  return event == Event::kConflict || event == Event::kReplaced || event == Event::kDeleted;
+}
 
 const char* ToString(StoreError error) {
   switch (error) {

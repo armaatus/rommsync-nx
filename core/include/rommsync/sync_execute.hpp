@@ -2,9 +2,10 @@
 //
 // `sync.hpp` asks the server what should happen to each save and reads the
 // answer strictly (M2-4). This executes it -- an upload, a download, a
-// keep-both resolution, or nothing -- and it is the file that carries the
-// project's one hard guarantee: **the bytes a save held before this code
-// replaced them are under `.backup/` first, or they were not replaced.**
+// keep-both resolution, 5.4.0's `delete`, or nothing -- and it is the file that
+// carries the project's one hard guarantee: **the bytes a save held before this
+// code replaced or removed them are under `.backup/` first, or they were not
+// replaced or removed.**
 //
 // The plan arrives already typed. Nothing here re-parses JSON that
 // `ParseNegotiateResponse` has already read, and nothing here second-guesses
@@ -192,6 +193,27 @@ enum class OperationOutcome {
   /// the operation was stopped rather than attempted, and reporting a shutdown
   /// to `complete` as a failed operation would describe work that went wrong.
   kCanceled,
+
+  /// A `delete` (#233), obeyed: the save's bytes are under `.backup/` and the
+  /// file is off the card -- or it was already gone, and `backup_sd_path` is
+  /// empty because there was nothing to protect.
+  kRemoved,
+
+  /// A `delete` under `[sync] on_server_delete = keep`: the file was left
+  /// exactly as it was, and its baseline row is dropped (sync_finish.hpp).
+  kKept,
+};
+
+/// What a `delete` does to the file it names -- `[sync] on_server_delete`.
+enum class DeleteMode {
+  /// Back it up, then remove it. The default.
+  kRemove,
+
+  /// Leave it on the card. It is still reported on every tick, and the server
+  /// answers `delete` again for as long as it holds the bytes it deleted;
+  /// once the player writes to it, it is new progress and RomM plans an
+  /// upload, which is RomM's call and not this client's.
+  kKeep,
 };
 
 /// Stable, log-friendly name. Never null.
@@ -261,12 +283,15 @@ enum class OperationError {
   /// (docs/AUTH.md#scopes).
   kForbidden,
 
-  /// The downloaded bytes are not the save the plan described. They were
-  /// discarded and the local file was not touched.
+  /// The bytes are not the save the plan described: a download that is not the
+  /// server's copy, or a save a `delete` names that changed after the scan
+  /// reported it. Either way they were discarded and the local file was not
+  /// touched.
   kUnverified,
 
-  /// The verified bytes could not be moved onto the save. `io::PreviousPathFor`
-  /// and the backup are both worth looking at; the message says which.
+  /// The verified bytes could not be moved onto the save, or a save a `delete`
+  /// names could not be removed. `io::PreviousPathFor` and the backup are both
+  /// worth looking at; the message says which.
   kCommitFailed,
 
   /// The bytes are on the card, and `POST /api/saves/{id}/downloaded` did not
@@ -457,6 +482,23 @@ struct ExecuteOptions {
   /// differs from the server's costs a suppression and can never invent one.
   bool send_content_hash = true;
 
+  /// What a `delete` does: `[sync] on_server_delete` (#233).
+  DeleteMode on_server_delete = DeleteMode::kRemove;
+
+  /// Whether this server's `delete` is one to obey --
+  /// `server::ServerCapabilities::delete_action`, which `RunTick` copies in.
+  /// False makes a `delete` `kNotUnderstood`, the way an action this build does
+  /// not know is.
+  bool delete_action = true;
+
+  /// What step 0 reported, the vector `Negotiate` sent. Optional, not owned.
+  ///
+  /// Set, a `delete` removes a save only when its backup holds the digest
+  /// reported for that `(rom_id, slot)`: the server ruled on those bytes, and a
+  /// save the player wrote to since is progress the ruling never saw. `RunTick`
+  /// always sets it. Null skips the check -- the backup is still taken first.
+  const std::vector<ClientSaveState>* reported = nullptr;
+
   /// Optional, not owned; must outlive the call. Checked between operations and
   /// passed to every request, so a shutdown ends the tick at an operation
   /// boundary rather than mid-write.
@@ -471,8 +513,10 @@ struct ExecuteOptions {
 /// history the *next* negotiation arbitrates against.
 ///
 /// One failed operation does not abandon the rest: each is isolated, counted,
-/// and left for the next tick. Nothing here deletes a save, and nothing here
-/// resolves a conflict the server did not report.
+/// and left for the next tick. Nothing here resolves a conflict the server did
+/// not report, and the one thing that removes a save -- a 5.4.0 `delete` -- does
+/// it only to a save in `targets`, only after `BackUpFirst` has put its bytes
+/// on the card, and never to a path `place` invents.
 ///
 /// The two exceptions are the two failures that are not about one operation: a
 /// cancellation, and a 401 or 403 (`ExecutionReport::unauthorized`). Both stop

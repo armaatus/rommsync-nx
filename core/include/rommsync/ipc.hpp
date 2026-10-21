@@ -139,7 +139,10 @@ inline constexpr const char* kServiceName = "rommsync";
 ///
 /// **6** since M10-16 (#242), which added `SyncOutcome::kDeferred`: a v5
 /// overlay reading `"deferred"` fails to decode `SyncNow`'s whole answer.
-inline constexpr std::uint32_t kVersion = 6;
+///
+/// **7** since M10-7 (#233), which added `conflicts::Event::kDeleted`: a v6
+/// overlay reading `"deleted"` fails to decode the whole `ConflictPage`.
+inline constexpr std::uint32_t kVersion = 7;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///

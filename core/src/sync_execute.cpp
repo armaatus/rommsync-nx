@@ -222,6 +222,10 @@ const char* ToString(OperationOutcome outcome) {
       return "not_understood";
     case OperationOutcome::kCanceled:
       return "canceled";
+    case OperationOutcome::kRemoved:
+      return "removed";
+    case OperationOutcome::kKept:
+      return "kept";
   }
   return "failed";
 }
@@ -780,6 +784,111 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   return result;
 }
 
+/// The digest step 0 reported for `target`, or empty when it reported none.
+std::string ReportedDigest(const std::vector<ClientSaveState>& reported,
+                           const SaveTarget& target) {
+  for (const ClientSaveState& save : reported) {
+    if (save.rom_id == target.rom_id && save.slot == target.slot) {
+      return save.content_hash.value_or(std::string());
+    }
+  }
+  return {};
+}
+
+/// A `delete` (#233): back up, check the backup is the bytes the server ruled
+/// on, remove. Hard rule 2 with the overwrite replaced by a removal, and the
+/// same `BackUpFirst` -- so a power cut at any call leaves the save on the card
+/// or its bytes under `.backup/`, never neither (`execute.crash_delete`).
+OperationResult Remove(fs::FileSystem& files, const SyncOperation& operation,
+                       const SaveTarget* target, const ExecuteOptions& options) {
+  if (target == nullptr) {
+    // Never `place`: that invents a path for a save the client does not have,
+    // and a removal aimed at an invented path is a removal of whatever is there
+    // -- a save in a Tico account the scan has not decided on (#231), say. A
+    // delete acts on what this tick reported and on nothing else.
+    return Fail(operation, OperationError::kNoLocalSave,
+                "there is no local save for this (rom_id, slot) to remove; nothing was touched");
+  }
+
+  OperationResult result;
+  result.action = operation.action;
+  result.rom_id = operation.rom_id;
+  result.slot = operation.slot;
+  result.sd_path = target->sd_path;
+
+  if (options.on_server_delete == DeleteMode::kKeep) {
+    result.outcome = OperationOutcome::kKept;
+    result.message = Describe(operation) + ": deleted on the server; " + target->sd_path +
+                     " stays on the card ([sync] on_server_delete = keep) and is no longer tracked";
+    return result;
+  }
+
+  const std::string source = files.Resolve(target->sd_path);
+  if (source.empty()) {
+    return Fail(operation, OperationError::kUnreadableCard,
+                "the save path " + target->sd_path + " is not a path on this card");
+  }
+
+  std::string message;
+  const OperationError backed_up =
+      BackUp(files, options, operation, *target, &result.backup_sd_path, &message);
+  if (backed_up != OperationError::kNone) {
+    OperationResult failed = Fail(operation, backed_up, std::move(message));
+    failed.sd_path = target->sd_path;
+    return failed;
+  }
+  if (result.backup_sd_path.empty()) {
+    // `BackUpFirst` found nothing at the path: the file left the card between
+    // the scan and now. That is where the plan wanted it.
+    result.outcome = OperationOutcome::kRemoved;
+    result.message = Describe(operation) + ": deleted on the server, and " + target->sd_path +
+                     " was already gone from the card";
+    return result;
+  }
+
+  // The backup, not the save, is what is hashed: it is the copy that has to be
+  // right for the removal to be safe, and it is the bytes the removal takes.
+  if (options.reported != nullptr) {
+    const std::string expected = ReportedDigest(*options.reported, *target);
+    const state::HashOutcome digest = state::HashFile(files.Resolve(result.backup_sd_path));
+    if (expected.empty() || !digest.ok() || digest.content_hash != expected) {
+      // The server ruled on the bytes this tick reported, and these are not
+      // them: progress the ruling never saw. The save stays, and the copy goes
+      // with it -- it duplicates a file nothing replaced, so it backs up
+      // nothing, which is `BackUpFirst`'s own reasoning for an unconfirmed one.
+      io::Remove(files.Resolve(result.backup_sd_path));
+      OperationResult failed =
+          Fail(operation, OperationError::kUnverified,
+               "the save is not the bytes this tick reported, so the server's ruling is not "
+               "about it; it was left on the card");
+      failed.sd_path = target->sd_path;
+      return failed;
+    }
+  }
+
+  if (io::Remove(source) != 0) {
+    OperationResult failed =
+        Fail(operation, OperationError::kCommitFailed,
+             "the card refused to remove " + target->sd_path +
+                 "; it is still there, and a copy is at " + result.backup_sd_path);
+    failed.sd_path = target->sd_path;
+    failed.backup_sd_path = result.backup_sd_path;
+    return failed;
+  }
+  // The removal's name made durable, asked and not required: a card that keeps
+  // the file through a power cut has the save and its backup both, and the
+  // next tick is answered `delete` again.
+  const std::size_t slash = source.find_last_of('/');
+  if (slash != std::string::npos) {
+    io::Sync(slash == 0 ? std::string("/") : source.substr(0, slash));
+  }
+
+  result.outcome = OperationOutcome::kRemoved;
+  result.message = Describe(operation) + ": deleted on the server; removed " + target->sd_path +
+                   " after backing it up to " + result.backup_sd_path;
+  return result;
+}
+
 }  // namespace
 
 ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
@@ -836,6 +945,20 @@ ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
           result.message = Describe(operation) + ": nothing to do (" +
                            ToString(operation.reason) + ")";
           break;
+        case Action::kDelete:
+          if (!options.delete_action) {
+            // A server that does not say it means `delete` (#228): obeyed as
+            // nothing, and counted with the actions this build does not know.
+            result.action = operation.action;
+            result.rom_id = operation.rom_id;
+            result.slot = operation.slot;
+            result.outcome = OperationOutcome::kNotUnderstood;
+            result.message = Describe(operation) +
+                             ": this server does not offer delete, so it was not acted on";
+            break;
+          }
+          result = Remove(files, operation, target, options);
+          break;
       }
     }
 
@@ -860,6 +983,10 @@ ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
       case OperationOutcome::kUploaded:
       case OperationOutcome::kDownloaded:
       case OperationOutcome::kKeptBoth:
+      case OperationOutcome::kRemoved:
+      case OperationOutcome::kKept:
+        // A kept delete is the plan obeyed too: the server's ruling was that
+        // this copy is not to be uploaded, and it is not.
         ++report.completed;
         break;
     }

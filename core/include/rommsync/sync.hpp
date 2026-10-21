@@ -285,12 +285,18 @@ Encoded EncodeNegotiateRequest(const SyncNegotiatePayload& payload);
 /// where an `action` this build does not recognise lands: on a save, the default
 /// branch is the one that can overwrite it, so an unknown action is pinned to
 /// the only action that touches nothing (`ClassifyAction`).
-enum class Action { kUpload, kDownload, kConflict, kNoOp };
+///
+/// `kDelete` is 5.4.0's (#233): the client holds a version of a slot the server
+/// has emptied, and must not upload it again. It is the one action that removes
+/// a file from the card, and `ExecutePlan` backs that file up first like any
+/// overwrite (sync_execute.hpp).
+enum class Action { kUpload, kDownload, kConflict, kNoOp, kDelete };
 
 /// The wire spelling, which doubles as the log-friendly name. Never null.
 const char* ToString(Action action);
 
-/// `upload` / `download` / `conflict` / `no_op`, and `kNoOp` for anything else.
+/// `upload` / `download` / `conflict` / `no_op` / `delete`, and `kNoOp` for
+/// anything else.
 ///
 /// `recognized`, when not null, is set false for that last case. It is the only
 /// way a caller can tell a planned no-op from a server this build has stopped
@@ -301,10 +307,10 @@ Action ClassifyAction(std::string_view action, bool* recognized = nullptr);
 /// Which arbitration produced an operation.
 ///
 /// This is the **complete** set 5.2.0 can emit, tabulated in
-/// docs/API_CONTRACT.md#save-sync--negotiate--execute--complete. Only five of
-/// the thirteen appear in server/contract/captures/, so `contract.captures`
-/// cannot guard the rest and `sync.plan` holds this enum to the document
-/// instead.
+/// docs/API_CONTRACT.md#save-sync--negotiate--execute--complete, plus 5.4.0's
+/// `delete` reason. Only five of the thirteen 5.2.0 ones appear in
+/// server/contract/captures/, so `contract.captures` cannot guard the rest and
+/// `sync.plan` holds this enum to the document instead.
 ///
 /// The client obeys `action` and not `reason` -- the server is the source of
 /// truth (docs/SYNC_PROTOCOL.md). What the reason is for is everything around
@@ -331,6 +337,7 @@ enum class Reason {
   kNoChanges,                      ///< no_op: neither side moved past the record
   kAppearIdentical,                ///< no_op: no record, equal timestamps, hashes not comparable
   kUntracked,                      ///< no_op: the device's sync row is marked untracked
+  kDeletedOnServer,                ///< delete: the slot was emptied after this copy was written
 };
 
 /// A stable slug for logs -- `both_changed`, not the server's sentence. Never
@@ -417,6 +424,10 @@ struct SyncPlan {
   std::int64_t total_download = 0;
   std::int64_t total_conflict = 0;
   std::int64_t total_no_op = 0;
+
+  /// 5.4.0's count of `delete`s. The one total read as optional: absent is a
+  /// plan with no deletions, which is what every body shaped like 5.2.0's is.
+  std::int64_t total_delete = 0;
 
   /// One line per operation this build did not fully understand: an unknown
   /// `action` (downgraded to `no_op`), an unknown `reason`, or a `file_name`

@@ -200,6 +200,15 @@ bool Rewrites(OperationOutcome outcome) {
   return outcome == OperationOutcome::kDownloaded || outcome == OperationOutcome::kKeptBoth;
 }
 
+/// Whether this outcome ended the slot's tracking: a `delete`, obeyed either
+/// way (#233). Removed, the row describes a file that is gone; kept, the
+/// server ruled the copy is not one to sync, and a row saying it was synced
+/// would be false. Either way the next scan hashes the file afresh if it is
+/// there, which is one save's hash and nothing else.
+bool Untracks(OperationOutcome outcome) {
+  return outcome == OperationOutcome::kRemoved || outcome == OperationOutcome::kKept;
+}
+
 }  // namespace
 
 CompletionCounts CountsFor(const ExecutionReport& report) {
@@ -237,7 +246,7 @@ BaselineUpdate AdvanceBaseline(state::Baseline previous, const SyncPlan& plan,
 
   for (std::size_t index = 0; index < report.operations.size(); ++index) {
     const OperationResult& done = report.operations[index];
-    if (!Advances(done.outcome)) {
+    if (!Advances(done.outcome) && !Untracks(done.outcome)) {
       continue;
     }
     // `ExecutePlan` returns one result per operation, in the plan's order. The
@@ -256,6 +265,10 @@ BaselineUpdate AdvanceBaseline(state::Baseline previous, const SyncPlan& plan,
                                 ": does not pair with " + Name(operation.rom_id, operation.slot) +
                                 " at the same position in the plan; its baseline was left as it "
                                 "was");
+      continue;
+    }
+    if (Untracks(done.outcome)) {
+      update.value.Erase(done.rom_id, done.slot);
       continue;
     }
 

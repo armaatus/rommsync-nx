@@ -68,6 +68,11 @@ std::size_t RecordSaves(History* history, const sync::SyncPlan& plan,
       // A download with no backup replaced nothing -- the save was not on the
       // card at all -- so there is nothing for a player to want back.
       event = Event::kReplaced;
+    } else if (result.outcome == sync::OperationOutcome::kRemoved &&
+               !result.backup_sd_path.empty()) {
+      // A save RomM deleted, off the card (#233). With no backup it was already
+      // gone and there is nothing to put back; a kept one changed nothing.
+      event = Event::kDeleted;
     } else {
       continue;
     }
