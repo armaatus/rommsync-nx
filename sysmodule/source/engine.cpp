@@ -171,7 +171,16 @@ void SdEngine::UseMinimumServerVersion(server::Version floor) {
   std::lock_guard<std::mutex> lock(mutex_);
   server_floor_ = floor;
   // What was read was judged against the old floor.
+  ForgetServerLocked(/*different_server=*/false);
+}
+
+void SdEngine::ForgetServerLocked(bool different_server) {
   server_read_ = false;
+  ++server_generation_;
+  if (different_server) {
+    server_caps_ = server::ServerCapabilities{};
+    server_too_old_ = false;
+  }
 }
 
 bool SdEngine::PumpLists() { return lists_.Pump(); }
@@ -675,9 +684,7 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
       // A different server is a different RomM (#228): what the old one said
       // about its version is not drawn beside the new one, and the next tick
       // asks.
-      server_caps_ = server::ServerCapabilities{};
-      server_read_ = false;
-      server_too_old_ = false;
+      ForgetServerLocked(/*different_server=*/true);
     }
     // Every other write to `attempt_` notifies, and this one has the longest
     // wait to cut short: the thread is parked in `AwaitNextPoll` until the
@@ -1566,18 +1573,25 @@ void SdEngine::RunOneTick() {
   // boot and once a pairing -- see `server_caps_` -- and every tick while the
   // answer is "too old".
   server::ServerCapabilities caps;
+  server::Version floor;
+  // Which answer this tick may record. A `server.url` change or a pairing
+  // landing while the heartbeat is in flight bumps it, and the old server's
+  // answer must not overwrite the "ask again" that stands for the new one.
+  std::uint64_t generation = 0;
   {
     bool read = false;
-    server::Version floor;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       read = server_read_;
       caps = server_caps_;
       floor = server_floor_;
+      generation = server_generation_;
     }
     if (!read) {
       sync::CallPolicy policy;
       policy.cancel = cancel.get();
+      // A backoff a shutdown or a sleep cuts short, as a drain's is.
+      policy.wait = [this](std::chrono::milliseconds delay) { AwaitBackoff(delay); };
       const server::Probe probe = server::ReadServer(*client, config->server.url, policy, floor);
       if (!probe.ok()) {
         // The heartbeat is unauthenticated, so nothing here is evidence about
@@ -1619,10 +1633,12 @@ void SdEngine::RunOneTick() {
                                    "\"); treated as the newest");
       }
       std::lock_guard<std::mutex> lock(mutex_);
-      server_caps_ = caps;
-      // A refused server is not remembered as read, so the next tick asks
-      // again and an upgrade is noticed without a reboot.
-      server_read_ = caps.supported;
+      if (server_generation_ == generation) {
+        server_caps_ = caps;
+        // A refused server is not remembered as read, so the next tick asks
+        // again and an upgrade is noticed without a reboot.
+        server_read_ = caps.supported;
+      }
     }
   }
   if (!caps.supported) {
@@ -1631,19 +1647,22 @@ void SdEngine::RunOneTick() {
     // negotiate anyway (`TickOutcome::kUnsupported`).
     StampPlayWindow();
     log::Error(log::Event::kServerUnsupported,
-               "RomM " + caps.version + " is older than " +
-                   server::ToString(server::kMinimumVersion) +
+               "RomM " + caps.version + " is older than " + server::ToString(floor) +
                    ", the oldest this build syncs with; nothing is synced until it is upgraded");
     LogTickEnd(sync::TickOutcome::kUnsupported);
     std::lock_guard<std::mutex> lock(mutex_);
     scheduler_.Finished(sync::TickOutcome::kUnsupported);
     RecordFailedTickLocked();
-    server_too_old_ = true;
+    if (server_generation_ == generation) {
+      server_too_old_ = true;
+    }
     return;
   }
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    server_too_old_ = false;
+    if (server_generation_ == generation) {
+      server_too_old_ = false;
+    }
   }
 
   // Step 0, the half `sync::RunTick` deliberately does not own: the library the
@@ -2273,7 +2292,7 @@ void SdEngine::CommitGrant(const std::shared_ptr<PairingAttempt>& attempt,
     // Once a pairing (#228): the first tick on these credentials asks the
     // server which RomM it is, rather than trusting what an earlier pairing's
     // server said.
-    server_read_ = false;
+    ForgetServerLocked(/*different_server=*/false);
   }
   // A paired console usually has a tick due: `[sync] on_boot` fired long before
   // there were credentials to fire it with -- and a queue too, if a drain gave

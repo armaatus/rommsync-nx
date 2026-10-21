@@ -2191,6 +2191,7 @@ set(ENGINE_SCENARIOS
   log       # M7-3: the misconfigurations docs/TROUBLESHOOTING.md answers, on the record
   stale_active  # M9-5: an `active` row a power cut left is work, not a live transfer
   sleeps    # M9-4: the console sleeps mid-tick, and the acknowledgement waits for the save write
+  romm_forgotten  # M10-2: a heartbeat answered after the engine forgot the server is not recorded
 )
 foreach(scenario IN LISTS ENGINE_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})

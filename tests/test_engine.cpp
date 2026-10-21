@@ -3232,6 +3232,143 @@ int RommVersion(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// A server whose heartbeat is held until the test lets it answer, and which
+/// counts heartbeats and negotiations. Everything else answers as an empty
+/// library, and a negotiation as a dropped connection.
+class HeldHeartbeat final : public http::HttpClient {
+ public:
+  http::Result Send(const http::Request& request) override {
+    http::Result result;
+    if (request.url.find("/api/heartbeat") != std::string::npos) {
+      std::unique_lock<std::mutex> lock(mutex_);
+      ++heartbeats_;
+      arrived_.notify_all();
+      released_.wait(lock, [this] { return heartbeats_ < held_; });
+      result.response.status = 200;
+      result.response.body = R"({"SYSTEM":{"VERSION":"5.4.0"}})";
+      return result;
+    }
+    if (request.url.find("/api/roms") != std::string::npos) {
+      result.response.status = 200;
+      result.response.body = R"({"total":0,"limit":64,"offset":0,"items":[]})";
+      return result;
+    }
+    if (request.url.find("/api/sync/negotiate") != std::string::npos) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ++negotiations_;
+    }
+    result.error = http::Error::kConnectFailed;
+    result.message = "nothing behind this test server";
+    return result;
+  }
+
+  http::Result Download(const http::Request&, const http::DownloadTarget&) override {
+    return Send({});
+  }
+
+  /// Hold heartbeat number `n` and every one after it.
+  void HoldFrom(int n) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    held_ = n;
+  }
+
+  bool AwaitHeartbeat(int n) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return arrived_.wait_for(lock, std::chrono::seconds{10}, [this, n] { return heartbeats_ >= n; });
+  }
+
+  void Release() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      held_ = 1 << 30;
+    }
+    released_.notify_all();
+  }
+
+  int heartbeats() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return heartbeats_;
+  }
+  int negotiations() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return negotiations_;
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable arrived_;
+  std::condition_variable released_;
+  int heartbeats_ = 0;
+  int held_ = 1 << 30;
+  int negotiations_ = 0;
+};
+
+/// M10-2 (#228): an answer about the server that was asked for **before** the
+/// engine was told to forget it must not stand for what came after.
+///
+/// The heartbeat is held, and while it is in flight the floor moves past what
+/// the server will answer -- the same "ask again" a `server.url` change or a
+/// pairing sets. When the old question's answer lands it was judged against the
+/// old floor, and a tick that recorded it would mark the server read: the next
+/// tick would then skip the heartbeat and negotiate with a server the new floor
+/// refuses.
+void RommForgotten(checks::Checks& c) {
+  Console console(c, "engine-romm-forgotten");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = https://romm.example.com\n\n[sync]\n"
+                                 "enabled = true\ninterval_min = 0\non_boot = false\n"),
+           "a configured card");
+  auth::StoredToken token;
+  token.server_url = "https://romm.example.com";
+  token.access_token = "not-a-real-token";
+  token.device_id = "console-romm-forgotten";
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+           "and a paired one");
+  console.engine.UseMinimumServerVersion(rommsync::server::kMinimumVersion);
+  HeldHeartbeat server;
+  server.HoldFrom(1);
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&server, token.access_token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+
+  const auto settle = [&console](std::int64_t after) {
+    ipc::Status status = console.Status();
+    for (int waited = 0; waited < 400 && (status.sync_in_progress || status.last_sync_at == after);
+         ++waited) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{25});
+      status = console.Status();
+    }
+    return status;
+  };
+
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, "the first tick is asked for");
+  c.Expect(server.AwaitHeartbeat(1), "and it is asking the server which RomM it is");
+  console.engine.UseMinimumServerVersion(rommsync::server::Version{99, 0, 0});
+  server.Release();
+  const ipc::Status first = settle(0);
+  c.Expect(first.last_sync_result != ipc::SyncResult::kNever, "the first tick settled");
+  const int negotiated = server.negotiations();
+  c.Expect(negotiated > 0, "and negotiated, under the floor it asked with");
+
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, "a second tick is asked for");
+  // A refused tick returns before `last_sync_at` moves, so the wait is on the
+  // tick being over rather than on the clock.
+  ipc::Status second = console.Status();
+  for (int waited = 0; waited < 400 && (second.sync_in_progress || server.heartbeats() < 2 ||
+                                        second.server_supported);
+       ++waited) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    second = console.Status();
+  }
+  c.ExpectEq(server.heartbeats(), 2,
+             "the second tick asks again: the first answer predates the forgetting");
+  c.Expect(!second.server_supported, "and the new floor refuses the server");
+  c.ExpectEq(server.negotiations(), negotiated, "so the second tick negotiated nothing");
+}
+
 /// The scenarios that need the docker RomM, by name. A table rather than a
 /// second `if` chain, so the list of them is written down once.
 struct RigScenario {
@@ -3312,6 +3449,8 @@ int main(int argc, char** argv) {
     StaleActiveOnBoot(checks);
   } else if (scenario == "log") {
     LogsMisconfiguration(checks);
+  } else if (scenario == "romm_forgotten") {
+    RommForgotten(checks);
   } else if (const RigScenario* rig_scenario = FindRigScenario(scenario)) {
     // The scenarios that need the fixture RomM. `server` pins that a *live*
     // credential stops being on the card, and the M1-6 three drive a real

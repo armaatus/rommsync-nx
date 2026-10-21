@@ -62,9 +62,12 @@ struct Version {
 /// The oldest RomM this build syncs with (D1, #226).
 inline constexpr Version kMinimumVersion{5, 4, 0};
 
-/// The releases a feature arrived in (#226 R1).
-inline constexpr Version kRomIdsSince{5, 3, 0};
-inline constexpr Version kDeleteActionSince{5, 4, 0};
+/// The releases that changed what a client can ask for (#226 R1). Named for
+/// the release rather than for one feature, because each brought several:
+/// 5.3 `rom_ids` and the slot cap, 5.4 everything else `ServerCapabilities`
+/// lists.
+inline constexpr Version kRelease53{5, 3, 0};
+inline constexpr Version kRelease54{5, 4, 0};
 
 /// The longest version string this client keeps, and so carries to the overlay.
 /// A real one is `5.4.0-beta.1`; anything longer is a server answering
@@ -113,6 +116,10 @@ struct ServerCapabilities {
 
 /// The capabilities of a server reporting `version_text`. Never fails: see the
 /// header for what an unparseable version means.
+///
+/// `floor` decides `supported` and nothing else. It is `kMinimumVersion` for
+/// every caller but a test that has to sync with an older fixture
+/// (`SdEngine::UseMinimumServerVersion`).
 ServerCapabilities CapabilitiesFor(std::string_view version_text,
                                    const Version& floor = kMinimumVersion);
 

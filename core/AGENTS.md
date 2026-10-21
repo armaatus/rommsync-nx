@@ -20,6 +20,12 @@ break by accident.
   or the wrong type into a message naming *which* field, which is the difference
   between a bug found here and one found on a console.
   `include/rommsync/auth.hpp` is the worked example.
+  One response is walked rather than parsed whole: the heartbeat
+  (`server_capabilities.cpp`, #228), which is the server's whole configuration
+  and grows with it. The walk checks the grammar of every value it crosses and
+  builds nothing; the one member read (`SYSTEM`) still goes through
+  `json::Parse`. Copy that shape only for a response this large that is read for
+  one member -- a response that is one large array is #217's `json::ParseEach`.
 - Sources are globbed by `core/CMakeLists.txt` — add a `.cpp`, no CMake edit.
 - Streaming, not buffering: a rom may be gigabytes and the sysmodule heap is
   tiny. Write to a file as bytes arrive.

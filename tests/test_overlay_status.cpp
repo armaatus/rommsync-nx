@@ -643,10 +643,12 @@ void CheckServerVersion(Checks& checks) {
                   "and a supported one changes nothing else");
   ExpectNothingBlank(checks, shown, "version shown");
 
-  // Before the first tick has asked, the row is there and says so.
+  // Before the first tick has asked -- or from a server whose heartbeat named
+  // no version, which `Status` cannot tell apart and neither can a user act on
+  // differently -- the row is there and says so.
   const overlay::StatusView unasked = RenderOverWire(checks, Healthy());
-  checks.ExpectEq(ValueOf(unasked, "RomM"), std::string("Not asked yet"),
-                  "a version nobody has read yet is a sentence, not a blank");
+  checks.ExpectEq(ValueOf(unasked, "RomM"), std::string("Unknown"),
+                  "a version nobody has read is a word, not a blank");
   ExpectNothingBlank(checks, unasked, "version not read");
 
   ipc::Status old = Healthy();

@@ -163,8 +163,8 @@ class Walker {
   /// A literal or a number at the cursor. Spelled out rather than run to the
   /// next delimiter, so `fals` is refused here as `json::Parse` would refuse
   /// it -- a body with one broken field is a body this client does not trust
-  /// the rest of either. A number's *shape* is its characters only; nothing
-  /// here reads one.
+  /// the rest of either. A number is held to RFC 8259's grammar; nothing here
+  /// reads its value, so its range is not checked.
   bool Scalar() {
     for (std::string_view literal : {"true", "false", "null"}) {
       if (text_.substr(at_, literal.size()) == literal) {
@@ -172,13 +172,41 @@ class Walker {
         return Delimited();
       }
     }
+    // -? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?
+    Accept('-');
+    if (Accept('0')) {
+      // A leading zero is the whole integer part: `01` is not a number.
+    } else if (Digits() == 0) {
+      return false;
+    }
+    if (Accept('.') && Digits() == 0) {
+      return false;
+    }
+    if (Accept('e') || Accept('E')) {
+      if (!Accept('+')) {
+        Accept('-');
+      }
+      if (Digits() == 0) {
+        return false;
+      }
+    }
+    return Delimited();
+  }
+
+  bool Accept(char c) {
+    if (at_ < text_.size() && text_[at_] == c) {
+      ++at_;
+      return true;
+    }
+    return false;
+  }
+
+  std::size_t Digits() {
     const std::size_t start = at_;
-    while (at_ < text_.size() && (std::isdigit(static_cast<unsigned char>(text_[at_])) != 0 ||
-                                  text_[at_] == '-' || text_[at_] == '+' || text_[at_] == '.' ||
-                                  text_[at_] == 'e' || text_[at_] == 'E')) {
+    while (at_ < text_.size() && std::isdigit(static_cast<unsigned char>(text_[at_])) != 0) {
       ++at_;
     }
-    return at_ > start && Delimited();
+    return at_ - start;
   }
 
   /// A scalar has to end where a value can: `truex` is not `true`.
@@ -222,7 +250,14 @@ std::optional<std::string_view> TopLevelMember(std::string_view body, std::strin
         *error = Fail(walk.at(), "a member's value ends early or does not balance");
         return std::nullopt;
       }
-      if (name == key && !found.has_value()) {
+      if (name == key) {
+        if (found.has_value()) {
+          // `json::Parse` refuses a duplicate key for the same reason: which
+          // of the two is meant is not this client's to guess.
+          *error = Fail(start, "the member appears twice");
+          error->field = std::string(key);
+          return std::nullopt;
+        }
         found = walk.Slice(start);
       }
       if (walk.Take(',')) {
@@ -298,26 +333,36 @@ std::string ToString(const Version& version) {
          std::to_string(version.patch);
 }
 
-ServerCapabilities CapabilitiesFor(std::string_view version_text, const Version& floor) {
+namespace {
+
+/// The one place a release becomes a set of flags. `parsed` empty is the
+/// unknown version, which reads as the newest -- see the header.
+ServerCapabilities Infer(std::string text, const std::optional<Version>& parsed,
+                         const Version& floor) {
   ServerCapabilities caps;
-  caps.version = std::string(version_text.substr(0, kMaxVersionBytes));
-  const std::optional<Version> parsed = ParseVersion(version_text);
+  caps.version = std::move(text);
   caps.known = parsed.has_value();
-  // Unknown reads as the newest: see the header.
   const Version version = parsed.value_or(Version{kMaxComponent, 0, 0});
   caps.supported = version >= floor;
-  caps.rom_ids = version >= kRomIdsSince;
-  caps.slot_cap = version >= kRomIdsSince;
-  caps.delete_action = version >= kDeleteActionSince;
-  caps.emulators_filter = version >= kDeleteActionSince;
-  caps.restore_unlisted = version >= kDeleteActionSince;
-  caps.hash_baselines = version >= kDeleteActionSince;
-  caps.device_capabilities = version >= kDeleteActionSince;
+  caps.rom_ids = version >= kRelease53;
+  caps.slot_cap = version >= kRelease53;
+  caps.delete_action = version >= kRelease54;
+  caps.emulators_filter = version >= kRelease54;
+  caps.restore_unlisted = version >= kRelease54;
+  caps.hash_baselines = version >= kRelease54;
+  caps.device_capabilities = version >= kRelease54;
   return caps;
 }
 
+}  // namespace
+
+ServerCapabilities CapabilitiesFor(std::string_view version_text, const Version& floor) {
+  return Infer(std::string(version_text.substr(0, kMaxVersionBytes)), ParseVersion(version_text),
+               floor);
+}
+
 ServerCapabilities CapabilitiesFor(const Version& version) {
-  return CapabilitiesFor(ToString(version));
+  return Infer(ToString(version), version, kMinimumVersion);
 }
 
 auth::Parsed<std::string> ParseHeartbeatVersion(std::string_view body) {

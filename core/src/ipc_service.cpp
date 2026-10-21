@@ -25,6 +25,7 @@
 #include "rommsync/json.hpp"
 #include "rommsync/text.hpp"
 #include "rommsync/pairing.hpp"
+#include "rommsync/server_capabilities.hpp"
 
 namespace rommsync::ipc {
 namespace {
@@ -105,7 +106,7 @@ Status ServiceCore::GetStatus() const {
   // The engine already cut it to `server::kMaxVersionBytes`; bounded again here
   // because `GetStatus` may not fail, whatever an `Engine` hands it.
   status.server_version = snapshot.server_version;
-  Shorten(&status.server_version, kMaxNameBytes);
+  Shorten(&status.server_version, server::kMaxVersionBytes);
   status.server_supported = snapshot.server_supported;
   status.download = snapshot.download;
   // A `fs_name` comes off a RomM library, so its length is not ours to assume,

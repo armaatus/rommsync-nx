@@ -340,15 +340,14 @@ StatusView Render(const ipc::Status& status, std::int64_t now_unix) {
 
   // The release the sysmodule read off the heartbeat (#228), beside the server
   // it describes. Present in every state, for the header's reason: a missing
-  // row reads as one that failed to load.
-  if (!status.server_supported) {
-    Add(&view.lines, "RomM",
-        (status.server_version.empty() ? std::string("Unknown") : status.server_version) +
-            " (too old)",
-        Tone::kBad);
+  // row reads as one that failed to load. "Unknown" is both "not asked yet"
+  // and "the heartbeat named none", which `Status` does not tell apart.
+  const std::string release =
+      status.server_version.empty() ? std::string("Unknown") : status.server_version;
+  if (status.server_supported) {
+    Add(&view.lines, "RomM", release);
   } else {
-    Add(&view.lines, "RomM",
-        status.server_version.empty() ? std::string("Not asked yet") : status.server_version);
+    Add(&view.lines, "RomM", release + " (too old)", Tone::kBad);
   }
 
   switch (status.auth) {

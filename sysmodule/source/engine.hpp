@@ -859,6 +859,12 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// True when `*text` is what to edit; false leaves a `Diagnostic` behind.
   bool ReadConfigText(std::string* text, std::vector<config::Diagnostic>* diagnostics) const;
 
+  /// Ask the server which RomM it is again on the next tick (#228). The caller
+  /// holds `mutex_`. `different_server` also forgets what the old one said,
+  /// for a `server.url` change; a re-pairing or a new floor keeps it on the
+  /// screen until the next tick replaces it.
+  void ForgetServerLocked(bool different_server);
+
   /// Take `loaded` as the configuration in force.
   ///
   /// `auth.json`'s complaint goes **in front** of the file's rather than being
@@ -1097,6 +1103,11 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// already owns every other request a tick makes.
   server::ServerCapabilities server_caps_;
   bool server_read_ = false;
+
+  /// Bumped by `ForgetServerLocked`, and compared by a tick before it records
+  /// what its heartbeat said: a tick that asked the old server must not mark
+  /// the new one as read.
+  std::uint64_t server_generation_ = 0;
 
   /// The last tick was refused because the server is below the floor. What
   /// `Status::server_supported` reports -- a finding about a tick, never a

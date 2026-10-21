@@ -129,6 +129,10 @@ void Heartbeat(rig::Checks& checks) {
   const auth::Parsed<std::string> later = server::ParseHeartbeatVersion(
       R"({"FILESYSTEM":{"FS_PLATFORMS":["a\"}",{"x":[1,2,{"y":"]"}]}]},)"
       R"("SYSTEM":{"VERSION":"5.4.0-beta.1"}})");
+  const auth::Parsed<std::string> numbers = server::ParseHeartbeatVersion(
+      R"({"A":-1.5e+3,"B":[0,12,3.25,1E9],"C":-0,"SYSTEM":{"VERSION":"5.4.0"}})");
+  checks.Expect(numbers.ok() && numbers.value == "5.4.0",
+                "well-formed numbers elsewhere are walked past: " + numbers.error.Describe());
   checks.Expect(later.ok() && later.value == "5.4.0-beta.1",
                 "SYSTEM after a member whose strings hold brackets and escaped quotes: " +
                     later.error.Describe());
@@ -147,7 +151,14 @@ void Heartbeat(rig::Checks& checks) {
         R"({"SYSTEM":{"VERSION":"5.4.0"}} trailing)", R"({"SYSTEM":"5.4.0"})",
         R"({"SYSTEM":{"VERSION":5.4}})", R"({"SYSTEM":{"VERSION":"5.4.0",}})",
         R"({"OIDC":{"ENABLED":fals},"SYSTEM":{"VERSION":"5.4.0"}})",
-        R"({"OIDC":"unterminated,"SYSTEM":{"VERSION":"5.4.0"}})", R"({"SYSTEM" {}})"}) {
+        R"({"OIDC":"unterminated,"SYSTEM":{"VERSION":"5.4.0"}})", R"({"SYSTEM" {}})",
+        // Numbers are held to their grammar, not to their characters.
+        R"({"N":1-2,"SYSTEM":{"VERSION":"5.4.0"}})", R"({"N":-,"SYSTEM":{"VERSION":"5.4.0"}})",
+        R"({"N":[e],"SYSTEM":{"VERSION":"5.4.0"}})", R"({"N":01,"SYSTEM":{"VERSION":"5.4.0"}})",
+        R"({"N":1.,"SYSTEM":{"VERSION":"5.4.0"}})",
+        // A second SYSTEM is refused, as json::Parse refuses a duplicate key:
+        // which one is meant is not this client's to guess.
+        R"({"SYSTEM":{"VERSION":"5.2.0"},"SYSTEM":{"VERSION":"5.4.0"}})"}) {
     const auth::Parsed<std::string> read = server::ParseHeartbeatVersion(broken);
     checks.Expect(!read.ok(), std::string("refused: ") + broken);
   }
