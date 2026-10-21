@@ -4,6 +4,7 @@
 
 namespace rommsync {
 
-const char* version() { return kVersion; }
+// The marker's tail, not kVersion: see kBuildMarker for why.
+const char* version() { return kBuildMarker + sizeof(kBuildMarkerPrefix) - 1; }
 
 }  // namespace rommsync
