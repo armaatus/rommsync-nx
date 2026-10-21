@@ -145,7 +145,9 @@ ResolveReport ResolveRefusedUploads(http::HttpClient& client, fs::FileSystem& fi
   // Once per tick, and only the refused saves, scoped to their roms: unscoped,
   // the server answers a narrow question with a download for every save in the
   // library this device has no history for.
-  Negotiation second = NegotiateRoms(client, token, asked, rom_ids, options.negotiate);
+  Negotiation second = options.rom_ids
+                           ? NegotiateRoms(client, token, asked, rom_ids, options.negotiate)
+                           : Negotiate(client, token, asked, options.negotiate);
   out.renegotiated = true;
   out.negotiate_error = second.error;
   out.negotiate_message = second.message;
@@ -162,7 +164,9 @@ ResolveReport ResolveRefusedUploads(http::HttpClient& client, fs::FileSystem& fi
   for (const std::size_t index : refused) {
     const OperationResult& was = executed->operations[index];
     const SyncOperation* head = PlannedFor(second.plan, was.rom_id, was.slot);
-    if (head == nullptr) {
+    if (head == nullptr || ReportedFor(asked, was.rom_id, was.slot) == nullptr) {
+      // Not asked about -- a sibling slot of an asked rom, which the rom scope
+      // still answers for -- is the next tick's, as the header says.
       continue;
     }
     std::optional<SyncOperation> resolved = ResolveNewerOnServer(
@@ -182,6 +186,10 @@ ResolveReport ResolveRefusedUploads(http::HttpClient& client, fs::FileSystem& fi
 
   for (std::size_t at = 0; at < ran.operations.size() && at < run_at.size(); ++at) {
     const std::size_t index = run_at[at];
+    if (ran.operations[at].outcome == OperationOutcome::kCanceled) {
+      // Never attempted: the 409 is still what happened to this save.
+      continue;
+    }
     // The 409's own line goes: it described an operation this tick then did
     // something about, and the engine logs every warning here as a failed save.
     const auto stale = std::find(executed->warnings.begin(), executed->warnings.end(),
@@ -201,8 +209,8 @@ ResolveReport ResolveRefusedUploads(http::HttpClient& client, fs::FileSystem& fi
   // The second session is closed with what it saw done. Best-effort: the
   // baseline and the first session's accounting are `FinishTick`'s, and this
   // one only costs a row in a history if it fails.
-  out.reported = CompleteSession(client, token, run.session_id, CountsFor(ran), {},
-                                 options.complete);
+  out.second_session = CompleteSession(client, token, run.session_id, CountsFor(ran), {},
+                                       options.complete);
   return out;
 }
 

@@ -244,6 +244,7 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
   // a download of the server's head, or a conflict, at the same index -- never
   // another upload, and never more than one second negotiation (#232).
   ResolveOptions resolve;
+  resolve.rom_ids = options.server.rom_ids;
   resolve.negotiate = negotiate;
   resolve.execute = execute;
   resolve.complete = options.finish.complete;

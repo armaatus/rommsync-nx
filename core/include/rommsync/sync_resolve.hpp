@@ -87,6 +87,12 @@ std::optional<SyncOperation> ResolveNewerOnServer(const SyncOperation& head,
 
 /// How hard the resolution tries. `RunTick` fills it from `TickOptions`.
 struct ResolveOptions {
+  /// `server::ServerCapabilities::rom_ids`: whether the second negotiation may
+  /// be scoped. True on every server a tick runs against (5.4.0 is the floor);
+  /// unscoped, it is still correct -- only the refused saves' operations are
+  /// run -- and merely a larger answer.
+  bool rom_ids = true;
+
   NegotiateOptions negotiate;
   ExecuteOptions execute;
   CompleteOptions complete;
@@ -114,7 +120,7 @@ struct ResolveReport {
   /// the baseline is the first session's to write, so a failure here costs a row
   /// in a history a user reads and nothing else (5.4.0 expires an unfinished
   /// session after 24 h).
-  Completion reported;
+  Completion second_session;
 };
 
 /// Resolve every operation in `*executed` that failed with `kNewerOnServer`,
