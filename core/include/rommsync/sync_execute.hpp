@@ -100,11 +100,12 @@ inline constexpr const char* kBackupDir = "/config/rommsync/.backup";
 /// exactly the pair that separates two of them.
 ///
 /// The slot is reduced to `[A-Za-z0-9._-]`, with every other byte becoming `_`.
-/// The slots this client derives are already that shape (`retroarch-srm`), but
-/// the one on an operation is whatever some other client chose, and a `/` in it
-/// would put the backup somewhere other than `.backup/`. A `null` slot -- an
-/// archival save -- spells itself `archival`, which is a slot no derived name
-/// produces because `SlotFor` always carries a source and an extension.
+/// The slots this client derives are already that shape (`autosave`,
+/// `autosave-rtc`), but the one on an operation is whatever some other client
+/// chose, and a `/` in it would put the backup somewhere other than `.backup/`. A
+/// `null` slot -- an archival save -- spells itself `archival`, which only a
+/// `[sync] slot = archival` would also produce; two such backups in one second
+/// still never share a name, by `BackUpFirst`'s uniquifier.
 ///
 /// `uniquifier` is appended from 1 upwards, for the caller that finds the name
 /// already taken. `ExecutePlan` walks it rather than overwriting: a name that is
@@ -160,8 +161,10 @@ struct SaveTarget {
   /// `fs::FileSystem::Resolve` turns it into something that can be opened.
   std::string sd_path;
 
-  /// The client's own name for it, `Game (USA).srm`. Used for the backup's
-  /// extension and as the name an upload reports; never the server's.
+  /// The name an upload reports, and the source of the backup's extension. The
+  /// engine passes `scan::SaveFile::server_name` -- `<rom fs_name_no_ext><ext>`,
+  /// the stem RomM serves RetroArch the save under (#236) -- which is the
+  /// client's to choose; never the server's tagged one.
   std::string file_name;
 };
 

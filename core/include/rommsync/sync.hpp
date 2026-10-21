@@ -214,6 +214,15 @@ struct SyncNegotiatePayload {
   /// At most `kMaxNegotiateRomIds` positive ids; the encoder refuses more, or a
   /// non-positive one, rather than sending a body RomM answers with a 422.
   std::optional<std::vector<std::int64_t>> rom_ids;
+
+  /// The emulators whose saves this console can load (`emulators`, RomM 5.4),
+  /// or absent for every save -- and absent is not sent at all: `[]` would match
+  /// none. RomM then pairs and offers only server saves one of these wrote, so a
+  /// lineage this console cannot load is never downloaded over one it can (#236).
+  /// Its slot guard still sees every lineage (sync_resolve.hpp).
+  ///
+  /// No entry may be empty; the encoder refuses one by name.
+  std::optional<std::vector<std::string>> emulators;
 };
 
 /// RomM 5.4.0's `maxItems` on `SyncNegotiatePayload.rom_ids`.
@@ -576,9 +585,14 @@ struct CallPolicy {
   const http::CancelToken* cancel = nullptr;
 };
 
-/// The spelling `Negotiate` takes. An alias rather than a struct of its own:
-/// see `CallPolicy`.
-using NegotiateOptions = CallPolicy;
+/// The spelling `Negotiate` takes: `CallPolicy`, plus the one thing a caller says
+/// about *what* is asked rather than how hard.
+struct NegotiateOptions : CallPolicy {
+  /// `SyncNegotiatePayload::emulators`: absent sends none (#236). A tick sets it
+  /// once and both of its negotiations carry it, so the second -- the 409's
+  /// (sync_resolve.hpp) -- sees the same lineages the first did.
+  std::optional<std::vector<std::string>> emulators;
+};
 
 /// A plan, or the reason there isn't one. `plan` is left default-constructed on
 /// failure and must not be used -- check `ok()`.

@@ -263,18 +263,40 @@ void Names(::checks::Checks& checks) {
   checks.ExpectEq(scan::BaseName("Game.state.auto"), std::string("Game.state"),
                   "only the last extension is stripped");
 
-  checks.ExpectEq(scan::SlotFor("retroarch", "Game (USA).srm"), std::string("retroarch-srm"),
-                  "the slot is the emulator and the extension");
-  // The reason the emulator is in there at all: RomM pairs on `(rom_id, slot)`
-  // alone, so a RetroArch `.srm` and a Tico `.srm` for one rom that both mapped
-  // to `srm` would overwrite each other through the server, forever.
-  checks.Expect(scan::SlotFor("tico", "Game (USA).srm") != scan::SlotFor("retroarch",
-                                                                         "Game (USA).srm"),
-                "two emulators' .srm for one rom are different slots");
-  checks.ExpectEq(scan::SlotFor("retroarch", "Game"), std::string("retroarch-save"),
-                  "a save with no extension still gets a stable, non-empty slot");
-  checks.ExpectEq(scan::SlotFor("retroarch", "Game.SRM"), std::string("retroarch-srm"),
+  // #236: the shared slot RetroArch's Cloud Sync, the web player, Argosy and
+  // Grout all file a game's save RAM under.
+  checks.ExpectEq(std::string(config::kDefaultSlot), std::string("autosave"),
+                  "the default slot is RomM's AUTOSAVE_SLOT");
+  checks.ExpectEq(config::Defaults().sync.slot, std::string("autosave"),
+                  "and it is the slot a console with no [sync] slot line uses");
+  checks.ExpectEq(scan::SlotFor("autosave", "Game (USA).srm"), std::string("autosave"),
+                  "a .srm is the configured slot itself");
+  checks.ExpectEq(scan::SlotFor("autosave", "Game.SRM"), std::string("autosave"),
                   "the slot does not change with the case the card happened to use");
+  checks.ExpectEq(scan::SlotFor("Switch", "Game.srm"), std::string("Switch"),
+                  "a configured slot is used as written");
+  // RomM pairs on `(rom_id, slot)` alone and keeps the newest row per pair, so a
+  // `.rtc` in the same slot as its `.srm` would be negotiated as the head the
+  // `.srm` is paired with. RomM's own RetroArch path keeps companions out of the
+  // slot for that reason ("a slot holds one save").
+  checks.ExpectEq(scan::SlotFor("autosave", "Game.rtc"), std::string("autosave-rtc"),
+                  "a companion file is a slot of its own beside the save's");
+  checks.ExpectEq(scan::SlotFor("autosave", "Game.mcd"), std::string("autosave-mcd"),
+                  "and so is every extension RomM does not slot as save RAM");
+  checks.ExpectEq(scan::SlotFor("autosave", "Game"), std::string("autosave-save"),
+                  "a save with no extension still gets a stable, non-empty slot");
+
+  // What a v2 state.db row's `<source>-<ext>` slot becomes (#236's migration).
+  checks.ExpectEq(scan::MigratedSlot("autosave", "retroarch-srm"), std::string("autosave"),
+                  "retroarch-srm moves to the shared slot");
+  checks.ExpectEq(scan::MigratedSlot("autosave", "tico-srm"), std::string("autosave"),
+                  "and so does tico-srm");
+  checks.ExpectEq(scan::MigratedSlot("autosave", "tico-rtc"), std::string("autosave-rtc"),
+                  "a companion's old slot moves to the companion's new one");
+  checks.ExpectEq(scan::MigratedSlot("Switch", "srm"), std::string("Switch"),
+                  "a slot from a folder neither emulator explained was the bare extension");
+  checks.ExpectEq(scan::MigratedSlot("autosave", "tico-save"), std::string("autosave-save"),
+                  "and an extensionless save keeps its 'save'");
 
   // The scan must not emit more saves than a baseline can hold: `SaveBaseline`
   // *refuses* a file with more rows than `state::kMaxRecords`, so a card past
@@ -481,16 +503,22 @@ void Unusable(::checks::Checks& checks) {
   checks.Expect(!bare.ToClientSaveState(std::string()).content_hash.has_value(),
                 "an empty digest is null, not a blank value the server would store");
 
-  // Two files for one rom in one folder land on the same `(rom_id, slot)`, which
-  // the server pairs on -- so they would overwrite each other through RomM on
-  // alternating ticks. The first in scan order keeps it.
+  // Two files for one rom land on the same `(rom_id, slot)`, which the server
+  // pairs on -- so they would overwrite each other through RomM on alternating
+  // ticks. The first in scan order keeps it. Since #236 that includes one rom's
+  // `.srm` under two emulators: the shared slot holds one save per rom.
   FakeFileSystem duplicates("duplicates");
   duplicates.AddFile("/retroarch/saves", "nova.srm", 512, kMtime);
   duplicates.AddFile("/tico/saves/nes", "nova.srm", 512, kMtime);
   duplicates.AddFile("/tico/saves/nes", "nova.sav", 512, kMtime);
   const scan::ScanResult mixed = scan::ScanSaves(config, kRetroArchDefaults, index, duplicates, kFirstTick);
-  checks.ExpectEq(mixed.saves.size(), static_cast<std::size_t>(3),
-                  "the same rom under two emulators, and two extensions, are three slots");
+  checks.ExpectEq(mixed.saves.size(), static_cast<std::size_t>(2),
+                  "two extensions are two slots, and the same rom's .srm twice is one");
+  checks.Expect(SkippedFor(mixed, "/tico/saves/nes/nova.srm", scan::SkipReason::kDuplicateSlot),
+                "the copy found second -- Tico's, after RetroArch's -- is reported, not synced");
+  const scan::SaveFile* sav = FindSave(mixed, "nova.sav");
+  checks.Expect(sav != nullptr && sav->slot == "autosave-sav",
+                "a .sav is a slot of its own beside the .srm's");
 
   // Two spellings of one extension in one folder are one slot, because the slot
   // is lowercased. The entries are sorted by name, so `nova.SRM` is seen first
@@ -505,6 +533,53 @@ void Unusable(::checks::Checks& checks) {
   const scan::ScanResult replayed = scan::ScanSaves(config, kRetroArchDefaults, index, duplicates, kFirstTick);
   checks.Expect(SkippedFor(replayed, "/retroarch/saves/nova.srm", scan::SkipReason::kDuplicateSlot),
                 "the same file loses the slot on the next tick, not the other one");
+
+  // #236: the server is told the rom's own stem, which is the name RomM serves
+  // RetroArch the save under -- not whatever the card's copy happened to be
+  // called when it matched by the tagless name.
+  roms::RomIndex tagged;
+  roms::Rom game = MakeRom(9, "Game (USA)", "snes");
+  game.fs_name_no_tags = "Game";
+  tagged.Add(game);
+  FakeFileSystem renamed("server-name");
+  renamed.AddFile("/tico/saves/snes", "Game.srm", 512, kMtime);
+  renamed.AddFile("/tico/saves/snes", "Game.rtc", 16, kMtime);
+  const scan::ScanResult named = scan::ScanSaves(config, kRetroArchDefaults, tagged, renamed, kFirstTick);
+  const scan::SaveFile* srm = FindSave(named, "Game.srm");
+  checks.Expect(srm != nullptr && srm->slot == "autosave" && srm->server_name == "Game (USA).srm",
+                "the save is in autosave, under the rom's stem");
+  checks.Expect(srm != nullptr && srm->ToClientSaveState().file_name == "Game (USA).srm",
+                "and negotiate is told that name");
+  const scan::SaveFile* rtc = FindSave(named, "Game.rtc");
+  checks.Expect(rtc != nullptr && rtc->slot == "autosave-rtc" && rtc->server_name == "Game (USA).rtc",
+                "the clock beside it is its own slot, under the same stem (#231's collision)");
+  // #236: the emulators negotiate is filtered to.
+  const std::optional<std::vector<std::string>> filter = scan::EmulatorFilter(config, named.saves);
+  const auto lists = [&filter](const char* id) {
+    return filter.has_value() && std::find(filter->begin(), filter->end(), id) != filter->end();
+  };
+  checks.Expect(lists("snes9x") && lists("Snes9x"),
+                "the filter holds the scanned save's core, and RetroArch's folder name for it -- "
+                "what a Grout-like client sends as the emulator");
+  checks.Expect(lists("mgba") && lists("fceumm") && lists("tico-duckstation"),
+                "and the core every mapped platform's folders resolve to, with no save yet");
+  checks.Expect(!lists("mednafen_psx_hw"),
+                "but not a core no folder of this console writes");
+  checks.Expect(filter.has_value() && std::is_sorted(filter->begin(), filter->end()) &&
+                    std::adjacent_find(filter->begin(), filter->end()) == filter->end(),
+                "sorted and without repeats, so the body is the same every tick");
+  scan::SaveFile anonymous = named.saves.front();
+  anonymous.emulator.clear();
+  checks.Expect(!scan::EmulatorFilter(config, {anonymous}).has_value(),
+                "a save with no emulator turns the filter off: RomM cannot list null, and its "
+                "own upload would vanish from the pairing and be uploaded again every tick");
+
+  config::Config mine = config;
+  mine.sync.slot = "switch";
+  const scan::ScanResult moved = scan::ScanSaves(mine, kRetroArchDefaults, tagged, renamed, kFirstTick);
+  const scan::SaveFile* configured = FindSave(moved, "Game.rtc");
+  checks.Expect(configured != nullptr && configured->slot == "switch-rtc",
+                "[sync] slot decides both: " + (configured ? configured->slot : std::string("none")));
 }
 
 // --- hashing ------------------------------------------------------------------
@@ -732,42 +807,42 @@ void Sources(::checks::Checks& checks) {
   // One row per fixture file, grouped by the layout that wrote it.
   const Row kRows[] = {
       // RetroArch, flat: one folder for every system, so the platform's default core.
-      {"/retroarch/saves", "Snes Game.srm", "snes", "snes9x", "retroarch-srm"},
-      {"/retroarch/saves", "Nes Game.srm", "nes", "fceumm", "retroarch-srm"},
-      {"/retroarch/saves", "N64 Game.srm", "n64", "mupen64plus_next", "retroarch-srm"},
-      {"/retroarch/saves", "Psp Game.srm", "psp", "ppsspp", "retroarch-srm"},
+      {"/retroarch/saves", "Snes Game.srm", "snes", "snes9x", "autosave"},
+      {"/retroarch/saves", "Nes Game.srm", "nes", "fceumm", "autosave"},
+      {"/retroarch/saves", "N64 Game.srm", "n64", "mupen64plus_next", "autosave"},
+      {"/retroarch/saves", "Psp Game.srm", "psp", "ppsspp", "autosave"},
       // RetroArch, sort-by-core: the folder names the core, and outranks an override.
-      {"/retroarch/saves/mGBA", "Gba Core.srm", "gba", "mgba", "retroarch-srm"},
-      {"/retroarch/saves/Gambatte", "Gb Core.srm", "gb", "gambatte", "retroarch-srm"},
-      {"/retroarch/saves/Beetle PSX HW", "Psx Hw.srm", "psx", "mednafen_psx_hw", "retroarch-srm"},
-      {"/retroarch/saves/Beetle PSX", "Psx Sw.srm", "psx", "mednafen_psx", "retroarch-srm"},
+      {"/retroarch/saves/mGBA", "Gba Core.srm", "gba", "mgba", "autosave"},
+      {"/retroarch/saves/Gambatte", "Gb Core.srm", "gb", "gambatte", "autosave"},
+      {"/retroarch/saves/Beetle PSX HW", "Psx Hw.srm", "psx", "mednafen_psx_hw", "autosave"},
+      {"/retroarch/saves/Beetle PSX", "Psx Sw.srm", "psx", "mednafen_psx", "autosave"},
       // RetroArch, a subfolder RomM's table does not know: no guessed core.
-      {"/retroarch/saves/Gearboy", "Gbc Gearboy.srm", "gbc", "", "retroarch-srm"},
+      {"/retroarch/saves/Gearboy", "Gbc Gearboy.srm", "gbc", "", "autosave"},
       // Tico: one folder per system, and the module Tico runs for it.
-      {"/tico/saves/nes", "Nes Tico.srm", "nes", "fceumm", "tico-srm"},
-      {"/tico/saves/snes", "Snes Tico.srm", "snes", "snes9x", "tico-srm"},
-      {"/tico/saves/gbc", "Gbc Tico.srm", "gbc", "gambatte", "tico-srm"},
-      {"/tico/saves/gba", "Gba Tico.srm", "gba", "mgba", "tico-srm"},
-      {"/tico/saves/genesis", "Md Tico.srm", "genesis", "genesis_plus_gx", "tico-srm"},
-      {"/tico/saves/master-system", "Sms Tico.srm", "sms", "genesis_plus_gx", "tico-srm"},
-      {"/tico/saves/game-gear", "Gg Tico.srm", "gamegear", "genesis_plus_gx", "tico-srm"},
-      {"/tico/saves/sega-cd", "Scd Tico.brm", "segacd", "genesis_plus_gx", "tico-brm"},
-      {"/tico/saves/fbneo", "Arcade Tico.srm", "arcade", "fbneo", "tico-srm"},
+      {"/tico/saves/nes", "Nes Tico.srm", "nes", "fceumm", "autosave"},
+      {"/tico/saves/snes", "Snes Tico.srm", "snes", "snes9x", "autosave"},
+      {"/tico/saves/gbc", "Gbc Tico.srm", "gbc", "gambatte", "autosave"},
+      {"/tico/saves/gba", "Gba Tico.srm", "gba", "mgba", "autosave"},
+      {"/tico/saves/genesis", "Md Tico.srm", "genesis", "genesis_plus_gx", "autosave"},
+      {"/tico/saves/master-system", "Sms Tico.srm", "sms", "genesis_plus_gx", "autosave"},
+      {"/tico/saves/game-gear", "Gg Tico.srm", "gamegear", "genesis_plus_gx", "autosave"},
+      {"/tico/saves/sega-cd", "Scd Tico.brm", "segacd", "genesis_plus_gx", "autosave-brm"},
+      {"/tico/saves/fbneo", "Arcade Tico.srm", "arcade", "fbneo", "autosave"},
       // Tico, formats no libretro core shares: isolated under tico-* (#226 D3).
-      {"/tico/saves/n64", "N64 Tico.eep", "n64", "tico-mupen64plus", "tico-eep"},
-      {"/tico/saves/psx", "Psx Tico.mcd", "psx", "tico-duckstation", "tico-mcd"},
-      {"/tico/saves/dc", "Dc Tico.bin", "dreamcast", "tico-flycast", "tico-bin"},
-      {"/tico/saves/dc", "Dc Romm.bin", "dc", "tico-flycast", "tico-bin"},  // RomM's own spelling
-      {"/tico/saves/nds", "Nds Tico.dsv", "nds", "tico-drastic", "tico-dsv"},
-      {"/tico/saves/saturn", "Saturn Tico.bkr", "saturn", "tico-yabasanshiro", "tico-bkr"},
-      {"/tico/saves/psp", "Psp Tico.bin", "psp", "tico-ppsspp", "tico-bin"},
+      {"/tico/saves/n64", "N64 Tico.eep", "n64", "tico-mupen64plus", "autosave-eep"},
+      {"/tico/saves/psx", "Psx Tico.mcd", "psx", "tico-duckstation", "autosave-mcd"},
+      {"/tico/saves/dc", "Dc Tico.bin", "dreamcast", "tico-flycast", "autosave-bin"},
+      {"/tico/saves/dc", "Dc Romm.bin", "dc", "tico-flycast", "autosave-bin"},  // RomM's own spelling
+      {"/tico/saves/nds", "Nds Tico.dsv", "nds", "tico-drastic", "autosave-dsv"},
+      {"/tico/saves/saturn", "Saturn Tico.bkr", "saturn", "tico-yabasanshiro", "autosave-bkr"},
+      {"/tico/saves/psp", "Psp Tico.bin", "psp", "tico-ppsspp", "autosave-bin"},
       // The override: mGBA for GB, set in config.ini.
-      {"/tico/saves/gb", "Gb Tico.srm", "gb", "mgba", "tico-srm"},
+      {"/tico/saves/gb", "Gb Tico.srm", "gb", "mgba", "autosave"},
       // A folder neither emulator owns: the override when there is one, else null.
-      {"/emulators/wonderswan", "Ws Game.sav", "wonderswan", "mednafen_wswan", "sav"},
-      {"/emulators/ngp", "Ngp Game.sav", "ngp", "", "sav"},
+      {"/emulators/wonderswan", "Ws Game.sav", "wonderswan", "mednafen_wswan", "autosave-sav"},
+      {"/emulators/ngp", "Ngp Game.sav", "ngp", "", "autosave-sav"},
       // A system Tico has no table entry for: null rather than a guess.
-      {"/tico/saves/vectrex", "Vec Game.srm", "vectrex", "", "tico-srm"},
+      {"/tico/saves/vectrex", "Vec Game.srm", "vectrex", "", "autosave"},
   };
 
   roms::RomIndex index;
@@ -790,7 +865,7 @@ void Sources(::checks::Checks& checks) {
     }
     const std::string where = std::string(row.directory) + "/" + row.file_name;
     checks.ExpectEq(save->emulator, std::string(row.emulator), where + "'s emulator id");
-    checks.ExpectEq(save->slot, std::string(row.slot), where + "'s slot is unchanged");
+    checks.ExpectEq(save->slot, std::string(row.slot), where + "'s slot");
     const sync::ClientSaveState negotiated = save->ToClientSaveState();
     checks.Expect(negotiated.emulator.has_value() == (*row.emulator != '\0'),
                   where + ": an unknown emulator is sent as null, never as \"\"");
@@ -884,7 +959,7 @@ void RetroArch(::checks::Checks& checks) {
     const scan::ScanResult result = scan::ScanSaves(defaults, flat, index, card.files, kFirstTick);
     const scan::SaveFile* gba = SaveAt(result, kSaves + "/Gba Game.srm");
     const scan::SaveFile* snes = SaveAt(result, kSaves + "/Snes Game.srm");
-    checks.Expect(gba != nullptr && gba->emulator == "mgba" && gba->slot == "retroarch-srm",
+    checks.Expect(gba != nullptr && gba->emulator == "mgba" && gba->slot == "autosave",
                   "flat: the folder retroarch.cfg names is RetroArch's, with the platform's core");
     checks.Expect(snes != nullptr && snes->emulator == "snes9x", "flat: per platform");
     checks.ExpectEq(result.saves.size(), std::size_t{2},
@@ -908,15 +983,15 @@ void RetroArch(::checks::Checks& checks) {
     const scan::SaveFile* gba = FindSave(result, "Gba Game.srm");
     checks.Expect(gba != nullptr && gba->sd_path == kSaves + "/mGBA/Gba Game.srm",
                   "sorted: the copy RetroArch reads wins its slot over a stale flat one");
-    checks.Expect(gba != nullptr && gba->emulator == "mgba" && gba->slot == "retroarch-srm",
-                  "sorted: the core folder names the emulator; the slot is unchanged");
+    checks.Expect(gba != nullptr && gba->emulator == "mgba" && gba->slot == "autosave",
+                  "sorted: the core folder names the emulator; and the slot is the shared one");
     checks.Expect(SkippedFor(result, "/retroarch/saves/Gba Game.srm",
                              scan::SkipReason::kDuplicateSlot),
                   "sorted: and the stale copy is reported, not synced");
     const scan::SaveFile* snes = FindSave(result, "Snes Game.srm");
     checks.Expect(snes != nullptr && snes->emulator == "snes9x", "sorted: Snes9x is snes9x");
     const scan::SaveFile* gb = FindSave(result, "Gb Game.srm");
-    checks.Expect(gb != nullptr && gb->emulator.empty() && gb->slot == "retroarch-srm",
+    checks.Expect(gb != nullptr && gb->emulator.empty() && gb->slot == "autosave",
                   "sorted: a core RomM does not know is RetroArch's, with no guessed id");
     checks.Expect(FindSave(result, "Psx Game.srm") == nullptr,
                   "sorted: neither a loose file nor a netplay folder is a save RetroArch reads");
@@ -936,7 +1011,7 @@ void RetroArch(::checks::Checks& checks) {
     const scan::ScanResult named =
         scan::ScanSaves(defaults, elsewhere, index, card.files, kFirstTick);
     const scan::SaveFile* gba = FindSave(named, "Gba Game.srm");
-    checks.Expect(gba != nullptr && gba->emulator == "mgba" && gba->slot == "retroarch-srm",
+    checks.Expect(gba != nullptr && gba->emulator == "mgba" && gba->slot == "autosave",
                   "a configured folder with no 'retroarch' in its path is still RetroArch's");
 
     retroarch::Settings gone;
@@ -969,7 +1044,7 @@ void RetroArch(::checks::Checks& checks) {
     opted.sources.retroarch_content_dir = true;
     const scan::ScanResult open = scan::ScanSaves(opted, beside, index, card.files, kFirstTick);
     const scan::SaveFile* gba = SaveAt(open, "/tico/roms/gba/Gba Game.srm");
-    checks.Expect(gba != nullptr && gba->emulator == "mgba" && gba->slot == "retroarch-srm" &&
+    checks.Expect(gba != nullptr && gba->emulator == "mgba" && gba->slot == "autosave" &&
                       gba->rom_id == 1,
                   "content dir, opted in: the save beside the rom is RetroArch's");
     checks.ExpectEq(open.saves.size(), std::size_t{1}, "content dir: and a rom is never a save");
@@ -1145,11 +1220,11 @@ void Tico(::checks::Checks& checks) {
     const scan::SaveFile* srm = SaveAt(result, "/tico/saves/snes/Snes Game.srm");
     const scan::SaveFile* rtc = SaveAt(result, "/tico/saves/snes/Snes Game.rtc");
     checks.Expect(srm != nullptr && rtc != nullptr && srm->rom_id == rtc->rom_id &&
-                      srm->slot == "tico-srm" && rtc->slot == "tico-rtc" &&
+                      srm->slot == "autosave" && rtc->slot == "autosave-rtc" &&
                       rtc->emulator == "snes9x",
                   "the .rtc is the same rom's, in a slot of its own, under the same emulator");
     const scan::SaveFile* sms = SaveAt(result, "/tico/saves/master-system/Sms Game.srm");
-    checks.Expect(sms != nullptr && sms->emulator == "genesis_plus_gx" && sms->slot == "tico-srm",
+    checks.Expect(sms != nullptr && sms->emulator == "genesis_plus_gx" && sms->slot == "autosave",
                   "an sms save is read from Tico's master-system folder");
     checks.ExpectEq(result.skipped_total, std::size_t{0},
                     "0.7.9: a .tmp and backups/ are not saves, and not skips either: " +
@@ -1175,7 +1250,7 @@ void Tico(::checks::Checks& checks) {
     checks.ExpectEq(result.saves.size(), std::size_t{2},
                     "0.8.0: both saves in the account's folders: " + result.DescribeSkipped());
     const scan::SaveFile* snes = SaveAt(result, saves + "/snes/Snes Game.srm");
-    checks.Expect(snes != nullptr && snes->emulator == "snes9x" && snes->slot == "tico-srm",
+    checks.Expect(snes != nullptr && snes->emulator == "snes9x" && snes->slot == "autosave",
                   "the account's snes save keeps Tico's emulator id and its slot");
     checks.Expect(SaveAt(result, "/tico/saves/snes/Old Game.srm") == nullptr,
                   "a save left in the layout before 0.8.0 is not synced");
@@ -1350,10 +1425,10 @@ void Library(::checks::Checks& checks, http::HttpClient& client, const std::stri
     const char* slot;
   };
   const Expected kExpected[] = {
-      {"240pee.srm", "240pee", "nes", "fceumm", "retroarch-srm"},
-      {"gb240p.srm", "gb240p", "gb", "gambatte", "retroarch-srm"},
-      {"nova.sav", "nova", "nes", "fceumm", "retroarch-sav"},
-      {"240pee_mb.srm", "240pee_mb", "gba", "mgba", "tico-srm"},
+      {"240pee.srm", "240pee", "nes", "fceumm", "autosave"},
+      {"gb240p.srm", "gb240p", "gb", "gambatte", "autosave"},
+      {"nova.sav", "nova", "nes", "fceumm", "autosave-sav"},
+      {"240pee_mb.srm", "240pee_mb", "gba", "mgba", "autosave"},
   };
   for (const Expected& expected : kExpected) {
     const scan::SaveFile* save = FindSave(result, expected.file_name);
@@ -1374,7 +1449,7 @@ void Library(::checks::Checks& checks, http::HttpClient& client, const std::stri
     checks.ExpectEq(save->emulator, std::string(expected.emulator),
                     "and the core that writes that platform's saves in that folder");
     checks.ExpectEq(save->slot, std::string(expected.slot),
-                    "and a slot still derived from the folder's source (#236 changes it)");
+                    "and the shared slot (#236)");
     checks.Expect(save->modified_unix > 0, "and the mtime the card gave up");
     checks.Expect(save->size_bytes > 0, "and its size");
     checks.Expect(save->file_name.find('/') == std::string::npos,
@@ -1437,7 +1512,7 @@ void Library(::checks::Checks& checks, http::HttpClient& client, const std::stri
   checks.ExpectEq(cores.saves.size(), std::size_t{2}, "the two core folders' saves are found");
   for (const auto& [file_name, emulator] : kCores) {
     const scan::SaveFile* save = FindSave(cores, file_name);
-    checks.Expect(save != nullptr && save->emulator == emulator && save->slot == "retroarch-srm" &&
+    checks.Expect(save != nullptr && save->emulator == emulator && save->slot == "autosave" &&
                       fetched.index.ById(save->rom_id) != nullptr,
                   std::string(file_name) + " is the live rom's, under " + emulator);
   }

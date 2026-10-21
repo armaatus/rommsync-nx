@@ -1,10 +1,13 @@
 #include "rommsync/state_db.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <map>
+#include <set>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -494,7 +497,15 @@ LoadedBaseline ParseBaseline(std::string_view text) {
     lines.pop_back();
   }
 
-  if (lines.empty() || lines.front() != FormatHeader()) {
+  // The version before #236 is read too: its rows are this version's, keyed on
+  // slots that moved, and they are the migration's input (`legacy_saves`).
+  const std::string source_slot_header =
+      std::string(kFormatMagic) + " " + std::to_string(kSourceSlotVersion);
+  const int version = lines.empty()                         ? 0
+                      : lines.front() == FormatHeader()     ? kFormatVersion
+                      : lines.front() == source_slot_header ? kSourceSlotVersion
+                                                            : 0;
+  if (version == 0) {
     // Includes an empty file and a truncated first line. Naming the expected
     // header rather than quoting what was found: the found bytes may be
     // anything a corrupt card region holds.
@@ -512,6 +523,8 @@ LoadedBaseline ParseBaseline(std::string_view text) {
   }
 
   Baseline baseline;
+  std::vector<SaveRecord> legacy;
+  std::set<Baseline::Key> legacy_keys;
   std::vector<std::string> complaints;
   for (std::size_t at = 1; at < lines.size(); ++at) {
     if (lines[at].empty()) {
@@ -532,12 +545,20 @@ LoadedBaseline ParseBaseline(std::string_view text) {
           Add(&complaints, "state.db line " + std::to_string(at + 1) + ": " + why);
           continue;
         }
-        if (baseline.Find(record.rom_id, record.slot) != nullptr) {
+        const bool held_apart = version == kSourceSlotVersion && record.slot.has_value();
+        const bool second = held_apart
+                                ? !legacy_keys.emplace(record.rom_id, record.slot).second
+                                : baseline.Find(record.rom_id, record.slot) != nullptr;
+        if (second) {
           Add(&complaints, "state.db line " + std::to_string(at + 1) +
                                ": a second row for the same (rom_id, slot)");
           continue;
         }
-        baseline.Set(std::move(record));
+        if (held_apart) {
+          legacy.push_back(std::move(record));
+        } else {
+          baseline.Set(std::move(record));
+        }
         break;
       }
       case RowKind::kState: {
@@ -576,7 +597,40 @@ LoadedBaseline ParseBaseline(std::string_view text) {
   }
 
   loaded.value = std::move(baseline);
+  loaded.legacy_saves = std::move(legacy);
+  loaded.version = version;
   return loaded;
+}
+
+std::size_t AdoptLegacySaves(
+    LoadedBaseline* loaded,
+    const std::function<std::optional<std::string>(std::string_view old_slot)>& slot_for) {
+  // In key order, so a contest for one new key goes the same way on every boot:
+  // `retroarch-srm` sorts before `tico-srm`, as RetroArch's folders are read
+  // before Tico's.
+  std::vector<SaveRecord> legacy = std::move(loaded->legacy_saves);
+  loaded->legacy_saves.clear();
+  std::sort(legacy.begin(), legacy.end(), [](const SaveRecord& a, const SaveRecord& b) {
+    return Baseline::Key{a.rom_id, a.slot} < Baseline::Key{b.rom_id, b.slot};
+  });
+  std::size_t adopted = 0;
+  for (SaveRecord& record : legacy) {
+    if (!record.slot.has_value() || slot_for == nullptr) {
+      continue;
+    }
+    std::optional<std::string> slot = slot_for(*record.slot);
+    if (!slot.has_value() || slot->empty() ||
+        loaded->value.Find(record.rom_id, slot) != nullptr) {
+      continue;
+    }
+    record.slot = std::move(slot);
+    // The old slot's server, not the new one's: see the header.
+    record.server_updated_at.reset();
+    record.server_content_hash.reset();
+    loaded->value.Set(std::move(record));
+    ++adopted;
+  }
+  return adopted;
 }
 
 LoadedBaseline LoadBaseline(const std::string& path) {
@@ -603,7 +657,7 @@ LoadedBaseline LoadBaseline(const std::string& path) {
       // is exactly the state that would have been silent. `config.cpp` takes
       // the parsed result unconditionally for the same reason.
       std::vector<std::string> diagnostics{
-          Describe(path, recovered.value.empty()
+          Describe(path, recovered.value.empty() && recovered.legacy_saves.empty()
                              ? "is missing and " + previous_path +
                                    " holds no usable baseline either -- a write of it was "
                                    "interrupted; every save is hashed this tick"

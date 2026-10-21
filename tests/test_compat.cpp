@@ -27,7 +27,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <string>
+#include <string_view>
 
 #include "checks.hpp"
 #include "scratch.hpp"
@@ -38,6 +40,7 @@
 #include "rommsync/device_identity.hpp"
 #include "rommsync/download.hpp"
 #include "rommsync/play_sessions.hpp"
+#include "rommsync/save_scan.hpp"
 #include "rommsync/state_db.hpp"
 #include "rommsync/sync.hpp"
 #include "rommsync/token_store.hpp"
@@ -229,20 +232,40 @@ void ConfigIni(checks::Checks& c) {
   c.Expect(rs::config::ParseConfig(fresh).value.configured(), "config.ini: and reads back");
 }
 
-// --- state.db: discard and rehash, both ways ----------------------------------------
+// --- state.db: rc1 read and migrated (#236), newer discarded -----------------------
 
 void StateDb(checks::Checks& c) {
   const std::string rc1 = Fixture("state_db");
-  const rs::state::LoadedBaseline read = rs::state::ParseBaseline(rc1);
+  rs::state::LoadedBaseline read = rs::state::ParseBaseline(rc1);
   c.Expect(read.diagnostics.empty(), "state.db rc1: no complaints -- " + read.DescribeDiagnostics());
-  c.ExpectEq(read.value.rows().size(), std::size_t{2}, "state.db rc1: both saves");
+  c.ExpectEq(read.version, kRc1State, "state.db rc1: read as rc1's version");
+  // #236 moved every save to the shared slot (version 3). rc1's slotted row is
+  // held apart for the migration rather than read as a row of `retroarch-srm`,
+  // which nothing is synced in any more.
+  c.ExpectEq(read.value.rows().size(), std::size_t{1}, "state.db rc1: the slotless save, in force");
+  c.ExpectEq(read.legacy_saves.size(), std::size_t{1},
+             "state.db rc1: and the slotted one, held for the migration");
   c.ExpectEq(read.value.state_rows().size(), std::size_t{1}, "state.db rc1: and the state");
-  const rs::state::SaveRecord* save = read.value.Find(101, std::string("retroarch-srm"));
-  c.Expect(save != nullptr && save->content_hash == "0123456789abcdef0123456789abcdef" &&
-               save->file_size_bytes == 32768 &&
-               rs::sync::UnixSeconds(save->mtime) == 1757000000 &&
-               save->server_content_hash == std::string("fedcba9876543210fedcba9876543210"),
+  const rs::state::SaveRecord* legacy =
+      read.legacy_saves.empty() ? nullptr : &read.legacy_saves.front();
+  c.Expect(legacy != nullptr && legacy->rom_id == 101 &&
+               legacy->slot == std::string("retroarch-srm") &&
+               legacy->content_hash == "0123456789abcdef0123456789abcdef" &&
+               legacy->file_size_bytes == 32768 &&
+               rs::sync::UnixSeconds(legacy->mtime) == 1757000000 &&
+               legacy->server_content_hash == std::string("fedcba9876543210fedcba9876543210"),
            "state.db rc1: a save row's values");
+  const std::size_t adopted = rs::state::AdoptLegacySaves(
+      &read, [](std::string_view old_slot) -> std::optional<std::string> {
+        return rs::scan::MigratedSlot(rs::config::kDefaultSlot, old_slot);
+      });
+  const rs::state::SaveRecord* save = read.value.Find(101, std::string("autosave"));
+  c.Expect(adopted == 1 && save != nullptr &&
+               save->content_hash == "0123456789abcdef0123456789abcdef" &&
+               rs::sync::UnixSeconds(save->mtime) == 1757000000 &&
+               !save->server_content_hash.has_value() && !save->server_updated_at.has_value(),
+           "state.db rc1: migrated, the save is autosave's row, with its file's facts and none of "
+           "the old slot's server");
   const rs::state::SaveRecord* slotless = read.value.Find(202, std::nullopt);
   c.Expect(slotless != nullptr && !slotless->server_updated_at.has_value(),
            "state.db rc1: a slotless save with no server side");
@@ -254,11 +277,11 @@ void StateDb(checks::Checks& c) {
                "state.db: written differently under rc1's version -- bump kFormatVersion");
   }
 
-  // Older (version 1) is test_state_db's: discarded and rehashed. Newer is the
-  // same answer -- a baseline is an optimisation, rebuilt from the card.
-  const rs::state::LoadedBaseline newer = rs::state::ParseBaseline(Bumped(
-      rc1, "rommsync-state " + std::to_string(rs::state::kFormatVersion),
-      "rommsync-state " + std::to_string(rs::state::kFormatVersion + 1)));
+  // Older still (version 1) is test_state_db's: discarded and rehashed. Newer is
+  // the same answer -- a baseline is an optimisation, rebuilt from the card.
+  const rs::state::LoadedBaseline newer = rs::state::ParseBaseline(
+      Bumped(rc1, "rommsync-state " + std::to_string(kRc1State),
+             "rommsync-state " + std::to_string(rs::state::kFormatVersion + 1)));
   c.Expect(newer.value.empty(), "state.db newer: discarded");
   c.Expect(!newer.diagnostics.empty(), "state.db newer: and said");
 }

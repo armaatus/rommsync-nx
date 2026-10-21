@@ -304,6 +304,18 @@ unreachable* and names the half to update, and when they can but are from
 different releases its status screen shows both builds and says to install both
 from the same release. Unzipping the whole release again is the fix either way.
 
+**Upgrading from v1.0.0-rc1 moves your saves to the shared slot.** rc1 kept each
+save in a slot of its own on the server (`tico-srm`, `retroarch-srm`), which no
+other client reads. This release syncs them in `autosave`, the slot RetroArch's
+Cloud Sync and RomM's web player use ([CONFIG.md](CONFIG.md#slot-the-shared-slot)).
+The first sync after the upgrade offers each save to that slot rather than
+uploading it again: where RomM already holds a newer save there (from RetroArch,
+say) it comes down to the card, your copy backed up first; where your copy is
+the newer one, it shows up under **Conflicts** so you can choose. rc1's copies
+stay on the server as they were, visible as named slots in RomM's web UI —
+delete them there once you no longer want them
+([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#upgrading-from-rc1-the-old-slots-236)).
+
 **Going back to an older release** is safe for your settings and your pairing,
 but not seamless. An older build — any from the one after v1.0.0-rc1 on —
 refuses a `config.ini` or a `token.dat` that a

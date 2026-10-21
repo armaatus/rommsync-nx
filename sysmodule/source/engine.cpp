@@ -4,7 +4,9 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -1415,6 +1417,21 @@ void SdEngine::LogDrain(const download::DrainResult& result) {
 
 namespace {
 
+/// `state.db`, with a version-2 file's rows moved to the slots their files are
+/// synced in now (#236) -- so the first tick after the upgrade hashes nothing it
+/// already knew, and M7-4 sees the same saves either side of it.
+///
+/// Both of a tick's reads go through this: the states half re-reads the file
+/// the saves half wrote, which on a tick that wrote none is still version 2.
+state::LoadedBaseline LoadBaselineFor(const std::string& path, const config::Config& config) {
+  state::LoadedBaseline loaded = state::LoadBaseline(path);
+  state::AdoptLegacySaves(&loaded,
+                          [&config](std::string_view old_slot) -> std::optional<std::string> {
+                            return scan::MigratedSlot(config.sync.slot, old_slot);
+                          });
+  return loaded;
+}
+
 /// The saves as the *last* tick left them, for M7-4's derivation.
 ///
 /// Two projections rather than one, because the two sides of the comparison come
@@ -1792,7 +1809,7 @@ bool SdEngine::RunOneTick() {
   }
 
   const std::string baseline_path = files->Resolve(sync::kStateSdPath);
-  const state::LoadedBaseline loaded = state::LoadBaseline(baseline_path);
+  const state::LoadedBaseline loaded = LoadBaselineFor(baseline_path, *config);
   // Where RetroArch keeps its saves this tick, and whether it syncs them itself
   // (#230). Read every tick rather than at boot: RetroArch rewrites its file on
   // exit, from another process, and a client that kept the boot-time answer
@@ -1822,7 +1839,7 @@ bool SdEngine::RunOneTick() {
     target.rom_id = save.rom_id;
     target.slot = save.slot;
     target.sd_path = save.sd_path;
-    target.file_name = save.file_name;
+    target.file_name = save.server_name;
     targets.push_back(std::move(target));
   }
 
@@ -1865,6 +1882,12 @@ bool SdEngine::RunOneTick() {
   // to be supported -- the refusal above returned -- and passed anyway, so the
   // tick's own gate is the same fact rather than a default.
   options.server = caps;
+  // Only the lineages this console can load are paired or offered (#236): a
+  // PlayStation core's save in the shared slot is not this console's to
+  // download. Off when a scanned save names no emulator (`EmulatorFilter`).
+  if (caps.emulators_filter) {
+    options.negotiate.emulators = scan::EmulatorFilter(*config, scanned.saves);
+  }
   // The check above is the last before the plan. A 409's resolution is a second
   // negotiation and transfer after it, so it asks again (#232 against #242).
   options.hold_resolution = [this]() { return application_running(); };
@@ -1964,7 +1987,7 @@ bool SdEngine::RunOneTick() {
     // own copy on the way out, and `SyncStates` advances the same file. Reading
     // it back is one small file and is what keeps the two halves from writing
     // over each other's rows.
-    state::Baseline baseline = state::LoadBaseline(baseline_path).value;
+    state::Baseline baseline = LoadBaselineFor(baseline_path, *config).value;
     sync::StateSyncOptions state_options;
     state_options.backup_dir = sync::kBackupDir;
     state_options.cancel = cancel.get();

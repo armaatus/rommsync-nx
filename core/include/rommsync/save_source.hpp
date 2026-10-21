@@ -23,10 +23,11 @@
 //      an incompatible format is isolated rather than offered to a core that
 //      would misread it.
 //
-// None of it changes the *slot*. `scan::SlotFor` still builds it from the
-// source's name -- `tico-srm`, `retroarch-srm` -- until #236 moves saves to
-// `autosave`; changing both at once would make every save on the card a new one
-// on the server twice over.
+// None of it decides the *slot*: since #236 that is the configured shared one
+// (`scan::SlotFor`), whoever wrote the save. The id is what keeps two lineages
+// in that slot apart -- RomM prunes per `(emulator, extension)`, and negotiate's
+// `emulators` filter (`scan::EmulatorFilter`) offers only the ones this console
+// can load.
 //
 // The RetroArch table mirrors RomM 5.4.0's
 // `backend/handler/sync/retroarch/emulator_names.py`, pinned verbatim at
@@ -51,8 +52,9 @@ enum class Source {
   kTico,       ///< a path segment named `tico`
 };
 
-/// `retroarch`, `tico`, or "" for `kUnknown`. Never null. This is the name the
-/// slot is built from until #236, and nothing else -- never an `emulator`.
+/// `retroarch`, `tico`, or "" for `kUnknown`. Never null. A name for logs and
+/// tests -- never an `emulator`, and since #236 no part of a slot (a version-2
+/// `state.db` row's slot still carries it; `scan::MigratedSlot` strips it).
 const char* ToString(Source source);
 
 /// How the source lays its saves out, which decides what a folder can say.

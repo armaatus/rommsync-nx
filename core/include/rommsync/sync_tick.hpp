@@ -254,7 +254,7 @@ const char* ToString(TickOutcome outcome);
 /// What one tick is allowed to touch, and how hard each stage tries.
 ///
 /// The per-call retry is not re-implemented here: `NegotiateOptions` and
-/// `CompleteOptions` are `CallPolicy`, which already times out, retries and
+/// `CompleteOptions` are a `CallPolicy`, which already times out, retries and
 /// backs off, and widening `ShouldRetry` is explicitly not this module's to do.
 struct TickOptions {
   /// `config::SyncConfig::enabled`, and the whole of what a false one costs:

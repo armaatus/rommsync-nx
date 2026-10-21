@@ -103,6 +103,21 @@ inline constexpr std::size_t kMaxPathLength = 768;
 inline constexpr int kMinIntervalMinutes = 0;
 inline constexpr int kMaxIntervalMinutes = 7 * 24 * 60;
 
+/// `[sync] slot`'s default: RomM's `AUTOSAVE_SLOT`, the slot RetroArch's Cloud
+/// Sync, the web player, Argosy and Grout file a game's save RAM under (#226 R2,
+/// D2). A save in any other slot is seen by this client and nobody else.
+inline constexpr const char* kDefaultSlot = "autosave";
+
+/// The longest `[sync] slot` accepted. RomM takes 255, and a companion file's
+/// slot is this one plus `-<extension>` (`scan::SlotFor`).
+inline constexpr std::size_t kMaxSlotLength = 64;
+
+/// True for a `[sync] slot` value: 1 to `kMaxSlotLength` ASCII letters, digits,
+/// `-` or `_`. Narrow because the slot is a key this client must reproduce
+/// byte for byte on every tick, and RomM shows it in its web UI as the slot's
+/// name. Sets `why` on refusal.
+bool ValidSlot(std::string_view slot, std::string* why);
+
 /// `[server]`.
 struct ServerConfig {
   /// Origin, with any trailing slash removed: `https://romm.example.com`, or
@@ -136,6 +151,14 @@ struct SyncConfig {
 
   bool on_boot = true;
   bool saves = true;
+
+  /// The slot every save is negotiated and uploaded in (#236): `kDefaultSlot`
+  /// unless `[sync] slot` names another. `scan::SlotFor` derives a companion
+  /// file's slot from it.
+  ///
+  /// Changing it moves every save to a new slot on the next tick: the old one
+  /// is left on the server, and the new one is negotiated as a first meeting.
+  std::string slot = kDefaultSlot;
 
   /// Off by default: a save state is a snapshot of an emulator core's memory,
   /// so it survives neither a core update nor a different core, and syncing one

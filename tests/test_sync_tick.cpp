@@ -28,7 +28,9 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "crash_disk.hpp"
@@ -40,6 +42,7 @@
 #include "rommsync/host/file_sync.hpp"
 #include "rommsync/host/native_file_system.hpp"
 #include "rommsync/md5.hpp"
+#include "rommsync/save_scan.hpp"
 #include "rommsync/state_db.hpp"
 #include "rommsync/scheduler.hpp"
 #include "rommsync/server_capabilities.hpp"
@@ -2753,6 +2756,113 @@ void BaselineOtherRow(rig::Checks& checks, http::HttpClient& client, const std::
   harness::DeleteSave(client, base, fixture, other.id);
 }
 
+// --- migrated (#236) --------------------------------------------------------------
+//
+// The first tick after an upgrade from rc1: `state.db` is version 2, its save row
+// in rc1's `tico-srm`, and the shared slot already holds another client's newer
+// progress. The tick negotiates the save in the shared slot -- never re-uploads
+// it into the old one -- and lands the head over it with the local bytes backed
+// up first, under `crash::Recorder` like every other overwrite (#203).
+//
+// The configured slot is a unique one standing in for `autosave`, so no other
+// scenario's saves are in it; the old slot is the real `tico-srm`, as rc1 wrote.
+void Migrated(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+              const Fixture& fixture, const harness::Rom& rom) {
+  Sandbox sandbox(checks, "tick-migrated");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const std::string slot = harness::UniqueSlot("m10-10");
+  const std::string name = "gb240p.srm";
+  const std::string mine = "what rc1 synced into tico-srm, " + slot + "\n";
+  const std::string theirs = "RetroArch's progress in the shared slot, " + slot + "\n";
+
+  // rc1's sync: the bytes on the card, the same bytes in `tico-srm` with this
+  // device's sync row, and the row rc1 wrote for them.
+  sandbox.SeedSave(SavePath(name), mine);
+  harness::Save old_slot;
+  if (!harness::UploadSave(client, base, fixture, rom.id, "tico-srm", "tico",
+                           sandbox.Host(SavePath(name)), name, /*with_device=*/true, &old_slot)) {
+    checks.Expect(false, "rc1's upload to its own slot was stored");
+    return;
+  }
+  sync::ClientSaveState local;
+  if (!LocalSaveOnCard(checks, *files, sandbox, rom.id, name, slot, &local)) {
+    harness::DeleteSave(client, base, fixture, old_slot.id);
+    return;
+  }
+  local.emulator = "gambatte";
+  const std::string v2 =
+      "rommsync-state 2\n{\"rom_id\":" + std::to_string(rom.id) +
+      ",\"slot\":\"tico-srm\",\"content_hash\":\"" + crypto::Md5Hex(mine) +
+      "\",\"mtime\":" + std::to_string(sync::UnixSeconds(local.updated_at)) +
+      ",\"file_size_bytes\":" + std::to_string(mine.size()) +
+      ",\"server_updated_at\":null,\"server_content_hash\":\"" + crypto::Md5Hex(mine) + "\"}\n";
+  state::LoadedBaseline loaded = state::ParseBaseline(v2);
+  const std::size_t adopted =
+      state::AdoptLegacySaves(&loaded, [&slot](std::string_view old) -> std::optional<std::string> {
+        return rommsync::scan::MigratedSlot(slot, old);
+      });
+  checks.ExpectEq(adopted, std::size_t{1}, "rc1's row moves to the configured slot");
+  checks.Expect(state::ContentHashFor(loaded.value, rom.id, slot,
+                                      sandbox.Host(SavePath(name)), local.updated_at,
+                                      local.file_size_bytes)
+                    .reused,
+                "and the save it describes is not hashed again");
+
+  // Another client's newer progress, already in the shared slot.
+  harness::PassASecond();
+  const std::string staged = sandbox.Host("/config/rommsync/theirs.srm");
+  rig::WriteFile(staged, theirs);
+  harness::Save head;
+  if (!harness::UploadSave(client, base, fixture, rom.id, slot, "gambatte", staged, name,
+                           /*with_device=*/false, &head)) {
+    checks.Expect(false, "the other client's save was stored");
+    harness::DeleteSave(client, base, fixture, old_slot.id);
+    return;
+  }
+  const std::vector<sync::SaveTarget> targets = {{rom.id, slot, SavePath(name), name}};
+
+  sync::TickResult tick;
+  {
+    crash::Recorder recorder(sandbox.root());
+    tick = sync::RunTick(client, *files, TokenFor(base, fixture), {local}, targets,
+                         std::move(loaded.value), OptionsAt(1'757'000'800));
+    crash::ExpectSurvives(checks, recorder, {SavePath(name), mine, theirs, harness::kBackupDir},
+                          rig::ScratchDir() + "/crash-migrated", "a migrated save's first tick");
+  }
+  checks.Expect(tick.outcome == sync::TickOutcome::kCompleted,
+                std::string("the tick completed: ") + sync::ToString(tick.outcome));
+  checks.Expect(tick.executed.operations.size() == 1 &&
+                    tick.executed.operations[0].outcome == sync::OperationOutcome::kDownloaded,
+                "the shared slot's newer head is downloaded, not answered with an upload");
+  checks.ExpectEq(sandbox.Read(SavePath(name)), theirs, "the card holds it");
+  checks.Expect(sandbox.HasBackupOf(mine), "and rc1's bytes are under .backup/");
+  checks.ExpectEq(SaveRowsFor(client, base, fixture, rom.id, slot, nullptr), 1,
+                  "nothing was uploaded into the shared slot");
+  checks.ExpectEq(SaveRowsFor(client, base, fixture, rom.id, "tico-srm", nullptr) >= 1, true,
+                  "and the old slot's row is still on the server, untouched");
+
+  const state::LoadedBaseline stored = StoredBaseline(*files);
+  checks.ExpectEq(stored.version, state::kFormatVersion, "state.db is written in version 3");
+  checks.Expect(stored.value.Find(rom.id, std::string("tico-srm")) == nullptr &&
+                    stored.value.Find(rom.id, slot) != nullptr,
+                "with the save under the slot it is synced in, and nothing under the old one");
+
+  sync::ClientSaveState now;
+  if (LocalSaveOnCard(checks, *files, sandbox, rom.id, name, slot, &now)) {
+    now.emulator = "gambatte";
+    const sync::TickResult next = sync::RunTick(client, *files, TokenFor(base, fixture), {now},
+                                                targets, stored.value, OptionsAt(1'757'000'801));
+    checks.Expect(next.executed.operations.size() == 1 &&
+                      next.executed.operations[0].outcome == sync::OperationOutcome::kNoOp,
+                  "the next tick has nothing to do: no duplicate upload");
+  }
+  checks.ExpectEq(SaveRowsFor(client, base, fixture, rom.id, slot, nullptr), 1,
+                  "still one row in the shared slot");
+  harness::DeleteSave(client, base, fixture, head.id);
+  harness::DeleteSave(client, base, fixture, old_slot.id);
+}
+
 int main(int argc, char** argv) {
   const std::string scenario = argc > 1 ? argv[1] : "recovery";
 
@@ -2946,6 +3056,8 @@ int main(int argc, char** argv) {
     BaselineConflict(checks, *client, base, fixture, rom);
   } else if (scenario == "baseline_other_row") {
     BaselineOtherRow(checks, *client, base, fixture, rom);
+  } else if (scenario == "migrated") {
+    Migrated(checks, *client, base, fixture, rom);
   } else if (scenario == "resumes") {
     Resumes(checks, *client, base, fixture, rom);
   } else if (scenario == "relaunched") {

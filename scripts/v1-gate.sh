@@ -194,6 +194,10 @@ T
       # the tick takes the server's head instead (#232). It goes through
       # `ExecutePlan`, so the census below has no new row; the replays are what
       # hold the resolution to the ordering.
+      #
+      # `tick.migrated` replays the first tick after an upgrade from rc1 (#236):
+      # a version-2 `state.db` row moved to the shared slot, and that slot's newer
+      # head landing over the save. `ExecutePlan` again, so again no census row.
       cat <<'T'
 ^harness\.backup$
 ^execute\.
@@ -203,6 +207,7 @@ T
 ^conflicts\.crash$
 ^tick\.newer_download$
 ^tick\.newer_conflict$
+^tick\.migrated$
 ^tick\.backupdir$
 ^tick\.durable$
 T

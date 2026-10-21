@@ -538,6 +538,33 @@ void EncodesTheRomScope(checks::Checks& c) {
   c.Expect(!sync::EncodeNegotiateRequest(payload).ok(), "and so is a rom id that is not one");
 }
 
+/// #236: `emulators` (RomM 5.4) pairs and offers only server saves one of these
+/// wrote, so a lineage this console cannot load is never downloaded.
+void EncodesTheEmulatorFilter(checks::Checks& c) {
+  sync::SyncNegotiatePayload payload;
+  payload.saves.push_back(SampleSave());
+  {
+    const sync::Encoded unfiltered = sync::EncodeNegotiateRequest(payload);
+    const json::ParseResult document = json::Parse(unfiltered.body);
+    c.Expect(document.ok() && document.value.Find("emulators") == nullptr,
+             "an unfiltered negotiation sends no emulators at all -- not [], which matches none");
+  }
+  payload.emulators = std::vector<std::string>{"snes9x", "Snes9x", "a\"b"};
+  {
+    const sync::Encoded filtered = sync::EncodeNegotiateRequest(payload);
+    const json::ParseResult document = json::Parse(filtered.body);
+    const json::Value* ids = document.ok() ? document.value.Find("emulators") : nullptr;
+    c.Expect(ids != nullptr && ids->is_array() && ids->size() == 3 &&
+                 ids->elements()[0].is_string() && ids->elements()[0].string() == "snes9x" &&
+                 ids->elements()[1].string() == "Snes9x" && ids->elements()[2].string() == "a\"b",
+             "a filtered one sends them as an array of strings, quoted: " + filtered.body);
+  }
+  payload.emulators = std::vector<std::string>{"snes9x", ""};
+  const sync::Encoded blank = sync::EncodeNegotiateRequest(payload);
+  c.Expect(!blank.ok() && blank.error.field == "emulators",
+           "a blank id is refused by name: it is no emulator, and RomM matches none to it");
+}
+
 /// A file name RomM is entitled to store and a JSON encoder is entitled to get
 /// wrong. Built by concatenation this would end the string early and turn the
 /// rest of the entry into keys the server reads at face value.
@@ -708,6 +735,7 @@ int main() {
   EncodesTheAbsentFieldsAsNull(c);
   EncodesAnEmptyLibrary(c);
   EncodesTheRomScope(c);
+  EncodesTheEmulatorFilter(c);
   QuotesRatherThanConcatenates(c);
   RefusesWhatItCannotSendFaithfully(c);
   FormatsTimestampsAsRomMReadsThem(c);

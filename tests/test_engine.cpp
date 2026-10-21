@@ -95,6 +95,7 @@
 #include "rommsync/ipc.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/log.hpp"
+#include "rommsync/md5.hpp"
 #include "rommsync/overlay_status_view.hpp"
 #include "rommsync/pairing.hpp"
 #include "rommsync/server_capabilities.hpp"
@@ -4113,6 +4114,400 @@ int ServerDeleted(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+// --- the shared slot (#236) ----------------------------------------------------
+
+/// A request as RetroArch's Cloud Sync makes it: WebDAV under
+/// `/api/sync/retroarch/`, as the fixture user over Basic auth (#226 R2).
+http::Result AsRetroArch(http::HttpClient& client, const std::string& base, http::Method method,
+                         const std::string& path, const std::string& body = std::string()) {
+  http::Request request;
+  request.method = method;
+  request.url = base + "/api/sync/retroarch/" + path;
+  request.headers.push_back(
+      {"Authorization", "Basic " + rig::Base64(std::string(rig::kUser) + ":" + rig::kPassword)});
+  if (method == http::Method::kPut) {
+    request.headers.push_back({"Content-Type", "application/octet-stream"});
+    request.body = body;
+  }
+  return client.Send(request);
+}
+
+/// One save row RomM holds for a rom.
+struct ServerRow {
+  std::int64_t id = 0;
+  std::string slot;
+  std::string emulator;
+  std::string file_name;
+  std::string content_hash;
+};
+
+std::vector<ServerRow> RowsFor(http::HttpClient& client, const std::string& base,
+                               const harness::Fixture& fixture, std::int64_t rom_id,
+                               const std::string& slot) {
+  const http::Result listed = client.Send(harness::Authed(
+      http::Method::kGet, base + "/api/saves?rom_id=" + std::to_string(rom_id), fixture));
+  const rommsync::json::ParseResult parsed = rommsync::json::Parse(listed.response.body);
+  std::vector<ServerRow> rows;
+  if (!listed.successful() || !parsed.ok() || !parsed.value.is_array()) {
+    return rows;
+  }
+  for (const rommsync::json::Value& save : parsed.value.elements()) {
+    ServerRow row;
+    row.id = harness::Number(save, "id");
+    row.slot = harness::Field(save, "slot");
+    row.emulator = harness::Field(save, "emulator");
+    row.file_name = harness::Field(save, "file_name");
+    row.content_hash = harness::Field(save, "content_hash");
+    if (row.slot == slot) {
+      rows.push_back(std::move(row));
+    }
+  }
+  return rows;
+}
+
+/// Delete what the shared and the old slot hold for `rom_id`, so a scenario
+/// starts from a slot it knows. Rig tests run serially; what is there is an
+/// earlier run's leftovers.
+void ClearSlots(http::HttpClient& client, const std::string& base, const harness::Fixture& fixture,
+                std::int64_t rom_id) {
+  for (const char* slot : {"autosave", "tico-srm"}) {
+    for (const ServerRow& row : RowsFor(client, base, fixture, rom_id, slot)) {
+      harness::DeleteSave(client, base, fixture, row.id);
+    }
+  }
+}
+
+/// A console on its own device, configured for the rig with no tick of its own:
+/// each one is a press, run to its end.
+bool PointAtTheRig(Console& console, rig::Checks& c, const std::string& base,
+                   const harness::Fixture& fixture, const std::string& device_id) {
+  if (!console.sandbox.Write("/config/rommsync/config.ini",
+                             "[server]\nurl = " + base +
+                                 "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                 "on_boot = false\nstates = false\n")) {
+    c.Expect(false, "the console points at the rig");
+    return false;
+  }
+  auth::StoredToken token;
+  token.server_url = base;
+  token.access_token = fixture.token;
+  token.device_id = device_id;
+  token.scopes = {"roms.read"};
+  if (!auth::SaveToken(console.directory + auth::kTokenFileName, token).ok()) {
+    c.Expect(false, "and is paired as its own device");
+    return false;
+  }
+  return true;
+}
+
+/// Press Sync now and wait for that tick to end.
+bool TickOnce(Console& console, rig::Checks& c, const std::string& what) {
+  const int before = TicksLogged(console.Log());
+  if (console.SyncNow() != ipc::SyncOutcome::kAccepted) {
+    c.Expect(false, what + ": Sync now starts a tick");
+    return false;
+  }
+  const std::chrono::steady_clock::time_point deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{120};
+  while ((TicksLogged(console.Log()) <= before || console.Status().sync_in_progress) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  const ipc::Status status = console.Status();
+  const bool ran = TicksLogged(console.Log()) > before && !status.sync_in_progress;
+  c.Expect(ran && status.last_sync_result == ipc::SyncResult::kOk,
+           what + ": the tick ran clean -- " + ipc::ToString(status.last_sync_result) +
+               Rendered(console.Log()));
+  return ran;
+}
+
+/// #236's interop acceptance, through the real engine: RetroArch's Cloud Sync
+/// writes `saves/mGBA/<rom>.srm` and the console's Tico folder gets it as
+/// `<rom>.srm`; the console's next save is what RetroArch is then served.
+int Interop(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "240pee_mb.gba", &rom),
+           "the fixture library has 240pee_mb.gba");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  ClearSlots(client, base, fixture, rom.id);
+  const std::string device_id = harness::CreateDevice(c, client, base, fixture, "engine-interop");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+  // Unique bytes per run: RomM remembers what a slot lost, and a client holding
+  // a deleted version's bytes is told `delete`.
+  const std::string stamp = harness::UniqueSlot("interop");
+
+  rlog::Reset();
+  Console console(c, "engine-interop");
+  if (!PointAtTheRig(console, c, base, fixture, device_id)) {
+    return c.failures();
+  }
+  const std::string save = "/tico/saves/gba/240pee_mb.srm";
+  console.sandbox.MakeDirs("/tico/saves/gba");
+  const std::string older = "the switch's save, before RetroArch played " + stamp + "\n";
+  console.sandbox.SeedSave(save, older);
+
+  harness::PassASecond();
+  const std::string retroarch = "RetroArch's progress, synced by Cloud Sync " + stamp + "\n";
+  const http::Result put =
+      AsRetroArch(client, base, http::Method::kPut, "saves/mGBA/240pee_mb.srm", retroarch);
+  c.Expect(put.successful(), "RetroArch's Cloud Sync stores its save: HTTP " +
+                                 std::to_string(put.response.status));
+
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.Boot();
+  console.engine.UseServer(&client, fixture.token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+
+  // RetroArch -> Switch.
+  TickOnce(console, c, "RetroArch to Switch");
+  c.ExpectEq(console.sandbox.Read(save), retroarch,
+             "RetroArch's save is in Tico's gba folder, under Tico's own name");
+  c.Expect(console.sandbox.HasBackupOf(older), "with the Switch's own bytes under .backup/");
+  const std::vector<ServerRow> after_download = RowsFor(client, base, fixture, rom.id, "autosave");
+  c.ExpectEq(after_download.size(), std::size_t{1},
+             "and nothing was uploaded: the autosave slot holds RetroArch's save alone");
+
+  // Switch -> RetroArch.
+  harness::PassASecond();
+  const std::string played = "the switch played on from there " + stamp + "\n";
+  console.sandbox.Reseed(save, played);
+  TickOnce(console, c, "Switch to RetroArch");
+  const http::Result served =
+      AsRetroArch(client, base, http::Method::kGet, "saves/mGBA/240pee_mb.srm");
+  c.Expect(served.successful() && served.response.body == played,
+           "RetroArch is served the Switch's save at its own path: HTTP " +
+               std::to_string(served.response.status) + " -- " + served.response.body);
+  bool uploaded = false;
+  for (const ServerRow& row : RowsFor(client, base, fixture, rom.id, "autosave")) {
+    if (row.content_hash == crypto::Md5Hex(played)) {
+      uploaded = true;
+      c.ExpectEq(row.emulator, std::string("mgba"), "uploaded under mGBA's core id");
+      c.Expect(row.file_name.rfind("240pee_mb [", 0) == 0 &&
+                   row.file_name.size() > 4 &&
+                   row.file_name.compare(row.file_name.size() - 4, 4, ".srm") == 0,
+               "under the rom's own stem: " + row.file_name);
+    }
+  }
+  c.Expect(uploaded, "the Switch's save is a version in the autosave slot");
+
+  ClearSlots(client, base, fixture, rom.id);
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
+/// `POST /api/saves` as rc1 sent one: its own `tico-srm` slot, `emulator=tico`,
+/// this device's sync row written.
+bool UploadAsRc1(http::HttpClient& client, const std::string& base,
+                 const harness::Fixture& fixture, const std::string& device_id,
+                 std::int64_t rom_id, const std::string& host_path, const std::string& name) {
+  http::Request request = harness::Authed(
+      http::Method::kPost,
+      base + "/api/saves?rom_id=" + std::to_string(rom_id) +
+          "&emulator=tico&slot=tico-srm&overwrite=true&device_id=" + device_id,
+      fixture);
+  http::FormPart part;
+  part.name = "saveFile";
+  part.file_path = host_path;
+  part.file_name = name;
+  part.content_type = "application/octet-stream";
+  request.form.push_back(part);
+  return client.Send(request).successful();
+}
+
+/// True when conflicts.db has a conflict row for `rom_id`.
+bool ConflictRecorded(const Console& console, std::int64_t rom_id) {
+  const std::string text = console.sandbox.Read("/config/rommsync/conflicts.db");
+  const std::string rom = "\"rom_id\":" + std::to_string(rom_id) + ",";
+  std::size_t at = 0;
+  while (at < text.size()) {
+    const std::size_t end = text.find('\n', at);
+    const std::string line = text.substr(at, end == std::string::npos ? std::string::npos : end - at);
+    if (line.find(rom) != std::string::npos && line.find("\"event\":\"conflict\"") != std::string::npos) {
+      return true;
+    }
+    if (end == std::string::npos) {
+      break;
+    }
+    at = end + 1;
+  }
+  return false;
+}
+
+/// #236's upgrade acceptance: a console rc1 synced, with rc1's own `state.db`
+/// (version 2, rows in `tico-srm`) and rc1's uploads on the server, runs its
+/// first ticks on this build. Three roms, the three ways the shared slot can be:
+///
+///   - nova.nes: empty, so the save is uploaded into it -- once;
+///   - 240pee.nes: holding RetroArch's progress, newer than the card's, which is
+///     downloaded over it with the card's bytes backed up first;
+///   - gb240p.gb: holding RetroArch's progress, *older* than the card's: the
+///     upload is refused by the slot guard (this device never synced that slot),
+///     and the 409 is a conflict -- RetroArch's copy on the card, the Switch's
+///     under `.backup/` and still on the server in `tico-srm`, and an entry on
+///     the conflicts screen. Not silently a download: see `AdoptLegacySaves`.
+///
+/// No data is lost (every byte the card held is on the card, under `.backup/` or
+/// on the server), rc1's rows stay where they are, and the second tick uploads
+/// nothing.
+int Upgrade(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  struct Game {
+    const char* rom_file;
+    const char* folder;
+    const char* core_folder;
+    std::int64_t rom_id = 0;
+    std::string save;
+    std::string bytes;
+    std::string retroarch;
+  };
+  Game games[] = {{"nova.nes", "/tico/saves/nes", nullptr, 0, {}, {}, {}},
+                  {"240pee.nes", "/tico/saves/nes", "FCEUmm", 0, {}, {}, {}},
+                  {"gb240p.gb", "/tico/saves/gb", "Gambatte", 0, {}, {}, {}}};
+  Game& empty = games[0];
+  Game& newer = games[1];
+  Game& older = games[2];
+  for (Game& game : games) {
+    harness::Rom rom;
+    c.Expect(harness::FindRom(client, base, fixture, game.rom_file, &rom),
+             std::string("the fixture library has ") + game.rom_file);
+    if (rom.id == 0) {
+      return c.failures();
+    }
+    game.rom_id = rom.id;
+    ClearSlots(client, base, fixture, rom.id);
+    const std::string stem(game.rom_file, std::string_view(game.rom_file).find('.'));
+    game.save = std::string(game.folder) + "/" + stem + ".srm";
+  }
+  const std::string device_id = harness::CreateDevice(c, client, base, fixture, "engine-upgrade");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+  const std::string stamp = harness::UniqueSlot("upgrade");
+
+  rlog::Reset();
+  Console console(c, "engine-upgrade");
+  if (!PointAtTheRig(console, c, base, fixture, device_id)) {
+    return c.failures();
+  }
+  console.sandbox.MakeDirs("/tico/saves/nes");
+  console.sandbox.MakeDirs("/tico/saves/gb");
+
+  // RetroArch played gb240p before the Switch last did.
+  older.retroarch = "RetroArch's gb240p, older than the Switch's " + stamp + "\n";
+  c.Expect(AsRetroArch(client, base, http::Method::kPut, "saves/Gambatte/gb240p.srm",
+                       older.retroarch)
+               .successful(),
+           "RetroArch's gb240p is in the shared slot");
+  harness::PassASecond();
+
+  // rc1's sync: every save on the card, uploaded into rc1's own slot.
+  for (Game& game : games) {
+    game.bytes = std::string("rc1 synced ") + game.rom_file + " " + stamp + "\n";
+    console.sandbox.SeedSave(game.save, game.bytes);
+    c.Expect(UploadAsRc1(client, base, fixture, device_id, game.rom_id,
+                         console.sandbox.Host(game.save), game.save.substr(game.save.rfind('/') + 1)),
+             std::string("rc1 uploaded ") + game.rom_file + " into tico-srm");
+  }
+
+  // RetroArch played 240pee after the Switch last did.
+  harness::PassASecond();
+  newer.retroarch = "RetroArch's 240pee, newer than the Switch's " + stamp + "\n";
+  c.Expect(AsRetroArch(client, base, http::Method::kPut, "saves/FCEUmm/240pee.srm",
+                       newer.retroarch)
+               .successful(),
+           "RetroArch's 240pee is in the shared slot");
+
+  // rc1's state.db, in rc1's format: each save's facts, as rc1 read them off the
+  // card, and rc1's upload's digest as the server's.
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  std::string v2 = "rommsync-state 2\n";
+  for (const Game& game : games) {
+    const fs::Listing listing = card->List(game.folder);
+    for (const fs::Entry& entry : listing.entries) {
+      if (game.save == std::string(game.folder) + "/" + entry.name) {
+        v2 += "{\"rom_id\":" + std::to_string(game.rom_id) +
+              ",\"slot\":\"tico-srm\",\"content_hash\":\"" + crypto::Md5Hex(game.bytes) +
+              "\",\"mtime\":" + std::to_string(entry.modified_unix) +
+              ",\"file_size_bytes\":" + std::to_string(entry.size_bytes) +
+              ",\"server_updated_at\":null,\"server_content_hash\":\"" +
+              crypto::Md5Hex(game.bytes) + "\"}\n";
+      }
+    }
+  }
+  c.Expect(console.sandbox.Write("/config/rommsync/state.db", v2), "rc1's state.db is on the card");
+
+  console.Boot();
+  console.engine.UseServer(&client, fixture.token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+  TickOnce(console, c, "the first tick after the upgrade");
+
+  const std::vector<ServerRow> empty_rows = RowsFor(client, base, fixture, empty.rom_id, "autosave");
+  c.Expect(empty_rows.size() == 1 && empty_rows[0].content_hash == crypto::Md5Hex(empty.bytes) &&
+               empty_rows[0].emulator == "fceumm",
+           "nova: an empty shared slot gets the save, once, under its core's id");
+  c.ExpectEq(console.sandbox.Read(empty.save), empty.bytes, "nova: and the card is untouched");
+
+  c.ExpectEq(console.sandbox.Read(newer.save), newer.retroarch,
+             "240pee: RetroArch's newer progress is on the card");
+  c.Expect(console.sandbox.HasBackupOf(newer.bytes), "240pee: the Switch's bytes under .backup/");
+  c.ExpectEq(RowsFor(client, base, fixture, newer.rom_id, "autosave").size(), std::size_t{1},
+             "240pee: and nothing was uploaded over it");
+  c.Expect(!ConflictRecorded(console, newer.rom_id), "240pee: a download, not a conflict");
+
+  c.ExpectEq(console.sandbox.Read(older.save), older.retroarch,
+             "gb240p: the server's head is on the card, as for any conflict");
+  c.Expect(console.sandbox.HasBackupOf(older.bytes),
+           "gb240p: the Switch's newer progress under .backup/");
+  c.ExpectEq(RowsFor(client, base, fixture, older.rom_id, "autosave").size(), std::size_t{1},
+             "gb240p: nothing was uploaded over RetroArch's save");
+  c.Expect(ConflictRecorded(console, older.rom_id),
+           "gb240p: and it is on the conflicts screen, restorable:\n" +
+               console.sandbox.Read("/config/rommsync/conflicts.db"));
+
+  for (const Game& game : games) {
+    const std::vector<ServerRow> old_rows = RowsFor(client, base, fixture, game.rom_id, "tico-srm");
+    c.Expect(old_rows.size() == 1 && old_rows[0].content_hash == crypto::Md5Hex(game.bytes),
+             std::string(game.rom_file) + ": rc1's row is still in tico-srm, as rc1 left it");
+  }
+  const std::string state_db = console.sandbox.Read("/config/rommsync/state.db");
+  c.Expect(state_db.rfind("rommsync-state 3\n", 0) == 0 &&
+               state_db.find("\"tico-srm\"") == std::string::npos,
+           "state.db is version 3, with nothing left under the old slot:\n" + state_db);
+
+  // The second tick: nothing to send.
+  TickOnce(console, c, "the second tick");
+  for (const Game& game : games) {
+    c.ExpectEq(RowsFor(client, base, fixture, game.rom_id, "autosave").size(), std::size_t{1},
+               std::string(game.rom_file) + ": no duplicate upload on the second tick");
+  }
+  c.ExpectEq(console.sandbox.Read(empty.save), empty.bytes, "nova: unchanged");
+  c.ExpectEq(console.sandbox.Read(newer.save), newer.retroarch, "240pee: unchanged");
+  c.ExpectEq(console.sandbox.Read(older.save), older.retroarch, "gb240p: unchanged");
+
+  for (const Game& game : games) {
+    ClearSlots(client, base, fixture, game.rom_id);
+  }
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
 /// The scenarios that need the docker RomM, by name. A table rather than a
 /// second `if` chain, so the list of them is written down once.
 struct RigScenario {
@@ -4140,6 +4535,8 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"foreground", Foreground},
       {"tico_accounts", TicoAccounts},
       {"server_deleted", ServerDeleted},
+      {"interop", Interop},
+      {"upgrade", Upgrade},
   };
   for (const RigScenario& scenario : kRigScenarios) {
     if (name == scenario.name) {

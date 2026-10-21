@@ -31,6 +31,19 @@ std::string LowerAscii(std::string_view text) {
   return out;
 }
 
+/// RomM's `SLOTTED_SAVE_EXTENSION`: the one save file its RetroArch path files
+/// as a version in a slot. Everything beside it -- `.rtc` -- it keeps out, "since
+/// a slot holds one save" (`handler/sync/retroarch/sync_handler.py`, 5.4.0).
+constexpr std::string_view kSlottedExtension = "srm";
+
+/// The slot for a save whose normalised extension is `extension`. See `SlotFor`.
+std::string SlotForExtension(std::string_view slot, std::string_view extension) {
+  if (extension == kSlottedExtension) {
+    return std::string(slot);
+  }
+  return std::string(slot) + "-" + std::string(extension);
+}
+
 /// The largest whole second a `sync::Timestamp` can actually hold.
 ///
 /// `sync.hpp` warns that `system_clock::time_point` cannot be relied on to hold
@@ -158,7 +171,7 @@ std::string BaseName(std::string_view file_name) {
   return std::string(file_name.substr(0, file_name.size() - sync::ExtensionOf(file_name).size()));
 }
 
-std::string SlotFor(std::string_view source, std::string_view file_name) {
+std::string SlotFor(std::string_view slot, std::string_view file_name) {
   // The extension, lowercased, with everything that is not a plain identifier
   // character dropped. FAT32 permits a good deal in a name, and the slot is a
   // key the server stores and this client has to reproduce byte for byte on
@@ -178,16 +191,50 @@ std::string SlotFor(std::string_view source, std::string_view file_name) {
   }
   if (extension.empty()) {
     // A save with no usable extension still needs a stable slot, and "save" is
-    // stable. It cannot collide with an extension-derived one for the same
-    // emulator unless the file really is called `x.save`, which pairs the two
-    // as the same slot -- the duplicate is then reported rather than silently
-    // overwriting through the server.
+    // stable. It cannot collide with an extension-derived one unless the file
+    // really is called `x.save`, which pairs the two as the same slot -- the
+    // duplicate is then reported rather than silently overwriting through the
+    // server.
     extension = "save";
   }
-  if (source.empty()) {
-    return extension;
+  return SlotForExtension(slot, extension);
+}
+
+std::string MigratedSlot(std::string_view slot, std::string_view old_slot) {
+  // Every slot a v2 build derived was `<source>-<extension>`, or the bare
+  // extension for a folder neither source explained, and the extension was
+  // already normalised -- so stripping the source is the whole inverse.
+  for (const std::string_view source : {std::string_view("retroarch-"), std::string_view("tico-")}) {
+    if (old_slot.size() > source.size() && old_slot.substr(0, source.size()) == source) {
+      return SlotForExtension(slot, old_slot.substr(source.size()));
+    }
   }
-  return LowerAscii(source) + "-" + extension;
+  return SlotForExtension(slot, old_slot);
+}
+
+std::optional<std::vector<std::string>> EmulatorFilter(const config::Config& config,
+                                                       const std::vector<SaveFile>& saves) {
+  std::set<std::string> ids;
+  const auto add = [&ids](std::string_view id) {
+    for (std::string& alias : RetroArchAliases(id)) {
+      ids.insert(std::move(alias));
+    }
+  };
+  for (const SaveFile& save : saves) {
+    if (save.emulator.empty()) {
+      return std::nullopt;
+    }
+    add(save.emulator);
+  }
+  for (const auto& [slug, mapped] : config.platforms) {
+    for (const std::string& folder : mapped.saves) {
+      add(ResolveSource(SourceOf(folder), slug, config).emulator_id);
+    }
+  }
+  if (ids.empty()) {
+    return std::nullopt;
+  }
+  return std::vector<std::string>(ids.begin(), ids.end());
 }
 
 std::map<std::string, std::string, std::less<>> PlatformHints(const config::Config& config,
@@ -216,7 +263,7 @@ std::map<std::string, std::string, std::less<>> PlatformHints(const config::Conf
 sync::ClientSaveState SaveFile::ToClientSaveState(std::optional<std::string> content_hash) const {
   sync::ClientSaveState state;
   state.rom_id = rom_id;
-  state.file_name = file_name;
+  state.file_name = server_name.empty() ? file_name : server_name;
   if (!slot.empty()) {
     state.slot = slot;
   }
@@ -689,7 +736,14 @@ ScanResult ScanSaves(const config::Config& config, const retroarch::Settings& re
          save.rom_id = rom.id;
          save.sd_path = sd_path;
          save.file_name = entry.name;
-         save.slot = SlotFor(ToString(source.source), entry.name);
+         save.slot = SlotFor(config.sync.slot, entry.name);
+         // The rom's stem, which is what RomM serves RetroArch and matches its
+         // uploads by (#236). The card's own name only if the stem could not be
+         // a file name, so a save that synced before still does.
+         save.server_name = rom.fs_name_no_ext + std::string(sync::ExtensionOf(entry.name));
+         if (rom.fs_name_no_ext.empty() || !sync::IsSingleFileName(save.server_name)) {
+           save.server_name = entry.name;
+         }
          save.emulator = source.emulator_id;
          save.platform_fs_slug = rom.platform_fs_slug;
          save.size_bytes = entry.size_bytes;

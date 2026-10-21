@@ -27,7 +27,7 @@
 // `rommsync/` headers (core/AGENTS.md) so SQLite cannot be linked into the
 // portable engine at all, and because a sysmodule heap has no room for one.
 //
-//     rommsync-state 2
+//     rommsync-state 3
 //     {"rom_id":12,"slot":"autosave","content_hash":"...","mtime":1757000000,...}
 //     {"rom_id":12,"slot":null,...}
 //     {"kind":"state","rom_id":12,"file_name":"Game (USA).state",...}
@@ -57,6 +57,18 @@
 // one extra tick of hashing, once, on the boot after the upgrade. That is the
 // designed cost of the version line, not a migration anybody has to write.
 //
+// ## Version 3: the shared slot (#236)
+//
+// The rows did not change shape; what a save's slot *means* did. Version 2
+// derived it from the folder's source and the extension (`tico-srm`); version 3
+// syncs every save in the configured shared slot (`autosave`, `autosave-rtc`).
+// Version 2 is every card rc1 wrote, so it is **read, not discarded**: discarding
+// it would lose its states' rows -- which no rescan rebuilds, and without which a
+// state is kept on both sides forever -- and every save's digest. Its states and
+// archival rows are in force as they were; its slotted rows are held apart in
+// `LoadedBaseline::legacy_saves` and moved by `AdoptLegacySaves` to the slot
+// each file is synced in now. A newer file than this build's is discarded.
+//
 // Timestamps are whole Unix seconds, not RFC 3339. The comparison the server
 // makes is at second granularity anyway, and a number cannot be spelled two
 // ways -- which the string can: this client writes `Z` and RomM writes `+00:00`
@@ -71,6 +83,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -88,7 +101,12 @@ inline constexpr const char* kStateFileName = "state.db";
 
 /// The first line of a well-formed file, `<magic> <version>`.
 inline constexpr const char* kFormatMagic = "rommsync-state";
-inline constexpr int kFormatVersion = 2;
+inline constexpr int kFormatVersion = 3;
+
+/// The version before #236 moved every save to the shared slot: the same rows,
+/// with slots derived as `<source>-<extension>`. Read, and migrated by
+/// `AdoptLegacySaves` -- see `LoadedBaseline::legacy_saves`.
+inline constexpr int kSourceSlotVersion = 2;
 
 /// The largest `state.db` that will be read, and the most rows it may hold.
 ///
@@ -322,6 +340,25 @@ struct LoadedBaseline {
   /// produces exactly one, saying there is no file yet.
   std::vector<std::string> diagnostics;
 
+  /// The version the file was written in: `kFormatVersion`, or
+  /// `kSourceSlotVersion` for a file from before #236. Zero when nothing was
+  /// read -- no file, or one discarded.
+  int version = 0;
+
+  /// A `kSourceSlotVersion` file's slotted save rows, **not** in `value`.
+  ///
+  /// Their slots are `<source>-<extension>` (`tico-srm`), which no save is
+  /// synced in any more, so a row left under one would describe nothing and
+  /// cost a row of `kMaxRecords` until it was trimmed. Held apart rather than
+  /// discarded, because each is still the digest of a file that is on the card:
+  /// `AdoptLegacySaves` moves it to the slot that file is now synced in, and the
+  /// first tick after the upgrade hashes nothing it already knew. A caller that
+  /// never adopts them loses only that -- every save is hashed once.
+  ///
+  /// The v2 file's archival (null-slot) rows and its states are in `value` as
+  /// they were: neither key moved.
+  std::vector<SaveRecord> legacy_saves;
+
   /// One line per diagnostic, for a log. Empty when there are none.
   std::string DescribeDiagnostics() const;
 };
@@ -338,6 +375,26 @@ std::string SerializeBaseline(const Baseline& baseline);
 /// no caller can reason about. Since dropping the lot costs only a tick of
 /// hashing, that is the cheaper mistake to make.
 LoadedBaseline ParseBaseline(std::string_view text);
+
+/// Move `loaded->legacy_saves` into `loaded->value`, each under the slot
+/// `slot_for` names for its old one -- `scan::MigratedSlot` under the
+/// configured slot (#236). Returns how many rows landed.
+///
+/// **Only the local half moves**: the digest, mtime and size of the file, which
+/// are what spare the scan a re-hash. The server half (`server_updated_at`,
+/// `server_content_hash`) described the *old* slot's row, and this device has
+/// never synced the new one -- carried across, the old digest would let #232's
+/// 409 rule read "unchanged since the last sync" against a slot whose head is
+/// some other device's progress, and download over a newer local save without a
+/// conflict. Left absent, the first meeting is what it is: no sync history.
+///
+/// A row whose new key is already taken -- RetroArch's and Tico's `.srm` of one
+/// rom, both now `autosave` -- is dropped, the first in key order kept, which is
+/// RetroArch's: the copy the scan also reads first. So is one `slot_for` has no
+/// slot for. Either costs a re-hash and nothing else.
+std::size_t AdoptLegacySaves(
+    LoadedBaseline* loaded,
+    const std::function<std::optional<std::string>(std::string_view old_slot)>& slot_for);
 
 /// Read `path` and parse it.
 ///

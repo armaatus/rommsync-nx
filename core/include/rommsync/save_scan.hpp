@@ -73,16 +73,25 @@ struct SaveFile {
   /// The file's own name, `Game (USA).srm`. Never a path.
   std::string file_name;
 
-  /// The pairing key with `rom_id`, derived and stable: `retroarch-srm`.
+  /// The pairing key with `rom_id`, from `SlotFor`: `autosave` for a `.srm`,
+  /// `autosave-rtc` for its companion (#236).
   ///
-  /// Derived rather than chosen because it has to be the *same* string on the
-  /// next tick and on the next boot -- a slot that moves makes the same file a
-  /// new save every time. It carries the source as well as the save's
-  /// extension because RomM pairs on `(rom_id, slot)` alone: a rom whose
-  /// RetroArch `.srm` and Tico `.srm` both mapped to `srm` would have the two
-  /// files overwrite each other through the server, forever. The *source*, not
-  /// the `emulator` below, so M10-3 moved no save to a new slot (#236 does).
+  /// The shared slot other clients use, so a save made here is the save they
+  /// see. Derived from the configured slot and the extension and nothing else,
+  /// because it has to be the *same* string on the next tick and on the next
+  /// boot -- a slot that moves makes the same file a new save every time. A
+  /// rom's RetroArch `.srm` and Tico `.srm` are therefore one slot, and the
+  /// second the walk finds is a `kDuplicateSlot` skip: RomM pairs on
+  /// `(rom_id, slot)` alone, and two files in one pair would overwrite each
+  /// other through the server.
   std::string slot;
+
+  /// The name the server is told -- the negotiate entry's `file_name` and the
+  /// upload's -- `<rom fs_name_no_ext><extension>`: RomM serves RetroArch the
+  /// newest autosave under that stem, and matches its uploads by it (#226 R2).
+  /// Differs from `file_name` when the card's copy matched by `fs_name_no_tags`
+  /// or by another case.
+  std::string server_name;
 
   /// RomM's `emulator` for it -- `snes9x`, `tico-duckstation`, an override --
   /// from `scan::ResolveSource`. Empty when nothing says, which is sent as
@@ -391,10 +400,38 @@ ScanResult ScanStates(const config::Config& config, const retroarch::Settings& r
 /// called `Game.nes` that the user does not have.
 std::string BaseName(std::string_view file_name);
 
-/// The slot for a file from a `source` folder -- `ToString(Source)`, so
-/// `retroarch`, `tico` or "". See `SaveFile::slot`. Which emulator wrote the
-/// file is `SourceOf` and `ResolveSource`, in save_source.hpp.
-std::string SlotFor(std::string_view source, std::string_view file_name);
+/// The slot a save called `file_name` is synced in, under the configured `slot`
+/// (`config::SyncConfig::slot`, `autosave` by default). See `SaveFile::slot`.
+///
+///   - A `.srm` -- save RAM, in any case -- is `slot` itself.
+///   - Anything else is `<slot>-<extension>`, lowercased: `autosave-rtc`,
+///     `autosave-mcd`, and `autosave-save` for a file with no extension.
+///
+/// One save per rom per slot, because that is all a slot can hold: RomM pairs on
+/// `(rom_id, slot)` and keeps the newest row of a slot as its head, so a `.rtc`
+/// beside the `.srm` in one slot would become the head the `.srm` downloads.
+/// RomM's own RetroArch path slots `.srm` only, for the same reason (#236).
+std::string SlotFor(std::string_view slot, std::string_view file_name);
+
+/// The slot a `state.db` version-2 row's `old_slot` describes now: the
+/// `<source>-<extension>` (`tico-srm`, `retroarch-rtc`) or bare extension a v2
+/// build derived, as `SlotFor` would derive it under `slot`. The migration
+/// `state::AdoptLegacySaves` performs (#236).
+std::string MigratedSlot(std::string_view slot, std::string_view old_slot);
+
+/// The emulators negotiate is filtered to (`SyncNegotiatePayload::emulators`,
+/// #236): the ids this console can load. Every scanned save's emulator, and the
+/// id each mapped platform's save folders resolve to (`ResolveSource`) so a core
+/// with no save on the card yet is still offered its server saves -- each with
+/// its `RetroArchAliases`, since other clients name a lineage by RetroArch's
+/// folder too. Sorted, without repeats.
+///
+/// **Nullopt -- no filter -- when a save has no emulator.** RomM filters on the
+/// row's `emulator` and a list cannot name `null`, so that save's own uploads
+/// would leave the pairing: negotiated as missing, uploaded again, every tick.
+/// Also nullopt when there is nothing to list.
+std::optional<std::vector<std::string>> EmulatorFilter(const config::Config& config,
+                                                       const std::vector<SaveFile>& saves);
 
 /// Which platform each save directory implies, keyed by directory.
 ///

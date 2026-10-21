@@ -467,6 +467,7 @@ Negotiation NegotiateWith(http::HttpClient& client, const auth::StoredToken& tok
   if (rom_ids != nullptr) {
     payload.rom_ids = *rom_ids;
   }
+  payload.emulators = options.emulators;
   const Encoded encoded = EncodeNegotiateRequest(payload);
   if (!encoded.ok()) {
     // The payload's own fields -- a blank `device_id` -- which the loop above

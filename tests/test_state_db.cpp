@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <string_view>
 #include <string>
 #include <system_error>
 
@@ -24,6 +25,7 @@
 #include "scratch.hpp"
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/md5.hpp"
+#include "rommsync/save_scan.hpp"
 #include "rommsync/state_db.hpp"
 #include "rommsync/sync.hpp"
 
@@ -36,6 +38,7 @@ namespace {
 // CI is the failure mode, and the anonymous namespace is what removes it.
 namespace crypto = rommsync::crypto;
 namespace io = rommsync::io;
+namespace scan = rommsync::scan;
 namespace state = rommsync::state;
 namespace sync = rommsync::sync;
 
@@ -652,6 +655,77 @@ void CorruptFilesAreAnEmptyBaselineAndADiagnostic(checks::Checks& c) {
            "and the verdict survives the cap -- " + flooded.DescribeDiagnostics());
 }
 
+/// #236: a version 2 file is the one every console upgrading from rc1 holds. Its
+/// states and archival rows mean what they meant; its slotted saves were keyed
+/// on a `<source>-<ext>` slot that no longer exists, so they are held apart
+/// rather than discarded or read as rows of the new slot.
+void AVersion2FileIsMigratedNotDiscarded(checks::Checks& c) {
+  const std::string digest = crypto::Md5Hex("rc1's save");
+  const std::string row_tail = "\",\"mtime\":1757000000,\"file_size_bytes\":32768,"
+                               "\"server_updated_at\":1757000100,\"server_content_hash\":\"" +
+                               crypto::Md5Hex("what rc1's server held") + "\"}\n";
+  const std::string v2 =
+      "rommsync-state 2\n"
+      "{\"rom_id\":12,\"slot\":null,\"content_hash\":\"" + crypto::Md5Hex("x") +
+      "\",\"mtime\":1757000000,\"file_size_bytes\":1,\"server_updated_at\":null,"
+      "\"server_content_hash\":null}\n"
+      "{\"rom_id\":12,\"slot\":\"retroarch-srm\",\"content_hash\":\"" + digest + row_tail +
+      "{\"rom_id\":12,\"slot\":\"tico-rtc\",\"content_hash\":\"" + crypto::Md5Hex("clock") + row_tail +
+      "{\"rom_id\":12,\"slot\":\"tico-srm\",\"content_hash\":\"" + crypto::Md5Hex("tico's") + row_tail +
+      "{\"kind\":\"state\",\"rom_id\":12,\"file_name\":\"Game (USA).state\",\"emulator\":\"tico\","
+      "\"content_hash\":\"" + crypto::Md5Hex("state") +
+      "\",\"mtime\":1757000100,\"file_size_bytes\":4,\"server_state_id\":7,"
+      "\"server_updated_at\":1757000090,\"server_file_size_bytes\":4}\n";
+
+  state::LoadedBaseline loaded = state::ParseBaseline(v2);
+  c.Expect(loaded.diagnostics.empty(), "a version 2 file reads silently -- " +
+                                           loaded.DescribeDiagnostics());
+  c.ExpectEq(loaded.version, 2, "and says which version it was");
+  c.Expect(loaded.value.Find(12, std::nullopt) != nullptr, "its archival row is kept as it was");
+  c.Expect(loaded.value.FindState(12, "Game (USA).state") != nullptr,
+           "and so is its state: states are keyed by name, which #236 did not move");
+  c.Expect(loaded.value.Find(12, std::string("tico-srm")) == nullptr,
+           "a slotted row is not read as a row of the slot it named");
+  c.ExpectEq(loaded.legacy_saves.size(), std::size_t{3}, "it is held apart, all three of them");
+
+  const std::size_t adopted =
+      state::AdoptLegacySaves(&loaded, [](std::string_view old_slot) -> std::optional<std::string> {
+        return scan::MigratedSlot("autosave", old_slot);
+      });
+  c.ExpectEq(adopted, std::size_t{2}, "two rows land: the save RAM and the clock");
+  c.Expect(loaded.legacy_saves.empty(), "and nothing is left apart");
+  const state::SaveRecord* save = loaded.value.Find(12, std::string("autosave"));
+  c.Expect(save != nullptr && save->content_hash == digest && save->file_size_bytes == 32768 &&
+               sync::UnixSeconds(save->mtime) == 1757000000,
+           "the shared slot's row is RetroArch's -- the copy the scan also reads first -- so "
+           "the file it describes is not hashed again");
+  c.Expect(save != nullptr && !save->server_updated_at.has_value() &&
+               !save->server_content_hash.has_value(),
+           "with no server side: this device has never synced the shared slot, and the old "
+           "slot's digest would have the 409 rule call its first meeting a download");
+  c.Expect(loaded.value.Find(12, std::string("autosave-rtc")) != nullptr,
+           "the clock's row is under the clock's new slot");
+
+  const std::string written = state::SerializeBaseline(loaded.value);
+  c.Expect(written.rfind(Header(), 0) == 0, "what is written back is this build's version");
+  const state::LoadedBaseline again = state::ParseBaseline(written);
+  c.ExpectEq(again.version, state::kFormatVersion, "and reads back as it");
+  c.Expect(again.legacy_saves.empty() && again.value.Find(12, std::string("autosave")) != nullptr,
+           "with its slotted rows in force, not held apart");
+
+  state::LoadedBaseline refused = state::ParseBaseline(v2);
+  c.ExpectEq(state::AdoptLegacySaves(&refused, [](std::string_view) -> std::optional<std::string> {
+               return std::nullopt;
+             }),
+             std::size_t{0}, "a row the caller has no slot for is dropped, not kept under its old one");
+  c.Expect(refused.value.rows().size() == 1 && refused.legacy_saves.empty(),
+           "leaving the archival row alone");
+
+  const state::LoadedBaseline broken = state::ParseBaseline(v2 + "{\"rom_id\":12,\n");
+  c.Expect(broken.value.empty() && broken.legacy_saves.empty(),
+           "a damaged version 2 file is discarded whole, like any other");
+}
+
 /// **Not the rows that happened to parse.** A truncation leaves a prefix that is
 /// individually well-formed and collectively a lie, and there is no way for a
 /// caller to tell it from a complete file.
@@ -908,6 +982,7 @@ int main() {
   TheTwoBoundsAgree(c);
   NamesAMissingDirectory(c);
   CorruptFilesAreAnEmptyBaselineAndADiagnostic(c);
+  AVersion2FileIsMigratedNotDiscarded(c);
   APartialFileIsNotAPartialBaseline(c);
   AHugeTimestampIsDiagnosedNotOverflowed(c);
   AnUnusableOldIsNotABrandNewCard(c);

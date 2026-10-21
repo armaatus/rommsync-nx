@@ -907,6 +907,7 @@ set(SYNC_SCENARIOS
   understood  # a renamed OPTIONAL one is a silent 200 with a different plan
   negotiates  # sync::Negotiate end to end: a session and an operation, typed
   discovers   # an empty `saves` is how a client learns what it is missing
+  filters     # `emulators` keeps a lineage this console cannot load out of the plan
   revoked     # 401 is a revoked token, not a parse failure, and nothing changes
   truncated   # a clean short body is a named json error and no plan
   stalled     # a stall times out and is retried, with the backoff doubling
@@ -1540,6 +1541,7 @@ set(TICK_RIG_SCENARIOS
   baseline_other_row  # #234: ...and against another device's new row (#227), never suppressed
   deleted          # M10-7: deleted in RomM -> backed up and removed, and never re-uploaded
   deleted_keep     # ...and under on_server_delete = keep, left on the card, never re-uploaded
+  migrated         # #236: rc1's v2 row moves to the shared slot; its newer head lands, backed up
 )
 
 # M10-2 (#228): which RomM this console is talking to. `versions` and
@@ -2267,6 +2269,8 @@ set(ENGINE_RIG_SCENARIOS
   tico_accounts  # #231: two Tico accounts and none named reach the settings screen
   foreground   # #242: no tick under a running game, and one after it closes
   server_deleted # #233: a save deleted in RomM, removed or kept as config.ini says, logged and listed
+  interop      # #236: RetroArch's Cloud Sync save reaches Tico's folder, and the Switch's reaches RetroArch
+  upgrade      # #236: rc1's state.db and tico-srm rows: no data lost, no duplicate upload
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})

@@ -439,6 +439,56 @@ int Discovers(http::HttpClient& client, const std::string& base, const Fixture& 
   return checks.failures();
 }
 
+// --- filters -------------------------------------------------------------------
+
+/// #236: `NegotiateOptions::emulators` reaches the wire, and RomM 5.4 answers it
+/// by leaving a lineage this console cannot load out of the plan -- the same
+/// server-only save the unfiltered negotiation offers as a download.
+int Filters(http::HttpClient& client, const std::string& base, const Fixture& fixture,
+            std::int64_t rom_id) {
+  rig::Checks checks;
+  const std::string slot = UniqueSlot("m10-10-filters");
+  const std::string name = "m10-10-filters.srm";
+  const std::string path = rig::ScratchDir() + "/" + name;
+  if (!rig::WriteFile(path, "a save only a PlayStation core can read, " + slot + "\n")) {
+    std::cerr << "could not write " << path << "\n";
+    return 1;
+  }
+  harness::Save server;
+  if (!harness::UploadSave(client, base, fixture, rom_id, slot, "mednafen_psx_hw", path, name,
+                           /*with_device=*/false, &server)) {
+    checks.Expect(false, "the other lineage's save was stored");
+    std::filesystem::remove(path);
+    return checks.failures();
+  }
+
+  const sync::Negotiation offered = sync::Negotiate(client, TokenFor(base, fixture), {});
+  checks.Expect(offered.ok() && PlannedFor(offered.plan, slot) != nullptr,
+                "unfiltered, the server offers it: " + offered.message);
+  harness::CloseSession(client, base, fixture,
+                        "{\"session_id\":" + std::to_string(offered.plan.session_id) + "}");
+
+  sync::NegotiateOptions filtered;
+  filtered.emulators = std::vector<std::string>{"snes9x", "Snes9x"};
+  const sync::Negotiation kept = sync::Negotiate(client, TokenFor(base, fixture), {}, filtered);
+  checks.Expect(kept.ok(), "a filtered negotiation is one RomM accepts: " + kept.message);
+  checks.Expect(PlannedFor(kept.plan, slot) == nullptr,
+                "filtered to the snes cores, it is not offered at all");
+  harness::CloseSession(client, base, fixture,
+                        "{\"session_id\":" + std::to_string(kept.plan.session_id) + "}");
+
+  filtered.emulators = std::vector<std::string>{"mednafen_psx_hw"};
+  const sync::Negotiation named = sync::Negotiate(client, TokenFor(base, fixture), {}, filtered);
+  checks.Expect(named.ok() && PlannedFor(named.plan, slot) != nullptr,
+                "and filtered to its own core, it is");
+  harness::CloseSession(client, base, fixture,
+                        "{\"session_id\":" + std::to_string(named.plan.session_id) + "}");
+
+  harness::DeleteSave(client, base, fixture, server.id);
+  std::filesystem::remove(path);
+  return checks.failures();
+}
+
 // --- revoked -----------------------------------------------------------------
 
 int Revoked(http::HttpClient& client, const std::string& base, const Fixture& fixture) {
@@ -769,6 +819,8 @@ int main(int argc, char** argv) {
     failures = Negotiates(*client, base, fixture, rom_id);
   } else if (scenario == "discovers") {
     failures = Discovers(*client, base, fixture, rom_id);
+  } else if (scenario == "filters") {
+    failures = Filters(*client, base, fixture, rom_id);
   } else if (scenario == "revoked") {
     failures = Revoked(*client, base, fixture);
   } else if (scenario == "truncated") {

@@ -414,6 +414,29 @@ void NumbersAndTheirBounds(checks::Checks& c) {
   c.ExpectEq(plus.value.sync.interval_min, 15, "a signed positive is still a number");
 }
 
+// #236: the slot every save is synced in.
+void TheSlotIsCheckedAndDefaultsToAutosave(checks::Checks& c) {
+  const config::LoadResult absent = config::ParseConfig(WithServer("[sync]\nenabled = true\n"));
+  c.ExpectEq(absent.value.sync.slot, std::string("autosave"),
+             "no slot line is the shared autosave slot");
+
+  const config::LoadResult named =
+      config::ParseConfig(WithServer("[sync]\nslot = switch_only-1\n"));
+  c.ExpectEq(named.value.sync.slot, std::string("switch_only-1"), "a named slot is used as written");
+  c.Expect(named.ok(), "and is not a complaint: " + named.DescribeDiagnostics());
+
+  for (const char* text : {"", "my slot", "a/b", "auto.save", "é",
+                           "a234567890123456789012345678901234567890123456789012345678901234x"}) {
+    const config::LoadResult bad =
+        config::ParseConfig(WithServer(std::string("[sync]\nslot = ") + text + "\n"));
+    c.ExpectEq(bad.value.sync.slot, std::string("autosave"),
+               std::string("'") + text + "' is refused and autosave stays in force");
+    const config::Diagnostic* said = Complaint(bad, "sync", "slot");
+    c.Expect(said != nullptr && said->severity == config::Severity::kWarning,
+             std::string("'") + text + "' is a warning on the slot line");
+  }
+}
+
 void DuplicatesResolveToTheLastLine(checks::Checks& c) {
   const config::LoadResult result = config::ParseConfig(WithServer(
       "[sync]\ninterval_min = 10\ninterval_min = 20\n[platform.gba]\nroms = /a\n"
@@ -897,6 +920,7 @@ void TheDocumentedExampleParses(checks::Checks& c) {
   c.Expect(example.rfind("version = " + std::to_string(config::kConfigVersion), 0) == 0,
            "the documented example opens with this build's config version");
   c.ExpectEq(result.value.sync.interval_min, 30, "the interval the document shows");
+  c.ExpectEq(result.value.sync.slot, std::string("autosave"), "the slot the document shows");
   c.Expect(!result.value.sync.states, "states off, as the document shows");
   c.ExpectEq(result.value.RomTarget("snes"), std::string("/tico/roms/snes"),
              "and the snes mapping the document shows");
@@ -940,6 +964,7 @@ void TheShippedExampleParses(checks::Checks& c) {
              "the interval is the built-in default");
   c.ExpectEq(result.value.sync.enabled, defaults.sync.enabled, "so is [sync] enabled");
   c.ExpectEq(result.value.sync.on_boot, defaults.sync.on_boot, "so is [sync] on_boot");
+  c.ExpectEq(result.value.sync.slot, defaults.sync.slot, "so is [sync] slot");
   c.ExpectEq(result.value.sync.saves, defaults.sync.saves, "so is [sync] saves");
   c.ExpectEq(result.value.sync.states, defaults.sync.states, "so is [sync] states");
   c.ExpectEq(result.value.sync.conflict_show, defaults.sync.conflict_show,
@@ -971,6 +996,7 @@ int main() {
   ItSurvivesHowPeopleActuallyWriteFiles(c);
   ABadFileStillBoots(c);
   NumbersAndTheirBounds(c);
+  TheSlotIsCheckedAndDefaultsToAutosave(c);
   DuplicatesResolveToTheLastLine(c);
   PlatformSectionsReplaceTheBuiltInEntry(c);
   PathsAreCheckedBeforeTheyAreUsed(c);

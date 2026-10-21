@@ -362,6 +362,15 @@ Encoded EncodeNegotiateRequest(const SyncNegotiatePayload& payload) {
     }
   }
 
+  if (payload.emulators.has_value()) {
+    for (const std::string& emulator : *payload.emulators) {
+      if (emulator.empty()) {
+        encoded.error = Fail("emulators", "an emulator id is empty");
+        return encoded;
+      }
+    }
+  }
+
   std::string body("{\"device_id\":");
   body += payload.device_id.has_value() ? json::Quote(*payload.device_id) : "null";
   body += ",\"saves\":[";
@@ -404,6 +413,10 @@ Encoded EncodeNegotiateRequest(const SyncNegotiatePayload& payload) {
       body += std::to_string((*payload.rom_ids)[index]);
     }
     body += ']';
+  }
+  if (payload.emulators.has_value()) {
+    body += ",\"emulators\":";
+    body += json::QuoteArray(*payload.emulators);
   }
   body += '}';
   encoded.body = std::move(body);

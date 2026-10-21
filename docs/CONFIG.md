@@ -14,6 +14,7 @@ enabled       = true
 interval_min  = 30                 ; 0 = only boot + manual
 on_boot       = true
 saves         = true
+slot          = autosave           ; the slot RetroArch, the web player and Grout share
 states        = false              ; fragile across cores; opt-in
 conflict_show = true               ; surface conflicts in the overlay
 on_server_delete = remove          ; remove | keep; a save deleted in RomM, see below
@@ -300,7 +301,28 @@ warning.
 reads no subfolder), `*.tmp` (Tico writes a save there and renames it; one a
 crash left behind is never uploaded), `*.png` (a state's screenshot) and
 `*.restart` (DuckStation's). Snes9x's `.rtc` clock is synced beside its `.srm`,
-as a save of its own in its own slot.
+as a save of its own in its own slot (`autosave-rtc`; see below).
+
+### `slot`: the shared slot
+
+`[sync] slot` names the slot every save is synced in, and defaults to
+`autosave` (#236). That is the slot RetroArch's own Cloud Sync, RomM's web
+player, Argosy and Grout keep a game's save RAM in, so with the default a save
+made on the Switch is the one those clients load, and theirs is the one the
+Switch gets — for the systems whose Tico module is the same libretro core
+([`emulator`](#emulator-which-emulator-romm-is-told-wrote-a-platforms-saves)).
+
+A `.srm` is synced in the slot itself. Every other kind of save file gets a slot
+of its own, `<slot>-<extension>` — `autosave-rtc` for Snes9x's clock,
+`autosave-mcd` for a DuckStation card — because a slot holds one save per game:
+RomM pairs a game's slot with its newest file, and a clock in the same slot
+would be paired with the save RAM.
+
+Another name keeps this console's saves to itself, in a slot no other client
+reads: letters, digits, `-` and `_`, up to 64 of them. Anything else is a
+`warning` and `autosave` stays in force. Changing it moves every save to the new
+slot on the next tick, as a first meeting with whatever is there; the old slot
+is left on the server. The overlay does not edit it.
 
 ### `conflict_show` hides the screen, never the recording
 
@@ -432,6 +454,8 @@ Each report carries a severity, the line number, and the section and key:
   is already there and truncated, so a rom queued again is downloaded again
   rather than assumed good. A download nothing could check still finishes; the
   queue entry says it was not verified and never claims it was.
+- `slot` is 1–64 ASCII letters, digits, `-` and `_`. Anything else → `warning`,
+  and the slot in force (`autosave` unless an earlier line set one) is kept.
 - `interval_min` is a whole number of minutes. Negative or unparseable →
   `warning`, default kept. Above the 10080-minute (one week) maximum → clamped
   to it with a `warning`, because falling back to the 30-minute default would

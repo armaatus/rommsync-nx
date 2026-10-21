@@ -61,13 +61,21 @@ For each file under the configured save/state dirs:
    RetroArch's flat `saves/` doesn't — match by name across the library then).
 4. Ambiguous match (same base name on two platforms, no platform hint) → skip and
    log; never guess.
-5. Derive the `slot` from the source the folder belongs to (RetroArch or Tico)
-   and the save's own extension (`retroarch-srm`). It pairs with `rom_id` on the
-   server, so it has to be **derived, not chosen**: a slot that changes between
-   ticks makes the same file a new save every tick. The source is in it because
-   RomM pairs on `(rom_id, slot)` alone — a rom whose RetroArch `.srm` and Tico
-   `.srm` both mapped to `srm` would have the two files overwrite each other
-   through the server, forever. (#236 moves saves to `autosave`.)
+5. Derive the `slot`: the shared one, `[sync] slot` (`autosave` by default,
+   [CONFIG.md](CONFIG.md#slot-the-shared-slot)), for a `.srm`, and
+   `<slot>-<extension>` for anything else (`autosave-rtc`, `autosave-mcd`) —
+   `scan::SlotFor` (#236). `autosave` is the slot RetroArch's Cloud Sync, the
+   web player, Argosy and Grout file a game's save RAM under, so a save here is
+   the save they see. It pairs with `rom_id` on the server, so it is **derived,
+   not chosen** per file: a slot that changes between ticks makes the same file a
+   new save every tick. One slot holds one save per rom — RomM keeps the newest
+   row of a slot as the head every client pairs against — which is why a
+   companion such as Snes9x's `.rtc` gets a slot of its own (RomM's RetroArch path
+   keeps it out of the slot too), and why a rom's RetroArch `.srm` and Tico `.srm`
+   on one card are one slot: the one found first (RetroArch's) is synced and the
+   other is skipped as a *duplicate slot*. The name the server is told is the
+   rom's own stem, `<fs_name_no_ext><ext>`, which is the name RomM serves
+   RetroArch the save under.
 6. Name the `emulator` that wrote it — the id RomM pairs lineages on and other
    clients look saves up by, not the source's name (`scan::ResolveSource`,
    [`save_source.hpp`](../core/include/rommsync/save_source.hpp)). A RetroArch
@@ -129,6 +137,45 @@ the SHA1 the rom schema uses:
 sync across ticks; a `null` slot means "archival, manual upload" to RomM and is
 never paired with a slotted server save, so it negotiates as `upload` every time
 even when the identical bytes are already there. Pick a slot and keep it.
+
+**`emulators` filters the lineages (5.4, #236).** The body also carries
+`"emulators": [...]`, the ids this console can load — every scanned save's, and
+the one each mapped platform's folders resolve to, each with RetroArch's folder
+name for it (`scan::EmulatorFilter`). RomM then pairs and offers only server
+saves one of them wrote, so a PlayStation core's save in a rom's `autosave` is
+never downloaded over a Tico DuckStation card. It is left out — not sent as `[]`,
+which matches nothing — when a scanned save has no emulator: RomM cannot list
+`null`, and that save's own uploads would drop out of the pairing and be
+uploaded again every tick. The slot guard is not filtered: an upload into a slot
+whose newest save is a lineage the filter hides still draws the 409 below.
+
+### Upgrading from rc1: the old slots (#236)
+
+v1.0.0-rc1 synced each save in a slot of its own, `<source>-<extension>`
+(`tico-srm`, `retroarch-srm`). The first tick after the upgrade does **not**
+re-upload those: every save is negotiated in the shared slot like any other, and
+the server arbitrates the first meeting.
+
+- `state.db` is version 2 on that card. It is read, not discarded (state_db.hpp):
+  each `tico-srm` row moves to the slot its file is synced in now, keeping the
+  file's digest, mtime and size — so nothing is hashed again — and **dropping its
+  server half**. This device has never synced the shared slot, and the old
+  slot's digest would have the 409 rule below take any newer head as a plain
+  download of "unchanged" bytes.
+- An empty shared slot gets the save, once.
+- A shared slot holding the same bytes is a `no_op`.
+- One holding a newer save (RetroArch's, say) is a `download`, the card's bytes
+  backed up first.
+- One holding an *older* one is a `conflict`: the guard refuses the upload, and a
+  device that has never synced the slot cannot show its bytes unchanged. The
+  head lands as for any conflict and the conflicts screen offers the card's copy
+  back; with #240 the losing side is also kept on the server.
+
+**rc1's rows are left on the server**, in their old slots, untouched. RomM's web
+UI shows them as named slots (`tico-srm`) beside `autosave`; they are the copy
+of each save as rc1 last synced it, and deleting them is the user's call. With
+the `emulators` filter on they are never offered back to this console (rc1 sent
+`emulator=tico`).
 
 That entry is `rommsync::sync::ClientSaveState`
 ([`core/include/rommsync/sync.hpp`](../core/include/rommsync/sync.hpp)), and

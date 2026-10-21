@@ -222,6 +222,32 @@ void ApplyServer(const ParseState& state, int line, std::string_view key, std::s
   }
 }
 
+}  // namespace
+
+bool ValidSlot(std::string_view slot, std::string* why) {
+  if (slot.empty()) {
+    *why = "a slot cannot be empty";
+    return false;
+  }
+  if (slot.size() > kMaxSlotLength) {
+    *why = "longer than " + std::to_string(kMaxSlotLength) + " characters";
+    return false;
+  }
+  for (const char character : slot) {
+    const bool keep = (character >= 'a' && character <= 'z') ||
+                      (character >= 'A' && character <= 'Z') ||
+                      (character >= '0' && character <= '9') || character == '-' ||
+                      character == '_';
+    if (!keep) {
+      *why = "a slot is letters, digits, '-' and '_' only";
+      return false;
+    }
+  }
+  return true;
+}
+
+namespace {
+
 void ApplySync(const ParseState& state, int line, std::string_view key, std::string_view value,
                Config* config, Diagnostics* diags) {
   const std::string quoted = "'" + std::string(value) + "'";
@@ -268,6 +294,17 @@ void ApplySync(const ParseState& state, int line, std::string_view key, std::str
                      std::string(config->sync.on_server_delete == OnServerDelete::kKeep ? "keep"
                                                                                        : "remove"));
     }
+    return;
+  }
+
+  if (key == "slot") {
+    std::string why;
+    if (!ValidSlot(value, &why)) {
+      diags->Add(Severity::kWarning, line, state.section, key,
+                 why + "; keeping '" + config->sync.slot + "'");
+      return;
+    }
+    config->sync.slot = std::string(value);
     return;
   }
 
