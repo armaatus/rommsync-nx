@@ -73,6 +73,9 @@ void SetHeadline(SyncActionsView* view, const ipc::Status& status, ipc::SyncOutc
       view->tone = Tone::kNeutral;
       return;
     case ipc::SyncOutcome::kAccepted:
+    // Never predicted: `Status` does not carry the foreground, so a held press
+    // is the notice's to say, not the headline's (#242).
+    case ipc::SyncOutcome::kDeferred:
       break;
   }
   view->headline = "Ready to sync";
@@ -138,7 +141,12 @@ void SetNotice(SyncActionsView* view, const ipc::Status& status, const LastComma
       // dropped afterwards -- `sync_seen_running` is what makes the second half
       // of that true, since a tick that has finished reports the same
       // `sync_in_progress` as one that has not started.
-      if (last.sync == ipc::SyncOutcome::kAccepted &&
+      //
+      // A held press (#242) goes the same way, for the same reason, once the
+      // tick it promised starts: until then it is the only thing on the screen
+      // saying the press was not lost.
+      if ((last.sync == ipc::SyncOutcome::kAccepted ||
+           last.sync == ipc::SyncOutcome::kDeferred) &&
           (status.sync_in_progress || last.sync_seen_running)) {
         return;
       }
@@ -212,6 +220,8 @@ std::string SyncOutcomeText(ipc::SyncOutcome outcome) {
       return "This console is not paired";
     case ipc::SyncOutcome::kDisabled:
       return "Auto-sync is off";
+    case ipc::SyncOutcome::kDeferred:
+      return "Syncs when the game closes";
   }
   return "The sysmodule did not say";
 }
@@ -221,7 +231,9 @@ Tone SyncOutcomeTone(ipc::SyncOutcome outcome) {
     case ipc::SyncOutcome::kAccepted:
       return Tone::kGood;
     case ipc::SyncOutcome::kAlreadyRunning:
-      // Nothing is wrong: the thing the user asked for is already happening.
+    // Nothing is wrong: the thing the user asked for is already happening, or
+    // will the moment the game closes.
+    case ipc::SyncOutcome::kDeferred:
       return Tone::kNeutral;
     case ipc::SyncOutcome::kNotConfigured:
     case ipc::SyncOutcome::kUnauthenticated:

@@ -136,7 +136,10 @@ inline constexpr const char* kServiceName = "rommsync";
 /// **5** since M10-2 (#228), which added `server_version` and
 /// `server_supported` to `Status` -- required fields, so a bump by the rule
 /// above.
-inline constexpr std::uint32_t kVersion = 5;
+///
+/// **6** since M10-16 (#242), which added `SyncOutcome::kDeferred`: a v5
+/// overlay reading `"deferred"` fails to decode `SyncNow`'s whole answer.
+inline constexpr std::uint32_t kVersion = 6;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///
@@ -570,12 +573,18 @@ inline constexpr std::size_t kMaxAssignments = config::kMaxEditAssignments;
 /// `kDisabled` is a distinct outcome from `kAccepted` because M4-2 (#24) renders
 /// it: a user who pressed "Sync now" with auto-sync switched off has to be told
 /// which switch to flip, not shown a spinner that never moves.
+///
+/// `kDeferred` is a press that was **taken** and will not run yet (#242): a game
+/// is in the foreground, and a tick under it is the one that loses a save --
+/// the game writes its in-memory copy over a download when it closes. The tick
+/// runs once it has. Not a refusal, so the screen says when rather than no.
 enum class SyncOutcome {
   kAccepted,
   kAlreadyRunning,
   kNotConfigured,
   kUnauthenticated,
   kDisabled,
+  kDeferred,
 };
 const char* ToString(SyncOutcome outcome);
 
@@ -1137,6 +1146,15 @@ class Engine {
   /// already established that there is a server, a token and a switch that is
   /// on -- see `ServiceCore::SyncNow`.
   virtual bool RequestSync() = 0;
+
+  /// An application is in the foreground, so a tick asked for now waits for it
+  /// to close (#242). What turns a taken `RequestSync` into
+  /// `SyncOutcome::kDeferred` rather than `kAccepted`.
+  ///
+  /// Asks the platform, never the network. False by default: an engine that
+  /// cannot tell is one that never holds a tick, which is every engine before
+  /// #242 and every host build without a probe.
+  virtual bool application_running() const { return false; }
 
   /// Start a pairing attempt, discarding whatever the last one left behind.
   ///

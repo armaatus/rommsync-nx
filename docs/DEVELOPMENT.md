@@ -817,8 +817,10 @@ tick runs on, so the two save writers cannot overlap -- and answers `running` at
 once; the overlay polls command 17 until it says `done`. Before that the copy
 ran on the IPC thread and held the overlay's call, and every other command, for
 as long as the card took. That change of answer made `ipc::kVersion` 3;
-`SyncResult::kServerDisabled` (M10-9, #235) made it 4, and the two required
-`Status` fields M10-2 (#228) added made it 5.
+`SyncResult::kServerDisabled` (M10-9, #235) made it 4, the two required
+`Status` fields M10-2 (#228) added made it 5, and `SyncOutcome::kDeferred` --
+"Sync now" pressed during a game, held until it closes (M10-16, #242) -- made
+it 6.
 
 The overlay bounds every call anyway: `IpcClient` dispatches on a worker thread
 of its own and the draw thread waits at most `kCallBudget` (half a second) for

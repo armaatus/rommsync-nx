@@ -224,7 +224,13 @@ SyncOutcome ServiceCore::SyncNow() {
   if (!config.sync.enabled) {
     return SyncOutcome::kDisabled;
   }
-  return engine_.RequestSync() ? SyncOutcome::kAccepted : SyncOutcome::kAlreadyRunning;
+  if (!engine_.RequestSync()) {
+    return SyncOutcome::kAlreadyRunning;
+  }
+  // Taken either way, and last because it is not a remedy: a game in the
+  // foreground holds the tick until it closes (#242), and a screen that said
+  // "Sync started" would be a press the user repeats while nothing moves.
+  return engine_.application_running() ? SyncOutcome::kDeferred : SyncOutcome::kAccepted;
 }
 
 Error ServiceCore::StartPair(auth::PairingStatus* status) {

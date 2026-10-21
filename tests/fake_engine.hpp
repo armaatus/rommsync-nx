@@ -86,6 +86,10 @@ class FakeEngine : public ipc::Engine {
     return sync_accepted;
   }
 
+  /// #242: an application in the foreground.
+  bool application_running_now = false;
+  bool application_running() const override { return application_running_now; }
+
   ipc::Error StartPairing() override { return start_pairing_error; }
   ipc::Error Unpair() override { return unpair_error; }
 

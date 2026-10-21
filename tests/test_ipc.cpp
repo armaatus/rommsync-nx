@@ -192,10 +192,11 @@ int Version() {
   // M9-6 (#209): `RestoreBackup` answers a `RestoreState` rather than the
   // finished report. 4 since M10-9 (#235): `SyncResult` gained a value a v3
   // decoder refuses. 5 since M10-2 (#228): `Status` gained the server's version
-  // and whether this build syncs with it. What is frozen is command 0's
-  // *encoding*, asserted above
+  // and whether this build syncs with it. 6 since M10-16 (#242): `SyncOutcome`
+  // gained `kDeferred`, which a v5 decoder refuses. What is frozen is command
+  // 0's *encoding*, asserted above
   // -- not the number in it.
-  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{5},
+  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{6},
                   "the interface version this build speaks");
   checks.ExpectEq(static_cast<int>(ipc::Command::kGetInterfaceVersion), 0,
                   "GetInterfaceVersion is command 0");
@@ -373,7 +374,7 @@ int RoundTrip() {
   for (const ipc::SyncOutcome outcome :
        {ipc::SyncOutcome::kAccepted, ipc::SyncOutcome::kAlreadyRunning,
         ipc::SyncOutcome::kNotConfigured, ipc::SyncOutcome::kUnauthenticated,
-        ipc::SyncOutcome::kDisabled}) {
+        ipc::SyncOutcome::kDisabled, ipc::SyncOutcome::kDeferred}) {
     const ipc::Decoded<ipc::SyncOutcome> back =
         ipc::DecodeSyncOutcome(ipc::EncodeSyncOutcome(outcome));
     checks.Expect(back.ok() && back.value == outcome,
@@ -1421,6 +1422,17 @@ int DispatchTable() {
     checks.Expect(core.SyncNow() == ipc::SyncOutcome::kAlreadyRunning,
                   "unless one is already running");
     checks.ExpectEq(engine.sync_requests, 2, "and the engine is only asked when it could act");
+
+    // #242: a game in the foreground. The press is still taken -- it runs when
+    // the game closes -- and the answer says so rather than "Sync started".
+    engine.sync_accepted = true;
+    engine.application_running_now = true;
+    checks.Expect(core.SyncNow() == ipc::SyncOutcome::kDeferred,
+                  "a press under a running game is taken and held, and says so");
+    checks.ExpectEq(engine.sync_requests, 3, "the engine was asked, so the press is queued");
+    engine.sync_accepted = false;
+    checks.Expect(core.SyncNow() == ipc::SyncOutcome::kAlreadyRunning,
+                  "a tick already running is still that, game or not");
   }
 
   // SetEnabled answers with the state that *took*, inside a successful reply.

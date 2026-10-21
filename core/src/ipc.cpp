@@ -216,7 +216,7 @@ constexpr DownloadState kAllDownloadStates[] = {
 
 constexpr SyncOutcome kAllSyncOutcomes[] = {
     SyncOutcome::kAccepted,      SyncOutcome::kAlreadyRunning, SyncOutcome::kNotConfigured,
-    SyncOutcome::kUnauthenticated, SyncOutcome::kDisabled,
+    SyncOutcome::kUnauthenticated, SyncOutcome::kDisabled,       SyncOutcome::kDeferred,
 };
 
 constexpr WriteOutcome kAllWriteOutcomes[] = {
@@ -637,6 +637,8 @@ const char* ToString(SyncOutcome outcome) {
       return "unauthenticated";
     case SyncOutcome::kDisabled:
       return "disabled";
+    case SyncOutcome::kDeferred:
+      return "deferred";
   }
   return "accepted";
 }
