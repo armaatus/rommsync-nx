@@ -443,6 +443,23 @@ void ApplyPlatform(const ParseState& state, int line, std::string_view key,
     ApplyEmulator(state, line, key, value, config, diags);
     return;
   }
+  if (key == "play_with") {
+    const std::string lowered = LowerAscii(Trim(value));
+    if (lowered.empty()) {
+      config->play_with.erase(state.slug);  // `play_with =` is the default again
+    } else if (lowered == "tico") {
+      config->play_with[state.slug] = PlayWith::kTico;
+    } else if (lowered == "retroarch") {
+      config->play_with[state.slug] = PlayWith::kRetroArch;
+    } else {
+      // Not guessed at: which emulator's folder a first restore lands in is the
+      // whole meaning of the line, and a typo that picked one would write saves
+      // where the user does not play.
+      diags->Add(Severity::kWarning, line, state.section, key,
+                 "expected tico or retroarch, got '" + Redact(value) + "'; this line is ignored");
+    }
+    return;
+  }
   if (key == "enabled") {
     bool flag = false;
     if (!ParseBool(value, &flag)) {
@@ -824,6 +841,28 @@ std::string_view Config::EmulatorOverride(std::string_view slug) const {
   return found == emulators.end() ? std::string_view() : std::string_view(found->second);
 }
 
+const char* ToString(PlayWith play_with) {
+  switch (play_with) {
+    case PlayWith::kTico:
+      return "tico";
+    case PlayWith::kRetroArch:
+      return "retroarch";
+  }
+  return "tico";
+}
+
+std::optional<PlayWith> Config::PlayWithFor(std::string_view slug) const {
+  const auto found = play_with.find(slug);
+  if (found != play_with.end()) {
+    return found->second;
+  }
+  if (scan::TicoModuleFor(scan::TicoSlugFor(slug)) != nullptr ||
+      OptionalPlatforms().find(slug) != OptionalPlatforms().end()) {
+    return PlayWith::kTico;
+  }
+  return std::nullopt;
+}
+
 std::string Config::RomTarget(std::string_view slug) const {
   const PlatformFolders* folders = Platform(slug);
   if (folders == nullptr || folders->roms.empty()) {
@@ -984,8 +1023,8 @@ LoadResult ParseConfig(std::string_view text) {
   std::set<std::string> sections_seen;       // canonical section names already opened
   std::set<std::string> platform_sections;   // which slugs the file has claimed
   std::set<std::string> platform_rejected;   // ...and which had a line that was dropped
-  std::set<std::string> platform_folders;    // ...which had a line other than `emulator`
-  std::set<std::string> platform_emulators;  // ...and which had an `emulator` line
+  std::set<std::string> platform_folders;    // ...which had a folder line
+  std::set<std::string> platform_emulators;  // ...and which had `emulator` or `play_with`
   std::map<std::string, bool> platform_enabled;  // ...and what an `enabled` line said
   std::set<std::string> assigned;            // "section\x1fkey" pairs already set
   bool platform_cap_reported = false;
@@ -1183,7 +1222,7 @@ LoadResult ParseConfig(std::string_view text) {
         ApplyTico(state, line_number, key, value, &result.value, &diags);
         break;
       case SectionKind::kPlatform:
-        if (key == "emulator") {
+        if (key == "emulator" || key == "play_with") {
           platform_emulators.insert(state.slug);
         } else if (key != "enabled") {
           platform_folders.insert(state.slug);
@@ -1230,8 +1269,9 @@ LoadResult ParseConfig(std::string_view text) {
     }
     if (!maps_folders && platform_emulators.find(slug) != platform_emulators.end() &&
         defaults != DefaultPlatforms().end()) {
-      // A section that sets only `emulator` is not a folder map, so it does not
-      // replace one. "mGBA for GB" must not also mean "stop syncing GB", and
+      // A section that sets only `emulator` or `play_with` is not a folder map,
+      // so it does not replace one. "mGBA for GB" must not also mean "stop
+      // syncing GB", and
       // nobody reading that one line could tell that it did -- nor a refused or
       // emptied `emulator` line. A section with no lines at all is still the
       // documented way to unmap a platform.

@@ -30,6 +30,7 @@
 
 #include <cstddef>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -218,6 +219,18 @@ struct TicoConfig {
   std::string uid;
 };
 
+/// `[platform.<slug>] play_with`: the emulator a platform is played in on this
+/// console, which decides where a save or a state the card has never held is
+/// written (#237, `place::Placer`). A file already on the card stays where it
+/// was found.
+enum class PlayWith {
+  kTico,
+  kRetroArch,
+};
+
+/// `tico` or `retroarch`. Never null.
+const char* ToString(PlayWith play_with);
+
 /// True when `text` is a Tico account folder's name: 32 hex digits, either case
 /// (FAT32 does not keep case apart; Tico writes lowercase).
 bool IsTicoUid(std::string_view text);
@@ -312,6 +325,12 @@ struct Config {
   /// folders is still a platform that maps nothing.
   std::map<std::string, std::string, std::less<>> emulators;
 
+  /// `[platform.<slug>] play_with`, keyed like `platforms`, for the platforms
+  /// whose section says so; `PlayWithFor` adds the default. Not a folder key,
+  /// for `emulators`' reason: a section that sets only this keeps the
+  /// platform's built-in folders.
+  std::map<std::string, PlayWith, std::less<>> play_with;
+
   /// There is a server to talk to. False on a first boot, and after an edit
   /// that made `server.url` unusable.
   bool configured() const { return !server.url.empty(); }
@@ -322,6 +341,12 @@ struct Config {
 
   /// The `emulator` override for `slug`, or empty when there is none.
   std::string_view EmulatorOverride(std::string_view slug) const;
+
+  /// The emulator `slug` is played in: its `play_with` line, else Tico for
+  /// every system Tico runs (#226 D5) -- the ones `scan::TicoModuleFor` knows
+  /// and the off-by-default `OptionalPlatforms` -- else none, which places
+  /// nothing rather than guessing.
+  std::optional<PlayWith> PlayWithFor(std::string_view slug) const;
 
   /// Where a download for `slug` is written: the first `roms` entry, or empty
   /// when the platform is unmapped or maps no rom folder.

@@ -1069,6 +1069,28 @@ foreach(scenario IN LISTS SOURCE_SCENARIOS)
   set_tests_properties(source.${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
 
+# M10-11: where a save or a state the console has never held is written. Against
+# scratch directories and no server, so it never skips; every placement it
+# accepts is scanned back as the same rom in the same slot.
+add_executable(test_placement test_placement.cpp)
+target_link_libraries(test_placement PRIVATE rommsync::host)
+target_include_directories(test_placement PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_placement PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+
+set(PLACE_SCENARIOS
+  config   # play_with, and Tico by default for every system Tico runs (#226 D5)
+  names    # folder, core folder, the rom's name and the emulator's extension
+  saves    # Tico's layouts and RetroArch's, read back by the scan -- and every refusal
+  states   # the same rule for a state, under the name it pairs on
+)
+foreach(scenario IN LISTS PLACE_SCENARIOS)
+  add_test(NAME place.${scenario} COMMAND test_placement ${scenario})
+  set_tests_properties(place.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
 # M10-4: retroarch.cfg, read for where RetroArch keeps saves and whether it syncs
 # them itself. Pure apart from scratch files, so it never skips.
 add_executable(test_retroarch_cfg test_retroarch_cfg.cpp)
