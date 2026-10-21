@@ -2,6 +2,7 @@
 
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -16,7 +17,8 @@
 namespace rommsync::sysmodule {
 namespace {
 
-/// `/retroarch/saves` -> `sdmc:/retroarch/saves`, or empty.
+/// `/retroarch/saves` -> `sdmc:/retroarch/saves`, or empty. `mount` is `kSdRoot`
+/// everywhere but in `test_card`.
 ///
 /// A `..` segment is **refused rather than resolved**, the same line the host
 /// backend draws and for the same reason: these paths name folders a human
@@ -24,11 +26,11 @@ namespace {
 /// mistake that must not become a write somewhere else. `.` and empty segments
 /// are dropped; a NUL is refused, because every call below stops at one and the
 /// path that got used would not be the path that was checked.
-std::string ResolveOnCard(std::string_view sd_path) {
+std::string ResolveOnCard(const std::string& mount, std::string_view sd_path) {
   if (sd_path.find('\0') != std::string_view::npos) {
     return {};
   }
-  std::string resolved = kSdRoot;
+  std::string resolved = mount;
   std::size_t start = 0;
   while (start <= sd_path.size()) {
     const std::size_t slash = sd_path.find('/', start);
@@ -75,9 +77,11 @@ bool ByNameDescending(const fs::Entry& left, const fs::Entry& right) {
 
 class SdCard final : public fs::FileSystem {
  public:
+  SdCard(std::string mount, fs::Format format) : mount_(std::move(mount)), format_(format) {}
+
   fs::Listing List(std::string_view sd_path) override {
     fs::Listing listing;
-    const std::string resolved = ResolveOnCard(sd_path);
+    const std::string resolved = ResolveOnCard(mount_, sd_path);
     if (resolved.empty()) {
       listing.error = fs::ListError::kMissing;
       listing.message = std::string(sd_path) + ": not a path on this card";
@@ -143,7 +147,7 @@ class SdCard final : public fs::FileSystem {
 
   fs::MakeDirResult CreateDirectory(std::string_view sd_path) override {
     fs::MakeDirResult result;
-    const std::string resolved = ResolveOnCard(sd_path);
+    const std::string resolved = ResolveOnCard(mount_, sd_path);
     if (resolved.empty()) {
       result.error = fs::MakeDirError::kNotOnThisCard;
       result.message = std::string(sd_path) + ": not a path on this card";
@@ -152,9 +156,9 @@ class SdCard final : public fs::FileSystem {
 
     // Every parent, because the one directory this exists for --
     // `sdmc:/config/rommsync/.backup/` -- sits under one that may not be there
-    // either on a first boot. `kSdRoot` itself is skipped: `sdmc:` is the mount
-    // and not a directory anything creates.
-    std::size_t at = resolved.find('/', std::strlen(kSdRoot));
+    // either on a first boot. The mount itself is skipped: `sdmc:` is not a
+    // directory anything creates.
+    std::size_t at = resolved.find('/', mount_.size() + 1);
     while (at != std::string::npos) {
       const std::string parent = resolved.substr(0, at);
       ::mkdir(parent.c_str(), 0777);
@@ -181,11 +185,52 @@ class SdCard final : public fs::FileSystem {
     return result;
   }
 
-  std::string Resolve(std::string_view sd_path) const override { return ResolveOnCard(sd_path); }
+  std::string Resolve(std::string_view sd_path) const override {
+    return ResolveOnCard(mount_, sd_path);
+  }
+
+  /// The format `main.cpp` passed in, the ceiling it implies, and `statvfs`'s
+  /// free space -- which `fsdev` answers from `fsFsGetFreeSpace` for the device
+  /// whatever the path, and the host answers for the directory's volume.
+  ///
+  /// **An unknown format is held to FAT32's ceiling, not to none.** `fsdev`
+  /// writes plain files, so on a FAT32 card one stops at 4 GiB - 1, and libnx
+  /// has no call that says which format a card is: `fsIsExFatSupported` says
+  /// whether the *console* could read exFAT, which almost every one can, and so
+  /// rules FAT32 in only when it says no. Of the two ways to be wrong, refusing
+  /// a rom on an exFAT card costs a sentence and a copy made some other way;
+  /// accepting one on a FAT32 card costs a 4 GiB transfer that fails at its last
+  /// byte. The console's own answer to a bigger file is a concatenation file
+  /// (`FsCreateOption_BigFile`), which v1 does not write.
+  fs::Volume VolumeOf(std::string_view sd_path) const override {
+    fs::Volume volume;
+    volume.format = format_;
+    const bool bounded = format_ == fs::Format::kFat32 || format_ == fs::Format::kUnknown;
+    volume.max_file_bytes = bounded ? fs::kFat32MaxFileBytes : 0;
+    const std::string resolved = ResolveOnCard(mount_, sd_path);
+    struct ::statvfs info {};
+    if (!resolved.empty() && ::statvfs(resolved.c_str(), &info) == 0) {
+      // `f_frsize` is the unit `f_bavail` counts in; a devoptab that leaves it
+      // zero still sets the block size.
+      const std::uint64_t unit = info.f_frsize != 0 ? info.f_frsize : info.f_bsize;
+      volume.free_bytes = static_cast<std::int64_t>(static_cast<std::uint64_t>(info.f_bavail) * unit);
+    }
+    return volume;
+  }
+
+ private:
+  std::string mount_;
+  fs::Format format_;
 };
 
 }  // namespace
 
-std::unique_ptr<fs::FileSystem> MakeSdCard() { return std::make_unique<SdCard>(); }
+std::unique_ptr<fs::FileSystem> MakeSdCard(fs::Format format) {
+  return MakeSdCardAt(kSdRoot, format);
+}
+
+std::unique_ptr<fs::FileSystem> MakeSdCardAt(std::string mount, fs::Format format) {
+  return std::make_unique<SdCard>(std::move(mount), format);
+}
 
 }  // namespace rommsync::sysmodule

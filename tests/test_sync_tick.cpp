@@ -18,6 +18,7 @@
 // **Every rig scenario runs `sync::RunTick` inside a `harness::Sandbox`**, so the
 // backup-before-overwrite audit judges it on teardown whether or not the
 // scenario thought to look, and every one ends on `harness::ExpectDisarmed`.
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -29,6 +30,7 @@
 #include <string>
 #include <vector>
 
+#include "faulty_disk.hpp"
 #include "harness.hpp"
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/host/curl_http_client.hpp"
@@ -1124,6 +1126,70 @@ void DownloadFault(rig::Checks& checks, http::HttpClient& client, const std::str
   harness::DeleteSave(client, base, fixture, arranged.server.id);
 }
 
+/// The card, rather than the server, refusing part of a download (M9-13, #202).
+///
+/// `DownloadFault`'s assertions, with the damage moved from the network to the
+/// card: `faulty::Disk` refuses the writes aimed at `aimed_at` with `error`, so
+/// the transfer (`.part`) or the backup the overwrite depends on (`/.backup/`)
+/// is what fails. Either way the save on the card is the one the tick started
+/// with, the baseline has not moved, and the operation says *why* in words a
+/// user can act on.
+void DiskFault(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+               const Fixture& fixture, const harness::Rom& rom, const std::string& aimed_at,
+               int error, sync::OperationError expected, const std::string& says,
+               const std::string& what) {
+  Sandbox sandbox(checks, "tick-disk");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  DownloadFixture arranged;
+  if (!ArrangeDownload(checks, client, base, fixture, sandbox, rom, "m9-13-disk", &arranged)) {
+    return;
+  }
+
+  {
+    faulty::Disk card({aimed_at, error, /*after=*/0, /*gone=*/false});
+    const sync::TickResult tick = sync::RunTick(client, *files, TokenFor(base, fixture),
+                                                {arranged.local}, arranged.targets,
+                                                /*previous=*/{}, OptionsAt(1'757'000'600));
+    checks.Expect(card.refusals() > 0, what + ": the card refused the write it was aimed at");
+    if (tick.executed.operations.size() != 1) {
+      checks.Expect(false, what + ": the plan carried one operation, got " +
+                               std::to_string(tick.executed.operations.size()));
+    } else {
+      const sync::OperationResult& result = tick.executed.operations[0];
+      checks.Expect(result.action == sync::Action::kDownload,
+                    std::string(what) + ": the plan was a download, got " +
+                        sync::ToString(result.action));
+      checks.Expect(result.error == expected,
+                    what + ": named " + sync::ToString(expected) + ", got " +
+                        sync::ToString(result.error) + " -- " + result.message);
+      checks.Expect(result.message.find(says) != std::string::npos,
+                    what + ": and says \"" + says + "\" -- got \"" + result.message + "\"");
+    }
+    checks.ExpectEq(tick.executed.failed, 1, what + ": counted failed, once");
+    const state::LoadedBaseline stored = StoredBaseline(*files);
+    checks.Expect(stored.value.Find(rom.id, arranged.slot) == nullptr,
+                  what + ": and the failed save was not advanced, so the next tick retries it");
+  }
+
+  SaveSurvived(checks, sandbox, arranged.name, arranged.previous, what);
+
+  // Room on the card again: the same plan completes, backup first.
+  const sync::TickResult next =
+      sync::RunTick(client, *files, TokenFor(base, fixture), {arranged.local}, arranged.targets,
+                    /*previous=*/{}, OptionsAt(1'757'000'601));
+  checks.Expect(next.outcome == sync::TickOutcome::kCompleted,
+                what + ": and with room again the next tick completes: " +
+                    sync::ToString(next.outcome));
+  checks.ExpectEq(sandbox.Read(SavePath(arranged.name)), arranged.server_bytes,
+                  what + ": with the server's bytes on the card");
+  checks.Expect(sandbox.HasBackupOf(arranged.previous),
+                what + ": and the bytes it replaced under .backup/");
+  NoLeftovers(checks, sandbox, SavePath(arranged.name), what + ", after the next tick");
+
+  harness::DeleteSave(client, base, fixture, arranged.server.id);
+}
+
 /// The 401 arriving at a download rather than at an upload: the plan stops, the
 /// save is untouched, and the *tick* -- not this operation -- is what reports the
 /// answer `auth::Gate` counts (M1-4).
@@ -1541,6 +1607,15 @@ int main(int argc, char** argv) {
                   "a stall at a download");
   } else if (scenario == "download_401") {
     DownloadRevoked(checks, *client, base, fixture, rom);
+  } else if (scenario == "download_full") {
+    DiskFault(checks, *client, base, fixture, rom, ".part", ENOSPC,
+              sync::OperationError::kTransferFailed, "full", "a full card under the transfer");
+  } else if (scenario == "download_eio") {
+    DiskFault(checks, *client, base, fixture, rom, ".part", EIO,
+              sync::OperationError::kTransferFailed, "refused", "an I/O error under the transfer");
+  } else if (scenario == "backup_full") {
+    DiskFault(checks, *client, base, fixture, rom, "/.backup/", ENOSPC,
+              sync::OperationError::kBackupFailed, "full", "a full card under the backup");
   } else if (scenario == "complete_drop") {
     CompleteFault(checks, *client, base, fixture, rom,
                   R"({"mode":"drop","bytes":4,"path":"/api/sync/sessions","count":9})",

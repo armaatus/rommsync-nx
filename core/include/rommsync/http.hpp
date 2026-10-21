@@ -40,6 +40,8 @@ enum class Error {
   kCanceled,         ///< the caller's CancelToken fired
   kTruncated,        ///< the body ended before the length the server declared
   kWriteFailed,      ///< the destination file could not be written
+  kDiskFull,         ///< ...because the card is full (ENOSPC)
+  kFileTooLarge,     ///< ...because the card's format holds no file that large (EFBIG)
   kTransport,        ///< anything else the backend could not classify
 };
 

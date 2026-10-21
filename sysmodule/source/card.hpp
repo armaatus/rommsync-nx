@@ -19,11 +19,14 @@
 // keeps, and about what an unreadable mtime means, and two files written the
 // same way are two files a reader can diff.
 //
-// Nothing here has ever run: it is Horizon-side and is exercised in Ryujinx
-// before the M8-1 gate, never on hardware (sysmodule/AGENTS.md).
+// Nothing here has run on a console yet (sysmodule/AGENTS.md), but since M9-13
+// (#202) all of it runs on the host: it names no libnx type, so `test_card`
+// compiles this file unchanged and roots it at a scratch directory through
+// `MakeSdCardAt`.
 #pragma once
 
 #include <memory>
+#include <string>
 
 #include "rommsync/file_system.hpp"
 
@@ -34,6 +37,15 @@ namespace rommsync::sysmodule {
 /// One per process. It holds no handle and no state -- every call opens what it
 /// needs and closes it -- so it is safe to share between the IPC thread and the
 /// worker, which is what `ipc::Engine` requires of anything both touch.
-std::unique_ptr<fs::FileSystem> MakeSdCard();
+///
+/// `format` is what `main.cpp` could learn about the card from libnx, which is
+/// the one thing this file cannot learn through a devoptab: `VolumeOf` reports it
+/// and decides the per-file ceiling from it.
+std::unique_ptr<fs::FileSystem> MakeSdCard(fs::Format format);
+
+/// The same card, mounted at `mount` instead of `kSdRoot`. For `test_card`: a
+/// host directory standing in for `sdmc:`, so the file that ships is the file
+/// under test.
+std::unique_ptr<fs::FileSystem> MakeSdCardAt(std::string mount, fs::Format format);
 
 }  // namespace rommsync::sysmodule

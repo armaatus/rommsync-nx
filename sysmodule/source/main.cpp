@@ -360,6 +360,21 @@ std::unique_ptr<rommsync::http::HttpClient> g_http;
 /// ever one.
 std::unique_ptr<rommsync::fs::FileSystem> g_card;
 
+/// What libnx can say about the SD card's format, which is less than it sounds.
+///
+/// `fsIsExFatSupported` answers whether the *console* has the exFAT driver, not
+/// what the card is. A console without one can only be reading FAT32, so a "no"
+/// is certain; a "yes" -- nearly every console -- leaves the card unknown, and
+/// `card.cpp` holds an unknown card to FAT32's 4 GiB ceiling (#202). A call that
+/// fails is the same unknown.
+rommsync::fs::Format CardFormat() {
+  bool exfat = true;
+  if (R_SUCCEEDED(fsIsExFatSupported(&exfat)) && !exfat) {
+    return rommsync::fs::Format::kFat32;
+  }
+  return rommsync::fs::Format::kUnknown;
+}
+
 /// `sdmc:/config/rommsync/rommsync.log`, and the reason there is one (M7-3,
 /// #38). File scope for `g_http`'s reason: it outlives every caller, every
 /// thread writes through it, and there is only ever one.
@@ -703,7 +718,14 @@ void __appInit(void) {
   if (R_FAILED(rc)) {
     diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_InitFail_FS));
   }
-  fsdevMountSdmc();
+  // Not fatal, for the reason a card that refuses `CreateDirectory` is not
+  // (below): the overlay and the in-memory log still work without one. Noted
+  // rather than discarded, so the first line a user is asked for says why every
+  // read after it answers "missing" (#202).
+  rc = fsdevMountSdmc();
+  if (R_FAILED(rc)) {
+    rommsync::sysmodule::boot::Note(g_boot, "rommsync: fsdevMountSdmc", rc);
+  }
 
   // **`core/` calls `std::chrono::system_clock::now()`**, in `sync_execute.cpp`,
   // `state_sync.cpp` and `download.cpp`, and on Horizon that answers nothing at
@@ -867,10 +889,11 @@ int main(int, char**) {
   // `core/` has only standard headers, and a first boot on a fresh card would
   // otherwise drop exactly the lines a new user is asked for.
   //
-  // **A card that refuses is not fatal and is not reported.** There is nowhere
-  // left to report it to, and the log's in-memory tail still answers `GetLog` --
-  // a client that stopped syncing over a log file it could not write would have
-  // the tail wagging the dog. `fsdevMountSdmc` has already run, in `__appInit`.
+  // **A card that refuses is not fatal**: the log's in-memory tail still
+  // answers `GetLog`, and a client that stopped syncing over a log file it
+  // could not write would have the tail wagging the dog. It *is* reported since
+  // M9-13 (#202), once the log exists -- to the tail, which is the one place
+  // left that can hold it. `fsdevMountSdmc` has already run, in `__appInit`.
   //
   // **What this costs at boot**, stated rather than left to be measured: one
   // `mkdir` and one append of a few dozen bytes. It is SD I/O on the boot path
@@ -878,8 +901,9 @@ int main(int, char**) {
   // files off the same card, and the rule that matters is that nothing here
   // touches the *network* (CLAUDE.md, "Never block boot"), which is still true.
   // Nothing in this block waits on anything.
-  g_card = rommsync::sysmodule::MakeSdCard();
-  static_cast<void>(g_card->CreateDirectory(rommsync::sysmodule::kConfigSdDir));
+  g_card = rommsync::sysmodule::MakeSdCard(CardFormat());
+  const rommsync::fs::MakeDirResult config_dir =
+      g_card->CreateDirectory(rommsync::sysmodule::kConfigSdDir);
   g_log = std::make_unique<rommsync::log::FileSink>(
       std::string(rommsync::sysmodule::kConfigDir) + rommsync::log::kLogFileName);
   rommsync::log::SetSink(g_log.get());
@@ -897,6 +921,9 @@ int main(int, char**) {
   if (g_boot.dropped != 0) {
     Log(rommsync::log::Level::kWarn,
         "rommsync: " + std::to_string(g_boot.dropped) + " more boot notes were dropped");
+  }
+  if (!config_dir.ok()) {
+    Log(rommsync::log::Level::kWarn, "rommsync: " + config_dir.message);
   }
 
   // A crash dump or a debug log that cannot say which build produced it costs

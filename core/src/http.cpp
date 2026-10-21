@@ -38,6 +38,8 @@ const char* ToString(Error error) {
     case Error::kCanceled:       return "canceled";
     case Error::kTruncated:      return "body ended early";
     case Error::kWriteFailed:    return "could not write the destination file";
+    case Error::kDiskFull:       return "the card is full";
+    case Error::kFileTooLarge:   return "the file is too large for the card's format";
     case Error::kTransport:      return "transport failure";
   }
   return "unknown error";

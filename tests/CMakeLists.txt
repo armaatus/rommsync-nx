@@ -628,6 +628,7 @@ set(HTTP_SCENARIOS
   progress          # ...reporting how far it has got while it is still going
   range             # fetch a slice and prove it is the right slice
   drop              # a TCP reset mid-body: an error, and no file at the destination
+  disk              # M9-13: a full card, a file too large, an EIO -- each named, no file left
   resume            # pick that interrupted download back up
   resume_no_range   # ...even when the server ignores Range and starts over
   resume_empty_body # ...and a bodyless 2xx never promotes the stale partial
@@ -1444,6 +1445,9 @@ set(TICK_RIG_SCENARIOS
   download_5xx     # a refusal never replaces a save
   download_stall   # ...and neither does a transfer that stopped moving; next tick recovers
   download_401     # M1-4's stop, met at a download rather than at an upload
+  download_full    # M9-13: the card fills under the transfer; save and baseline untouched
+  download_eio     # M9-13: ...or refuses it with EIO, the stand-in for a pulled card
+  backup_full      # M9-13: ...or fills under the backup, which stops the overwrite
   complete_drop    # the accounting is lost and the baseline is not
   complete_stall   # the same on the timeout, and the next tick finds no work to redo
   resumes          # a reset mid-download, then a second tick: one save, one row
@@ -1984,6 +1988,9 @@ set(DOWNLOAD_RIG_SCENARIOS
   nested     # ...and a directory holding ONE file is downloaded, not refused
   nestedname # #92: a nested rom this client will not name is skipped, not guessed
   missing    # a rom the server's library no longer holds fails with a sentence
+  fullcard   # M9-13: the card fills mid-transfer; nothing destroyed, and it says so
+  cardgone   # M9-13: the card refuses a write, then goes away and comes back
+  toolarge   # M9-13: a rom the card cannot hold is refused before a byte moves
 )
 foreach(scenario IN LISTS DOWNLOAD_RIG_SCENARIOS)
   add_test(NAME download.${scenario} COMMAND test_download ${scenario})
@@ -2125,6 +2132,32 @@ foreach(scenario downloading preempts discards repoints shutdown sleep_download)
   endif()
   set_tests_properties(engine.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 endforeach()
+
+# --- M9-13: the console's SD card, compiled for the host ------------------------
+# `sysmodule/source/card.cpp` names no libnx type -- it is <dirent.h>,
+# <sys/stat.h> and <sys/statvfs.h> over the `sdmc:` devoptab -- so it compiles
+# here unchanged, rooted at a scratch directory through `MakeSdCardAt` (#202).
+# Until this target it was built only by devkitPro.
+add_executable(test_card test_card.cpp
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/card.cpp")
+target_link_libraries(test_card PRIVATE rommsync::host)
+target_include_directories(test_card PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/sysmodule/source")
+target_compile_definitions(test_card PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+
+foreach(scenario resolve list bounded mkdir volume)
+  add_test(NAME card.${scenario} COMMAND test_card ${scenario})
+  set_tests_properties(card.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
+# A real FAT32 volume: an image the script makes and mounts -- `hdiutil` on a
+# Mac, a loop mount on Linux when `sudo -n` is allowed -- and skips (77) where it
+# can do neither, saying which. docs/TESTING.md lists where it runs.
+add_test(NAME card.fat32 COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/test_fat_volume.sh"
+  "$<TARGET_FILE:test_card>")
+set_tests_properties(card.fat32 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180 RUN_SERIAL TRUE)
 
 # --- M9-4: the console going to sleep, and coming back -----------------------
 # `psc:m` is a service, so the console's `power::Module` cannot be reached from a

@@ -9,7 +9,9 @@
 // The interesting half is the failure scenarios. A downloader that works on the
 // happy path and quietly leaves a half-written rom behind when the connection
 // dies is worse than one that does not work at all, so `drop`, `truncate`,
-// `cancel` and `stall` all assert on what is NOT on disk afterwards.
+// `cancel` and `stall` all assert on what is NOT on disk afterwards. `disk` is
+// the one whose failure is the card's rather than the network's: RomM is real,
+// and the refusal comes from `faulty::Disk` over the backend's own writes.
 //
 // **This file is compiled twice**, and that is the point (M1-7, #126). The
 // scenarios below are the whole of what `core/include/rommsync/http.hpp`
@@ -22,6 +24,7 @@
 // of them would have drifted from this one by the second issue.
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -32,6 +35,7 @@
 #include <thread>
 #include <vector>
 
+#include "faulty_disk.hpp"
 #include "loopback_server.hpp"
 #include "rig.hpp"
 
@@ -371,6 +375,36 @@ int Drop(http::HttpClient& client, const std::string& base, const std::string& a
   checks.ExpectEq(result.response.bytes_received, kept, "and bytes_received matches them");
 
   rig::DisarmFault(client, base);
+  return checks.failures();
+}
+
+// The card refusing the bytes, named for what it is (M9-13, #202).
+//
+// `faulty::Disk` refuses the `.part`'s writes part way in with the errno a card
+// produces. A full card and a file past FAT32's ceiling are two sentences a
+// user can act on, and everything else is "the card refused" -- so the three
+// arrive as three errors, and none of them leaves a file where the body goes.
+int DiskRefusals(http::HttpClient& client, const std::string& base, const std::string& asset) {
+  rig::Checks checks;
+  const auto refused = [&](int error, http::Error expected, const char* name) {
+    const std::string path = Scratch(std::string("disk-") + name + ".bin");
+    Clear(path);
+    http::Request request;
+    request.url = base + asset;
+    request.timeout = std::chrono::milliseconds{0};
+    http::Result result;
+    {
+      faulty::Disk card({".part", error, 100'000, /*gone=*/false});
+      result = client.Download(request, DownloadTo(path));
+      checks.Expect(card.refusals() > 0, std::string(name) + ": the card refused a write");
+    }
+    checks.ExpectError(result, expected, std::string(name) + ": named for what the card said");
+    checks.Expect(!Exists(path), std::string(name) + ": no file at the destination");
+    Clear(path);
+  };
+  refused(ENOSPC, http::Error::kDiskFull, "full");
+  refused(EFBIG, http::Error::kFileTooLarge, "too-large");
+  refused(EIO, http::Error::kWriteFailed, "eio");
   return checks.failures();
 }
 
@@ -988,7 +1022,8 @@ int main(int argc, char** argv) {
   if (scenario == "download" || scenario == "range" || scenario == "drop" ||
       scenario == "resume" || scenario == "truncate" || scenario == "cancel" ||
       scenario == "resume_empty_body" || scenario == "resume_stale_range" ||
-      scenario == "range_expected_size" || scenario == "progress" || scenario == "chunk") {
+      scenario == "range_expected_size" || scenario == "progress" || scenario == "chunk" ||
+      scenario == "disk") {
     asset = rig::DiscoverLargeAsset(*client, base);
     if (asset.empty()) {
       std::cerr << "could not find a large asset to stream from " << base << "\n";
@@ -1013,6 +1048,8 @@ int main(int argc, char** argv) {
     failures = Progress(*client, base, asset);
   } else if (scenario == "range") {
     failures = Range(*client, base, asset);
+  } else if (scenario == "disk") {
+    failures = DiskRefusals(*client, base, asset);
   } else if (scenario == "drop") {
     failures = Drop(*client, base, asset);
   } else if (scenario == "resume") {

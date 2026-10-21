@@ -35,8 +35,12 @@
 //   nestedname -- ...unless that name is one the card cannot hold, which is a skip
 //   missing    -- a rom the server's library no longer holds fails with a sentence
 //   progress   -- how far a transfer has got, read from a second thread while it moves
+//   fullcard   -- M9-13: the card fills mid-transfer; nothing destroyed, a sentence that says so
+//   cardgone   -- M9-13: the card refuses a write, then goes away entirely and comes back
+//   toolarge   -- M9-13: a rom the card cannot hold is refused before a byte moves
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -48,6 +52,7 @@
 #include <thread>
 #include <vector>
 
+#include "faulty_disk.hpp"
 #include "harness.hpp"
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/config.hpp"
@@ -2590,6 +2595,235 @@ void Progress(checks::Checks& c, http::HttpClient& client, const std::string& ba
 
 }  // namespace
 
+// --- a card that will not take the bytes (M9-13, #202) ---------------------------
+//
+// Everything above meets a server that misbehaves. These meet a *card* that
+// does: full, refusing, gone. The refusal comes from `faulty::Disk`, installed
+// over the same `io::Disk` the engine writes through, so the drain under test is
+// the shipping one and only the card's answer is invented.
+
+/// Nothing a refused transfer could have left beside `sd_path`.
+void NothingBeside(checks::Checks& c, const Rig& rig, const std::string& sd_path,
+                   const std::string& what) {
+  c.Expect(!rig.sandbox.Exists(http::PartialPathFor(io::TempPathFor(sd_path))),
+           what + ": no partial body beside the rom");
+  c.Expect(!rig.sandbox.Exists(io::TempPathFor(sd_path)), what + ": no staged body beside it");
+  c.Expect(!rig.sandbox.Exists(io::PreviousPathFor(sd_path)),
+           what + ": no half-finished commit beside it");
+}
+
+/// A card already holding a file where the rom goes: the right length, the wrong
+/// bytes. It is what "a failed write never destroys the destination" has to be
+/// asserted against -- with an empty destination there is nothing to destroy.
+std::string Occupy(checks::Checks& c, Rig& rig, const std::string& sd_path, std::size_t size) {
+  const std::string before(size, 'Z');
+  c.Expect(rig.sandbox.Write(sd_path, before), "a file is already on the card at " + sd_path);
+  return before;
+}
+
+void FullCard(checks::Checks& c, http::HttpClient& client, const std::string& base,
+              const harness::Fixture& fixture) {
+  Rig rig(c, "download-fullcard", base, fixture);
+  harness::Rom rom;
+  const std::int64_t rom_id = Queued(c, client, base, fixture, &rig.queue, "240pee.nes", &rom);
+  if (rom_id == 0) {
+    return;
+  }
+  const std::string destination = "/tico/roms/nes/240pee.nes";
+  const std::string expected = FixtureRom("roms/nes/240pee.nes");
+  const std::string before = Occupy(c, rig, destination, expected.size());
+
+  download::DrainResult result;
+  {
+    // 20 KiB into a 64 KiB rom: mid-transfer, after the first buffers landed.
+    faulty::Disk card({".part", ENOSPC, 20 * 1024, /*gone=*/false});
+    result = rig.Drain(client);
+    c.Expect(card.refusals() > 0, "the card really did fill part way through the transfer");
+  }
+
+  c.ExpectEq(result.failed, 1, "a full card fails the entry rather than leaving it to spin");
+  c.ExpectEq(result.downloaded, 0, "and nothing is counted as downloaded");
+  const QueueEntry entry = rig.Persisted(rom_id);
+  c.Expect(entry.state == QueueState::kFailed,
+           std::string("the entry on the card settles failed -- got ") +
+               download::ToString(entry.state));
+  c.Expect(entry.message.find("full") != std::string::npos,
+           "with a sentence a user can act on, that the card is full -- got \"" + entry.message +
+               "\"");
+  c.Expect(entry.message.find(rom.fs_name) == std::string::npos,
+           "that does not quote the rom's name back into the queue file");
+  c.ExpectEq(entry.bytes_done, std::int64_t{0}, "and claims no bytes the card does not hold");
+  c.ExpectEq(rig.sandbox.Read(destination), before,
+             "the file already at the destination is exactly as it was");
+  NothingBeside(c, rig, destination, "after a full card");
+
+  // Space freed, queued again: the same rom comes down whole.
+  std::int32_t position = 0;
+  c.Expect(rig.queue.Enqueue(rom_id, &position) == ipc::Error::kOk,
+           "a rom that failed on a full card can be queued again");
+  const download::DrainResult again = rig.Drain(client);
+  c.ExpectEq(again.downloaded, 1, "and with room on the card it comes down");
+  c.Expect(rig.sandbox.Read(destination) == expected, "byte for byte");
+  NothingBeside(c, rig, destination, "after the retry");
+}
+
+void CardGone(checks::Checks& c, http::HttpClient& client, const std::string& base,
+              const harness::Fixture& fixture) {
+  Rig rig(c, "download-cardgone", base, fixture);
+  harness::Rom rom;
+  const std::int64_t rom_id = Queued(c, client, base, fixture, &rig.queue, "240pee.nes", &rom);
+  if (rom_id == 0) {
+    return;
+  }
+  const std::string destination = "/tico/roms/nes/240pee.nes";
+  const std::string expected = FixtureRom("roms/nes/240pee.nes");
+  const std::string before = Occupy(c, rig, destination, expected.size());
+
+  // One write refused with EIO, the card otherwise still there: the error a
+  // failing card, or one half out of its slot, produces.
+  {
+    download::DrainResult result;
+    {
+      faulty::Disk card({".part", EIO, 20 * 1024, /*gone=*/false});
+      result = rig.Drain(client);
+      c.Expect(card.refusals() > 0, "the card refused a write part way through the transfer");
+    }
+    c.ExpectEq(result.failed, 1, "a refused write fails the entry");
+    const QueueEntry entry = rig.Persisted(rom_id);
+    c.Expect(entry.state == QueueState::kFailed,
+             std::string("the entry on the card settles failed -- got ") +
+                 download::ToString(entry.state));
+    c.Expect(entry.message.find("refused") != std::string::npos,
+             "with a sentence that says the card refused it -- got \"" + entry.message + "\"");
+    c.ExpectEq(rig.sandbox.Read(destination), before,
+               "the file already at the destination is exactly as it was");
+    NothingBeside(c, rig, destination, "after a refused write");
+  }
+
+  // The card goes away mid-transfer and nothing on it answers again -- not the
+  // `.part`, not the queue file. Nothing can be recorded, so the requirement is
+  // that nothing is *lost*: the queue on the card is the one written before the
+  // card went, and when it comes back the next drain finishes the rom.
+  {
+    std::int32_t position = 0;
+    c.Expect(rig.queue.Enqueue(rom_id, &position) == ipc::Error::kOk,
+             "the failed rom is queued again");
+    download::DrainResult result;
+    {
+      faulty::Disk card({".part", EIO, 20 * 1024, /*gone=*/true});
+      result = rig.Drain(client);
+      c.Expect(card.refusals() > 1, "the card went away, and stayed away");
+    }
+    c.Expect(result.outcome == download::DrainOutcome::kStoreFailed,
+             std::string("a card that is gone ends the drain as a queue that cannot be written -- "
+                         "got ") +
+                 download::ToString(result.outcome) + " (" + result.message + ")");
+    c.ExpectEq(result.downloaded, 0, "and nothing is counted as downloaded");
+    c.ExpectEq(rig.sandbox.Read(destination), before,
+               "the file already at the destination is exactly as it was");
+    const QueueEntry entry = rig.Persisted(rom_id);
+    c.Expect(!download::Terminal(entry.state),
+             std::string("the queue on the card still has the rom to do -- got ") +
+                 download::ToString(entry.state));
+    c.Expect(!rig.sandbox.Exists(io::TempPathFor(destination)),
+             "no unverified body was staged where a commit could pick it up");
+  }
+
+  // The card is back.
+  const download::DrainResult back = rig.Drain(client);
+  c.Expect(back.outcome == download::DrainOutcome::kCompleted,
+           std::string("with the card back the next drain finishes -- got ") +
+               download::ToString(back.outcome) + " (" + back.message + ")");
+  c.Expect(rig.Persisted(rom_id).state == QueueState::kDone, "the entry is done");
+  c.Expect(rig.sandbox.Read(destination) == expected, "and the rom is on the card, byte for byte");
+  NothingBeside(c, rig, destination, "once the card is back");
+}
+
+/// The native card with the volume answer replaced: the one fact a laptop's disk
+/// cannot be made to report.
+class Bounded final : public fs::FileSystem {
+ public:
+  Bounded(fs::FileSystem& inner, fs::Volume volume) : inner_(inner), volume_(volume) {}
+
+  fs::Listing List(std::string_view sd_path) override { return inner_.List(sd_path); }
+  fs::MakeDirResult CreateDirectory(std::string_view sd_path) override {
+    return inner_.CreateDirectory(sd_path);
+  }
+  std::string Resolve(std::string_view sd_path) const override { return inner_.Resolve(sd_path); }
+  fs::Volume VolumeOf(std::string_view) const override { return volume_; }
+
+ private:
+  fs::FileSystem& inner_;
+  fs::Volume volume_;
+};
+
+void TooLarge(checks::Checks& c, http::HttpClient& client, const std::string& base,
+              const harness::Fixture& fixture) {
+  const std::string expected = FixtureRom("roms/nes/240pee.nes");
+  const std::int64_t size = static_cast<std::int64_t>(expected.size());
+
+  // Checked with the queue on the card as well as with the result: refused
+  // before it starts means not one content request and not one byte staged.
+  const auto refused = [&](const char* name, fs::Volume volume, const char* says) {
+    Rig rig(c, name, base, fixture);
+    harness::Rom rom;
+    const std::int64_t rom_id = Queued(c, client, base, fixture, &rig.queue, "240pee.nes", &rom);
+    if (rom_id == 0) {
+      return;
+    }
+    Bounded card(*rig.filesystem, volume);
+    Watched watched(client);
+    const download::DrainResult result =
+        download::Drain(watched, card, rig.settings, rig.queue, rig.options);
+    const std::string what = std::string(name) + ": ";
+    c.ExpectEq(result.failed, 1, what + "the rom is refused");
+    c.ExpectEq(watched.statuses.size(), std::size_t{0},
+               what + "before a single content request was made");
+    const QueueEntry entry = rig.Persisted(rom_id);
+    c.Expect(entry.state == QueueState::kFailed,
+             what + "the entry settles failed -- got " + download::ToString(entry.state));
+    c.Expect(entry.message.find(says) != std::string::npos,
+             what + "with a sentence that says why -- got \"" + entry.message + "\"");
+    c.Expect(entry.message.size() <= download::kMaxMessageChars,
+             what + "short enough for the queue screen to render whole");
+    c.Expect(entry.message.find(rom.fs_name) == std::string::npos,
+             what + "and does not quote the rom's name");
+    c.Expect(!rig.sandbox.Exists("/tico/roms/nes/240pee.nes"), what + "nothing reached the card");
+    NothingBeside(c, rig, "/tico/roms/nes/240pee.nes", std::string(name));
+  };
+
+  // One byte past the per-file ceiling. The real ceiling is 4 GiB - 1 and the
+  // fixture is 64 KiB, so the ceiling is what is scaled down, not the rom.
+  fs::Volume fat;
+  fat.format = fs::Format::kFat32;
+  fat.max_file_bytes = static_cast<std::uint64_t>(size - 1);
+  refused("download-toolarge", fat, "FAT32");
+
+  fs::Volume full;
+  full.format = fs::Format::kOther;
+  full.free_bytes = size - 1;
+  refused("download-nofreespace", full, "free");
+
+  // Exactly at both limits is not over either.
+  {
+    Rig rig(c, "download-fits", base, fixture);
+    harness::Rom rom;
+    const std::int64_t rom_id = Queued(c, client, base, fixture, &rig.queue, "240pee.nes", &rom);
+    if (rom_id == 0) {
+      return;
+    }
+    fs::Volume snug;
+    snug.format = fs::Format::kFat32;
+    snug.max_file_bytes = static_cast<std::uint64_t>(size);
+    snug.free_bytes = size;
+    Bounded card(*rig.filesystem, snug);
+    const download::DrainResult result =
+        download::Drain(client, card, rig.settings, rig.queue, rig.options);
+    c.ExpectEq(result.downloaded, 1, "a rom exactly at the ceiling and the free space fits");
+    c.Expect(rig.sandbox.Read("/tico/roms/nes/240pee.nes") == expected, "byte for byte");
+  }
+}
+
 int main(int argc, char** argv) {
   const std::string scenario = argc > 1 ? argv[1] : "roundtrip";
   const std::string base = rig::BaseUrl();
@@ -2665,6 +2899,12 @@ int main(int argc, char** argv) {
     Progress(checks, *client, base, fixture);
   } else if (scenario == "relaunched") {
     Relaunched(checks, *client, base, fixture);
+  } else if (scenario == "fullcard") {
+    FullCard(checks, *client, base, fixture);
+  } else if (scenario == "cardgone") {
+    CardGone(checks, *client, base, fixture);
+  } else if (scenario == "toolarge") {
+    TooLarge(checks, *client, base, fixture);
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;
