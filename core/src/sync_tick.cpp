@@ -282,7 +282,9 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
   resolve.execute.delete_action = false;
   resolve.complete = options.finish.complete;
   resolve.complete.cancel = options.cancel;
-  result.resolved = ResolveRefusedUploads(client, files, token, reported, targets, previous,
+  // `offered` again: a save withheld as deleted on the server (#233) was never
+  // uploaded, so it cannot have drawn a 409, and is not asked about here either.
+  result.resolved = ResolveRefusedUploads(client, files, token, *offered, targets, previous,
                                           &result.negotiated.plan, &result.executed, resolve);
 
   // Always, including after a cancellation and after a 401. The baseline is

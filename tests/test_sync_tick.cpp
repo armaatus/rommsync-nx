@@ -923,6 +923,19 @@ void NewerRule(rig::Checks& checks) {
     emptied.reason = sync::Reason::kDeletedOnServer;
     checks.Expect(!sync::ResolveNewerOnServer(emptied, &local, &last).has_value(),
                   "a delete is never something the resolution runs");
+
+    // #233: a slot whose row is a kept delete. Its deleted bytes are never
+    // uploaded, so only new progress can draw a 409 -- and against a row that
+    // records no server copy, that progress is never silently replaced.
+    state::SaveRecord kept_delete = last;
+    kept_delete.server_content_hash = std::nullopt;
+    kept_delete.deleted_on_server = true;
+    sync::ClientSaveState progress = local;
+    progress.content_hash = edited;
+    const std::optional<sync::SyncOperation> over_kept =
+        sync::ResolveNewerOnServer(head, &progress, &kept_delete);
+    checks.Expect(over_kept.has_value() && over_kept->action == sync::Action::kConflict,
+                  "progress on a kept delete, met by another device's head, is a conflict");
   }
 
   // Nothing to run: the failure stands and the next tick negotiates again.
