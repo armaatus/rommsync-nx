@@ -481,7 +481,7 @@ static_assert(kHeapPeak == 0x148800, "the table above no longer sums to its peak
 //     213 is 353 KiB, of which 1,024 roms and the page on its way in take 259 and
 //     the margin above is the rest. Each further 256 roms is ~62 KiB of resident
 //     `.bss` -- the heap growing with it, against an image ceiling
-//     (`scripts/image-budget.sh`) with ~264 KiB to spare -- and that trade is
+//     (`scripts/image-budget.sh`) with ~260 KiB to spare -- and that trade is
 //     this table's to make again rather than a constant's to drift into.
 //
 // **Still not in this table**, and M9-20 (#246) is where they go: every other

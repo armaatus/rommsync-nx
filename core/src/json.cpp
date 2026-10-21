@@ -123,6 +123,11 @@ class Parser {
   Parser(std::string_view text, std::string_view each_key, const EachElement& each)
       : text_(text), each_key_(each_key), each_(&each) {}
 
+  /// The whole document. `kStreams` is `json::ParseEach`'s, and an instantiation
+  /// of its own for the reason `ParseObject` is one: `json::Parse` is on the
+  /// main thread's deepest chain (#216), and the dispatch below would cost it
+  /// frame for a branch it never takes.
+  template <bool kStreams>
   ParseResult Run() {
     ParseResult result;
     SkipWhitespace();
@@ -132,8 +137,21 @@ class Parser {
       return result;
     }
     Value root;
-    const bool streamed = each_ != nullptr && each_key_.empty();
-    if (!(streamed ? ParseEach(0, &root) : ParseValue(0, &root))) {
+    bool parsed = false;
+    if constexpr (kStreams) {
+      // The streamed array is the root (an empty key) or a member of the root
+      // object; any other document is `ParseValue`'s, whatever its shape.
+      if (each_key_.empty()) {
+        parsed = ParseEach(0, &root);
+      } else if (text_[at_] == '{') {
+        parsed = ParseObject<true>(0, &root);
+      } else {
+        parsed = ParseValue(0, &root);
+      }
+    } else {
+      parsed = ParseValue(0, &root);
+    }
+    if (!parsed) {
       result.error = error_;
       return result;
     }
@@ -209,7 +227,7 @@ class Parser {
       case '[':
         return ParseArray(depth, out);
       case '{':
-        return ParseObject(depth, out);
+        return ParseObject<false>(depth, out);
       default:
         return ParseNumber(out);
     }
@@ -288,6 +306,14 @@ class Parser {
     }
   }
 
+  /// An object. `kStreams` is the top-level object `ParseEach` was asked about,
+  /// and only `Run` asks for it: the member named `each_key_` goes to
+  /// `ParseEach`. A separate instantiation rather than a runtime test, so the
+  /// recursion `ParseValue` -> `ParseObject<false>` is the one #216 measured --
+  /// `stack.measured` counts every function on that cycle once per nesting
+  /// level, and `ParseEach` on it would cost the main thread 272 bytes a level
+  /// for a branch only depth 0 can take.
+  template <bool kStreams>
   bool ParseObject(int depth, Value* out) {
     out->type_ = Type::kObject;
     ++at_;  // '{'
@@ -320,11 +346,15 @@ class Parser {
       }
       ++at_;
       SkipWhitespace();
-      const bool streamed =
-          depth == 0 && each_ != nullptr && !each_key_.empty() && member.key == each_key_;
-      if (!(streamed ? ParseEach(depth + 1, &member.value)
-                     : ParseValue(depth + 1, &member.value))) {
-        return false;
+      if constexpr (kStreams) {
+        if (!(member.key == each_key_ ? ParseEach(depth + 1, &member.value)
+                                      : ParseValue(depth + 1, &member.value))) {
+          return false;
+        }
+      } else {
+        if (!ParseValue(depth + 1, &member.value)) {
+          return false;
+        }
       }
       out->members_.push_back(std::move(member));
       SkipWhitespace();
@@ -535,12 +565,12 @@ class Parser {
 
 ParseResult Parse(std::string_view text) {
   Parser parser(text);
-  return parser.Run();
+  return parser.Run<false>();
 }
 
 ParseResult ParseEach(std::string_view text, std::string_view key, const EachElement& each) {
   Parser parser(text, key, each);
-  return parser.Run();
+  return parser.Run<true>();
 }
 
 std::string Quote(std::string_view value) {
