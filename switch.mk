@@ -152,7 +152,33 @@ ARCH := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 ROMMSYNC_WARNINGS := -Wall -Wextra -Wpedantic -Werror
 ROMMSYNC_VENDOR_DROPS := -Wextra -Wpedantic -Werror
 
-CFLAGS := -g $(ROMMSYNC_WARNINGS) -O2 -ffunction-sections -fdata-sections \
+# What the image costs to keep resident, M9-9 (#200). Both targets live in a
+# budget someone else sets -- the sysmodule in what Atmosphere carves out of the
+# applet pool (7 MB on FW 21, shared with every other sysmodule; boot2 aborts on
+# a launch that does not fit), the overlay in nx-ovlloader's 4 MB heap, which
+# reads the whole .ovl in -- so these two are chosen for size:
+#
+#   * -fno-unwind-tables -fno-asynchronous-unwind-tables: the build is
+#     -fno-exceptions, so nothing ever unwinds through our frames, and the
+#     tables sat in the rodata segment anyway -- 57 KiB of the sysmodule's
+#     .eh_frame and 45 KiB of the overlay's. What .eh_frame is left is libnx's,
+#     newlib's and libstdc++'s prebuilt tables, ~27 KiB. Atmosphere goes on to
+#     /DISCARD/ those in its own linker script; we do not, because that means
+#     owning a fork of libnx's switch.ld (switch.specs names it, and KEEPs
+#     .eh_frame) that every move of the toolchain pin would have to re-merge,
+#     to save 27 KiB whose only reader is the unwinder on a libstdc++-internal
+#     throw that ends in std::terminate either way.
+#   * -Os rather than -O2: the sysmodule's .text goes from 1.12 MiB to 495 KiB
+#     and the overlay's from 801 KiB to 495 KiB. Measured against the hot path
+#     it could cost -- hashing a whole rom on download -- it is not a loss:
+#     core/'s MD5 is ~5% slower and its SHA-1 ~34% faster, compiled by this
+#     devkitA64 with these flags (the numbers are in docs/DEVELOPMENT.md).
+#     libultrahand's own recommended flag set is -Os as well.
+#
+# `ctest -R switch.builds` holds both: no object of ours with an .eh_frame,
+# the sysmodule's .eh_frame under 32 KiB, and both .texts under 640 KiB.
+CFLAGS := -g $(ROMMSYNC_WARNINGS) -Os -ffunction-sections -fdata-sections \
+			-fno-unwind-tables -fno-asynchronous-unwind-tables \
 			$(ARCH) $(DEFINES)
 
 CFLAGS += $(INCLUDE) -D__SWITCH__

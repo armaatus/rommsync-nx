@@ -98,6 +98,75 @@ phase_ci() {
 
 # --- the real cross-compile ---------------------------------------------------
 
+# `aarch64-none-elf-size -A` of ELF $1 (relative to $SCRATCH), as "section size"
+# lines.
+section_sizes() {
+  docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work "$IMAGE" \
+    bash -lc '"$DEVKITPRO"/devkitA64/bin/aarch64-none-elf-size -A "$1"' _ "$1" |
+    awk '$1 ~ /^\./ { print $1, $2 }'
+}
+
+# M9-9 (#200): every object this build compiles -- ours, core/'s and the
+# vendored libultrahand alike -- carries no unwind table. The targets are
+# -fno-exceptions, so nothing ever unwinds through them, and `.eh_frame` sits in
+# the rodata segment: it is resident for as long as the process is, in a budget
+# Atmosphere has cut to 7 MB on FW 21 (sysmodule) and a 4 MB ovlloader heap
+# (overlay). Checked per object rather than only on the linked total, because
+# the total also holds libnx's, newlib's and libstdc++'s prebuilt tables, which
+# no flag of ours can remove -- a flag lost from one compile would hide inside
+# them.
+check_unwind_tables() {
+  local listing target
+  for target in "$@"; do
+    ls "$SCRATCH/$target/build/"*.o >/dev/null 2>&1 ||
+      fail "no objects in $target/build; the unwind-table check would pass vacuously"
+  done
+  listing="$(docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work "$IMAGE" \
+      bash -lc 'for t in "$@"; do for o in "$t"/build/*.o; do
+                  "$DEVKITPRO"/devkitA64/bin/aarch64-none-elf-readelf -SW "$o" |
+                    grep -q "\.eh_frame" && echo "$o"; done; done; true' _ "$@")"
+  [ -z "$listing" ] ||
+    fail "these objects were compiled with unwind tables (switch.mk lost \
+-fno-unwind-tables -fno-asynchronous-unwind-tables for them):
+$listing"
+}
+
+# ...and the linked numbers that buys, held rather than observed once.
+#
+#   .eh_frame, sysmodule  < 32 KiB  #200's acceptance. 85,672 bytes at -O2 with
+#                                   unwind tables; ~27 KiB without, all of it
+#                                   prebuilt library tables (libnx alone ~11 KiB).
+#   .text, both targets   < 640 KiB  holds -Os. At -O2 the sysmodule's .text is
+#                                   ~1.12 MiB and the overlay's ~800 KiB; at -Os
+#                                   ~495 KiB each. A switch.mk that drops -Os
+#                                   lands well past this, and the room under it
+#                                   is growth, not slack to spend on -O2.
+#
+# The absolute budget for the whole image -- .bss and page-aligned segments -- is
+# M9-15 (#204)'s; these are the two numbers #200 moved.
+check_image_ceilings() {
+  local sys ovl eh text
+  sys="$(section_sizes sysmodule/sys-rommsync.elf)"
+  ovl="$(section_sizes overlay/ovl-rommsync.elf)"
+  [ -n "$sys" ] && [ -n "$ovl" ] || fail "aarch64-none-elf-size reported no sections"
+
+  eh="$(awk '$1 == ".eh_frame" { print $2 }' <<<"$sys")"
+  [ -n "$eh" ] || fail "no .eh_frame in the sysmodule at all; the linker script changed under this check"
+  [ "$eh" -lt $(( 32 * 1024 )) ] ||
+    fail "the sysmodule's .eh_frame is $eh bytes, past the 32 KiB ceiling (#200)"
+
+  local which sizes
+  for which in sysmodule overlay; do
+    if [ "$which" = sysmodule ]; then sizes="$sys"; else sizes="$ovl"; fi
+    text="$(awk '$1 == ".text" { print $2 }' <<<"$sizes")"
+    [ -n "$text" ] || fail "no .text in the $which"
+    [ "$text" -lt $(( 640 * 1024 )) ] ||
+      fail "the $which's .text is $text bytes, past the 640 KiB ceiling -- is switch.mk still -Os? (#200)"
+  done
+  echo "ok: sysmodule .eh_frame $eh, .text $(awk '$1 == ".text" { print $2 }' <<<"$sys");\
+ overlay .text $(awk '$1 == ".text" { print $2 }' <<<"$ovl")"
+}
+
 phase_builds() {
   command -v docker >/dev/null 2>&1 || skip "no docker"
   docker info >/dev/null 2>&1 || skip "docker daemon not running"
@@ -209,6 +278,9 @@ $(( declared )); $(( bss - declared )) bytes of that is something other than the
 which is more than the $slack this check allows (#207, #204)"
   fi
 
+  check_unwind_tables sysmodule overlay
+  check_image_ceilings
+
   # The sysmodule hosts the service the overlay opens (M4-1). Nothing in this
   # repo can run it before the M8-1 gate, so this is the only automated check
   # that the loop is still in the image at all.
@@ -311,6 +383,10 @@ phase_tlsprobe() {
   if grep -q 'rommsync::version()' "$lst"; then
     fail "core/ was linked into the probe; its footprint no longer means what it says"
   fi
+
+  # The probe's own objects too: it is the measurement of what TLS costs a
+  # sysmodule, so it has to be compiled the way the sysmodule is.
+  check_unwind_tables tlsprobe
 
   # The number this target exists to produce, printed on every run so a change
   # in it is visible in the log rather than only on someone's console.

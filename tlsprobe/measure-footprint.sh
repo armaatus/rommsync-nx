@@ -151,7 +151,8 @@ EOF
 # switch.mk`s flags, verbatim, so these numbers are comparable to the ones a
 # real target produces.
 ARCH="-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE"
-CXXFLAGS="-g -Wall -O2 -ffunction-sections -fdata-sections $ARCH -D__SWITCH__ \
+CXXFLAGS="-g -Wall -Os -ffunction-sections -fdata-sections \
+  -fno-unwind-tables -fno-asynchronous-unwind-tables $ARCH -D__SWITCH__ \
   -std=c++20 -fno-rtti -fno-exceptions \
   -isystem /opt/devkitpro/libnx/include -isystem /opt/devkitpro/portlibs/switch/include"
 LDFLAGS="-specs=/opt/devkitpro/libnx/switch.specs -g $ARCH -Wl,--gc-sections \

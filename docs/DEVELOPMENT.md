@@ -99,6 +99,76 @@ signatures that still compile but mean something else -- v2.0.0 changed four
 (`drawString`, `CategoryHeader`, `OverlayFrame`, `ListItem`; #199 has the
 table) -- before trusting a green `switch.builds`.
 
+### What the image costs
+
+Both Switch targets live in a memory budget somebody else sets. The sysmodule's
+comes out of what Atmosphere reserves for custom system modules, which has
+shrunk with every recent firmware (7 MB on HOS 21.0.0+ by
+`kern_k_system_control.cpp`'s count, shared with every other sysmodule
+installed), and boot2 aborts outright on a launch that does not fit. The
+overlay's is nx-ovlloader's heap, 4 MB by default, into which the whole `.ovl`
+is read before anything is allocated. So `switch.mk` compiles for size (#200):
+
+- **`-fno-unwind-tables -fno-asynchronous-unwind-tables`.** The build is
+  `-fno-exceptions`, so nothing unwinds through our frames, and `.eh_frame`
+  lives in the rodata segment -- resident for the life of the process. What is
+  left after the flags is libnx's, newlib's and libstdc++'s prebuilt tables.
+  Atmosphere also `/DISCARD/`s those in its linker script; we do not, because
+  that means forking libnx's `switch.ld` (which `switch.specs` names and which
+  `KEEP`s `.eh_frame`) and re-merging it on every move of the pin above, for
+  27 KiB.
+- **`-Os`, not `-O2`.** The larger win by far, and libultrahand's own
+  recommended flag set.
+
+Measured in `devkitpro/devkita64:20260219` (GCC 15.2.0) with
+`aarch64-none-elf-size -A`; "image" is the end of `.bss`, i.e. everything the loader maps:
+
+| | `-O2` (before) | `+` no unwind tables | `+ -Os` (now) |
+|---|---|---|---|
+| sysmodule `.text` | 1,177,792 | 1,177,792 | **506,624** |
+| sysmodule `.rodata` | 62,912 | 62,912 | 56,592 |
+| sysmodule `.eh_frame` | 85,672 | 26,992 | 27,112 |
+| sysmodule `.bss` | 1,393,792 | 1,393,792 | 1,393,792 |
+| sysmodule image | 2,745,296 (2.62 MiB) | 2,687,952 (2.56 MiB) | **2,008,016 (1.92 MiB)** |
+| `.nsp` | 980,504 | 944,557 | 432,370 |
+| overlay `.text` | 820,608 | 820,608 | 506,944 |
+| overlay `.eh_frame` | 81,376 | 34,864 | 34,936 |
+| `.ovl` | 1,015,868 | 970,812 | **647,228** |
+
+The trade `-Os` could have cost is speed on the one hot loop: hashing a whole rom
+to verify a download (`crypto::Sha1FileHex` / `Md5FileHex`, 4 KiB at a time).
+core/'s `md5.cpp` and `sha1.cpp` compiled by that devkitA64 with `switch.mk`'s
+exact flags, linked into a Linux arm64 driver and run over 256 MiB in 4 KiB
+chunks (best of five, Apple-silicon host, not a Cortex-A57):
+
+| | `-O2` | `-Os` |
+|---|---|---|
+| MD5 | 579 MiB/s | 548 MiB/s (−5%) |
+| SHA-1 | 311 MiB/s | 418 MiB/s (+34%) |
+
+On this host either is several times what a console's SD card reads. An A57 is
+slower at both, but `-Os` did not make the slower hash materially slower, and it
+made the one a verify prefers -- SHA-1, whenever RomM recorded one -- faster.
+
+The rig's own download and hash tests (`download.roundtrip|verify|resume`,
+`wire.download`, `core.md5`, `core.sha1_fixture`), rebuilt at `-O2` and at
+`-Os`, are identical to the 10 ms except `download.resume` (1.36--1.44 s
+against 1.47--1.50 s). That says little: the rig runs host-compiled code over
+small fixtures, so it cannot see `switch.mk`'s flags at all. How long a verify
+takes on a real A57 is a hardware measurement, and waits for the M8-1 gate.
+
+`ctest -R switch.builds` holds the result: no object this build compiles may
+carry an `.eh_frame`, the sysmodule's linked `.eh_frame` stays under 32 KiB, and
+both targets' `.text` under 640 KiB, which a revert to `-O2` overshoots in both.
+The budget for the whole image is M9-15 (#204)'s.
+
+What is still linked and could go: newlib's full `printf` (`_svfprintf_r`,
+~15 KiB, plus `_dtoa_r`), first pulled in by our six `snprintf` calls, none of
+which formats a float (whether libnx needs it too is not audited); and
+libstdc++'s `fast_float` (a 10 KiB power-of-five table and ~6 KiB of parser),
+which `core/src/json.cpp` genuinely uses to parse JSON numbers with a
+fraction or exponent.
+
 ## Repo build layout
 
 ```
@@ -455,15 +525,16 @@ The experiment is [`tlsprobe/`](../tlsprobe/README.md): a manually-launched
 through `ssl` and reports what each stage cost. It is built by CI on every push
 and by `ctest -R switch.tlsprobe`, and it has **not been run** — see below.
 
-**Code size.** Three aarch64 images, identical flags and libnx, differing only in
-what they link (`./tlsprobe/measure-footprint.sh`, devkitA64 r29.2-1,
+**Code size.** Three aarch64 images, identical flags (`switch.mk`'s, re-measured
+at its `-Os` by #200, which moved each figure by under 50 bytes) and libnx,
+differing only in what they link (`./tlsprobe/measure-footprint.sh`, devkitA64 r29.2-1,
 libnx 4.12.0-1, switch-mbedtls 2.28.10-1):
 
 | image | `.text` | `.data` | `.bss` | Δ`.text` |
 |---|---|---|---|---|
-| baseline — libnx + newlib stdio | 113,806 | 14,264 | 19,392 | — |
-| **`ssl` service** — sockets + the full handshake sequence | 176,513 | 15,216 | 19,712 | **+62,707** |
-| mbedTLS — the same handshake in-process | 501,685 | 30,952 | 29,088 | +387,879 |
+| baseline — libnx + newlib stdio | 113,774 | 14,264 | 19,392 | — |
+| **`ssl` service** — sockets + the full handshake sequence | 176,465 | 15,216 | 19,712 | **+62,691** |
+| mbedTLS — the same handshake in-process | 501,629 | 30,952 | 29,088 | +387,855 |
 
 Borrowing Horizon's TLS costs **61 KiB of code**; carrying our own costs
 **379 KiB**, six times more, before its per-connection heap. That is the whole
