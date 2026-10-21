@@ -127,7 +127,8 @@ void Heartbeat(rig::Checks& checks) {
 
   // SYSTEM anywhere among the members, not only first.
   const auth::Parsed<std::string> later = server::ParseHeartbeatVersion(
-      R"({"FILESYSTEM":{"FS_PLATFORMS":["a\"}",{"x":[1,2,{"y":"]"}]}]},"SYSTEM":{"VERSION":"5.4.0-beta.1"}})");
+      R"({"FILESYSTEM":{"FS_PLATFORMS":["a\"}",{"x":[1,2,{"y":"]"}]}]},)"
+      R"("SYSTEM":{"VERSION":"5.4.0-beta.1"}})");
   checks.Expect(later.ok() && later.value == "5.4.0-beta.1",
                 "SYSTEM after a member whose strings hold brackets and escaped quotes: " +
                     later.error.Describe());
@@ -179,7 +180,8 @@ server::Version FixtureVersion(http::HttpClient& client, const std::string& base
   const json::ParseResult parsed = json::Parse(sent.response.body);
   const json::Value* system = parsed.value.Find("SYSTEM");
   const json::Value* version = system == nullptr ? nullptr : system->Find("VERSION");
-  return server::ParseVersion(version == nullptr ? "" : version->string()).value_or(server::Version{});
+  return server::ParseVersion(version == nullptr ? "" : version->string())
+      .value_or(server::Version{});
 }
 
 void Live(rig::Checks& checks, http::HttpClient& client, const std::string& base) {

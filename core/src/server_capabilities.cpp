@@ -388,11 +388,12 @@ Probe ReadServer(http::HttpClient& client, std::string_view base_url,
     const http::Result sent = client.Send(request);
     if (!sent.ok()) {
       probe.transport = sent.error;
-      probe.message = std::string("the server's version could not be read: ") + http::ToString(sent.error) + " (" +
-                      sent.message + ")";
+      probe.message = std::string("the server's version could not be read: ") +
+                      http::ToString(sent.error) + " (" + sent.message + ")";
     } else if (!sent.successful()) {
       probe.status = sent.response.status;
-      probe.message = "the heartbeat was refused with status " + std::to_string(sent.response.status);
+      probe.message =
+          "the heartbeat was refused with status " + std::to_string(sent.response.status);
     } else {
       const auth::Parsed<std::string> version = ParseHeartbeatVersion(sent.response.body);
       if (version.ok()) {
