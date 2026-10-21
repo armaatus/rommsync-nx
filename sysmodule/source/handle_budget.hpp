@@ -17,9 +17,9 @@
 //   * `time` is not a domain: `timeInitialize` opens five sub-sessions beside
 //     `time:s` and, on 6.0.0+, maps a shared memory.
 //
-// The table is held to **twice** the count, so the next service (#242's
-// foreground-application detection) is an edit to a term here rather than a
-// surprise on a console. It is not the 1023 maximum other sysmodules declare:
+// The table is **twice** the count rounded up to a power of two, so the next
+// service (#242's foreground-application detection) is an edit to a term here
+// rather than a surprise on a console. It is not the 1023 maximum other sysmodules declare:
 // sessions count against the system resource limit every system module shares,
 // so a table sized for a leak lets one spend that budget, where this one fails
 // the leaking call in this process first.
@@ -30,6 +30,7 @@
 // fits; change the table and the npdm has to follow.
 #pragma once
 
+#include <bit>
 #include <cstddef>
 
 #include "http/ssl_http_client.hpp"
@@ -85,12 +86,18 @@ inline constexpr std::size_t kHeld = kThreads + kSm + kFs + kTime + kPsc + kNifm
                                      kSsl + kService + kDnsInFlight;
 
 /// What `sys-rommsync.json` declares. `scripts/npdm-check.py` reads this line.
+///
+/// A literal, so the script can read it, held **exactly** to the rule by the
+/// assert below: twice the count, rounded up to a power of two. Exactly, and
+/// not "at least", because a floor is what a widening passes -- 1023 here and in
+/// the json together would satisfy every other check there is.
 inline constexpr std::size_t kHandleTableSize = 64;
 
 static_assert(kHeld == 28, "the count moved: update sysmodule/README.md's handle row with it");
-static_assert(kHandleTableSize >= 2 * kHeld,
-              "the handle table no longer has twice the handles this process holds; raise "
-              "kHandleTableSize and handle_table_size in sys-rommsync.json together (#210)");
+static_assert(kHandleTableSize == std::bit_ceil(2 * kHeld),
+              "kHandleTableSize is not twice the handles this process holds, rounded up to a "
+              "power of two; change it and handle_table_size in sys-rommsync.json together "
+              "(#210)");
 static_assert(kHandleTableSize <= 1023, "handle_table_size is a 10-bit field");
 
 }  // namespace rommsync::sysmodule::handles

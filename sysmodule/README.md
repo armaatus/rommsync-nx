@@ -167,8 +167,8 @@ guess, and is still wrong to make now.
   | Facility | Bit | Granted |
   |---|---|---|
   | `sdmc:` — `fsOpenSdCardFileSystem`, under fsdev | `SdCard` (21) | **yes**: every file this process reads or writes |
-  | A user's game save — `fsOpen_SaveData`, `fsdevMountSaveData` | `SaveDataBackUp` (5) | no; it also needs `acc:u0` in `service_access` for the `AccountUid` |
-  | This process's own system save — `fsOpen_SystemSaveData` | `SystemSaveData` (3) | no |
+  | A user's game save — `fsOpen_SaveData`, `fsdevMountSaveData` (fs's `CanMountOthersSaveData*`) | `SaveDataBackUp` (5) | no; it also needs `acc:u0` in `service_access` for the `AccountUid` |
+  | This process's own system save — `fsOpen_SystemSaveData` (`CanMountSystemSaveData*`) | `SystemSaveData` (3) | no |
   | A BIS partition — `fsOpenBisFileSystem` | `BisFileSystem` (15) | no |
   | Never: format, corrupt, raw or debug access | `FormatSdCard` (26), `CorruptSaveData` (24), `BisAllRaw` (7), `FillBis` (23), `GameCardRaw` (8), `SaveDataForDebug` (25), `Debug` (62), `FullPermission` (63) | **no, and not for any facility this project plans** |
 
@@ -187,8 +187,9 @@ guess, and is still wrong to make now.
   lookups in flight. Open files, `SslConnection`s and the `PmModule` are domain
   objects and cost nothing here; **a socket is not a handle at all**, so the
   `errno == ENOENT` descriptor question in `ssl_http_client.cpp` is a bsd limit
-  and not this one. A `static_assert` fails the build when the count outgrows
-  half the table. Not the 1023 sys-con and sys-ftpd declare: sessions are drawn
+  and not this one. A `static_assert` holds the table to exactly twice the
+  count, rounded up to a power of two, so it cannot be widened by editing the
+  number. Not the 1023 sys-con and sys-ftpd declare: sessions are drawn
   from the resource limit every system module shares, and a table sized for a
   leak lets the leak spend it, where 64 fails the leaking call here first.
 - **Address space: type 3, 39-bit** (#210). It is the 64-bit layout the kernel
