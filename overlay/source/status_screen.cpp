@@ -58,7 +58,8 @@ constexpr int kPollsBetweenProbes = 60;
 
 }  // namespace
 
-StatusScreen::StatusScreen(IpcClient& client) : client_(client) {}
+StatusScreen::StatusScreen(IpcClient& client)
+    : client_(client), probe_cadence_(kPollsBetweenProbes) {}
 
 tsl::elm::Element* StatusScreen::createUI() {
   auto* frame = new tsl::elm::OverlayFrame("rommsync", version());
@@ -125,12 +126,12 @@ const CardState& StatusScreen::CardThisPoll(Link link) {
   // Re-read on the first look and then only every `kPollsBetweenProbes` polls: the card
   // is the one thing here a *user* changes while this screen is up -- they leave
   // for ovl-sysmodules, turn the toggle on, and come back -- so it cannot be
-  // read once and kept, and it must not be read every frame either.
-  if (probe_countdown_ <= 0) {
+  // read once and kept, and it must not be read every frame either. And on the
+  // first poll of every showing, which a count of this screen's own would miss:
+  // nothing counts while the overlay is hidden (`lifecycle.hpp`, #209).
+  if (probe_cadence_.Due()) {
     card_ = ProbeCard();
-    probe_countdown_ = kPollsBetweenProbes;
   }
-  --probe_countdown_;
   return card_;
 }
 

@@ -7,6 +7,7 @@
 #include "conflicts_screen.hpp"
 #include "ipc_client.hpp"
 #include "library_screen.hpp"
+#include "lifecycle.hpp"
 #include "pairing_screen.hpp"
 #include "palette.hpp"
 #include "rommsync/auth.hpp"
@@ -52,7 +53,9 @@ constexpr int kPollFrames = 30;
 
 }  // namespace
 
-SettingsScreen::SettingsScreen(IpcClient& client) : client_(client) { Rebuild(); }
+SettingsScreen::SettingsScreen(IpcClient& client) : client_(client), cadence_(kPollFrames) {
+  Rebuild();
+}
 
 tsl::elm::Element* SettingsScreen::createUI() {
   auto* frame = new tsl::elm::OverlayFrame("rommsync", version());
@@ -67,11 +70,13 @@ tsl::elm::Element* SettingsScreen::createUI() {
 }
 
 void SettingsScreen::update() {
-  if (since_poll_ > 0 && since_poll_ < kPollFrames) {
-    ++since_poll_;
-    return;
+  // By `Cadence` rather than a frame count of this screen's own: `update()`
+  // does not run while the overlay is hidden, and a count resumed after a hide
+  // would draw the configuration from before it for up to half a second
+  // (`lifecycle.hpp`, #209).
+  if (cadence_.Due()) {
+    Poll();
   }
-  Poll();
 }
 
 bool SettingsScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidAnalogStickState,
@@ -135,8 +140,6 @@ bool SettingsScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidAn
 }
 
 void SettingsScreen::Poll() {
-  since_poll_ = 1;
-
   // The port and the version handshake, both of which every screen needs and
   // none of which is this screen's own (`screen_frame.hpp`).
   const Link link = frame_.Ready();

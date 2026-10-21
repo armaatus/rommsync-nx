@@ -21,6 +21,7 @@
 #include <tesla.hpp>
 
 #include "ipc_client.hpp"
+#include "lifecycle.hpp"
 #include "rommsync/overlay_status_view.hpp"
 #include "screen_frame.hpp"
 
@@ -61,7 +62,7 @@ class StatusScreen : public tsl::Gui {
   /// the one due to.
   ///
   /// Not an accessor: it is the poll's own step, and it stats three files on the
-  /// polls where the countdown has run out. Named for that -- `card()` beside
+  /// polls where `probe_cadence_` is due. Named for that -- `card()` beside
   /// `card_` would read as free.
   ///
   /// `link` is what decides whether to look at all. Only `Link::kNotRunning`
@@ -88,10 +89,11 @@ class StatusScreen : public tsl::Gui {
   /// a blank one there is indistinguishable from a broken overlay.
   StatusView view_ = RenderUnreachable(Link::kNotRunning);
 
-  /// The last look at the card, and how many polls until the next one. Zero so
-  /// the first poll that needs it reads it rather than drawing a default.
+  /// The last look at the card, and when the next one is due. Due on the first
+  /// poll that needs it, so that poll reads the card rather than drawing a
+  /// default -- and on the first of every showing (`lifecycle.hpp`).
   CardState card_;
-  int probe_countdown_ = 0;
+  Cadence probe_cadence_;
 };
 
 }  // namespace rommsync::overlay

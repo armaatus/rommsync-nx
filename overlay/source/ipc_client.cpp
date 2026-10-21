@@ -3,6 +3,7 @@
 #include <pthread.h>
 #include <switch.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -47,6 +48,11 @@ namespace {
 constexpr std::size_t kWorkerStackBytes = 0x4000;
 static_assert(kWorkerStackBytes % 0x1000 == 0,
               "a thread stack must be page-aligned or __syscall_thread_create returns EINVAL");
+
+std::atomic<int>& RunningWorkers() {
+  static std::atomic<int> running{0};
+  return running;
+}
 
 }  // namespace
 
@@ -130,13 +136,17 @@ bool IpcClient::StartWorkerLocked() {
   return ok;
 }
 
+int IpcClient::Workers() { return RunningWorkers().load(); }
+
 void IpcClient::Run() {
+  ++RunningWorkers();
   std::unique_lock<std::mutex> lock(mutex_);
   for (;;) {
     work_.wait(lock, [this] { return stopping_ || slot_ == Slot::kQueued; });
     if (stopping_) {
       // `Shutdown` only sets this once nothing is queued or running, so there is
       // no call to abandon on the way out.
+      --RunningWorkers();
       return;
     }
     slot_ = Slot::kRunning;

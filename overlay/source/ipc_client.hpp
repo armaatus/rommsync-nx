@@ -167,6 +167,11 @@ class IpcClient {
   /// `NotResponding()` at once while this holds.
   bool busy();
 
+  /// How many workers this process has running, across every client. What
+  /// `overlay.cycles` balances: a worker left behind by a close is a thread
+  /// returning into an overlay nx-ovlloader has already unloaded.
+  static int Workers();
+
   /// The contract the *sysmodule* speaks. Compare it with `ipc::kVersion`: a
   /// mismatch means one half needs updating, and this is the only call that is
   /// safe to make before knowing (its encoding is frozen).
