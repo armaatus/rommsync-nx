@@ -680,6 +680,91 @@ void Overwrite(rig::Checks& checks) {
   }
 }
 
+// --- content_hash -------------------------------------------------------------
+//
+// #234: RomM 5.4 keeps a per-device baseline from the `content_hash` an upload
+// and a `/downloaded` carry, and treats a later report matching it as proof
+// that side did not change. So both carry one, and it is the digest of the
+// bytes that actually moved: the file as the upload streams it, and the
+// verified bytes a download put on the card. Needs no server -- what is checked
+// is what leaves -- and the digests are literals, worked out once, not
+// recomputed the way the code computes them.
+
+/// Answers the four calls an upload and a download make, and nothing else.
+class SaveServer final : public http::HttpClient {
+ public:
+  explicit SaveServer(std::string bytes) : bytes_(std::move(bytes)) {}
+
+  http::Result Send(const http::Request& request) override {
+    http::Result result;
+    result.response.status = 200;
+    if (request.url.find("/api/saves?") != std::string::npos) {
+      result.response.body = R"({"id":41})";
+    } else if (request.url.find("/api/saves/5/downloaded") != std::string::npos) {
+      result.response.body = R"({"id":5})";
+    } else if (request.url.find("/api/saves/5") != std::string::npos) {
+      result.response.body = R"({"id":5,"file_size_bytes":)" + std::to_string(bytes_.size()) +
+                             R"(,"content_hash":"0931bd07b94c9c07f0645fa14e9a5092"})";
+    } else {
+      result.response.status = 404;
+    }
+    return result;
+  }
+  http::Result Download(const http::Request&, const http::DownloadTarget& into) override {
+    rig::WriteFile(into.path, bytes_);
+    http::Result result;
+    result.response.status = 200;
+    return result;
+  }
+
+ private:
+  std::string bytes_;
+};
+
+void ContentHash(rig::Checks& checks) {
+  Sandbox sandbox(checks, "execute-content-hash");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  auth::StoredToken token;
+  token.server_url = "http://127.0.0.1:1";
+  token.access_token = "not-used";
+  token.device_id = "this-console";
+
+  // The card moved on after the scan that negotiated: what goes up is these
+  // bytes, so the baseline must be their digest and not the scan's.
+  sandbox.SeedSave(SavePath("up.srm"), "the bytes on the card when the upload went\n");
+  sandbox.SeedSave(SavePath("down.srm"), "the local copy the download replaces\n");
+
+  sync::SyncPlan plan;
+  plan.session_id = 1;
+  plan.operations.push_back(OperationOf(sync::Action::kUpload, 7, "up"));
+  sync::SyncOperation download = OperationOf(sync::Action::kDownload, 8, "down");
+  download.save_id = 5;
+  download.server_content_hash = "0931bd07b94c9c07f0645fa14e9a5092";
+  plan.operations.push_back(download);
+  const std::vector<sync::SaveTarget> targets = {
+      {7, std::string("up"), SavePath("up.srm"), "up.srm"},
+      {8, std::string("down"), SavePath("down.srm"), "down.srm"}};
+
+  SaveServer server("the server copy, verified\n");
+  harness::BaselineAudit audit(server);
+  const sync::ExecutionReport report =
+      sync::ExecutePlan(audit, *files, token, plan, targets, OptionsAt(1'757'000'000));
+
+  checks.ExpectEq(report.completed, 2,
+                  "the upload and the download both completed" +
+                      (report.warnings.empty() ? std::string() : ": " + report.warnings[0]));
+  for (const std::string& violation : audit.violations) {
+    checks.Expect(false, violation);
+  }
+  checks.Expect(audit.uploaded == std::vector<std::string>{"52aa82374597bb39c0ceac4261823731"},
+                "the upload carries the MD5 of the bytes it sent");
+  checks.Expect(audit.confirmed == std::vector<std::string>{"0931bd07b94c9c07f0645fa14e9a5092"},
+                "and the confirmation the MD5 of the verified bytes now on the card");
+  checks.ExpectEq(sandbox.Read(SavePath("down.srm")), std::string("the server copy, verified\n"),
+                  "which are the server's");
+}
+
 // --- upload -------------------------------------------------------------------
 //
 // An upload that respects RomM's slot guard: `overwrite=false`, `session_id`
@@ -1740,11 +1825,13 @@ int main(int argc, char** argv) {
 
   // The two that need no server, so they stay checked with docker stopped.
   if (scenario == "naming" || scenario == "staging" || scenario == "counting" ||
-      scenario == "crash_model" || scenario == "overwrite") {
+      scenario == "crash_model" || scenario == "overwrite" || scenario == "content_hash") {
     if (scenario == "naming") {
       Naming(checks);
     } else if (scenario == "overwrite") {
       Overwrite(checks);
+    } else if (scenario == "content_hash") {
+      ContentHash(checks);
     } else if (scenario == "staging") {
       Staging(checks);
     } else if (scenario == "crash_model") {

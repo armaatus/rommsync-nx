@@ -947,6 +947,7 @@ set(EXECUTE_UNIT_SCENARIOS
   counting # no-op, a downgraded action, and the two refusals that need no server
   crash_model # M9-14: a power cut at every call of an overwrite, and the replay's own check
   overwrite # #232: overwrite=false unless Keep local, and a 409 named as a newer save in the slot
+  content_hash # #234: an upload and a /downloaded carry the MD5 of the bytes that moved
 )
 foreach(scenario IN LISTS EXECUTE_UNIT_SCENARIOS)
   add_test(NAME execute.${scenario} COMMAND test_sync_execute ${scenario})

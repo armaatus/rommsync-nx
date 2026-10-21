@@ -49,6 +49,7 @@
 #include "rig.hpp"
 #include "scratch.hpp"
 #include "rommsync/json.hpp"
+#include "rommsync/md5.hpp"
 #include "rommsync/sync.hpp"
 #include "rommsync/state_sync.hpp"
 #include "rommsync/sync_execute.hpp"
@@ -1036,6 +1037,98 @@ inline sync::ClientSaveState LocalSave(std::int64_t rom_id, const std::string& f
 /// original somewhere, and this says where rather than that a digest did not
 /// match. The fixture is generated with a per-block index for exactly that
 /// (server/testing/make_fixtures.py).
+/// Passes every request through, and holds each save upload and each download
+/// confirmation to #234's rule on the way: it carries a `content_hash`, and an
+/// upload's is the MD5 of the very bytes the request sends.
+///
+/// That last part is what makes a RomM 5.4 baseline safe to have. RomM treats a
+/// device's reported hash matching its baseline as *proof* that side did not
+/// change, so a digest of anything other than what went up would be a proof of
+/// something false. The file is read here when the request leaves, the same
+/// moment the transport streams it.
+///
+/// Decorates the real client rather than standing in for it, so a rig scenario
+/// can wrap its tick in one and still be talking to RomM.
+class BaselineAudit final : public http::HttpClient {
+ public:
+  explicit BaselineAudit(http::HttpClient& inner) : inner_(inner) {}
+
+  http::Result Send(const http::Request& request) override {
+    if (request.method == http::Method::kPost) {
+      if (request.url.find("/api/saves?") != std::string::npos) {
+        AuditUpload(request);
+      } else if (EndsWith(request.url, "/downloaded")) {
+        AuditConfirmation(request);
+      }
+    }
+    return inner_.Send(request);
+  }
+  http::Result Download(const http::Request& request, const http::DownloadTarget& into) override {
+    return inner_.Download(request, into);
+  }
+
+  /// The `content_hash` each upload and each confirmation carried, in order.
+  std::vector<std::string> uploaded;
+  std::vector<std::string> confirmed;
+
+  /// One line per request that broke the rule. Empty is the pass.
+  std::vector<std::string> violations;
+
+ private:
+  static bool EndsWith(const std::string& text, std::string_view suffix) {
+    return text.size() >= suffix.size() &&
+           text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
+  }
+
+  static bool IsMd5(const std::string& value) {
+    if (value.size() != 32) {
+      return false;
+    }
+    for (const char c : value) {
+      if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void AuditUpload(const http::Request& request) {
+    const std::size_t at = request.url.find("&content_hash=");
+    if (at == std::string::npos) {
+      violations.push_back("an upload left without content_hash: " + request.url);
+      return;
+    }
+    const std::size_t from = at + std::string_view("&content_hash=").size();
+    const std::string sent = request.url.substr(from, request.url.find('&', from) - from);
+    uploaded.push_back(sent);
+    if (request.form.size() != 1 || request.form[0].file_path.empty()) {
+      violations.push_back("an upload whose bytes this audit cannot read: " + request.url);
+      return;
+    }
+    const std::string actual = rommsync::crypto::Md5Hex(rig::ReadFile(request.form[0].file_path));
+    if (sent != actual) {
+      violations.push_back("an upload claimed content_hash " + sent + " for bytes whose MD5 is " +
+                           actual);
+    }
+  }
+
+  void AuditConfirmation(const http::Request& request) {
+    const json::ParseResult body = json::Parse(request.body);
+    const json::Value* device = body.ok() ? body.value.Find("device_id") : nullptr;
+    const json::Value* hash = body.ok() ? body.value.Find("content_hash") : nullptr;
+    if (device == nullptr || !device->is_string() || device->string().empty()) {
+      violations.push_back("a download confirmation without device_id: " + request.body);
+    }
+    if (hash == nullptr || !hash->is_string() || !IsMd5(hash->string())) {
+      violations.push_back("a download confirmation without a content_hash: " + request.body);
+      return;
+    }
+    confirmed.push_back(hash->string());
+  }
+
+  http::HttpClient& inner_;
+};
+
 inline bool SameBytes(const std::string& left, const std::string& right,
                       std::uint64_t* first_difference) {
   std::ifstream a(left, std::ios::binary);
