@@ -204,13 +204,12 @@ it proves this side did not change -- so an mtime-only touch (Tico's atomic
 rewrites) against a row that moved in place negotiates as `download`, not
 `conflict` (`tick.baseline_moved`, `tick.baseline_downloaded`). A baseline can
 only ever remove a conflict, never create one, and the one way it could remove a
-*real* one is a digest of bytes the server does not hold; hashing at the moment
-of upload, and confirming only the verified digest, is what rules that out
-(`harness::BaselineAudit`). It is the bytes' own MD5 even for a ZIP, whose
+*real* one is a digest of bytes the server does not hold; hashing just before
+the upload streams the file, and confirming only the verified digest, is what
+keeps that from happening (`harness::BaselineAudit`). It is the bytes' own MD5 even for a ZIP, whose
 server digest hashes the entries instead: RomM holds a device's baseline only
 against that device's later reports, so the different function costs the
-suppression and nothing else. A
-baseline lives on one row, and another device's upload is a new head with no
+suppression and nothing else. A baseline lives on one row, and another device's upload is a new head with no
 history for this device -- that case is #232's 409 (`tick.baseline_other_row`).
 
 Three traps in the operation itself:

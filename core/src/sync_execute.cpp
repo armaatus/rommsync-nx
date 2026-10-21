@@ -472,13 +472,16 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
   }
   url += "&session_id=" + std::to_string(plan.session_id);
   url += "&device_id=" + http::EncodeQueryValue(token.device_id);
-  if (options.content_hash) {
-    // The file is hashed here, as it goes, rather than taken from the scan: the
-    // card may have moved on since step 0, and RomM keeps this digest as proof
-    // of what this device holds. A report matching it later reads as "this side
-    // did not change", so it has to be the digest of the bytes that went up --
-    // a stale one would be a proof of something false (#234). A save that
-    // cannot be hashed is not uploaded without one.
+  if (options.send_content_hash) {
+    // Hashed here, just before the transport streams the file, rather than
+    // taken from the scan: the card may have moved on since step 0, and RomM
+    // keeps this digest as proof of what this device holds. A report matching
+    // it later reads as "this side did not change", so it has to be the digest
+    // of the bytes that go up -- a stale one would be a proof of something
+    // false (#234). What is left is the gap between this read and the
+    // transport's; #242 holds a tick while a game is in the foreground, so
+    // nothing should be writing the save inside it. A save that cannot be
+    // hashed is not uploaded without one.
     const state::HashOutcome digest = state::HashFile(source);
     if (!digest.ok()) {
       return Fail(operation, OperationError::kUnreadableCard,
@@ -735,10 +738,11 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   // The digest of the bytes now on the card, verified equal to the plan's above,
   // is what records this device's baseline (#234): a claim about the card that
   // is true by construction, never one about a copy this device does not hold.
-  confirm.body = "{\"device_id\":" + json::Quote(token.device_id) +
-                 (options.content_hash ? ",\"content_hash\":" + json::Quote(digest.content_hash)
-                                       : std::string()) +
-                 "}";
+  confirm.body = "{\"device_id\":" + json::Quote(token.device_id);
+  if (options.send_content_hash) {
+    confirm.body += ",\"content_hash\":" + json::Quote(digest.content_hash);
+  }
+  confirm.body += "}";
   const http::Result confirmed = client.Send(confirm);
   if (const auto refused = Refused(confirmed, "the download confirmation")) {
     // Counted failed on purpose, even though the bytes are correct: as far as

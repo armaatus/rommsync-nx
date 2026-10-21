@@ -2269,7 +2269,7 @@ void TouchMtime(const Sandbox& sandbox, const std::string& sd_path) {
       std::filesystem::file_time_type::clock::now() + std::chrono::minutes{2}, error);
 }
 
-/// Tick one of every baseline scenario: the card's only copy, uploaded through
+/// The first tick of every baseline scenario: the card's only copy, uploaded through
 /// the audit, so the slot has one row and this device's baseline is on it.
 bool UploadedOnce(rig::Checks& checks, http::HttpClient& client, fs::FileSystem& files,
                   const std::string& base, const Fixture& fixture, Sandbox& sandbox,

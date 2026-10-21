@@ -1030,13 +1030,6 @@ inline sync::ClientSaveState LocalSave(std::int64_t rom_id, const std::string& f
 
 // --- files --------------------------------------------------------------------
 
-/// Byte-for-byte equality of two files, streamed rather than loaded.
-///
-/// Used instead of a hash to check a 120 MiB download, and stronger than one: a
-/// resumed transfer that stitched the wrong offset together differs from the
-/// original somewhere, and this says where rather than that a digest did not
-/// match. The fixture is generated with a per-block index for exactly that
-/// (server/testing/make_fixtures.py).
 /// Passes every request through, and holds each save upload and each download
 /// confirmation to #234's rule on the way: it carries a `content_hash`, and an
 /// upload's is the MD5 of the very bytes the request sends.
@@ -1044,8 +1037,8 @@ inline sync::ClientSaveState LocalSave(std::int64_t rom_id, const std::string& f
 /// That last part is what makes a RomM 5.4 baseline safe to have. RomM treats a
 /// device's reported hash matching its baseline as *proof* that side did not
 /// change, so a digest of anything other than what went up would be a proof of
-/// something false. The file is read here when the request leaves, the same
-/// moment the transport streams it.
+/// something false. The file is read here as the request leaves, just before
+/// the transport streams it.
 ///
 /// Decorates the real client rather than standing in for it, so a rig scenario
 /// can wrap its tick in one and still be talking to RomM.
@@ -1129,6 +1122,13 @@ class BaselineAudit final : public http::HttpClient {
   http::HttpClient& inner_;
 };
 
+/// Byte-for-byte equality of two files, streamed rather than loaded.
+///
+/// Used instead of a hash to check a 120 MiB download, and stronger than one: a
+/// resumed transfer that stitched the wrong offset together differs from the
+/// original somewhere, and this says where rather than that a digest did not
+/// match. The fixture is generated with a per-block index for exactly that
+/// (server/testing/make_fixtures.py).
 inline bool SameBytes(const std::string& left, const std::string& right,
                       std::uint64_t* first_difference) {
   std::ifstream a(left, std::ios::binary);

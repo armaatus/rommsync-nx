@@ -448,11 +448,14 @@ struct ExecuteOptions {
   ///
   /// `RunTick` sets it from `server::ServerCapabilities::hash_baselines`, which
   /// is true on every server a tick executes against (a server below the 5.4.0
-  /// floor ends the tick `kUnsupported` first). The digest is always the bytes'
+  /// floor ends the tick `kUnsupported` first); it is a field so that the
+  /// capability is asked rather than assumed, as every release-dependent
+  /// behaviour is (server_capabilities.hpp). True by default for the same
+  /// reason `TickOptions::server` defaults to the floor's set. The digest is always the bytes'
   /// own MD5, never a ZIP's per-entry hash: RomM holds this device's baseline
   /// only against what the same device reports later, so a function that
   /// differs from the server's costs a suppression and can never invent one.
-  bool content_hash = true;
+  bool send_content_hash = true;
 
   /// Optional, not owned; must outlive the call. Checked between operations and
   /// passed to every request, so a shutdown ends the tick at an operation
