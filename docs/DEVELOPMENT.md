@@ -741,8 +741,23 @@ A removed command leaves a hole.
 | 12 | `ListNext` | cursor -> `ListPage` | `kBadCursor`, `kNotConfigured`, `kOffline`, `kInternal` |
 | 13 | `ListEnd` | cursor -> - | `kBadCursor` |
 | 14 | `ListConflicts` | `ConflictQuery` (offset + limit) -> `ConflictPage` | never fails; an empty history is a page |
-| 15 | `RestoreBackup` | `entry_id` -> `RestoreReport` (outcome + the new backup's path) | never fails; the outcome is `restored \| no_such_entry \| nothing_to_restore \| backup_missing \| backup_failed \| write_failed` |
+| 15 | `RestoreBackup` | `entry_id` -> `RestoreState` (phase + which entry) | never fails, never waits for the copy; a press while one runs answers that one |
 | 16 | `GetLog` | `lines` -> the last N log lines + how many were ever written | never fails; an empty tail is an answer |
+| 17 | `GetRestoreState` | - -> `RestoreState` (`idle \| running \| done` + the `RestoreReport` when done) | never fails; the outcome is `restored \| no_such_entry \| nothing_to_restore \| backup_missing \| backup_failed \| write_failed` |
+
+`RestoreBackup` and `GetRestoreState` are one restore in two calls, since M9-6
+(#209). A restore copies a whole save, and a save is as large as a game makes
+it, so the command hands the copy to the sysmodule's worker -- the thread every
+tick runs on, so the two save writers cannot overlap -- and answers `running` at
+once; the overlay polls command 17 until it says `done`. Before that the copy
+ran on the IPC thread and held the overlay's call, and every other command, for
+as long as the card took. The change of answer is why `ipc::kVersion` is 3.
+
+The overlay bounds every call anyway: `IpcClient` dispatches on a worker thread
+of its own and the draw thread waits at most `kCallBudget` (half a second) for
+an answer. Past that the screen says "not responding" and every later call
+answers at once until the one that is out comes back
+(`overlay/source/ipc_client.hpp`).
 
 `GetLog` is the one command answered from neither the engine nor the card.
 `core/include/rommsync/log.hpp` keeps the last `log::kTailLines` lines in memory

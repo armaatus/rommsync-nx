@@ -236,6 +236,12 @@ constexpr conflicts::RestoreOutcome kAllRestoreOutcomes[] = {
     conflicts::RestoreOutcome::kBackupFailed,  conflicts::RestoreOutcome::kWriteFailed,
 };
 
+constexpr RestorePhase kAllRestorePhases[] = {
+    RestorePhase::kIdle,
+    RestorePhase::kRunning,
+    RestorePhase::kDone,
+};
+
 constexpr config::Severity kAllSeverities[] = {
     config::Severity::kNotice,
     config::Severity::kWarning,
@@ -506,6 +512,8 @@ const char* ToString(Command command) {
       return "RestoreBackup";
     case Command::kGetLog:
       return "GetLog";
+    case Command::kGetRestoreState:
+      return "GetRestoreState";
   }
   return "Unknown";
 }
@@ -628,6 +636,18 @@ const char* ToString(SyncOutcome outcome) {
       return "disabled";
   }
   return "accepted";
+}
+
+const char* ToString(RestorePhase phase) {
+  switch (phase) {
+    case RestorePhase::kIdle:
+      return "idle";
+    case RestorePhase::kRunning:
+      return "running";
+    case RestorePhase::kDone:
+      return "done";
+  }
+  return "idle";
 }
 
 const char* ToString(WriteOutcome outcome) {
@@ -1280,12 +1300,32 @@ Decoded<std::int64_t> DecodeEntryId(std::string_view text) {
       });
 }
 
+namespace {
+
+/// The report object, written once for both payloads that carry one.
+void AppendRestoreReport(std::string* out, const conflicts::RestoreReport& report) {
+  *out += '{';
+  AppendText(out, "outcome", conflicts::ToString(report.outcome), /*first=*/true);
+  AppendText(out, "message", report.message);
+  AppendText(out, "backup_sd_path", report.backup_sd_path);
+  *out += '}';
+}
+
+bool ReadRestoreReport(const json::Value& object, conflicts::RestoreReport* out,
+                       json::Error* error) {
+  // Both texts may be empty: a restore that replaced nothing wrote no backup,
+  // and a message is a sentence rather than a field a caller derives from.
+  return ReadEnum(object, "outcome", kAllRestoreOutcomes, conflicts::ToString,
+                  "a restore outcome", &out->outcome, error) &&
+         ReadText(object, "message", &out->message, error) &&
+         ReadText(object, "backup_sd_path", &out->backup_sd_path, error);
+}
+
+}  // namespace
+
 std::string EncodeRestoreReport(const conflicts::RestoreReport& report) {
-  std::string out("{");
-  AppendText(&out, "outcome", conflicts::ToString(report.outcome), /*first=*/true);
-  AppendText(&out, "message", report.message);
-  AppendText(&out, "backup_sd_path", report.backup_sd_path);
-  out += '}';
+  std::string out;
+  AppendRestoreReport(&out, report);
   return out;
 }
 
@@ -1293,16 +1333,36 @@ Decoded<conflicts::RestoreReport> DecodeRestoreReport(std::string_view text) {
   return DecodeObject<conflicts::RestoreReport>(
       text, "restore report",
       [](const json::Value& object, conflicts::RestoreReport* out, json::Error* error) {
-        if (!ReadEnum(object, "outcome", kAllRestoreOutcomes, conflicts::ToString,
-                      "a restore outcome", &out->outcome, error)) {
+        ReadRestoreReport(object, out, error);
+      });
+}
+
+std::string EncodeRestoreState(const RestoreState& state) {
+  std::string out("{");
+  AppendText(&out, "phase", ToString(state.phase), /*first=*/true);
+  AppendInteger(&out, "entry_id", state.entry_id);
+  AppendKey(&out, "report");
+  AppendRestoreReport(&out, state.report);
+  out += '}';
+  return out;
+}
+
+Decoded<RestoreState> DecodeRestoreState(std::string_view text) {
+  return DecodeObject<RestoreState>(
+      text, "restore state", [](const json::Value& object, RestoreState* out, json::Error* error) {
+        // `0` is allowed, which is what an idle state is about: a decoder that
+        // refused it would be refusing the one answer that says the sysmodule
+        // restarted.
+        if (!ReadEnum(object, "phase", kAllRestorePhases, ToString, "a restore phase",
+                      &out->phase, error) ||
+            !ReadInteger(object, "entry_id", &out->entry_id, 0, kMaxId, error)) {
           return;
         }
-        // Both may be empty: a restore that replaced nothing wrote no backup,
-        // and a message is a sentence rather than a field a caller derives from.
-        if (!ReadText(object, "message", &out->message, error) ||
-            !ReadText(object, "backup_sd_path", &out->backup_sd_path, error)) {
+        const json::Value* report = ReadObject(object, "report", error);
+        if (report == nullptr) {
           return;
         }
+        ReadRestoreReport(*report, &out->report, error);
       });
 }
 

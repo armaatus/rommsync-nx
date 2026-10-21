@@ -74,6 +74,14 @@
 // `PairingSession::status()` already documents, and the reason it exists: an
 // overlay redrawing at 60 Hz cannot be parked on a socket, and a sysmodule may
 // not park a thread at all when the rule is that nothing blocks boot.
+//
+// **Nor on the card for longer than a small write.** `RestoreBackup` copies a
+// whole save, and a save is as large as a game makes it, so since M9-6 (#209)
+// it starts the restore on the worker and answers at once; `GetRestoreState` is
+// what the overlay polls. What is still answered on the IPC thread after a card
+// write is `SetConfig`/`SetEnabled` (one `config.ini`) and the queue commands
+// (one `queue.json`) -- small, bounded files, and the overlay bounds its wait
+// for them anyway (`overlay/source/ipc_client.hpp`, `kCallBudget`).
 #pragma once
 
 #include <array>
@@ -114,7 +122,13 @@ inline constexpr const char* kServiceName = "rommsync";
 /// sysmodule's `Status` fails to decode. Without the bump that arrives as
 /// "sysmodule unreachable", which is the sentence this constant exists to
 /// replace with "update the sysmodule".
-inline constexpr std::uint32_t kVersion = 2;
+///
+/// **3** since M9-6 (#209), which moved `RestoreBackup`'s meaning: it answered
+/// the finished `RestoreReport` and now answers a `RestoreState` the moment the
+/// restore is taken. A v2 overlay decoding that as a report would fail, and a
+/// v3 one reading a v2 sysmodule's report would wait for a restore that had
+/// already happened -- so the two say "update" to each other instead.
+inline constexpr std::uint32_t kVersion = 3;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///
@@ -173,6 +187,7 @@ enum class Command : std::uint32_t {
   kListConflicts = 14,
   kRestoreBackup = 15,
   kGetLog = 16,
+  kGetRestoreState = 17,
 };
 
 /// Every command, in id order. The dispatch table and the documentation are both
@@ -184,7 +199,7 @@ inline constexpr std::array kAllCommands = {
     Command::kStartPair,           Command::kGetPairState, Command::kUnpair,
     Command::kEnqueue,             Command::kDequeue,      Command::kListBegin,
     Command::kListNext,            Command::kListEnd,      Command::kListConflicts,
-    Command::kRestoreBackup,       Command::kGetLog,
+    Command::kRestoreBackup,       Command::kGetLog,       Command::kGetRestoreState,
 };
 
 /// Stable, log-friendly name -- `GetStatus`. Never null; "Unknown" for an id
@@ -850,6 +865,40 @@ bool AppendIfItFits(ConflictPage* page, ConflictRow row);
 /// card lets it be.
 inline constexpr std::size_t kMaxRestoreMessageBytes = 512;
 
+/// Where the sysmodule's one restore stands (M9-6, #209).
+enum class RestorePhase {
+  /// No restore has been asked for since this process started. A restore a
+  /// screen is waiting for and the sysmodule answers this about is one it has
+  /// lost track of -- it restarted -- and the screen says so rather than
+  /// waiting for ever.
+  kIdle,
+
+  /// Taken, and not finished: waiting for the worker, or copying.
+  kRunning,
+
+  /// Finished, and `report` says how. Kept until the next restore is taken, so
+  /// a screen that was hidden while it ran still reads the outcome.
+  kDone,
+};
+const char* ToString(RestorePhase phase);
+
+/// `RestoreBackup`'s answer and `GetRestoreState`'s.
+///
+/// **One restore at a time**, and `entry_id` says which. A press while one is
+/// running starts nothing and is answered with the one that is -- so a screen
+/// compares the id with the one it asked for, and "another restore is still
+/// running" is a sentence it can say rather than a press that silently did
+/// nothing.
+struct RestoreState {
+  RestorePhase phase = RestorePhase::kIdle;
+
+  /// The restore this is about. `0` when `kIdle`.
+  std::int64_t entry_id = 0;
+
+  /// `kDone` only; defaulted otherwise.
+  conflicts::RestoreReport report;
+};
+
 // --- the log tail -------------------------------------------------------------
 
 /// How many log lines one `GetLog` may answer with.
@@ -964,6 +1013,12 @@ Decoded<std::int64_t> DecodeEntryId(std::string_view text);
 
 std::string EncodeRestoreReport(const conflicts::RestoreReport& report);
 Decoded<conflicts::RestoreReport> DecodeRestoreReport(std::string_view text);
+
+/// `{"phase":...,"entry_id":<int>,"report":{...}}`. The report is the
+/// `EncodeRestoreReport` object, carried whole in every phase so the decoder has
+/// one shape to refuse rather than three.
+std::string EncodeRestoreState(const RestoreState& state);
+Decoded<RestoreState> DecodeRestoreState(std::string_view text);
 
 /// `{"lines":<int>}` -- `GetLog`'s request: how many of the last lines to send.
 ///
@@ -1086,14 +1141,24 @@ class Engine {
   /// the sysmodule lie about what it recorded. See conflict_log.hpp.
   virtual Error ListConflicts(const ConflictQuery& query, ConflictPage* page) = 0;
 
-  /// Put the bytes an entry names back on the card.
+  /// Ask for the bytes an entry names to be put back on the card, and answer
+  /// where that stands **without waiting for it** (M9-6, #209).
   ///
-  /// Never fails at the transport either, for `SetConfig`'s reason: what
-  /// happened is a `conflicts::RestoreOutcome` inside a successful reply,
-  /// because a `Result` that says the call failed takes the answer with it --
-  /// and "the backup is gone" and "the sysmodule is not running" must not arrive
-  /// at a screen as the same thing.
-  virtual Error RestoreBackup(std::int64_t entry_id, conflicts::RestoreReport* report) = 0;
+  /// A restore copies a whole save, so an implementation hands it to a thread
+  /// of its own and answers `kRunning`; one with no such thread may run it here
+  /// and answer `kDone`. While one is running a second ask starts nothing and is
+  /// answered with the running one -- see `RestoreState`.
+  ///
+  /// Never fails at the transport, for `SetConfig`'s reason: what happened is a
+  /// `conflicts::RestoreOutcome` inside a successful reply, because a `Result`
+  /// that says the call failed takes the answer with it -- and "the backup is
+  /// gone" and "the sysmodule is not running" must not arrive at a screen as the
+  /// same thing.
+  virtual RestoreState RequestRestore(std::int64_t entry_id) = 0;
+
+  /// Where the last restore stands. Safe at any rate, from the IPC thread,
+  /// while one runs.
+  virtual RestoreState restore_state() const = 0;
 };
 
 /// The service, as a plain C++ class with one method per command.
@@ -1164,8 +1229,12 @@ class ServiceCore {
   /// implementation is held to the same cap.
   ConflictPage ListConflicts(const ConflictQuery& query);
 
-  /// Command 15. Never fails; the outcome is in the answer.
-  conflicts::RestoreReport RestoreBackup(std::int64_t entry_id);
+  /// Command 15. Starts the restore and answers at once; never fails. The
+  /// outcome arrives through command 17.
+  RestoreState RestoreBackup(std::int64_t entry_id);
+
+  /// Command 17. Where the restore stands. Never fails.
+  RestoreState GetRestoreState() const;
 
   /// Command 16. The last `lines` lines of this process's log, clamped to
   /// `[0, kMaxLogLines]`. Never fails: a console that has logged nothing has an
@@ -1191,6 +1260,10 @@ class ServiceCore {
   /// verification URLs come off a server response, so their length is not this
   /// client's to assume, and both commands that answer one never fail.
   static auth::PairingStatus Bounded(auth::PairingStatus status);
+
+  /// A restore state cut to what a payload carries: the report's message is a
+  /// sentence `core/` wrote around two paths (`kMaxRestoreMessageBytes`).
+  static RestoreState Bounded(RestoreState state);
 
   Engine& engine_;
 };

@@ -323,11 +323,17 @@ Result IpcClient::ListConflicts(const ipc::ConflictQuery& query, ipc::ConflictPa
                        ipc::DecodeConflictPage, page);
 }
 
-Result IpcClient::RestoreBackup(std::int64_t entry_id, conflicts::RestoreReport* report) {
+Result IpcClient::RestoreBackup(std::int64_t entry_id, ipc::RestoreState* state) {
   // Decoded rather than fire-and-forget: `RestoreBackup` never fails at the
-  // transport, so the whole of what happened is in the answer (ipc.hpp).
+  // transport, so whether it was taken -- and, while another is running, which
+  // one is -- is in the answer (ipc.hpp).
   return CallAndDecode(ipc::Command::kRestoreBackup, ipc::EncodeEntryId(entry_id),
-                       ipc::DecodeRestoreReport, report);
+                       ipc::DecodeRestoreState, state);
+}
+
+Result IpcClient::GetRestoreState(ipc::RestoreState* state) {
+  return CallAndDecode(ipc::Command::kGetRestoreState, ipc::EncodeEmpty(),
+                       ipc::DecodeRestoreState, state);
 }
 
 }  // namespace rommsync::overlay

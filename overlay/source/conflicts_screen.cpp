@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <string>
 
+#include "conflicts_pump.hpp"
 #include "ipc_client.hpp"
 #include "palette.hpp"
 #include "rommsync/core.hpp"
@@ -111,69 +112,10 @@ bool ConflictsScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidA
 }
 
 void ConflictsScreen::Pump() {
-  // The port and the version handshake, both of which every screen needs and
-  // none of which is this screen's own (`screen_frame.hpp`).
-  const Link link = frame_.Ready();
-  if (link != Link::kOk) {
-    model_.OnUnreachable(link, frame_.sysmodule_interface());
-    link_ = link;
-    view_ = model_.Render();
-    return;
-  }
-  if (link_ != Link::kOk) {
-    link_ = Link::kOk;
-    model_.OnLinkRestored();
-  }
-
-  const ConflictsModel::Command command = model_.Next();
-  if (command.kind != ConflictsModel::Command::Kind::kNone) {
-    Send(command);
-  }
+  // The handshake, one command and its answer -- in `conflicts_pump.cpp`, where
+  // a host test can drive it (#209).
+  PumpConflicts(frame_, client_, model_, link_);
   view_ = model_.Render();
-}
-
-void ConflictsScreen::Send(const ConflictsModel::Command& command) {
-  Result rc = 0;
-  ipc::ConflictPage page;
-  conflicts::RestoreReport report;
-
-  switch (command.kind) {
-    case ConflictsModel::Command::Kind::kListConflicts:
-      rc = client_.ListConflicts(command.query, &page);
-      break;
-    case ConflictsModel::Command::Kind::kRestore:
-      rc = client_.RestoreBackup(command.entry_id, &report);
-      break;
-    case ConflictsModel::Command::Kind::kNone:
-      return;
-  }
-
-  if (R_FAILED(rc)) {
-    // A refusal the sysmodule named, or the transport. Telling them apart is
-    // the whole reason `DecodeError` exists (`ipc_client.hpp`): without it, a
-    // sysmodule that is not running and a payload this build cannot read draw
-    // the same sentence over an entry that is perfectly fine.
-    ipc::Error error = ipc::Error::kOk;
-    if (DecodeError(rc, &error)) {
-      model_.OnRefused(error);
-      return;
-    }
-    const Link link = frame_.Diagnose(rc);
-    model_.OnUnreachable(link, frame_.sysmodule_interface());
-    link_ = link;
-    return;
-  }
-
-  switch (command.kind) {
-    case ConflictsModel::Command::Kind::kListConflicts:
-      model_.OnPage(page);
-      return;
-    case ConflictsModel::Command::Kind::kRestore:
-      model_.OnRestored(report);
-      return;
-    case ConflictsModel::Command::Kind::kNone:
-      return;
-  }
 }
 
 s32 ConflictsScreen::PromptRows() const {

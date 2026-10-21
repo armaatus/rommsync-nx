@@ -865,6 +865,19 @@ void SdEngine::RunWorker() {
       continue;
     }
 
+    // A restore first: somebody pressed A on the conflicts screen and is
+    // watching it say "Restoring", and it is one copy on the card rather than a
+    // tick's worth of network (#209). Here rather than beside the list pump,
+    // because a due tick would otherwise go in front of it.
+    if (restore_pending_) {
+      restore_pending_ = false;
+      const std::int64_t entry_id = restore_.entry_id;
+      lock.unlock();
+      RunRestore(entry_id);
+      lock.lock();
+      continue;
+    }
+
     // Read **before** the decision and compared after the pump: everything that
     // gives this thread work bumps it under `mutex_`, so a notification that
     // lands while the lock is released below cannot be missed. See `wakes_`.
@@ -1132,11 +1145,13 @@ void SdEngine::Quiesce() {
   const bool pairing_idle = !pairing_busy_;
   lock.unlock();
 
-  // The other writer of a save file: a restore, on the IPC thread, which takes
-  // this lock rather than `mutex_` (`save_write_mutex_`). It is not the worker
-  // and no cancel token reaches it -- one restore is one copy and it ends on its
-  // own -- so the only thing to do is wait for it, with what is left of the
-  // budget.
+  // The other writer of a save file: a restore, which takes this lock rather
+  // than `mutex_` (`save_write_mutex_`). On the worker since M9-6 (#209), so
+  // the park above already waited for one that was running -- but a console
+  // whose worker never started runs it on the IPC thread instead, where no
+  // park reaches it and no cancel token does either: one restore is one copy
+  // and it ends on its own. So the only thing to do is wait for it, with what
+  // is left of the budget.
   const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
   // `try_lock` and not `try_lock_for(0)` when the budget is already gone, so the
   // line below says what was actually true rather than reporting a save write in
@@ -2242,52 +2257,81 @@ ipc::Error SdEngine::ListConflicts(const ipc::ConflictQuery& query, ipc::Conflic
   return ipc::Error::kOk;
 }
 
-ipc::Error SdEngine::RestoreBackup(std::int64_t entry_id, conflicts::RestoreReport* report) {
-  // **Refused while a tick is writing saves**, because both write the same
-  // bytes.
-  //
-  // Until M7-2 (#37) this was the only thing in the sysmodule that wrote a save,
-  // so there was nothing to be atomic against. Now the worker runs
-  // `sync::Execute` and `sync::SyncStates` over the same `sd_path` a restore
-  // targets. Each write is individually atomic, so the collision is a lost
-  // update rather than a corrupt file -- the restored bytes replaced moments
-  // later by an in-flight download, and the tick's `.backup/` copy taken of a
-  // half-restored state -- and neither is something to hand a player.
-  //
-  // **The lock is taken for the whole check-and-act, not consulted and
-  // dropped.** A flag read under a lock that is then released is a race with a
-  // handful of instructions in it rather than an unbounded one, which is not the
-  // same as no race: the worker could take the flag and start writing in exactly
-  // that gap. Holding `save_write_mutex_` until the restore has finished is what
-  // actually excludes it.
-  //
-  // Try-locked rather than waited on: waiting would park the **IPC thread**
-  // behind a whole tick, which `ipc.hpp` forbids in as many words.
-  // `kBackupFailed` is the outcome whose promise is exactly what holds here --
-  // nothing was written -- and the sentence beside it is what the screen draws,
-  // so the user is told to press again rather than told their backup is gone.
-  std::unique_lock<std::timed_mutex> writing(save_write_mutex_, std::try_to_lock);
-  if (!writing.owns_lock()) {
-    report->outcome = conflicts::RestoreOutcome::kBackupFailed;
-    report->message = "a sync is running; try the restore again when it finishes";
-    return ipc::Error::kOk;
+ipc::RestoreState SdEngine::RequestRestore(std::int64_t entry_id) {
+  bool handed = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (restore_.phase == ipc::RestorePhase::kRunning) {
+      // One at a time, and the answer says which one is out -- a screen that
+      // compares the id can say "another restore is still running" rather than
+      // drawing a press that did nothing (`ipc::RestoreState`).
+      return restore_;
+    }
+    restore_ = ipc::RestoreState{};
+    restore_.phase = ipc::RestorePhase::kRunning;
+    restore_.entry_id = entry_id;
+    if (worker_live_) {
+      restore_pending_ = true;
+      // The press must not wait out a rom, for `RequestSync`'s reason: the drain
+      // ends at its next boundary with its `.part` kept, the restore runs, and
+      // the next pass picks the transfer back up. A tick is *not* cancelled --
+      // it is writing saves, and the restore waits for it rather than racing
+      // it, which is the exclusion `save_write_mutex_` used to buy by refusing.
+      CancelDrainLocked();
+      handed = true;
+    }
+  }
+  if (handed) {
+    Wake();
+    return restore_state();
+  }
+  // No worker to hand it to. Run here, as every restore did before #209 --
+  // a console that cannot restore at all would be the worse failure.
+  RunRestore(entry_id);
+  return restore_state();
+}
+
+ipc::RestoreState SdEngine::restore_state() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return restore_;
+}
+
+void SdEngine::RunRestore(std::int64_t entry_id) {
+  conflicts::RestoreReport report;
+  {
+    // **Held for the whole check-and-act**, which on the worker is the same
+    // thread as every tick and so cannot contend with one; it is taken anyway
+    // because `Quiesce` reads it to know that no save write is in flight, and
+    // because with no worker this runs on the IPC thread beside one that may
+    // yet be started. Waited on rather than tried: nothing that holds it holds
+    // it for longer than a save copy, and this thread is not the one a screen
+    // is waiting on any more.
+    std::lock_guard<std::timed_mutex> writing(save_write_mutex_);
+
+    // The vector, for the read and the entry it hands back. Inside the write
+    // lock, which is the order both sides take them in.
+    std::lock_guard<std::mutex> history(history_mutex_);
+
+    if (card_ == nullptr) {
+      // Nothing implements `fs::FileSystem` for Horizon yet (`engine.hpp`).
+      // `kBackupFailed` rather than a transport failure: its promise is that
+      // nothing was written, which is the one thing a build that cannot open
+      // the card is certain of.
+      report.outcome = conflicts::RestoreOutcome::kBackupFailed;
+      report.message = "this build cannot open the SD card, so nothing was written";
+    } else {
+      report = conflicts::Restore(*card_, history_, entry_id);
+    }
   }
 
-  // The vector, for the read and the entry it hands back. Inside the write lock,
-  // which is the order both sides take them in.
-  std::lock_guard<std::mutex> history(history_mutex_);
-
-  if (card_ == nullptr) {
-    // Nothing implements `fs::FileSystem` for Horizon yet (`engine.hpp`).
-    // `kBackupFailed` rather than a transport failure: its promise is that
-    // nothing was written, which is the one thing a build that cannot open the
-    // card is certain of.
-    report->outcome = conflicts::RestoreOutcome::kBackupFailed;
-    report->message = "this build cannot open the SD card, so nothing was written";
-    return ipc::Error::kOk;
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (restore_.entry_id != entry_id) {
+    // Not reachable while only one restore runs at a time, and it is cheap to
+    // refuse rather than write one restore's outcome under another's id.
+    return;
   }
-  *report = conflicts::Restore(*card_, history_, entry_id);
-  return ipc::Error::kOk;
+  restore_.phase = ipc::RestorePhase::kDone;
+  restore_.report = std::move(report);
 }
 
 }  // namespace rommsync::sysmodule

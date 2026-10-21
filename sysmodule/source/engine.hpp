@@ -364,7 +364,8 @@ class SdEngine : public ipc::Engine, public power::Sink {
   ///   * no `download::Drain` is running -- the worker has *returned* from it,
   ///     not merely been asked to stop (M9-5, #197);
   ///   * no `sync::RunTick` is running, and so no save write is in flight;
-  ///   * no restore is writing a save from the IPC thread either;
+  ///   * no restore is writing a save -- on the worker, which the park covers,
+  ///     or on the IPC thread of a console whose worker never started;
   ///   * no pairing poll or commit is in flight on the pairing thread;
   ///   * nothing more is written to the log **file** until `Resume`.
   ///
@@ -506,7 +507,24 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// neither touches the network -- the history is what a *previous* tick wrote,
   /// and a restore is one copy between two files on the card.
   ipc::Error ListConflicts(const ipc::ConflictQuery& query, ipc::ConflictPage* page) override;
-  ipc::Error RestoreBackup(std::int64_t entry_id, conflicts::RestoreReport* report) override;
+
+  /// M9-6 (#209): the restore is taken here and run **on the worker**, and this
+  /// answers at once.
+  ///
+  /// It used to run on the IPC thread, which held the overlay's call -- and
+  /// every other command -- for as long as the card took to copy a save. The
+  /// worker is also the thread every tick runs on, so the two save writers are
+  /// serialised by construction: a press during a tick waits its turn rather
+  /// than being refused with "try again" (`save_write_mutex_` still records the
+  /// write, for `Quiesce`). The drain is cancelled the way `RequestSync` cancels
+  /// it, so a restore does not wait out a rom.
+  ///
+  /// **With no worker, the restore runs here**, on the caller, and answers
+  /// `kDone`: a build or a boot whose worker never started still restores, at
+  /// the cost every restore had before. `StartWorker` failing is logged
+  /// (`kBoot`), so that console says why.
+  ipc::RestoreState RequestRestore(std::int64_t entry_id) override;
+  ipc::RestoreState restore_state() const override;
 
   /// Serialises `history_` -- the vector, and nothing else.
   ///
@@ -521,21 +539,23 @@ class SdEngine : public ipc::Engine, public power::Sink {
   mutable std::mutex history_mutex_;
 
   /// **The right to write a save file.** Held by the worker for the whole of a
-  /// tick's transfers, and *try*-locked by a restore.
+  /// tick's transfers, and for the whole of a restore.
   ///
   /// A second lock rather than a wider `history_mutex_`, because the two have
   /// opposite requirements: the history has to be readable while a tick runs, so
   /// its lock may not be held across the network, and the save bytes have to be
   /// exclusive *for* the length of a tick. One mutex cannot be both.
   ///
-  /// **Try-locked and never waited on**, on the IPC thread's side. Both writers
-  /// are individually atomic, so the collision they make is a lost update rather
-  /// than a corrupt file -- restored bytes replaced moments later by an
-  /// in-flight download, and the tick's `.backup/` copy taken of a half-restored
-  /// state -- and neither is something to hand a player. But *waiting* would
-  /// park the IPC thread behind a whole tick, which `ipc.hpp` forbids in as many
-  /// words. So a restore that arrives mid-tick is refused with a sentence, and
-  /// the user presses again.
+  /// Both writers are individually atomic, so the collision they would make is a
+  /// lost update rather than a corrupt file -- restored bytes replaced moments
+  /// later by an in-flight download, and the tick's `.backup/` copy taken of a
+  /// half-restored state -- and neither is something to hand a player. Until
+  /// M9-6 (#209) the restore ran on the IPC thread and *try*-locked this,
+  /// refusing a press that arrived mid-tick. It now runs on the worker, the
+  /// same thread as every tick, so the two cannot overlap at all and the lock is
+  /// simply taken -- it is still taken, because `Quiesce` reads it to know that
+  /// no save write is in flight, and because a worker that never started runs
+  /// the restore on the IPC thread instead (`RequestRestore`).
   ///
   /// Order is this one, then `history_mutex_`, on both sides.
   ///
@@ -766,6 +786,11 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// here because `conflict_record.hpp` includes `state_sync.hpp`, so recording
   /// from inside the tick would be a cycle.
   void RunOneTick();
+
+  /// The restore `RequestRestore` took, start to finish, and its outcome
+  /// recorded in `restore_` (#209). Called on the worker, or on the caller when
+  /// there is no worker; `mutex_` not held, because a restore is card I/O.
+  void RunRestore(std::int64_t entry_id);
 
   /// Move M7-4's play-session window forward, recording nothing (#39).
   ///
@@ -1017,6 +1042,15 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// What `Status::sync_in_progress` draws, and the same fact `RequestSync`
   /// answers false on.
   bool sync_in_progress_ = false;
+
+  /// Where the one restore stands, as `GetRestoreState` reads it (#209).
+  /// Guarded by `mutex_`, and copied out rather than referenced.
+  ipc::RestoreState restore_;
+
+  /// A restore was taken and the worker has not started it. Separate from
+  /// `restore_.phase`, which says `kRunning` from the press onward: the overlay
+  /// has no use for "queued" as distinct from "copying", and the worker does.
+  bool restore_pending_ = false;
 
   /// The last tick's outcome, as the status screen reads it.
   std::int64_t last_sync_at_ = 0;

@@ -202,7 +202,12 @@ class IpcClient {
   /// M7-1 (#36). Neither touches the network: the history is what an earlier
   /// tick wrote, and a restore is one copy between two files on the card.
   Result ListConflicts(const ipc::ConflictQuery& query, ipc::ConflictPage* page);
-  Result RestoreBackup(std::int64_t entry_id, conflicts::RestoreReport* report);
+
+  /// Ask for the restore, and where it stands the instant it was taken --
+  /// usually `kRunning`, because the copy is the sysmodule worker's and is not
+  /// waited for (M9-6, #209). `GetRestoreState` is the poll that follows.
+  Result RestoreBackup(std::int64_t entry_id, ipc::RestoreState* state);
+  Result GetRestoreState(ipc::RestoreState* state);
 
  private:
   /// Where the one call is. `kDone` with `abandoned_` set is a late answer

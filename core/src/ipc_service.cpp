@@ -331,6 +331,7 @@ bool TakesRequest(Command command) {
     case Command::kStartPair:
     case Command::kGetPairState:
     case Command::kUnpair:
+    case Command::kGetRestoreState:
       return false;
   }
   return false;
@@ -363,19 +364,25 @@ ConflictPage ServiceCore::ListConflicts(const ConflictQuery& query) {
   return page;
 }
 
-conflicts::RestoreReport ServiceCore::RestoreBackup(std::int64_t entry_id) {
-  conflicts::RestoreReport report;
-  const Error refused = engine_.RestoreBackup(entry_id, &report);
-  if (refused != Error::kOk && report.outcome == conflicts::RestoreOutcome::kRestored) {
-    // An engine that refused and reported success is a bug on that side; the
-    // wire says what the file did, so the safe reading is the refusal.
-    report.outcome = conflicts::RestoreOutcome::kWriteFailed;
-    report.message = "the sysmodule could not carry out the restore";
-  }
+RestoreState ServiceCore::Bounded(RestoreState state) {
   // The two paths in the message are as long as the card lets them be.
-  Shorten(&report.message, kMaxRestoreMessageBytes);
-  return report;
+  Shorten(&state.report.message, kMaxRestoreMessageBytes);
+  if (state.phase != RestorePhase::kDone) {
+    // Defaulted outside `kDone`, which the payload documents: a report that rode
+    // along with a running restore would be read by somebody as its outcome.
+    state.report = {};
+  }
+  return state;
 }
+
+RestoreState ServiceCore::RestoreBackup(std::int64_t entry_id) {
+  // Answered without waiting for the copy (#209). What the engine hands back is
+  // where the restore stands the instant it was taken -- or, while one is
+  // already running, that one -- and both are answers rather than refusals.
+  return Bounded(engine_.RequestRestore(entry_id));
+}
+
+RestoreState ServiceCore::GetRestoreState() const { return Bounded(engine_.restore_state()); }
 
 LogTail ServiceCore::GetLog(std::int32_t lines) const {
   // Clamped here rather than at the decoder, so an over-large ask is a smaller
@@ -562,12 +569,17 @@ Error Dispatch(ServiceCore& core, std::uint32_t command_id, std::string_view req
       if (!entry_id.ok()) {
         return Error::kMalformedRequest;
       }
-      // Succeeds whatever the restore did, for `SetConfig`'s reason: a `Result`
+      // Succeeds whatever the restore does, for `SetConfig`'s reason: a `Result`
       // that says the call failed takes the answer with it, and "the backup is
-      // gone" is an answer the screen has a sentence for.
-      payload = EncodeRestoreReport(core.RestoreBackup(entry_id.value));
+      // gone" is an answer the screen has a sentence for. It arrives through
+      // `GetRestoreState`, because the copy has not happened yet (#209).
+      payload = EncodeRestoreState(core.RestoreBackup(entry_id.value));
       break;
     }
+
+    case Command::kGetRestoreState:
+      payload = EncodeRestoreState(core.GetRestoreState());
+      break;
 
     case Command::kGetLog: {
       const Decoded<std::int32_t> lines = DecodeLogRequest(request);
