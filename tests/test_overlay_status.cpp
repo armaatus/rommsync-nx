@@ -631,8 +631,58 @@ void CheckFormatting(Checks& checks) {
 
 }  // namespace
 
+/// M10-2 (#228): the server's version is on the screen, and a server below the
+/// floor is the headline -- with the remedy, because nothing on the console
+/// fixes it.
+void CheckServerVersion(Checks& checks) {
+  ipc::Status current = Healthy();
+  current.server_version = "5.4.0";
+  const overlay::StatusView shown = RenderOverWire(checks, current);
+  checks.ExpectEq(ValueOf(shown, "RomM"), std::string("5.4.0"), "the server's version is drawn");
+  checks.ExpectEq(shown.headline, std::string("Up to date"),
+                  "and a supported one changes nothing else");
+  ExpectNothingBlank(checks, shown, "version shown");
+
+  // Before the first tick has asked, the row is there and says so.
+  const overlay::StatusView unasked = RenderOverWire(checks, Healthy());
+  checks.ExpectEq(ValueOf(unasked, "RomM"), std::string("Not asked yet"),
+                  "a version nobody has read yet is a sentence, not a blank");
+  ExpectNothingBlank(checks, unasked, "version not read");
+
+  ipc::Status old = Healthy();
+  old.server_version = "5.2.0";
+  old.server_supported = false;
+  old.last_sync_result = ipc::SyncResult::kFailed;
+  const overlay::StatusView refused = RenderOverWire(checks, old);
+  checks.ExpectEq(refused.headline, std::string("RomM is too old to sync with"),
+                  "a refused server is the headline");
+  checks.Expect(refused.tone == overlay::Tone::kBad, "in the bad tone");
+  checks.ExpectEq(refused.hint, std::string("Upgrade RomM to 5.4.0 or later (it runs 5.2.0)"),
+                  "and the hint names the floor and the server's own version");
+  checks.ExpectEq(ValueOf(refused, "RomM"), std::string("5.2.0 (too old)"), "and so does the row");
+  checks.ExpectEq(ValueOf(refused, "Server"), std::string("Reachable"),
+                  "it was reached: being too old is not being offline");
+  ExpectNothingBlank(checks, refused, "too old");
+
+  // A console that is not paired still says that first: pairing is the user's
+  // next step whatever the server runs.
+  ipc::Status unpaired = old;
+  unpaired.auth = ipc::AuthState::kNeverPaired;
+  checks.ExpectEq(RenderOverWire(checks, unpaired).headline, std::string("Not paired"),
+                  "pairing outranks the version");
+
+  // A refused server whose version was not stated still gets a sentence.
+  ipc::Status unnamed = old;
+  unnamed.server_version.clear();
+  const overlay::StatusView nameless = RenderOverWire(checks, unnamed);
+  checks.ExpectEq(nameless.hint, std::string("Upgrade RomM to 5.4.0 or later"),
+                  "no version, no parenthesis");
+  ExpectNothingBlank(checks, nameless, "too old, unnamed");
+}
+
 int main() {
   Checks checks;
+  CheckServerVersion(checks);
   CheckHealthy(checks);
   CheckNever(checks);
   CheckAuthStates(checks);

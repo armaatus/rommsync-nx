@@ -132,7 +132,11 @@ inline constexpr const char* kServiceName = "rommsync";
 /// **4** since M10-9 (#235), which added `SyncResult::kServerDisabled`. An enum
 /// value is a field's value a decoder does not tolerate either: a v3 overlay
 /// reading `"server_disabled"` fails to decode the whole `Status`.
-inline constexpr std::uint32_t kVersion = 4;
+///
+/// **5** since M10-2 (#228), which added `server_version` and
+/// `server_supported` to `Status` -- required fields, so a bump by the rule
+/// above.
+inline constexpr std::uint32_t kVersion = 5;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///
@@ -450,6 +454,16 @@ struct Status {
   /// (`config::Severity`), and a status screen that counted those would be red
   /// on a console with nothing wrong with it.
   std::int64_t config_error_count = 0;
+
+  /// The RomM version the sysmodule last read off the server's heartbeat, as
+  /// the server spelled it (M10-2, #228). Empty until a tick has asked, or
+  /// when the server did not say. At most `server::kMaxVersionBytes`.
+  std::string server_version;
+
+  /// False when the last tick was refused because the server is older than
+  /// `server::kMinimumVersion`. True otherwise, including before anything was
+  /// asked -- "too old" is a finding, never a default.
+  bool server_supported = true;
 
   DownloadSnapshot download;
 };
@@ -1063,6 +1077,9 @@ struct EngineSnapshot {
   std::int64_t conflicts = 0;
   std::int64_t failed = 0;
   std::int64_t queue_depth = 0;
+  /// See `Status::server_version` and `Status::server_supported` (#228).
+  std::string server_version;
+  bool server_supported = true;
   DownloadSnapshot download;
 };
 

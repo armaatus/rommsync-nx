@@ -102,6 +102,11 @@ Status ServiceCore::GetStatus() const {
       ++status.config_error_count;
     }
   }
+  // The engine already cut it to `server::kMaxVersionBytes`; bounded again here
+  // because `GetStatus` may not fail, whatever an `Engine` hands it.
+  status.server_version = snapshot.server_version;
+  Shorten(&status.server_version, kMaxNameBytes);
+  status.server_supported = snapshot.server_supported;
   status.download = snapshot.download;
   // A `fs_name` comes off a RomM library, so its length is not ours to assume,
   // and `GetStatus` is documented never to fail. A truncated label costs a few

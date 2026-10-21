@@ -83,6 +83,8 @@ ipc::Status LoadedStatus() {
   status.failed = 2;
   status.queue_depth = 4;
   status.config_error_count = 2;
+  status.server_version = "5.3.1";
+  status.server_supported = false;
   status.download.state = ipc::DownloadState::kVerifying;
   status.download.rom_id = 42;
   status.download.fs_name = "Some Game (USA).gba";
@@ -189,9 +191,11 @@ int Version() {
   // required field is an incompatible change by this header's own rule. 3 since
   // M9-6 (#209): `RestoreBackup` answers a `RestoreState` rather than the
   // finished report. 4 since M10-9 (#235): `SyncResult` gained a value a v3
-  // decoder refuses. What is frozen is command 0's *encoding*, asserted above
+  // decoder refuses. 5 since M10-2 (#228): `Status` gained the server's version
+  // and whether this build syncs with it. What is frozen is command 0's
+  // *encoding*, asserted above
   // -- not the number in it.
-  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{4},
+  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{5},
                   "the interface version this build speaks");
   checks.ExpectEq(static_cast<int>(ipc::Command::kGetInterfaceVersion), 0,
                   "GetInterfaceVersion is command 0");
@@ -319,6 +323,9 @@ int RoundTrip() {
     checks.ExpectEq(back.value.queue_depth, sent.queue_depth, "the queue depth survives");
     checks.ExpectEq(back.value.config_error_count, sent.config_error_count,
                     "config_error_count survives");
+    checks.ExpectEq(back.value.server_version, sent.server_version, "server_version survives");
+    checks.ExpectEq(back.value.server_supported, sent.server_supported,
+                    "server_supported survives");
     checks.ExpectEq(std::string(ipc::ToString(back.value.download.state)),
                     std::string(ipc::ToString(sent.download.state)), "the download state survives");
     checks.ExpectEq(back.value.download.rom_id, sent.download.rom_id, "its rom_id survives");

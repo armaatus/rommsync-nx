@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "rommsync/ipc.hpp"
+#include "rommsync/server_capabilities.hpp"
 #include "rommsync/version.hpp"
 
 namespace rommsync::overlay {
@@ -126,6 +127,18 @@ void SetHeadline(StatusView* view, const ipc::Status& status) {
   if (status.auth == ipc::AuthState::kUnauthenticated) {
     view->headline = "Sign-in expired";
     view->hint = "Pair this console again";
+    view->tone = Tone::kBad;
+    return;
+  }
+  // Above everything a tick decides, because no tick will decide anything
+  // until the server is upgraded (#228) -- and the upgrade is the one thing on
+  // this screen a user cannot do from the console, so it is said in full.
+  if (!status.server_supported) {
+    view->headline = "RomM is too old to sync with";
+    view->hint = "Upgrade RomM to " + server::ToString(server::kMinimumVersion) + " or later";
+    if (!status.server_version.empty()) {
+      view->hint += " (it runs " + status.server_version + ")";
+    }
     view->tone = Tone::kBad;
     return;
   }
@@ -324,6 +337,19 @@ StatusView Render(const ipc::Status& status, std::int64_t now_unix) {
   Add(&view.lines, "Server", status.configured ? (status.online ? "Reachable" : "Not reached")
                                                : "Not set",
       status.configured ? (status.online ? Tone::kGood : Tone::kWarn) : Tone::kWarn);
+
+  // The release the sysmodule read off the heartbeat (#228), beside the server
+  // it describes. Present in every state, for the header's reason: a missing
+  // row reads as one that failed to load.
+  if (!status.server_supported) {
+    Add(&view.lines, "RomM",
+        (status.server_version.empty() ? std::string("Unknown") : status.server_version) +
+            " (too old)",
+        Tone::kBad);
+  } else {
+    Add(&view.lines, "RomM",
+        status.server_version.empty() ? std::string("Not asked yet") : status.server_version);
+  }
 
   switch (status.auth) {
     case ipc::AuthState::kNeverPaired:
