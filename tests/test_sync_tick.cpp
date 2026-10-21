@@ -1379,8 +1379,15 @@ void Scheduled(rig::Checks& checks, http::HttpClient& client, const std::string&
 
   // The save the fault interrupted did reach the server on that second tick,
   // which is what makes the backoff a delay rather than a loss.
-  const int rows = SaveRowsFor(client, base, fixture, rom.id, arranged.slot, nullptr);
+  std::vector<std::int64_t> ids;
+  const int rows = SaveRowsFor(client, base, fixture, rom.id, arranged.slot, &ids);
   checks.ExpectEq(rows, 1, what + ": and the save is on the server exactly once");
+  // Deleted, like every scenario's: two rows a run is what a long-lived fixture
+  // collected until each console new to it met more saves than the log's tail
+  // holds lines (engine.foreground, engine.server_deleted).
+  for (const std::int64_t id : ids) {
+    harness::DeleteSave(client, base, fixture, id);
+  }
 }
 
 // --- upload -------------------------------------------------------------------
