@@ -24,6 +24,8 @@
 //   sources      -- fixture trees for RetroArch (flat and sort-by-core), Tico
 //                   and an override each scan to the emulator id that wrote them
 //   library      -- a Sandbox scanned against the docker library, end to end
+//   grown        -- the index is reserved from the first page's total, and a
+//                   library that grows mid-fetch stops it there, and says so
 //   paging       -- limit=1 over a six-rom library still finds the last page
 #include <algorithm>
 #include <cstdint>
@@ -599,6 +601,8 @@ void Truncated(::checks::Checks& checks) {
                 "a directory past the bound says so rather than pretending it is complete");
   checks.ExpectEq(listing.entries.size(), fs::kMaxDirectoryEntries,
                   "and holds exactly the bound");
+  checks.Expect(listing.entries.capacity() <= fs::kMaxDirectoryEntries,
+                "and never allocated room for more than the bound (M9-19, #217)");
 
   std::vector<std::string> names;
   for (const fs::Entry& entry : listing.entries) {
@@ -920,6 +924,10 @@ void Paging(::checks::Checks& checks, http::HttpClient& client, const std::strin
     checks.Expect(false, "the fixture library is empty; scan it with provision.py");
     return;
   }
+  // Held for the length of a tick, and a heap term at its bound (M9-19, #217):
+  // sized once from `total`, not doubled past the library as it grows.
+  checks.ExpectEq(all.index.roms().capacity(), all.index.size(),
+                  "the index is reserved to the library it holds, not grown past it");
 
   // The rom the last page holds. A client that reads `items` and stops has the
   // first page only, and this is the save that then never matches.
@@ -931,6 +939,8 @@ void Paging(::checks::Checks& checks, http::HttpClient& client, const std::strin
   checks.Expect(one_at_a_time.ok(), "a limit of one still fetched: " + one_at_a_time.message);
   checks.ExpectEq(one_at_a_time.index.size(), all.index.size(),
                   "paging by one finds the whole library");
+  checks.ExpectEq(one_at_a_time.index.roms().capacity(), all.index.size(),
+                  "and reserves it from the first page's total rather than page by page");
   checks.Expect(!one_at_a_time.index.truncated(), "and does not stop early");
 
   const roms::Match found =
@@ -1006,6 +1016,77 @@ void Paging(::checks::Checks& checks, http::HttpClient& client, const std::strin
   checks.Expect(odd.Find("(USA)", "").matched(), "and the rom is still findable by the other");
 }
 
+// --- grown --------------------------------------------------------------------
+
+/// `GET /api/roms`, answered from a script: each request takes the next body.
+class ScriptedLibrary final : public http::HttpClient {
+ public:
+  explicit ScriptedLibrary(std::vector<std::string> pages) : pages_(std::move(pages)) {}
+
+  http::Result Send(const http::Request&) override {
+    http::Result result;
+    result.response.status = 200;
+    result.response.body = next_ < pages_.size()
+                               ? pages_[next_++]
+                               : std::string(R"({"items":[],"total":0,"limit":1,"offset":0})");
+    return result;
+  }
+
+  http::Result Download(const http::Request&, const http::DownloadTarget&) override {
+    http::Result result;
+    result.error = http::Error::kConnectFailed;
+    return result;
+  }
+
+ private:
+  std::vector<std::string> pages_;
+  std::size_t next_ = 0;
+};
+
+std::string OneRomPage(std::int64_t id, std::int64_t total, std::int64_t offset) {
+  const std::string name = "game" + std::to_string(id);
+  return R"({"items":[{"id":)" + std::to_string(id) + R"(,"fs_name_no_ext":")" + name +
+         R"(","fs_name_no_tags":")" + name +
+         R"(","platform_fs_slug":"nes","has_multiple_files":false}],"total":)" +
+         std::to_string(total) + R"(,"limit":1,"offset":)" + std::to_string(offset) + "}";
+}
+
+/// The index is reserved once, from the first page's `total`, because it is a
+/// heap term at its bound (M9-19, #217) -- and a library that grows while it is
+/// being read must not grow the index past that reservation. It stops there and
+/// says why, as a library that shrank mid-fetch already does; the next tick
+/// reads the roms that arrived.
+void Grown(::checks::Checks& checks) {
+  roms::FetchOptions options;
+  options.base_url = "http://library.invalid";
+  options.page_size = 1;
+
+  ScriptedLibrary steady({OneRomPage(1, 2, 0), OneRomPage(2, 2, 1)});
+  const roms::FetchResult whole = roms::FetchRomIndex(steady, options);
+  checks.Expect(whole.ok() && !whole.index.truncated(), "a library read whole: " + whole.message);
+  checks.ExpectEq(whole.index.size(), std::size_t{2}, "holds both roms");
+  checks.ExpectEq(whole.index.roms().capacity(), std::size_t{2}, "in exactly the room it needed");
+
+  // Two roms when the fetch started and three by its second page.
+  ScriptedLibrary growing({OneRomPage(1, 2, 0), OneRomPage(2, 3, 1), OneRomPage(3, 3, 2)});
+  const roms::FetchResult grown = roms::FetchRomIndex(growing, options);
+  checks.Expect(grown.ok(), "a library that grew mid-fetch is still an index: " + grown.message);
+  checks.ExpectEq(grown.index.size(), std::size_t{2}, "of the roms there were when it started");
+  checks.ExpectEq(grown.index.roms().capacity(), std::size_t{2}, "and no room past them");
+  checks.Expect(grown.index.truncated(), "which it says is short");
+  checks.Expect(grown.message.find("grew") != std::string::npos,
+                "and why, so an unmatched save names this rather than the library: " +
+                    grown.message);
+
+  // The bound still wins over a larger library.
+  options.max_roms = 1;
+  ScriptedLibrary large({OneRomPage(1, 2, 0), OneRomPage(2, 2, 1)});
+  const roms::FetchResult capped = roms::FetchRomIndex(large, options);
+  checks.ExpectEq(capped.index.size(), std::size_t{1}, "an index stops at max_roms");
+  checks.ExpectEq(capped.index.roms().capacity(), std::size_t{1}, "and reserves no more than it");
+  checks.Expect(capped.index.truncated(), "and says so");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1021,7 +1102,7 @@ int main(int argc, char** argv) {
 
   if (scenario == "names" || scenario == "ambiguous" || scenario == "walked_once" ||
       scenario == "unusable" || scenario == "truncated" || scenario == "hashing" ||
-      scenario == "sources") {
+      scenario == "sources" || scenario == "grown") {
     if (scenario == "names") {
       Names(checks);
     } else if (scenario == "ambiguous") {
@@ -1034,6 +1115,8 @@ int main(int argc, char** argv) {
       Hashing(checks);
     } else if (scenario == "sources") {
       Sources(checks);
+    } else if (scenario == "grown") {
+      Grown(checks);
     } else {
       Unusable(checks);
     }

@@ -15,6 +15,11 @@
 //   alloc.log_ring the log's in-memory tail, full and written through: it holds
 //                  the same blocks however many lines pass, which a `deque`
 //                  under it did not (found by `soak`, see `LogRing`).
+//   alloc.page_parse
+//                  a page of roms or platforms is read a row at a time: its
+//                  peak grows with the rows it becomes, not with their parsed
+//                  documents, which weigh ~11x their text (M9-19, see
+//                  `PageParse`).
 //   alloc.steady   the real `SdEngine` -- its worker, its scheduler, the fixture
 //                  RomM -- run tick after tick through the IPC table, with what
 //                  is outstanding sampled between ticks. After a warm-up that
@@ -58,7 +63,9 @@
 #include "rommsync/host/file_sync.hpp"
 #include "rommsync/host/native_file_system.hpp"
 #include "rommsync/ipc.hpp"
+#include "rommsync/list_service.hpp"
 #include "rommsync/log.hpp"
+#include "rommsync/rom_index.hpp"
 #include "rommsync/token_store.hpp"
 
 namespace auth = rommsync::auth;
@@ -447,6 +454,112 @@ void LogRing(checks::Checks& c) {
   rlog::Reset();
 }
 
+// --- a page is read a row at a time (M9-19, #217) ------------------------------
+
+/// One row the shape of RomM 5.2.0's list schema, as far as the parse is
+/// concerned: the fields the three readers take, and seventy more that each of
+/// them throws away, two of them nested. Synthetic rather than the capture,
+/// because what is under test is how the peak scales with the *row count*, and
+/// that needs a page of any length.
+std::string Row(std::int64_t id) {
+  const std::string name = "Synthetic Game " + std::to_string(id) + " (USA)";
+  std::string row = "{\"id\":" + std::to_string(id) + ",\"fs_name_no_ext\":\"" + name +
+                    "\",\"fs_name_no_tags\":\"" + name + "\",\"fs_name\":\"" + name +
+                    ".nes\",\"name\":\"" + name +
+                    "\",\"platform_fs_slug\":\"nes\",\"fs_slug\":\"nes\",\"display_name\":\"" +
+                    name + "\",\"rom_count\":1,\"fs_size_bytes\":4096,"
+                           "\"has_multiple_files\":false";
+  for (int field = 0; field < 70; ++field) {
+    row += ",\"discarded_metadata_field_" + std::to_string(field) + "\":null";
+  }
+  row += ",\"rom_user\":{\"is_main_sibling\":false,\"backlogged\":false,\"note_raw_markdown\":"
+         "\"\",\"last_played\":null},\"files\":[{\"file_name\":\"" +
+         name + ".nes\",\"file_size_bytes\":4096,\"crc_hash\":\"00000000\"}]}";
+  return row;
+}
+
+/// `rows` of `Row`, joined, as a bare array or inside the `/api/roms` envelope.
+std::string Page(std::size_t rows, bool envelope) {
+  std::string items = "[";
+  for (std::size_t at = 0; at < rows; ++at) {
+    items += (at == 0 ? "" : ",") + Row(static_cast<std::int64_t>(at) + 1);
+  }
+  items += "]";
+  if (!envelope) {
+    return items;
+  }
+  return "{\"items\":" + items + ",\"total\":" + std::to_string(rows) +
+         ",\"limit\":" + std::to_string(rows) + ",\"offset\":0}";
+}
+
+/// The bytes `parse` reaches over what was outstanding before it, the body
+/// itself excluded: it is the caller's, and already allocated.
+template <class Parse>
+std::int64_t PeakOf(const std::string& body, const Parse& parse) {
+  count_new::ResetPeak();
+  const std::int64_t before = count_new::Now().outstanding_bytes;
+  parse(body);
+  return count_new::Now().peak_bytes - before;
+}
+
+/// A page of rows costs the rows it becomes and **one** row's document, not the
+/// whole page's.
+///
+/// `json::Value` is ~100 bytes a node and a RomM row is ~100 nodes, so a parsed
+/// row weighs about eleven times its text -- measured at 23 KiB a row on
+/// aarch64's libstdc++ against the fixture RomM (sysmodule/source/main.cpp).
+/// Holding a 64-row page as a document is ~1.5 MiB on a 1.4 MiB heap, which is a
+/// `std::terminate` on a console the first time a library has that many roms.
+/// So the peak of a 64-row page may exceed a 1-row page's by what the 63 extra
+/// rows become -- a struct and a few short strings each -- and by nothing that
+/// scales with their documents.
+void PageParse(checks::Checks& c) {
+  constexpr std::size_t kRows = 64;
+  // Far more than the struct and strings one row becomes on either standard
+  // library, and far less than one row's document (~8 KiB of nodes for `Row`).
+  constexpr std::int64_t kPerRow = 1024;
+
+  const std::string one_page = Page(1, true);
+  const std::string full_page = Page(kRows, true);
+  const auto index_page = [](const std::string& body) {
+    rommsync::roms::Page page;
+    return rommsync::roms::ParsePage(body, &page).ok() && !page.roms.empty();
+  };
+  c.Expect(index_page(one_page) && index_page(full_page), "the index pages parse");
+  const std::int64_t index_one = PeakOf(one_page, index_page);
+  const std::int64_t index_full = PeakOf(full_page, index_page);
+  std::cout << "roms::ParsePage: " << index_one << " bytes at 1 row, " << index_full
+            << " at " << kRows << " (" << full_page.size() << " bytes of text)\n";
+  c.Expect(index_full - index_one < static_cast<std::int64_t>(kRows) * kPerRow,
+           "roms::ParsePage holds one row's document at a time, not the page's");
+
+  const auto list_page = [](const std::string& body) {
+    rommsync::lists::RomPage page;
+    return rommsync::lists::ParseRomPage(body, &page).ok() && !page.roms.empty();
+  };
+  c.Expect(list_page(one_page) && list_page(full_page), "the list pages parse");
+  const std::int64_t list_one = PeakOf(one_page, list_page);
+  const std::int64_t list_full = PeakOf(full_page, list_page);
+  std::cout << "lists::ParseRomPage: " << list_one << " bytes at 1 row, " << list_full
+            << " at " << kRows << "\n";
+  c.Expect(list_full - list_one < static_cast<std::int64_t>(kRows) * kPerRow,
+           "lists::ParseRomPage holds one row's document at a time, not the page's");
+
+  const std::string one_platform = Page(1, false);
+  const std::string all_platforms = Page(kRows, false);
+  const auto platforms = [](const std::string& body) {
+    std::vector<rommsync::lists::PlatformRow> rows;
+    return rommsync::lists::ParsePlatforms(body, &rows).ok() && !rows.empty();
+  };
+  c.Expect(platforms(one_platform) && platforms(all_platforms), "the platform lists parse");
+  const std::int64_t platforms_one = PeakOf(one_platform, platforms);
+  const std::int64_t platforms_all = PeakOf(all_platforms, platforms);
+  std::cout << "lists::ParsePlatforms: " << platforms_one << " bytes at 1 row, "
+            << platforms_all << " at " << kRows << "\n";
+  c.Expect(platforms_all - platforms_one < static_cast<std::int64_t>(kRows) * kPerRow,
+           "lists::ParsePlatforms holds one row's document at a time, not the list's");
+}
+
 /// One rig run: a console paired with the fixture, its worker started, the
 /// log's tick counter installed, `round` driven `rounds` times after the
 /// warm-up, and what it held judged. `what` names the run in the output and in
@@ -539,11 +652,14 @@ int main(int argc, char** argv) {
   }
 
   rig::Checks checks;
-  if (scenario == "counts" || scenario == "judge" || scenario == "log_ring") {
+  if (scenario == "counts" || scenario == "judge" || scenario == "log_ring" ||
+      scenario == "page_parse") {
     if (scenario == "counts") {
       Counts(checks);
     } else if (scenario == "judge") {
       JudgeRule(checks);
+    } else if (scenario == "page_parse") {
+      PageParse(checks);
     } else {
       LogRing(checks);
     }

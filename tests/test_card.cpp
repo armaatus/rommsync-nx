@@ -112,9 +112,17 @@ void Bounded(checks::Checks& c) {
   const fs::Listing listing = card->List("/many");
   c.Expect(listing.error == fs::ListError::kTooManyEntries, "an oversized folder says so");
   c.ExpectEq(listing.entries.size(), fs::kMaxDirectoryEntries, "and holds exactly the bound");
+  // The bound is a heap term (M9-19, #217): a vector pushed one past it and then
+  // popped back has already doubled to twice the bound, with both buffers live
+  // while it moved.
+  c.Expect(listing.entries.capacity() <= fs::kMaxDirectoryEntries,
+           "and never allocated room for more than the bound (capacity " +
+               std::to_string(listing.entries.capacity()) + ")");
+  char first_cut[32];
+  std::snprintf(first_cut, sizeof(first_cut), "%05zu", fs::kMaxDirectoryEntries);
   bool first_by_name = true;
   for (const fs::Entry& entry : listing.entries) {
-    if (entry.name >= "04096") {
+    if (entry.name >= first_cut) {
       first_by_name = false;
     }
   }

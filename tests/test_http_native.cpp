@@ -982,6 +982,38 @@ int Chunk(const std::string& base, const std::string& asset) {
                 "at least one download read came back larger than the old 16 KiB");
   return checks.failures();
 }
+
+// An API body is held in exactly the room its `Content-Length` declared (M9-19,
+// #217). Appended a 16 KiB read at a time, a `std::string` doubles its way past
+// the body -- up to twice it held, and three times while the last reallocation
+// has both buffers live -- and the heap table budgets every buffered response at
+// its text, once.
+int Reserved(http::HttpClient& client, const std::string& base, const std::string& asset) {
+  rig::Checks checks;
+  // Several reads long and well under the reservation's ceiling, and an exact
+  // size the body has to arrive at, so the room it was given is checkable.
+  constexpr std::size_t kBody = 100 * 1024;
+  http::Request request;
+  request.url = base + asset;
+  const http::Result whole = client.Send(request);
+  checks.Expect(whole.successful() && whole.response.body.size() > kBody,
+                "the asset is longer than the slice asked for");
+  if (checks.failures() != 0) {
+    return checks.failures();
+  }
+  // The wire writes `Range` itself from `range_start` and drops one passed as a
+  // header, so the slice is the asset's last `kBody` bytes.
+  request.range_start = whole.response.body.size() - kBody;
+  const http::Result result = client.Send(request);
+  checks.ExpectOk(result, "a ranged GET over Send");
+  checks.ExpectEq(result.response.status, 206, "answered as a slice");
+  checks.ExpectEq(result.response.body.size(), kBody, "the range, whole");
+  checks.Expect(result.response.body.capacity() < kBody + 64,
+                "held in the room it declared, not grown past it (capacity " +
+                    std::to_string(result.response.body.capacity()) + " for " +
+                    std::to_string(kBody) + " bytes)");
+  return checks.failures();
+}
 #endif
 
 }  // namespace
@@ -1023,6 +1055,7 @@ int main(int argc, char** argv) {
       scenario == "resume" || scenario == "truncate" || scenario == "cancel" ||
       scenario == "resume_empty_body" || scenario == "resume_stale_range" ||
       scenario == "range_expected_size" || scenario == "progress" || scenario == "chunk" ||
+      scenario == "reserved" ||
       scenario == "disk") {
     asset = rig::DiscoverLargeAsset(*client, base);
     if (asset.empty()) {
@@ -1077,6 +1110,8 @@ int main(int argc, char** argv) {
 #ifdef ROMMSYNC_TEST_WIRE_BACKEND
   } else if (scenario == "chunk") {
     failures = Chunk(base, asset);
+  } else if (scenario == "reserved") {
+    failures = Reserved(*client, base, asset);
 #endif
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";

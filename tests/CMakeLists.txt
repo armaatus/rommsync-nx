@@ -789,6 +789,7 @@ target_compile_definitions(test_http_wire PRIVATE
 # per gigabyte, and libcurl's chunk is not ours to assert on.
 set(WIRE_ONLY_SCENARIOS
   chunk             # a download reads 64 KiB at a time, an API call 16 KiB
+  reserved          # an API body is held in the room Content-Length declared (M9-19)
 )
 
 foreach(scenario IN LISTS HTTP_SCENARIOS WIRE_ONLY_SCENARIOS)
@@ -1025,6 +1026,7 @@ set(SCAN_UNIT_SCENARIOS
   truncated    # a directory past kMaxDirectoryEntries keeps a set that does not move
   hashing      # the digest is real, reused when nothing changed, null only when unreadable
   sources      # fixture trees for each source scan to the emulator id that wrote them
+  grown        # the index is reserved from total; a library that grows mid-fetch stops there
 )
 foreach(scenario IN LISTS SCAN_UNIT_SCENARIOS)
   add_test(NAME scan.${scenario} COMMAND test_save_scan ${scenario})
@@ -2388,7 +2390,7 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   target_compile_options(test_heap_steady PRIVATE -fno-allocation-dce)
 endif()
 
-foreach(scenario counts judge log_ring)
+foreach(scenario counts judge log_ring page_parse)
   add_test(NAME alloc.${scenario} COMMAND test_heap_steady ${scenario})
   set_tests_properties(alloc.${scenario} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 endforeach()
