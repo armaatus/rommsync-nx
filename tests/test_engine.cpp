@@ -39,6 +39,8 @@
 //   nonblocking -- M1-6: `StartPair` returns while the init is still in flight
 //   repairs   -- M1-6: `StartPair` then `Unpair`, with neither instant losing
 //                both the old pairing and the new attempt
+//   pair_commit -- `kApproved` is said only once `token.dat` is committed, and a
+//                  commit the card refuses is a failure that keeps the old token
 //   stale_active -- M9-5: an `active` row a power cut left behind is work, not a
 //                   transfer in flight
 //   drains    -- M9-5: a rom queued over IPC becomes a file on the card
@@ -60,6 +62,7 @@
 //                runs, and one tick runs once it closes
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -76,6 +79,7 @@
 #include <vector>
 
 #include "engine.hpp"
+#include "faulty_disk.hpp"
 #include "harness.hpp"
 #include "power.hpp"
 #include "power_fake.hpp"
@@ -83,6 +87,7 @@
 #include "rommsync/auth.hpp"
 #include "rommsync/auth_gate.hpp"
 #include "rommsync/conflict_log.hpp"
+#include "rommsync/disk.hpp"
 #include "rommsync/download.hpp"
 #include "rommsync/file_system.hpp"
 #include "rommsync/host/curl_http_client.hpp"
@@ -1299,6 +1304,230 @@ int Repairs(http::HttpClient& client, const std::string& base) {
   c.Expect(replaced.ok(), "with credentials on the card: " + replaced.message);
   c.Expect(replaced.value.access_token != fixture.token,
            "and they are the new ones, not the discarded ones");
+  return c.failures();
+}
+
+/// A card that lets a scenario look at the console from *inside* the pairing
+/// commit: every write, rename, remove and sync that touches the credentials
+/// stops first to ask the engine what it is telling the overlay.
+///
+/// The race `engine.pairs` and `engine.repairs` lost under `-j4` was the overlay
+/// reading `kApproved` while `token.dat` was still `token.dat.tmp` -- a window
+/// of a few hundred microseconds a poll every 100 ms almost never lands in. This
+/// lands in it every time, because the look *is* the commit's next step.
+///
+/// The engine is asked directly rather than through `ipc::Dispatch`: the look
+/// runs on the pairing thread, concurrently with the scenario's own polls, and
+/// `ServiceCore` is served by one thread on the console.
+class CommitWatch final : public rommsync::io::Disk {
+ public:
+  CommitWatch(Console& console, std::string directory)
+      : console_(console), directory_(std::move(directory)) {
+    previous_ = rommsync::io::SetDisk(this);
+  }
+  ~CommitWatch() override { rommsync::io::SetDisk(previous_); }
+
+  CommitWatch(const CommitWatch&) = delete;
+  CommitWatch& operator=(const CommitWatch&) = delete;
+
+  std::FILE* Open(const std::string& path, const char* mode) override {
+    Look("open " + path);
+    return Inner().Open(path, mode);
+  }
+  std::size_t Write(std::FILE* file, const void* data, std::size_t size) override {
+    return Inner().Write(file, data, size);
+  }
+  int Rename(const std::string& from, const std::string& to) override {
+    Look("rename " + from + " -> " + to);
+    const int renamed = Inner().Rename(from, to);
+    Look("renamed " + from + " -> " + to);
+    return renamed;
+  }
+  int Remove(const std::string& path) override {
+    Look("remove " + path);
+    return Inner().Remove(path);
+  }
+  bool Sync(const std::string& path) override {
+    Look("sync " + path);
+    return Inner().Sync(path);
+  }
+
+  /// How many times the engine was asked -- non-zero, or the scenario proved
+  /// nothing about the commit.
+  int looks() const {
+    std::lock_guard<std::mutex> hold(mutex_);
+    return looks_;
+  }
+
+  /// Every moment the engine said `kApproved` while the commit was still on the
+  /// card's side of the line. Empty is the whole assertion.
+  std::vector<std::string> premature() const {
+    std::lock_guard<std::mutex> hold(mutex_);
+    return premature_;
+  }
+
+ private:
+  rommsync::io::Disk& Inner() const {
+    return previous_ != nullptr ? *previous_ : rommsync::io::StdioDisk();
+  }
+
+  /// The credentials, `auth.json` beside them, and the directory a commit syncs
+  /// once its rename has landed. Nothing else: the worker writes this directory
+  /// too, and its files are no part of what the pairing state promises.
+  bool Watched(const std::string& path) const {
+    return path.find(auth::kTokenFileName) != std::string::npos ||
+           path.find(auth::kAuthStateFileName) != std::string::npos ||
+           path + "/" == directory_;
+  }
+
+  void Look(const std::string& what) {
+    if (!Watched(what.substr(what.find(' ') + 1))) {
+      return;
+    }
+    const auth::PairingStatus seen = console_.engine.pairing_status();
+    std::lock_guard<std::mutex> hold(mutex_);
+    ++looks_;
+    if (seen.state == auth::PairingState::kApproved) {
+      // Named relative to the config directory: the sandbox path is long, and the
+      // file is the part of the line that says which step of the commit it was.
+      std::string moment = what;
+      for (std::string::size_type at = moment.find(directory_); at != std::string::npos;
+           at = moment.find(directory_)) {
+        moment.erase(at, directory_.size());
+      }
+      premature_.push_back(moment);
+    }
+  }
+
+  Console& console_;
+  std::string directory_;
+  rommsync::io::Disk* previous_ = nullptr;
+  mutable std::mutex mutex_;
+  int looks_ = 0;
+  std::vector<std::string> premature_;
+};
+
+/// The pairing state follows the card, not the server (bug found by
+/// `engine.pairs` and `engine.repairs` at `-j4`).
+///
+/// `kApproved` tells the overlay "Paired -- this console can now sync". It may
+/// only be said once the grant is a committed `token.dat`: while the commit is
+/// in flight the attempt reads as still pending, and a commit the card refuses
+/// reads as failed -- never as approved first and failed afterwards.
+///
+/// Played as a re-pair over a working credential, because that is the commit
+/// that overwrites one: the refused commit has to leave the previous token
+/// exactly where it was, and the one that lands replaces it whole.
+int PairCommit(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+
+  Console console(c, "engine-pair-commit");
+  auth::StoredToken old_token;
+  old_token.server_url = base;
+  old_token.access_token = fixture.token;
+  old_token.device_id = fixture.device_id;
+  const std::string token_path = console.directory + auth::kTokenFileName;
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini", "[server]\nurl = " + base + "\n"),
+           "the console is configured for the fixture RomM");
+  c.Expect(auth::SaveToken(token_path, old_token).ok(), "and already paired with it");
+  console.engine.UsePairingBackend(Backend(client));
+  console.Boot();
+  c.Expect(console.Status().auth == ipc::AuthState::kPaired, "so it comes up paired");
+
+  // --- a card that refuses the new token ---------------------------------------
+  {
+    const auth::PairingStatus showing = BeginAndShow(console, c);
+    c.Expect(showing.state == auth::PairingState::kPending,
+             std::string("the re-pair reaches a live code (") + auth::ToString(showing.state) +
+                 ": " + showing.message + ")");
+
+    // Full the moment the new token is written: the temp file takes nothing.
+    // Declared before the watch, so the watch sits on top and sees every call.
+    faulty::Plan plan;
+    plan.aimed_at = auth::kTokenFileName;
+    plan.error = ENOSPC;
+    plan.after = 0;
+    faulty::Disk full(plan);
+    CommitWatch watch(console, console.directory);
+
+    const http::Result approved =
+        rig::ApproveDeviceCode(client, base, showing.user_code, Scopes());
+    c.Expect(approved.successful(),
+             "approving the code -- HTTP " + std::to_string(approved.response.status));
+    const auth::PairingStatus settled = Terminal(console, c);
+
+    c.Expect(full.refusals() > 0, "the card really did refuse the commit");
+    c.Expect(watch.looks() > 0, "and the commit was watched while it ran");
+    for (const std::string& moment : watch.premature()) {
+      c.Expect(false, "the overlay was told kApproved before token.dat was committed, at: " +
+                          moment);
+    }
+    c.Expect(settled.state == auth::PairingState::kFailed,
+             std::string("a commit the card refuses is a failed pairing, not an approved one (") +
+                 auth::ToString(settled.state) + ": " + settled.message + ")");
+    c.Expect(settled.message.find("could not be saved") != std::string::npos,
+             "and says the token could not be saved: " + settled.message);
+  }
+  c.Expect(!console.sandbox.Exists("/config/rommsync/token.dat.tmp"),
+           "a refused commit leaves no partial file beside the token");
+  c.Expect(!console.sandbox.Exists("/config/rommsync/token.dat.old"),
+           "nor the previous one moved aside");
+  {
+    const auth::LoadedToken kept = auth::LoadToken(token_path);
+    c.Expect(kept.ok(), "the previous credential is still on the card: " + kept.message);
+    c.Expect(kept.value.access_token == fixture.token, "and it is the previous one, untouched");
+  }
+  c.Expect(console.Status().auth == ipc::AuthState::kPaired,
+           "so the console is still paired, on the credential it had");
+
+  // --- a card that takes it -------------------------------------------------------
+  {
+    const auth::PairingStatus showing = BeginAndShow(console, c);
+    c.Expect(showing.state == auth::PairingState::kPending,
+             std::string("pairing again reaches a live code (") + auth::ToString(showing.state) +
+                 ": " + showing.message + ")");
+
+    CommitWatch watch(console, console.directory);
+    const http::Result approved =
+        rig::ApproveDeviceCode(client, base, showing.user_code, Scopes());
+    c.Expect(approved.successful(),
+             "approving the code -- HTTP " + std::to_string(approved.response.status));
+    const auth::PairingStatus granted = Terminal(console, c);
+
+    c.Expect(watch.looks() > 0, "the commit was watched while it ran");
+    for (const std::string& moment : watch.premature()) {
+      c.Expect(false, "the overlay was told kApproved before token.dat was committed, at: " +
+                          moment);
+    }
+    c.Expect(granted.state == auth::PairingState::kApproved,
+             std::string("the re-pair completes (") + auth::ToString(granted.state) + ": " +
+                 granted.message + ")");
+    // The instant the overlay reads `kApproved` -- before anything else runs --
+    // the card and the engine both have to agree with it. This is the check
+    // `engine.pairs` lost to the scheduler.
+    c.Expect(console.Status().auth == ipc::AuthState::kPaired,
+             "and the instant it says so, the console is paired");
+    c.Expect(!console.sandbox.Exists("/config/rommsync/token.dat.tmp"),
+             "with no partial file beside the token");
+    c.Expect(!console.sandbox.Exists("/config/rommsync/token.dat.old"),
+             "and nothing moved aside left behind");
+  }
+  const auth::LoadedToken replaced = auth::LoadToken(token_path);
+  c.Expect(replaced.ok(), "the new credential is on the card: " + replaced.message);
+  c.Expect(replaced.value.access_token != fixture.token,
+           "and it is the new one, not the previous one");
+
+  http::Request mine;
+  mine.url = base + "/api/users/me";
+  mine.headers.push_back({"Authorization", "Bearer " + replaced.value.access_token});
+  const http::Result whoami = client.Send(mine);
+  c.Expect(whoami.response.status == 200,
+           "and RomM accepts it -- HTTP " + std::to_string(whoami.response.status));
   return c.failures();
 }
 
@@ -3701,6 +3930,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"pairs", Pairs},
       {"nonblocking", NonBlocking},
       {"repairs", Repairs},
+      {"pair_commit", PairCommit},
       {"log_faults", LogsTransportFailures},
       {"server_disabled", ServerDisabled},
       {"drains", Drains},

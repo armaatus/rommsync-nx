@@ -2249,6 +2249,7 @@ set(ENGINE_RIG_SCENARIOS
   pairs        # start to committed token, and the token works against the server
   nonblocking  # `StartPair` returns while the init is stalled: `ipc.hpp`'s contract
   repairs      # `StartPair` then `Unpair`, with neither instant leaving nothing
+  pair_commit  # `kApproved` only once token.dat is committed; a refused commit keeps the old one
   log_faults   # M7-3: the four transport failures the guide documents, as the proxy makes them
   server_disabled  # #235: sync off in RomM reaches the status screen as the server's switch
   drains       # M9-5: a rom queued over IPC becomes a file on the card
