@@ -1008,6 +1008,22 @@ int Secrets() {
     }
     checks.Expect(named, "the user is told why the field is blank");
   }
+
+  // #230: what the last tick found about RetroArch reaches the settings screen
+  // with config.ini's own complaints, and after them.
+  {
+    FakeEngine engine;
+    engine.notes.push_back({config::Severity::kWarning, 3, "sync", "states", "a config.ini line"});
+    engine.sources.push_back({config::Severity::kNotice, 0, "", "",
+                              "RetroArch syncs itself: Cloud Sync is on in retroarch.cfg"});
+    ipc::ServiceCore core(engine);
+    const ipc::ConfigView view = core.GetConfig();
+    checks.ExpectEq(view.diagnostics.size(), std::size_t{2},
+                    "GetConfig serves config.ini's diagnostics and the source notes");
+    checks.Expect(view.diagnostics.size() == 2 && view.diagnostics[0].key == "states" &&
+                      view.diagnostics[1].message.find("RetroArch syncs itself") == 0,
+                  "config.ini's first, then RetroArch's");
+  }
   return checks.failures();
 }
 

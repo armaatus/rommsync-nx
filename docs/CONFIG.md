@@ -22,6 +22,10 @@ enabled       = true
 verify_hash   = true               ; check sha1 (or md5) after download
 resume        = true
 
+[sources]
+retroarch             = auto       ; auto | on | off; auto = off while RetroArch's Cloud Sync is on
+retroarch_content_dir = false      ; read RetroArch saves kept beside the roms
+
 ; Platform folder map: RomM platform_fs_slug -> SD folders.
 ; roms   = where downloads land (first entry is the write target)
 ; saves  = dirs to scan/sync for SRAM saves
@@ -79,7 +83,11 @@ answer to an older and a newer one; they are listed in
 - Heavy platforms with no Switch emulator (ps2/ps3/ps4/wii/ngc/3ds) are
   intentionally unmapped; the client skips anything without a mapping.
 - **Verify Tico's real save paths** on your SD and correct `saves`/`states` —
-  the Tico defaults are best-guesses; RetroArch's defaults are correct.
+  the Tico defaults are best-guesses.
+- **RetroArch's folders come from RetroArch**, not from this map: see
+  [RetroArch](#retroarch-read-from-retroarchcfg) below. The map's
+  `/retroarch/saves` and `/retroarch/states` are still read as written, after
+  RetroArch's own.
 
 ### A platform section replaces that platform's defaults
 
@@ -158,6 +166,51 @@ The id has to be one RomM accepts — at most 50 characters, none of
 `\ / : | * ? " < >`, no control character, no space at either end. One that is
 not is dropped with a `warning` naming the line, and the built-in id stays in
 force: RomM would otherwise refuse every upload of that platform's saves.
+
+### RetroArch: read from `retroarch.cfg`
+
+Where RetroArch keeps saves is RetroArch's setting, so every sync reads it from
+`sdmc:/retroarch/retroarch.cfg` rather than trusting a guess here:
+
+| `retroarch.cfg` | What is read |
+|---|---|
+| `savefile_directory` (`savestate_directory`) | that folder, whatever it is called. `default`, or a folder that does not exist, is the Switch build's default, `/retroarch/cores/savefiles` (`/retroarch/cores/savestates`) — not `/retroarch/saves` |
+| `sort_savefiles_enable = true` (the default) | each folder one level under it, `<folder>/<CoreFolder>/`, named by RomM's core table: `mGBA` is `mgba`. A folder RomM does not know is RetroArch's with no emulator id. A file directly in the parent is skipped as *outside layout*: RetroArch does not read it |
+| `sort_savefiles_enable = false` | the folder itself, every system in it, with the table above's RetroArch column |
+| `savefiles_in_content_dir = true` | the `roms` folders of the map, and in them only `.srm`/`.rtc` (`.state`, `.stateN`) — **only** with `[sources] retroarch_content_dir = true`; otherwise nothing, and a `warning` says so |
+| `sort_savefiles_by_content_enable = true` | nothing: that layout is not read, and a `warning` says so |
+| `cloud_sync_enable = true` (with `cloud_sync_sync_saves`) | nothing, unless `[sources] retroarch = on`: **RetroArch syncs itself** |
+
+RetroArch's folders are read before the map's, so when the map's
+`/retroarch/saves` still holds an older copy of a save, the copy RetroArch
+actually reads is the one that syncs. The map's entry for the folder
+`retroarch.cfg` names is not read a second time beside it.
+
+A missing `retroarch.cfg` is RetroArch's defaults and a `notice`; an unreadable,
+oversized or malformed one is its defaults for whatever it did not state
+usably, with a `warning` naming the line. None of it is an `error`: it is not
+this client's configuration. These appear on the overlay's settings screen
+after `config.ini`'s own, and in the log when they change.
+
+#### `[sources]`
+
+```ini
+[sources]
+retroarch             = auto   ; auto (default) | on | off
+retroarch_content_dir = false  ; true reads saves RetroArch keeps beside the roms
+```
+
+- `retroarch = auto` reads RetroArch's folders unless RetroArch's own Cloud Sync
+  is syncing its saves. Two writers to one save look like another device's
+  changes on every sync, so while Cloud Sync is on the client stays out of the
+  way and the settings screen says **"RetroArch syncs itself"**.
+- `retroarch = on` reads them anyway, and warns that two things are syncing the
+  same saves. `off` reads no RetroArch folder at all — the map's included.
+- `retroarch_content_dir` is off by default because the folders it reads are
+  rom folders.
+
+`[sources]` is edited by hand; the overlay does not offer it. v1.0.0-rc1 warns
+that it is not a section it knows and ignores it.
 
 ### `conflict_show` hides the screen, never the recording
 

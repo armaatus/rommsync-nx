@@ -69,6 +69,7 @@
 #include "rommsync/list_service.hpp"
 #include "rommsync/pairing.hpp"
 #include "rommsync/play_sessions.hpp"
+#include "rommsync/retroarch_cfg.hpp"
 #include "rommsync/scheduler.hpp"
 #include "rommsync/sync_tick.hpp"
 #include "rommsync/token_store.hpp"
@@ -411,6 +412,7 @@ class SdEngine : public ipc::Engine, public power::Sink {
 
   const config::Config& config() const override;
   const std::vector<config::Diagnostic>& config_diagnostics() const override;
+  std::vector<config::Diagnostic> source_notes() const override;
   ipc::EngineSnapshot Snapshot() const override;
   auth::PairingStatus pairing_status() const override;
 
@@ -862,6 +864,10 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// reboot and a changed `server.url` lifts a TLS park.
   void AdoptConfigLocked(config::LoadResult loaded);
 
+  /// Keep what this tick's `retroarch.cfg` says for `source_notes()`, logging
+  /// it when it differs from the last tick's. Takes `mutex_`.
+  void NoteSources(const config::Config& config, const retroarch::LoadResult& loaded);
+
   /// One of this client's files, under the directory `Load` was given.
   std::string PathTo(const char* file_name) const;
 
@@ -916,6 +922,11 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// does not silently drop it. At most one line, and only when the file was
   /// there and would not read (M1-4, #8).
   std::vector<config::Diagnostic> auth_diagnostics_;
+
+  /// `retroarch.cfg`'s complaints and what follows from it -- "RetroArch syncs
+  /// itself" -- as the last tick read them (#230). Under `mutex_`: the sync
+  /// thread replaces it and the IPC thread serves it.
+  std::vector<config::Diagnostic> source_notes_;
 
   /// The download queue as the card holds it. Loaded once and written by every
   /// command that changes it, so the file and this never disagree by more than

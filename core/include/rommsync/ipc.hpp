@@ -1092,6 +1092,16 @@ class Engine {
   virtual const config::Config& config() const = 0;
   virtual const std::vector<config::Diagnostic>& config_diagnostics() const = 0;
 
+  /// What the last tick found about how the emulators' folders are read --
+  /// `retroarch.cfg`'s complaints, and "RetroArch syncs itself" (#230). Served
+  /// after `config_diagnostics()` by `GetConfig`, which is where the settings
+  /// screen reads them.
+  ///
+  /// A value rather than a reference, because a tick on another thread replaces
+  /// it. Empty by default: an engine that never reads `retroarch.cfg` has
+  /// nothing to say about it.
+  virtual std::vector<config::Diagnostic> source_notes() const { return {}; }
+
   virtual EngineSnapshot Snapshot() const = 0;
 
   /// The live pairing attempt, or an idle status when there is none.

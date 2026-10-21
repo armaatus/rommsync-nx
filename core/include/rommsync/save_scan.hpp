@@ -47,6 +47,7 @@
 
 #include "rommsync/config.hpp"
 #include "rommsync/file_system.hpp"
+#include "rommsync/retroarch_cfg.hpp"
 #include "rommsync/rom_index.hpp"
 #include "rommsync/save_source.hpp"
 #include "rommsync/state_db.hpp"
@@ -174,6 +175,12 @@ enum class SkipReason {
   kDuplicateName,
 
   kTooManyStates,   ///< the state scan hit `kMaxStates` and stopped
+
+  /// A file directly in a folder RetroArch sorts by core. RetroArch reads
+  /// `<folder>/<CoreFolder>/` and nothing beside it, so this is a copy left from
+  /// before sorting was on -- and synced, it would win a slot from the copy
+  /// RetroArch actually reads.
+  kOutsideLayout,
 };
 
 /// Stable, log-friendly name. Never null.
@@ -245,6 +252,12 @@ struct ScanResult {
   /// Files seen in the mapped directories, matched or not.
   std::size_t files_seen = 0;
 
+  /// Every directory the scan read for files, in the order it read them: the
+  /// folder map's, and the ones `retroarch.cfg` led it to. What a sweep for an
+  /// interrupted write has to cover, since a save is overwritten where it was
+  /// found (`sync::TickOptions::recover_dirs`).
+  std::vector<std::string> folders;
+
   /// The rom index did not hold the whole library (`roms::RomIndex::truncated`).
   ///
   /// Carried because it changes what an unmatched file *means*: with a short
@@ -274,9 +287,31 @@ struct ScanResult {
   std::string DescribeSkipped() const;
 };
 
-/// Walk `config`'s save directories and match what is in them.
+/// Walk `config`'s save directories, and RetroArch's, and match what is in them.
 ///
-/// Directories come from `config::Config::SaveScanDirs()`, so one physical
+/// **RetroArch's folders are the ones `retroarch.cfg` names, read the way
+/// RetroArch lays them out** (#230), and they are read first, so the copy
+/// RetroArch actually reads wins a contested slot over one the folder map also
+/// finds:
+///
+///   - its `savefile_directory`, whatever it is called -- and when that is not
+///     there, the build's default, because RetroArch ignores a folder it cannot
+///     use and writes to its default instead;
+///   - with sort-by-core on, the folders one level under it, each through
+///     RomM's core table (`RetroArchCoreId`), and a file directly in it is a
+///     `kOutsideLayout` skip; a folder starting with `.` (`.netplay`) is not a
+///     core;
+///   - with `savefiles_in_content_dir`, the map's `roms` folders instead -- only
+///     with `[sources] retroarch_content_dir` on, and only RetroArch's own
+///     `.srm`/`.rtc` (`.state`, `.stateN`) in them;
+///   - with a per-content-directory layout, nothing: it is not read.
+///
+/// The folder map's own entry for that folder is not read a second time, flat,
+/// beside it. And while `retroarch::Enabled` says no -- RetroArch's Cloud Sync,
+/// or `[sources] retroarch = off` -- no RetroArch folder is read at all, the
+/// map's included.
+///
+/// Everything else comes from `config::Config::SaveScanDirs()`, so one physical
 /// folder listed under a dozen platforms is walked **once** and yields one
 /// record per file. Order is the config's first-seen order, and each directory's
 /// entries are sorted by name, so two runs over an unchanged card produce the
@@ -286,10 +321,16 @@ struct ScanResult {
 /// than defaulted: an empty one is a perfectly good baseline that hashes
 /// everything, and a caller that *forgot* the argument would otherwise get a
 /// scan that quietly reported no digests at all.
-ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
-                     fs::FileSystem& files, const state::Baseline& baseline);
+///
+/// `retroarch` is required for the reason `baseline` is: a console with no
+/// `retroarch.cfg` passes `retroarch::Settings{}`, which is what RetroArch would
+/// use, and a caller that forgot it would scan a layout nobody chose.
+ScanResult ScanSaves(const config::Config& config, const retroarch::Settings& retroarch,
+                     const roms::RomIndex& index, fs::FileSystem& files,
+                     const state::Baseline& baseline);
 
-/// The same walk over `config::Config::StateScanDirs()`, emitting states.
+/// The same walk over `config::Config::StateScanDirs()` and RetroArch's
+/// `savestate_directory`, under its own four settings, emitting states.
 ///
 /// **It does not consult `sync.states`.** `StateScanDirs()` answers regardless
 /// of the toggle because whether to scan is the engine's decision rather than
@@ -298,8 +339,9 @@ ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
 /// all. A second copy of that check here would be a second thing to get wrong,
 /// and the failure mode of getting it wrong is silent: a console reading state
 /// directories the user never opted into.
-ScanResult ScanStates(const config::Config& config, const roms::RomIndex& index,
-                      fs::FileSystem& files, const state::Baseline& baseline);
+ScanResult ScanStates(const config::Config& config, const retroarch::Settings& retroarch,
+                      const roms::RomIndex& index, fs::FileSystem& files,
+                      const state::Baseline& baseline);
 
 // --- the pieces, exposed because they are the parts worth testing directly ----
 

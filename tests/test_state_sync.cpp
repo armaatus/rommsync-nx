@@ -385,7 +385,7 @@ void Scanning(rig::Checks& checks) {
   }
 
   state::Baseline baseline;
-  const scan::ScanResult result = scan::ScanStates(configured, index, *files, baseline);
+  const scan::ScanResult result = scan::ScanStates(configured, rommsync::retroarch::Settings{}, index, *files, baseline);
 
 
   checks.ExpectEq(result.states.size(), std::size_t{1},

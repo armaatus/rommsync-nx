@@ -299,6 +299,11 @@ struct StateSyncOptions {
   /// two states backed up in the same second do not collide.
   std::function<Timestamp()> now;
 
+  /// `retroarch.cfg` as this tick read it, for where RetroArch keeps its states
+  /// (`scan::ScanStates`). Defaulted, unlike the scan's own argument, because
+  /// the default is exactly what a console with no `retroarch.cfg` reads.
+  retroarch::Settings retroarch;
+
   /// Where a server state the client has no local file for should be written,
   /// SD-root absolute. Returning an empty string -- or leaving this null --
   /// fails that one with `kNoPlacement` rather than guessing.

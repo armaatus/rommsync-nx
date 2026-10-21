@@ -785,7 +785,7 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
   }
   report.ran = true;
 
-  report.scan = scan::ScanStates(config, index, files, *baseline);
+  report.scan = scan::ScanStates(config, options.retroarch, index, files, *baseline);
   // Lifted, not left on `report.scan`. "An ambiguous state is skipped and
   // logged" is the acceptance, and a caller that logs `warnings` and nothing
   // else -- which is what every other step of a tick hands up -- would otherwise

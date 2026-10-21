@@ -1027,6 +1027,7 @@ set(SCAN_UNIT_SCENARIOS
   hashing      # the digest is real, reused when nothing changed, null only when unreadable
   sources      # fixture trees for each source scan to the emulator id that wrote them
   grown        # the index is reserved from total; a library that grows mid-fetch stops there
+  retroarch    # flat, sorted, beside the content and cloud-synced, as retroarch.cfg says
 )
 foreach(scenario IN LISTS SCAN_UNIT_SCENARIOS)
   add_test(NAME scan.${scenario} COMMAND test_save_scan ${scenario})
@@ -1050,6 +1051,24 @@ set(SOURCE_SCENARIOS
 foreach(scenario IN LISTS SOURCE_SCENARIOS)
   add_test(NAME source.${scenario} COMMAND test_save_source ${scenario})
   set_tests_properties(source.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
+# M10-4: retroarch.cfg, read for where RetroArch keeps saves and whether it syncs
+# them itself. Pure apart from scratch files, so it never skips.
+add_executable(test_retroarch_cfg test_retroarch_cfg.cpp)
+target_link_libraries(test_retroarch_cfg PRIVATE rommsync::core)
+target_include_directories(test_retroarch_cfg PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_retroarch_cfg PRIVATE
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+
+set(RETROARCH_CFG_SCENARIOS
+  parse     # every key read, quoted or not, with the device prefix; the last line wins
+  fallback  # missing, malformed and oversized files fall back to the defaults, said
+  notes     # [sources] against RetroArch's Cloud Sync, and what the overlay is told
+)
+foreach(scenario IN LISTS RETROARCH_CFG_SCENARIOS)
+  add_test(NAME retroarch.${scenario} COMMAND test_retroarch_cfg ${scenario})
+  set_tests_properties(retroarch.${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
 
 set(SCAN_RIG_SCENARIOS

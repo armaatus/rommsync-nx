@@ -313,7 +313,9 @@ setting that reads differently there is a `[platform.<slug>]` section holding
 only `emulator =` — rc1 ignores that key, so the section maps no folders and
 the platform is skipped. Remove such a section before going back to rc1. rc1
 also reports the `version = 1` line as a warning ("nothing it configures"),
-which is harmless.
+which is harmless, and a `[sources]` section as one it does not know, which is
+too: rc1 never reads `retroarch.cfg`, so it scans only the folder map, and does
+so even while RetroArch's own Cloud Sync is on.
 
 ---
 

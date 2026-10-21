@@ -39,6 +39,9 @@ class FakeEngine : public ipc::Engine {
   std::vector<config::Diagnostic> apply_edit_notes;
   ipc::ConfigEdit last_edit;
 
+  /// What the last tick said about the emulators' folders (#230).
+  std::vector<config::Diagnostic> sources;
+
   bool sync_accepted = true;
   int sync_requests = 0;
 
@@ -60,6 +63,7 @@ class FakeEngine : public ipc::Engine {
 
   const config::Config& config() const override { return settings; }
   const std::vector<config::Diagnostic>& config_diagnostics() const override { return notes; }
+  std::vector<config::Diagnostic> source_notes() const override { return sources; }
   ipc::EngineSnapshot Snapshot() const override { return snapshot; }
   auth::PairingStatus pairing_status() const override { return pairing; }
 

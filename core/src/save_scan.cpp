@@ -107,6 +107,8 @@ const char* ToString(SkipReason reason) {
       return "duplicate name";
     case SkipReason::kTooManyStates:
       return "too many states";
+    case SkipReason::kOutsideLayout:
+      return "outside layout";
   }
   return "unknown";
 }
@@ -240,34 +242,213 @@ sync::ClientSaveState SaveFile::ToClientSaveState(std::optional<std::string> con
 
 namespace {
 
+void RecordSkip(ScanResult* result, SkipReason reason, std::string sd_path,
+                std::string message) {
+  ++result->skipped_total;
+  if (result->skipped.size() < kMaxSkipsReported) {
+    result->skipped.push_back(MakeSkip(reason, std::move(sd_path), std::move(message)));
+  }
+}
+
+/// One folder a walk reads, and what is known about it before a file in it is.
+struct ScanFolder {
+  std::string directory;
+
+  /// What the folder says: `SourceOf`, or -- for a folder `retroarch.cfg` led
+  /// the scan to -- RetroArch's, whatever the path is called.
+  SaveSource source;
+
+  /// The platform the folder implies, or "" for every platform (`PlatformHints`).
+  std::string platform_hint;
+
+  /// A rom folder RetroArch keeps saves beside: only its own extensions are read.
+  bool beside_roms = false;
+};
+
+/// RetroArch's own name for a save (`.srm`, and the `.rtc` beside it) or a state
+/// (`.state`, `.state1`...) -- what a rom folder may hold that is not a rom.
+bool IsRetroArchFile(std::string_view name, Folders which) {
+  const std::string_view suffix = sync::ExtensionOf(name);
+  const std::string extension = LowerAscii(suffix.empty() ? suffix : suffix.substr(1));
+  if (which == Folders::kSaves) {
+    return extension == "srm" || extension == "rtc";
+  }
+  if (extension.rfind("state", 0) != 0) {
+    return false;
+  }
+  for (std::size_t i = 5; i < extension.size(); ++i) {
+    if (extension[i] < '0' || extension[i] > '9') {
+      return false;
+    }
+  }
+  return true;
+}
+
+SaveSource RetroArchFlat(const std::string& directory) {
+  SaveSource source;
+  source.source = Source::kRetroArch;
+  source.folder = directory;
+  source.layout = Layout::kFlat;
+  return source;
+}
+
+/// A folder one level under a sorted RetroArch folder: a core RomM's table
+/// knows, or RetroArch's with no guessed id -- `SourceOf`'s rule for a leaf it
+/// does not know, applied to a folder that is RetroArch's by configuration.
+SaveSource RetroArchCore(const std::string& directory, std::string_view leaf) {
+  SaveSource source;
+  source.source = Source::kRetroArch;
+  source.folder = directory;
+  source.emulator_id = RetroArchCoreId(leaf);
+  source.layout = source.emulator_id.empty() ? Layout::kUnknown : Layout::kCoreFolder;
+  return source;
+}
+
+/// The folders one walk reads, in the order it reads them. See `ScanSaves`.
+std::vector<ScanFolder> PlanFolders(const config::Config& config,
+                                    const retroarch::Settings& settings, Folders which,
+                                    fs::FileSystem& files, ScanResult* result) {
+  const bool saves = which == Folders::kSaves;
+  const std::map<std::string, std::string, std::less<>> hints = PlatformHints(config, which);
+  const auto hint_for = [&hints](const std::string& directory) {
+    const auto found = hints.find(directory);
+    return found == hints.end() ? std::string() : found->second;
+  };
+
+  std::vector<ScanFolder> plan;
+  // FAT32 ignores case, so `/RetroArch/saves` and `/retroarch/saves` are one
+  // folder, and reading it twice makes every save in it a duplicate of itself.
+  std::set<std::string> planned;
+  const auto add = [&plan, &planned](ScanFolder folder) {
+    if (planned.insert(LowerAscii(folder.directory)).second) {
+      plan.push_back(std::move(folder));
+    }
+  };
+
+  const bool enabled = retroarch::Enabled(config, settings);
+  const std::string configured =
+      saves ? settings.savefile_directory : settings.savestate_directory;
+  const std::string fallback =
+      saves ? retroarch::kDefaultSavefileDirectory : retroarch::kDefaultSavestateDirectory;
+  const bool sorted = saves ? settings.sort_savefiles : settings.sort_savestates;
+  const bool by_content =
+      saves ? settings.sort_savefiles_by_content : settings.sort_savestates_by_content;
+  const bool beside_roms =
+      saves ? settings.savefiles_in_content_dir : settings.savestates_in_content_dir;
+
+  // The folder retroarch.cfg names is RetroArch's to lay out, so the map's entry
+  // for it -- the built-in `/retroarch/saves`, or one a user wrote -- is decided
+  // here and never read flat beside it.
+  std::set<std::string> decided = {LowerAscii(configured)};
+
+  if (enabled && !by_content) {
+    std::vector<ScanFolder> bases;
+    if (beside_roms) {
+      if (config.sources.retroarch_content_dir) {
+        // The map's rom folders, each implying its platform when only one maps it.
+        std::map<std::string, std::string, std::less<>> rom_hints;
+        std::vector<std::string> rom_folders;
+        for (const auto& [slug, mapped] : config.platforms) {
+          for (const std::string& directory : mapped.roms) {
+            const auto found = rom_hints.find(directory);
+            if (found == rom_hints.end()) {
+              rom_hints.emplace(directory, slug);
+              rom_folders.push_back(directory);
+            } else if (found->second != slug) {
+              found->second.clear();
+            }
+          }
+        }
+        for (const std::string& directory : rom_folders) {
+          bases.push_back({directory, RetroArchFlat(directory), rom_hints[directory], true});
+        }
+      }
+    } else {
+      std::string directory = configured;
+      if (LowerAscii(configured) != LowerAscii(fallback) &&
+          files.List(configured).error == fs::ListError::kMissing) {
+        // RetroArch ignores a `savefile_directory` that is not a directory and
+        // writes to its default instead, so that is where the saves are.
+        directory = fallback;
+        decided.insert(LowerAscii(fallback));
+      }
+      bases.push_back({directory, RetroArchFlat(directory), hint_for(directory), false});
+    }
+
+    for (ScanFolder& base : bases) {
+      if (!sorted) {
+        add(std::move(base));
+        continue;
+      }
+      fs::Listing listing = files.List(base.directory);
+      if (!listing.ok() && listing.error != fs::ListError::kMissing) {
+        RecordSkip(result, SkipReason::kDirectoryFailed, base.directory,
+                   listing.message.empty() ? fs::ToString(listing.error) : listing.message);
+      }
+      std::sort(listing.entries.begin(), listing.entries.end(),
+                [](const fs::Entry& left, const fs::Entry& right) {
+                  return left.name < right.name;
+                });
+      for (const fs::Entry& entry : listing.entries) {
+        if (entry.name.empty()) {
+          continue;
+        }
+        const std::string path = Join(base.directory, entry.name);
+        if (entry.is_directory) {
+          // `.netplay` is where a netplay *client* keeps the host's saves, and
+          // nothing that starts with a dot is a core.
+          if (entry.name.front() != '.') {
+            add({path, RetroArchCore(path, entry.name), base.platform_hint, base.beside_roms});
+          }
+          continue;
+        }
+        if (base.beside_roms && !IsRetroArchFile(entry.name, which)) {
+          continue;  // a rom
+        }
+        ++result->files_seen;
+        RecordSkip(result, SkipReason::kOutsideLayout, path,
+                   std::string("RetroArch sorts ") + (saves ? "saves" : "states") +
+                       " by core here and reads them from the core's folder, not this file");
+      }
+    }
+  }
+
+  for (const std::string& directory : saves ? config.SaveScanDirs() : config.StateScanDirs()) {
+    SaveSource source = SourceOf(directory);
+    if (decided.count(LowerAscii(directory)) > 0 ||
+        (!enabled && source.source == Source::kRetroArch)) {
+      continue;
+    }
+    add({directory, std::move(source), hint_for(directory), false});
+  }
+  return plan;
+}
+
 /// The half of both walks that is the same, which is nearly all of it.
 ///
-/// It reads each directory once, sorts its entries, resolves the platform hint,
-/// matches the base name against the rom index and range-checks the mtime --
-/// then hands what survived to `on_match` with the folder's `SaveSource` --
-/// what the path says, read once per directory -- which returns whether it
-/// emitted a record. Every decision in here is one docs/SYNC_PROTOCOL.md states about the
-/// scan rather than about saves in particular, which is why a state gets the
-/// same one instead of a second copy that could drift from it.
+/// It reads each folder once, sorts its entries, matches the base name against
+/// the rom index under the folder's platform hint and range-checks the mtime --
+/// then hands what survived to `on_match` with the folder's `SaveSource`, which
+/// returns whether it emitted a record. Every decision in here is one
+/// docs/SYNC_PROTOCOL.md states about the scan rather than about saves in
+/// particular, which is why a state gets the same one instead of a second copy
+/// that could drift from it.
 ///
 /// `limit` is how many records the caller may emit before the walk stops and
 /// says so; the two kinds have different budgets against one shared baseline
 /// file (`scan::kMaxSaves`, `scan::kMaxStates`).
 template <class OnMatch>
-void Walk(const std::vector<std::string>& directories,
-          const std::map<std::string, std::string, std::less<>>& hints,
-          const roms::RomIndex& index, fs::FileSystem& files, std::size_t limit,
-          SkipReason limit_reason, const std::string& limit_message, ScanResult* result,
-          const OnMatch& on_match) {
+void Walk(const std::vector<ScanFolder>& folders, Folders which, const roms::RomIndex& index,
+          fs::FileSystem& files, std::size_t limit, SkipReason limit_reason,
+          const std::string& limit_message, ScanResult* result, const OnMatch& on_match) {
   const auto record_skip = [result](SkipReason reason, std::string sd_path, std::string message) {
-    ++result->skipped_total;
-    if (result->skipped.size() < kMaxSkipsReported) {
-      result->skipped.push_back(MakeSkip(reason, std::move(sd_path), std::move(message)));
-    }
+    RecordSkip(result, reason, std::move(sd_path), std::move(message));
   };
 
   std::size_t emitted = 0;
-  for (const std::string& directory : directories) {
+  for (const ScanFolder& folder : folders) {
+    const std::string& directory = folder.directory;
+    result->folders.push_back(directory);
     fs::Listing listing = files.List(directory);
     if (!listing.ok() && listing.error != fs::ListError::kMissing) {
       // A *missing* folder is a normal card -- a platform mapped to a Tico
@@ -289,14 +470,14 @@ void Walk(const std::vector<std::string>& directories,
     std::sort(listing.entries.begin(), listing.entries.end(),
               [](const fs::Entry& left, const fs::Entry& right) { return left.name < right.name; });
 
-    const SaveSource folder_source = SourceOf(directory);
-    const auto hint = hints.find(directory);
-    const std::string_view platform_hint =
-        hint == hints.end() ? std::string_view() : std::string_view(hint->second);
+    const std::string_view platform_hint = folder.platform_hint;
 
     for (const fs::Entry& entry : listing.entries) {
       if (entry.is_directory || entry.name.empty()) {
         continue;  // the walk is not recursive; see file_system.hpp
+      }
+      if (folder.beside_roms && !IsRetroArchFile(entry.name, which)) {
+        continue;  // a rom folder's roms are not files this scan has seen
       }
       ++result->files_seen;
       const std::string sd_path = Join(directory, entry.name);
@@ -337,7 +518,7 @@ void Walk(const std::vector<std::string>& directories,
         continue;
       }
 
-      if (on_match(sd_path, entry, *match.rom, folder_source, record_skip)) {
+      if (on_match(sd_path, entry, *match.rom, folder.source, record_skip)) {
         ++emitted;
       }
     }
@@ -346,8 +527,9 @@ void Walk(const std::vector<std::string>& directories,
 
 }  // namespace
 
-ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
-                     fs::FileSystem& files, const state::Baseline& baseline) {
+ScanResult ScanSaves(const config::Config& config, const retroarch::Settings& retroarch,
+                     const roms::RomIndex& index, fs::FileSystem& files,
+                     const state::Baseline& baseline) {
   ScanResult result;
   result.index_truncated = index.truncated();
 
@@ -358,7 +540,9 @@ ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
   // config's and each directory's entries are sorted by `Walk`.
   std::set<std::pair<std::int64_t, std::string>> claimed;
 
-  Walk(config.SaveScanDirs(), PlatformHints(config, Folders::kSaves), index, files, kMaxSaves,
+  const std::vector<ScanFolder> folders =
+      PlanFolders(config, retroarch, Folders::kSaves, files, &result);
+  Walk(folders, Folders::kSaves, index, files, kMaxSaves,
        SkipReason::kTooManySaves,
        "the scan stopped at " + std::to_string(kMaxSaves) +
            " saves; the rest of this card was not read",
@@ -424,8 +608,9 @@ ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
   return result;
 }
 
-ScanResult ScanStates(const config::Config& config, const roms::RomIndex& index,
-                      fs::FileSystem& files, const state::Baseline& baseline) {
+ScanResult ScanStates(const config::Config& config, const retroarch::Settings& retroarch,
+                      const roms::RomIndex& index, fs::FileSystem& files,
+                      const state::Baseline& baseline) {
   ScanResult result;
   result.index_truncated = index.truncated();
 
@@ -441,7 +626,9 @@ ScanResult ScanStates(const config::Config& config, const roms::RomIndex& index,
   // to disagree about what pairs with what.
   std::set<state::Baseline::StateKey> claimed;
 
-  Walk(config.StateScanDirs(), PlatformHints(config, Folders::kStates), index, files, kMaxStates,
+  const std::vector<ScanFolder> folders =
+      PlanFolders(config, retroarch, Folders::kStates, files, &result);
+  Walk(folders, Folders::kStates, index, files, kMaxStates,
        SkipReason::kTooManyStates,
        "the scan stopped at " + std::to_string(kMaxStates) +
            " states; the rest of this card was not read",

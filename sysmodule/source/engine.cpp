@@ -21,6 +21,7 @@
 #include "rommsync/log.hpp"
 #include "rommsync/pairing.hpp"
 #include "rommsync/play_sessions.hpp"
+#include "rommsync/retroarch_cfg.hpp"
 #include "rommsync/rom_index.hpp"
 #include "rommsync/save_scan.hpp"
 #include "rommsync/scheduler.hpp"
@@ -434,6 +435,40 @@ std::shared_ptr<const config::Config> SdEngine::ConfigSnapshot() const {
 
 const std::vector<config::Diagnostic>& SdEngine::config_diagnostics() const {
   return diagnostics_;
+}
+
+std::vector<config::Diagnostic> SdEngine::source_notes() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return source_notes_;
+}
+
+void SdEngine::NoteSources(const config::Config& config, const retroarch::LoadResult& loaded) {
+  std::vector<config::Diagnostic> notes = loaded.diagnostics;
+  for (config::Diagnostic& note : retroarch::Notes(config, loaded.value)) {
+    notes.push_back(std::move(note));
+  }
+  const auto same = [](const std::vector<config::Diagnostic>& left,
+                       const std::vector<config::Diagnostic>& right) {
+    if (left.size() != right.size()) {
+      return false;
+    }
+    for (std::size_t i = 0; i < left.size(); ++i) {
+      if (left[i].severity != right[i].severity || left[i].Describe() != right[i].Describe()) {
+        return false;
+      }
+    }
+    return true;
+  };
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (same(notes, source_notes_)) {
+    return;
+  }
+  // Logged when they change rather than every tick: "retroarch.cfg was not
+  // found" on a console without RetroArch is worth one line, not one per tick.
+  for (const config::Diagnostic& note : notes) {
+    log::Write(LevelFor(note.severity), log::Event::kConfigDiagnostic, note.Describe());
+  }
+  source_notes_ = std::move(notes);
 }
 
 ipc::EngineSnapshot SdEngine::Snapshot() const {
@@ -1549,7 +1584,16 @@ void SdEngine::RunOneTick() {
 
   const std::string baseline_path = files->Resolve(sync::kStateSdPath);
   const state::LoadedBaseline loaded = state::LoadBaseline(baseline_path);
-  const scan::ScanResult scanned = scan::ScanSaves(*config, library.index, *files, loaded.value);
+  // Where RetroArch keeps its saves this tick, and whether it syncs them itself
+  // (#230). Read every tick rather than at boot: RetroArch rewrites its file on
+  // exit, from another process, and a client that kept the boot-time answer
+  // would go on walking a layout the user has since switched away from -- or
+  // keep syncing beside a Cloud Sync they have just turned on.
+  const retroarch::LoadResult retroarch_cfg =
+      retroarch::Load(files->Resolve(retroarch::kConfigSdPath));
+  NoteSources(*config, retroarch_cfg);
+  const scan::ScanResult scanned =
+      scan::ScanSaves(*config, retroarch_cfg.value, library.index, *files, loaded.value);
   // One line per file the scan would not report, at the spelling the scanner
   // already renders for a log -- an unmatched name, a name on two platforms with
   // no platform hint, a save reported without a digest. Never guessed at
@@ -1614,7 +1658,16 @@ void SdEngine::RunOneTick() {
   // the overlay writes `config.ini` from another thread, where a sweep removing
   // a `.tmp` between the write and its rename would cost a setting the user had
   // just changed (`sync::RecoverStaging`).
+  //
+  // And every folder the scan read, which since #230 is more than the map: a
+  // save found under RetroArch's sorted `<CoreFolder>/` is overwritten there.
   options.recover_dirs = config->SaveScanDirs();
+  for (const std::string& folder : scanned.folders) {
+    if (std::find(options.recover_dirs.begin(), options.recover_dirs.end(), folder) ==
+        options.recover_dirs.end()) {
+      options.recover_dirs.push_back(folder);
+    }
+  }
   options.recover_dirs.push_back(std::string(sync::kBackupDir));
   for (const play::BufferedSession& buffered : play_sent) {
     options.finish.play_sessions.push_back(buffered.session);
@@ -1694,6 +1747,7 @@ void SdEngine::RunOneTick() {
     sync::StateSyncOptions state_options;
     state_options.backup_dir = sync::kBackupDir;
     state_options.cancel = cancel.get();
+    state_options.retroarch = retroarch_cfg.value;
     state_options.place = [place = placer(&config::PlatformFolders::states)](
                               const sync::ServerState& server) {
       return place(server.rom_id, server.file_name);

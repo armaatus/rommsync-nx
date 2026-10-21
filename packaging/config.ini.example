@@ -35,6 +35,16 @@ enabled     = true
 verify_hash = true                 ; check the hash after a download
 resume      = true
 
+[sources]
+; RetroArch's folders are read from sdmc:/retroarch/retroarch.cfg, sorted by
+; core or not, as RetroArch is set up. auto leaves them alone while RetroArch's
+; own Cloud Sync is on ("RetroArch syncs itself"); on reads them anyway; off
+; never reads them.
+retroarch             = auto
+; RetroArch can keep saves beside the roms (savefiles_in_content_dir). Those
+; folders hold roms, so they are read only when this is true.
+retroarch_content_dir = false
+
 ; --- the platform folder map -------------------------------------------------
 ;
 ; A built-in map ships for the Switch-capable systems (nes, snes, gb, gbc, gba,

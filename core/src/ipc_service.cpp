@@ -115,6 +115,11 @@ ConfigView ServiceCore::GetConfig() const {
   view.config = engine_.config();
 
   std::vector<config::Diagnostic> diagnostics = engine_.config_diagnostics();
+  // After the file's own: what is wrong with `config.ini` is what this screen is
+  // for, and a trim should cost "RetroArch syncs itself" before it costs that.
+  for (config::Diagnostic& note : engine_.source_notes()) {
+    diagnostics.push_back(std::move(note));
+  }
 
   // A URL is bounded by nothing in `config.ini` (config.hpp bounds the file, not
   // the line), and this command may not fail -- so an absurd one is withheld and

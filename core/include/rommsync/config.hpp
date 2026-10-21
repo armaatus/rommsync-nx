@@ -140,6 +140,27 @@ struct DownloadsConfig {
   bool resume = true;
 };
 
+/// `[sources] retroarch`: whether RetroArch's folders are synced.
+enum class SourceMode {
+  /// Yes, unless RetroArch's own Cloud Sync is syncing its saves
+  /// (`retroarch::Enabled`). The default.
+  kAuto,
+  kOn,   ///< yes, even alongside RetroArch's Cloud Sync -- two writers, said so
+  kOff,  ///< no RetroArch folder is read, wherever the folder map lists one
+};
+
+/// `[sources]`: which emulators' saves this client syncs, where the answer is
+/// not simply "the folders the map lists" (#230).
+struct SourcesConfig {
+  SourceMode retroarch = SourceMode::kAuto;
+
+  /// Read RetroArch saves and states kept beside the roms
+  /// (`savefiles_in_content_dir` in `retroarch.cfg`). Off by default because the
+  /// folders it reads are rom folders: what is in them is roms, and only
+  /// RetroArch's own save and state extensions are taken out of them even then.
+  bool retroarch_content_dir = false;
+};
+
 /// Where one RomM platform lives on the SD card.
 ///
 /// All three lists hold absolute paths from the SD root, normalised (see
@@ -212,6 +233,7 @@ struct Config {
   ServerConfig server;
   SyncConfig sync;
   DownloadsConfig downloads;
+  SourcesConfig sources;
 
   /// Keyed by RomM `platform_fs_slug` -- the on-disk folder name under RomM's
   /// `library/roms/`, so it is case-sensitive and not lowercased on the way in.

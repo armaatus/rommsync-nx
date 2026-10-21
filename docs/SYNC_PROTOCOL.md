@@ -15,6 +15,15 @@ what keeps *every* device and the server converged.
 
 For each file under the configured save/state dirs:
 
+0. **Which dirs.** RetroArch's come first, and from `sdmc:/retroarch/retroarch.cfg`
+   rather than from the map (#230, [CONFIG.md](CONFIG.md#retroarch-read-from-retroarchcfg)):
+   its `savefile_directory`, and with sort-by-core on — the Switch build's
+   default — each `<CoreFolder>/` one level under it instead, where a loose file
+   is skipped as *outside layout* because RetroArch does not read it. First, so
+   that the copy RetroArch reads wins its slot over an older one the map's flat
+   `/retroarch/saves` still holds. While RetroArch's own Cloud Sync is on, no
+   RetroArch folder is read at all (`[sources] retroarch = auto`): two writers
+   to one save is the failure to avoid. Then the map's folders, as written.
 1. Strip the save/state suffix to get the base name (`Game (USA).srm` → `Game (USA)`).
 2. Match to a rom by `fs_name_no_ext` (exact), falling back to `fs_name_no_tags`.
 3. Scope by platform when the path implies one (Tico's per-system folders do;

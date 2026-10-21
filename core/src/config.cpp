@@ -160,7 +160,7 @@ io::BoundedRead ReadBounded(const std::string& path, std::string* out) {
 
 // --- the parse ---------------------------------------------------------------
 
-enum class SectionKind { kNone, kServer, kSync, kDownloads, kPlatform, kUnknown };
+enum class SectionKind { kNone, kServer, kSync, kDownloads, kSources, kPlatform, kUnknown };
 
 /// The state one line of the file is read against.
 struct ParseState {
@@ -280,6 +280,37 @@ void ApplyDownloads(const ParseState& state, int line, std::string_view key,
     return;
   }
   *target = flag;
+}
+
+/// `[sources]` (#230).
+void ApplySources(const ParseState& state, int line, std::string_view key, std::string_view value,
+                  Config* config, Diagnostics* diags) {
+  if (key == "retroarch") {
+    const std::string lowered = LowerAscii(Trim(value));
+    bool flag = false;
+    if (lowered == "auto") {
+      config->sources.retroarch = SourceMode::kAuto;
+    } else if (ParseBool(lowered, &flag)) {
+      config->sources.retroarch = flag ? SourceMode::kOn : SourceMode::kOff;
+    } else {
+      diags->Add(Severity::kWarning, line, state.section, key,
+                 "expected auto, on or off, got '" + Redact(value) + "'; keeping auto");
+      config->sources.retroarch = SourceMode::kAuto;
+    }
+    return;
+  }
+  if (key == "retroarch_content_dir") {
+    bool flag = false;
+    if (!ParseBool(value, &flag)) {
+      diags->Add(Severity::kWarning, line, state.section, key,
+                 "expected true or false, got '" + Redact(value) + "'; keeping " +
+                     std::string(config->sources.retroarch_content_dir ? "true" : "false"));
+      return;
+    }
+    config->sources.retroarch_content_dir = flag;
+    return;
+  }
+  diags->Add(Severity::kWarning, line, state.section, key, "unknown key, ignored");
 }
 
 /// `[platform.<slug>] emulator`. Checked against RomM's own rule here, at the
@@ -855,6 +886,8 @@ LoadResult ParseConfig(std::string_view text) {
         state.kind = SectionKind::kSync;
       } else if (lowered == "downloads") {
         state.kind = SectionKind::kDownloads;
+      } else if (lowered == "sources") {
+        state.kind = SectionKind::kSources;
       } else if (lowered.rfind("platform.", 0) == 0) {
         // The slug keeps its case: it is RomM's `platform_fs_slug`, which is a
         // directory name on the server's filesystem, and lowercasing it would
@@ -993,6 +1026,9 @@ LoadResult ParseConfig(std::string_view text) {
         break;
       case SectionKind::kDownloads:
         ApplyDownloads(state, line_number, key, value, &result.value, &diags);
+        break;
+      case SectionKind::kSources:
+        ApplySources(state, line_number, key, value, &result.value, &diags);
         break;
       case SectionKind::kPlatform:
         (key == "emulator" ? platform_emulators : platform_folders).insert(state.slug);
