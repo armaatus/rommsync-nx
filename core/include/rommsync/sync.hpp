@@ -588,9 +588,9 @@ struct CallPolicy {
 /// The spelling `Negotiate` takes: `CallPolicy`, plus the one thing a caller says
 /// about *what* is asked rather than how hard.
 struct NegotiateOptions : CallPolicy {
-  /// `SyncNegotiatePayload::emulators`: absent sends none (#236). A tick sets it
-  /// once and both of its negotiations carry it, so the second -- the 409's
-  /// (sync_resolve.hpp) -- sees the same lineages the first did.
+  /// `SyncNegotiatePayload::emulators`: absent sends none (#236). A tick's first
+  /// negotiation carries it; the 409's second one deliberately does not, because
+  /// the slot guard is not filtered (sync_resolve.cpp).
   std::optional<std::vector<std::string>> emulators;
 };
 

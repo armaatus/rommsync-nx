@@ -972,6 +972,7 @@ class PlanningClient final : public http::HttpClient {
     http::Result result;
     result.response.status = 200;
     if (request.url.find("/api/sync/negotiate") != std::string::npos) {
+      negotiated.push_back(request.body);
       result.response.body =
           R"j({"session_id":9,"operations":[{"action":"upload","rom_id":4,"save_id":20,)j"
           R"j("file_name":"Game [2026-10-21_09-02-32].srm","slot":"autosave",)j"
@@ -993,6 +994,7 @@ class PlanningClient final : public http::HttpClient {
 
   int requests = 0;
   int downloads = 0;
+  std::vector<std::string> negotiated;
 };
 
 void NewerBounds(rig::Checks& checks) {
@@ -1090,9 +1092,16 @@ void NewerBounds(rig::Checks& checks) {
     options.negotiate.wait = [](std::chrono::milliseconds) {};
     options.complete.wait = [](std::chrono::milliseconds) {};
     options.execute.backup_dir = harness::kBackupDir;
+    options.negotiate.emulators = std::vector<std::string>{"snes9x", "Snes9x"};
     const sync::ResolveReport resolved = sync::ResolveRefusedUploads(
         client, *files, token, {local}, found, previous, &plan, &report, options);
     checks.ExpectEq(resolved.resolved, std::size_t{1}, "a found save is resolved");
+    // #236: the guard refused over the slot's newest save from any emulator, so
+    // the question of what that save is goes out unfiltered -- a head this
+    // console's filter hides would otherwise never be seen, and its 409 never end.
+    checks.Expect(client.negotiated.size() == 1 &&
+                      client.negotiated[0].find("\"emulators\"") == std::string::npos,
+                  "the second negotiation is not filtered to the tick's emulators");
     checks.Expect(plan.operations[0].action == sync::Action::kDownload &&
                       plan.operations[0].save_id == std::optional<std::int64_t>(20),
                   "as a download of the head the server named");
