@@ -71,7 +71,7 @@ namespace {
 //   |------------------------------------------|-------------------------|---------|---------|
 //   | bsd transfer memory, trimmed config      | `kHeapSocketMemory`     | 0x1D000 | 116 KiB |
 //   | `state.db` baseline at its bound         | `kHeapStateBaseline`    | 0x40000 | 256 KiB |
-//   | one in-flight transfer buffer            | `kHeapTransferBuffer`   | 0x4000  |  16 KiB |
+//   | a download's buffer and an API call's    | `kHeapTransferBuffer`   | 0x14000 |  80 KiB |
 //   | the largest buffered response            | `kHeapListResponse`     | 0x7D000 | 500 KiB |
 //   | two thread stacks (M1-6, M7-2)           | `kHeapThreadStacks`     | 0x44000 | 272 KiB |
 //   | the PSC watcher's stack (M9-4)           | `kHeapWatcherStack`     | 0xA000  |  40 KiB |
@@ -79,7 +79,7 @@ namespace {
 //   | the play-session buffer (M7-4)           | `kHeapPlaySessions`     | 0x8000  |  32 KiB |
 //   | the directories open at once (M9-2)      | `kHeapOpenDirectories`  | 0x2000  |   8 KiB |
 //   | newlib arena overhead and fragmentation  | `kHeapNewlibOverhead`   | 0x8000  |  32 KiB |
-//   | **peak**                                 | `kHeapPeak`             | 0x13F800 | 1278 KiB |
+//   | **peak**                                 | `kHeapPeak`             | 0x14F800 | 1342 KiB |
 //
 // The table is written this way so that something other than a reader adds it
 // up. `tests/test_heap_budget.py` totals these rows and compares each against
@@ -146,9 +146,14 @@ namespace {
 //     term that grows with the library rather than being a fixed buffer, and it
 //     is counted twice: the file's text and then the parsed rows it becomes,
 //     which cost more than the text they came from (`state_db.hpp`);
-//   * the transfer buffer is `kTransferBufferSize` in `http/http_wire.hpp` --
-//     one per in-flight request, because roms stream to file and never sit in
-//     RAM whole;
+//   * the transfer buffers are `kDownloadBufferSize` and `kTransferBufferSize`
+//     in `http/http_wire.hpp` -- one per in-flight request, because roms stream
+//     to file and never sit in RAM whole. **Two requests can be in flight**, one
+//     on each thread that makes them: the worker runs ticks, list pages and the
+//     download drain one after another, and the pairing thread polls beside it.
+//     Only the worker downloads, so the peak is one of each. Until M9-10 (#201)
+//     this row was a single 16 KiB buffer, which undercounted the pairing
+//     thread's by exactly that;
 //   * the buffered response is the larger of `lists::kMaxPlatforms` and
 //     `roms::kDefaultPageSize` times their row estimates below;
 //   * the thread stacks are `kThreadStackBytes` (`sized_thread.hpp`), which is
@@ -224,7 +229,8 @@ constexpr size_t kOpenDirectoryBytes =
 // build here rather than a table nobody re-totalled.
 constexpr size_t kHeapSocketMemory = rommsync::sysmodule::ExpectedBsdTransferMemory({});
 constexpr size_t kHeapStateBaseline = 2 * rommsync::state::kMaxStateBytes;
-constexpr size_t kHeapTransferBuffer = rommsync::sysmodule::kTransferBufferSize;
+constexpr size_t kHeapTransferBuffer =
+    rommsync::sysmodule::kDownloadBufferSize + rommsync::sysmodule::kTransferBufferSize;
 // The largest of the three buffered responses, not the first one anybody wrote
 // down: until M9-2 (#207) this term named only the platforms list, and the rom
 // index -- twice its size, and fetched every tick -- was not in the table at all.
@@ -256,7 +262,16 @@ constexpr size_t kHeapPeak = kHeapSocketMemory + kHeapStateBaseline + kHeapTrans
 static_assert(kHeapSocketMemory == 0x1D000,
               "the bsd transfer memory is not the trimmed 116 KiB M0-1 measured");
 static_assert(kHeapStateBaseline == 0x40000, "state::kMaxStateBytes moved; retotal the table");
-static_assert(kHeapTransferBuffer == 0x4000, "kTransferBufferSize moved; retotal the table");
+static_assert(kHeapTransferBuffer == 0x14000,
+              "kDownloadBufferSize or kTransferBufferSize moved; retotal the table");
+// A download's read chunk is the receive window, and no more: a read returns only
+// what the socket has buffered, so a chunk past `tcp_rx_buf_max_size` is heap
+// with nothing to fill it (`http_wire.hpp`, M9-10, #201). Raising the window is
+// what would make a bigger chunk worth its bytes, and it costs transfer memory
+// out of this same heap -- `kHeapSocketMemory`, pinned above.
+static_assert(rommsync::sysmodule::kDownloadBufferSize <=
+                  rommsync::sysmodule::SocketBudget{}.tcp_rx_buf_max_size,
+              "a download chunk larger than the receive window buys nothing");
 static_assert(kHeapListResponse == 0x7D000,
               "roms::kDefaultPageSize or lists::kMaxPlatforms moved; retotal the table");
 static_assert(kHeapThreadStacks == 0x44000, "kThreadStackBytes moved; retotal the table");
@@ -269,13 +284,18 @@ static_assert(kHeapOpenDirectories == 0x2000,
 // to its row rather than a second reader of a bound. Changing the term is a red
 // build here, which is the point: it is the term a reader is likeliest to nudge.
 static_assert(kHeapNewlibOverhead == 0x8000, "the newlib arena term moved; retotal the table");
-static_assert(kHeapPeak == 0x13F800, "the table above no longer sums to its peak row");
+static_assert(kHeapPeak == 0x14F800, "the table above no longer sums to its peak row");
 
-// 0x150000 leaves 0x10800 -- 66 KiB -- over that peak, which is the margin a
+// 0x160000 leaves 0x10800 -- 66 KiB -- over that peak, which is the margin a
 // process nobody can attach a debugger to needs. It is the only margin stated
 // here on purpose: #207's prose quoted two, 94 KiB and 78 KiB, and the
 // arithmetic gave neither. M9-4 (#208) took 40 KiB of it for the PSC watcher's
 // thread, which is the row above.
+//
+// **It grew by 0x10000 in M9-10 (#201)**, from 0x150000, for the download's
+// 64 KiB read chunk: the margin could not absorb it and stay a margin. That is
+// 64 KiB of resident `.bss` bought for a quarter of the `ssl` round trips per
+// rom, which is the trade #201 argues.
 //
 // **It grew by 0x90000 in M9-2**, from 0xC0000: 576 KiB more `.bss` in a
 // resident image that was ~2.00 MiB, against an Atmosphere third-party sysmodule
@@ -298,7 +318,7 @@ static_assert(kHeapPeak == 0x13F800, "the table above no longer sums to its peak
 // near 448 KiB. Both are bounds set without reference to this heap, and both
 // want a number derived from it rather than a term budgeted for the number they
 // have.
-constexpr size_t kInnerHeapSize = 0x150000;
+constexpr size_t kInnerHeapSize = 0x160000;
 constexpr size_t kHeapMargin = kInnerHeapSize - kHeapPeak;
 
 static_assert(kHeapPeak < kInnerHeapSize, "the heap no longer covers the peak in the table above");

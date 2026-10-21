@@ -152,16 +152,17 @@ guess, and is still wrong to make now.
   narrowed to what the engine actually opens. It is also the capability with the
   most reach in a project whose second hard rule is about not destroying a
   player's save.
-- **Heap and capabilities, settled.** `kInnerHeapSize` is `0x150000` (1.3 MiB)
+- **Heap and capabilities, settled.** `kInnerHeapSize` is `0x160000` (1.4 MiB)
   and is derived term by term in the table above the constant in
   `source/main.cpp`, where a `static_assert` fails the build rather than the
   console if a term outgrows it and `ctest -R heap` fails when the table, the
-  constants and the prose stop agreeing (M9-2, #207). The dominant term is the
+  constants and the prose stop agreeing (M9-2, #207; raised by M9-10, #201). The dominant term is the
   bsd transfer memory, which `socketInitialize` takes out of that heap: the config in
   `source/http/ssl_http_client.hpp` needs **116 KiB**, and libnx's default needs
   **2.25 MiB** and cannot fit at all — so `socketInitializeDefault()` is the one
-  call this process must never make. Add one in-flight transfer buffer to that;
-  roms stream to file and never sit in RAM whole.
+  call this process must never make. Add the transfer buffers to that -- a
+  download's 64 KiB, the receive window's worth, beside an API call's 16 KiB --
+  because roms stream to file and never sit in RAM whole.
 
   `main_thread_stack_size` went from the template's `0x4000` to `0x8000` for a
   reason that is not the transport: the main thread is where `SdEngine::Load`

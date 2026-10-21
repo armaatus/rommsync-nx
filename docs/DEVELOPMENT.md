@@ -46,7 +46,7 @@ with `cat`, and both substitute the same `version.hpp.in`.
   because libultrahand's own objects reference them (its updater and its package
   handling), and `--gc-sections` cannot drop a symbol a linked object still
   names. The overlay is a launched process with the applet's memory, not a
-  resident sysmodule in a `0x150000` heap, so the footprint M0-1 was measuring
+  resident sysmodule in a `0x160000` heap, so the footprint M0-1 was measuring
   does not apply to it -- and `ovl-rommsync` itself opens no socket: everything
   it does over the network happens in `sys-rommsync` (overlay/AGENTS.md). The
   rule for the **sysmodule** is unchanged.
@@ -571,13 +571,14 @@ a sysmodule pays for a TLS request is therefore:
    left as it was — it measured what it measured, and a spike edited after the
    fact measures nothing.
 
-   `sys-rommsync`'s inner heap is `0x150000` (1.3 MiB), derived term by term in
+   `sys-rommsync`'s inner heap is `0x160000` (1.4 MiB), derived term by term in
    `sysmodule/source/main.cpp` and checked there by a `static_assert` and by
    `tests/test_heap_budget.py` rather than by this table. It was `0xC0000` until
    M9-2 (#207), which found the table wrong by more than its own margin — two
    thread stacks budgeted at a quarter of what devkitA64 gives them, and an open
-   `DIR` costing ~24 KiB with no term at all. The default socket config does not
-   fit in it and never will; the sysmodule's leaves ~1.2 MiB. **Never call
+   `DIR` costing ~24 KiB with no term at all — and M9-10 (#201) added 64 KiB to
+   it for the download's read chunk (item 2). The default socket config does not
+   fit in it and never will; the sysmodule's leaves ~1.3 MiB. **Never call
    `socketInitializeDefault()` from the sysmodule** — that single line is the
    difference between a working engine and one that dies at `socketInitialize`.
 
@@ -589,9 +590,37 @@ a sysmodule pays for a TLS request is therefore:
    ~200 KiB, and `/api/roms?limit=64` is ~136 KiB. And there are **two** worker
    threads to come, not one — M1-6's pairing thread and M7-2's scheduler — each
    paying its stack out of this heap.
-2. **One in-flight buffer** — the download-streaming buffer, ours to size. Roms
-   stream to file and never sit in RAM whole (hard rule 2's sibling: nothing is
-   buffered that does not have to be).
+2. **The in-flight buffers** — ours to size. Roms stream to file and never sit
+   in RAM whole (hard rule 2's sibling: nothing is buffered that does not have
+   to be). Every `sslConnectionRead` is an IPC round trip to the `ssl`
+   sysmodule, so the buffer a download reads into is the IPC count per rom:
+   65,536 round trips per GiB at 16 KiB, which NPShopSwitch measured holding a
+   shipping sysmodule's HTTPS installs under 1 MB/s. Since M9-10 (#201) a
+   download reads **64 KiB** at a time (`kDownloadBufferSize`,
+   `sysmodule/source/http/http_wire.hpp`) and an API call keeps 16 KiB; two
+   requests can be in flight — the worker's and the pairing thread's — and only
+   the worker downloads, so the heap pays 80 KiB.
+
+   64 rather than NPShopSwitch's 128 because of the **second ceiling**: a read
+   returns what the socket has buffered, and `tcp_rx_buf_max_size = 0x10000`
+   with `sb_efficiency = 1` caps that, and the TCP receive window, at 64 KiB. A
+   bigger chunk is heap the read has nothing to fill from, and `main.cpp` holds
+   the chunk to the window with a `static_assert`. The window is also a
+   throughput ceiling of its own, window ÷ RTT:
+
+   | RTT | ceiling at a 64 KiB window | a 1 GiB rom |
+   |---|---|---|
+   | 2 ms (a home LAN) | ~32 MB/s | ~33 s, if the Wi-Fi keeps up |
+   | 10 ms | ~6.5 MB/s | ~2.7 min |
+   | 30 ms (a RomM across the internet) | ~2.2 MB/s | ~8 min |
+
+   **That is the intended limit for v1**, and it is recorded rather than raised:
+   RomM is self-hosted and usually on the LAN, where the window is not what
+   binds. Raising it costs transfer memory out of the same heap, one for one at
+   `sb_efficiency = 1` — `tcp_rx_buf_max_size = 0x40000` is another 192 KiB of
+   `kHeapSocketMemory` — and the chunk could then follow it. Whether either
+   number is right is a console measurement, and M8-2 (#44) asks for it:
+   `tlsprobe`'s `read_buf` and `tcp_rx_max` keys sweep both without a rebuild.
 3. **Transiently, the CA PEM** while `sslContextImportServerPki` copies it, for a
    self-signed server. Freed immediately after.
 
@@ -664,7 +693,7 @@ one in-flight download buffer + the bsd transfer memory above + the `state.db`
 baseline, and stream to file rather than buffering whole roms in RAM. The
 baseline is the one item that grows with the library rather than being a fixed
 buffer — its text and then its parsed rows, bounded by `state::kMaxStateBytes`
-and `state::kMaxRecords`, which are sized against the ~1.2 MiB this section
+and `state::kMaxRecords`, which are sized against the ~1.3 MiB this section
 leaves free and have to move with it (`core/include/rommsync/state_db.hpp`).
 Since M1-7 (#126) that budget is written out term by term above
 `kInnerHeapSize` in `sysmodule/source/main.cpp`, and a `static_assert` there
@@ -834,7 +863,7 @@ say "update the sysmodule" instead of decoding garbage.
 ### The bounds
 
 `ipc::kMaxPayloadBytes` (8 KiB) caps every single request and response, in both
-directions. The inner heap is `0x150000` with ~1.2 MiB left after the trimmed bsd
+directions. The inner heap is `0x160000` with ~1.3 MiB left after the trimmed bsd
 transfer memory ([M0-1](#m0-1-the-measurement-and-the-decision)), and that budget
 already owes a download buffer and the `state.db` baseline.
 

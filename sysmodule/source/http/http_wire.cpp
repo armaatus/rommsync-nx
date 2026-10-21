@@ -3,7 +3,7 @@
 //
 // Everything in this file is deliberately transport-blind and allocation-shy:
 // it runs on the console's inner heap (`sysmodule/source/main.cpp`), so a rom
-// streams through `kTransferBufferSize` and nothing that scales with a rom is
+// streams through `kDownloadBufferSize` and nothing that scales with a rom is
 // ever built in memory -- not a download body, and not a multipart upload.
 #include "http_wire.hpp"
 
@@ -447,7 +447,7 @@ class Reader {
  public:
   /// `buffer` is the exchange's one in-flight buffer, owned by the caller and
   /// on the heap: 16 KiB on a thread stack is most of the stack this process
-  /// gives a thread (`sysmodule/sys-rommsync.json`).
+  /// gives a thread (`sysmodule/sys-rommsync.json`), and a download's is 64.
   Reader(Connection& connection, Budget& budget, char* buffer, std::size_t size)
       : connection_(connection), budget_(budget), buffer_(buffer), size_(size) {}
 
@@ -609,12 +609,16 @@ class WireHttpClient final : public http::HttpClient {
  private:
   /// One request/response exchange, redirects included. `writer` sees only the
   /// body of the response the caller ends up with.
-  Result Exchange(const Request& request, BodyWriter* writer);
+  ///
+  /// `buffer_size` is the exchange's in-flight buffer: `kTransferBufferSize`
+  /// for an API call, `kDownloadBufferSize` for a rom.
+  Result Exchange(const Request& request, BodyWriter* writer, std::size_t buffer_size);
 
   /// Everything between opening a connection and the last body byte, for one
   /// hop. `redirect_to` comes back non-empty when the caller should follow.
   Result OneHop(const Request& request, const std::string& url, BodyWriter* writer,
-                Budget& budget, bool allow_redirect, std::string* redirect_to);
+                std::size_t buffer_size, Budget& budget, bool allow_redirect,
+                std::string* redirect_to);
 
   Connector& connector_;
   http::ClientOptions options_;
@@ -940,7 +944,8 @@ Error ReadBody(Framing framing, std::uint64_t length, Reader& reader, BodyWriter
 }  // namespace
 
 Result WireHttpClient::OneHop(const Request& request, const std::string& url, BodyWriter* writer,
-                              Budget& budget, bool allow_redirect, std::string* redirect_to) {
+                              std::size_t buffer_size, Budget& budget, bool allow_redirect,
+                              std::string* redirect_to) {
   Result result;
   Url parsed;
   if (!ParseUrl(url, &parsed)) {
@@ -972,7 +977,7 @@ Result WireHttpClient::OneHop(const Request& request, const std::string& url, Bo
   // the thread's stack, and reused for the request body and then the response:
   // the two never overlap, and a second one would double what a download costs
   // the inner heap for nothing.
-  const std::unique_ptr<char[]> scratch(new (std::nothrow) char[kTransferBufferSize]);
+  const std::unique_ptr<char[]> scratch(new (std::nothrow) char[buffer_size]);
   if (scratch == nullptr) {
     result.error = Error::kTransport;
     result.message = "no room for a transfer buffer";
@@ -1049,7 +1054,7 @@ Result WireHttpClient::OneHop(const Request& request, const std::string& url, Bo
     char* const chunk = scratch.get();
     for (;;) {
       std::size_t produced = 0;
-      if (!body.Next(chunk, kTransferBufferSize, &produced)) {
+      if (!body.Next(chunk, buffer_size, &produced)) {
         result.error = Error::kInvalidRequest;
         result.message = "the request body could not be read from the card";
         return result;
@@ -1060,7 +1065,7 @@ Result WireHttpClient::OneHop(const Request& request, const std::string& url, Bo
   }
 
   // --- read the response ---
-  Reader reader(*connection, budget, scratch.get(), kTransferBufferSize);
+  Reader reader(*connection, budget, scratch.get(), buffer_size);
   Head response_head;
   if (const Error error = ReadHead(reader, &response_head); error != Error::kNone) {
     result.error = error;
@@ -1099,7 +1104,8 @@ Result WireHttpClient::OneHop(const Request& request, const std::string& url, Bo
   return result;
 }
 
-Result WireHttpClient::Exchange(const Request& request, BodyWriter* writer) {
+Result WireHttpClient::Exchange(const Request& request, BodyWriter* writer,
+                                std::size_t buffer_size) {
   Result result;
   if (request.url.empty()) {
     result.error = Error::kInvalidRequest;
@@ -1134,7 +1140,7 @@ Result WireHttpClient::Exchange(const Request& request, BodyWriter* writer) {
 
   for (int redirect = 0;; ++redirect) {
     std::string next;
-    result = OneHop(hop, url, writer, budget, redirect < limit, &next);
+    result = OneHop(hop, url, writer, buffer_size, budget, redirect < limit, &next);
     if (next.empty()) return result;
 
     // A 303 -- and, by every client's convention, a 301 or 302 on a POST --
@@ -1165,7 +1171,7 @@ Result WireHttpClient::Send(const Request& request) {
   // several exchanges, and only the last one's body is the caller's.
   std::string body;
   StringWriter writer(&body);
-  Result result = Exchange(request, &writer);
+  Result result = Exchange(request, &writer, kTransferBufferSize);
   result.response.body = std::move(body);
   return result;
 }
@@ -1199,7 +1205,7 @@ Result WireHttpClient::Download(const Request& request, const DownloadTarget& ta
     return result;
   }
 
-  result = Exchange(effective, &writer);
+  result = Exchange(effective, &writer, kDownloadBufferSize);
   const bool flushed = writer.Finish();
   const std::uint64_t written = writer.resume_from() + writer.received();
   result.response.body = std::move(writer.error_body());

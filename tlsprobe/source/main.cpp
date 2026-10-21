@@ -209,6 +209,8 @@ int main(int, char**) {
         sink.Line("         cert verify error rc=0x%08x", report.verify_cert_rc);
       }
     }
+    sink.Line("reads    %llu, the largest %u bytes",
+              static_cast<unsigned long long>(report.reads), report.largest_read);
     sink.Line("tls      %s %s", report.protocol_version, report.cipher);
     sink.Line("timing   connect %llums, handshake %llums, total %llums",
               static_cast<unsigned long long>(report.connect_ms),

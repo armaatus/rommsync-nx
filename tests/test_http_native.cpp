@@ -20,6 +20,7 @@
 // unreachable off a console -- everything a downloader can get wrong is
 // checked, against the same RomM, by the same eighteen scenarios. A second copy
 // of them would have drifted from this one by the second issue.
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -853,6 +854,102 @@ int MultipartGrows(http::HttpClient& client) {
   return checks.failures();
 }
 
+#ifdef ROMMSYNC_TEST_WIRE_BACKEND
+// What the wire client asks of a connection per read, which on the console is
+// what it asks of the `ssl` service per IPC round trip (M9-10, #201).
+//
+// Wire-only, because libcurl has no `Connector` to observe and its chunk is not
+// ours. The connection underneath is the shipping `PlainConnector` against the
+// real rig; this only watches the sizes go past.
+class RecordingConnection final : public rommsync::sysmodule::Connection {
+ public:
+  RecordingConnection(std::unique_ptr<Connection> inner, std::size_t* asked,
+                      std::size_t* filled)
+      : inner_(std::move(inner)), asked_(asked), filled_(filled) {}
+
+  rommsync::sysmodule::IoResult Write(const void* data, std::size_t size,
+                                      std::chrono::milliseconds timeout) override {
+    return inner_->Write(data, size, timeout);
+  }
+
+  rommsync::sysmodule::IoResult Read(void* data, std::size_t size,
+                                     std::chrono::milliseconds timeout) override {
+    *asked_ = std::max(*asked_, size);
+    const rommsync::sysmodule::IoResult io = inner_->Read(data, size, timeout);
+    if (io.status == rommsync::sysmodule::IoStatus::kOk) {
+      *filled_ = std::max(*filled_, io.transferred);
+    }
+    return io;
+  }
+
+ private:
+  std::unique_ptr<Connection> inner_;
+  std::size_t* asked_;
+  std::size_t* filled_;
+};
+
+class RecordingConnector final : public rommsync::sysmodule::Connector {
+ public:
+  std::unique_ptr<rommsync::sysmodule::Connection> Open(
+      const rommsync::sysmodule::Origin& origin, std::chrono::milliseconds connect_timeout,
+      const http::ClientOptions& options, http::Error* error, std::string* message) override {
+    std::unique_ptr<rommsync::sysmodule::Connection> inner =
+        plain_.Open(origin, connect_timeout, options, error, message);
+    if (inner == nullptr) return nullptr;
+    return std::make_unique<RecordingConnection>(std::move(inner), &largest_asked,
+                                                 &largest_filled);
+  }
+
+  void Reset() { largest_asked = largest_filled = 0; }
+
+  std::size_t largest_asked = 0;
+  std::size_t largest_filled = 0;
+
+ private:
+  rig::TcpConnector plain_;
+};
+
+// A download reads in chunks the size of the socket's receive window, and an
+// API call keeps the small buffer.
+//
+// The expected sizes are written out rather than read from `http_wire.hpp`, so
+// that this is a statement about the wire and not the header agreeing with
+// itself: 64 KiB is `SocketBudget::tcp_rx_buf_max_size`, the most a single read
+// can find waiting (`sysmodule/source/main.cpp`), and 16 KiB is what an API
+// exchange -- the pairing thread's, concurrently with a download -- costs.
+int Chunk(const std::string& base, const std::string& asset) {
+  rig::Checks checks;
+  constexpr std::size_t kDownloadChunk = 64 * 1024;
+  constexpr std::size_t kApiChunk = 16 * 1024;
+
+  RecordingConnector connector;
+  const std::unique_ptr<http::HttpClient> client =
+      rig::Own(rommsync::sysmodule::MakeWireHttpClient(connector));
+
+  http::Request request;
+  request.url = base + asset;
+  const http::Result reference = client->Send(request);
+  checks.ExpectOk(reference, "the reference copy, over Send");
+  checks.Expect(reference.response.body.size() > 4 * kDownloadChunk,
+                "the asset is several download chunks long, so the sizes below mean something");
+  checks.ExpectEq(connector.largest_asked, kApiChunk, "Send reads in 16 KiB");
+
+  connector.Reset();
+  const std::string path = Scratch("chunk.bin");
+  Clear(path);
+  request.timeout = std::chrono::milliseconds{0};  // bounded by stall_timeout
+  const http::Result result = client->Download(request, DownloadTo(path));
+  checks.ExpectOk(result, "download");
+  checks.ExpectEq(rig::ReadFile(path), reference.response.body, "file contents");
+  checks.ExpectEq(connector.largest_asked, kDownloadChunk, "Download reads in 64 KiB");
+  // Asking is not the same as using: a buffer that is allocated at 64 KiB and
+  // handed to `Read` as 16 would pass the line above on a recording that lied.
+  checks.Expect(connector.largest_filled > kApiChunk,
+                "at least one download read came back larger than the old 16 KiB");
+  return checks.failures();
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -891,7 +988,7 @@ int main(int argc, char** argv) {
   if (scenario == "download" || scenario == "range" || scenario == "drop" ||
       scenario == "resume" || scenario == "truncate" || scenario == "cancel" ||
       scenario == "resume_empty_body" || scenario == "resume_stale_range" ||
-      scenario == "range_expected_size" || scenario == "progress") {
+      scenario == "range_expected_size" || scenario == "progress" || scenario == "chunk") {
     asset = rig::DiscoverLargeAsset(*client, base);
     if (asset.empty()) {
       std::cerr << "could not find a large asset to stream from " << base << "\n";
@@ -940,6 +1037,10 @@ int main(int argc, char** argv) {
     failures = RedirectCredentials(*client);
   } else if (scenario == "multipart_grows") {
     failures = MultipartGrows(*client);
+#ifdef ROMMSYNC_TEST_WIRE_BACKEND
+  } else if (scenario == "chunk") {
+    failures = Chunk(base, asset);
+#endif
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;

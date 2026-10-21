@@ -426,6 +426,8 @@ static void RunProbeInner(const Config& config, Report& report) {
       break;
     }
     if (got == 0) break;
+    ++report.reads;
+    if (got > report.largest_read) report.largest_read = got;
 
     const HeapSample now = SampleHeap();
     if (now.malloc_in_use > peak.malloc_in_use) peak = now;

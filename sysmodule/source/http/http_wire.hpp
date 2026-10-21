@@ -98,14 +98,37 @@ class Connector {
   Connector() = default;
 };
 
-/// The one in-flight buffer the heap budget in
-/// docs/DEVELOPMENT.md#m0-1-the-measurement-and-the-decision is about.
+/// The in-flight buffer of an API exchange: `Send`, its request body and its
+/// response. One per call, on the heap.
 ///
-/// One per call, on the heap, and never one per rom: a download streams through
-/// this and lands on the card. 16 KiB is a TLS record's worth, so a read rarely
-/// stops in the middle of one, and it is small enough that two concurrent
-/// transfers still fit the inner heap (`sysmodule/source/main.cpp`).
+/// Small because nothing it carries is large enough for the chunk to matter --
+/// the biggest response is a few hundred KiB of JSON, a few dozen reads -- and
+/// because it is the one that can be in flight *beside* a download: the pairing
+/// thread's polls run while the worker streams a rom, so this is what the second
+/// concurrent request costs the inner heap (`sysmodule/source/main.cpp`).
 inline constexpr std::size_t kTransferBufferSize = 16 * 1024;
+
+/// The in-flight buffer of a `Download`, which is the one place the chunk size
+/// is a cost that scales with the file (M9-10, #201).
+///
+/// On the console every `Connection::Read` is an `sslConnectionRead`, and every
+/// one of those is an IPC round trip to the `ssl` sysmodule. At 16 KiB that is
+/// 65,536 round trips per GiB of rom; NPShopSwitch, a shipping boot2 sysmodule,
+/// measured the same choice holding its HTTPS installs under 1 MB/s
+/// (nps_http_ssl.cpp). The old justification -- "a TLS record's worth" -- was
+/// true of TLS framing and beside the point: the record size bounds nothing a
+/// read returns, the IPC cost is per call, and only the second scales with a rom.
+///
+/// **64 KiB, because that is the receive window.** A read can only return what
+/// the socket has buffered, and `SocketBudget::tcp_rx_buf_max_size` caps that at
+/// 64 KiB (`ssl_http_client.hpp`), so a larger buffer is heap the read has
+/// nothing to fill from. 16,384 round trips per GiB, a quarter of before. The
+/// window and this move together, and `main.cpp` holds them to it.
+///
+/// One download is in flight at a time -- the worker drains the queue one rom
+/// after another (`download::Drain`) -- and a redirect frees one hop's buffer
+/// before the next hop allocates its own, so this costs the heap once.
+inline constexpr std::size_t kDownloadBufferSize = 64 * 1024;
 
 /// How much of a failed download's body is kept, matching the native backend.
 /// A 404 from RomM is a short JSON document and worth surfacing; anything

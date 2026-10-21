@@ -750,7 +750,14 @@ target_compile_definitions(test_http_wire PRIVATE
   # GETs, and the reason to think twice before giving it a negotiate (#174).
   ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch-wire")
 
-foreach(scenario IN LISTS HTTP_SCENARIOS)
+# Plus what only this backend has: a `Connector` whose reads can be watched.
+# `chunk` is M9-10's (#201) -- the read size is the console's `ssl` IPC count
+# per gigabyte, and libcurl's chunk is not ours to assert on.
+set(WIRE_ONLY_SCENARIOS
+  chunk             # a download reads 64 KiB at a time, an API call 16 KiB
+)
+
+foreach(scenario IN LISTS HTTP_SCENARIOS WIRE_ONLY_SCENARIOS)
   add_test(NAME wire.${scenario} COMMAND test_http_wire ${scenario})
   if(NOT ROMMSYNC_REQUIRE_RIG)
     set_tests_properties(wire.${scenario} PROPERTIES SKIP_RETURN_CODE 77)

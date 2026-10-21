@@ -116,6 +116,13 @@ struct Report {
   u64 header_bytes = 0;
   u64 body_bytes = 0;
 
+  /// How many `sslConnectionRead`s the response took, and the most one returned.
+  /// Each is an IPC round trip to the `ssl` sysmodule, and whether one ever
+  /// returns more than a TLS record's 16 KiB is what decides whether a bigger
+  /// `read_buf` buys anything (M9-10, #201) -- a question only a console answers.
+  u64 reads = 0;
+  u32 largest_read = 0;
+
   u64 connect_ms = 0;
   u64 handshake_ms = 0;
   u64 total_ms = 0;
