@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "rommsync/atomic_file.hpp"
+#include "rommsync/disk.hpp"
 #include "rommsync/http.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/state_db.hpp"
@@ -168,7 +169,7 @@ class StagedFile {
   explicit StagedFile(std::string path) : path_(std::move(path)) {}
   ~StagedFile() {
     if (!path_.empty()) {
-      std::remove(path_.c_str());
+      io::Remove(path_);
     }
   }
 
@@ -588,7 +589,7 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   // refuses -- it is not a replace -- so it goes first. The bytes in it are a
   // download that never completed and belong to nothing.
   io::StagedFile staged(io::TempPathFor(destination));
-  std::remove(staged.path().c_str());
+  io::Remove(staged.path());
 
   http::Request request = Authed(http::Method::kGet,
                                  http::JoinUrl(token.server_url, std::string(kSavesPath) + "/" +
@@ -616,7 +617,7 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
     // remove it. `<path>.part` is `http::DownloadTarget`'s documented staging
     // name, not a guess. The staged file goes with it, by the guard above: an
     // incomplete download is not a save.
-    std::remove((staged.path() + ".part").c_str());
+    io::Remove(staged.path() + ".part");
     return Fail(operation, refused->first, refused->second);
   }
 

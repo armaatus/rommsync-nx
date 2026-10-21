@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "rommsync/atomic_file.hpp"
+#include "rommsync/disk.hpp"
 #include "rommsync/version.hpp"
 
 namespace rommsync::sysmodule {
@@ -662,12 +663,12 @@ class FileWriter final : public BodyWriter {
   bool Open(bool resuming, std::uint64_t already_have) {
     resume_from_ = already_have;
     if (!resuming) {
-      file_ = std::fopen(path_.c_str(), "wb");
+      file_ = io::OpenForWriting(path_, "wb");
       return file_ != nullptr;
     }
     // "r+b" rather than "ab": O_APPEND would ignore the seek needed when the
     // server turns out to have ignored the Range header.
-    file_ = std::fopen(path_.c_str(), "r+b");
+    file_ = io::OpenForWriting(path_, "r+b");
     if (file_ == nullptr) return false;
     if (std::fseek(file_, 0, SEEK_END) != 0) {
       Close();
@@ -704,7 +705,7 @@ class FileWriter final : public BodyWriter {
         return false;
       }
     }
-    if (size != 0 && (file_ == nullptr || std::fwrite(data, 1, size, file_) != size)) {
+    if (size != 0 && (file_ == nullptr || io::Write(file_, data, size) != size)) {
       *error = Error::kWriteFailed;
       return false;
     }
@@ -747,7 +748,7 @@ class FileWriter final : public BodyWriter {
   /// declared. `fopen(..., "wb")` is the truncation both targets do have.
   bool Restart() {
     Close();
-    file_ = std::fopen(path_.c_str(), "wb");
+    file_ = io::OpenForWriting(path_, "wb");
     if (file_ == nullptr) return false;
     resume_from_ = 0;
     return true;
@@ -1218,7 +1219,7 @@ Result WireHttpClient::Download(const Request& request, const DownloadTarget& ta
     // Our offset is not valid for this resource any more, so the bytes we were
     // building on are worthless -- and keeping them would make every future
     // resume ask for the same impossible range.
-    std::remove(partial_path.c_str());
+    io::Remove(partial_path);
     result.error = Error::kTruncated;
     result.message = "the partial file no longer matches the resource; retry from the start";
     return result;
@@ -1226,7 +1227,7 @@ Result WireHttpClient::Download(const Request& request, const DownloadTarget& ta
   if (status != 200 && status != 206) {
     // Not a body-bearing response: a status the caller has to handle, with
     // nothing at the destination. Do not leave the empty part file behind.
-    if (!resuming) std::remove(partial_path.c_str());
+    if (!resuming) io::Remove(partial_path);
     return result;
   }
   if (!flushed) {
@@ -1256,7 +1257,7 @@ Result WireHttpClient::Download(const Request& request, const DownloadTarget& ta
     return result;
   }
 
-  if (std::rename(partial_path.c_str(), target.path.c_str()) != 0) {
+  if (io::Rename(partial_path, target.path) != 0) {
     result.error = Error::kWriteFailed;
     result.message = "could not rename " + partial_path;
   }

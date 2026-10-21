@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "rommsync/atomic_file.hpp"
+#include "rommsync/disk.hpp"
 #include "rommsync/file_system.hpp"
 #include "rommsync/http.hpp"
 #include "rommsync/sync_tick.hpp"
@@ -56,7 +57,7 @@ void Warn(RecoveryReport* report, std::string line) {
 /// Remove `path`, counting it or naming why not.
 void Discard(const std::string& path, const std::string& sd_path, std::size_t* counter,
              RecoveryReport* report) {
-  if (std::remove(path.c_str()) == 0 || !io::Exists(path)) {
+  if (io::Remove(path) == 0 || !io::Exists(path)) {
     ++*counter;
     return;
   }
@@ -134,7 +135,7 @@ RecoveryReport RecoverStaging(fs::FileSystem& files,
       // The destination does not exist, which is the one thing Horizon's rename
       // needs (atomic_file.hpp), so this is the same two-rename commit finished
       // in the other direction.
-      if (std::rename(path.c_str(), base.c_str()) != 0) {
+      if (io::Rename(path, base) != 0) {
         Warn(&report, "the interrupted commit at " + sd_path + " could not be undone; " +
                           base_sd_path + " is still missing");
         continue;

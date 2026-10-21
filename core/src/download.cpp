@@ -14,6 +14,7 @@
 
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/config.hpp"
+#include "rommsync/disk.hpp"
 #include "rommsync/file_system.hpp"
 #include "rommsync/http.hpp"
 #include "rommsync/ipc.hpp"
@@ -264,7 +265,7 @@ std::int64_t PartialBytes(const std::string& staging) {
 /// orphan beside a rom that never arrived is bytes the card does not get back
 /// until a human finds it, on a console with no file manager.
 void DiscardPartial(const std::string& staging) {
-  std::remove(http::PartialPathFor(staging).c_str());
+  io::Remove(http::PartialPathFor(staging));
 }
 
 /// ASCII lowercase, for comparing a digest this client computed against one the
@@ -1759,7 +1760,7 @@ class Drainer {
       // skip returns before `Transfer`, which is what usually tidies them, and a
       // 120 MiB orphan beside a rom that is already there is space the card does
       // not get back on a console with no file manager.
-      std::remove(staging_.c_str());
+      io::Remove(staging_);
       DiscardPartial(staging_);
       // Where it actually is, which is not always where it would have been
       // written: a rom found in the platform's second `roms` folder belongs in
@@ -1848,7 +1849,7 @@ class Drainer {
     // spliced, the digest catches it, and the retry below fetches it clean.
     const std::string in_flight = http::PartialPathFor(staging_);
     if (target.resume && entry.size_bytes > 0 && FileSizeBytes(in_flight) > entry.size_bytes) {
-      std::remove(in_flight.c_str());
+      io::Remove(in_flight);
     }
 
     // A staging file is a *complete* body nothing verified -- left by a power cut
@@ -1869,7 +1870,7 @@ class Drainer {
     // Whatever is left is bytes nothing will build on -- and it is also a
     // destination the backend's own rename would have to replace, which
     // Horizon's refuses (atomic_file.hpp).
-    std::remove(staging_.c_str());
+    io::Remove(staging_);
 
     for (;;) {
       // Bytes this attempt did not fetch. A body built on them and then failing
@@ -1986,7 +1987,7 @@ class Drainer {
       // The user dequeued it, or the queue could not be written. Either way
       // nothing will record this download, and a complete body under a name no
       // entry mentions is an orphan the console has no file manager to find.
-      std::remove(staging_.c_str());
+      io::Remove(staging_);
       return step;
     }
 
@@ -1995,7 +1996,7 @@ class Drainer {
       // Both files go. Bytes that are not this rom's are not a prefix of it
       // either, so keeping them for a resume would buy a cheaper way to produce
       // the same wrong file.
-      std::remove(staging_.c_str());
+      io::Remove(staging_);
       DiscardPartial(staging_);
       entry->bytes_done = 0;
       if (inherited) {

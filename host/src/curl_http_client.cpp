@@ -21,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+#include "rommsync/disk.hpp"
 #include "rommsync/version.hpp"
 
 #if LIBCURL_VERSION_NUM < 0x073800  // 7.56.0
@@ -180,7 +181,7 @@ std::size_t OnBodyToFile(char* data, std::size_t size, std::size_t nmemb, void* 
     }
   }
 
-  if (std::fwrite(data, 1, length, transfer->file) != length) {
+  if (io::Write(transfer->file, data, length) != length) {
     transfer->write_failed = true;
     return 0;
   }
@@ -461,7 +462,7 @@ class CurlHttpClient final : public http::HttpClient {
       // were building on are worthless -- and keeping them would make every
       // future resume ask for the same impossible range. Start the next attempt
       // clean instead.
-      std::remove(partial_path.c_str());
+      io::Remove(partial_path);
       result.error = Error::kTruncated;
       result.message = "the partial file no longer matches the resource; retry from the start";
       return result;
@@ -471,7 +472,7 @@ class CurlHttpClient final : public http::HttpClient {
       // nothing at the destination. Do not leave the empty part file we just
       // created lying next to it.
       if (!resuming) {
-        std::remove(partial_path.c_str());
+        io::Remove(partial_path);
       }
       return result;
     }
@@ -504,7 +505,7 @@ class CurlHttpClient final : public http::HttpClient {
       return result;
     }
 
-    if (std::rename(partial_path.c_str(), target.path.c_str()) != 0) {
+    if (io::Rename(partial_path, target.path) != 0) {
       result.error = Error::kWriteFailed;
       result.message = "could not rename " + partial_path + ": " + std::strerror(errno);
     }
@@ -514,13 +515,13 @@ class CurlHttpClient final : public http::HttpClient {
  private:
   static std::FILE* OpenPartial(const std::string& path, bool keep_existing) {
     if (!keep_existing) {
-      return std::fopen(path.c_str(), "wb");
+      return io::OpenForWriting(path, "wb");
     }
     // "r+b" rather than "ab": O_APPEND would ignore the seek we need when the
     // server turns out to have ignored our Range header.
-    std::FILE* file = std::fopen(path.c_str(), "r+b");
+    std::FILE* file = io::OpenForWriting(path, "r+b");
     if (file == nullptr) {
-      return std::fopen(path.c_str(), "wb");
+      return io::OpenForWriting(path, "wb");
     }
     if (std::fseek(file, 0, SEEK_END) != 0) {
       std::fclose(file);

@@ -8,6 +8,8 @@
 #include <string>
 #include <string_view>
 
+#include "rommsync/disk.hpp"
+
 namespace rommsync::io {
 namespace {
 
@@ -58,7 +60,7 @@ std::string Describe(const std::string& path, std::string_view what) {
 /// all, since a filesystem is free to drop dirty pages belonging to an inode
 /// that is about to be unlinked. The unlink is the part that does the work.
 bool ShredOne(const std::string& path) {
-  std::FILE* file = std::fopen(path.c_str(), "r+b");
+  std::FILE* file = OpenForWriting(path, "r+b");
   if (file != nullptr) {
     long size = 0;
     if (std::fseek(file, 0, SEEK_END) == 0) {
@@ -70,7 +72,7 @@ bool ShredOne(const std::string& path) {
         const long chunk = size - written < static_cast<long>(sizeof(zeroes))
                                ? size - written
                                : static_cast<long>(sizeof(zeroes));
-        if (std::fwrite(zeroes, 1, static_cast<std::size_t>(chunk), file) !=
+        if (Write(file, zeroes, static_cast<std::size_t>(chunk)) !=
             static_cast<std::size_t>(chunk)) {
           break;
         }
@@ -80,7 +82,7 @@ bool ShredOne(const std::string& path) {
     }
     std::fclose(file);
   }
-  std::remove(path.c_str());
+  Remove(path);
   return !Exists(path);
 }
 
@@ -142,25 +144,25 @@ WriteResult CommitStaged(const std::string& staged, const std::string& path) {
     // move aside, though: a `.old` left by an interrupted commit is the only
     // copy of the record when `path` is missing, and removing it before the new
     // one is committed would turn a recoverable interruption into a loss.
-    std::remove(previous.c_str());
-    if (std::rename(path.c_str(), previous.c_str()) != 0) {
-      std::remove(staged.c_str());
+    Remove(previous);
+    if (Rename(path, previous) != 0) {
+      Remove(staged);
       return {WriteError::kCommitFailed, Describe(path, "could not be moved aside to " + previous)};
     }
   }
-  if (std::rename(staged.c_str(), path.c_str()) != 0) {
+  if (Rename(staged, path) != 0) {
     std::string detail = "could not be replaced by " + staged;
     // Putting the previous record back is the whole reason a caller can treat a
     // failed write as costing only the new record. When even *that* fails the
     // destination is gone, and saying so is the difference between a caller
     // reading `.old` deliberately and one wondering why its file vanished.
-    if (replacing && std::rename(previous.c_str(), path.c_str()) != 0) {
+    if (replacing && Rename(previous, path) != 0) {
       detail += ", and the previous record could not be put back -- it is at " + previous;
     }
-    std::remove(staged.c_str());
+    Remove(staged);
     return {WriteError::kCommitFailed, Describe(path, detail)};
   }
-  std::remove(previous.c_str());
+  Remove(previous);
 
   // Best effort, and after the fact on purpose: the rename has happened, so
   // reporting a failure here would describe a commit that did not occur. What it
@@ -178,13 +180,13 @@ WriteResult CommitStaged(const std::string& staged, const std::string& path) {
 WriteResult WriteAtomically(const std::string& path, std::string_view contents) {
   const std::string temp = TempPathFor(path);
 
-  std::FILE* file = std::fopen(temp.c_str(), "wb");
+  std::FILE* file = OpenForWriting(temp, "wb");
   if (file == nullptr) {
     return {WriteError::kOpenFailed,
             Describe(temp, "could not be created (does the directory exist?)")};
   }
 
-  const std::size_t written = std::fwrite(contents.data(), 1, contents.size(), file);
+  const std::size_t written = Write(file, contents.data(), contents.size());
   // The flush has to happen while the handle is still open: fclose reports a
   // failed flush too, but by then there is nothing left to distinguish "the
   // bytes never left the buffer" from "the close itself failed". The sync comes
@@ -197,7 +199,7 @@ WriteResult WriteAtomically(const std::string& path, std::string_view contents) 
   // publishes them.
   const bool synced = flushed && closed && Synced(temp);
   if (!flushed || !closed || !synced) {
-    std::remove(temp.c_str());
+    Remove(temp);
     return {WriteError::kWriteFailed, Describe(temp, "could not be written completely")};
   }
 
@@ -241,7 +243,7 @@ CopyResult CopyAtomically(const std::string& from, const std::string& to) {
   }
 
   const std::string temp = TempPathFor(to);
-  std::FILE* destination = std::fopen(temp.c_str(), "wb");
+  std::FILE* destination = OpenForWriting(temp, "wb");
   if (destination == nullptr) {
     std::fclose(source);
     result.error = CopyError::kOpenFailed;
@@ -257,7 +259,7 @@ CopyResult CopyAtomically(const std::string& from, const std::string& to) {
   bool short_write = false;
   std::size_t got = 0;
   while ((got = std::fread(buffer, 1, sizeof(buffer), source)) > 0) {
-    if (std::fwrite(buffer, 1, got, destination) != got) {
+    if (Write(destination, buffer, got) != got) {
       short_write = true;
       break;
     }
@@ -269,7 +271,7 @@ CopyResult CopyAtomically(const std::string& from, const std::string& to) {
   const bool closed = std::fclose(destination) == 0;
 
   if (read_failed) {
-    std::remove(temp.c_str());
+    Remove(temp);
     result.error = CopyError::kSourceUnreadable;
     result.message = Describe(from, "could not be read to the end");
     return result;
@@ -280,7 +282,7 @@ CopyResult CopyAtomically(const std::string& from, const std::string& to) {
   // that is about to be deleted would just be a slow way to fail.
   const bool synced = !short_write && flushed && closed && Synced(temp);
   if (short_write || !flushed || !closed || !synced) {
-    std::remove(temp.c_str());
+    Remove(temp);
     result.error = CopyError::kWriteFailed;
     result.message = Describe(temp, "could not be written completely");
     return result;
@@ -389,7 +391,7 @@ bool Shred(const std::string& path) {
 
 StagedFile::~StagedFile() {
   if (!path_.empty()) {
-    std::remove(path_.c_str());
+    Remove(path_);
   }
 }
 

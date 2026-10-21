@@ -32,6 +32,20 @@ const char* ToString(MakeDirError error) {
   return "unknown";
 }
 
+const char* ToString(Format format) {
+  switch (format) {
+    case Format::kUnknown:
+      return "unknown";
+    case Format::kFat32:
+      return "FAT32";
+    case Format::kExFat:
+      return "exFAT";
+    case Format::kOther:
+      return "other";
+  }
+  return "unknown";
+}
+
 bool SplitPath(const std::string& sd_path, std::string* directory, std::string* leaf) {
   const std::size_t slash = sd_path.rfind('/');
   if (slash == std::string::npos || slash + 1 >= sd_path.size()) {

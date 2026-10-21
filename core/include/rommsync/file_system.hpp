@@ -118,6 +118,39 @@ struct MakeDirResult {
   bool ok() const { return error == MakeDirError::kNone; }
 };
 
+/// The card's format, as far as a backend can tell.
+///
+/// It exists for one number: FAT32 holds no file larger than 4 GiB - 1, several
+/// rom images are larger, and finding that out at byte 4294967295 costs a whole
+/// transfer to learn something the card could have said first (#202).
+enum class Format {
+  kUnknown,  ///< the backend could not tell -- Horizon cannot, unless the console has no exFAT driver
+  kFat32,
+  kExFat,
+  kOther,    ///< something that is neither, so not bounded at 4 GiB -- a laptop's disk
+};
+
+/// Stable, log-friendly name. Never null.
+const char* ToString(Format format);
+
+/// FAT32's per-file ceiling: a 32-bit size field, so 4 GiB - 1.
+inline constexpr std::uint64_t kFat32MaxFileBytes = 0xFFFFFFFFull;
+
+/// What a volume can hold. Everything here is an answer *before* a write, so
+/// every field has an "I do not know" that a caller reads as "do not refuse on
+/// my account": a refusal built on a guess would block a download that works.
+struct Volume {
+  Format format = Format::kUnknown;
+
+  /// The largest file one write may produce, or `0` when nothing known bounds
+  /// it. The backend decides, not the caller -- an unknown format is not
+  /// automatically unbounded (`sysmodule/source/card.cpp` says why).
+  std::uint64_t max_file_bytes = 0;
+
+  /// Bytes this process may still write, or `-1` when the backend could not say.
+  std::int64_t free_bytes = -1;
+};
+
 /// The one directory-reading surface the engine is allowed to use.
 ///
 /// Non-recursive on purpose. The scanner walks the folders a human listed in
@@ -166,6 +199,19 @@ class FileSystem {
   /// failure to find: a caller must not fall back to the SD path, because on
   /// the host it would resolve against the process's working directory.
   virtual std::string Resolve(std::string_view sd_path) const = 0;
+
+  /// What the volume holding `sd_path` can take: its format, the largest file
+  /// it allows, and the space left on it.
+  ///
+  /// Asked once per download, before the first byte moves, so a rom the card
+  /// cannot hold is a sentence on the queue screen rather than a transfer that
+  /// fails at the end of a 4 GiB file (#202). Not pure: a backend that cannot
+  /// tell answers the all-unknown `Volume`, which refuses nothing -- and that is
+  /// also what every test fake that predates this inherits.
+  virtual Volume VolumeOf(std::string_view sd_path) const {
+    static_cast<void>(sd_path);
+    return {};
+  }
 
  protected:
   FileSystem() = default;

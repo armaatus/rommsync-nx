@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "rommsync/atomic_file.hpp"
+#include "rommsync/disk.hpp"
 #include "rommsync/hash_file.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/sync_execute.hpp"
@@ -499,7 +500,7 @@ StateOperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   // anything has checked it. A stale one from an interrupted run goes first --
   // the bytes in it are a download that never completed and belong to nothing.
   io::StagedFile staged(io::TempPathFor(destination));
-  std::remove(staged.path().c_str());
+  io::Remove(staged.path());
 
   http::Request request =
       Authed(http::Method::kGet,
@@ -528,7 +529,7 @@ StateOperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   if (const auto refused = Refused(fetched, "the state download")) {
     // The backend leaves its partial behind for a resume that is never coming,
     // so it is litter beside a state rather than progress towards one.
-    std::remove(http::PartialPathFor(staged.path()).c_str());
+    io::Remove(http::PartialPathFor(staged.path()));
     // **A body that ended early is `kUnverified`, not `kTransferFailed`.** The
     // length check is enforced by the transport (`DownloadTarget::expected_size`)
     // and comes back as `http::Error::kTruncated`, so leaving it in the
