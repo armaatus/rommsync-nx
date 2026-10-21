@@ -98,37 +98,60 @@ phase_ci() {
 
 # --- the real cross-compile ---------------------------------------------------
 
-# `aarch64-none-elf-size -A` of ELF $1 (relative to $SCRATCH), as "section size"
-# lines.
-section_sizes() {
+# Our own code is -Werror, so a warning there fails the compile; but the
+# vendored objects drop -Werror (switch.mk, ROMMSYNC_VENDOR_DROPS) and the link
+# has no -Werror at all, so a warning from either would scroll past a green
+# build. #200 changed the optimisation level under all of them and promised no
+# new warnings; this is what keeps that promise past the one log someone read.
+check_no_warnings() {
+  if grep -qi 'warning:' "$1"; then
+    grep -i 'warning:' "$1" >&2
+    fail "the Switch build printed warnings"
+  fi
+}
+
+# section_size ELF SECTION -- the size of SECTION in ELF (relative to $SCRATCH),
+# by the toolchain's own `size -A`. Empty if the ELF has no such section.
+section_size() {
   docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work "$IMAGE" \
     bash -lc '"$DEVKITPRO"/devkitA64/bin/aarch64-none-elf-size -A "$1"' _ "$1" |
-    awk '$1 ~ /^\./ { print $1, $2 }'
+    awk -v want="$2" '$1 == want { print $2 }'
 }
 
 # M9-9 (#200): every object this build compiles -- ours, core/'s and the
 # vendored libultrahand alike -- carries no unwind table. The targets are
 # -fno-exceptions, so nothing ever unwinds through them, and `.eh_frame` sits in
-# the rodata segment: it is resident for as long as the process is, in a budget
-# Atmosphere has cut to 7 MB on FW 21 (sysmodule) and a 4 MB ovlloader heap
-# (overlay). Checked per object rather than only on the linked total, because
-# the total also holds libnx's, newlib's and libstdc++'s prebuilt tables, which
-# no flag of ours can remove -- a flag lost from one compile would hide inside
-# them.
+# the rodata segment, resident for as long as the process is
+# (docs/DEVELOPMENT.md#what-the-image-costs). Checked per object rather than
+# only on the linked total, because the total also holds libnx's, newlib's and
+# libstdc++'s prebuilt tables, which no flag of ours can remove -- a flag lost
+# from one compile would hide inside them.
+#
+# The container reports every object it inspected, and the count has to match
+# the objects on this side: an empty "found none" from a container that never
+# ran, or a readelf that failed, is the vacuous pass this file keeps refusing.
 check_unwind_tables() {
-  local listing target
+  local target expected=0 report
   for target in "$@"; do
-    ls "$SCRATCH/$target/build/"*.o >/dev/null 2>&1 ||
+    local objects=("$SCRATCH/$target/build/"*.o)
+    [ -f "${objects[0]}" ] ||
       fail "no objects in $target/build; the unwind-table check would pass vacuously"
+    expected=$(( expected + ${#objects[@]} ))
   done
-  listing="$(docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work "$IMAGE" \
+  report="$(docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work "$IMAGE" \
       bash -lc 'for t in "$@"; do for o in "$t"/build/*.o; do
-                  "$DEVKITPRO"/devkitA64/bin/aarch64-none-elf-readelf -SW "$o" |
-                    grep -q "\.eh_frame" && echo "$o"; done; done; true' _ "$@")"
-  [ -z "$listing" ] ||
+                  sections="$("$DEVKITPRO"/devkitA64/bin/aarch64-none-elf-readelf -SW "$o")" ||
+                    { echo "unreadable $o"; continue; }
+                  if grep -q "\.eh_frame" <<<"$sections"; then echo "unwind $o"; else echo "clean $o"; fi
+                done; done' _ "$@")" || fail "the container inspecting the objects failed"
+  [ "$(grep -c '^clean \|^unwind ' <<<"$report")" -eq "$expected" ] ||
+    fail "inspected $(grep -c '^clean \|^unwind ' <<<"$report") of $expected objects:
+$report"
+  if grep -q '^unwind ' <<<"$report"; then
     fail "these objects were compiled with unwind tables (switch.mk lost \
 -fno-unwind-tables -fno-asynchronous-unwind-tables for them):
-$listing"
+$(sed -n 's/^unwind //p' <<<"$report")"
+  fi
 }
 
 # ...and the linked numbers that buys, held rather than observed once.
@@ -145,26 +168,23 @@ $listing"
 # The absolute budget for the whole image -- .bss and page-aligned segments -- is
 # M9-15 (#204)'s; these are the two numbers #200 moved.
 check_image_ceilings() {
-  local sys ovl eh text
-  sys="$(section_sizes sysmodule/sys-rommsync.elf)"
-  ovl="$(section_sizes overlay/ovl-rommsync.elf)"
-  [ -n "$sys" ] && [ -n "$ovl" ] || fail "aarch64-none-elf-size reported no sections"
-
-  eh="$(awk '$1 == ".eh_frame" { print $2 }' <<<"$sys")"
+  local eh
+  eh="$(section_size sysmodule/sys-rommsync.elf .eh_frame)"
   [ -n "$eh" ] || fail "no .eh_frame in the sysmodule at all; the linker script changed under this check"
   [ "$eh" -lt $(( 32 * 1024 )) ] ||
     fail "the sysmodule's .eh_frame is $eh bytes, past the 32 KiB ceiling (#200)"
+  check_text_ceiling sysmodule/sys-rommsync.elf
+  check_text_ceiling overlay/ovl-rommsync.elf
+  echo "ok: sysmodule .eh_frame $eh bytes, under 32 KiB"
+}
 
-  local which sizes
-  for which in sysmodule overlay; do
-    if [ "$which" = sysmodule ]; then sizes="$sys"; else sizes="$ovl"; fi
-    text="$(awk '$1 == ".text" { print $2 }' <<<"$sizes")"
-    [ -n "$text" ] || fail "no .text in the $which"
-    [ "$text" -lt $(( 640 * 1024 )) ] ||
-      fail "the $which's .text is $text bytes, past the 640 KiB ceiling -- is switch.mk still -Os? (#200)"
-  done
-  echo "ok: sysmodule .eh_frame $eh, .text $(awk '$1 == ".text" { print $2 }' <<<"$sys");\
- overlay .text $(awk '$1 == ".text" { print $2 }' <<<"$ovl")"
+check_text_ceiling() {
+  local text
+  text="$(section_size "$1" .text)"
+  [ -n "$text" ] || fail "aarch64-none-elf-size reported no .text for $1"
+  [ "$text" -lt $(( 640 * 1024 )) ] ||
+    fail "$1's .text is $text bytes, past the 640 KiB ceiling -- is switch.mk still -Os? (#200)"
+  echo "ok: $1 .text $text bytes, under 640 KiB"
 }
 
 phase_builds() {
@@ -217,6 +237,7 @@ phase_builds() {
     cat "$log" >&2
     fail "devkitA64 build failed"
   fi
+  check_no_warnings "$log"
 
   local nsp="$SCRATCH/sysmodule/sys-rommsync.nsp"
   local ovl="$SCRATCH/overlay/ovl-rommsync.ovl"
@@ -263,9 +284,7 @@ phase_builds() {
   declared="$(sed -n 's/^constexpr size_t kInnerHeapSize = \(0x[0-9A-Fa-f]*\);.*/\1/p' \
       "$REPO_ROOT/sysmodule/source/main.cpp")"
   [ -n "$declared" ] || fail "no kInnerHeapSize in sysmodule/source/main.cpp"
-  bss="$(docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work "$IMAGE" \
-        bash -lc '"$DEVKITPRO"/devkitA64/bin/aarch64-none-elf-size -A sysmodule/sys-rommsync.elf' |
-      awk '$1 == ".bss" { print $2 }')"
+  bss="$(section_size sysmodule/sys-rommsync.elf .bss)"
   [ -n "$bss" ] || fail "aarch64-none-elf-size reported no .bss for the sysmodule"
   slack=$(( 64 * 1024 ))
   if [ "$bss" -lt "$(( declared ))" ]; then
@@ -354,6 +373,7 @@ phase_tlsprobe() {
     cat "$log" >&2
     fail "the tlsprobe build failed"
   fi
+  check_no_warnings "$log"
 
   local nro="$SCRATCH/tlsprobe/rommsync-tlsprobe.nro"
   [ -s "$nro" ] || fail "no rommsync-tlsprobe.nro"

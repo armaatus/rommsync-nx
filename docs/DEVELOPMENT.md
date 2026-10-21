@@ -102,10 +102,12 @@ table) -- before trusting a green `switch.builds`.
 ### What the image costs
 
 Both Switch targets live in a memory budget somebody else sets. The sysmodule's
-comes out of what Atmosphere reserves for custom system modules, which has
-shrunk with every recent firmware (7 MB on HOS 21.0.0+ by
-`kern_k_system_control.cpp`'s count, shared with every other sysmodule
-installed), and boot2 aborts outright on a launch that does not fit. The
+comes out of what Atmosphere leaves custom system modules, shared with every
+other sysmodule installed. That has shrunk on recent firmware -- Atmosphere's
+1.9.0 and 1.10.0 changelogs each say so -- and boot2 aborts outright on a launch
+that does not fit. (How much is left on HOS 21: #200 cites 7 MB from
+`kern_k_system_control.cpp` and 32 MB from pm's `pm_spec.cpp`, constants in
+different layers, not yet reconciled. Nothing here is sized against either.) The
 overlay's is nx-ovlloader's heap, 4 MB by default, into which the whole `.ovl`
 is read before anything is allocated. So `switch.mk` compiles for size (#200):
 
@@ -116,7 +118,7 @@ is read before anything is allocated. So `switch.mk` compiles for size (#200):
   Atmosphere also `/DISCARD/`s those in its linker script; we do not, because
   that means forking libnx's `switch.ld` (which `switch.specs` names and which
   `KEEP`s `.eh_frame`) and re-merging it on every move of the pin above, for
-  27 KiB.
+  ~27 KiB in the sysmodule (~34 KiB in the overlay, which links more of libnx).
 - **`-Os`, not `-O2`.** The larger win by far, and libultrahand's own
   recommended flag set.
 
@@ -159,7 +161,9 @@ takes on a real A57 is a hardware measurement, and waits for the M8-1 gate.
 
 `ctest -R switch.builds` holds the result: no object this build compiles may
 carry an `.eh_frame`, the sysmodule's linked `.eh_frame` stays under 32 KiB, and
-both targets' `.text` under 640 KiB, which a revert to `-O2` overshoots in both.
+both targets' `.text` under 640 KiB, which a revert to `-O2` overshoots in both;
+and the build log carries no warning, vendored code and the link included, since
+neither is `-Werror`.
 The budget for the whole image is M9-15 (#204)'s.
 
 What is still linked and could go: newlib's full `printf` (`_svfprintf_r`,
@@ -526,7 +530,7 @@ through `ssl` and reports what each stage cost. It is built by CI on every push
 and by `ctest -R switch.tlsprobe`, and it has **not been run** — see below.
 
 **Code size.** Three aarch64 images, identical flags (`switch.mk`'s, re-measured
-at its `-Os` by #200, which moved each figure by under 50 bytes) and libnx,
+at its `-Os` by #200, which moved each figure by under 60 bytes) and libnx,
 differing only in what they link (`./tlsprobe/measure-footprint.sh`, devkitA64 r29.2-1,
 libnx 4.12.0-1, switch-mbedtls 2.28.10-1):
 
