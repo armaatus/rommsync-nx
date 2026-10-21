@@ -237,6 +237,15 @@ void Layouts(checks::Checks& c) {
   c.Expect(elsewhere.source == scan::Source::kRetroArch,
            "any segment, and FAT32 is case-insensitive");
 
+  const scan::SaveSource unknown_core = scan::SourceOf("/retroarch/saves/YabaSanshiro");
+  c.Expect(unknown_core.source == scan::Source::kRetroArch &&
+               unknown_core.layout == scan::Layout::kUnknown,
+           "a RetroArch subfolder RomM's table does not know is neither flat nor a core");
+  c.ExpectEq(scan::ResolveSource(unknown_core, "saturn", config::Defaults()).emulator_id,
+             std::string(), "...so it gets no guessed id");
+  c.Expect(scan::SourceOf("/retroarch/states").layout == scan::Layout::kFlat,
+           "RetroArch's states folder is flat too");
+
   const scan::SaveSource neither = scan::SourceOf("/saves/Snes9x");
   c.Expect(neither.source == scan::Source::kUnknown && neither.layout == scan::Layout::kUnknown,
            "a folder neither emulator owns says nothing -- a core-named leaf included");
@@ -256,6 +265,13 @@ void Layouts(checks::Checks& c) {
   const scan::SaveSource plain_gbc =
       scan::ResolveSource(scan::SourceOf("/tico/saves/gbc"), "gbc", overridden);
   c.ExpectEq(plain_gbc.emulator_id, std::string("gambatte"), "and it is per platform");
+  // The override is the platform's emulator wherever the folder does not name
+  // a core -- RetroArch's flat folder included (docs/CONFIG.md).
+  c.ExpectEq(scan::ResolveSource(scan::SourceOf("/retroarch/saves"), "gb", overridden).emulator_id,
+             std::string("mgba"), "the override covers a flat RetroArch folder too");
+  c.ExpectEq(scan::ResolveSource(scan::SourceOf("/retroarch/saves/Gearboy"), "gb", overridden)
+                 .emulator_id,
+             std::string("mgba"), "and a folder whose layout is unknown");
 }
 
 }  // namespace

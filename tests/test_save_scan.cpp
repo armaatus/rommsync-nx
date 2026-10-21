@@ -639,8 +639,9 @@ void Truncated(::checks::Checks& checks) {
 // --- sources ------------------------------------------------------------------
 
 /// The `config.ini` the `sources` fixtures are scanned under: the built-in map,
-/// plus RetroArch's sort-by-core folders, the Tico systems the defaults do not
-/// map yet (#231), a folder neither emulator owns, and two overrides.
+/// plus RetroArch's sort-by-core folders (and one RomM does not know), the Tico
+/// systems the defaults do not map yet (#231), a folder neither emulator owns,
+/// and two overrides.
 constexpr const char* kSourcesConfig = R"ini([server]
 url = https://romm.example.com
 
@@ -659,6 +660,9 @@ states = /retroarch/states, /tico/states/gba
 roms   = /tico/roms/psx
 saves  = /tico/saves/psx, /retroarch/saves/Beetle PSX HW, /retroarch/saves/Beetle PSX
 states = /tico/states/psx
+
+[platform.gbc]
+saves = /tico/saves/gbc, /retroarch/saves/Gearboy
 
 [platform.sms]
 saves = /tico/saves/master-system
@@ -710,6 +714,8 @@ void Sources(::checks::Checks& checks) {
       {"/retroarch/saves/Gambatte", "Gb Core.srm", "gb", "gambatte", "retroarch-srm"},
       {"/retroarch/saves/Beetle PSX HW", "Psx Hw.srm", "psx", "mednafen_psx_hw", "retroarch-srm"},
       {"/retroarch/saves/Beetle PSX", "Psx Sw.srm", "psx", "mednafen_psx", "retroarch-srm"},
+      // RetroArch, a subfolder RomM's table does not know: no guessed core.
+      {"/retroarch/saves/Gearboy", "Gbc Gearboy.srm", "gbc", "", "retroarch-srm"},
       // Tico: one folder per system, and the module Tico runs for it.
       {"/tico/saves/nes", "Nes Tico.srm", "nes", "fceumm", "tico-srm"},
       {"/tico/saves/snes", "Snes Tico.srm", "snes", "snes9x", "tico-srm"},

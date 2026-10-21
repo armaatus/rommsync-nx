@@ -57,14 +57,11 @@ const char* ToString(Source source);
 
 /// How the source lays its saves out, which decides what a folder can say.
 enum class Layout {
-  kUnknown,        ///< `Source::kUnknown`'s: nothing is assumed
-  kFlat,           ///< RetroArch's one `saves/` for every system
+  kUnknown,        ///< nothing is assumed: no built-in id, only an override
+  kFlat,           ///< RetroArch's one `saves/` (or `states/`) for every system
   kCoreFolder,     ///< RetroArch's sort-by-core `saves/<CoreFolder>/`
   kPlatformFolder, ///< Tico's `saves/<slug>/`
 };
-
-/// Stable, log-friendly name. Never null.
-const char* ToString(Layout layout);
 
 /// Where a save came from, and the emulator id that follows from it.
 struct SaveSource {
@@ -89,16 +86,17 @@ struct SaveSource {
 ///
 /// A segment named `retroarch` or `tico` anywhere in the path names the source,
 /// so `/emulators/retroarch/saves` is recognised as well as the default; the
-/// comparison ignores case because FAT32 does. A core folder is recognised only
-/// as the **last** segment of a RetroArch path, since the walk is one level
-/// deep, and only when RomM's table knows the name: `saves/YabaSanshiro` could
-/// as well be a folder somebody made, and a guess there is a lineage nobody
-/// else is in.
+/// comparison ignores case because FAT32 does. A RetroArch folder is flat when
+/// its last segment is `saves`, `states` or `retroarch`, and a core folder when
+/// the last segment is a name RomM's table knows. Any other leaf -- say
+/// `saves/YabaSanshiro` -- is `Layout::kUnknown`: it could as well be a folder
+/// somebody made, and a guessed core there is a lineage nobody else is in.
 SaveSource SourceOf(std::string_view folder);
 
 /// `folder`, completed for one rom's platform under `config`: the folder's own
-/// core if it named one, else the platform's override, else the built-in id for
-/// that source and platform, else empty.
+/// core if it named one, else the platform's override, else -- for a folder
+/// whose layout is known -- the built-in id for that source and platform, else
+/// empty.
 SaveSource ResolveSource(const SaveSource& folder, std::string_view platform_fs_slug,
                          const config::Config& config);
 

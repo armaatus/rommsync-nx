@@ -1,25 +1,15 @@
 #include "rommsync/save_source.hpp"
 
-#include <algorithm>
 #include <set>
 #include <string>
 #include <vector>
 
+#include "rommsync/config_text.hpp"
+
 namespace rommsync::scan {
 namespace {
 
-/// ASCII-only lowering, for save_scan.cpp's reason: a path segment compared
-/// against `retroarch` must not depend on the locale.
-std::string LowerAscii(std::string_view text) {
-  std::string out;
-  out.reserve(text.size());
-  for (const char character : text) {
-    out.push_back((character >= 'A' && character <= 'Z')
-                      ? static_cast<char>(character - 'A' + 'a')
-                      : character);
-  }
-  return out;
-}
+using config::text::LowerAscii;
 
 /// The `/`-separated segments of an SD path, in order, with empties dropped.
 std::vector<std::string_view> Segments(std::string_view sd_path) {
@@ -39,35 +29,6 @@ std::vector<std::string_view> Segments(std::string_view sd_path) {
   return segments;
 }
 
-/// The RetroArch core a system's flat `saves/` is filed under, keyed by Tico's
-/// spelling of the system so the two tables line up.
-///
-/// The libretro systems repeat Tico's module on purpose -- the same core on two
-/// devices is one lineage on the server, which is the point of M10. The others
-/// are the cores RomM's web player uses for those systems, so a flat RetroArch
-/// save at least meets the browser's.
-struct RetroArchDefault {
-  const char* slug;
-  const char* emulator_id;
-};
-
-constexpr RetroArchDefault kRetroArchDefaults[] = {
-    {"nes", "fceumm"},
-    {"snes", "snes9x"},
-    {"gb", "gambatte"},
-    {"gbc", "gambatte"},
-    {"gba", "mgba"},
-    {"fbneo", "fbneo"},
-    {"genesis", "genesis_plus_gx"},
-    {"master-system", "genesis_plus_gx"},
-    {"game-gear", "genesis_plus_gx"},
-    {"sega-cd", "genesis_plus_gx"},
-    {"n64", "mupen64plus_next"},
-    {"psx", "pcsx_rearmed"},
-    {"dc", "flycast"},
-    {"nds", "melonds"},
-    {"psp", "ppsspp"},
-};
 
 // #229's table. A `tico-*` id is a format no libretro core shares (#226 D3):
 // Mupen64Plus is built without libretro and splits N64 saves by type,
@@ -91,6 +52,22 @@ constexpr TicoModule kTicoModules[] = {
     {"nds", "DraStic", "tico-drastic"},
     {"saturn", "YabaSanshiro", "tico-yabasanshiro"},
     {"psp", "PPSSPP", "tico-ppsspp"},
+};
+
+/// The RetroArch core a flat `saves/` is filed under, for the systems where
+/// Tico's module is *not* a libretro core. Everywhere else it is Tico's core:
+/// the same core on two devices is one lineage on the server, which is the
+/// point of M10, so that half is derived rather than written twice. These are
+/// the cores RomM's web player uses, so a flat RetroArch save at least meets
+/// the browser's [#44 checks the Switch build's defaults]. Saturn has none.
+struct RetroArchDefault {
+  const char* slug;
+  const char* emulator_id;
+};
+
+constexpr RetroArchDefault kRetroArchOwnCores[] = {
+    {"n64", "mupen64plus_next"}, {"psx", "pcsx_rearmed"}, {"dc", "flycast"},
+    {"nds", "melonds"},          {"psp", "ppsspp"},
 };
 
 /// Where RomM's `platform_fs_slug` and Tico's folder name part ways (#226 R5).
@@ -129,20 +106,6 @@ const char* ToString(Source source) {
       break;
   }
   return "";
-}
-
-const char* ToString(Layout layout) {
-  switch (layout) {
-    case Layout::kFlat:
-      return "flat";
-    case Layout::kCoreFolder:
-      return "core folder";
-    case Layout::kPlatformFolder:
-      return "platform folder";
-    case Layout::kUnknown:
-      break;
-  }
-  return "unknown";
 }
 
 const std::vector<RetroArchCore>& RetroArchCores() {
@@ -253,18 +216,24 @@ std::string TicoSlugFor(std::string_view romm_slug) {
 
 std::string DefaultEmulatorId(Source source, std::string_view platform_fs_slug) {
   const std::string slug = TicoSlugFor(platform_fs_slug);
-  if (source == Source::kTico) {
-    const TicoModule* module = TicoModuleFor(slug);
-    return module == nullptr ? std::string() : std::string(module->emulator_id);
+  if (source == Source::kUnknown) {
+    return {};
   }
   if (source == Source::kRetroArch) {
-    for (const RetroArchDefault& entry : kRetroArchDefaults) {
+    for (const RetroArchDefault& entry : kRetroArchOwnCores) {
       if (slug == entry.slug) {
         return entry.emulator_id;
       }
     }
   }
-  return {};
+  const TicoModule* module = TicoModuleFor(slug);
+  if (module == nullptr) {
+    return {};
+  }
+  const std::string_view id = module->emulator_id;
+  // A `tico-*` id is a format RetroArch never writes, so it is never RetroArch's.
+  return source == Source::kRetroArch && id.rfind("tico-", 0) == 0 ? std::string()
+                                                                     : std::string(id);
 }
 
 bool ValidEmulatorId(std::string_view id, std::string* why) {
@@ -317,10 +286,20 @@ SaveSource SourceOf(std::string_view folder) {
     }
   }
   switch (where.source) {
-    case Source::kRetroArch:
-      where.emulator_id = segments.empty() ? std::string() : RetroArchCoreId(segments.back());
-      where.layout = where.emulator_id.empty() ? Layout::kFlat : Layout::kCoreFolder;
+    case Source::kRetroArch: {
+      // Flat only when the folder is one RetroArch keeps for every system --
+      // `saves/`, `states/`, or RetroArch's own root. Any other leaf is a folder
+      // somebody made or a core RomM's table does not know, and its saves get
+      // the override or nothing, never a guessed core.
+      const std::string leaf = LowerAscii(segments.back());
+      where.emulator_id = RetroArchCoreId(segments.back());
+      if (!where.emulator_id.empty()) {
+        where.layout = Layout::kCoreFolder;
+      } else if (leaf == "saves" || leaf == "states" || leaf == "retroarch") {
+        where.layout = Layout::kFlat;
+      }
       break;
+    }
     case Source::kTico:
       where.layout = Layout::kPlatformFolder;
       break;
@@ -334,12 +313,15 @@ SaveSource ResolveSource(const SaveSource& folder, std::string_view platform_fs_
                          const config::Config& config) {
   SaveSource resolved = folder;
   resolved.platform_fs_slug = std::string(platform_fs_slug);
-  if (resolved.layout == Layout::kCoreFolder && !resolved.emulator_id.empty()) {
+  if (resolved.layout == Layout::kCoreFolder) {
     return resolved;
   }
   const std::string_view chosen = config.EmulatorOverride(platform_fs_slug);
-  resolved.emulator_id =
-      chosen.empty() ? DefaultEmulatorId(folder.source, platform_fs_slug) : std::string(chosen);
+  if (!chosen.empty()) {
+    resolved.emulator_id = std::string(chosen);
+  } else if (resolved.layout != Layout::kUnknown) {
+    resolved.emulator_id = DefaultEmulatorId(folder.source, platform_fs_slug);
+  }
   return resolved;
 }
 
