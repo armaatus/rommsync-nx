@@ -512,6 +512,7 @@ void CheckMenuReachesEveryScreen(Checks& checks) {
   bool sync = false;
   bool library = false;
   bool pairing = false;
+  bool log = false;
   for (const overlay::SettingsRow& row : menu.rows) {
     const std::string what = overlay::ToString(row.destination);
     checks.Expect(row.selectable, "every menu row can be pressed: " + what);
@@ -522,7 +523,9 @@ void CheckMenuReachesEveryScreen(Checks& checks) {
     sync = sync || row.destination == overlay::Destination::kSync;
     library = library || row.destination == overlay::Destination::kLibrary;
     pairing = pairing || row.destination == overlay::Destination::kPairing;
+    log = log || row.destination == overlay::Destination::kLog;
   }
+  checks.Expect(log, "the log is reachable, so it can be read without an SD reader (#209)");
   checks.Expect(sync, "the sync screen is reachable");
   checks.Expect(library, "the library browser is reachable");
   checks.Expect(pairing, "the pairing screen is reachable without discarding anything");

@@ -515,6 +515,7 @@ add_executable(test_overlay_native
   "${CMAKE_SOURCE_DIR}/overlay/source/conflicts_pump.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/ipc_client.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/lifecycle.cpp"
+  "${CMAKE_SOURCE_DIR}/overlay/source/log_paint.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/screen_frame.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/status_paint.cpp"
   "${CMAKE_SOURCE_DIR}/sysmodule/source/ipc/result.cpp")
@@ -548,6 +549,7 @@ foreach(scenario
         restore    # a restore that is still copying holds no frame at all
         cycles     # every exit path gives back everything, the same way, every time
         hidden     # polling is by showing, because update() stops while hidden
+        log        # the log the sysmodule serves, readable without an SD reader
         portable   # the half of a screen that must keep compiling on a host
         draw)      # what the status screen actually asks to be drawn
   add_test(NAME overlay.${scenario} COMMAND test_overlay_native ${scenario})

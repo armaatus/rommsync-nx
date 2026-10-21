@@ -52,7 +52,9 @@
 #include "rommsync/config.hpp"
 #include "rommsync/conflict_log.hpp"
 #include "rommsync/ipc.hpp"
+#include "rommsync/log.hpp"
 #include "rommsync/overlay_conflicts_view.hpp"
+#include "rommsync/overlay_log_view.hpp"
 #include "rommsync/overlay_status_view.hpp"
 
 // The overlay's own headers, and the sysmodule's half of the error mapping.
@@ -62,6 +64,7 @@
 #include "draw_list.hpp"
 #include "ipc_client.hpp"
 #include "lifecycle.hpp"
+#include "log_paint.hpp"
 #include "prompts.hpp"
 #include "result.hpp"
 #include "screen_frame.hpp"
@@ -383,6 +386,11 @@ constexpr ClientCall kClientCalls[] = {
        ipc::RestoreState out;
        return c.GetRestoreState(&out);
      }},
+    {ipc::Command::kGetLog, "GetLog",
+     [](overlay::IpcClient& c) {
+       ipc::LogTail out;
+       return c.GetLog(ipc::kMaxLogLines, &out);
+     }},
 };
 
 int RunWire(Checks& checks) {
@@ -421,18 +429,13 @@ int RunWire(Checks& checks) {
                   "the response buffer is the contract's whole cap");
 
   // Every command this contract has, against the client that is supposed to be
-  // able to send it. `kGetLog` is the one hole and it is a known one: the
-  // sysmodule dispatches it and no screen calls it (#209, which decides whether
-  // to wire it or drop it). Pinned rather than left implicit, so a *new*
-  // command with no client is a red test rather than a discovery on a console.
+  // able to send it. `kGetLog` was the one hole until M9-6 (#209) wired it to
+  // the log screen; there is none now, so a *new* command with no client is a
+  // red test rather than a discovery on a console.
   for (const ipc::Command command : ipc::kAllCommands) {
     bool covered = false;
     for (const ClientCall& call : kClientCalls) {
       covered = covered || call.command == command;
-    }
-    if (command == ipc::Command::kGetLog) {
-      checks.Expect(!covered, "kGetLog still has no client -- #209 decides its fate");
-      continue;
     }
     checks.Expect(covered, std::string("IpcClient can send ") + ipc::ToString(command));
   }
@@ -572,6 +575,17 @@ int RunRoundtrip(Checks& checks) {
                   "...and the backup this restore itself wrote first (hard rule 2)");
   checks.ExpectEq(engine.last_restore_id, static_cast<std::int64_t>(3),
                   "against the entry id the overlay named");
+  // The log tail, which the log screen reads (#209). The sysmodule answers it
+  // from `log::Tail`, so what goes in is a line logged in this process.
+  rommsync::log::Reset();
+  rommsync::log::Warn(rommsync::log::Event::kNetOffline, "negotiate: connection failed");
+  ipc::LogTail tail;
+  checks.Expect(R_SUCCEEDED(client.GetLog(ipc::kMaxLogLines, &tail)), "GetLog succeeds");
+  checks.ExpectEq(tail.total, static_cast<std::int64_t>(1), "the total survives");
+  checks.Expect(tail.lines.size() == 1 &&
+                    tail.lines[0].find("negotiate: connection failed") != std::string::npos,
+                "and the line, as the log rendered it");
+
   ipc::RestoreState polled;
   checks.Expect(R_SUCCEEDED(client.GetRestoreState(&polled)), "GetRestoreState succeeds");
   checks.Expect(polled.phase == ipc::RestorePhase::kDone && polled.entry_id == 3 &&
@@ -1350,7 +1364,7 @@ int RunHidden(Checks& checks) {
 constexpr const char* kPortableFiles[] = {
     "draw_list.hpp",    "prompts.hpp",      "screen_frame.hpp",   "screen_frame.cpp",
     "status_paint.hpp", "status_paint.cpp", "conflicts_pump.hpp", "conflicts_pump.cpp",
-    "lifecycle.hpp",    "lifecycle.cpp",
+    "lifecycle.hpp",    "lifecycle.cpp",    "log_paint.hpp",      "log_paint.cpp",
 };
 
 /// What none of them may name. `card_probe` and `ipc_client` are deliberately
@@ -1686,6 +1700,105 @@ int RunDraw(Checks& checks) {
   return checks.failures();
 }
 
+// --- overlay.log --------------------------------------------------------------
+
+/// M9-6 (#209): the log the sysmodule serves is readable without an SD reader.
+///
+/// `GetLog` (M7-3, #38) was dispatched and had no client, so the only way to
+/// read why a sync did not happen was to pull the card. This is the screen's
+/// two portable halves -- what it says (`RenderLog`, in `core/`) and where it
+/// puts it (`PaintLog`) -- the way `overlay.draw` holds the status screen's.
+int RunLog(Checks& checks) {
+  // What it says.
+  {
+    const overlay::LogView none = overlay::RenderLog(ipc::LogTail{});
+    checks.Expect(!none.headline.empty(), "a console that has logged nothing says so");
+    checks.Expect(none.lines.empty(), "and draws no lines");
+
+    ipc::LogTail whole;
+    whole.lines = {"1 info boot rommsync-nx/0.1.0", "2 warn net.offline negotiate: failed"};
+    whole.total = 2;
+    const overlay::LogView all = overlay::RenderLog(whole);
+    checks.Expect(all.headline.find('2') != std::string::npos,
+                  "the whole log says how many lines it is: " + all.headline);
+    checks.ExpectEq(all.lines.size(), std::size_t{2}, "every line is there");
+    checks.ExpectEq(all.lines.back(), whole.lines.back(), "oldest first, newest last");
+
+    ipc::LogTail tail = whole;
+    tail.total = 412;
+    const overlay::LogView end = overlay::RenderLog(tail);
+    checks.Expect(end.headline.find("412") != std::string::npos,
+                  "a tail says it is the end of a longer log: " + end.headline);
+    checks.Expect(end.hint.find(rommsync::log::kLogSdPath) != std::string::npos,
+                  "and where the rest of it is: " + end.hint);
+
+    const overlay::LogView gone = overlay::RenderLogUnreachable(overlay::Link::kNotRunning);
+    checks.Expect(gone.link == overlay::Link::kNotRunning && !gone.headline.empty(),
+                  "a sysmodule that is not there is the same sentence every screen uses");
+    checks.Expect(gone.hint.find(rommsync::log::kLogSdPath) != std::string::npos ||
+                      !gone.hint.empty(),
+                  "with something to do about it");
+  }
+
+  // Where it goes.
+  const overlay::Palette palette = TestPalette();
+  overlay::LogView view;
+  view.headline = "The last 40 of 412 lines";
+  view.hint = "The rest is on the card";
+  for (int line = 0; line < 40; ++line) {
+    view.lines.push_back(std::to_string(line) + " info sync.tick a line that is long enough to "
+                                                "need bounding on a narrow panel, " +
+                         std::string(120, 'x'));
+  }
+  {
+    Recorder out;
+    overlay::PaintLog(view, palette, out, kPanelX, kPanelY, kPanelWidth, kPanelHeight);
+    checks.Expect(out.Drew(view.headline), "the headline is drawn");
+    checks.Expect(out.Drew(overlay::Prompt(overlay::kGlyphB, "Back")), "and the way out");
+    // **The end of the log is what fits**, not the start: the newest lines are
+    // the ones that say why the last tick failed.
+    checks.Expect(out.Drew(view.lines.back()), "the newest line is drawn");
+    checks.Expect(!out.Drew(view.lines.front()),
+                  "and a panel too short for forty drops the oldest, not the newest");
+    std::int32_t newest_y = -1;
+    std::int32_t previous_y = -1;
+    bool in_order = true;
+    for (const overlay::DrawCommand& command : out.commands) {
+      if (command.text.find(" info sync.tick ") == std::string::npos) {
+        continue;
+      }
+      in_order = in_order && command.y > previous_y;
+      previous_y = command.y;
+      if (command.text == view.lines.back()) {
+        newest_y = command.y;
+      }
+    }
+    checks.Expect(in_order, "the lines run oldest to newest, down the panel");
+    checks.ExpectEq(newest_y, previous_y, "with the newest at the bottom of them");
+    for (const overlay::DrawCommand& command : out.commands) {
+      checks.Expect(command.width > 0, "no string is drawn unbounded: \"" + command.text + "\"");
+      checks.Expect(command.y >= kPanelY && command.y <= kPanelY + kPanelHeight,
+                    "nothing is drawn outside the panel");
+      checks.Expect(command.x + command.width <= kPanelX + kPanelWidth,
+                    "nor past its right edge");
+    }
+  }
+  // No room at all: nothing rather than a headline over whatever is beside it.
+  {
+    Recorder out;
+    overlay::PaintLog(view, palette, out, kPanelX, kPanelY, 4, kPanelHeight);
+    checks.Expect(out.commands.empty(), "a panel with no width draws nothing");
+  }
+  // A panel with room for the prompt and nothing else keeps the prompt.
+  {
+    Recorder out;
+    overlay::PaintLog(view, palette, out, kPanelX, kPanelY, kPanelWidth, 40);
+    checks.Expect(out.Drew(overlay::Prompt(overlay::kGlyphB, "Back")),
+                  "the way out survives a panel with no room");
+  }
+  return checks.failures();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1706,6 +1819,9 @@ int main(int argc, char** argv) {
   if (scenario == "errors") {
     return RunErrors(checks);
   }
+  if (scenario == "log") {
+    return RunLog(checks);
+  }
   if (scenario == "cycles") {
     return RunCycles(checks);
   }
@@ -1725,6 +1841,6 @@ int main(int argc, char** argv) {
     return RunDraw(checks);
   }
   std::cerr << "usage: test_overlay_native "
-               "<card|wire|roundtrip|version|errors|timeout|restore|cycles|hidden|portable|draw>\n";
+               "<card|wire|roundtrip|version|errors|timeout|restore|cycles|hidden|log|portable|draw>\n";
   return 2;
 }
