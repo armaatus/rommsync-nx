@@ -286,7 +286,7 @@ auth::Answer AnswerOf(OperationError error) {
 std::string SlotBackupDiscriminator(const std::optional<std::string>& slot) {
   if (!slot.has_value()) {
     // Archival, which pairs with nothing. It cannot collide with a derived slot
-    // because `scan::SlotFor` always carries an emulator and an extension.
+    // because `scan::SlotFor` always carries a source and an extension.
     return "archival";
   }
   std::string safe_slot = Sanitize(*slot);

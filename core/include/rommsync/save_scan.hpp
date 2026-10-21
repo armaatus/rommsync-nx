@@ -48,6 +48,7 @@
 #include "rommsync/config.hpp"
 #include "rommsync/file_system.hpp"
 #include "rommsync/rom_index.hpp"
+#include "rommsync/save_source.hpp"
 #include "rommsync/state_db.hpp"
 #include "rommsync/sync.hpp"
 
@@ -75,14 +76,16 @@ struct SaveFile {
   ///
   /// Derived rather than chosen because it has to be the *same* string on the
   /// next tick and on the next boot -- a slot that moves makes the same file a
-  /// new save every time. It carries the emulator as well as the save's
+  /// new save every time. It carries the source as well as the save's
   /// extension because RomM pairs on `(rom_id, slot)` alone: a rom whose
   /// RetroArch `.srm` and Tico `.srm` both mapped to `srm` would have the two
-  /// files overwrite each other through the server, forever.
+  /// files overwrite each other through the server, forever. The *source*, not
+  /// the `emulator` below, so M10-3 moved no save to a new slot (#236 does).
   std::string slot;
 
-  /// `retroarch` or `tico`, when the directory said so; empty when it did not,
-  /// which is sent as `null`.
+  /// RomM's `emulator` for it -- `snes9x`, `tico-duckstation`, an override --
+  /// from `scan::ResolveSource`. Empty when nothing says, which is sent as
+  /// `null`.
   std::string emulator;
 
   /// The rom's platform, for callers that lay files out by it.
@@ -126,9 +129,9 @@ struct StateFile {
   /// name it was sent, without the ingest tag it stamps on a save.
   std::string file_name;
 
-  /// `retroarch` or `tico`, when the directory said so; empty when it did not.
-  /// Sent as the `emulator` query parameter and used to place a download, but
-  /// never part of the key -- see `SkipReason::kDuplicateName`.
+  /// RomM's `emulator` for it, from `scan::ResolveSource`; empty when nothing
+  /// says. Sent as the `emulator` query parameter, but never part of the key --
+  /// see `SkipReason::kDuplicateName`.
   std::string emulator;
 
   /// The rom's platform, for callers that lay files out by it.
@@ -309,15 +312,10 @@ ScanResult ScanStates(const config::Config& config, const roms::RomIndex& index,
 /// called `Game.nes` that the user does not have.
 std::string BaseName(std::string_view file_name);
 
-/// The emulator a mapped directory belongs to: `retroarch`, `tico`, or empty.
-///
-/// Any segment of the path, not just the first, so `/emulators/retroarch/saves`
-/// is recognised as well as the default `/retroarch/saves`. The comparison is
-/// case-insensitive because FAT32 is.
-std::string EmulatorFor(std::string_view sd_dir);
-
-/// The slot for a file from `emulator`'s directory. See `SaveFile::slot`.
-std::string SlotFor(std::string_view emulator, std::string_view file_name);
+/// The slot for a file from a `source` folder -- `ToString(Source)`, so
+/// `retroarch`, `tico` or "". See `SaveFile::slot`. Which emulator wrote the
+/// file is `SourceOf` and `ResolveSource`, in save_source.hpp.
+std::string SlotFor(std::string_view source, std::string_view file_name);
 
 /// Which platform each save directory implies, keyed by directory.
 ///

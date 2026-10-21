@@ -7,6 +7,11 @@ Nothing here runs on a Switch, and nothing here is built with devkitPro.
   minimum. Check it before writing a request or assuming a response field. Do
   not edit either by hand — `probe_contract.py --openapi` writes one from a live
   RomM.
+- **`contract/romm-5.4.0-emulator_names.py`** is RomM 5.4.0's
+  `backend/handler/sync/retroarch/emulator_names.py`, verbatim, so the RetroArch
+  core table in `core/src/save_source.cpp` has something to be diffed against
+  (`source.retroarch_table`, #229). Re-pin it from the image, never by hand:
+  `docker run --rm --entrypoint cat rommapp/romm:<version> /backend/handler/sync/retroarch/emulator_names.py`.
 - **`contract/captures/`** is what the API docs quote: real responses, captured
   from the fixture — 5.2.0's at its top level, 5.4.0's under `captures/5.4.0/`. Read these before trusting a field's type or nullability —
   the OpenAPI snapshot declares neither that a save's `content_hash` is an MD5

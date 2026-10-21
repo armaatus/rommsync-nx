@@ -92,7 +92,7 @@ inline constexpr const char* kBackupDir = "/config/rommsync/.backup";
 /// the one on an operation is whatever some other client chose, and a `/` in it
 /// would put the backup somewhere other than `.backup/`. A `null` slot -- an
 /// archival save -- spells itself `archival`, which is a slot no derived name
-/// produces because `SlotFor` always carries an emulator and an extension.
+/// produces because `SlotFor` always carries a source and an extension.
 ///
 /// `uniquifier` is appended from 1 upwards, for the caller that finds the name
 /// already taken. `ExecutePlan` walks it rather than overwriting: a name that is

@@ -203,6 +203,16 @@ struct Config {
   /// A platform with no entry here has no mapping and is skipped entirely.
   std::map<std::string, PlatformFolders, std::less<>> platforms;
 
+  /// `[platform.<slug>] emulator`, keyed like `platforms`: the RomM emulator id
+  /// this platform's saves and states are sent under wherever their folder does
+  /// not name a core (scan::ResolveSource). Absent means the built-in id.
+  ///
+  /// Kept apart from `PlatformFolders` because it is not a folder: a section
+  /// that sets only this key leaves the platform's folders as they were rather
+  /// than replacing them with none, and a platform with an override and no
+  /// folders is still a platform that maps nothing.
+  std::map<std::string, std::string, std::less<>> emulators;
+
   /// There is a server to talk to. False on a first boot, and after an edit
   /// that made `server.url` unusable.
   bool configured() const { return !server.url.empty(); }
@@ -210,6 +220,9 @@ struct Config {
   /// The mapping for `slug`, or nullptr when there is none -- which is the
   /// signal to skip the platform, not a reason to guess a folder.
   const PlatformFolders* Platform(std::string_view slug) const;
+
+  /// The `emulator` override for `slug`, or empty when there is none.
+  std::string_view EmulatorOverride(std::string_view slug) const;
 
   /// Where a download for `slug` is written: the first `roms` entry, or empty
   /// when the platform is unmapped or maps no rom folder.

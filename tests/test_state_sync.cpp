@@ -392,8 +392,8 @@ void Scanning(rig::Checks& checks) {
   if (result.states.size() == 1) {
     checks.ExpectEq(result.states.front().file_name, std::string("Game.state"),
                     "and it is the first one in scan order");
-    checks.ExpectEq(result.states.front().emulator, std::string("retroarch"),
-                    "carrying the emulator its folder implied");
+    checks.ExpectEq(result.states.front().emulator, std::string("fceumm"),
+                    "carrying the core RetroArch runs for that rom's platform");
     checks.Expect(!result.states.front().content_hash.empty(), "and a digest of its bytes");
   }
 

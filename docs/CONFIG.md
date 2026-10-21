@@ -24,6 +24,7 @@ resume        = true
 ; roms   = where downloads land (first entry is the write target)
 ; saves  = dirs to scan/sync for SRAM saves
 ; states = dirs to scan/sync for save states
+; emulator = RomM emulator id for this platform's saves (optional; see below)
 [platform.snes]
 roms   = /tico/roms/snes
 saves  = /retroarch/saves, /tico/saves/snes
@@ -76,6 +77,56 @@ states =
 
 A platform that maps no folders is skipped entirely, the same as one nobody
 ever mapped.
+
+### `emulator`: which emulator RomM is told wrote a platform's saves
+
+Every save and state goes to RomM with an `emulator` id, and it is not a label:
+RomM files a save's versions by it, and RetroArch's Cloud Sync, the web player
+and other clients look saves up by it. The client works it out per save:
+
+1. A RetroArch **sort-by-core** folder names its core: a save in
+   `/retroarch/saves/mGBA` is `mgba`, in `/retroarch/saves/Beetle PSX HW`
+   `mednafen_psx_hw`. The folder names are RomM's own table.
+2. Otherwise **`[platform.<slug>] emulator`**, when you set it.
+3. Otherwise the built-in id for the folder's emulator and that platform:
+
+| System | Tico (`/tico/...`) | RetroArch, flat `saves/` |
+|---|---|---|
+| nes | `fceumm` | `fceumm` |
+| snes | `snes9x` | `snes9x` |
+| gb, gbc | `gambatte` | `gambatte` |
+| gba | `mgba` | `mgba` |
+| genesis, sms, gamegear, segacd | `genesis_plus_gx` | `genesis_plus_gx` |
+| arcade / fbneo | `fbneo` | `fbneo` |
+| n64 | `tico-mupen64plus` | `mupen64plus_next` |
+| psx | `tico-duckstation` | `pcsx_rearmed` |
+| dreamcast | `tico-flycast` | `flycast` |
+| nds | `tico-drastic` | `melonds` |
+| saturn | `tico-yabasanshiro` | — |
+| psp | `tico-ppsspp` | `ppsspp` |
+
+A `tico-` id is a save format no RetroArch core shares, so those saves sync
+between Switches and nowhere else rather than being offered to a core that
+would misread them. A system in neither column, in a folder that belongs to
+neither emulator, is sent with no emulator at all.
+
+The override is for a system whose emulator you changed. Tico can run GB on
+mGBA instead of Gambatte, and the client cannot see that choice yet:
+
+```ini
+[platform.gb]
+emulator = mgba
+```
+
+**A section that sets only `emulator` keeps that platform's built-in folders** —
+it is not a folder map, so it does not replace one. Add `roms`, `saves` or
+`states` to it and it becomes one, under the rule above. `emulator =` takes the
+override back out.
+
+The id has to be one RomM accepts — at most 50 characters, none of
+`\ / : | * ? " < >`, no control character, no space at either end. One that is
+not is dropped with a `warning` naming the line, and the built-in id stays in
+force: RomM would otherwise refuse every upload of that platform's saves.
 
 ### `conflict_show` hides the screen, never the recording
 
@@ -235,6 +286,9 @@ Each report carries a severity, the line number, and the section and key:
   files by name across the library.
 - A platform with `roms` but no `saves` → downloads work, saves are skipped
   for it.
+- `emulator` is checked against RomM's rule for an emulator id (see
+  [above](#emulator-which-emulator-romm-is-told-wrote-a-platforms-saves));
+  a refused one is a `warning` and the built-in id stays in force.
 - A section left with no folders at all is skipped entirely. Doing that on
   purpose (every key set to nothing) is a `notice`; arriving there because every
   line in the section was dropped — `rom` for `roms`, say — is a `warning`, since
@@ -273,9 +327,9 @@ Three things do change beyond the one line:
 - "reset to default" removes the key, and removes **every** occurrence of it in
   that section. Leaving an earlier one would hand the old value straight back on
   the next boot.
-- setting a folder for a platform that has **no section in your file yet** writes
-  that platform's built-in mapping out with your change applied on top, and says
-  so. A `[platform.x]` section replaces the built-in entry rather than adding to
+- setting a folder for a platform that has **no section in your file yet** — or
+  whose section sets only `emulator` — writes that platform's built-in mapping
+  out with your change applied on top, and says so. A `[platform.x]` section replaces the built-in entry rather than adding to
   it, so writing only the key you changed would unmap that platform's other
   folders as a side effect. Emptying one on purpose is still `roms =`.
 

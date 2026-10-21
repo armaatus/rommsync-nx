@@ -29,24 +29,6 @@ std::string LowerAscii(std::string_view text) {
   return out;
 }
 
-/// The `/`-separated segments of an SD path, in order, with empties dropped.
-std::vector<std::string_view> Segments(std::string_view sd_path) {
-  std::vector<std::string_view> segments;
-  std::size_t start = 0;
-  while (start <= sd_path.size()) {
-    const std::size_t slash = sd_path.find('/', start);
-    const std::size_t end = slash == std::string_view::npos ? sd_path.size() : slash;
-    if (end > start) {
-      segments.push_back(sd_path.substr(start, end - start));
-    }
-    if (slash == std::string_view::npos) {
-      break;
-    }
-    start = slash + 1;
-  }
-  return segments;
-}
-
 /// The largest whole second a `sync::Timestamp` can actually hold.
 ///
 /// `sync.hpp` warns that `system_clock::time_point` cannot be relied on to hold
@@ -170,17 +152,7 @@ std::string BaseName(std::string_view file_name) {
   return std::string(file_name.substr(0, file_name.size() - sync::ExtensionOf(file_name).size()));
 }
 
-std::string EmulatorFor(std::string_view sd_dir) {
-  for (const std::string_view segment : Segments(sd_dir)) {
-    const std::string lowered = LowerAscii(segment);
-    if (lowered == "retroarch" || lowered == "tico") {
-      return lowered;
-    }
-  }
-  return {};
-}
-
-std::string SlotFor(std::string_view emulator, std::string_view file_name) {
+std::string SlotFor(std::string_view source, std::string_view file_name) {
   // The extension, lowercased, with everything that is not a plain identifier
   // character dropped. FAT32 permits a good deal in a name, and the slot is a
   // key the server stores and this client has to reproduce byte for byte on
@@ -206,10 +178,10 @@ std::string SlotFor(std::string_view emulator, std::string_view file_name) {
     // overwriting through the server.
     extension = "save";
   }
-  if (emulator.empty()) {
+  if (source.empty()) {
     return extension;
   }
-  return LowerAscii(emulator) + "-" + extension;
+  return LowerAscii(source) + "-" + extension;
 }
 
 std::map<std::string, std::string, std::less<>> PlatformHints(const config::Config& config,
@@ -272,8 +244,9 @@ namespace {
 ///
 /// It reads each directory once, sorts its entries, resolves the platform hint,
 /// matches the base name against the rom index and range-checks the mtime --
-/// then hands what survived to `on_match`, which returns whether it emitted a
-/// record. Every decision in here is one docs/SYNC_PROTOCOL.md states about the
+/// then hands what survived to `on_match` with the folder's `SaveSource` --
+/// what the path says, read once per directory -- which returns whether it
+/// emitted a record. Every decision in here is one docs/SYNC_PROTOCOL.md states about the
 /// scan rather than about saves in particular, which is why a state gets the
 /// same one instead of a second copy that could drift from it.
 ///
@@ -316,7 +289,7 @@ void Walk(const std::vector<std::string>& directories,
     std::sort(listing.entries.begin(), listing.entries.end(),
               [](const fs::Entry& left, const fs::Entry& right) { return left.name < right.name; });
 
-    const std::string emulator = EmulatorFor(directory);
+    const SaveSource folder_source = SourceOf(directory);
     const auto hint = hints.find(directory);
     const std::string_view platform_hint =
         hint == hints.end() ? std::string_view() : std::string_view(hint->second);
@@ -364,7 +337,7 @@ void Walk(const std::vector<std::string>& directories,
         continue;
       }
 
-      if (on_match(sd_path, entry, *match.rom, emulator, record_skip)) {
+      if (on_match(sd_path, entry, *match.rom, folder_source, record_skip)) {
         ++emitted;
       }
     }
@@ -391,13 +364,16 @@ ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
            " saves; the rest of this card was not read",
        &result,
        [&](const std::string& sd_path, const fs::Entry& entry, const roms::Rom& rom,
-           const std::string& emulator, const auto& record_skip) {
+           const SaveSource& folder_source, const auto& record_skip) {
+         // Per rom rather than per folder: RetroArch's flat folder holds every
+         // system, and the id is the platform's.
+         const SaveSource source = ResolveSource(folder_source, rom.platform_fs_slug, config);
          SaveFile save;
          save.rom_id = rom.id;
          save.sd_path = sd_path;
          save.file_name = entry.name;
-         save.slot = SlotFor(emulator, entry.name);
-         save.emulator = emulator;
+         save.slot = SlotFor(ToString(source.source), entry.name);
+         save.emulator = source.emulator_id;
          save.platform_fs_slug = rom.platform_fs_slug;
          save.size_bytes = entry.size_bytes;
          save.modified_unix = entry.modified_unix;
@@ -471,12 +447,12 @@ ScanResult ScanStates(const config::Config& config, const roms::RomIndex& index,
            " states; the rest of this card was not read",
        &result,
        [&](const std::string& sd_path, const fs::Entry& entry, const roms::Rom& rom,
-           const std::string& emulator, const auto& record_skip) {
+           const SaveSource& folder_source, const auto& record_skip) {
          StateFile file;
          file.rom_id = rom.id;
          file.sd_path = sd_path;
          file.file_name = entry.name;
-         file.emulator = emulator;
+         file.emulator = ResolveSource(folder_source, rom.platform_fs_slug, config).emulator_id;
          file.platform_fs_slug = rom.platform_fs_slug;
          file.size_bytes = entry.size_bytes;
          file.modified_unix = entry.modified_unix;

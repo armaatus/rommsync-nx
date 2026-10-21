@@ -236,6 +236,7 @@ set(CONFIG_WRITE_SCENARIOS
   rejects    # a refused edit changes nothing, and never quotes a URL
   absent     # a missing key, and a missing section, both land where they read
   removes    # `remove` drops every occurrence and the default comes back
+  emulator   # the [platform.x] emulator override, and the folders it must not unmap
 )
 foreach(scenario IN LISTS CONFIG_WRITE_SCENARIOS)
   add_test(NAME config.write_${scenario} COMMAND test_config_write ${scenario})
@@ -980,10 +981,30 @@ set(SCAN_UNIT_SCENARIOS
   unusable     # a record sync::Validate refuses costs one file, not the tick
   truncated    # a directory past kMaxDirectoryEntries keeps a set that does not move
   hashing      # the digest is real, reused when nothing changed, null only when unreadable
+  sources      # fixture trees for each source scan to the emulator id that wrote them
 )
 foreach(scenario IN LISTS SCAN_UNIT_SCENARIOS)
   add_test(NAME scan.${scenario} COMMAND test_save_scan ${scenario})
   set_tests_properties(scan.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
+# M10-3: which emulator wrote a save. Pure tables and rules, so it never skips;
+# `retroarch_table` diffs the core-folder table against RomM's own, pinned.
+add_executable(test_save_source test_save_source.cpp)
+target_link_libraries(test_save_source PRIVATE rommsync::core)
+target_include_directories(test_save_source PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_save_source PRIVATE
+  ROMMSYNC_EMULATOR_NAMES="${CMAKE_SOURCE_DIR}/server/contract/romm-5.4.0-emulator_names.py")
+
+set(SOURCE_SCENARIOS
+  retroarch_table  # the core-folder table is RomM 5.4.0's, entry for entry
+  tico_table       # every Tico slug's module and id; isolated formats are tico-*
+  ids              # RomM's rule for an emulator id, refused before it is sent
+  layouts          # what a folder alone says, and what the platform adds
+)
+foreach(scenario IN LISTS SOURCE_SCENARIOS)
+  add_test(NAME source.${scenario} COMMAND test_save_source ${scenario})
+  set_tests_properties(source.${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
 
 set(SCAN_RIG_SCENARIOS

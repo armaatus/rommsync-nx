@@ -135,7 +135,7 @@ inline constexpr std::size_t kMaxDiagnostics = 16;
 /// Refused rather than shortened, which is where this parts company with
 /// `conflicts::Shorten`: a slot is a *key*, and half of one names a save that
 /// does not exist. A slot this long is a bug upstream rather than a user's long
-/// game title -- `scan::SlotFor` builds them from an emulator name and an
+/// game title -- `scan::SlotFor` builds them from a source name and an
 /// extension.
 inline constexpr std::size_t kMaxSlotBytes = 64;
 

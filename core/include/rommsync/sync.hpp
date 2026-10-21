@@ -167,7 +167,8 @@ struct ClientSaveState {
   /// empty string is refused rather than quietly treated as one or the other.
   std::optional<std::string> slot;
 
-  /// Which emulator wrote it (`retroarch`, `tico`), when that is known.
+  /// RomM's id for the emulator that wrote it -- a libretro core id such as
+  /// `snes9x`, or a `tico-*` one (`scan::ResolveSource`) -- when that is known.
   std::optional<std::string> emulator;
 
   /// **MD5** of the file's bytes, 32 lowercase hex digits. `null` when it has

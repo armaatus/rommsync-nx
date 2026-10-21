@@ -641,6 +641,74 @@ void NothingCrashesOnAPartialFile(checks::Checks& c) {
   c.Expect(Mentions(flood, "further problems"), "...and says how many it dropped");
 }
 
+// --- emulator overrides -----------------------------------------------------------
+
+void EmulatorOverridesAreCheckedAndKeepTheFolders(checks::Checks& c) {
+  const config::LoadResult set = config::ParseConfig(WithServer(
+      "[platform.gb]\n"
+      "emulator = mgba\n"
+      "[platform.gbc]\n"
+      "emulator = Genesis Plus GX\n"));
+  c.Expect(set.ok(), "an override parses: " + set.DescribeDiagnostics());
+  c.ExpectEq(std::string(set.value.EmulatorOverride("gb")), std::string("mgba"),
+             "mGBA for GB, from config.ini");
+  c.ExpectEq(std::string(set.value.EmulatorOverride("gbc")), std::string("Genesis Plus GX"),
+             "an id is taken as written, spaces and case included");
+  c.ExpectEq(std::string(set.value.EmulatorOverride("snes")), std::string(),
+             "a platform with no override has none");
+  // A section that sets *only* the emulator is not a folder map, so it must not
+  // replace one: "mGBA for GB" that also stopped GB syncing would be a trap
+  // nobody reading the line could see.
+  const config::Config defaults = config::Defaults();
+  const config::PlatformFolders* gb = set.value.Platform("gb");
+  c.Expect(gb != nullptr && gb->saves == defaults.Platform("gb")->saves &&
+               gb->roms == defaults.Platform("gb")->roms &&
+               gb->states == defaults.Platform("gb")->states,
+           "an emulator-only section keeps that platform's built-in folders");
+  c.Expect(Complaint(set, "platform.gb", "saves") == nullptr,
+           "...and says nothing about folders it did not touch");
+
+  const config::LoadResult mixed = config::ParseConfig(WithServer(
+      "[platform.gb]\n"
+      "emulator = mgba\n"
+      "saves = /tico/saves/gb\n"));
+  const config::PlatformFolders* mixed_gb = mixed.value.Platform("gb");
+  c.Expect(mixed_gb != nullptr && mixed_gb->roms.empty(),
+           "a section that sets a folder still replaces the map, as documented");
+  c.ExpectEq(std::string(mixed.value.EmulatorOverride("gb")), std::string("mgba"),
+             "...and keeps its override");
+
+  // The acceptance line: an id RomM would refuse is refused here, with a
+  // diagnostic naming the line, rather than turned into a 400 on every upload.
+  const config::LoadResult bad = config::ParseConfig(WithServer(
+      "[platform.gb]\n"
+      "emulator = retroarch/cores\n"
+      "[platform.snes]\n"
+      "emulator = " + std::string(51, 'x') + "\n"
+      "[platform.nes]\n"
+      "emulator = what?\n"));
+  for (const char* section : {"platform.gb", "platform.snes", "platform.nes"}) {
+    const config::Diagnostic* complaint = Complaint(bad, section, "emulator");
+    c.Expect(complaint != nullptr && complaint->severity == config::Severity::kWarning,
+             std::string("an invalid id is a warning on its line: ") + section);
+  }
+  c.Expect(Complaint(bad, "platform.gb", "emulator") != nullptr &&
+               Complaint(bad, "platform.gb", "emulator")->line == 4,
+           "the diagnostic carries the line number");
+  c.ExpectEq(std::string(bad.value.EmulatorOverride("gb")), std::string(),
+             "a refused id leaves the built-in one in force");
+  c.Expect(bad.value.Platform("gb") != nullptr && !bad.value.Platform("gb")->saves.empty(),
+           "and a refused id does not unmap the platform");
+
+  // `emulator =` is how an override is taken back out, like `roms =` for a folder.
+  const config::LoadResult cleared = config::ParseConfig(WithServer(
+      "[platform.gb]\n"
+      "emulator = mgba\n"
+      "emulator =\n"));
+  c.ExpectEq(std::string(cleared.value.EmulatorOverride("gb")), std::string(),
+             "an empty value clears the override");
+}
+
 // --- the document -------------------------------------------------------------------
 
 /// The first ```ini block of docs/CONFIG.md.
@@ -749,6 +817,7 @@ int main() {
   DuplicatesResolveToTheLastLine(c);
   PlatformSectionsReplaceTheBuiltInEntry(c);
   PathsAreCheckedBeforeTheyAreUsed(c);
+  EmulatorOverridesAreCheckedAndKeepTheFolders(c);
   TheServerUrlIsAnOriginOrNothing(c);
   LoadingFromDisk(c);
   NothingCrashesOnAPartialFile(c);

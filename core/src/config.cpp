@@ -3,6 +3,7 @@
 #include "rommsync/atomic_file.hpp"
 
 #include "rommsync/config_text.hpp"
+#include "rommsync/save_source.hpp"
 
 #include <cstddef>
 #include <iterator>
@@ -280,12 +281,37 @@ void ApplyDownloads(const ParseState& state, int line, std::string_view key,
   *target = flag;
 }
 
+/// `[platform.<slug>] emulator`. Checked against RomM's own rule here, at the
+/// line that wrote it, because an id RomM refuses is otherwise a 400 on every
+/// upload of that platform's saves -- reported per save, every tick, nowhere
+/// near the typo.
+void ApplyEmulator(const ParseState& state, int line, std::string_view key,
+                   std::string_view value, Config* config, Diagnostics* diags) {
+  if (value.empty()) {
+    // `emulator =` takes an override back out, the way `roms =` maps nowhere.
+    config->emulators.erase(state.slug);
+    return;
+  }
+  std::string why;
+  if (!scan::ValidEmulatorId(value, &why)) {
+    diags->Add(Severity::kWarning, line, state.section, key,
+               "'" + Redact(value) + "' " + why + "; this line is ignored and " + state.slug +
+                   " keeps its built-in emulator id");
+    return;
+  }
+  config->emulators[state.slug] = std::string(value);
+}
+
 /// `rejected` collects slugs whose section had a line the parser could not use,
 /// so the end-of-parse sweep can tell a platform emptied on purpose from one
 /// emptied by a typo.
 void ApplyPlatform(const ParseState& state, int line, std::string_view key,
                    std::string_view value, Config* config, Diagnostics* diags,
                    std::set<std::string>* rejected) {
+  if (key == "emulator") {
+    ApplyEmulator(state, line, key, value, config, diags);
+    return;
+  }
   std::vector<std::string>* target = nullptr;
   PlatformFolders& folders = config->platforms[state.slug];
   if (key == "roms") {
@@ -631,6 +657,11 @@ const PlatformFolders* Config::Platform(std::string_view slug) const {
   return found == platforms.end() ? nullptr : &found->second;
 }
 
+std::string_view Config::EmulatorOverride(std::string_view slug) const {
+  const auto found = emulators.find(slug);
+  return found == emulators.end() ? std::string_view() : std::string_view(found->second);
+}
+
 std::string Config::RomTarget(std::string_view slug) const {
   const PlatformFolders* folders = Platform(slug);
   if (folders == nullptr || folders->roms.empty()) {
@@ -775,6 +806,8 @@ LoadResult ParseConfig(std::string_view text) {
   std::set<std::string> sections_seen;       // canonical section names already opened
   std::set<std::string> platform_sections;   // which slugs the file has claimed
   std::set<std::string> platform_rejected;   // ...and which had a line that was dropped
+  std::set<std::string> platform_folders;    // ...which had a line other than `emulator`
+  std::set<std::string> platform_emulators;  // ...and which had an `emulator` line
   std::set<std::string> assigned;            // "section\x1fkey" pairs already set
   bool platform_cap_reported = false;
 
@@ -921,6 +954,7 @@ LoadResult ParseConfig(std::string_view text) {
         ApplyDownloads(state, line_number, key, value, &result.value, &diags);
         break;
       case SectionKind::kPlatform:
+        (key == "emulator" ? platform_emulators : platform_folders).insert(state.slug);
         ApplyPlatform(state, line_number, key, value, &result.value, &diags,
                       &platform_rejected);
         break;
@@ -940,6 +974,18 @@ LoadResult ParseConfig(std::string_view text) {
   // likely way a user stops their own saves from syncing.
   for (const std::string& slug : platform_sections) {
     const std::string section = "platform." + slug;
+    const auto defaults = DefaultPlatforms().find(slug);
+    if (platform_folders.find(slug) == platform_folders.end() &&
+        platform_emulators.find(slug) != platform_emulators.end() &&
+        defaults != DefaultPlatforms().end()) {
+      // A section that sets only `emulator` is not a folder map, so it does not
+      // replace one. "mGBA for GB" must not also mean "stop syncing GB", and
+      // nobody reading that one line could tell that it did -- nor a refused or
+      // emptied `emulator` line. A section with no lines at all is still the
+      // documented way to unmap a platform.
+      result.value.platforms[slug] = defaults->second;
+      continue;
+    }
     const PlatformFolders& now = result.value.platforms[slug];
     if (now.empty()) {
       // Emptying a section on purpose is how a user removes a built-in mapping
@@ -955,7 +1001,6 @@ LoadResult ParseConfig(std::string_view text) {
                     : "maps no folders, so " + slug + " is skipped entirely");
       continue;
     }
-    const auto defaults = DefaultPlatforms().find(slug);
     if (defaults == DefaultPlatforms().end()) {
       continue;
     }

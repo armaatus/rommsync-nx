@@ -21,18 +21,27 @@ For each file under the configured save/state dirs:
    RetroArch's flat `saves/` doesn't — match by name across the library then).
 4. Ambiguous match (same base name on two platforms, no platform hint) → skip and
    log; never guess.
-5. Derive the `slot` from the emulator the folder belongs to and the save's own
-   extension (`retroarch-srm`). It pairs with `rom_id` on the server, so it has
-   to be **derived, not chosen**: a slot that changes between ticks makes the
-   same file a new save every tick. The emulator is in it because RomM pairs on
-   `(rom_id, slot)` alone — a rom whose RetroArch `.srm` and Tico `.srm` both
-   mapped to `srm` would have the two files overwrite each other through the
-   server, forever.
-6. Validate the record before emitting it. A save the encoder would refuse — an
+5. Derive the `slot` from the source the folder belongs to (RetroArch or Tico)
+   and the save's own extension (`retroarch-srm`). It pairs with `rom_id` on the
+   server, so it has to be **derived, not chosen**: a slot that changes between
+   ticks makes the same file a new save every tick. The source is in it because
+   RomM pairs on `(rom_id, slot)` alone — a rom whose RetroArch `.srm` and Tico
+   `.srm` both mapped to `srm` would have the two files overwrite each other
+   through the server, forever. (#236 moves saves to `autosave`.)
+6. Name the `emulator` that wrote it — the id RomM pairs lineages on and other
+   clients look saves up by, not the source's name (`scan::ResolveSource`,
+   [`save_source.hpp`](../core/include/rommsync/save_source.hpp)). A RetroArch
+   sort-by-core folder RomM's table knows names its core (`saves/mGBA/` →
+   `mgba`); otherwise `[platform.<slug>] emulator` in `config.ini` decides;
+   otherwise the built-in table: the libretro core id where the bytes are
+   RetroArch-compatible (`snes9x`, `gambatte`, `genesis_plus_gx`), a `tico-*`
+   id where they are not (`tico-duckstation`, `tico-ppsspp`), and `null` for a
+   system neither table knows. The same id goes on a state's upload.
+7. Validate the record before emitting it. A save the encoder would refuse — an
    mtime of 0 from a console with an unset clock, a name the server would read
    as a path — is skipped with a reason, because `EncodeNegotiateRequest` stops
    at the first bad entry and would otherwise cost the tick every other save.
-7. Fill `content_hash` from `state::ContentHashFor` — the baseline's digest when
+8. Fill `content_hash` from `state::ContentHashFor` — the baseline's digest when
    the file's mtime **and** size still match, a fresh read otherwise. **Never
    leave it null to save a read**: a save reported without a digest is compared
    on timestamps and planned as an `upload` the server already has, on this tick
@@ -68,7 +77,7 @@ the SHA1 the rom schema uses:
       "updated_at": "2026-09-03T12:00:00Z",    // required — FS mtime, UTC
       "file_size_bytes": 32768,                // required
       "slot": "autosave",                      // optional, but see below
-      "emulator": "retroarch",                 // or "tico"
+      "emulator": "snes9x",                    // the core that wrote it; step 0
       "content_hash": "<MD5 of the file bytes>"
     }
     // ... one per local save

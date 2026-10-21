@@ -43,6 +43,13 @@ resume      = true
 ; saves  = directories scanned for SRAM saves
 ; states = directories scanned for save states
 ;
+; emulator = the RomM emulator id this platform's saves are sent as, when the
+;            built-in one is wrong -- say Tico runs GB on mGBA. A section with
+;            only this key keeps the built-in folders. See docs/CONFIG.md.
+;
+; [platform.gb]
+; emulator = mgba
+;
 ; Check these against your card before the first sync. The RetroArch paths are
 ; correct; the Tico ones are best guesses.
 ;

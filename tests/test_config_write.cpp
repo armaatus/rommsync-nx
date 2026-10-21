@@ -429,6 +429,79 @@ void Removes(checks::Checks& c) {
   c.ExpectEq(after, std::string("untouched"), "and writes nothing");
 }
 
+// --- the emulator override ------------------------------------------------------
+
+void Emulator(checks::Checks& c) {
+  const std::string before = Busy();
+
+  // Set in an existing section: one line, and the folders stay as written.
+  const std::string snes =
+      Applied(c, before, One("platform.snes", "emulator", "snes9x"), "platform.snes emulator");
+  const config::Config snes_parsed = Parsed(snes);
+  c.ExpectEq(std::string(snes_parsed.EmulatorOverride("snes")), std::string("snes9x"),
+             "an override set from the overlay reads back");
+  c.Expect(snes_parsed.Platform("snes") != nullptr &&
+               snes_parsed.Platform("snes")->saves == Parsed(before).Platform("snes")->saves,
+           "and the section's folders are untouched");
+
+  // A section that does not exist yet gets the override and nothing else: an
+  // emulator-only section keeps the built-in folders, so there is nothing to
+  // carry and nothing to tell the user about.
+  std::string gb;
+  std::vector<config::Diagnostic> notes;
+  c.Expect(config::ApplyEdit(before, One("platform.gb", "emulator", "mgba"), &gb, &notes),
+           "an override for a platform with no section");
+  c.Expect(gb.find("[platform.gb]\r\nemulator = mgba") != std::string::npos ||
+               gb.find("[platform.gb]\nemulator = mgba") != std::string::npos,
+           "is a new section with the one line in it");
+  c.Expect(gb.find("/tico/roms/gb") == std::string::npos, "and no folders written out");
+  c.Expect(!Mentions(notes, "written out"), "and nothing carried, so no notice");
+  const config::Config gb_parsed = Parsed(gb);
+  c.Expect(gb_parsed.Platform("gb") != nullptr &&
+               gb_parsed.Platform("gb")->roms == config::Defaults().Platform("gb")->roms,
+           "gb keeps its built-in folders");
+
+  // ...and a folder set later in that emulator-only section must not unmap the
+  // other two: the section's folders in force are the built-in ones, and the
+  // edit lands on those, exactly as it does for a section that is not there.
+  std::string moved;
+  notes.clear();
+  c.Expect(config::ApplyEdit(gb, One("platform.gb", "saves", "/tico/saves/gb"), &moved, &notes),
+           "a folder in an emulator-only section");
+  const config::Config moved_parsed = Parsed(moved);
+  const config::PlatformFolders* moved_gb = moved_parsed.Platform("gb");
+  c.Expect(moved_gb != nullptr && moved_gb->roms == config::Defaults().Platform("gb")->roms,
+           "the roms folder in force is carried, not dropped");
+  c.Expect(moved_gb != nullptr && moved_gb->saves == std::vector<std::string>{"/tico/saves/gb"},
+           "the saves folder is the one that was set");
+  c.ExpectEq(std::string(moved_parsed.EmulatorOverride("gb")), std::string("mgba"),
+             "and the override is still there");
+  c.Expect(Mentions(notes, "written out"), "and the user is told what was carried");
+
+  // A section that is there and maps nothing on purpose is not given folders back.
+  const std::string off = "[server]\nurl = https://romm.example.com\n[platform.psp]\n";
+  const std::string psp =
+      Applied(c, off, One("platform.psp", "saves", "/tico/saves/psp"), "platform.psp saves");
+  const config::Config psp_parsed = Parsed(psp);
+  c.Expect(psp_parsed.Platform("psp") != nullptr && psp_parsed.Platform("psp")->roms.empty(),
+           "an emptied section stays empty but for what was set");
+
+  // Refused, with nothing written, for an id RomM would refuse.
+  std::string untouched = "unchanged";
+  notes.clear();
+  c.Expect(!config::ApplyEdit(before, One("platform.snes", "emulator", "snes/9x"), &untouched,
+                              &notes),
+           "an id with a slash is refused");
+  c.ExpectEq(untouched, std::string("unchanged"), "and nothing was written");
+  c.Expect(!notes.empty() && notes.back().key == "emulator", "the refusal names the key");
+
+  // Reset to default removes it.
+  const std::string reset =
+      Applied(c, snes, Remove("platform.snes", "emulator"), "platform.snes emulator removed");
+  c.ExpectEq(std::string(Parsed(reset).EmulatorOverride("snes")), std::string(),
+             "removing the override puts the built-in id back");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -443,6 +516,8 @@ int main(int argc, char** argv) {
     Absent(checks);
   } else if (scenario == "removes") {
     Removes(checks);
+  } else if (scenario == "emulator") {
+    Emulator(checks);
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;
