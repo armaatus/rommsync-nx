@@ -840,7 +840,12 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// and `conflicts::RecordSaves`/`RecordStates` on the way out -- which live
   /// here because `conflict_record.hpp` includes `state_sync.hpp`, so recording
   /// from inside the tick would be a cycle.
-  void RunOneTick();
+  ///
+  /// **False when it stopped for a game** (#242): one launched after the worker
+  /// asked and before the first save is planned. Nothing is recorded then --
+  /// not `Finished`, not the play window -- and the caller hands the tick back
+  /// to the scheduler exactly as if the game had been running when it asked.
+  bool RunOneTick();
 
   /// The restore `RequestRestore` took, start to finish, and its outcome
   /// recorded in `restore_` (#209). Called on the worker, or on the caller when

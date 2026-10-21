@@ -3577,8 +3577,9 @@ int Foreground(http::HttpClient& client, const std::string& base) {
   std::this_thread::sleep_for(std::chrono::seconds{1});
 
   c.ExpectEq(counted.urls().size(), std::size_t{0},
-             "nothing reached the server while the game ran: no negotiate, no upload, no "
-             "download");
+             "nothing reached the server while the game ran: no heartbeat -- this is the "
+             "boot's first tick, so one was due (#228) -- no library, no negotiate (where "
+             "#235's 'sync is disabled' would come from), no upload, no download");
   const std::vector<std::int64_t> during = SaveIdsFor(client, base, fixture, rom.id);
   c.ExpectEq(during.size(), before.size(), "so RomM holds no new save for the rom");
   c.ExpectEq(console.sandbox.Read(save), played, "and the save on the card is untouched");
@@ -3669,6 +3670,13 @@ int Foreground(http::HttpClient& client, const std::string& base) {
     }
   }
   c.ExpectEq(other_uploaded.size(), std::size_t{1}, "and uploads the second save, once");
+  std::size_t heartbeats = 0;
+  for (const std::string& url : counted.urls()) {
+    heartbeats += url.find("/api/heartbeat") != std::string::npos ? 1 : 0;
+  }
+  c.ExpectEq(heartbeats, std::size_t{1},
+             "one heartbeat in the whole run: the tick that ran after the first game read "
+             "it, the held ticks never did, and the second tick reused the answer (#228)");
 
   for (const std::int64_t id : uploaded) {
     harness::DeleteSave(client, base, fixture, id);

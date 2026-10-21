@@ -97,9 +97,7 @@ void SyncScreen::Poll() {
   // started" would come back when the sync ended. What to *do* about it is
   // still the view model's (`overlay_sync_actions.hpp`); this only records that
   // it happened.
-  // A press held for a running game (#242) is the same promise made later.
-  if (last_.kind == LastCommand::Kind::kSyncNow &&
-      (last_.sync == ipc::SyncOutcome::kAccepted || last_.sync == ipc::SyncOutcome::kDeferred) &&
+  if (last_.kind == LastCommand::Kind::kSyncNow && PromisesTick(last_.sync) &&
       status_.sync_in_progress) {
     last_.sync_seen_running = true;
   }

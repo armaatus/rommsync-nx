@@ -19,7 +19,8 @@
 //
 // The table is **twice** the count rounded up to a power of two, so the next
 // service is an edit to a term here rather than a surprise on a console --
-// which is what #242's `pm:dmnt` was: one session, `kPm`, and 64 still fits. It is not the 1023 maximum other sysmodules declare:
+// which is what #242's `pm:dmnt` was: one session, `kPm`, and 64 still fits.
+// It is not the 1023 maximum other sysmodules declare:
 // sessions count against the system resource limit every system module shares,
 // so a table sized for a leak lets one spend that budget, where this one fails
 // the leaking call in this process first.

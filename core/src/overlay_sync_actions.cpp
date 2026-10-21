@@ -145,9 +145,7 @@ void SetNotice(SyncActionsView* view, const ipc::Status& status, const LastComma
       // A held press (#242) goes the same way, for the same reason, once the
       // tick it promised starts: until then it is the only thing on the screen
       // saying the press was not lost.
-      if ((last.sync == ipc::SyncOutcome::kAccepted ||
-           last.sync == ipc::SyncOutcome::kDeferred) &&
-          (status.sync_in_progress || last.sync_seen_running)) {
+      if (PromisesTick(last.sync) && (status.sync_in_progress || last.sync_seen_running)) {
         return;
       }
       view->notice = SyncOutcomeText(last.sync);
@@ -206,6 +204,10 @@ ipc::SyncOutcome PredictSyncNow(const ipc::Status& status) {
     return ipc::SyncOutcome::kAlreadyRunning;
   }
   return ipc::SyncOutcome::kAccepted;
+}
+
+bool PromisesTick(ipc::SyncOutcome outcome) {
+  return outcome == ipc::SyncOutcome::kAccepted || outcome == ipc::SyncOutcome::kDeferred;
 }
 
 std::string SyncOutcomeText(ipc::SyncOutcome outcome) {

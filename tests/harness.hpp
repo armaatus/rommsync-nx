@@ -394,17 +394,11 @@ inline http::Result PostJson(http::HttpClient& client, const std::string& url,
   return client.Send(request);
 }
 
-/// A second device of the fixture user's, with sync switched off for it in
-/// RomM -- the setting `400 "Sync is disabled for this device"` reports (#235).
-/// Empty, with a failed check, when RomM would not make one.
-///
-/// Its own device rather than the fixture's switched off and back: every rig
-/// process negotiates as the fixture device, so turning *that* one off would
-/// fail whichever test was mid-tick on it. The fixture token can do this
-/// because pairing granted `devices.write`. `DeleteDevice` removes it.
 /// A second device of the fixture user's, with sync on -- a console with no
 /// history at all, so its first tick uploads what is on its card rather than
 /// negotiating against whatever the fixture device has done (#242).
+/// Empty, with a failed check, when RomM would not make one. The fixture token
+/// can do this because pairing granted `devices.write`. `DeleteDevice` removes it.
 inline std::string CreateDevice(rig::Checks& checks, http::HttpClient& client,
                                 const std::string& base, const Fixture& fixture,
                                 const std::string& name) {
@@ -419,6 +413,12 @@ inline std::string CreateDevice(rig::Checks& checks, http::HttpClient& client,
   return device_id;
 }
 
+/// The same, with sync switched off for it in RomM -- the setting
+/// `400 "Sync is disabled for this device"` reports (#235).
+///
+/// Its own device rather than the fixture's switched off and back: every rig
+/// process negotiates as the fixture device, so turning *that* one off would
+/// fail whichever test was mid-tick on it.
 inline std::string CreateSyncDisabledDevice(rig::Checks& checks, http::HttpClient& client,
                                             const std::string& base, const Fixture& fixture,
                                             const std::string& name) {

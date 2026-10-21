@@ -985,18 +985,26 @@ void SdEngine::RunWorker() {
     sync::Decision decision = scheduler_.Poll();
     if (decision.run()) {
       // Asked only now, when a tick is actually due: a console with nothing to
-      // run never asks `pm` anything (#242).
+      // run never asks `pm` anything (#242). And asked **first**, ahead of
+      // everything `RunOneTick` does -- the gate, #228's heartbeat and floor,
+      // the library, and the negotiate that answers #235's "sync is disabled"
+      // -- so a held tick spends no request at all and says nothing about the
+      // server it has not asked.
       lock.unlock();
-      const bool game = application_running();
+      bool game = application_running();
       lock.lock();
       if (!game) {
         holding_ = false;
         sync_in_progress_ = true;
         lock.unlock();
-        RunOneTick();
+        // False is a game launched while the tick fetched the library: held
+        // below exactly as if it had been running when it was asked.
+        game = !RunOneTick();
         lock.lock();
         sync_in_progress_ = false;
-        continue;
+        if (!game) {
+          continue;
+        }
       }
       // **Held, not run, and not lost.** A game holds its save in memory and
       // writes it when it closes, so a download placed under it is overwritten
@@ -1017,6 +1025,10 @@ void SdEngine::RunWorker() {
       }
       decision = sync::Decision{};
       decision.sleep_for = foreground_poll_;
+    } else {
+      // Nothing is owed -- the switch went off under a hold, say -- so the next
+      // hold is a new one and says so.
+      holding_ = false;
     }
 
     // A list page is one request and somebody is looking at a screen waiting for
@@ -1525,7 +1537,7 @@ void SdEngine::LogPlayStore(const play::StoreResult& stored) {
   }
 }
 
-void SdEngine::RunOneTick() {
+bool SdEngine::RunOneTick() {
   const std::shared_ptr<const config::Config> config = ConfigSnapshot();
   http::HttpClient* client = nullptr;
   fs::FileSystem* files = nullptr;
@@ -1585,7 +1597,7 @@ void SdEngine::RunOneTick() {
     std::lock_guard<std::mutex> lock(mutex_);
     scheduler_.Finished(sync::TickOutcome::kUnauthorized);
     RecordFailedTickLocked();
-    return;
+    return true;
   }
   if (client == nullptr || files == nullptr || token.access_token.empty() ||
       !config->configured()) {
@@ -1615,7 +1627,7 @@ void SdEngine::RunOneTick() {
     std::lock_guard<std::mutex> lock(mutex_);
     scheduler_.Finished(sync::TickOutcome::kOffline);
     RecordFailedTickLocked();
-    return;
+    return true;
   }
 
   // M10-2 (#228): which RomM this is, before anything is asked of it. Once a
@@ -1669,7 +1681,7 @@ void SdEngine::RunOneTick() {
         if (outcome != sync::TickOutcome::kCanceled) {
           RecordFailedTickLocked();
         }
-        return;
+        return true;
       }
       caps = probe.capabilities;
       if (caps.supported) {
@@ -1705,7 +1717,7 @@ void SdEngine::RunOneTick() {
     if (server_generation_ == generation) {
       server_too_old_ = true;
     }
-    return;
+    return true;
   }
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1753,7 +1765,20 @@ void SdEngine::RunOneTick() {
                                                          : sync::TickOutcome::kOffline,
                         library.transport);
     RecordFailedTickLocked();
-    return;
+    return true;
+  }
+
+  // **Asked again, here** (#242). The worker asked before this tick started,
+  // and the rom index can be several pages: a game launched meanwhile has
+  // already read the save a download would replace. This is the last moment
+  // before anything is planned, placed, sent -- or stamped into the play window
+  // -- and the GETs above wrote nothing. The tick goes back to the scheduler
+  // as if the game had been running when the worker asked.
+  //
+  // Once, not before every placement: a game launched mid-execute is a window
+  // of one transfer, where this one was the length of the library.
+  if (application_running()) {
+    return false;
   }
 
   const std::string baseline_path = files->Resolve(sync::kStateSdPath);
@@ -2070,6 +2095,7 @@ void SdEngine::RunOneTick() {
       last_sync_result_ = ipc::SyncResult::kFailed;
       break;
   }
+  return true;
 }
 
 ipc::Error SdEngine::StartPairing() {
