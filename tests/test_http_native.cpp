@@ -152,11 +152,46 @@ http::Request DeviceInit(const std::string& base, const std::string& identifier)
   return request;
 }
 
+/// RomM's device-init window: ten a minute per client IP, counted in a fixed
+/// Redis window that opens on the first init and expires 60 s later
+/// (`AUTHORIZE_RATE_LIMIT` and `RATE_LIMIT_WINDOW_SECONDS` in RomM's
+/// `backend/utils/device_auth.py`, 5.2.0 and 5.4.0 alike). Both are constants,
+/// not settings, and the 429 carries no Retry-After.
+constexpr std::chrono::seconds kInitWindow{60};
+
+/// How long a 429 asks to be left alone: its Retry-After in seconds if it has
+/// one, else the whole of RomM's window -- which, being fixed rather than
+/// sliding, is certain to have rolled over by then. One second over, for the
+/// clocks.
+std::chrono::seconds RetryAfter(const http::Response& refused) {
+  const std::string* header = http::FindHeader(refused.headers, "Retry-After");
+  if (header != nullptr && !header->empty() && header->size() < 6 &&
+      std::all_of(header->begin(), header->end(), [](char c) { return c >= '0' && c <= '9'; })) {
+    return std::chrono::seconds(std::stoi(*header) + 1);
+  }
+  return kInitWindow + std::chrono::seconds(1);
+}
+
 // A JSON POST against the endpoint the device-code flow (M1) actually starts on.
+//
+// The suite reaches that endpoint from one IP, the fault proxy's, and `pair.*`,
+// `device.*` and `engine.*` open codes on it too -- so whether RomM's ten a
+// minute is already spent when this runs is test order and timing (#235's
+// flake, held by `http.post_json_spent`). A 429 is therefore waited out ONCE,
+// for as long as the window it names, and the second answer is held to exactly
+// what the first would have been. Not a retry loop: a second 429 is red.
 int PostJson(http::HttpClient& client, const std::string& base) {
   rig::Checks checks;
 
-  const http::Result result = client.Send(DeviceInit(base, "rommsync-nx-http-test"));
+  const http::Request init = DeviceInit(base, "rommsync-nx-http-test");
+  http::Result result = client.Send(init);
+  if (result.ok() && result.response.status == 429) {
+    const std::chrono::seconds wait = RetryAfter(result.response);
+    std::cerr << "  device init is rate limited (429); waiting " << wait.count()
+              << "s for RomM's window, then sending it once more\n";
+    std::this_thread::sleep_for(wait);
+    result = client.Send(init);
+  }
   checks.ExpectOk(result, "POST /api/auth/device/init");
   checks.ExpectEq(result.response.status, 201, "status");
   checks.Expect(!rig::JsonString(result.response.body, "device_code").empty(),

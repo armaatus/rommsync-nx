@@ -394,7 +394,18 @@ ctest --test-dir build --output-on-failure
   `POST /api/auth/device/init` to **ten a minute, per IP**. A console
   pairs once; the suite opens a dozen codes from one address, so `pair.*` waits
   a rate-limited init out rather than failing on it. The wait is bounded, so an
-  init broken for any other reason still goes red.
+  init broken for any other reason still goes red. The address is the fault
+  proxy's, since every rig test goes through it, so the budget is the suite's.
+  It is a fixed Redis window (`AUTHORIZE_RATE_LIMIT`/`RATE_LIMIT_WINDOW_SECONDS`
+  in RomM's `backend/utils/device_auth.py`, 5.2.0 and 5.4.0 alike): constants
+  rather than settings, so the fixture cannot lift it, and the `429` carries no
+  `Retry-After`. The limiter also sits *behind* body validation, so a probe
+  with an empty body answers `422` and says nothing about it, while a valid one
+  spends budget. `http.post_json` / `wire.post_json` were the init callers that
+  did not wait, and failed whenever `pair.*`, `device.*` or `engine.*` had spent
+  the minute first (the 5.4.0 flake after #235). They now wait out one whole
+  window on a `429` and send once more; a second `429` is still red.
+  `http.post_json_spent` holds that by spending the window itself first.
 - The `device.*` tests cover registering the console (M1-3): `shapes`,
   `registered`, `repair`, `recovers`, `deleted`, `revoked`, `forbidden`,
   `sync_disabled`, `offline`, `impostor`, `never_post`. All but `shapes` need the rig, and they
