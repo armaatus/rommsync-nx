@@ -499,8 +499,14 @@ void Reset() {
   State& state = TheLog();
   std::lock_guard<std::mutex> lock(state.mutex);
   // Emptied, not merely forgotten: `Reset` is a fresh process's log, and that
-  // holds no line's bytes either.
-  state.ring = {};
+  // holds no line's bytes either. A swap with an empty string rather than
+  // `ring = {}`: libstdc++ -- the console's library -- assigns a short string
+  // into the buffer it already has, so assignment would keep every reserved
+  // slot's 256 bytes.
+  for (Line& slot : state.ring) {
+    std::string().swap(slot.text);
+    slot = Line{};
+  }
   state.next = 0;
   state.filled = 0;
   state.written = 0;

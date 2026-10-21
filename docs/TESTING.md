@@ -852,7 +852,8 @@ ctest --test-dir build --output-on-failure
   The same scenario runs nightly for a thousand rounds
   (`.github/workflows/soak.yml`), with its samples kept as an artifact. A
   schedule GitHub can disable for inactivity is not trusted on its own: the
-  `soak-fresh` job turns main red when the soak has not passed in three days
+  `soak-fresh` job turns main red when no *scheduled* soak has passed in three
+  days -- a hand-run one of four rounds does not reset the clock
   (`scripts/soak-fresh.sh`; `soak.workflow` and `soak.fresh` hold both).
 
   These are host numbers: the host's standard library, C++ allocations only

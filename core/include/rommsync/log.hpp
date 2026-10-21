@@ -342,7 +342,8 @@ struct Line {
 /// The last `count` lines, oldest first, and how many have been written in all.
 ///
 /// **Always available, sink or no sink.** The ring is the log's own memory: it
-/// costs `kTailLines * kMaxLineBytes` at worst -- 6 KiB, which is a term in the
+/// costs `kTailLines * kMaxLineBytes` once it is full -- each slot is reserved
+/// at that bound, so it is that and never more (M9-15, #204) -- 6 KiB, a term in the
 /// sysmodule's heap table (`sysmodule/source/main.cpp`) rather than a cost
 /// nobody added up -- and it is what `ipc::ServiceCore::GetLog`
 /// answers from, so the overlay can show why a sync did not happen without an SD

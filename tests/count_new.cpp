@@ -9,11 +9,6 @@
 // which keeps the pointer handed out aligned the way the caller asked.
 #include "count_new.hpp"
 
-#if !defined(ROMMSYNC_COUNT_NEW_DISABLED)
-
-#include <cstdlib>
-#include <new>
-
 namespace count_new {
 
 Counters& Get() {
@@ -24,6 +19,15 @@ Counters& Get() {
   return counters;
 }
 
+}  // namespace count_new
+
+#if !defined(ROMMSYNC_COUNT_NEW_DISABLED)
+
+#include <cstdlib>
+#include <limits>
+#include <new>
+
+namespace count_new {
 namespace {
 
 constexpr std::size_t kDefaultAlignment = __STDCPP_DEFAULT_NEW_ALIGNMENT__;
@@ -34,6 +38,9 @@ std::size_t HeaderFor(std::size_t alignment) {
 
 void* Allocate(std::size_t size, std::size_t alignment) noexcept {
   const std::size_t header = HeaderFor(alignment);
+  if (size > std::numeric_limits<std::size_t>::max() - header) {
+    return nullptr;
+  }
   void* block = nullptr;
   if (::posix_memalign(&block, header, header + (size == 0 ? 1 : size)) != 0) {
     return nullptr;
@@ -142,14 +149,5 @@ void operator delete(void* pointer, std::size_t, std::align_val_t alignment) noe
 void operator delete[](void* pointer, std::size_t, std::align_val_t alignment) noexcept {
   Release(pointer, static_cast<std::size_t>(alignment));
 }
-
-#else
-
-namespace count_new {
-Counters& Get() {
-  static constinit Counters counters;
-  return counters;
-}
-}  // namespace count_new
 
 #endif

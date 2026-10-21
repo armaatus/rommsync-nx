@@ -6,7 +6,10 @@
 # Run inside devkitpro/devkita64, after `make -C sysmodule` and `make -C overlay`:
 # the `switch-build` CI job runs it over its checkout, and `ctest -R
 # switch.builds` runs it over the copy it built. It reads the ELFs in place and
-# builds nothing.
+# builds nothing -- so over a worktree that has built before, `make clean`
+# first: make tracks no flags, and objects left from an older switch.mk link
+# into an image these ceilings were never set for (a stale tree measured an
+# .eh_frame of 33,632 bytes where a clean one has 27,288).
 #
 # Why the image and not the source: the heap is a `.bss` array
 # (`g_inner_heap`, sysmodule/source/main.cpp), so the toolchain's own
@@ -51,7 +54,11 @@ ROOT=.
 while [ $# -gt 0 ]; do
   case "$1" in
     --root) ROOT="$2"; shift 2 ;;
-    --image-budget) IMAGE_BUDGET="$2"; shift 2 ;;
+    --image-budget)
+      # Checked, because a non-number makes the `-gt` below an error inside an
+      # `if`, which is false: the ceiling would pass without being applied.
+      [[ "${2:-}" =~ ^[0-9]+$ ]] || { echo "--image-budget takes a byte count" >&2; exit 2; }
+      IMAGE_BUDGET="$2"; shift 2 ;;
     *) echo "usage: $0 [--root DIR] [--image-budget BYTES]" >&2; exit 2 ;;
   esac
 done

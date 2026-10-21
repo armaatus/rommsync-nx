@@ -19,9 +19,12 @@
 #
 # Inputs, each overridable so `ctest -R soak.fresh` can drive it without a
 # network or a token:
-#   SOAK_LAST_SUCCESS  ISO-8601 time of the last successful run on main; "none"
-#                      for never. Default: asked of the GitHub API with `gh`,
-#                      which needs GH_TOKEN.
+#   SOAK_LAST_SUCCESS  ISO-8601 time of the last successful *scheduled* run on
+#                      main; "none" for never. Default: asked of the GitHub API
+#                      with `gh`, which needs GH_TOKEN. Scheduled only, because a
+#                      `workflow_dispatch` of four rounds passes too and would
+#                      reset the clock without having soaked anything; and
+#                      because the schedule is the thing that can stop.
 #   SOAK_SINCE         ISO-8601 time soak.yml was added. Default: from git,
 #                      which needs history (ci.yml checks out with depth 0).
 #   SOAK_NOW           ISO-8601 time to judge at. Default: now.
@@ -48,11 +51,20 @@ print(int(moment.timestamp()))
 }
 
 if [ -z "${SOAK_LAST_SUCCESS+set}" ]; then
-  SOAK_LAST_SUCCESS="$(gh run list --workflow soak.yml --branch main --status success \
-                         --limit 1 --json createdAt --jq '.[0].createdAt // "none"')" || {
-    echo "::error::could not ask GitHub for the last successful soak" >&2
-    exit 1
-  }
+  # Three tries, ten seconds apart: one API hiccup should not turn main red for
+  # a reason that has nothing to do with the soak.
+  for attempt in 1 2 3; do
+    if SOAK_LAST_SUCCESS="$(gh run list --workflow soak.yml --branch main --event schedule \
+                              --status success --limit 1 --json createdAt \
+                              --jq '.[0].createdAt // "none"')"; then
+      break
+    fi
+    [ "$attempt" -lt 3 ] || {
+      echo "::error::could not ask GitHub for the last successful soak" >&2
+      exit 1
+    }
+    sleep 10
+  done
 fi
 if [ -z "${SOAK_SINCE+set}" ]; then
   SOAK_SINCE="$(git log --diff-filter=A --format=%cI -- "$WORKFLOW" | tail -n 1)"

@@ -183,8 +183,9 @@ namespace {
 //     RomM (tests/test_heap_steady.cpp). Between ticks it holds ~17 KiB, and
 //     that floor does not move across ticks: not a block, not a byte. A quiet
 //     tick peaks ~170 KiB over it, most of it the rom index being fetched and
-//     parsed. The nightly soak (.github/workflows/soak.yml) holds the same floor
-//     across a thousand rounds of a tick and a download.
+//     parsed. With a rom download added to every tick the floor held flat
+//     across a hundred rounds when this was written, and the nightly soak
+//     (.github/workflows/soak.yml) asks the same of a thousand.
 //
 // What the second one is **not**: a console number. It is counted on the host's
 // standard library, it counts C++ allocations only -- libcurl's `malloc`s are

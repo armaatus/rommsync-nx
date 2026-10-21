@@ -43,12 +43,19 @@ phase_workflow() {
   grep -q 'ROMMSYNC_ALLOC_REPORT' <<<"$body" ||
     fail "soak.yml keeps no record of what it measured"
   # Observable: the samples are uploaded whether the soak passed or failed, and
-  # an upload that found nothing is itself a failure.
-  grep -q 'if: always()' <<<"$body" || fail "soak.yml uploads nothing when the soak fails"
-  grep -q 'if-no-files-found: error' <<<"$body" ||
+  # an upload that found nothing is itself a failure. Read off the upload step
+  # itself, because the summary step is `if: always()` too and would answer for
+  # an upload that had lost it.
+  local upload summary
+  upload="$(soak_step upload-artifact)"
+  [ -n "$upload" ] || fail "soak.yml uploads nothing it measured"
+  grep -q 'if: always()' <<<"$upload" || fail "soak.yml uploads nothing when the soak fails"
+  grep -q 'soak.csv' <<<"$upload" || fail "soak.yml's upload does not carry the samples"
+  grep -q 'if-no-files-found: error' <<<"$upload" ||
     fail "soak.yml would publish an empty artifact without complaint"
-  grep -q 'GITHUB_STEP_SUMMARY' <<<"$body" ||
-    fail "soak.yml writes nothing to the run's summary"
+  summary="$(soak_step GITHUB_STEP_SUMMARY)"
+  grep -q 'if: always()' <<<"$summary" ||
+    fail "soak.yml writes its summary only when the soak passed"
 
   local job
   job="$(ci_job soak-fresh)"
@@ -58,6 +65,15 @@ phase_workflow() {
     fail "soak-fresh checks out shallow, so it cannot tell when soak.yml was added"
   grep -q 'actions: read' <<<"$job" || fail "soak-fresh cannot read the soak's runs"
   echo "ok: soak.yml is scheduled, runnable on demand and observable; ci.yml checks it is fresh"
+}
+
+# soak_step PATTERN -- the step of soak.yml whose lines mention PATTERN, from
+# its `- ` line to the next step's.
+soak_step() {
+  awk -v want="$1" '
+    /^      - / { if (found) exit; step = "" }
+    { step = step $0 "\n"; if (index($0, want)) found = 1 }
+    END { if (found) printf "%s", step }' "$SOAK"
 }
 
 # verdict EXPECTED_STATUS DESCRIPTION -- run soak-fresh.sh with the SOAK_*

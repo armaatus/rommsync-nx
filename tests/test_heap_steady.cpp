@@ -46,6 +46,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "count_new.hpp"
@@ -102,38 +103,32 @@ std::string Judge(const std::vector<Sample>& samples, Slack slack) {
   if (samples.size() < 4) {
     return "only " + std::to_string(samples.size()) + " samples; a trend needs at least four";
   }
-  const auto half = static_cast<std::ptrdiff_t>(samples.size() / 2);
-  const auto least = [](auto first, auto last, std::int64_t Sample::*field) {
-    std::int64_t value = (*first).*field;
-    for (auto it = first; it != last; ++it) {
-      value = std::min(value, (*it).*field);
-    }
-    return value;
-  };
-  const auto most = [](auto first, auto last, std::int64_t Sample::*field) {
-    std::int64_t value = (*first).*field;
-    for (auto it = first; it != last; ++it) {
-      value = std::max(value, (*it).*field);
-    }
-    return value;
-  };
-  const auto mid = samples.begin() + half;
+  const auto mid = samples.begin() + static_cast<std::ptrdiff_t>(samples.size() / 2);
   for (const auto& [field, allowed, unit] :
        {std::tuple{&Sample::blocks, slack.blocks, "blocks"},
         std::tuple{&Sample::bytes, slack.bytes, "bytes"}}) {
-    const std::int64_t early = least(samples.begin(), mid, field);
-    const std::int64_t late = least(mid, samples.end(), field);
+    const auto by_field = [field = field](const Sample& a, const Sample& b) {
+      return a.*field < b.*field;
+    };
+    const auto least = [&](auto first, auto last) {
+      return (*std::min_element(first, last, by_field)).*field;
+    };
+    const std::int64_t early = least(samples.begin(), mid);
+    const std::int64_t late = least(mid, samples.end());
     if (late - early > allowed) {
       return std::string("the floor rose by ") + std::to_string(late - early) + " " + unit +
              " between the first and second half of the run (" + std::to_string(early) +
              " -> " + std::to_string(late) + "), past the " + std::to_string(allowed) +
              " allowed";
     }
-    const std::int64_t low = least(samples.begin(), samples.end(), field);
-    const std::int64_t high = most(samples.begin(), samples.end(), field);
-    if (high - low > 4 * allowed + 64) {
-      return std::string("outstanding ") + unit + " spread " + std::to_string(low) + " .. " +
-             std::to_string(high) + " across the run";
+    // The spread may be wider than the floor's rise: a quiet reading is the
+    // least of five, and an unlucky one still catches the worker mid-loop.
+    // Four slacks and a little over is a reading that caught something
+    // transient, not one that found a different floor.
+    const auto [low, high] = std::minmax_element(samples.begin(), samples.end(), by_field);
+    if ((*high).*field - (*low).*field > 4 * allowed + 64) {
+      return std::string("outstanding ") + unit + " spread " + std::to_string((*low).*field) +
+             " .. " + std::to_string((*high).*field) + " across the run";
     }
   }
   return {};
@@ -280,7 +275,7 @@ struct Run {
   std::vector<Sample> samples;
   std::int64_t peak_over_floor = 0;
   std::int64_t floor_bytes = 0;
-  std::int64_t allocations_per_tick = 0;
+  std::int64_t allocations_per_round = 0;
 };
 
 /// Warm up, then `rounds` rounds of `round`, sampled after each one.
@@ -308,13 +303,13 @@ bool Drive(checks::Checks& c, int rounds, const std::function<bool(int)>& round,
         std::max(run->peak_over_floor, count_new::Now().peak_bytes - floor.bytes);
     run->samples.push_back(Quiet());
   }
-  run->allocations_per_tick = window.allocations() / std::max(rounds, 1);
+  run->allocations_per_round = window.allocations() / std::max(rounds, 1);
   return true;
 }
 
 void Report(const std::string& what, const Run& run, const char* path) {
   std::cout << what << ": floor " << run.floor_bytes << " bytes, a round peaks "
-            << run.peak_over_floor << " bytes over it, ~" << run.allocations_per_tick
+            << run.peak_over_floor << " bytes over it, ~" << run.allocations_per_round
             << " allocations a round\n";
   for (std::size_t at = 0; at < run.samples.size(); ++at) {
     std::cout << "  round " << at << ": " << run.samples[at].blocks << " blocks, "
@@ -452,76 +447,87 @@ void LogRing(checks::Checks& c) {
   rlog::Reset();
 }
 
-int Steady(checks::Checks& c, http::HttpClient& client, const std::string& base,
-           const harness::Fixture& fixture, int rounds, const char* report) {
+/// One rig run: a console paired with the fixture, its worker started, the
+/// log's tick counter installed, `round` driven `rounds` times after the
+/// warm-up, and what it held judged. `what` names the run in the output and in
+/// the failure message.
+void Measure(checks::Checks& c, http::HttpClient& client, const std::string& base,
+             const harness::Fixture& fixture, int rounds, const char* report,
+             const std::string& what,
+             const std::function<std::function<bool(int)>(Console&, const TickCounter&)>& make) {
   TickCounter counter;
   rlog::Sink* const previous = rlog::GetSink();
   rlog::SetSink(&counter);
   {
-    Console console(c, "alloc-steady", base, fixture, client);
+    Console console(c, what, base, fixture, client);
     c.Expect(console.ok, "a console configured for, and paired with, the fixture RomM");
     console.engine.StartWorker();
     Run run;
-    if (Drive(c, rounds,
-              [&](int) { return console.Tick(counter, std::chrono::seconds{60}); }, &run)) {
-      Report("alloc.steady", run, report);
+    if (Drive(c, rounds, make(console, counter), &run)) {
+      Report(what, run, report);
       const std::string verdict = Judge(run.samples, kSlack);
-      c.Expect(verdict.empty(), "what the engine holds between ticks does not grow with the "
-                                "number of ticks: " + verdict);
-      c.Expect(run.allocations_per_tick >= 100,
-               "and the ticks measured really ran: " + std::to_string(run.allocations_per_tick) +
-                   " allocations a tick");
+      c.Expect(verdict.empty(), what + ": what the engine holds between rounds does not grow "
+                                       "with the number of rounds: " + verdict);
+      // llvm's `RequireAllocationGuard`: a round that allocated next to nothing
+      // did not run, and a floor that never moved because nothing ran is the
+      // wrong reason to pass.
+      c.Expect(run.allocations_per_round >= 100,
+               what + ": and the rounds measured really ran: " +
+                   std::to_string(run.allocations_per_round) + " allocations a round");
     }
   }
   rlog::SetSink(previous);
-  return c.failures();
 }
 
-int Soak(checks::Checks& c, http::HttpClient& client, const std::string& base,
-         const harness::Fixture& fixture, int rounds, const char* report) {
+/// Ticks, and nothing else: the steady state of a console with nothing to do.
+void Steady(checks::Checks& c, http::HttpClient& client, const std::string& base,
+            const harness::Fixture& fixture, int rounds, const char* report) {
+  Measure(c, client, base, fixture, rounds, report, "alloc.steady",
+          [](Console& console, const TickCounter& counter) {
+            return [&console, &counter](int) {
+              return console.Tick(counter, std::chrono::seconds{60});
+            };
+          });
+}
+
+/// A tick and a rom download a round, the rom taken off the card after each so
+/// the next round downloads it again.
+void Soak(checks::Checks& c, http::HttpClient& client, const std::string& base,
+          const harness::Fixture& fixture, int rounds, const char* report) {
   harness::Rom rom;
   if (!harness::FindRom(client, base, fixture, "240pee.nes", &rom)) {
     c.Expect(false, "the seeded library holds 240pee.nes -- re-seed and rescan: "
                     "./server/testing/seed.sh && ./.venv/bin/python server/testing/provision.py");
-    return c.failures();
+    return;
   }
-  TickCounter counter;
-  rlog::Sink* const previous = rlog::GetSink();
-  rlog::SetSink(&counter);
-  {
-    Console console(c, "soak", base, fixture, client);
-    c.Expect(console.ok, "a console configured for, and paired with, the fixture RomM");
-    console.engine.StartWorker();
-    const std::string landed = console.sandbox.Host("/tico/roms/nes/240pee.nes");
-    Run run;
-    const auto round = [&](int) {
-      if (!console.Tick(counter, std::chrono::seconds{60})) {
-        return false;
-      }
-      if (!console.Download(rom.id, std::chrono::seconds{120})) {
-        return false;
-      }
-      std::error_code error;
-      const bool arrived = std::filesystem::remove(landed, error);
-      c.Expect(arrived, "the rom arrived on the card, and is taken away for the next round");
-      return arrived;
-    };
-    if (Drive(c, rounds, round, &run)) {
-      Report("soak", run, report);
-      const std::string verdict = Judge(run.samples, kSlack);
-      c.Expect(verdict.empty(), "what the engine holds across ticks and downloads does not "
-                                "grow with the number of rounds: " + verdict);
-    }
-  }
-  rlog::SetSink(previous);
-  return c.failures();
+  Measure(c, client, base, fixture, rounds, report, "soak",
+          [&c, id = rom.id](Console& console, const TickCounter& counter) {
+            return [&c, &console, &counter, id](int) {
+              if (!console.Tick(counter, std::chrono::seconds{60}) ||
+                  !console.Download(id, std::chrono::seconds{120})) {
+                return false;
+              }
+              std::error_code error;
+              const bool arrived = std::filesystem::remove(
+                  console.sandbox.Host("/tico/roms/nes/240pee.nes"), error);
+              c.Expect(arrived, "the rom arrived on the card, and is taken away for the next "
+                                "round");
+              return arrived;
+            };
+          });
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
   const std::string scenario = argc > 1 ? argv[1] : "counts";
-  const int rounds = argc > 2 ? std::max(4, std::atoi(argv[2])) : 16;
+  // Refused rather than clamped: a mistyped round count on the soak workflow's
+  // form would otherwise be a four-round soak reported green.
+  const int rounds = argc > 2 ? std::atoi(argv[2]) : 16;
+  if (rounds < 4) {
+    std::cerr << "rounds must be a number, at least 4: '" << (argc > 2 ? argv[2] : "") << "'\n";
+    return 2;
+  }
   // Where a rig scenario writes its samples as CSV, for the soak workflow to
   // keep as an artifact. Unset under ctest.
   const char* report = std::getenv("ROMMSYNC_ALLOC_REPORT");
@@ -567,9 +573,12 @@ int main(int argc, char** argv) {
   }
   harness::CloseOpenSessions(*client, base, fixture);
 
-  const int failures = scenario == "steady"
-                           ? Steady(checks, *client, base, fixture, rounds, report)
-                           : Soak(checks, *client, base, fixture, rounds, report);
+  if (scenario == "steady") {
+    Steady(checks, *client, base, fixture, rounds, report);
+  } else {
+    Soak(checks, *client, base, fixture, rounds, report);
+  }
+  const int failures = checks.failures();
   harness::CloseOpenSessions(*client, base, fixture);
   if (failures == 0) {
     std::cout << scenario << " ok against " << base << " over " << rounds << " rounds\n";
