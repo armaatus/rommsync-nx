@@ -1070,9 +1070,13 @@ for that check and for `contract.captures`. `rig.slot_cap` holds the
 it, and a cap left to each release's default would make every pruning test
 depend on which RomM ran it.
 
-CI runs `host-tests` once per version in its matrix, which since #235 is 5.4.0
-alone, under the plain job name branch protection requires. The 5.2.0 leg was
-dropped with the flip; the next RomM lands as a second matrix line beside it.
+CI runs `host-tests` against 5.4.0 alone since #235, under the plain job name
+branch protection requires. The 5.2.0 leg was dropped with the flip, and with
+it the matrix: a matrix job whose `name:` holds no matrix expression reports as
+`host-tests (5.4.0)`, so the required `host-tests` check would never arrive.
+The next RomM beside it brings the matrix back with a name expression that
+keeps the required leg plain `host-tests`; `agent.config` fails the
+workflow otherwise.
 
 ### Keeping the captured contract honest
 
