@@ -418,7 +418,12 @@ LoadedBaseline ParseBaseline(std::string_view text);
 /// A row whose new key is already taken -- RetroArch's and Tico's `.srm` of one
 /// rom, both now `autosave` -- is dropped, the first in key order kept, which is
 /// RetroArch's: the copy the scan also reads first. So is one `slot_for` has no
-/// slot for. Either costs a re-hash and nothing else.
+/// slot for. Either costs a re-hash -- and a dropped row's `deleted_on_server`
+/// mark goes with it, because the mark is held against that row's digest and
+/// cannot be put on the winner's, which names other bytes. That is the one
+/// place a mark is let go: the losing copy is read only once the winner's file
+/// is gone from the card, and then it is offered to the shared slot as any
+/// save with no history is.
 std::size_t AdoptLegacySaves(
     LoadedBaseline* loaded,
     const std::function<std::optional<std::string>(std::string_view old_slot)>& slot_for);
