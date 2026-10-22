@@ -128,9 +128,15 @@ json::Error ParseRomPage(std::string_view body, RomPage* out) {
   // A row at a time, never the page (`json::ParseEach`): a parsed row weighs
   // ~11x its text, so a page of `ipc::kMaxPageSize` rows held as one document is
   // more than the sysmodule's whole heap (M9-19, #217).
+  //
+  // And of a row only what is read (#248): a rom RomM identified carries ~12 KiB
+  // of metadata, ~190 KiB as a document, and the browser draws six fields.
+  static constexpr std::string_view kRead[] = {"id",     "fs_name",            "platform_fs_slug",
+                                               "fs_size_bytes", "has_multiple_files", "name",
+                                               "total"};
   RomPage page;
   const json::ParseResult document =
-      json::ParseEach(body, "items", [&page](const json::Value& item, std::size_t index) {
+      json::ParseEach(body, "items", kRead, [&page](const json::Value& item, std::size_t index) {
         const std::string where = "items[" + std::to_string(index) + "].";
         json::Reader reader(item, "rom");
         RomRow rom;
@@ -180,10 +186,14 @@ json::Error ParsePlatforms(std::string_view body, std::vector<PlatformRow>* out,
   // Streamed for the reason `ParseRomPage` is: `kMaxPlatforms` rows held as one
   // document would be ~2.3 MiB (M9-19, #217). The rows past the bound are still
   // parsed -- a malformed one still fails the list -- and only counted.
+  // A row's `description` and `firmware` are RomM's to grow, and only these five
+  // are read (#248).
+  static constexpr std::string_view kRead[] = {"id", "fs_slug", "name", "rom_count",
+                                               "display_name"};
   std::vector<PlatformRow> platforms;
   std::size_t seen = 0;
   const json::ParseResult document = json::ParseEach(
-      body, "", [&platforms, &seen](const json::Value& item, std::size_t index) {
+      body, "", kRead, [&platforms, &seen](const json::Value& item, std::size_t index) {
         ++seen;
         if (platforms.size() >= kMaxPlatforms) {
           return json::Error{};

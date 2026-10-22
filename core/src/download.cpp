@@ -1111,7 +1111,33 @@ std::string ContentUrl(std::string_view base_url, std::int64_t rom_id, std::stri
 }
 
 json::Error ParseRomDetail(std::string_view body, RomDetail* out) {
-  const json::ParseResult document = json::Parse(body);
+  // What is read, and nothing else (#248). A rom's detail is its list row and
+  // more -- every metadata source RomM holds for it, and a row per file -- so a
+  // rom RomM identified is ~12 KiB of text before its files, and parsed whole was
+  // ~16 times that in flight on the worker. `files` is streamed a file at a time,
+  // and two names are all that are kept: the worker asks whether there is
+  // exactly one (`file_names`).
+  static constexpr std::string_view kRead[] = {
+      "id",          "fs_name",       "platform_fs_slug", "fs_size_bytes", "has_multiple_files",
+      "has_nested_single_file", "missing_from_fs", "sha1_hash", "md5_hash", "file_name"};
+  constexpr std::size_t kNamesKept = 2;
+  std::vector<std::string> file_names;
+  const json::ParseResult document = json::ParseEach(
+      body, "files", kRead,
+      [&file_names](const json::Value& file, std::size_t) {
+        const json::Value* name = file.is_object() ? file.Find("file_name") : nullptr;
+        if (name == nullptr || !name->is_string()) {
+          json::Error error;
+          error.field = "files";
+          error.message = "expected every entry to carry a file_name string";
+          return error;
+        }
+        if (file_names.size() < kNamesKept) {
+          file_names.push_back(name->string());
+        }
+        return json::Error{};
+      },
+      "rom detail");
   if (!document.ok()) {
     return document.error;
   }
@@ -1157,18 +1183,10 @@ json::Error ParseRomDetail(std::string_view body, RomDetail* out) {
   // shape serves them all, and the next rom out of it is the nested one whose
   // name this decides. A caller reading `file_names.front()` must be reading a
   // name the server actually sent, not the survivor of a list with a hole in it.
-  if (const json::Value* files = document.value.Find("files"); files != nullptr) {
-    if (!files->is_array()) {
-      return refuse("files", "expected an array");
-    }
-    for (const json::Value& file : files->elements()) {
-      const json::Value* name = file.is_object() ? file.Find("file_name") : nullptr;
-      if (name == nullptr || !name->is_string()) {
-        return refuse("files", "expected every entry to carry a file_name string");
-      }
-      detail.file_names.push_back(name->string());
-    }
-  }
+  //
+  // Read as it streamed past (above); `ParseEach` refused a `files` that is not
+  // an array by name.
+  detail.file_names = std::move(file_names);
 
   // The two digests are `string | null` and the only fields here allowed to have
   // no value: an unscanned library leaves both null, and a download with nothing

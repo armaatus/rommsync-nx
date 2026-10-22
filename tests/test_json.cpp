@@ -473,6 +473,70 @@ void StreamsOneArray(checks::Checks& c) {
   c.ExpectEq(seen.size(), std::size_t{2}, "and nothing after it is read");
 }
 
+/// `ParseEach`'s keeping form (#248): what a reader names is built, at every
+/// depth, and the rest is read past as strictly and never built.
+void KeepsWhatIsNamed(checks::Checks& c) {
+  constexpr std::string_view kKeep[] = {"id", "name", "total", "file_name"};
+  std::vector<json::Value> seen;
+  const auto collect = [&seen](const json::Value& element, std::size_t) {
+    seen.push_back(element);
+    return json::Error{};
+  };
+  const json::ParseResult page = json::ParseEach(
+      R"({"items":[{"id":1,"name":"a","summary":"long \"text\" é","igdb":{"keywords":["x",)"
+      R"("y"],"id":9},"files":[{"file_name":"a.bin","size":1}]}],"total":1,"char_index":{"a":0}})",
+      "items", kKeep, collect, "rom list");
+  c.Expect(page.ok(), "a page parses keeping what is named: " + page.error.Describe());
+  c.ExpectEq(seen.size(), std::size_t{1}, "one element");
+  if (seen.size() == 1) {
+    c.ExpectEq(seen[0].size(), std::size_t{2}, "which holds only the two members named");
+    c.Expect(seen[0].Find("id") != nullptr && seen[0].Find("name") != nullptr &&
+                 seen[0].Find("summary") == nullptr && seen[0].Find("igdb") == nullptr &&
+                 seen[0].Find("files") == nullptr,
+             "id and name, and not what nothing reads");
+  }
+  c.Expect(page.value.Find("total") != nullptr && page.value.Find("char_index") == nullptr,
+           "the envelope keeps what is named and drops the rest");
+  c.Expect(page.value.Find("items") != nullptr && page.value.Find("items")->is_array(),
+           "and the streamed array is there, empty, whatever keep says");
+
+  // At any depth: a kept array's objects are filtered the same way.
+  seen.clear();
+  constexpr std::string_view kFiles[] = {"files", "file_name"};
+  const json::ParseResult nested = json::ParseEach(
+      R"([{"files":[{"file_name":"a.bin","crc":"00"},{"file_name":"b.bin","crc":"11"}],"x":1}])",
+      "", kFiles, collect);
+  c.Expect(nested.ok() && seen.size() == 1, "a nested array of objects parses");
+  if (seen.size() == 1 && seen[0].Find("files") != nullptr) {
+    const json::Value& files = *seen[0].Find("files");
+    c.Expect(files.size() == 2 && files.elements()[0].size() == 1 &&
+                 files.elements()[0].Find("file_name")->string() == "a.bin",
+             "its objects keep only the named member");
+  } else {
+    c.Expect(false, "the kept array is there");
+  }
+
+  // A skipped member is checked as strictly as a kept one.
+  for (const char* broken :
+       {R"([{"id":1,"skip":[1,2,]}])", R"([{"id":1,"skip":"\x"}])", R"([{"id":1,"skip":tru}])",
+        R"([{"id":1,"skip":{"a" 1}}])", R"([{"id":1,"skip":"\ud800"}])",
+        R"([{"id":1,"skip":01}])", R"([{"id":1,"skip":"a)"}) {
+    c.Expect(!json::ParseEach(broken, "", kKeep, collect).ok(),
+             std::string("a malformed skipped member fails the document: ") + broken);
+  }
+  std::string deep = R"([{"id":1,"skip":)";
+  for (int level = 0; level < json::kMaxDepth; ++level) deep += "[";
+  for (int level = 0; level < json::kMaxDepth; ++level) deep += "]";
+  deep += "}]";
+  c.Expect(!json::ParseEach(deep, "", kKeep, collect).ok(),
+           "and nested past kMaxDepth, it is refused");
+  // Two kept members of one name are still refused.
+  c.Expect(!json::ParseEach(R"([{"id":1,"id":2}])", "", kKeep, collect).ok(),
+           "a duplicated kept key is refused");
+  c.Expect(json::ParseEach(R"([{"id":1,"skip":1,"skip":2}])", "", kKeep, collect).ok(),
+           "a duplicated skipped key is not looked at");
+}
+
 }  // namespace
 
 int main() {
@@ -482,5 +546,6 @@ int main() {
   ReaderReportsTheField(c);
   QuotesWhatItIsGiven(c);
   StreamsOneArray(c);
+  KeepsWhatIsNamed(c);
   return c.failures() == 0 ? 0 : 1;
 }

@@ -861,6 +861,10 @@ struct RomDetail {
   /// string is a named refusal. That is not the same trade -- a library serving
   /// one body of that shape serves them all, and the next rom out of it is the
   /// nested one whose name this decides.
+  ///
+  /// **The first two, not all of them** (#248): the question asked of the list
+  /// is whether it names exactly one file, and a second already answers it. A
+  /// rom of a thousand files is a thousand names nothing reads.
   std::vector<std::string> file_names;
 
   /// RomM knows the rom and its file is gone from the server's own filesystem.

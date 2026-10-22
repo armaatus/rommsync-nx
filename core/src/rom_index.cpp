@@ -103,9 +103,15 @@ json::Error ParsePage(std::string_view body, Page* out) {
   // A row at a time, never the page (`json::ParseEach`): a parsed row weighs
   // ~11x its text, and a page held as one document is a multiple of the
   // sysmodule's whole heap (M9-19, #217).
+  //
+  // And of a row only what is read (#248): a rom RomM identified carries ~12 KiB
+  // of metadata nothing here looks at, ~190 KiB as a document.
+  static constexpr std::string_view kRead[] = {
+      "id",    "platform_fs_slug", "has_multiple_files", "fs_name_no_ext", "fs_name_no_tags",
+      "total", "limit",            "offset"};
   Page page;
   const json::ParseResult document = json::ParseEach(
-      body, "items",
+      body, "items", kRead,
       [&page](const json::Value& item, std::size_t index) {
         return ReadRom(item, index, &page.roms);
       },

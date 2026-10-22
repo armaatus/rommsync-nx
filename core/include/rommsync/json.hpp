@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -178,6 +179,30 @@ using EachElement = std::function<Error(const Value& element, std::size_t index)
 /// document". A missing `key` is still the caller's to refuse.
 ParseResult ParseEach(std::string_view text, std::string_view key, const EachElement& each,
                       std::string_view context = {});
+
+/// The member names a reader takes, for `ParseEach`'s keeping form.
+using Keep = std::span<const std::string_view>;
+
+/// `ParseEach`, building only the members `keep` names (#248).
+///
+/// A row is one element at a time, but each element was still parsed whole, and
+/// RomM's rows are as wide as the metadata it holds: a rom it identified on IGDB
+/// is ~12 KiB of text that no reader here looks at, and ~16 times that as a
+/// document -- ~190 KiB in flight on aarch64, beside the page, where the
+/// fixture's homebrew rows cost a tenth of it. So every **object** in the
+/// document -- the root and anything inside the streamed elements, at any depth
+/// -- holds only the members named in `keep`, and the root also `key`. The rest
+/// are read to the end of their value, as strictly as a kept one, and dropped
+/// without a node being built: a malformed skipped member still fails the
+/// document.
+///
+/// The one check a skipped member does not get is the duplicate-key rule (above):
+/// a key nothing reads cannot shadow anything that is read, and catching a
+/// duplicate needs the names held. Two kept members of one name are still
+/// refused. A reader must name every member it reads, at every depth -- one it
+/// forgets is simply absent, which its `Reader` then reports as missing.
+ParseResult ParseEach(std::string_view text, std::string_view key, Keep keep,
+                      const EachElement& each, std::string_view context = {});
 
 /// `value` as a JSON string literal, quotes included.
 ///
