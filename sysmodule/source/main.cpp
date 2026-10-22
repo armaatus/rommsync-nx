@@ -49,10 +49,12 @@
 #include "ipc/server.hpp"
 #include "power.hpp"
 #include "rommsync/atomic_file.hpp"
+#include "rommsync/conflict_log.hpp"
 #include "rommsync/core.hpp"
 #include "rommsync/device_identity.hpp"
 #include "rommsync/download.hpp"
 #include "rommsync/file_system.hpp"
+#include "rommsync/http.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/list_service.hpp"
 #include "rommsync/log.hpp"
@@ -65,6 +67,7 @@
 #include "rommsync/state_sync.hpp"
 #include "rommsync/sync.hpp"
 #include "rommsync/sync_execute.hpp"
+#include "rommsync/sync_resolve.hpp"
 #include "rommsync/version.hpp"
 // Named directly rather than through `engine.hpp`, because the heap table below
 // is built out of `kThreadStackBytes`: dropping the include from `engine.hpp`
@@ -87,10 +90,10 @@ namespace {
 //   | bsd transfer memory, trimmed config      | `kHeapSocketMemory`     | 0x1D000 | 116 KiB |
 //   | `state.db` baseline at its bound         | `kHeapStateBaseline`    | 0x10000 |  64 KiB |
 //   | a download's buffer and an API call's    | `kHeapTransferBuffer`   | 0x14000 |  80 KiB |
-//   | the largest buffered response or listing | `kHeapListResponse`     | 0x35400 | 213 KiB |
+//   | the largest buffered response or listing | `kHeapListResponse`     | 0x33800 | 206 KiB |
 //   | the rom index at its bound (M9-19)       | `kHeapRomIndex`         | 0x40C00 | 259 KiB |
-//   | a tick's saves at `kMaxSaves` (M9-20)    | `kHeapTickSaves`        | 0x36000 | 216 KiB |
-//   | the list service's pages (M9-20)         | `kHeapListPages`        | 0x24800 | 146 KiB |
+//   | a tick's saves at `kMaxSaves` (M9-20)    | `kHeapTickSaves`        | 0x37C00 | 223 KiB |
+//   | the list service's pages (M9-20)         | `kHeapListPages`        | 0x1F800 | 126 KiB |
 //   | two thread stacks (M1-6, M7-2)           | `kHeapThreadStacks`     | 0x44000 | 272 KiB |
 //   | the PSC watcher's stack (M9-4)           | `kHeapWatcherStack`     | 0xA000  |  40 KiB |
 //   | the log's in-memory tail (M7-3)          | `kHeapLogTail`          | 0x1800  |   6 KiB |
@@ -98,8 +101,9 @@ namespace {
 //   | the directories open at once (M9-2)      | `kHeapOpenDirectories`  | 0x2000  |   8 KiB |
 //   | the claimed remote installs (M10-19)     | `kHeapInstallClaims`    | 0x2000  |   8 KiB |
 //   | the download queue's rows (M9-21)        | `kHeapDownloadQueue`    | 0x5400  |  21 KiB |
+//   | the conflict history's entries (M9-22)   | `kHeapConflictHistory`  | 0x8C00  |  35 KiB |
 //   | newlib arena overhead and fragmentation  | `kHeapNewlibOverhead`   | 0x8000  |  32 KiB |
-//   | **peak**                                 | `kHeapPeak`             | 0x17A400 | 1513 KiB |
+//   | **peak**                                 | `kHeapPeak`             | 0x17E000 | 1528 KiB |
 //
 // The table is written this way so that something other than a reader adds it
 // up. `tests/test_heap_budget.py` totals these rows and compares each against
@@ -114,19 +118,23 @@ namespace {
 // The terms that are easiest to get wrong, and why each is what it is:
 //
 //   * **A response is buffered whole**, because `Send` returns a `std::string`
-//     (`http.hpp`) and nothing in this client caps it. Three can be large, and
-//     all three are measured against the fixture RomM rather than guessed:
-//     `/api/platforms` is an unpaged bare array in 5.2.0 at ~800 bytes a row,
-//     and both rom pages -- the index's `roms::kDefaultPageSize` and the
-//     overlay's `ipc::kMaxPageSize`, 64 rows each since M9-19 (#217) -- are
-//     ~2.1 KiB a row. **They are bounds on what the server sends, not ones this
-//     client enforces** -- the row counts are bounded (`list_service.hpp`,
-//     `rom_index.hpp`), the row widths are RomM's -- which is why the numbers
-//     are written down below with where they came from.
+//     (`http.hpp`), and **since M9-22 (#248) every backend caps it**:
+//     `http::kMaxResponseBytes`, 200 KiB, past which a body is `kTooLarge`,
+//     refused unread when it declares its length. Until then nothing did, and
+//     the widths the table was sized at were the fixture's -- homebrew roms with
+//     no metadata at ~2.1 KiB a row -- where a rom RomM identified on IGDB is
+//     ~12 KiB (a synthetic row at a popular title's widths, against the 5.4.0
+//     schema), so a 64-row page was ~750 KiB, doubled past a 256 KiB
+//     reservation into a heap that could not hold it. A page past the ceiling is
+//     now asked for again at half the rows (`roms::FetchRomIndex`, the list
+//     service's `Pump`), and a reader builds of a row only the members it reads
+//     (`json::ParseEach`'s keeping form): a wide row's document in flight was
+//     ~16 times its text, ~190 KiB, and is now what the reader keeps of it
+//     (`kRowInFlightBytes`).
 //
 //     A response costs its text **once** and **one row's document** beside it,
 //     and both of those were made true by M9-19 rather than assumed. The body
-//     is reserved to its `Content-Length` (`kMaxReservedBodyBytes`), where it
+//     is reserved to its `Content-Length`, where it
 //     used to double its way there a read at a time; and each row is parsed,
 //     read and dropped before the next (`json::ParseEach`), where the whole
 //     page used to be one document -- at ~11 times its text, a 200-row page was
@@ -147,9 +155,10 @@ namespace {
 //     row has to count are named in it below.
 //
 //     **The row is the largest of the things the worker holds one at a time**:
-//     the platforms list, a rom page, the directory listings -- two at most, at
-//     `fs::kMaxDirectoryEntries` each (`kHeapDirectoryListing`) -- the
-//     heartbeat, the negotiate plan's text, the state listing's, and a body
+//     a body at the ceiling and one row of it in flight -- the platforms list, a
+//     rom page, a rom's detail, the negotiate plan, a claim's answer -- the
+//     directory listings, two at most, at `fs::kMaxDirectoryEntries` each
+//     (`kHeapDirectoryListing`), the heartbeat, the state listing, and a body
 //     that declared no length.
 //     It is a `max()` and not a sum because all of them are taken on the worker
 //     thread, one after another: a list kind that needs the network defers it to
@@ -180,14 +189,25 @@ namespace {
 //     did. It ran beside the saves' run phase until the engine let go of every
 //     save before it -- what was reported and targeted, and the last plan and
 //     its results, which the tick kept for nothing -- so it is one more phase in
-//     the `max()` rather than a sum, and pinned under the run phase.
+//     the `max()` rather than a sum, and pinned under the run phase. M9-22
+//     (#248) found three more things a phase held and counted none of: the
+//     negotiate request's body, there several times over while the plan arrived
+//     and now once and let go of before it is read (under the plan phase); the
+//     last chunk's plan and results, kept beside the next chunk's arriving and
+//     now freed before it is asked (`sync::RunTick`); and the #232 resolution's
+//     second negotiation, which plans refused uploads beside the run's own --
+//     now at most `sync::kMaxResolvedUploads` of them, a term of the run phase
+//     (`kTickResolveBytes`).
 //   * **The list service holds pages between pumps.** One platform snapshot and
 //     one built rom page, across every cursor (`lists::Service::Pump`, M9-20),
 //     plus the page the IPC thread is handing over -- built out of the snapshot
 //     on that thread, beside whatever the worker is doing. Before M9-20 every
 //     cursor kept its own of each, `kMaxCursors` of them, and the header said
 //     four times a number nothing reaches was still nothing; this table budgets
-//     at bounds, not at what is reached.
+//     at bounds, not at what is reached. **Each page is measured at its peak**
+//     since M9-22 (#248): a page used to be encoded whole on every append to see
+//     whether it still fit, ~13 KiB past its term, and is now counted by the
+//     encoder's own writer and sent as its text once (`ipc::AppendIfItFits`).
 //   * **Two threads, not one, and each costs 0x22000.** M1-6 (#123) starts a
 //     pairing thread and M7-2 (#37) starts the worker that drives `PumpLists`
 //     and the sync tick. Their stacks are now this process's own number rather
@@ -219,6 +239,14 @@ namespace {
 //     (`Queue::Visit`), so what a write or a page costs beside the rows is a few
 //     entries, and it is under rows that exist (`kQueueWriteBytes`). The row is
 //     the rows, and the rows are why `download::kMaxQueueEntries` is 32.
+//   * **So is the conflict history** (M9-22, #248): `conflicts::History` keeps
+//     every entry for the boot, up to `conflicts::kMaxEntries`, and records one
+//     from inside a tick's run (`TickOptions::on_plan`). Every record rewrote
+//     `conflicts.db` from one string of the whole history, doubled its way to
+//     `kMaxHistoryBytes`, into a vector with no room left that doubled too -- at
+//     the run phase, which had none either. It is written an entry at a time
+//     now, into room reserved once, and the row is the entries and one in
+//     flight.
 //   * **An open `DIR` is not free.** fsdev allocates
 //     `sizeof(FsDirectoryEntry)` -- 784 bytes -- times
 //     `__nx_fsdev_direntry_cache_size` for every `::opendir`, and holds it until
@@ -245,17 +273,17 @@ namespace {
 //     Only the worker downloads, so the peak is one of each. Until M9-10 (#201)
 //     this row was a single 16 KiB buffer, which undercounted the pairing
 //     thread's by exactly that;
-//   * the buffered response is the largest of `lists::kMaxPlatforms`, the
-//     larger of `roms::kDefaultPageSize` and `ipc::kMaxPageSize`,
-//     `fs::kMaxDirectoryEntries`, `sync::kMaxPlanOperations`,
-//     `sync::kMaxStateListBytes` and `kMaxUndeclaredBodyBytes`, each times its
-//     row estimate below;
+//   * the buffered response is the largest of `http::kMaxResponseBytes` and
+//     one row of it in flight, `fs::kMaxDirectoryEntries`,
+//     `sync::kMaxStateListBytes` and `kMaxUndeclaredBodyBytes`;
 //   * the rom index is `roms::kMaxIndexRoms` times what one rom holds;
 //   * the tick's saves are `scan::kMaxSaves` -- which `state::kMaxRecords` and
 //     `sync::kMaxPlanOperations` equal -- times what one save costs in the
 //     tick's worst phase;
 //   * the list pages are `lists::kMaxPlatforms` rows and two built pages of at
-//     most `ipc::kMaxPageSize` items;
+//     most `ipc::kMaxPageSize` items and `ipc::kMaxPayloadBytes` of text;
+//   * the conflict history is `conflicts::kMaxEntries` entries at the names the
+//     rom index is budgeted at;
 //   * the thread stacks are `kThreadStackBytes` (`sized_thread.hpp`), which is
 //     where the derivation of that number lives;
 //   * the tail is `log::kTailLines` times `log::kMaxLineBytes`, and
@@ -315,7 +343,10 @@ constexpr size_t kPlatformJsonBytes = 800;
 /// homebrew with almost no metadata and a library with full IGDB rows is wider.
 /// Like `kPlatformJsonBytes` this is an estimate with a provenance, not a bound
 /// anything enforces; `roms::kDefaultPageSize` bounds the count and RomM decides
-/// the width.
+/// the width. **No longer what a page is held to** (M9-22, #248): a rom RomM
+/// identified on IGDB is ~12 KiB of row, and the text a page may be is the
+/// transport's ceiling (`http::kMaxResponseBytes`), which a pager meets by
+/// asking for fewer rows. This is the width a full page of 64 still fits at.
 constexpr size_t kRomJsonBytes = 2560;
 
 /// What `GET /api/heartbeat` weighs on the wire (M10-2, #228). Measured against
@@ -346,6 +377,19 @@ constexpr size_t kStateJsonBytes = 768;
 /// 512. Not a bound anything enforces either: a claim answers every request the
 /// device holds taken, and the count is what the user queued.
 constexpr size_t kInstallRequestJsonBytes = 512;
+
+/// What one row of a buffered response costs while it is read, at its widest
+/// (M9-22, #248): the document of the members its reader keeps, and what it is
+/// kept as. Measured on aarch64 the way the tick's rows are, below: a rom RomM
+/// identified on IGDB -- a synthetic row at a popular title's widths against
+/// the 5.4.0 schema, 11,760 bytes of text -- peaks at 1,694 read by the index
+/// and 1,785 by the overlay's list, 3,479 as a rom's detail with its files; a
+/// platform with a 1,500-byte description and six firmware rows at 2,718; a
+/// negotiate operation at 2,104; a device row at 3,479; a claim's answer at
+/// 5,156 with the `install::kMaxClaims` requests it keeps. 6 KiB covers all of
+/// them. Before #248 a row was parsed whole, ~16 times its text: ~190 KiB for
+/// that rom.
+constexpr size_t kRowInFlightBytes = 6 * 1024;
 
 /// How many entries fsdev caches per open `DIR`, against libnx's default of 32
 /// (M9-2, #207).
@@ -467,6 +511,13 @@ constexpr size_t kPlannedSaveBytes = 544;
 /// archival upload to report.
 constexpr size_t kExecutedSaveBytes = 624;
 
+/// One save's entry in the negotiate request's body (M9-22, #248): 30,418 bytes
+/// for `scan::kMaxSaves` saves at the scan's names, 237.6 a save, reserved to
+/// exactly that. Held while the plan arrives and let go of before it is read,
+/// so it is under the plan the phase then holds, and pinned there below.
+constexpr size_t kNegotiateEntryBytes = 256;
+
+
 /// A `sync::ClientSaveState` copied into a chunk's request when the scope is
 /// several chunks: half of `kReportedSaveBytes`'s measurement (the
 /// `SaveTarget` is not copied), rounded up.
@@ -505,8 +556,21 @@ constexpr size_t kTickPlanBytes =
     rommsync::scan::kMaxSaves *
     (kReportedSaveBytes + kPlannedSaveBytes + sizeof(rommsync::sync::SyncOperation) / 2 +
      kOfferedCopyBytes);
+//
+// The run phase holds the resolution too (M9-22, #248): at most
+// `sync::kMaxResolvedUploads` uploads it resolves, and the plan's refused
+// indices it counts them from. Each, at the resolution's worst moment -- the run
+// of what it became -- is the save asked about again (`kOfferedCopyBytes`), what
+// the head became (`kPlannedSaveBytes`) and what running it did
+// (`kExecutedSaveBytes`); the heads the server named are freed before that run,
+// and measured on aarch64 cost no more than what they become (526 bytes each).
+constexpr size_t kResolvedUploadBytes = kOfferedCopyBytes + kPlannedSaveBytes + kExecutedSaveBytes;
+constexpr size_t kTickResolveBytes =
+    rommsync::sync::kMaxResolvedUploads * kResolvedUploadBytes +
+    rommsync::sync::kMaxPlanOperations * sizeof(std::size_t);
 constexpr size_t kTickRunBytes =
-    rommsync::scan::kMaxSaves * (kReportedSaveBytes + kPlannedSaveBytes + kExecutedSaveBytes);
+    rommsync::scan::kMaxSaves * (kReportedSaveBytes + kPlannedSaveBytes + kExecutedSaveBytes) +
+    kTickResolveBytes;
 
 // The states half (M9-21, #247), measured the same way: `scan::StateFile`s
 // built the way `ScanStates` fills them, `sync::ParseStateList` over the 5.4.0
@@ -585,12 +649,40 @@ constexpr size_t kListRomRowBytes = 512;
 /// the name's width; `lists::kMaxPlatforms` bounds the count.
 constexpr size_t kPlatformRowBytes = 168;
 
-/// What one built page costs: a `ListPage` of `ipc::kMaxPageSize` items, each a
-/// vector of tagged fields (`ipc::ListField` is 88 bytes on aarch64). The
-/// largest measured was a platform page, 63 items at 60-byte names in 51,763
-/// bytes with its blocks; a rom page, whose rows are wider and so fewer under
-/// `ipc::kMaxPayloadBytes`, peaked at 40,186. 52 KiB covers both.
-constexpr size_t kListPageBytes = 52 * 1024;
+/// What one page costs at its peak: a `ListPage` of at most `ipc::kMaxPageSize`
+/// items, each a vector of tagged fields (`ipc::ListField` is 88 bytes on
+/// aarch64), as it is built or handed over. **Measured at the peak since M9-22
+/// (#248)**, through `lists::Service` on aarch64, names swept from none to the
+/// payload's: the most a page holds is a rom page of 55 items with empty names,
+/// 42,236 bytes -- the narrower the rows the more of them `ipc::kMaxPayloadBytes`
+/// lets in -- and the most one costs as it is handed over is a platform page of
+/// 64 items at 48-byte names, 33,920 held and 8,214 encoding, 42,134. A queue
+/// page peaks at 39,006, a conflict page at 27,123 and a log tail at 20,496, the
+/// other pages the IPC thread hands over. A rom page is the one built on the
+/// worker and handed over as it is, so its 50,442 at handover is both pages'
+/// share, and inside the two.
+///
+/// The term was 52 KiB on a platform page measured held and not at its peak,
+/// which #247 found 13 KiB short for a queue page: each append encoded the page
+/// to see whether it still fit, holding its text as it doubled past the payload.
+/// An append now counts with the encoder's own writer (`ipc::AppendIfItFits`),
+/// a page is encoded once into exactly its length, and each kind reserves its
+/// items' fields at their number, where they grew into room for twice it.
+constexpr size_t kListPageBytes = 42 * 1024;
+
+/// One conflict-history entry's strings beside its struct (M9-22, #248), at the
+/// names the rom index is budgeted at -- a No-Intro rom name and file name, a
+/// core's id, RomM's reason sentence, the save's path under a 63-byte folder and
+/// its backup's: measured on aarch64 over `conflicts::kMaxEntries` of them, 606
+/// bytes an entry with its blocks, rounded up. **An estimate at the names, like
+/// the queue's**: two paths at `config::kMaxPathLength` are ~1.5 KiB more an
+/// entry, which is a card of paths that long and the estimate wrong by it.
+constexpr size_t kHistoryEntryTextBytes = 624;
+
+/// What recording a conflict holds beside the history: one entry's line of
+/// `conflicts.db` in flight, and the entry it measures the file with. Measured
+/// at 1,948 over a full history.
+constexpr size_t kHistoryWriteBytes = 2 * 1024;
 
 /// The table's rows are whole KiB, so a term computed from widths is rounded up
 /// to one rather than written as a literal that would drift from them.
@@ -607,12 +699,16 @@ constexpr size_t kHeapTransferBuffer =
 // wrote down: until M9-2 (#207) this term named only the platforms list, and
 // until M9-19 (#217) it counted each response's text and not the document it was
 // parsed into, which was ten times larger. Each response is its text, once
-// (`kMaxReservedBodyBytes`), and one row of it in flight (`json::ParseEach`).
-constexpr size_t kHeapPlatformsResponse =
-    rommsync::lists::kMaxPlatforms * kPlatformJsonBytes +
-    kPlatformJsonBytes * kJsonDocumentPerTextByte;
-constexpr size_t kHeapRomPageResponse =
-    kRomPageRows * kRomJsonBytes + kRomJsonBytes * kJsonDocumentPerTextByte;
+// (reserved to its `Content-Length`), and one row of it in flight
+// (`json::ParseEach`). **Since M9-22 (#248) the text is the transport's ceiling**
+// rather than the widths the fixture's rows have: every response whose size
+// comes from an array -- the platforms list, a rom page, a rom's detail and its
+// files, the negotiate plan, a claim's answer, the device list -- is at most
+// `http::kMaxResponseBytes`, and one row of it is at most `kRowInFlightBytes`.
+// An oversized plan's text among them, which used to be received whole before
+// it was refused (#248, §4): past the ceiling it is refused unread, and under it
+// this is what it costs.
+constexpr size_t kHeapBufferedResponse = rommsync::http::kMaxResponseBytes + kRowInFlightBytes;
 constexpr size_t kHeapDirectoryListing =
     kMaxListingsHeld * rommsync::fs::kMaxDirectoryEntries * kDirectoryEntryBytes;
 // The heartbeat a tick reads first (M10-2, #228): its body, and the one member
@@ -621,30 +717,19 @@ constexpr size_t kHeapDirectoryListing =
 // is one more thing held one at a time.
 constexpr size_t kHeapHeartbeat =
     kHeartbeatJsonBytes + rommsync::server::kMaxSystemBytes * kJsonDocumentPerTextByte;
-// The three M9-20 (#246) gave a bound: the plan's text at its operation bound
-// and one operation in flight -- its rows are `kHeapTickSaves`'s -- the state
-// listing's text at its byte bound and one row, and a body that declared no
-// length at its cap, half again while its last step copies.
-constexpr size_t kHeapNegotiateResponse =
-    rommsync::sync::kMaxPlanOperations * kOperationJsonBytes +
-    kOperationJsonBytes * kJsonDocumentPerTextByte;
+// The two M9-20 (#246) gave a bound of their own: the state listing's text at
+// its byte bound and one row, and a body that declared no length at its cap,
+// half again while its last step copies.
 constexpr size_t kHeapStateListResponse =
     rommsync::sync::kMaxStateListBytes + kStateJsonBytes * kJsonDocumentPerTextByte;
 constexpr size_t kHeapUndeclaredBody = rommsync::sysmodule::kMaxUndeclaredBodyBytes * 3 / 2;
-// A claim's answer (M10-19, #245): read on the worker in the tick, after the
-// index fetch, a row at a time into at most `install::kMaxClaims` requests --
-// one more thing held one at a time. Budgeted at a full download queue's worth
-// of requests, which is past what one console can be handed between two ticks
-// by anyone but a script; a longer answer is the transport's unbounded body
-// (#246 §4), not a row of its own.
-constexpr size_t kHeapInstallClaimResponse =
-    rommsync::download::kMaxQueueEntries * kInstallRequestJsonBytes +
-    kInstallRequestJsonBytes * kJsonDocumentPerTextByte +
-    rommsync::install::kMaxClaims * (sizeof(rommsync::install::Request) + kHeapNameBytes);
+// A claim's answer (M10-19, #245) is read on the worker in the tick, after the
+// index fetch, a row at a time into at most `install::kMaxClaims` requests: a
+// buffered response like the others, its requests kept counted in its row in
+// flight (`kRowInFlightBytes`).
 constexpr size_t kHeapListResponse = RoundUpToKiB(std::max(
-    {kHeapPlatformsResponse, kHeapRomPageResponse, kHeapDirectoryListing, kHeapHeartbeat,
-     kHeapNegotiateResponse, kHeapStateListResponse, kHeapUndeclaredBody,
-     kHeapInstallClaimResponse}));
+    {kHeapBufferedResponse, kHeapDirectoryListing, kHeapHeartbeat, kHeapStateListResponse,
+     kHeapUndeclaredBody}));
 // Beside whichever of those the tick holds: the index, and the page whose rows
 // are on their way into it, before it is freed.
 constexpr size_t kHeapRomIndex =
@@ -658,7 +743,8 @@ constexpr size_t kHeapTickSaves = RoundUpToKiB(std::max(
     {kTickScanBytes, kTickBuildBytes, kTickPlanBytes, kTickRunBytes, kTickStatesBytes}));
 // Held between pumps, beside everything -- a tick included: the one platform
 // snapshot, the one built page waiting for its `ListNext`, and the page the IPC
-// thread is handing over, built on that thread out of the snapshot.
+// thread is handing over, built on that thread out of the snapshot, each at its
+// peak (`kListPageBytes`).
 constexpr size_t kHeapListPages =
     RoundUpToKiB(rommsync::lists::kMaxPlatforms * kPlatformRowBytes + 2 * kListPageBytes);
 constexpr size_t kHeapThreadStacks =
@@ -684,13 +770,21 @@ constexpr size_t kHeapInstallClaims = RoundUpToKiB(
 constexpr size_t kHeapDownloadQueue = RoundUpToKiB(
     rommsync::download::kMaxQueueEntries *
     (sizeof(rommsync::download::QueueEntry) + kQueuedRomTextBytes));
+// Resident for the boot, beside everything, and written from inside a tick's
+// run: every entry the history keeps, in the array `conflicts::History`
+// reserves once -- one past the bound, which an `Append` inserts before it
+// trims -- and one entry's line of the file in flight.
+constexpr size_t kHeapConflictHistory = RoundUpToKiB(
+    (rommsync::conflicts::kMaxEntries + 1) * sizeof(rommsync::conflicts::Entry) +
+    rommsync::conflicts::kMaxEntries * kHistoryEntryTextBytes + kHistoryWriteBytes);
 constexpr size_t kHeapNewlibOverhead = 0x8000;
 
 constexpr size_t kHeapPeak = kHeapSocketMemory + kHeapStateBaseline + kHeapTransferBuffer +
                              kHeapListResponse + kHeapRomIndex + kHeapTickSaves +
                              kHeapListPages + kHeapThreadStacks + kHeapWatcherStack +
                              kHeapLogTail + kHeapPlaySessions + kHeapOpenDirectories +
-                             kHeapInstallClaims + kHeapDownloadQueue + kHeapNewlibOverhead;
+                             kHeapInstallClaims + kHeapDownloadQueue + kHeapConflictHistory +
+                             kHeapNewlibOverhead;
 
 // The arithmetic above, checked by the compiler rather than by a reader. It is
 // the transfer memory that this is really about: the trimmed socket config is
@@ -733,50 +827,45 @@ static_assert(sizeof(rommsync::lists::PlatformRow) == 80 &&
                   sizeof(rommsync::ipc::ListField) == 88,
               "a list row changed size; re-measure kPlatformRowBytes and kListPageBytes");
 // The responses that compete for `kHeapListResponse`, each pinned so the one that
-// wins can be seen to, and the two decisions M9-19 (#217) made against it: a rom
-// page and a listing at their bounds both fit under the platforms list the heap
-// already pays for, so neither costs a byte of its own. Past that, every row of
-// a page and every entry of a listing is heap.
-static_assert(kHeapPlatformsResponse == 217600, "lists::kMaxPlatforms moved; retotal the table");
-static_assert(kHeapRomPageResponse == 204800,
-              "roms::kDefaultPageSize or ipc::kMaxPageSize moved; retotal the table");
+// wins can be seen to. Since M9-22 (#248) the one that wins is a body at the
+// transport's ceiling and one row of it, and every other is pinned under it --
+// a listing at its bound, the heartbeat, the state listing, a body that
+// declared no length -- so none of them costs a byte of its own.
+static_assert(rommsync::http::kMaxResponseBytes == 204800,
+              "the transport's ceiling moved; retotal the table");
+static_assert(kHeapBufferedResponse == 210944,
+              "the ceiling or a row in flight moved; retotal the table");
 static_assert(kHeapDirectoryListing == 151552,
               "fs::kMaxDirectoryEntries moved; retotal the table");
-static_assert(kHeapRomPageResponse <= kHeapPlatformsResponse,
-              "a rom page is now the largest response; it was chosen not to be (M9-19)");
-static_assert(kHeapDirectoryListing <= kHeapPlatformsResponse,
-              "a listing is now the largest buffer; it was chosen not to be (M9-19)");
-static_assert(kHeapHeartbeat <= kHeapPlatformsResponse,
-              "the heartbeat is now the largest response the worker holds (#228)");
-// M9-20's three (#246), and the decision each was made against: none of them
-// costs a byte of its own. The undeclared body is the one that came closest,
-// and why its cap is 128 KiB and not the 256 KiB a declared body is reserved to.
-static_assert(kHeapNegotiateResponse == 73728,
-              "sync::kMaxPlanOperations moved; retotal the table");
 static_assert(kHeapStateListResponse == 143360,
               "sync::kMaxStateListBytes moved; retotal the table");
 static_assert(kHeapUndeclaredBody == 196608,
               "kMaxUndeclaredBodyBytes moved; retotal the table");
-static_assert(kHeapNegotiateResponse <= kHeapPlatformsResponse &&
-                  kHeapStateListResponse <= kHeapPlatformsResponse,
-              "the plan or the state listing is now the largest response (M9-20)");
-static_assert(kHeapUndeclaredBody <= kHeapPlatformsResponse,
-              "a body with no Content-Length now costs more than any response the row "
-              "counts; its cap was chosen so it would not (M9-20)");
-static_assert(rommsync::sync::kMaxPlanOperations * kOperationJsonBytes <=
-                      rommsync::http::kMaxResponseBytes &&
-                  rommsync::sync::kMaxStateListBytes <= rommsync::http::kMaxResponseBytes,
-              "the plan or the state listing is larger than the body the wire reserves");
-static_assert(kHeapInstallClaimResponse <= kHeapPlatformsResponse,
-              "a claim's answer is now the largest response the worker holds (#245)");
-static_assert(kHeapListResponse == 0x35400,
-              "a response or listing bound moved; retotal the table");
-// The reservation that makes "its text, once" true has to reach every response
-// the row budgets, or the largest of them doubles its way in after all.
+static_assert(kHeapDirectoryListing <= kHeapBufferedResponse &&
+                  kHeapHeartbeat <= kHeapBufferedResponse &&
+                  kHeapStateListResponse <= kHeapBufferedResponse &&
+                  kHeapUndeclaredBody <= kHeapBufferedResponse,
+              "a listing, the heartbeat, the state listing or an undeclared body now costs "
+              "more than a body at the transport's ceiling (M9-22)");
+// The widths the ceiling was set against: the platforms list at its row bound,
+// a full rom page at the fixture's widths, a plan at its operation bound and
+// the state listing at its byte bound all fit it, so a ceiling below them is a
+// library that fails by name where it used to be read.
 static_assert(rommsync::lists::kMaxPlatforms * kPlatformJsonBytes <=
                       rommsync::http::kMaxResponseBytes &&
-                  kRomPageRows * kRomJsonBytes <= rommsync::http::kMaxResponseBytes,
-              "a budgeted response is larger than the body the wire reserves");
+                  kRomPageRows * kRomJsonBytes <= rommsync::http::kMaxResponseBytes &&
+                  rommsync::sync::kMaxPlanOperations * kOperationJsonBytes <=
+                      rommsync::http::kMaxResponseBytes &&
+                  rommsync::sync::kMaxStateListBytes <= rommsync::http::kMaxResponseBytes,
+              "a response the table was sized for no longer fits the transport's ceiling");
+// What a claim's answer keeps beside its row in flight is inside the term the
+// row in flight was measured at, with the row's own document beside it.
+static_assert(rommsync::install::kMaxClaims *
+                      (sizeof(rommsync::install::Request) + kHeapNameBytes) <=
+                  kRowInFlightBytes / 2,
+              "a claim's kept requests outgrew the row in flight they were measured in");
+static_assert(kHeapListResponse == 0x33800,
+              "a response or listing bound moved; retotal the table");
 static_assert(kHeapRomIndex == 0x40C00, "roms::kMaxIndexRoms moved; retotal the table");
 // The tick's row is its last phase, and the others are pinned under it so the
 // one that wins can be seen to. A save is one plan operation and one baseline
@@ -789,6 +878,14 @@ static_assert(kTickScanBytes <= kTickRunBytes && kTickBuildBytes <= kTickRunByte
 static_assert(kTickStatesBytes <= kTickRunBytes,
               "the states half is now a tick's worst phase; it was pinned under the saves' "
               "run phase when the engine started freeing that before it (M9-21)");
+// The negotiate request's body, under the plan its phase then holds (M9-22): it
+// is let go of before the plan is read, so the phase holds one or the other.
+static_assert(kNegotiateEntryBytes <=
+                  kPlannedSaveBytes + sizeof(rommsync::sync::SyncOperation) / 2,
+              "a save's negotiate entry now costs more than its plan operation; it is no "
+              "longer under the plan phase (M9-22)");
+static_assert(rommsync::sync::kMaxResolvedUploads == 4 && kTickResolveBytes == 6848,
+              "the uploads one tick resolves moved; retotal the run phase (M9-22)");
 static_assert(sizeof(rommsync::scan::StateFile) == 184 &&
                   sizeof(rommsync::sync::ServerState) == 96 &&
                   sizeof(rommsync::sync::StateOperationResult) == 264,
@@ -797,8 +894,8 @@ static_assert(rommsync::sync::kMaxStatePlacements == rommsync::scan::kMaxStates,
               "the placements one run makes moved; re-derive kTickStatesBytes");
 static_assert(kRomPageRows * kListRomRowBytes <= kHeapTickSaves,
               "a list page's rows no longer fit where a tick's saves are held (M9-20)");
-static_assert(kHeapTickSaves == 0x36000, "scan::kMaxSaves moved; retotal the table");
-static_assert(kHeapListPages == 0x24800,
+static_assert(kHeapTickSaves == 0x37C00, "scan::kMaxSaves moved; retotal the table");
+static_assert(kHeapListPages == 0x1F800,
               "lists::kMaxPlatforms or ipc::kMaxPageSize moved; retotal the table");
 static_assert(kHeapThreadStacks == 0x44000, "kThreadStackBytes moved; retotal the table");
 static_assert(kHeapWatcherStack == 0xA000, "kWatcherStackBytes moved; retotal the table");
@@ -813,6 +910,14 @@ static_assert(sizeof(rommsync::download::QueueEntry) == 208,
               "download::QueueEntry changed size; re-measure kQueuedRomTextBytes");
 static_assert(kHeapDownloadQueue == 0x5400,
               "download::kMaxQueueEntries moved; retotal the table");
+static_assert(sizeof(rommsync::conflicts::Entry) == 408,
+              "conflicts::Entry changed size; re-measure kHistoryEntryTextBytes");
+static_assert(kHeapConflictHistory == 0x8C00,
+              "conflicts::kMaxEntries moved; retotal the table");
+// The history read at boot, before the worker starts, under the response row --
+// one more thing held one at a time, as `queue.json` is.
+static_assert(rommsync::conflicts::kMaxHistoryBytes <= kHeapListResponse,
+              "conflicts.db at its bound is now larger than the response row it is read under");
 // What a queue write holds beside the rows, under the two rows whose holder it
 // excludes, and the file read at boot -- before the worker starts -- under the
 // response row, one more thing held one at a time.
@@ -824,14 +929,28 @@ static_assert(rommsync::download::kMaxQueueBytes <= kHeapListResponse,
 // to its row rather than a second reader of a bound. Changing the term is a red
 // build here, which is the point: it is the term a reader is likeliest to nudge.
 static_assert(kHeapNewlibOverhead == 0x8000, "the newlib arena term moved; retotal the table");
-static_assert(kHeapPeak == 0x17A400, "the table above no longer sums to its peak row");
+static_assert(kHeapPeak == 0x17E000, "the table above no longer sums to its peak row");
 
-// 0x180000 leaves 0x5C00 -- 23 KiB -- over that peak, which is the margin a
+// 0x180000 leaves 0x2000 -- 8 KiB -- over that peak, which is the margin a
 // process nobody can attach a debugger to needs. It is the only margin stated
 // here on purpose: #207's prose quoted two, and the arithmetic gave neither.
 // M9-4 (#208) took 40 KiB of it for the PSC watcher's thread, which is the row
 // above, M10-19 (#245) 8 KiB for the claimed installs, and M9-21 (#247) 21 KiB
 // for the download queue, which was always resident and never counted.
+//
+// **M9-22 (#248) took 15 KiB more**, and every byte of it is cost that was
+// always there: the conflict history, resident and never counted (35 KiB), and
+// the #232 resolution's share of the run phase (7 KiB) -- against 20 KiB the
+// list pages gave back once they were measured at their peak and their items
+// stopped growing into room for twice their fields, and 7 KiB the response row
+// gave back once a row in flight was what its reader keeps. What it did not
+// take is the rest of what it closed: the negotiate request's body and the last
+// chunk's plan are under the plan phase now, the device list and an oversized
+// plan's text under the response row. The image had 12 KiB left under
+// `scripts/image-budget.sh`'s ceiling after #248's code, so growing the heap was
+// not on the table; `sync::kMaxResolvedUploads` is 4 rather than 8 for the 6 KiB
+// that left, and `conflicts::kMaxEntries` at 24 would give 8 KiB back -- the
+// trade this table's to make again.
 //
 // **The queue is why `download::kMaxQueueEntries` is 32, not 64** (M9-21). At
 // 64 its rows were ~41 KiB at the names above -- the whole margin -- and the
@@ -902,22 +1021,19 @@ static_assert(kHeapPeak == 0x17A400, "the table above no longer sums to its peak
 // was never asked about. (There is no console in the field to migrate: a larger
 // `state.db` is refused and rebuilt, `state_db.hpp`.)
 //
-// **Still not in this table**, found by M9-20 and M9-21 and left for an issue
-// of their own (#248): the negotiate request's body (a save's entry,
-// `kMaxSaves` of them, held while the plan arrives); a device list whose rows
-// nothing counts; a body that declares a `Content-Length` past
-// `kMaxReservedBodyBytes`, which still grows the way an undeclared one used to
-// -- an oversized plan's text among them, received whole before it is refused;
-// the #232 resolution's second plan beside the run's own; and a list page's
-// peak while it is built, measured ~13 KiB past `kListPageBytes` for a queue
-// page. They live in the margin today, which is what a margin is not for. The responses that are one row -- a save row, an
-// upload's answer, a rom's detail, the play-session answer -- are one row's
-// document beside their text, under `kHeapListResponse` with room.
+// **What M9-20 and M9-21 left out of this table, M9-22 (#248) put in it** -- the
+// negotiate request's body, the device list, a body past the old reservation
+// and an oversized plan's text with it, the resolution's second plan, a list
+// page's peak, and the conflict history -- each a row, a term of one, or a
+// bound under one, pinned above. The responses that are one row of a fixed
+// schema -- a save row, an upload's answer, the play-session answer -- are one
+// row's document beside their text, under `kHeapListResponse` with room; a rom's
+// detail, the one that is not fixed, is read as the list rows are.
 constexpr size_t kInnerHeapSize = 0x180000;
 constexpr size_t kHeapMargin = kInnerHeapSize - kHeapPeak;
 
 static_assert(kHeapPeak < kInnerHeapSize, "the heap no longer covers the peak in the table above");
-static_assert(kHeapMargin == 0x5C00,
+static_assert(kHeapMargin == 0x2000,
               "the margin in the sentence above is no longer the one left");
 
 alignas(16) u8 g_inner_heap[kInnerHeapSize];
