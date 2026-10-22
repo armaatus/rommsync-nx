@@ -89,7 +89,7 @@ struct BaselineUpdate {
 
   /// Rows dropped to keep `value` inside `state::kMaxRecords` -- saves that were
   /// neither reported nor operated on this tick, so almost always saves that are
-  /// no longer on the card. See `AdvanceBaseline`.
+  /// no longer on the card, and then state rows. See `AdvanceBaseline`.
   std::size_t dropped = 0;
 
   /// One line per save that could not be advanced, bounded by
@@ -101,8 +101,8 @@ struct BaselineUpdate {
 
 /// Move `previous` forward by what this tick did.
 ///
-/// `reported` is the `ClientSaveState` vector the tick negotiated with -- the
-/// scan's own facts, which are still exactly right for every save this tick did
+/// `reported` is the `ClientSaveState` vector step 0 produced -- the scan's own
+/// facts, which are still exactly right for every save this tick did
 /// not rewrite. `plan` and `report` are paired by index, the order
 /// `ExecutePlan` promises; an operation whose two halves disagree about
 /// `(rom_id, slot)` is skipped and named rather than guessed at.
@@ -130,7 +130,14 @@ struct BaselineUpdate {
 /// `state::kMaxRecords`, which is the point at which keeping them costs the
 /// *whole* baseline (`SaveBaseline` refuses a file `ParseBaseline` would
 /// discard whole). Dropping the stale ones first is the only order that loses
-/// nothing this tick knows.
+/// nothing this tick knows. **Then state rows**, which share the bound and
+/// which this half is handed too (state_db.hpp): a state goes before a save
+/// this tick knows, `sync::SyncStates`' own order, and is compared from scratch.
+///
+/// `reported` is every save the scan found, a save `RunTick` withheld as deleted
+/// on the server (#233) included: its marked row is what keeps the deleted
+/// bytes from being offered again, and a withheld save is on the card, not
+/// stale.
 ///
 /// **It cannot invent room.** A tick that reports and plans more than
 /// `kMaxRecords` saves by itself has nothing droppable left, and neither this

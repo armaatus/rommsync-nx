@@ -92,6 +92,23 @@ void TrimToFit(const SyncPlan& plan, const std::map<Key, const ClientSaveState*>
                                " rows a baseline can be read back with; this save was neither "
                                "reported nor planned this tick");
   }
+  // Then state rows, which share the bound (state_db.hpp): this half is handed
+  // them, and a file over it is refused whole. A save is what hard rule 2
+  // protects, so a state goes first -- `TrimStates`' order -- and is compared
+  // from scratch next tick.
+  std::size_t states = 0;
+  while (update->value.size() > state::kMaxRecords && !update->value.state_rows().empty()) {
+    const state::Baseline::StateKey key = update->value.state_rows().begin()->first;
+    update->value.EraseState(key.first, key.second);
+    ++states;
+  }
+  if (states > 0) {
+    update->dropped += states;
+    AddWarning(&update->warnings,
+               std::to_string(states) + " state row(s) dropped from the baseline to keep the "
+               "saves' inside the " + std::to_string(state::kMaxRecords) +
+               " rows it can be read back with; those states are compared from scratch");
+  }
   if (update->value.size() > state::kMaxRecords) {
     // Nothing left that this tick does not know about, so the file cannot be
     // made writable from here. `SaveBaseline` refuses it and says so, but its

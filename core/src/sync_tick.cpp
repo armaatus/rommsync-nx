@@ -190,6 +190,7 @@ struct PlanRun {
 /// Execute, resolve and finish one plan, starting from `*baseline` and leaving
 /// in it what was written. `first` is the run that carries the play sessions.
 PlanRun CarryOut(http::HttpClient& client, fs::FileSystem& files, const auth::StoredToken& token,
+                 const std::vector<ClientSaveState>& reported,
                  const std::vector<ClientSaveState>& offered,
                  const std::vector<SaveTarget>& targets, Negotiation* negotiated,
                  state::Baseline* baseline, const TickOptions& options,
@@ -234,9 +235,10 @@ PlanRun CarryOut(http::HttpClient& client, fs::FileSystem& files, const auth::St
   if (!first) {
     finish.play_sessions.clear();
   }
-  // `offered`, not `reported`: a withheld save is one this tick did not
-  // mention, so its marked row stands as it is.
-  run.finished = FinishTick(client, files, token, negotiated->plan, run.executed, offered,
+  // `reported`, not `offered`: nothing was planned for a withheld save, so its
+  // marked row stands as it is -- and it is on the card, so a baseline past its
+  // bound does not trim it as stale (#233).
+  run.finished = FinishTick(client, files, token, negotiated->plan, run.executed, reported,
                             std::move(*baseline), finish, baseline);
 
   run.outcome = OutcomeAfter(run.executed, run.finished);
@@ -492,8 +494,8 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
     }
 
     const bool first = result.totals.plans == 0;
-    PlanRun run = CarryOut(client, files, token, *offered, targets, &one, &baseline, options,
-                           negotiate, first);
+    PlanRun run = CarryOut(client, files, token, reported, *offered, targets, &one, &baseline,
+                           options, negotiate, first);
     ++result.totals.plans;
     result.totals.completed += run.executed.completed;
     result.totals.failed += run.executed.failed;
