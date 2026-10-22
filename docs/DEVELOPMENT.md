@@ -599,7 +599,8 @@ through `ssl` and reports what each stage cost. It is built by CI on every push
 and by `ctest -R switch.tlsprobe`, and it has **not been run** — see below.
 
 **Code size.** Three aarch64 images, identical flags (`switch.mk`'s, re-measured
-at its `-Os` by #200, which moved each figure by under 60 bytes) and libnx,
+at its `-Os` by #200, which moved each figure by under 60 bytes; read from
+`switch.mk` by make rather than copied since #256, which moved none) and libnx,
 differing only in what they link (`./tlsprobe/measure-footprint.sh`, devkitA64 r29.2-1,
 libnx 4.12.0-1, switch-mbedtls 2.28.10-1):
 

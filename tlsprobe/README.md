@@ -17,7 +17,8 @@ This page is how to build it and how to run it.
 make -C tlsprobe                     # -> tlsprobe/rommsync-tlsprobe.nro
 make -C tlsprobe clean
 ctest --test-dir build -R switch.tlsprobe   # the same build, in the CI image
-./tlsprobe/measure-footprint.sh      # ssl vs mbedTLS, in code bytes
+./tlsprobe/measure-footprint.sh      # ssl vs mbedTLS, in code bytes, at switch.mk's flags
+./tlsprobe/measure-footprint.sh --flags   # ...which it reads from switch.mk (#256)
 ```
 
 ## What it does

@@ -443,7 +443,59 @@ phase_tlsprobe() {
   toolchain_run "$SCRATCH" \
     '"$DEVKITPRO"/devkitA64/bin/aarch64-none-elf-size tlsprobe/rommsync-tlsprobe.elf'
 
+  # The footprint measurement compiles with what make makes of switch.mk, and
+  # that is every flag switch.mk spells (#256). make's answer against the
+  # file's text: a derivation that came back empty, or lost a flag, fails here.
+  local derived cxxflags flag
+  derived="$(bash "$REPO_ROOT/tlsprobe/measure-footprint.sh" --flags)" ||
+    fail "measure-footprint.sh --flags could not read switch.mk's flags"
+  cxxflags=" $(sed -n 's/^CXXFLAGS=//p' <<<"$derived") "
+  grep -q '^LDFLAGS=.*-specs=' <<<"$derived" ||
+    fail "measure-footprint.sh --flags gave no link flags: $derived"
+  while read -r flag; do
+    [[ "$cxxflags" == *" $flag "* ]] ||
+      fail "measure-footprint.sh would compile without switch.mk's $flag: $derived"
+  done < <(switch_mk_flags)
+  echo "$derived"
+
   echo "ok: the M0-1 probe builds as an NRO carrying $version, without core/"
+}
+
+# --- the footprint measurement's flags -------------------------------------------
+
+# The literal flags switch.mk's own definitions of ARCH, ROMMSYNC_WARNINGS,
+# CFLAGS and CXXFLAGS spell, continuation lines included, one a line. Read as
+# text, so it is an account of switch.mk independent of the make that evaluates
+# it -- which is what lets phase_tlsprobe hold one to the other.
+switch_mk_flags() {
+  awk '/^(ARCH|ROMMSYNC_WARNINGS|CFLAGS|CXXFLAGS)[[:space:]]*[:+]?=/ { grab = 1 }
+       grab { print; if ($0 !~ /\\$/) grab = 0 }' "$REPO_ROOT/switch.mk" |
+    sed 's/^[^=]*=//' | tr -s ' \t\\' '\n\n\n' | grep -E '^-' | sort -u
+}
+
+# M9-29 (#256): tlsprobe/measure-footprint.sh compiles three images to measure
+# what TLS costs a sysmodule, and the numbers mean that only with switch.mk's
+# flags. It used to carry a copy "verbatim" that was not: -Wall for
+# ROMMSYNC_WARNINGS. It now asks make for them, and this keeps a copy from
+# coming back -- none of switch.mk's flags may be spelled in the script itself.
+phase_footprint() {
+  local script="$REPO_ROOT/tlsprobe/measure-footprint.sh"
+  [ -f "$script" ] || fail "no tlsprobe/measure-footprint.sh"
+  local flags
+  flags="$(switch_mk_flags)"
+  # Asserted, because an empty list would make the check below pass over a
+  # script holding the whole copy.
+  grep -qx -- '-fno-exceptions' <<<"$flags" && grep -qx -- '-Werror' <<<"$flags" ||
+    fail "read no flags out of switch.mk; the check below would pass vacuously: $flags"
+
+  # The script's words, outside its comments, split the way a shell would.
+  local spelled
+  spelled="$(grep -v '^[[:space:]]*#' "$script" | tr -s " \t\"'\\\\" '\n\n\n\n\n' | sort -u |
+             comm -12 - <(echo "$flags"))"
+  [ -z "$spelled" ] ||
+    fail "tlsprobe/measure-footprint.sh spells switch.mk's flags itself ($(echo $spelled)); \
+read them from switch.mk, or the measurement drifts from the build (#256)"
+  echo "ok: tlsprobe/measure-footprint.sh holds no copy of switch.mk's flags"
 }
 
 # --- the entries that need the toolchain, and where they run -------------------
@@ -540,9 +592,10 @@ nothing in CI runs them: $(sed -n 's/^UNLABELLED //p' <<<"$labelled" | tr '\n' '
 }
 
 case "${1:-}" in
-  ci)       phase_ci ;;
-  builds)   phase_builds ;;
-  tlsprobe) phase_tlsprobe ;;
-  suite)    shift; phase_suite "$@" ;;
-  *)        echo "usage: $0 {ci|builds|tlsprobe|suite CTEST BUILD_DIR}" >&2; exit 2 ;;
+  ci)        phase_ci ;;
+  builds)    phase_builds ;;
+  tlsprobe)  phase_tlsprobe ;;
+  footprint) phase_footprint ;;
+  suite)     shift; phase_suite "$@" ;;
+  *)         echo "usage: $0 {ci|builds|tlsprobe|footprint|suite CTEST BUILD_DIR}" >&2; exit 2 ;;
 esac

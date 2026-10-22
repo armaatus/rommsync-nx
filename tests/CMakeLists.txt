@@ -1820,6 +1820,14 @@ set_tests_properties(switch.tlsprobe PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 
                      RUN_SERIAL TRUE
                      ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
 
+# tlsprobe/measure-footprint.sh reads its compile flags from switch.mk rather
+# than carrying a copy (#256). This reads the script only, so it never skips;
+# switch.tlsprobe above runs the script's --flags in the image and holds what
+# make computed to switch.mk's own text.
+add_test(NAME switch.footprint_flags
+         COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" footprint)
+set_tests_properties(switch.footprint_flags PROPERTIES TIMEOUT 60)
+
 # The suite the `switch-build` job runs is the `toolchain` label, no more and
 # no less, and it fails on a skip: checked against stubs here, so it needs no
 # image and never skips. ctest's own --show-only output is what it reads.
