@@ -94,7 +94,7 @@ inline constexpr int kFormatVersion = 1;
 /// read.
 ///
 /// Bounds for `config::kMaxConfigBytes`' reason -- this runs on a sysmodule heap
-/// with ~1.3 MiB free (docs/DEVELOPMENT.md) over a FAT32 card that gets yanked
+/// of 1.5 MiB (docs/DEVELOPMENT.md) over a FAT32 card that gets yanked
 /// mid-write, so a corrupt directory entry claiming four gigabytes has to be a
 /// named refusal rather than a `bad_alloc`.
 ///
@@ -106,10 +106,18 @@ inline constexpr int kFormatVersion = 1;
 /// asserts exactly that, because a writer that can produce a file the reader
 /// discards would cost a console its whole queue at the next boot.
 ///
-/// Sixty-four is not a small queue: these are roms, so a full one is several
-/// gigabytes of transfer. A user who wants more queues more when these drain.
-inline constexpr std::size_t kMaxQueueEntries = 64;
-inline constexpr std::size_t kMaxQueueBytes = 160 * 1024;
+/// **Thirty-two, from sixty-four, because the heap holds the queue** (M9-21,
+/// #247): every entry is resident for the life of the process, and nothing in
+/// the heap's table counted them until then. At sixty-four the rows were ~41
+/// KiB at No-Intro-length names -- nearly all of the margin the table had left
+/// -- and ~131 KiB at the bounds above; the derivation is beside the table, in
+/// `sysmodule/source/main.cpp`. Thirty-two is still not a small queue: these
+/// are roms, so a full one is gigabytes of transfer, and a user who wants more
+/// queues more when these drain. What it costs is history: finished rows make
+/// way for new ones (`Queue::Enqueue`), so the queue screen shows the last
+/// thirty-two rather than sixty-four.
+inline constexpr std::size_t kMaxQueueEntries = 32;
+inline constexpr std::size_t kMaxQueueBytes = 80 * 1024;
 
 /// The longest `QueueEntry::message`. Long enough for the sentences
 /// `config::RomDestination::reason` and `http::Result::message` produce, short
@@ -351,7 +359,9 @@ struct DownloadStatus {
 /// `state::ParseBaseline` is.
 class Queue {
  public:
-  Queue() = default;
+  /// The rows are reserved at `kMaxQueueEntries` once, here and on `Reset`, so
+  /// no change ever moves them into a bigger array with both alive (#247).
+  Queue() { entries_.reserve(kMaxQueueEntries); }
 
   Queue(const Queue&) = delete;
   Queue& operator=(const Queue&) = delete;

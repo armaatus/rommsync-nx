@@ -86,7 +86,7 @@ namespace rommsync::sync {
 /// **It bounds the rows, and the text only once it is here.** `Send` reads a
 /// body whole, so a listing past this is already resident when it is refused --
 /// and one that declares a `Content-Length` past the wire's reservation is not
-/// capped by the transport at all (#247). Under it, the listing is read a row at
+/// capped by the transport at all (#248). Under it, the listing is read a row at
 /// a time and costs its text and one row's document (`json::ParseEach`, M9-20,
 /// #246), which `sysmodule/source/main.cpp` counts.
 inline constexpr std::size_t kMaxStateListBytes = 128 * 1024;

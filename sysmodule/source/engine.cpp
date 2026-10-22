@@ -2036,7 +2036,7 @@ bool SdEngine::RunOneTick() {
   ServeInstalls(*client, token, *config, caps, cancel.get());
 
   const std::string baseline_path = files->Resolve(sync::kStateSdPath);
-  const state::LoadedBaseline loaded = LoadBaselineFor(baseline_path, *config);
+  state::LoadedBaseline loaded = LoadBaselineFor(baseline_path, *config);
   // Taken here and let go only once a negotiation has asked for them, so an
   // offline tick keeps them for the next (#241).
   std::vector<std::int64_t> fresh;
@@ -2269,8 +2269,13 @@ bool SdEngine::RunOneTick() {
     conflicts::RecordSaves(&history_, plan, executed, reported, record);
   };
 
-  const sync::TickResult tick =
-      sync::RunTick(*client, *files, token, reported, targets, loaded.value, options);
+  // The baseline is **moved** in, not copied: `RunTick` takes it by value and
+  // hands its own on to the finish, and a copy left here was a third set of its
+  // rows beside the two the finish holds -- the rows and the text they are
+  // written as -- for the length of the tick (`kHeapStateBaseline`, main.cpp;
+  // #247). Nothing below reads it: the states half re-reads the file.
+  sync::TickResult tick = sync::RunTick(*client, *files, token, reported, targets,
+                                        std::move(loaded.value), options);
   ObserveAnswer(tick.answer);
   if (tick.totals.plans > 0 && tick.outcome != sync::TickOutcome::kCanceled && !fresh.empty()) {
     // Asked for, and done -- unless it was asked again for, or a plan never
@@ -2318,6 +2323,19 @@ bool SdEngine::RunOneTick() {
                   tick.negotiated.message + "; " + std::to_string(tick.unasked_roms.size()) +
                   " roms wait for the next sync");
   }
+
+  // The saves half is done with, and it lets go of every save here, before the
+  // states half takes its own (#247): what was reported and targeted, and the
+  // last plan and what it did, which `tick` keeps for nothing past this point --
+  // the scheduler reads the outcome and the transport, and the summary the
+  // totals. Held on, they were the saves' worst phase beside the states', and
+  // `kHeapTickSaves` (main.cpp) is the larger of the two rather than their sum
+  // because of this.
+  std::vector<sync::ClientSaveState>().swap(reported);
+  std::vector<sync::SaveTarget>().swap(targets);
+  std::vector<sync::SyncOperation>().swap(tick.negotiated.plan.operations);
+  std::vector<sync::OperationResult>().swap(tick.executed.operations);
+  std::vector<std::string>().swap(tick.executed.warnings);
 
   sync::StateSyncReport states;
   // Not when RomM says sync is off for this console either: states have no

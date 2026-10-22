@@ -570,6 +570,7 @@ void Queue::Reset(std::vector<QueueEntry> entries) {
   }
   std::lock_guard<std::mutex> held(mutex_);
   entries_ = std::move(entries);
+  entries_.reserve(kMaxQueueEntries);
   // These entries are not the ones the rate was measured over, nor the ones
   // anything finished -- this is a load, or the rollback of a write that failed.
   last_finished_rom_id_ = 0;

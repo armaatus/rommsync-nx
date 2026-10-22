@@ -649,13 +649,14 @@ void ResponseParse(checks::Checks& c) {
   // ~3 KiB for the smallest of the four.
   constexpr std::int64_t kPerRow = 1024;
   const auto check = [&c](const char* what, const std::string& one, const std::string& many,
-                          const std::function<bool(const std::string&)>& parse) {
+                          const std::function<bool(const std::string&)>& parse,
+                          std::size_t rows = kRows) {
     c.Expect(parse(one) && parse(many), std::string(what) + " parses");
     const std::int64_t at_one = PeakOf(one, parse);
     const std::int64_t at_many = PeakOf(many, parse);
-    std::cout << what << ": " << at_one << " bytes at 1 row, " << at_many << " at " << kRows
+    std::cout << what << ": " << at_one << " bytes at 1 row, " << at_many << " at " << rows
               << " (" << many.size() << " bytes of text)\n";
-    c.Expect(at_many - at_one < static_cast<std::int64_t>(kRows) * kPerRow,
+    c.Expect(at_many - at_one < static_cast<std::int64_t>(rows) * kPerRow,
              std::string(what) + " holds one row's document at a time, not the whole body's");
   };
 
@@ -687,10 +688,16 @@ void ResponseParse(checks::Checks& c) {
     }
     return rommsync::download::SerializeQueue(entries);
   };
-  check("download::ParseQueue", queue(1), queue(kRows), [](const std::string& text) {
-    const rommsync::download::LoadedQueue loaded = rommsync::download::ParseQueue(text);
-    return !loaded.discarded && !loaded.entries.empty();
-  });
+  // A queue holds no more than `kMaxQueueEntries` -- fewer than the other three
+  // carry since #247 -- and a file with more is refused whole.
+  constexpr std::size_t kQueueRows = rommsync::download::kMaxQueueEntries;
+  check(
+      "download::ParseQueue", queue(1), queue(kQueueRows),
+      [](const std::string& text) {
+        const rommsync::download::LoadedQueue loaded = rommsync::download::ParseQueue(text);
+        return !loaded.discarded && !loaded.entries.empty();
+      },
+      kQueueRows);
 }
 
 /// A body of the wrong shape is refused before it is parsed, not after.

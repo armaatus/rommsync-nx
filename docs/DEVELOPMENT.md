@@ -677,6 +677,19 @@ a sysmodule pays for a TLS request is therefore:
    tick alone was ~856 KiB, so the bound is now **128 saves**, what the heap
    holds after growing to `0x180000`; each further 64 is ~140 KiB of resident
    `.bss`, and the image is within 36 KiB of `scripts/image-budget.sh`'s ceiling.
+
+   M9-21 (#247) counted the last three it found. The **states half of a tick**
+   is a fifth phase of the tick's row, pinned under the saves' run phase: the
+   engine now lets go of every save before it, and one run places at most
+   `sync::kMaxStatePlacements` (32) of the server's states, where a full
+   listing could have placed ~220. The **baseline** is held twice, not three
+   times: the engine moves it into `sync::RunTick` instead of keeping a copy.
+   And the **download queue** has a row: it is resident, and a change to it
+   used to hold it three times over — the queue, a copy to roll back to, and all
+   of it serialised. A change now keeps the rows it touched, `queue.json` is
+   written a piece at a time, and the queue's page reads the rows in place; even
+   so the rows are ~21 KiB at 32 entries, which is why `kMaxQueueEntries` is 32
+   and not 64. The margin is 23 KiB, and what is still uncounted is #248.
 2. **The in-flight buffers** — ours to size. Roms stream to file and never sit
    in RAM whole (hard rule 2's sibling: nothing is buffered that does not have
    to be). Every `sslConnectionRead` is an IPC round trip to the `ssl`
