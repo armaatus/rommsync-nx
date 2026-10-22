@@ -356,13 +356,16 @@ struct TickOptions {
   /// server with `restore_unlisted`; otherwise they are ordinary roms.
   std::vector<std::int64_t> restore_roms;
 
-  /// Asked once more, before a 409 is resolved (#232): true holds the
-  /// resolution -- no second negotiation, no transfer -- and leaves the refused
-  /// uploads for the next tick. The engine passes "a game is running" (#242):
-  /// its own check sits before the plan, and the resolution is a second round
-  /// trip after it, so a game launched meanwhile has already read the save the
-  /// resolution would replace. Null never holds.
-  std::function<bool()> hold_resolution;
+  /// Asked again wherever the tick would start more work after its first plan
+  /// ran: before each later chunk (`rom_scope`), and before a 409 is resolved
+  /// (#232). True holds that work -- no request, no transfer -- for the next
+  /// tick: the chunks held are `TickResult::unasked_roms` and make the tick
+  /// `kPartial`, and a held resolution leaves the refused uploads as they are.
+  /// The engine passes "a game is running" (#242): its own check sits before
+  /// the first plan, and a game launched while one ran has already read the
+  /// saves the next would replace. Not asked before the first chunk. Null never
+  /// holds.
+  std::function<bool()> hold;
 
   /// Called once for every plan the tick carried out, in order, after it was
   /// executed, resolved and finished and before it is freed (#246). The plan and

@@ -109,7 +109,7 @@ struct ResolveOptions {
   /// run -- and merely a larger answer.
   bool rom_ids = true;
 
-  /// `TickOptions::hold_resolution`: asked before the second negotiation, and
+  /// `TickOptions::hold`: asked before the second negotiation, and
   /// true sends nothing and changes nothing (`ResolveReport::held`).
   std::function<bool()> hold;
 

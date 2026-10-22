@@ -2201,6 +2201,45 @@ void Scoped(rig::Checks& checks, http::HttpClient& client, const std::string& ba
   harness::DeleteDevice(client, base, fixture, device);
 }
 
+/// #242 per chunk: a game launched while one chunk's plan ran stops the chunks
+/// after it -- asked before each, never before the first, which the engine's own
+/// check covers -- and they are the next tick's: unasked, and the tick partial.
+void Held(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+          const Fixture& fixture, const harness::Rom& rom) {
+  const std::string device = harness::CreateDevice(checks, client, base, fixture, "tick-held");
+  if (device.empty()) {
+    return;
+  }
+  Sandbox sandbox(checks, "tick-held");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  auth::StoredToken token = TokenFor(base, fixture);
+  token.device_id = device;
+  Recording recording(client);
+  sync::TickOptions options = OptionsAt(1'757'000'450);
+  std::vector<std::int64_t> card = {rom.id};
+  for (std::int64_t id = 1; card.size() < 2 * sync::kMaxNegotiateRomIds + 1; ++id) {
+    card.push_back(900'000'000 + id);
+  }
+  options.rom_scope = card;
+  int asked = 0;
+  options.hold = [&asked]() {
+    ++asked;
+    return true;
+  };
+  const sync::TickResult tick = sync::RunTick(recording, *files, token, {}, {}, {}, options);
+  checks.ExpectEq(recording.negotiations.size(), std::size_t{1},
+                  "the first chunk runs; the game is asked about before the next, and holds it");
+  checks.ExpectEq(asked, 1, "asked once, before the second chunk, and not before the first");
+  checks.ExpectEq(tick.totals.plans, std::size_t{1}, "one plan ran");
+  checks.ExpectEq(tick.unasked_roms.size(), card.size() - sync::kMaxNegotiateRomIds,
+                  "the roms of the chunks held are unasked, for the next tick");
+  checks.Expect(tick.outcome == sync::TickOutcome::kPartial,
+                std::string("and the tick is partial, not clean: ") + sync::ToString(tick.outcome));
+  checks.ExpectEq(recording.completed, 1, "the plan that ran closed its session");
+  harness::DeleteDevice(client, base, fixture, device);
+}
+
 /// #241: a rom just downloaded has its save restored even when this device
 /// synced that save before -- which RomM otherwise reads as the user having
 /// deleted it -- and only that rom is asked with `restore_unlisted`.
@@ -4151,6 +4190,8 @@ int main(int argc, char** argv) {
     IsolatedIds(checks, *client, base, fixture);
   } else if (scenario == "oversized") {
     Oversized(checks, *client, base, fixture);
+  } else if (scenario == "held") {
+    Held(checks, *client, base, fixture, rom);
   } else if (scenario == "scoped") {
     Scoped(checks, *client, base, fixture, rom);
   } else if (scenario == "restore") {

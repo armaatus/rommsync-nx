@@ -2075,8 +2075,8 @@ bool SdEngine::RunOneTick() {
   // -- and the GETs above wrote nothing. The tick goes back to the scheduler
   // as if the game had been running when the worker asked.
   //
-  // Not the last time: a 409's resolution asks again (`hold_resolution`), and
-  // so does the states half before it starts.
+  // Not the last time: each later chunk and a 409's resolution ask again
+  // (`TickOptions::hold`), and so does the states half before it starts.
   if (application_running()) {
     return false;
   }
@@ -2187,9 +2187,9 @@ bool SdEngine::RunOneTick() {
     options.rom_scope = std::move(on_card.rom_ids);
     options.restore_roms = fresh;
   }
-  // The check above is the last before the plan. A 409's resolution is a second
-  // negotiation and transfer after it, so it asks again (#232 against #242).
-  options.hold_resolution = [this]() { return application_running(); };
+  // The check above is the last before the first plan. Each later chunk's plan,
+  // and a 409's resolution, are transfers after it, so they ask again (#242).
+  options.hold = [this]() { return application_running(); };
   options.execute.backup_dir = sync::kBackupDir;
   // What a save RomM deleted does here (#233): backed up, then removed, unless
   // `keep` says leave it.

@@ -390,7 +390,7 @@ rather than counting it failed forever (`sync::ResolveRefusedUploads`,
    that row would fetch — and confirm — a superseded save. Never more than one
    second negotiation per tick, and none while a game is running: the engine's
    own check (#242) is before the plan, and this is a round trip after it, so
-   it asks again (`TickOptions::hold_resolution`) and a held resolution leaves
+   it asks again (`TickOptions::hold`) and a held resolution leaves
    the 409 for the next tick.
 2. **Decide** with Grout's rule (#226 R3): local bytes whose MD5 equals the
    server digest `state.db` recorded at the last sync take the head as a
