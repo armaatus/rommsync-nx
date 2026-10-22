@@ -234,8 +234,8 @@ WriteResult WriteAtomically(const std::string& path, std::string_view contents) 
   });
 }
 
-WriteResult WriteAtomicallyEach(const std::string& path,
-                                const std::function<bool(std::string* piece)>& next) {
+WriteResult WriteAtomically(const std::string& path,
+                            const std::function<bool(std::string* piece)>& next) {
   return WriteStaged(path, [&next](std::FILE* file) {
     std::string piece;
     for (;;) {

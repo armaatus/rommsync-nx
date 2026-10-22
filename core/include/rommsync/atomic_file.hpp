@@ -208,8 +208,13 @@ WriteResult WriteAtomically(const std::string& path, std::string_view contents);
 /// For a record whose text would be a second copy of something already in
 /// memory: `queue.json`, written whole on every change to the download queue,
 /// was the queue again in text beside the queue.
-WriteResult WriteAtomicallyEach(const std::string& path,
-                                const std::function<bool(std::string* piece)>& next);
+///
+/// An overload rather than a name of its own on purpose: `scripts/v1-gate.sh`
+/// counts every `io::WriteAtomically(` call in its census of what commits bytes
+/// over a file, and a writer it could not see would be an overwrite path nobody
+/// had classified.
+WriteResult WriteAtomically(const std::string& path,
+                            const std::function<bool(std::string* piece)>& next);
 
 /// Move a file that is already staged on disk onto `path`, atomically.
 ///

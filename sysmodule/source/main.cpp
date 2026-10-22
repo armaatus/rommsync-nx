@@ -215,7 +215,7 @@ namespace {
 //     at its bounds, from the IPC thread beside everything -- and the overlay's
 //     queue page copied it whole. A change now keeps only the rows it touched
 //     (`download::Queue::Undo`), `queue.json` is written a piece at a time
-//     (`io::WriteAtomicallyEach`) and the page reads the rows in place
+//     (`io::WriteAtomically` in pieces) and the page reads the rows in place
 //     (`Queue::Visit`), so what a write or a page costs beside the rows is a few
 //     entries, and it is under rows that exist (`kQueueWriteBytes`). The row is
 //     the rows, and the rows are why `download::kMaxQueueEntries` is 32.

@@ -1062,7 +1062,7 @@ StoreResult SaveQueue(const std::string& path, const std::vector<QueueEntry>& en
 
   std::size_t next = 0;
   const io::WriteResult written =
-      io::WriteAtomicallyEach(path, [&entries, &next](std::string* out) {
+      io::WriteAtomically(path, [&entries, &next](std::string* out) {
         if (next == PieceCount(entries)) {
           return false;
         }
