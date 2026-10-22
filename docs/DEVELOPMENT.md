@@ -671,15 +671,17 @@ and by `ctest -R switch.tlsprobe`, and it has **not been run** — see below.
 
 **Code size.** Three aarch64 images, identical flags (`switch.mk`'s, re-measured
 at its `-Os` by #200, which moved each figure by under 60 bytes; read from
-`switch.mk` by make rather than copied since #256, which moved none) and libnx,
-differing only in what they link (`./tlsprobe/measure-footprint.sh`, devkitA64 r29.2-1,
+`switch.mk` by make rather than copied since #256, which moved none; #253's LTO
+moved `ssl` by 8 bytes and mbedTLS by 16, since only the probe's own one unit is
+LTO, and libnx, newlib and mbedTLS are prebuilt) and libnx, differing only in
+what they link (`./tlsprobe/measure-footprint.sh`, devkitA64 r29.2-1,
 libnx 4.12.0-1, switch-mbedtls 2.28.10-1):
 
 | image | `.text` | `.data` | `.bss` | Δ`.text` |
 |---|---|---|---|---|
 | baseline — libnx + newlib stdio | 113,774 | 14,264 | 19,392 | — |
-| **`ssl` service** — sockets + the full handshake sequence | 176,465 | 15,216 | 19,712 | **+62,691** |
-| mbedTLS — the same handshake in-process | 501,629 | 30,952 | 29,088 | +387,855 |
+| **`ssl` service** — sockets + the full handshake sequence | 176,473 | 15,216 | 19,712 | **+62,699** |
+| mbedTLS — the same handshake in-process | 501,613 | 30,952 | 29,088 | +387,839 |
 
 Borrowing Horizon's TLS costs **61 KiB of code**; carrying our own costs
 **379 KiB**, six times more, before its per-connection heap. That is the whole
