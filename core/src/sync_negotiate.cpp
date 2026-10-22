@@ -70,6 +70,8 @@ constexpr ReasonSpelling kReasons[] = {
     {Reason::kAppearIdentical, "appear_identical", "Saves appear identical"},
     {Reason::kUntracked, "untracked", "Save is untracked on this device"},
     {Reason::kDeletedOnServer, "deleted_on_server", "Save was deleted on the server"},
+    {Reason::kHeldSinceRemoval, "held_since_removal",
+     "Client holds a version removed on the server"},
 };
 
 const ReasonSpelling* SpellingOf(Reason reason) {

@@ -736,6 +736,33 @@ def sync_scenarios_5_4(s, base, cap, rom_id, run, created, devices):
     cap.record("sync-negotiate-delete", gone)
     print(json.dumps(gone, indent=2)[:600])
 
+    hr("5.4: a version the slot lost, still held, negotiates as `download`")
+    # The slot keeps a head, so this is `compare_save_state` rather than the
+    # empty-slot branch above: the client offers the version removed under the
+    # head, written before the removal, and is told to take the head (#259).
+    slot = f"probe-{run}-removed"
+    holder = device("removed")
+    lost = uploaded(slot, holder, v1)
+    # Second-granular heads, as in the version scenarios below: in one second
+    # the two rows tie and the older stays head.
+    time.sleep(1.1)
+    uploaded(slot, holder, b"rommsync probe save v2\n")
+    s.post(f"{base}/api/saves/delete", json={"saves": [lost["id"]]},
+           timeout=60).raise_for_status()
+    created.remove(lost["id"])
+    behind = negotiate(s, base, cap, holder, [
+        client_save(rom_id, "probe.srm", slot, "probe-emulator", v1, "2026-01-01T00:00:00Z"),
+    ])
+    expect_action(behind, "download", slot)
+    held_reason = "Client holds a version removed on the server"
+    if not any(op.get("slot") == slot and op.get("reason") == held_reason
+               for op in behind["operations"]):
+        print(f"!! the lost version came back without {held_reason!r}; the capture would be "
+              f"mislabelled, so it is not written.", file=sys.stderr)
+        sys.exit(1)
+    cap.record("sync-negotiate-held-since-removal", behind)
+    print(json.dumps(behind, indent=2)[:600])
+
     # --- another device's version, and baselines ----------------------------
     hr("5.4: another device's upload is a new head this device has no history with")
     # Sync records are per (device, save row), and negotiate only reads the

@@ -349,7 +349,8 @@ Action ClassifyAction(std::string_view action, bool* recognized = nullptr);
 ///
 /// This is the **complete** set 5.2.0 can emit, tabulated in
 /// docs/API_CONTRACT.md#save-sync--negotiate--execute--complete, plus 5.4.0's
-/// `delete` reason. Only five of the thirteen 5.2.0 ones appear in
+/// two removal reasons -- `delete`'s and `download`'s -- each pinned by a 5.4.0
+/// capture. Only five of the thirteen 5.2.0 ones appear in
 /// server/contract/captures/, so `contract.captures` cannot guard the rest and
 /// `sync.plan` holds this enum to the document instead.
 ///
@@ -379,6 +380,7 @@ enum class Reason {
   kAppearIdentical,                ///< no_op: no record, equal timestamps, hashes not comparable
   kUntracked,                      ///< no_op: the device's sync row is marked untracked
   kDeletedOnServer,                ///< delete: the slot was emptied after this copy was written
+  kHeldSinceRemoval,               ///< download: the slot lost this version after it was written
 };
 
 /// A stable slug for logs -- `both_changed`, not the server's sentence. Never

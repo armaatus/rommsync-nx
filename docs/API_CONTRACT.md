@@ -475,7 +475,7 @@ source. Treat an unlisted reason as a server that moved:
 | `download` | `Server save is newer (no sync history)` | no sync record, server timestamp is later | |
 | `download` | `Server save is newer than last sync` | only the server moved past the sync record | ✔ |
 | `download` | `Server save updated since last sync, not present on client` | the client dropped a pair that has since changed — or any it dropped, under `restore_unlisted` | |
-| `download` | `Client holds a version removed on the server` | the slot has a head, and the client holds a version the slot lost, written no later than the loss (`_held_since_removal`) | |
+| `download` | `Client holds a version removed on the server` | the slot has a head, and the client holds a version the slot lost, written no later than the loss (`_held_since_removal`); `captures/sync-negotiate-held-since-removal.json` | ✔ |
 | `conflict` | `Both sides changed since last sync` | both moved past the sync record | ✔ |
 | `conflict` | `Same timestamp but different content` | no sync record, equal timestamps, different hashes | ✔ |
 | `no_op` | `Content is identical` | hashes match — checked before anything else | ✔ |
@@ -499,16 +499,11 @@ and falls back to timestamps: `captures/sync-negotiate-other-device-version.json
 is `upload`, `"Client save is newer (no sync history)"` — for bytes the server
 has already seen from this very device.
 
-`Client holds a version removed on the server` is not in `sync::Reason` yet, so
-it arrives `kUnrecognized` with a warning; the `download` is obeyed regardless
-(#259 names it).
-
 An `action` or a `reason` that is not in the tables above is a server that moved.
 `ClassifyAction` pins the unknown action to `no_op` and reports it, because on a
 save the default branch is the one that can overwrite it; an unrecognised
 `reason` leaves the action obeyed and is reported the same way. `sync.plan` keeps
-a typed copy of both tables — every row above but the held-version one, until
-#259 — and checks the client's classifier against it in both directions; it
+a typed copy of both tables — every row above — and checks the client's classifier against it in both directions; it
 does not parse this page, so a row added here is added there by hand.
 
 Both `conflict` reasons matter to the client: hashes are compared first, so a

@@ -224,6 +224,31 @@ void DeleteCapture(checks::Checks& c) {
   c.Expect(!deleted->server_content_hash.has_value(), "and no server copy");
 }
 
+/// 5.4.0's other removal reason (#259): the slot still has a head, and the
+/// client offers a version the slot lost -- deleted, or pruned -- written before
+/// it went. The server answers with its head, and says why in a sentence of its
+/// own: before #259 that sentence arrived `kUnrecognized`, with a warning on
+/// every tick that met it.
+void HeldSinceRemovalCapture(checks::Checks& c) {
+  const auth::Parsed<sync::SyncPlan> parsed =
+      ParseCapture(c, "sync-negotiate-held-since-removal.json");
+  const sync::SyncOperation* held = nullptr;
+  for (const sync::SyncOperation& operation : parsed.value.operations) {
+    if (operation.reason_text == "Client holds a version removed on the server") {
+      held = &operation;
+    }
+  }
+  if (held == nullptr) {
+    c.Expect(false, "the held-since-removal capture carries its reason");
+    return;
+  }
+  c.Expect(held->reason == sync::Reason::kHeldSinceRemoval, "the reason classifies");
+  c.Expect(held->action == sync::Action::kDownload && held->known_action,
+           "...on a download this build obeys");
+  c.Expect(held->save_id.has_value() && held->server_content_hash.has_value(),
+           "of the head the slot still holds, with its digest to verify against");
+}
+
 /// A body without `total_delete` is a plan with no deletions. 5.4.0 sends it
 /// on every plan and declares it required, but every hand-built body here omits
 /// it and a server below the 5.4.0 floor never reaches negotiate
@@ -274,6 +299,10 @@ const ReasonCase kReasons[] = {
     // 5.4.0 (#233): a slot emptied on the server, held by a client that wrote
     // its copy before the removal (`compare_missing_server_save`).
     {sync::Reason::kDeletedOnServer, sync::Action::kDelete, "Save was deleted on the server"},
+    // 5.4.0 (#259): the slot kept a head and lost the version the client holds,
+    // which was written before the loss (`_held_since_removal`).
+    {sync::Reason::kHeldSinceRemoval, sync::Action::kDownload,
+     "Client holds a version removed on the server"},
 };
 
 /// A plan carrying one operation with the given action and reason, spelled the
@@ -294,7 +323,7 @@ void EveryDocumentedReason(checks::Checks& c) {
   // silent no-op months later.
   c.ExpectEq(static_cast<int>(sync::Reason::kUnrecognized), 0,
              "kUnrecognized is what a default-constructed operation carries");
-  c.ExpectEq(static_cast<int>(sync::Reason::kDeletedOnServer),
+  c.ExpectEq(static_cast<int>(sync::Reason::kHeldSinceRemoval),
              static_cast<int>(std::size(kReasons)),
              "the enum holds exactly the documented reasons and the unrecognised one");
 
@@ -672,6 +701,7 @@ int main() {
   NoOpCapture(c);
   EmptyCapture(c);
   DeleteCapture(c);
+  HeldSinceRemovalCapture(c);
   TotalDeleteIsOptional(c);
   EveryDocumentedReason(c);
   EveryAction(c);

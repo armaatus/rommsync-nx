@@ -75,6 +75,7 @@
 #include "rommsync/file_system.hpp"
 #include "rommsync/http.hpp"
 #include "rommsync/placement.hpp"
+#include "rommsync/state_db.hpp"
 #include "rommsync/sync.hpp"
 #include "rommsync/token_store.hpp"
 
@@ -178,6 +179,37 @@ struct SaveTarget {
   /// client's to choose; never the server's tagged one.
   std::string file_name;
 };
+
+/// The pair RomM keys a save on, from anything that names one: a reported save,
+/// a target, an operation or its result.
+template <typename Save>
+state::Baseline::Key KeyOf(const Save& save) {
+  return {save.rom_id, save.slot};
+}
+
+/// Whether `save` is the one `key` names. A key is compared as itself, so a
+/// list of keys (`ExecuteOptions::keep_local`) is searched like any other.
+template <typename Save>
+bool HasKey(const Save& save, const state::Baseline::Key& key) {
+  return save.rom_id == key.first && save.slot == key.second;
+}
+inline bool HasKey(const state::Baseline::Key& entry, const state::Baseline::Key& key) {
+  return entry == key;
+}
+
+/// The first of `saves` keyed `key`, or nullptr: **the** `(rom_id, slot)`
+/// lookup, which every step of a tick that pairs one list with another goes
+/// through (#259). A scan of at most `kMaxPlanOperations` entries, which builds
+/// nothing on the heap.
+template <typename Save>
+const Save* FindByKey(const std::vector<Save>& saves, const state::Baseline::Key& key) {
+  for (const Save& save : saves) {
+    if (HasKey(save, key)) {
+      return &save;
+    }
+  }
+  return nullptr;
+}
 
 /// The target for `operation`, matched on `(rom_id, slot)`, or nullptr.
 ///
@@ -380,9 +412,24 @@ enum class ArchiveOutcome {
 /// Stable, log-friendly name. Never null.
 const char* ToString(ArchiveOutcome outcome);
 
+/// `OperationResult::warning` for an operation that wrote no line of its own.
+inline constexpr std::int32_t kNoWarning = -1;
+
 /// One operation, and what became of it.
 struct OperationResult {
   Action action = Action::kNoOp;
+
+  /// Where in `ExecutionReport::warnings` the line `ExecutePlan` wrote for this
+  /// operation is -- a failure's, or an action not understood -- or
+  /// `kNoWarning`. The line's identity, so the one thing that takes a line back
+  /// out (a 409 a resolution then acted on, sync_resolve.hpp) does it by
+  /// position rather than by matching a sentence that can be reworded (#259).
+  ///
+  /// 32 bits and here, beside `action`, because that is padding the struct
+  /// already had: `sysmodule/source/main.cpp` pins its size, and the per-save
+  /// heap figure measured on it.
+  std::int32_t warning = kNoWarning;
+
   std::int64_t rom_id = 0;
   std::optional<std::string> slot;
 
@@ -465,6 +512,13 @@ struct ExecutionReport {
   std::vector<std::string> warnings;
 };
 
+/// Set `report`'s three totals from its operations' outcomes. **The** mapping
+/// from an outcome to `completed`, `failed` or `not_understood` -- `ExecutePlan`
+/// counts with it as it goes, and a resolution that replaced some results
+/// recounts with it (sync_resolve.hpp) -- so an outcome added later is counted
+/// in one place or in none (#259). A cancelled operation counts nowhere.
+void Recount(ExecutionReport* report);
+
 /// How hard one execution tries, and what it is allowed to touch.
 struct ExecuteOptions {
   /// Where backups go, SD-root absolute. Overridable so a test can look at one
@@ -528,7 +582,7 @@ struct ExecuteOptions {
   /// never the engine's. Empty, which is every tick today: the overlay choice
   /// that fills it was split out of #240 into a later PR, so a conflict is
   /// always resolved Keep server (with the local copy archived on the server).
-  std::vector<std::pair<std::int64_t, std::optional<std::string>>> keep_local;
+  std::vector<state::Baseline::Key> keep_local;
 
   /// Whether an upload and a `/downloaded` carry `content_hash`: the MD5 of the
   /// file as it is uploaded, and of the verified bytes a download put on the

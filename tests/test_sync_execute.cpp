@@ -557,6 +557,31 @@ void Counting(rig::Checks& checks) {
     checks.Expect(report.operations[3].error == sync::OperationError::kNoSaveId,
                   std::string("a download the server named no save for is named: ") +
                       sync::ToString(report.operations[3].error));
+
+    // Each line written for an operation is that operation's by position, not by
+    // its text (#259): a resolution removes the 409's line through this.
+    checks.Expect(report.operations[0].warning == sync::kNoWarning,
+                  "a planned no-op writes no line");
+    for (std::size_t at = 1; at < report.operations.size(); ++at) {
+      const std::int32_t line = report.operations[at].warning;
+      checks.Expect(line >= 0 && static_cast<std::size_t>(line) < report.warnings.size() &&
+                        report.warnings[static_cast<std::size_t>(line)] ==
+                            report.operations[at].message,
+                    "operation " + std::to_string(at) + " names its own line in warnings");
+    }
+  }
+
+  // One mapping from an outcome to a total (#259): what `ExecutePlan` counted,
+  // recounted from the results, is the same three numbers.
+  {
+    sync::ExecutionReport recounted = report;
+    recounted.completed = 0;
+    recounted.failed = 0;
+    recounted.not_understood = 0;
+    sync::Recount(&recounted);
+    checks.Expect(recounted.completed == 1 && recounted.failed == 2 &&
+                      recounted.not_understood == 1,
+                  "Recount agrees with what ExecutePlan counted");
   }
 
   // Cancellation lands on an operation boundary. The plan above is all no-ops

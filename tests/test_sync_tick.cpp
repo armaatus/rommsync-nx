@@ -33,6 +33,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "crash_disk.hpp"
@@ -1059,13 +1060,19 @@ class PlanningClient final : public http::HttpClient {
     result.response.status = 200;
     if (request.url.find("/api/sync/negotiate") != std::string::npos) {
       negotiated.push_back(request.body);
+      std::string operations;
+      for (const std::string& slot : slots) {
+        operations += std::string(operations.empty() ? "" : ",") +
+                      R"j({"action":"upload","rom_id":4,"save_id":20,)j"
+                      R"j("file_name":"Game [2026-10-21_09-02-32].srm","slot":")j" +
+                      slot +
+                      R"j(","emulator":"snes9x","reason":"Client save is newer (no sync history)",)j"
+                      R"j("server_updated_at":"2026-10-21T09:02:14+00:00",)j"
+                      R"j("server_content_hash":"00112233445566778899aabbccddeeff"})j";
+      }
       result.response.body =
-          R"j({"session_id":9,"operations":[{"action":"upload","rom_id":4,"save_id":20,)j"
-          R"j("file_name":"Game [2026-10-21_09-02-32].srm","slot":"autosave",)j"
-          R"j("emulator":"snes9x","reason":"Client save is newer (no sync history)",)j"
-          R"j("server_updated_at":"2026-10-21T09:02:14+00:00",)j"
-          R"j("server_content_hash":"00112233445566778899aabbccddeeff"}],)j"
-          R"j("total_upload":1,"total_download":0,"total_conflict":0,"total_no_op":0})j";
+          R"j({"session_id":9,"operations":[)j" + operations +
+          R"j(],"total_upload":1,"total_download":0,"total_conflict":0,"total_no_op":0})j";
     } else {
       result.response.body = "{}";
     }
@@ -1078,12 +1085,42 @@ class PlanningClient final : public http::HttpClient {
     return result;
   }
 
+  /// The slots the plan names a head for.
+  std::vector<std::string> slots = {"autosave"};
   int requests = 0;
   int downloads = 0;
   std::vector<std::string> negotiated;
 };
 
+/// Converts to anything, so a brace-init of these is valid exactly up to the
+/// number of fields an aggregate has. Declared only: it is never evaluated.
+struct AnyField {
+  template <typename T>
+  operator T() const;
+};
+
+template <typename T, std::size_t... I>
+constexpr bool BracesTake(std::index_sequence<I...>) {
+  return requires { T{(static_cast<void>(I), AnyField{})...}; };
+}
+
+/// How many fields the aggregate `T` has.
+template <typename T, std::size_t N = 0>
+constexpr std::size_t FieldCount() {
+  if constexpr (BracesTake<T>(std::make_index_sequence<N + 1>{})) {
+    return FieldCount<T, N + 1>();
+  } else {
+    return N;
+  }
+}
+
 void NewerBounds(rig::Checks& checks) {
+  // `Accumulate` is kept in step with `ResolveReport` by hand, so the struct is
+  // pinned to the fields it folds and the block below checks each of them
+  // (#259): a field added is a red run here until both know about it.
+  checks.ExpectEq(FieldCount<sync::ResolveReport>(), std::size_t{7},
+                  "ResolveReport has the seven fields Accumulate folds; fold a new one there "
+                  "and check it here");
   // A tick scoped in chunks resolves each plan's 409s with that plan (#246), so
   // `TickResult::resolved` is every plan's, folded -- not the last one's.
   {
@@ -1153,9 +1190,12 @@ void NewerBounds(rig::Checks& checks) {
     result.outcome = sync::OperationOutcome::kFailed;
     result.error = sync::OperationError::kNewerOnServer;
     result.message = "upload rom 4, slot autosave: 409";
+    // The 409's line is the second, and worded unlike the result's message: it
+    // is removed as the line the operation wrote, never by its text (#259).
+    result.warning = 1;
     report->operations = {result};
     report->failed = 1;
-    report->warnings = {result.message};
+    report->warnings = {"a line about something else", "the 409, as the log words it"};
   };
 
   // A game launched since the tick's own check: nothing is asked, nothing runs.
@@ -1172,6 +1212,8 @@ void NewerBounds(rig::Checks& checks) {
     checks.ExpectEq(client.requests, 0, "and it sends nothing");
     checks.Expect(report.operations[0].error == sync::OperationError::kNewerOnServer,
                   "the 409 stands for the next tick");
+    checks.Expect(report.warnings.size() == 2 && report.operations[0].warning == 1,
+                  "and so does its line");
   }
 
   // No file step 0 found for the save: the head is named, and still not fetched.
@@ -1217,6 +1259,21 @@ void NewerBounds(rig::Checks& checks) {
                       plan.operations[0].save_id == std::optional<std::int64_t>(20),
                   "as a download of the head the server named");
     checks.Expect(client.downloads > 0, "which is fetched");
+    // The fetch fails here (nowhere to fetch from), so the operation carries a
+    // line of its own again -- the run's, not the 409's.
+    checks.Expect(std::find(report.warnings.begin(), report.warnings.end(),
+                            "the 409, as the log words it") == report.warnings.end(),
+                  "the 409's line is gone, though its text matched no message");
+    checks.Expect(!report.warnings.empty() &&
+                      report.warnings.front() == "a line about something else",
+                  "and the line before it is kept");
+    checks.Expect(report.operations[0].outcome == sync::OperationOutcome::kFailed,
+                  "the resolution's fetch failed, as this client makes it");
+    const std::int32_t line = report.operations[0].warning;
+    checks.Expect(line >= 0 && static_cast<std::size_t>(line) < report.warnings.size() &&
+                      report.warnings[static_cast<std::size_t>(line)] ==
+                          report.operations[0].message,
+                  "the resolved operation names its own line: " + report.operations[0].message);
   }
   // Past `kMaxResolvedUploads` refused uploads, the rest wait for the next tick
   // (#248): each is a save asked about again, a head and its run beside the
@@ -1244,16 +1301,28 @@ void NewerBounds(rig::Checks& checks) {
       result.outcome = sync::OperationOutcome::kFailed;
       result.error = sync::OperationError::kNewerOnServer;
       result.message = "upload rom 4, slot " + *save.slot + ": 409";
+      result.warning = static_cast<std::int32_t>(report.warnings.size());
       report.operations.push_back(result);
       report.warnings.push_back(result.message);
       ++report.failed;
     }
+    // A head and a found file for every one of them, so as many as one plan
+    // resolves are: their 409 lines go together (#259). The fetch fails, so
+    // nothing is written.
     PlanningClient client;
+    std::vector<sync::SaveTarget> everywhere;
+    client.slots.clear();
+    for (const sync::ClientSaveState& save : reported) {
+      client.slots.push_back(*save.slot);
+      everywhere.push_back({4, save.slot, SavePath("Game.srm"), "Game.srm"});
+    }
     sync::ResolveOptions options;
     options.negotiate.wait = [](std::chrono::milliseconds) {};
     options.complete.wait = [](std::chrono::milliseconds) {};
     const sync::ResolveReport resolved = sync::ResolveRefusedUploads(
-        client, *files, token, reported, found, previous, &plan, &report, options);
+        client, *files, token, reported, everywhere, previous, &plan, &report, options);
+    checks.ExpectEq(resolved.resolved, sync::kMaxResolvedUploads,
+                    "as many are resolved as one plan resolves");
     checks.ExpectEq(resolved.refused, refused_uploads, "every refused upload is counted");
     std::size_t asked = 0;
     if (!client.negotiated.empty()) {
@@ -1270,6 +1339,23 @@ void NewerBounds(rig::Checks& checks) {
     }
     checks.Expect(still_refused >= refused_uploads - sync::kMaxResolvedUploads,
                   "the rest stand refused for the next tick");
+    // Several 409 lines out at once, from the middle of the list (#259): every
+    // operation still names its own line, and a line names one operation.
+    std::size_t named = 0;
+    for (const sync::OperationResult& result : report.operations) {
+      if (result.warning == sync::kNoWarning) {
+        continue;
+      }
+      ++named;
+      checks.Expect(result.warning >= 0 &&
+                        static_cast<std::size_t>(result.warning) < report.warnings.size() &&
+                        report.warnings[static_cast<std::size_t>(result.warning)] ==
+                            result.message,
+                    "after the lines dropped, an operation still names its own: " +
+                        result.message);
+    }
+    checks.ExpectEq(named, report.operations.size(),
+                    "and every one of them, refused or resolved, has one");
   }
 
   checks.ExpectEq(sandbox.Read(SavePath("Game.srm")), bytes,

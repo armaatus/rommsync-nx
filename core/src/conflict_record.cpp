@@ -20,22 +20,6 @@ std::int64_t NowSeconds(const std::function<sync::Timestamp()>& clock) {
   return sync::UnixSeconds(clock ? clock() : std::chrono::system_clock::now());
 }
 
-/// The client's reported copy for `(rom_id, slot)`, or nullptr.
-///
-/// Matched the way the server pairs them and the way `sync::MatchTarget` does:
-/// on `(rom_id, slot)` and never on a name, because the name on an operation is
-/// the server's (sync_execute.hpp).
-const sync::ClientSaveState* ReportedFor(const std::vector<sync::ClientSaveState>& reported,
-                                        std::int64_t rom_id,
-                                        const std::optional<std::string>& slot) {
-  for (const sync::ClientSaveState& save : reported) {
-    if (save.rom_id == rom_id && save.slot == slot) {
-      return &save;
-    }
-  }
-  return nullptr;
-}
-
 /// The scanned state for `(rom_id, file_name)`, which is how RomM keys one.
 const scan::StateFile* ScannedFor(const scan::ScanResult& scan, std::int64_t rom_id,
                                   const std::string& file_name) {
@@ -98,8 +82,9 @@ std::size_t RecordSaves(History* history, const sync::SyncPlan& plan,
     }
 
     // The local facts are the ones step 0 reported, not the ones on the card:
-    // the card now holds the server's copy.
-    if (const sync::ClientSaveState* local = ReportedFor(reported, result.rom_id, result.slot);
+    // the card now holds the server's copy. Matched on `(rom_id, slot)`, never on
+    // a name: the name on an operation is the server's (sync_execute.hpp).
+    if (const sync::ClientSaveState* local = sync::FindByKey(reported, sync::KeyOf(result));
         local != nullptr) {
       entry.file_name = local->file_name;
       entry.emulator = local->emulator.value_or(std::string());

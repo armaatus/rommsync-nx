@@ -80,11 +80,19 @@ std::string Describe(const SyncOperation& operation) {
          ", slot " + (operation.slot.has_value() ? *operation.slot : "<archival>");
 }
 
-OperationResult Fail(const SyncOperation& operation, OperationError error, std::string message) {
+/// A result for `operation`, naming the action and the save it is about and
+/// nothing else yet. Every result starts here, so a field that identifies an
+/// operation is filled in one place.
+OperationResult ResultFor(const SyncOperation& operation) {
   OperationResult result;
   result.action = operation.action;
   result.rom_id = operation.rom_id;
   result.slot = operation.slot;
+  return result;
+}
+
+OperationResult Fail(const SyncOperation& operation, OperationError error, std::string message) {
+  OperationResult result = ResultFor(operation);
   // A cancellation is not a failure -- the caller stopped this, and nothing
   // about the save went wrong. It gets its own outcome so the accounting M2-6
   // reports cannot call it either completed or failed.
@@ -386,12 +394,40 @@ std::string StateBackupDiscriminator(std::string_view file_name) {
 
 const SaveTarget* MatchTarget(const std::vector<SaveTarget>& targets,
                               const SyncOperation& operation) {
-  for (const SaveTarget& target : targets) {
-    if (target.rom_id == operation.rom_id && target.slot == operation.slot) {
-      return &target;
+  return FindByKey(targets, KeyOf(operation));
+}
+
+void Recount(ExecutionReport* report) {
+  report->completed = 0;
+  report->failed = 0;
+  report->not_understood = 0;
+  for (const OperationResult& result : report->operations) {
+    // Enumerated rather than defaulted: a `default` here would count whatever
+    // outcome is added next as work the client completed, which is the one
+    // direction this accounting must not be wrong in (M2-6 reports it).
+    switch (result.outcome) {
+      case OperationOutcome::kFailed:
+        ++report->failed;
+        break;
+      case OperationOutcome::kNotUnderstood:
+        ++report->not_understood;
+        break;
+      case OperationOutcome::kCanceled:
+        // Counted nowhere: the caller stopped this one, and the rest are not
+        // attempted at all.
+        break;
+      case OperationOutcome::kNoOp:
+      case OperationOutcome::kUploaded:
+      case OperationOutcome::kDownloaded:
+      case OperationOutcome::kKeptBoth:
+      case OperationOutcome::kRemoved:
+      case OperationOutcome::kKept:
+        // A kept delete is the plan obeyed too: the server's ruling was that
+        // this copy is not to be uploaded, and it is not.
+        ++report->completed;
+        break;
     }
   }
-  return nullptr;
 }
 
 OperationError BackUpFirst(fs::FileSystem& files, const std::string& backup_dir,
@@ -481,12 +517,12 @@ OperationError BackUp(fs::FileSystem& files, const ExecuteOptions& options,
 
 /// Whether the player chose "Keep local" for this save (`ExecuteOptions::keep_local`).
 bool KeepsLocal(const ExecuteOptions& options, const SyncOperation& operation) {
-  for (const auto& key : options.keep_local) {
-    if (key.first == operation.rom_id && key.second == operation.slot) {
-      return true;
-    }
-  }
-  return false;
+  return FindByKey(options.keep_local, KeyOf(operation)) != nullptr;
+}
+
+/// What step 0 reported for `target`, or nullptr -- also when nothing was.
+const ClientSaveState* ReportedFor(const ExecuteOptions& options, const SaveTarget& target) {
+  return options.reported != nullptr ? FindByKey(*options.reported, KeyOf(target)) : nullptr;
 }
 
 /// `POST /api/saves?...&content_hash=<md5>&overwrite=false` with the local file
@@ -568,10 +604,7 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
     return Fail(operation, refused->first, refused->second);
   }
 
-  OperationResult uploaded;
-  uploaded.action = operation.action;
-  uploaded.rom_id = operation.rom_id;
-  uploaded.slot = operation.slot;
+  OperationResult uploaded = ResultFor(operation);
   uploaded.outcome = OperationOutcome::kUploaded;
   uploaded.sd_path = target->sd_path;
   uploaded.message = Describe(operation) + ": uploaded " + target->sd_path;
@@ -588,14 +621,8 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
 
 /// The emulator step 0 reported for `target`, or empty.
 std::string ReportedEmulator(const ExecuteOptions& options, const SaveTarget& target) {
-  if (options.reported != nullptr) {
-    for (const ClientSaveState& save : *options.reported) {
-      if (save.rom_id == target.rom_id && save.slot == target.slot) {
-        return save.emulator.value_or(std::string());
-      }
-    }
-  }
-  return {};
+  const ClientSaveState* save = ReportedFor(options, target);
+  return save != nullptr ? save->emulator.value_or(std::string()) : std::string();
 }
 
 /// A conflict's losing local copy, put on the server as an archival save before
@@ -736,12 +763,7 @@ std::string OtherEmulator(const SyncOperation& operation, const SaveTarget& targ
   } else if (placed && options.reads_as != nullptr) {
     local = options.reads_as(operation, target.sd_path);
   } else if (!placed && options.reported != nullptr) {
-    for (const ClientSaveState& save : *options.reported) {
-      if (save.rom_id == target.rom_id && save.slot == target.slot) {
-        local = save.emulator.value_or(std::string());
-        break;
-      }
-    }
+    local = ReportedEmulator(options, target);
   } else {
     known = false;
   }
@@ -920,10 +942,7 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
                 "not touched");
   }
 
-  OperationResult result;
-  result.action = operation.action;
-  result.rom_id = operation.rom_id;
-  result.slot = operation.slot;
+  OperationResult result = ResultFor(operation);
   result.sd_path = target->sd_path;
   result.save_id = save_id;
 
@@ -1026,17 +1045,6 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   return result;
 }
 
-/// The digest step 0 reported for `target`, or empty when it reported none.
-std::string ReportedDigest(const std::vector<ClientSaveState>& reported,
-                           const SaveTarget& target) {
-  for (const ClientSaveState& save : reported) {
-    if (save.rom_id == target.rom_id && save.slot == target.slot) {
-      return save.content_hash.value_or(std::string());
-    }
-  }
-  return {};
-}
-
 /// A `delete` (#233): back up, check the backup is the bytes the server ruled
 /// on, remove. Hard rule 2 with the overwrite replaced by a removal, and the
 /// same `BackUpFirst` -- so a power cut at any call leaves the save on the card
@@ -1052,10 +1060,7 @@ OperationResult Remove(fs::FileSystem& files, const SyncOperation& operation,
                 "there is no local save for this (rom_id, slot) to remove; nothing was touched");
   }
 
-  OperationResult result;
-  result.action = operation.action;
-  result.rom_id = operation.rom_id;
-  result.slot = operation.slot;
+  OperationResult result = ResultFor(operation);
   result.sd_path = target->sd_path;
 
   if (options.on_server_delete == config::OnServerDelete::kKeep) {
@@ -1073,8 +1078,9 @@ OperationResult Remove(fs::FileSystem& files, const SyncOperation& operation,
   }
   // Asked before anything is copied: with no digest to hold the backup to,
   // the removal will not happen, and a copy made first would only be litter.
+  const ClientSaveState* reported = ReportedFor(options, *target);
   const std::string expected =
-      options.reported != nullptr ? ReportedDigest(*options.reported, *target) : std::string();
+      reported != nullptr ? reported->content_hash.value_or(std::string()) : std::string();
   if (expected.empty()) {
     OperationResult failed =
         Fail(operation, OperationError::kUnverified,
@@ -1158,15 +1164,12 @@ ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
       break;
     }
 
-    OperationResult result;
+    OperationResult result = ResultFor(operation);
     if (!operation.known_action) {
       // M2-4 hands an action this build does not know over as a `no_op` so that
       // the default branch cannot overwrite a save. Counting it as an ordinary
       // completed no-op would report that the client did what was asked, and it
       // does not know what was asked.
-      result.action = operation.action;
-      result.rom_id = operation.rom_id;
-      result.slot = operation.slot;
       result.outcome = OperationOutcome::kNotUnderstood;
       result.message = "rom " + std::to_string(operation.rom_id) + ", slot " +
                        (operation.slot.has_value() ? *operation.slot : "<archival>") +
@@ -1190,9 +1193,6 @@ ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
                          OperationOutcome::kKeptBoth, &report.warnings);
           break;
         case Action::kNoOp:
-          result.action = operation.action;
-          result.rom_id = operation.rom_id;
-          result.slot = operation.slot;
           result.outcome = OperationOutcome::kNoOp;
           result.message = Describe(operation) + ": nothing to do (" +
                            ToString(operation.reason) + ")";
@@ -1201,9 +1201,6 @@ ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
           if (!options.delete_action) {
             // A server that does not say it means `delete` (#228): obeyed as
             // nothing, and counted with the actions this build does not know.
-            result.action = operation.action;
-            result.rom_id = operation.rom_id;
-            result.slot = operation.slot;
             result.outcome = OperationOutcome::kNotUnderstood;
             result.message = Describe(operation) +
                              ": this server does not offer delete, so it was not acted on";
@@ -1214,37 +1211,18 @@ ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
       }
     }
 
-    // Enumerated rather than defaulted: a `default` here would count whatever
-    // outcome is added next as work the client completed, which is the one
-    // direction this accounting must not be wrong in (M2-6 reports it).
-    switch (result.outcome) {
-      case OperationOutcome::kFailed:
-        ++report.failed;
-        report.warnings.push_back(result.message);
-        break;
-      case OperationOutcome::kNotUnderstood:
-        ++report.not_understood;
-        report.warnings.push_back(result.message);
-        break;
-      case OperationOutcome::kCanceled:
-        // Counted nowhere: the caller stopped this one, and the rest are not
-        // attempted at all.
-        report.canceled = true;
-        break;
-      case OperationOutcome::kNoOp:
-      case OperationOutcome::kUploaded:
-      case OperationOutcome::kDownloaded:
-      case OperationOutcome::kKeptBoth:
-      case OperationOutcome::kRemoved:
-      case OperationOutcome::kKept:
-        // A kept delete is the plan obeyed too: the server's ruling was that
-        // this copy is not to be uploaded, and it is not.
-        ++report.completed;
-        break;
+    // A failure and an action not understood are each a line of their own, and
+    // the result keeps where its line is (`OperationResult::warning`). The
+    // totals are `Recount`'s, below.
+    if (result.outcome == OperationOutcome::kFailed ||
+        result.outcome == OperationOutcome::kNotUnderstood) {
+      result.warning = static_cast<std::int32_t>(report.warnings.size());
+      report.warnings.push_back(result.message);
     }
+    report.canceled = report.canceled || result.outcome == OperationOutcome::kCanceled;
     // The two failures that are not about one operation. A cancellation was
-    // never attempted; a 401 or a 403 was, and failed -- so it is counted above,
-    // and only the operations *after* it go unattempted.
+    // never attempted; a 401 or a 403 was, and failed -- so it is counted, and
+    // only the operations *after* it go unattempted.
     const bool refused_the_token = result.error == OperationError::kUnauthorized ||
                                    result.error == OperationError::kForbidden;
     report.unauthorized = report.unauthorized || refused_the_token;
@@ -1255,6 +1233,7 @@ ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
     }
   }
 
+  Recount(&report);
   return report;
 }
 

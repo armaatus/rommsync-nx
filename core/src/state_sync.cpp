@@ -876,8 +876,6 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
     // work that went wrong rather than work that was not attempted.
     report.failed = failed.outcome == StateOutcome::kFailed ? 1 : 0;
     report.canceled = failed.outcome == StateOutcome::kCanceled;
-    report.unauthorized =
-        error == StateError::kUnauthorized || error == StateError::kForbidden;
     report.operations.push_back(std::move(failed));
     report.warnings.push_back(message);
     return report;
@@ -908,7 +906,6 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
     }
     const bool refused_the_token =
         result.error == StateError::kUnauthorized || result.error == StateError::kForbidden;
-    report.unauthorized = report.unauthorized || refused_the_token;
     const bool stop = result.outcome == StateOutcome::kCanceled || refused_the_token;
     report.operations.push_back(std::move(result));
     return !stop;

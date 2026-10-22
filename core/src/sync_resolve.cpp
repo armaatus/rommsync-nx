@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <utility>
@@ -16,51 +17,24 @@
 namespace rommsync::sync {
 namespace {
 
-const ClientSaveState* ReportedFor(const std::vector<ClientSaveState>& reported,
-                                   std::int64_t rom_id, const std::optional<std::string>& slot) {
-  for (const ClientSaveState& save : reported) {
-    if (save.rom_id == rom_id && save.slot == slot) {
-      return &save;
+/// Take the lines at `drop` out of `report->warnings` -- by position, which is
+/// a line's identity (`OperationResult::warning`) -- and keep every operation's
+/// `warning` naming its own line afterwards.
+void DropWarnings(ExecutionReport* report, std::vector<std::int32_t> drop) {
+  // Last first, so a line not yet dropped has not moved.
+  std::sort(drop.begin(), drop.end(), std::greater<>());
+  drop.erase(std::unique(drop.begin(), drop.end()), drop.end());
+  for (const std::int32_t line : drop) {
+    if (line < 0 || static_cast<std::size_t>(line) >= report->warnings.size()) {
+      continue;
     }
-  }
-  return nullptr;
-}
-
-const SyncOperation* PlannedFor(const SyncPlan& plan, std::int64_t rom_id,
-                                const std::optional<std::string>& slot) {
-  for (const SyncOperation& operation : plan.operations) {
-    if (operation.rom_id == rom_id && operation.slot == slot) {
-      return &operation;
-    }
-  }
-  return nullptr;
-}
-
-/// The counts `ExecutePlan` keeps, recomputed from the operations after the
-/// merge replaced some of them. Enumerated for `ExecutePlan`'s reason: a
-/// `default` would count whatever outcome is added next as work done.
-void Recount(ExecutionReport* report) {
-  report->completed = 0;
-  report->failed = 0;
-  report->not_understood = 0;
-  for (const OperationResult& result : report->operations) {
-    switch (result.outcome) {
-      case OperationOutcome::kFailed:
-        ++report->failed;
-        break;
-      case OperationOutcome::kNotUnderstood:
-        ++report->not_understood;
-        break;
-      case OperationOutcome::kCanceled:
-        break;
-      case OperationOutcome::kNoOp:
-      case OperationOutcome::kUploaded:
-      case OperationOutcome::kDownloaded:
-      case OperationOutcome::kKeptBoth:
-      case OperationOutcome::kRemoved:
-      case OperationOutcome::kKept:
-        ++report->completed;
-        break;
+    report->warnings.erase(report->warnings.begin() + line);
+    for (OperationResult& result : report->operations) {
+      if (result.warning == line) {
+        result.warning = kNoWarning;
+      } else if (result.warning > line) {
+        --result.warning;
+      }
     }
   }
 }
@@ -148,8 +122,9 @@ ResolveReport ResolveRefusedUploads(http::HttpClient& client, fs::FileSystem& fi
     refused.push_back(index);
     const bool new_rom =
         std::find(rom_ids.begin(), rom_ids.end(), result.rom_id) == rom_ids.end();
-    const ClientSaveState* local = ReportedFor(reported, result.rom_id, result.slot);
-    const bool asked_already = ReportedFor(asked, result.rom_id, result.slot) != nullptr;
+    const state::Baseline::Key key = KeyOf(result);
+    const ClientSaveState* local = FindByKey(reported, key);
+    const bool asked_already = FindByKey(asked, key) != nullptr;
     if (local == nullptr || (new_rom && rom_ids.size() >= kMaxNegotiateRomIds) ||
         (!asked_already && asked.size() >= kMaxResolvedUploads)) {
       // Past RomM's bound on one scope, or past what one plan resolves
@@ -196,8 +171,7 @@ ResolveReport ResolveRefusedUploads(http::HttpClient& client, fs::FileSystem& fi
   std::vector<bool> headed(asked.size(), false);
   unfiltered.keep = [&asked, &headed](const SyncOperation& operation) {
     for (std::size_t at = 0; at < asked.size(); ++at) {
-      if (!headed[at] && asked[at].rom_id == operation.rom_id &&
-          asked[at].slot == operation.slot) {
+      if (!headed[at] && HasKey(asked[at], KeyOf(operation))) {
         headed[at] = true;
         return true;
       }
@@ -221,9 +195,9 @@ ResolveReport ResolveRefusedUploads(http::HttpClient& client, fs::FileSystem& fi
   run.session_id = second.plan.session_id;
   std::vector<std::size_t> run_at;
   for (const std::size_t index : refused) {
-    const OperationResult& was = executed->operations[index];
-    const SyncOperation* head = PlannedFor(second.plan, was.rom_id, was.slot);
-    if (head == nullptr || ReportedFor(asked, was.rom_id, was.slot) == nullptr ||
+    const state::Baseline::Key key = KeyOf(executed->operations[index]);
+    const SyncOperation* head = FindByKey(second.plan.operations, key);
+    if (head == nullptr || FindByKey(asked, key) == nullptr ||
         MatchTarget(targets, *head) == nullptr) {
       // Not asked about -- a sibling slot of an asked rom, which the rom scope
       // still answers for -- is the next tick's, as the header says. And a
@@ -233,7 +207,7 @@ ResolveReport ResolveRefusedUploads(http::HttpClient& client, fs::FileSystem& fi
       continue;
     }
     std::optional<SyncOperation> resolved = ResolveNewerOnServer(
-        *head, ReportedFor(reported, was.rom_id, was.slot), previous.Find(was.rom_id, was.slot));
+        *head, FindByKey(reported, key), previous.Find(key.first, key.second));
     if (!resolved.has_value()) {
       continue;
     }
@@ -247,21 +221,34 @@ ResolveReport ResolveRefusedUploads(http::HttpClient& client, fs::FileSystem& fi
 
   ExecutionReport ran = ExecutePlan(client, files, token, run, targets, options.execute);
 
-  for (std::size_t at = 0; at < ran.operations.size() && at < run_at.size(); ++at) {
-    const std::size_t index = run_at[at];
-    if (ran.operations[at].outcome == OperationOutcome::kCanceled) {
-      // Never attempted: the 409 is still what happened to this save.
+  // A resolution was attempted unless its run was cancelled first; one that was
+  // not, never ran, and the 409 is still what happened to that save.
+  const auto attempted = [&ran, &run_at](std::size_t at) {
+    return at < run_at.size() && ran.operations[at].outcome != OperationOutcome::kCanceled;
+  };
+  // The 409's own line goes: it described an operation this tick then did
+  // something about, and the engine logs every warning here as a failed save.
+  // Taken out as the line that operation wrote, not as the text it holds.
+  std::vector<std::int32_t> stale;
+  for (std::size_t at = 0; at < ran.operations.size(); ++at) {
+    if (attempted(at)) {
+      stale.push_back(executed->operations[run_at[at]].warning);
+    }
+  }
+  DropWarnings(executed, std::move(stale));
+  // What the run wrote follows what is left, so its lines move up by that much.
+  const auto moved = static_cast<std::int32_t>(executed->warnings.size());
+  for (std::size_t at = 0; at < ran.operations.size(); ++at) {
+    if (!attempted(at)) {
       continue;
     }
-    // The 409's own line goes: it described an operation this tick then did
-    // something about, and the engine logs every warning here as a failed save.
-    const auto stale = std::find(executed->warnings.begin(), executed->warnings.end(),
-                                 executed->operations[index].message);
-    if (stale != executed->warnings.end()) {
-      executed->warnings.erase(stale);
+    const std::size_t index = run_at[at];
+    OperationResult& result = ran.operations[at];
+    if (result.warning != kNoWarning) {
+      result.warning += moved;
     }
     plan->operations[index] = std::move(run.operations[at]);
-    executed->operations[index] = std::move(ran.operations[at]);
+    executed->operations[index] = std::move(result);
     ++out.resolved;
   }
   executed->warnings.insert(executed->warnings.end(), ran.warnings.begin(), ran.warnings.end());
