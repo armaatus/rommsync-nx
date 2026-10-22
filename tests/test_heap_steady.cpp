@@ -219,20 +219,30 @@ class Console {
     return false;
   }
 
-  /// Queue `rom_id` and wait for the worker to drain it onto the card.
-  bool Download(std::int64_t rom_id, std::chrono::seconds budget) {
+  /// Queue `rom_id`, wait for the worker to drain it onto the card, and for the
+  /// tick a finished download asks for to bring its save (#241) -- so a round
+  /// ends with the worker idle, as the next round's press needs it.
+  bool Download(std::int64_t rom_id, const TickCounter& counter, std::chrono::seconds budget) {
+    const std::int64_t before = counter.ticks();
     std::string response;
     if (Call(ipc::Command::kEnqueue, ipc::EncodeRomId(rom_id), &response) != ipc::Error::kOk) {
       return false;
     }
     const auto deadline = std::chrono::steady_clock::now() + budget;
+    bool drained = false;
     while (std::chrono::steady_clock::now() < deadline) {
-      if (Status().queue_depth == 0) {
+      if (!drained && Status().queue_depth == 0) {
         // The finished row stays for the queue screen; taking it out is what a
         // user tidying the screen does, and it is what lets the next round
         // queue the same rom again.
-        return Call(ipc::Command::kDequeue, ipc::EncodeRomId(rom_id), &response) ==
-               ipc::Error::kOk;
+        if (Call(ipc::Command::kDequeue, ipc::EncodeRomId(rom_id), &response) !=
+            ipc::Error::kOk) {
+          return false;
+        }
+        drained = true;
+      }
+      if (drained && counter.ticks() > before && !Status().sync_in_progress) {
+        return true;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds{20});
     }
@@ -618,7 +628,7 @@ void Soak(checks::Checks& c, http::HttpClient& client, const std::string& base,
           [&c, id = rom.id](Console& console, const TickCounter& counter) {
             return [&c, &console, &counter, id](int) {
               if (!console.Tick(counter, std::chrono::seconds{60}) ||
-                  !console.Download(id, std::chrono::seconds{120})) {
+                  !console.Download(id, counter, std::chrono::seconds{120})) {
                 return false;
               }
               std::error_code error;
