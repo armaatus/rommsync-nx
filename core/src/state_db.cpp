@@ -600,56 +600,59 @@ class Parser {
 /// At most `kMaxStateBytes`, `io::ReadBounded`'s bound and reasoning, shared
 /// with `config.ini`. Past it, the file is read on only while it is rc1's
 /// version 2 within rc1's bound -- a line at a time, its text never held, so it
-/// costs the heap what a file inside this build's bound does.
+/// costs the heap what a file inside this build's bound does -- or for as long
+/// as it takes to see that it is a later release's. Both reads are one open
+/// (#255): reopening the path for the second let a rename between them read as
+/// an unreadable file.
 io::BoundedRead Load(const std::string& path, LoadedBaseline* out) {
-  {
-    std::string contents;
-    const io::BoundedRead outcome = io::ReadBounded(path, kMaxStateBytes, &contents);
-    if (outcome != io::BoundedRead::kTooLarge) {
-      if (outcome == io::BoundedRead::kOk) {
-        *out = ParseBaseline(contents);
-      }
-      return outcome;
-    }
+  std::string contents;
+  bool streamed = false;
+  const io::BoundedRead outcome = io::ReadBounded(
+      path, kMaxStateBytes, &contents, [&path, out, &streamed](std::FILE* file) {
+        streamed = true;
+        if (const testing::BetweenReads hook = g_between_reads.load(); hook != nullptr) {
+          hook(path);
+        }
+        Parser parser;
+        std::string line;
+        char buffer[1024];
+        std::size_t total = 0;
+        std::size_t got = 0;
+        bool fits = true;
+        bool newer = false;
+        while (fits && !newer && (got = std::fread(buffer, 1, sizeof(buffer), file)) > 0) {
+          total += got;
+          fits = total <= kRc1MaxStateBytes;
+          for (std::size_t at = 0; fits && !newer && at < got; ++at) {
+            if (buffer[at] != '\n') {
+              line.push_back(buffer[at]);
+              fits = line.size() <= kMaxLineBytes;
+              continue;
+            }
+            parser.Line(line);
+            line.clear();
+            // A later release's header is the whole answer; its rows are the
+            // ones this build would misread, so they are not read at all.
+            newer = parser.newer() > 0;
+            fits = newer || parser.version() == kSourceSlotVersion;
+          }
+        }
+        if (std::ferror(file) != 0) {
+          return io::BoundedRead::kUnreadable;
+        }
+        if (!fits) {
+          return io::BoundedRead::kTooLarge;
+        }
+        if (!newer) {
+          parser.Line(line);
+        }
+        *out = parser.Finish();
+        return io::BoundedRead::kOk;
+      });
+  if (outcome == io::BoundedRead::kOk && !streamed) {
+    *out = ParseBaseline(contents);
   }
-  if (const testing::BetweenReads hook = g_between_reads.load(); hook != nullptr) {
-    hook(path);
-  }
-  std::FILE* file = std::fopen(path.c_str(), "rb");
-  if (file == nullptr) {
-    return io::BoundedRead::kUnreadable;
-  }
-  Parser parser;
-  std::string line;
-  char buffer[1024];
-  std::size_t total = 0;
-  std::size_t got = 0;
-  bool fits = true;
-  while (fits && (got = std::fread(buffer, 1, sizeof(buffer), file)) > 0) {
-    total += got;
-    fits = total <= kRc1MaxStateBytes;
-    for (std::size_t at = 0; fits && at < got; ++at) {
-      if (buffer[at] != '\n') {
-        line.push_back(buffer[at]);
-        fits = line.size() <= kMaxLineBytes;
-        continue;
-      }
-      parser.Line(line);
-      line.clear();
-      fits = parser.version() == kSourceSlotVersion;
-    }
-  }
-  const bool failed = std::ferror(file) != 0;
-  std::fclose(file);
-  if (failed) {
-    return io::BoundedRead::kUnreadable;
-  }
-  if (!fits) {
-    return io::BoundedRead::kTooLarge;
-  }
-  parser.Line(line);
-  *out = parser.Finish();
-  return io::BoundedRead::kOk;
+  return outcome;
 }
 
 }  // namespace

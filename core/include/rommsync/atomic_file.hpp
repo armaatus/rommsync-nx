@@ -17,6 +17,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <string>
 #include <utility>
@@ -376,6 +377,15 @@ const char* ToString(BoundedRead outcome);
 /// `kMissing` draws the same line `ReadFile` does, for the same reason: only
 /// ENOENT and ENOTDIR mean nothing was ever written here.
 BoundedRead ReadBounded(const std::string& path, std::size_t limit, std::string* out);
+
+/// `ReadBounded`, for a reader that can go on past `limit` a piece at a time:
+/// over it, `out` is released and `past_limit` gets the file, rewound and
+/// still open, and its answer is the read's. One open for both reads, so a
+/// rename landing between them -- `WriteAtomically`'s, say -- cannot turn the
+/// second into a failure the first never had (#255). Null `past_limit` is
+/// plain `ReadBounded`.
+BoundedRead ReadBounded(const std::string& path, std::size_t limit, std::string* out,
+                        const std::function<BoundedRead(std::FILE* file)>& past_limit);
 
 /// Remove `path` and the `.tmp`/`.old` an interrupted commit can leave beside
 /// it, overwriting each with zeroes first.

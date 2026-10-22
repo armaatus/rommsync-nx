@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -44,17 +45,23 @@ std::string Describe(const std::string& path, std::string_view what) {
 
 /// "could not be written completely", and what the card said when it was the
 /// card that refused -- "the card is full" is the half of the sentence a user
-/// can act on (#202). `written` is false when the write or the flush failed,
-/// which is when `refused` holds the `errno` they left; a close or a sync that
-/// failed after them says nothing `errno` can be trusted for.
-std::string Incomplete(bool written, int refused) {
+/// can act on (#202). `card_refused` is whether the write or the flush failed,
+/// which is when `error_number` holds the `errno` they left; a close or a sync
+/// that failed after them says nothing `errno` can be trusted for.
+std::string Incomplete(bool card_refused, int error_number) {
   std::string sentence = "could not be written completely";
-  if (!written) {
+  if (card_refused) {
     sentence += ": ";
-    sentence += Explain(RefusalOf(refused));
+    sentence += Explain(RefusalOf(error_number));
   }
   return sentence;
 }
+
+/// Whether a failed open's `errno` means the path names nothing. Only ENOENT
+/// and ENOTDIR do; every other refusal -- a handle table that is full, `sdmc:`
+/// not mounted yet at boot, a permission -- is a bad moment, and a bad moment
+/// is not evidence that nothing was ever written here.
+bool Absent(int error_number) { return error_number == ENOENT || error_number == ENOTDIR; }
 
 /// Overwrite whatever is at `path` with zeroes, then unlink it.
 ///
@@ -218,7 +225,7 @@ WriteResult WriteStaged(const std::string& path, const std::function<bool(std::F
   const bool synced = flushed && closed && Sync(temp);
   if (!flushed || !closed || !synced) {
     Remove(temp);
-    return {WriteError::kWriteFailed, Describe(temp, Incomplete(flushed, refused))};
+    return {WriteError::kWriteFailed, Describe(temp, Incomplete(!flushed, refused))};
   }
 
   // Everything above touched only the temp file, so a failure up to this point
@@ -273,12 +280,11 @@ CopyResult CopyAtomically(const std::string& from, const std::string& to) {
   errno = 0;
   std::FILE* source = std::fopen(from.c_str(), "rb");
   if (source == nullptr) {
-    // The same line `ReadFile` draws, and the caller this exists for reads it
-    // the same way: only ENOENT and ENOTDIR mean there is nothing here to
-    // preserve. A full handle table is a bad moment, and a bad moment is not
-    // permission to overwrite a save without a backup.
-    const int why = errno;
-    const bool absent = why == ENOENT || why == ENOTDIR;
+    // The caller this exists for reads `Absent` as there being nothing here to
+    // preserve, and anything else must not be: a full handle table is a bad
+    // moment, and a bad moment is not permission to overwrite a save without a
+    // backup.
+    const bool absent = Absent(errno);
     result.error = absent ? CopyError::kSourceMissing : CopyError::kSourceUnreadable;
     result.message = Describe(from, absent ? "does not exist" : "could not be opened");
     return result;
@@ -333,7 +339,7 @@ CopyResult CopyAtomically(const std::string& from, const std::string& to) {
   if (short_write || !flushed || !closed || !synced) {
     Remove(temp);
     result.error = CopyError::kWriteFailed;
-    result.message = Describe(temp, Incomplete(!short_write && flushed, refused));
+    result.message = Describe(temp, Incomplete(short_write || !flushed, refused));
     return result;
   }
 
@@ -356,12 +362,8 @@ ReadResult ReadFile(const std::string& path) {
   if (file == nullptr) {
     // The distinction is load-bearing, not tidiness: a caller answers "there is
     // no file" by creating one, and `device.dat` is a file that must never be
-    // created over an existing identifier. Only ENOENT and ENOTDIR mean the
-    // path cannot name anything; every other refusal -- a handle table that is
-    // full, `sdmc:` not mounted yet at boot, a permission -- is a bad moment,
-    // and a bad moment is not evidence that nothing was ever written here.
-    const int why = errno;
-    const bool absent = why == ENOENT || why == ENOTDIR;
+    // created over an existing identifier (`Absent`).
+    const bool absent = Absent(errno);
     result.error = absent ? ReadError::kMissing : ReadError::kUnreadable;
     result.message = Describe(path, absent ? "does not exist" : "could not be opened");
     return result;
@@ -397,16 +399,18 @@ const char* ToString(BoundedRead outcome) {
 }
 
 BoundedRead ReadBounded(const std::string& path, std::size_t limit, std::string* out) {
+  return ReadBounded(path, limit, out, nullptr);
+}
+
+BoundedRead ReadBounded(const std::string& path, std::size_t limit, std::string* out,
+                        const std::function<BoundedRead(std::FILE* file)>& past_limit) {
   out->clear();
   errno = 0;
   std::FILE* file = std::fopen(path.c_str(), "rb");
   if (file == nullptr) {
-    // The same distinction ReadFile draws, for the same reason: only ENOENT and
-    // ENOTDIR mean nothing was ever written here. A full handle table or an
-    // `sdmc:` that is not mounted yet is a bad moment, and answering one with
-    // "no file" would silently run the console on defaults.
-    const int why = errno;
-    return (why == ENOENT || why == ENOTDIR) ? BoundedRead::kMissing : BoundedRead::kUnreadable;
+    // `ReadFile`'s distinction, for its reason: answering a bad moment with "no
+    // file" would silently run the console on defaults.
+    return Absent(errno) ? BoundedRead::kMissing : BoundedRead::kUnreadable;
   }
 
   char buffer[4096];
@@ -420,6 +424,15 @@ BoundedRead ReadBounded(const std::string& path, std::size_t limit, std::string*
     out->append(buffer, got);
   }
   const bool failed = std::ferror(file) != 0;
+  if (too_large && past_limit != nullptr) {
+    // Released, not cleared: the caller streams the rest because it cannot hold
+    // it, and the bound's worth of text would otherwise sit beside it.
+    std::string().swap(*out);
+    std::rewind(file);
+    const BoundedRead streamed = past_limit(file);
+    std::fclose(file);
+    return streamed;
+  }
   std::fclose(file);
   if (too_large) {
     out->clear();
