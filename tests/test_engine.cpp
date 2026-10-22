@@ -64,6 +64,8 @@
 //                downloaded, and reported done
 //   states_guard -- the states half does not run under a game, nor after a saves
 //                half refused or offline, and its own 401 counts towards the gate
+//   install_settle -- a report the link did not carry stops the pass; the rest are
+//                reported once it does
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -77,6 +79,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -5134,6 +5137,162 @@ int StatesGuarded(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// A console paired as its own device for the remote-install endpoints, which
+/// answer only to the token bound to the device, with whatever an earlier run
+/// left taken ended and the capability withdrawn -- so the first tick is the
+/// one that registers. Shared by the review's install scenarios.
+struct InstallConsole {
+  auth::StoredToken token;
+  std::int64_t nova = 0;
+  std::int64_t other = 0;
+};
+
+bool AdoptInstallDevice(rig::Checks& c, http::HttpClient& client, const std::string& base,
+                        const harness::Fixture& fixture, const std::string& name,
+                        InstallConsole* out) {
+  harness::Rom nova;
+  harness::Rom other;
+  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &nova),
+           "the fixture library has nova.nes");
+  c.Expect(harness::FindRom(client, base, fixture, "240pee.nes", &other),
+           "and 240pee.nes");
+  out->token = harness::PairDevice(c, client, base, name);
+  out->nova = nova.id;
+  out->other = other.id;
+  if (nova.id == 0 || other.id == 0 || out->token.device_id.empty()) {
+    return false;
+  }
+  for (const install::Request& left : install::Claim(client, base, out->token).page.requests) {
+    install::Report(client, base, out->token, left.id,
+                    {install::Outcome::kFailed, "an earlier run"});
+  }
+  install::Register(client, base, out->token, false);
+  return true;
+}
+
+bool ConfigureInstallConsole(rig::Checks& c, Console& console, const std::string& base,
+                             const auth::StoredToken& token) {
+  const bool ok = console.sandbox.Write("/config/rommsync/config.ini",
+                                        "[server]\nurl = " + base +
+                                            "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                            "on_boot = false\nstates = false\n") &&
+                  auth::SaveToken(console.directory + auth::kTokenFileName, token).ok();
+  c.Expect(ok, "the console is configured and paired as its own device");
+  return ok;
+}
+
+/// Wait until `wire` has asked nothing new matching `fragment` for `quiet`,
+/// and no tick is running -- the end of whatever passes were under way.
+void UntilQuiet(Console& console, const Intercepting& wire, http::Method method,
+                std::string_view fragment, std::chrono::milliseconds quiet) {
+  const std::chrono::steady_clock::time_point deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{120};
+  std::size_t seen = wire.Count(method, fragment);
+  std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+  while (std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    const std::size_t now = wire.Count(method, fragment);
+    if (now != seen || console.Status().sync_in_progress) {
+      seen = now;
+      since = std::chrono::steady_clock::now();
+    } else if (std::chrono::steady_clock::now() - since >= quiet) {
+      return;
+    }
+  }
+}
+
+/// The reports a console owes RomM's web UI, over a link that will not carry
+/// them (review of #245). One report's link failure is every report's: the
+/// pass stops at the first rather than spending each held claim's retries on
+/// the worker, and the rest are reported once the link carries them.
+int InstallSettle(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  const std::string name = "engine-install-settle";
+  InstallConsole device;
+  if (!AdoptInstallDevice(c, client, base, fixture, name, &device)) {
+    return c.failures();
+  }
+  const auth::StoredToken& token = device.token;
+  const auto queue_in_browser = [&](std::int64_t rom_id) {
+    return rig::AsTheUser(client, base, "/api/devices/" + token.device_id + "/installs",
+                          "{\"rom_id\":" + std::to_string(rom_id) + "}");
+  };
+  const auto open = [&] { return install::Claim(client, base, token).page.requests.size(); };
+  const auto notices = [&](std::int64_t after, const std::string& status) {
+    return rig::InstallNoticesSince(client, base, after, "rommsync-nx " + name, status);
+  };
+
+  rlog::Reset();
+  const TickLines ticks;
+  Console console(c, name);
+  if (!ConfigureInstallConsole(c, console, base, token)) {
+    return c.failures();
+  }
+  Intercepting wire(client);
+  std::atomic<bool> down{false};
+  wire.Use([&](const http::Request& request) -> std::optional<http::Result> {
+    if (down.load() && Asks(request, http::Method::kPut, "/installs/")) {
+      return Unreachable();
+    }
+    return std::nullopt;
+  });
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseCard(card.get());
+  console.engine.UseServer(&wire, std::string());
+  console.Boot();
+  console.engine.StartWorker();
+
+  TickOnce(console, ticks, c, "the first tick");
+  c.ExpectEq(queue_in_browser(device.nova).response.status, 201, "the web UI queues nova");
+  c.ExpectEq(queue_in_browser(device.other).response.status, 201, "and 240pee");
+
+  // **The link stops carrying reports**, and nothing else: the claim, the
+  // downloads and the ticks all go through.
+  const std::int64_t started = rig::LatestNotificationId(client, base);
+  down = true;
+  TickOnce(console, ticks, c, "the tick that claims both");
+  const std::chrono::steady_clock::time_point by =
+      std::chrono::steady_clock::now() + std::chrono::seconds{120};
+  while ((!console.sandbox.Exists("/tico/roms/nes/nova.nes") ||
+          !console.sandbox.Exists("/tico/roms/nes/240pee.nes")) &&
+         std::chrono::steady_clock::now() < by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  }
+  c.Expect(console.sandbox.Exists("/tico/roms/nes/nova.nes") &&
+               console.sandbox.Exists("/tico/roms/nes/240pee.nes"),
+           "both roms the browser queued are on the card" + Rendered(console.Log()));
+  // The settle after the drain, and the one in the tick the download asks for
+  // (#241), each spend their retries.
+  UntilQuiet(console, wire, http::Method::kPut, "/installs/", std::chrono::seconds{5});
+  const std::vector<std::string> tried = wire.Asked(http::Method::kPut, "/installs/");
+  const std::set<std::string> reports(tried.begin(), tried.end());
+  c.Expect(!tried.empty(), "a report was tried");
+  c.ExpectEq(reports.size(), std::size_t{1},
+             "and only the first: the link that did not carry it would not carry the "
+             "next, so each pass stops there rather than spending every claim's retries" +
+                 Rendered(console.Log()));
+  c.ExpectEq(open(), std::size_t{2}, "both stay taken on the server");
+
+  // The link comes back: the next pass reports both.
+  down = false;
+  TickOnce(console, ticks, c, "the tick after the link comes back");
+  c.ExpectEq(open(), std::size_t{0}, "both requests are ended");
+  c.ExpectEq(notices(started, "done"), std::size_t{2},
+             "both reported done -- the one the pass stopped at and the one it kept");
+  c.ExpectEq(notices(started, "failed"), std::size_t{0}, "and neither failed");
+
+  // The download asks for a tick of its own (#241); let it end before teardown.
+  UntilQuiet(console, wire, http::Method::kPost, "/api/sync/negotiate", std::chrono::seconds{1});
+  install::Register(client, base, token, false);
+  harness::DeleteDevice(client, base, fixture, token.device_id);
+  return c.failures();
+}
+
 /// The scenarios that need the docker RomM, by name. A table rather than a
 /// second `if` chain, so the list of them is written down once.
 struct RigScenario {
@@ -5167,6 +5326,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"placement", Placement},
       {"remote_install", RemoteInstall},
       {"states_guard", StatesGuarded},
+      {"install_settle", InstallSettle},
   };
   for (const RigScenario& scenario : kRigScenarios) {
     if (name == scenario.name) {
