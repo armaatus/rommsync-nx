@@ -356,7 +356,24 @@ auth::Answer AnswerOf(NegotiateError error) {
 
 auth::Parsed<SyncPlan> ParseNegotiateResponse(std::string_view body) {
   auth::Parsed<SyncPlan> parsed;
-  const json::ParseResult document = json::Parse(body);
+  // An operation at a time (`json::ParseEach`): the plan held as one document is
+  // ~10x its text, 1.3 MiB at `kMaxPlanOperations` on aarch64 (M9-20, #246).
+  SyncPlan plan;
+  const json::ParseResult document = json::ParseEach(
+      body, "operations",
+      [&plan](const json::Value& element, std::size_t index) {
+        if (index >= kMaxPlanOperations) {
+          return Fail("operations", "holds more than the " + std::to_string(kMaxPlanOperations) +
+                                        " operations one plan may carry");
+        }
+        SyncOperation operation;
+        const json::Error error = ReadOperation(element, index, &operation, &plan.warnings);
+        if (error.ok()) {
+          plan.operations.push_back(std::move(operation));
+        }
+        return error;
+      },
+      "negotiate response");
   if (!document.ok()) {
     // A truncated body lands here, and it must: half a plan that parsed would be
     // a plan with saves missing from it, which looks exactly like a device that
@@ -365,7 +382,6 @@ auth::Parsed<SyncPlan> ParseNegotiateResponse(std::string_view body) {
     return parsed;
   }
 
-  SyncPlan plan;
   json::Reader reader(document.value, "negotiate response");
   reader.Required("session_id", &plan.session_id);
   reader.Required("total_upload", &plan.total_upload);
@@ -396,25 +412,8 @@ auth::Parsed<SyncPlan> ParseNegotiateResponse(std::string_view body) {
     parsed.error = Fail("operations", "is missing");
     return parsed;
   }
-  if (!operations->is_array()) {
-    // An empty array is a fully-synced device and is fine; anything that is not
-    // an array is a shape that moved.
-    parsed.error =
-        Fail("operations", std::string("expected an array, got ") + json::ToString(operations->type()));
-    return parsed;
-  }
-
-  plan.operations.reserve(operations->size());
-  for (std::size_t index = 0; index < operations->elements().size(); ++index) {
-    SyncOperation operation;
-    const json::Error error =
-        ReadOperation(operations->elements()[index], index, &operation, &plan.warnings);
-    if (!error.ok()) {
-      parsed.error = error;
-      return parsed;
-    }
-    plan.operations.push_back(std::move(operation));
-  }
+  // An empty array is a fully-synced device and is fine; anything that is not an
+  // array is a shape that moved, and `ParseEach` refused it by name above.
 
   parsed.value = std::move(plan);
   return parsed;

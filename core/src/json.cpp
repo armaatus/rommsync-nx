@@ -120,8 +120,9 @@ class Parser {
 
   /// The parser `ParseEach` runs: the array at `each_key` -- the root when it is
   /// empty -- goes to `each` an element at a time instead of into the result.
-  Parser(std::string_view text, std::string_view each_key, const EachElement& each)
-      : text_(text), each_key_(each_key), each_(&each) {}
+  Parser(std::string_view text, std::string_view each_key, const EachElement& each,
+         std::string_view context)
+      : text_(text), each_key_(each_key), each_(&each), context_(context) {}
 
   /// The whole document. `kStreams` is `json::ParseEach`'s, and an instantiation
   /// of its own for the reason `ParseObject` is one: `json::Parse` is on the
@@ -140,14 +141,19 @@ class Parser {
     bool parsed = false;
     if constexpr (kStreams) {
       // The streamed array is the root (an empty key) or a member of the root
-      // object; any other document is `ParseValue`'s, whatever its shape.
-      if (each_key_.empty()) {
-        parsed = ParseEach(0, &root);
-      } else if (text_[at_] == '{') {
-        parsed = ParseObject<true>(0, &root);
-      } else {
-        parsed = ParseValue(0, &root);
+      // object. A root of the other shape is refused here, before a byte of it
+      // is parsed: a caller's shape check would refuse it anyway, and a bare
+      // array where an envelope belongs would otherwise be held whole on the way
+      // to that refusal -- ~11x its text (M9-20, #246). What is not a JSON value
+      // at all goes on to `ParseValue`, whose syntax error is the better answer.
+      const char wanted = each_key_.empty() ? '[' : '{';
+      if (text_[at_] != wanted && KindAt(at_) != nullptr) {
+        Fail(std::string(context_.empty() ? "the document" : context_) + " is " + KindAt(at_) +
+             ", not the " + (each_key_.empty() ? "array" : "object") + " it must be");
+        result.error = error_;
+        return result;
       }
+      parsed = each_key_.empty() ? ParseEach(0, &root) : ParseObject<true>(0, &root);
     } else {
       parsed = ParseValue(0, &root);
     }
@@ -172,6 +178,28 @@ class Parser {
       error_.message = std::move(message);
     }
     return false;
+  }
+
+  /// What the value starting at `at` is, in `ToString`'s words, read off its
+  /// first byte and nothing else -- or nullptr when no JSON value starts there.
+  const char* KindAt(std::size_t at) const {
+    switch (text_[at]) {
+      case '{':
+        return ToString(Type::kObject);
+      case '[':
+        return ToString(Type::kArray);
+      case '"':
+        return ToString(Type::kString);
+      case 't':
+      case 'f':
+        return ToString(Type::kBool);
+      case 'n':
+        return ToString(Type::kNull);
+      default:
+        return text_[at] == '-' || (text_[at] >= '0' && text_[at] <= '9')
+                   ? ToString(Type::kNumber)
+                   : nullptr;
+    }
   }
 
   void SkipWhitespace() {
@@ -266,9 +294,18 @@ class Parser {
 
   /// `ParseArray` for the one array `ParseEach` streams: each element is parsed,
   /// handed over and destroyed before the next is read, so `out` stays an empty
-  /// array. Anything that is not an array is parsed the ordinary way.
+  /// array. Any other value there is refused by the member's name before it is
+  /// parsed, for `Run`'s reason; what is no value at all is `ParseValue`'s.
   bool ParseEach(int depth, Value* out) {
     if (depth >= kMaxDepth || at_ >= text_.size() || text_[at_] != '[') {
+      if (depth < kMaxDepth && at_ < text_.size() && KindAt(at_) != nullptr) {
+        if (error_.ok()) {
+          error_.offset = at_;
+          error_.field = std::string(each_key_);
+          error_.message = std::string("expected an array, got ") + KindAt(at_);
+        }
+        return false;
+      }
       return ParseValue(depth, out);
     }
     out->type_ = Type::kArray;
@@ -559,6 +596,8 @@ class Parser {
   std::string_view text_;
   std::string_view each_key_;
   const EachElement* each_ = nullptr;
+  /// What the document is called in a refusal of its shape: `Reader`'s context.
+  std::string_view context_;
   std::size_t at_ = 0;
   Error error_;
 };
@@ -569,8 +608,8 @@ ParseResult Parse(std::string_view text) {
 }
 
 ParseResult ParseEach(std::string_view text, std::string_view key, const EachElement& each,
-                      std::string_view) {
-  Parser parser(text, key, each);
+                      std::string_view context) {
+  Parser parser(text, key, each, context);
   return parser.Run<true>();
 }
 

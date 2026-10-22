@@ -287,23 +287,23 @@ auth::Parsed<ServerState> ParseState(std::string_view body) {
 
 auth::Parsed<std::vector<ServerState>> ParseStateList(std::string_view body) {
   auth::Parsed<std::vector<ServerState>> parsed;
-  const json::ParseResult document = json::Parse(body);
+  // A row at a time (`json::ParseEach`): held as one document the listing was
+  // ~8x its text, 980 KiB at `kMaxStateListBytes` on aarch64 (M9-20, #246).
+  std::vector<ServerState> states;
+  const json::ParseResult document = json::ParseEach(
+      body, "",
+      [&states](const json::Value& element, std::size_t) {
+        ServerState state;
+        json::Error error;
+        if (ReadStateRow(element, &state, &error)) {
+          states.push_back(std::move(state));
+        }
+        return error;
+      },
+      "state list");
   if (!document.ok()) {
     parsed.error = document.error;
     return parsed;
-  }
-  if (!document.value.is_array()) {
-    parsed.error = json::Error{0, "state list", "expected an array of StateSchema"};
-    return parsed;
-  }
-  std::vector<ServerState> states;
-  states.reserve(document.value.elements().size());
-  for (const json::Value& element : document.value.elements()) {
-    ServerState state;
-    if (!ReadStateRow(element, &state, &parsed.error)) {
-      return parsed;
-    }
-    states.push_back(std::move(state));
   }
   parsed.value = std::move(states);
   return parsed;
@@ -335,13 +335,14 @@ bool ListServerStates(http::HttpClient& client, const auth::StoredToken& token,
                " this client can work from; no state was touched this tick";
     return false;
   }
-  const auth::Parsed<std::vector<ServerState>> parsed = ParseStateList(result.response.body);
+  auth::Parsed<std::vector<ServerState>> parsed = ParseStateList(result.response.body);
   if (!parsed.ok()) {
     *error = StateError::kRefused;
     *message = "the state listing did not parse (" + parsed.error.Describe() + ")";
     return false;
   }
-  *out = parsed.value;
+  // Moved: a copy held both lists at once, beside the body (M9-20, #246).
+  *out = std::move(parsed.value);
   return true;
 }
 

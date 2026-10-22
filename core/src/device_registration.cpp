@@ -193,31 +193,28 @@ Parsed<DeviceRecord> ParseDeviceRecord(std::string_view body) {
 
 Parsed<std::vector<DeviceRecord>> ParseDeviceList(std::string_view body) {
   Parsed<std::vector<DeviceRecord>> parsed;
-  const json::ParseResult document = json::Parse(body);
+  // A row at a time (`json::ParseEach`), for the reason every list is: a device
+  // held as a document is ~7x its text, and a user's devices are theirs to
+  // multiply (M9-20, #246).
+  std::vector<DeviceRecord> devices;
+  const json::ParseResult document = json::ParseEach(
+      body, "",
+      [&devices](const json::Value& element, std::size_t) {
+        // Every row, not just the ones this console might be. A row that will
+        // not parse is `DeviceSchema` having changed, and skipping it quietly
+        // would hide exactly the drift this parse exists to catch -- while
+        // leaving the search below to report "no such device" for a console that
+        // is right there.
+        Parsed<DeviceRecord> device = ReadDevice(element);
+        if (device.ok()) {
+          devices.push_back(std::move(device.value));
+        }
+        return device.error;
+      },
+      "device list");
   if (!document.ok()) {
     parsed.error = document.error;
     return parsed;
-  }
-  if (!document.value.is_array()) {
-    parsed.error.field = "device list";
-    parsed.error.message =
-        std::string("expected an array, got ") + json::ToString(document.value.type());
-    return parsed;
-  }
-
-  std::vector<DeviceRecord> devices;
-  devices.reserve(document.value.elements().size());
-  for (const json::Value& element : document.value.elements()) {
-    // Every row, not just the ones this console might be. A row that will not
-    // parse is `DeviceSchema` having changed, and skipping it quietly would
-    // hide exactly the drift this parse exists to catch -- while leaving the
-    // search below to report "no such device" for a console that is right there.
-    Parsed<DeviceRecord> device = ReadDevice(element);
-    if (!device.ok()) {
-      parsed.error = device.error;
-      return parsed;
-    }
-    devices.push_back(std::move(device.value));
   }
   parsed.value = std::move(devices);
   return parsed;

@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <bit>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -632,24 +633,54 @@ class StringWriter final : public BodyWriter {
   explicit StringWriter(std::string* body) : body_(body) {}
 
   /// Room for the whole body before any of it arrives, so appending never
-  /// doubles it (`kMaxReservedBodyBytes`).
+  /// doubles it (`kMaxReservedBodyBytes`). A body framed by anything but its
+  /// length -- the rule `FramingFor` reads -- is undeclared, whatever else the
+  /// head says, and is held to `kMaxUndeclaredBodyBytes` instead.
   bool Begin(const Response& head, Error*) override {
+    undeclared_ = true;
+    if (http::FindHeader(head.headers, "Transfer-Encoding") != nullptr) {
+      return true;
+    }
     if (const std::string* declared = http::FindHeader(head.headers, "Content-Length")) {
       std::uint64_t length = 0;
-      if (ParseDecimal(Trim(*declared), &length) && length <= kMaxReservedBodyBytes) {
-        body_->reserve(static_cast<std::size_t>(length));
+      if (ParseDecimal(Trim(*declared), &length)) {
+        undeclared_ = false;
+        if (length <= kMaxReservedBodyBytes) {
+          body_->reserve(static_cast<std::size_t>(length));
+        }
       }
     }
     return true;
   }
 
-  bool Write(const char* data, std::size_t size, Error*) override {
+  bool Write(const char* data, std::size_t size, Error* error) override {
+    if (undeclared_) {
+      const std::size_t needed = body_->size() + size;
+      if (needed > kMaxUndeclaredBodyBytes) {
+        // Refused rather than kept: a prefix of a body is a body nobody can
+        // read, and the room it held goes back now rather than with the result.
+        overflowed_ = true;
+        std::string().swap(*body_);
+        *error = Error::kTransport;
+        return false;
+      }
+      // Grown in powers of two, so the last step lands on the cap exactly and
+      // never copies more than half of it (`kMaxUndeclaredBodyBytes`).
+      if (needed > body_->capacity()) {
+        body_->reserve(std::bit_ceil(needed));
+      }
+    }
     body_->append(data, size);
     return true;
   }
 
+  /// The body ran past `kMaxUndeclaredBodyBytes` with no length declared.
+  bool overflowed() const { return overflowed_; }
+
  private:
   std::string* body_;
+  bool undeclared_ = false;
+  bool overflowed_ = false;
 };
 
 /// `Download`'s sink: `<path>.part`, and the resume bookkeeping around it.
@@ -1195,6 +1226,11 @@ Result WireHttpClient::Send(const Request& request) {
   std::string body;
   StringWriter writer(&body);
   Result result = Exchange(request, &writer, kTransferBufferSize);
+  if (writer.overflowed()) {
+    result.message = "the response declared no Content-Length and ran past the " +
+                     std::to_string(kMaxUndeclaredBodyBytes / 1024) +
+                     " KiB this client holds without one";
+  }
   result.response.body = std::move(body);
   return result;
 }

@@ -151,6 +151,25 @@ inline constexpr std::size_t kDownloadBufferSize = 64 * 1024;
 /// worse than it was.
 inline constexpr std::size_t kMaxReservedBodyBytes = 256 * 1024;
 
+/// The largest API body taken **without** a `Content-Length` -- chunked, or
+/// ended by the close -- and past it the call fails (M9-20, #246).
+///
+/// Such a body has nothing to reserve, so it grows, and until #246 nothing
+/// stopped it. RomM behind its own nginx always declares a length (measured on
+/// 5.2.0), but a reverse proxy in front of it may not, and every buffered
+/// response is counted in `main.cpp`'s heap table at its text, once. So an
+/// undeclared body grows in powers of two up to this and no further: it holds at
+/// most this, and at most half again while the last step copies -- 192 KiB,
+/// which `main.cpp` asserts fits the row a response is counted under. A power of
+/// two so the last step lands on it exactly.
+///
+/// What it costs is a library past ~60 roms a page behind a proxy that strips
+/// `Content-Length`: a 64-row page of RomM's ~2.1 KiB rows is ~135 KiB, so the
+/// index fetch fails, by name, rather than growing into a heap with no room.
+inline constexpr std::size_t kMaxUndeclaredBodyBytes = 128 * 1024;
+static_assert((kMaxUndeclaredBodyBytes & (kMaxUndeclaredBodyBytes - 1)) == 0,
+              "grown in powers of two, the cap has to be one for the last step to land on it");
+
 /// How much of a failed download's body is kept, matching the native backend.
 /// A 404 from RomM is a short JSON document and worth surfacing; anything
 /// longer is a page that must not reach a log line or the destination file.

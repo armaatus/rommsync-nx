@@ -774,11 +774,55 @@ LoadedQueue ParseQueue(std::string_view text) {
   // not the standard's.
   LoadedQueue loaded;
 
-  const json::ParseResult document = json::Parse(text);
+  // An entry at a time (`json::ParseEach`), checked as it comes: a full queue at
+  // its widest held as one document peaked at 413 KiB on aarch64, at boot
+  // (M9-20, #246). What an entry says is only kept once the format below is
+  // known to be this one's, so reading it first changes no answer.
+  std::vector<QueueEntry> rows;
+  std::vector<std::string> complaints;
+  bool crowded = false;
+  const json::ParseResult document = json::ParseEach(
+      text, "entries",
+      [&rows, &complaints, &crowded](const json::Value& element, std::size_t at) {
+        if (at >= kMaxQueueEntries) {
+          crowded = true;
+          json::Error stop;
+          stop.field = "entries";
+          stop.message = "more than a queue may have";
+          return stop;
+        }
+        QueueEntry entry;
+        std::string why;
+        if (!ParseEntry(element, &entry, &why)) {
+          Add(&complaints,
+              std::string(kQueueFileName) + " entry " + std::to_string(at + 1) + ": " + why);
+          return json::Error{};
+        }
+        const bool duplicate = std::any_of(
+            rows.begin(), rows.end(),
+            [&entry](const QueueEntry& row) { return row.rom_id == entry.rom_id; });
+        if (duplicate) {
+          Add(&complaints, std::string(kQueueFileName) + " entry " + std::to_string(at + 1) +
+                               ": a second entry for the same rom");
+          return json::Error{};
+        }
+        rows.push_back(std::move(entry));
+        return json::Error{};
+      },
+      "download queue");
+  if (crowded) {
+    Add(&loaded.diagnostics, std::string(kQueueFileName) + " holds more than the " +
+                                 std::to_string(kMaxQueueEntries) +
+                                 " entries a queue may have; it is discarded");
+    loaded.discarded = true;
+    return loaded;
+  }
   if (!document.ok()) {
     // Naming the complaint rather than quoting the text: the bytes may be
-    // anything a corrupt card region holds.
-    Add(&loaded.diagnostics, std::string(kQueueFileName) + " is not readable JSON (" +
+    // anything a corrupt card region holds. Not "readable JSON" any more: a file
+    // whose shape `ParseEach` refused -- the whole of it, or its `entries` -- is
+    // JSON, and the complaint itself says which it was.
+    Add(&loaded.diagnostics, std::string(kQueueFileName) + " could not be read as a queue (" +
                                  document.error.Describe() + "); the queue is discarded");
     loaded.discarded = true;
     return loaded;
@@ -803,40 +847,11 @@ LoadedQueue ParseQueue(std::string_view text) {
     return loaded;
   }
 
-  const json::Value* entries = document.value.Find("entries");
-  if (entries == nullptr || !entries->is_array()) {
+  if (document.value.Find("entries") == nullptr) {
     Add(&loaded.diagnostics,
         std::string(kQueueFileName) + ": field entries: expected an array; the queue is discarded");
     loaded.discarded = true;
     return loaded;
-  }
-  if (entries->elements().size() > kMaxQueueEntries) {
-    Add(&loaded.diagnostics, std::string(kQueueFileName) + " holds more than the " +
-                                 std::to_string(kMaxQueueEntries) +
-                                 " entries a queue may have; it is discarded");
-    loaded.discarded = true;
-    return loaded;
-  }
-
-  std::vector<QueueEntry> rows;
-  std::vector<std::string> complaints;
-  for (std::size_t at = 0; at < entries->elements().size(); ++at) {
-    QueueEntry entry;
-    std::string why;
-    if (!ParseEntry(entries->elements()[at], &entry, &why)) {
-      Add(&complaints,
-          std::string(kQueueFileName) + " entry " + std::to_string(at + 1) + ": " + why);
-      continue;
-    }
-    const bool duplicate = std::any_of(
-        rows.begin(), rows.end(),
-        [&entry](const QueueEntry& row) { return row.rom_id == entry.rom_id; });
-    if (duplicate) {
-      Add(&complaints, std::string(kQueueFileName) + " entry " + std::to_string(at + 1) +
-                           ": a second entry for the same rom");
-      continue;
-    }
-    rows.push_back(std::move(entry));
   }
 
   if (!complaints.empty()) {

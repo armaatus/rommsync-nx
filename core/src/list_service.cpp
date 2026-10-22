@@ -151,7 +151,8 @@ json::Error ParseRomPage(std::string_view body, RomPage* out) {
         }
         page.roms.push_back(std::move(rom));
         return json::Error{};
-      });
+      },
+      "rom list");
   if (!document.ok()) {
     return document.error;
   }
@@ -211,12 +212,10 @@ json::Error ParsePlatforms(std::string_view body, std::vector<PlatformRow>* out,
         }
         platforms.push_back(std::move(platform));
         return json::Error{};
-      });
+      },
+      "platform list");
   if (!document.ok()) {
     return document.error;
-  }
-  if (!document.value.is_array()) {
-    return Fail("", "expected an array of platforms");
   }
 
   if (truncated != nullptr) {
@@ -625,6 +624,25 @@ bool Service::Pump() {
     }
     if (found == nullptr || client_ == nullptr) {
       return false;
+    }
+    // **One platform snapshot and one built rom page, across every cursor**
+    // (M9-20, #246). Each is ~30 KiB and held beside a sync tick, so at
+    // `kMaxCursors` of each they were the heap's largest row nobody had
+    // written. The overlay has one list on screen, so the cursor that gives its
+    // own up is one nobody is reading -- and it loses nothing but a request: it
+    // goes back to `kIdle` at the offset it had, and its next `ListNext` fetches
+    // again from there. Dropped *before* the request rather than when its answer
+    // lands, so the old one and the new one are never held at once.
+    for (Entry& other : cursors_) {
+      if (&other == found || other.request.kind != found->request.kind) {
+        continue;
+      }
+      if (other.fetch == Fetch::kReady) {
+        other.fetch = Fetch::kIdle;
+      }
+      other.ready = ipc::ListPage{};
+      std::vector<PlatformRow>().swap(other.platforms);
+      other.platforms_loaded = false;
     }
     client = client_;
     card = filesystem_;

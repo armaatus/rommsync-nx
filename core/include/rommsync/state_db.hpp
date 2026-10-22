@@ -169,6 +169,11 @@ inline constexpr int kSourceSlotVersion = 2;
 inline constexpr std::size_t kMaxRecords = 512;
 inline constexpr std::size_t kMaxStateBytes = 128 * 1024;
 
+// A plan names one operation per save, and a save this file cannot record is a
+// save no tick can finish: the two bounds are one number (M9-20, #246).
+static_assert(sync::kMaxPlanOperations == kMaxRecords,
+              "a negotiate plan may carry exactly as many operations as state.db records");
+
 /// How many diagnostics are kept before the rest are dropped. `config`'s
 /// reasoning: a corrupt file must not answer with fifty thousand strings.
 inline constexpr std::size_t kMaxDiagnostics = 32;

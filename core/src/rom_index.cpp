@@ -104,10 +104,12 @@ json::Error ParsePage(std::string_view body, Page* out) {
   // ~11x its text, and a page held as one document is a multiple of the
   // sysmodule's whole heap (M9-19, #217).
   Page page;
-  const json::ParseResult document =
-      json::ParseEach(body, "items", [&page](const json::Value& item, std::size_t index) {
+  const json::ParseResult document = json::ParseEach(
+      body, "items",
+      [&page](const json::Value& item, std::size_t index) {
         return ReadRom(item, index, &page.roms);
-      });
+      },
+      "rom list");
   if (!document.ok()) {
     return document.error;
   }

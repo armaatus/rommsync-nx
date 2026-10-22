@@ -163,12 +163,19 @@ using EachElement = std::function<Error(const Value& element, std::size_t index)
 ///
 /// `key` names a member of the top-level object; empty means the top-level value
 /// is itself the array. In the result that array is present and **empty**, so a
-/// reader of the rest of the document still sees that it was an array. Anything
-/// else at `key` -- an object, a string -- is parsed and held as `Parse` would,
-/// and a caller's shape check refuses it by name the way it always did. Every
+/// reader of the rest of the document still sees that it was an array. Every
 /// element is still parsed in full, so the strictness above is unchanged: a
 /// malformed element fails the document, even after earlier ones were handed
 /// over -- which is why a caller keeps what it reads only once this returns ok.
+///
+/// **The wrong shape is refused before it is parsed** (M9-20, #246): a root that
+/// is not the object holding `key` -- or, for an empty key, not the array -- as
+/// "`context` is an array, not the object it must be", `Reader`'s sentence; and
+/// anything but an array at `key` as that field, "expected an array, got an
+/// object". Parsed first, a bare array where the envelope belongs was held whole,
+/// at ~11x its text, on its way to a refusal that was always coming. `context`
+/// names the document as a caller's `Reader` would, and defaults to "the
+/// document". A missing `key` is still the caller's to refuse.
 ParseResult ParseEach(std::string_view text, std::string_view key, const EachElement& each,
                       std::string_view context = {});
 

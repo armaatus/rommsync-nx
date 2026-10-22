@@ -490,7 +490,22 @@ struct SyncPlan {
 /// are a server that moved, and refusing the whole tick over a `no_op` nobody
 /// had to act on would be the client breaking itself on a RomM upgrade. They
 /// are downgraded, recorded in `SyncPlan::warnings`, and reported.
+///
+/// **A plan past `kMaxPlanOperations` is refused**, for the same reason and in
+/// the same way. The operations are read one at a time (`json::ParseEach`) and
+/// the plan is held for the whole tick, so it is the operations' count that the
+/// heap pays for -- `sysmodule/source/main.cpp` counts the plan at this bound
+/// (M9-20, #246).
 auth::Parsed<SyncPlan> ParseNegotiateResponse(std::string_view body);
+
+/// The most operations a plan may carry: as many saves as `state.db` can record
+/// (`state::kMaxRecords`, which `state_db.hpp` asserts this equals).
+///
+/// A plan names every save the server holds for this console's roms as well as
+/// the ones it was told about, so its length is the server's, and a library with
+/// more saves than one console can track is refused here, by name, rather than
+/// held on a heap that was never sized for it.
+inline constexpr std::size_t kMaxPlanOperations = 512;
 
 /// Why a negotiation did not produce a plan.
 ///
