@@ -530,6 +530,12 @@ std::int64_t PeakOf(const std::string& body, const Parse& parse) {
   return count_new::Now().peak_bytes - before;
 }
 
+/// The rows `PageParse` and `ResponseParse` hold a page to. Namespace scope
+/// because `ResponseParse`'s `check` takes it as a default argument, where no
+/// local may appear ([dcl.fct.default]) -- clang lets a constexpr one through,
+/// GCC does not.
+constexpr std::size_t kRows = 64;
+
 /// A page of rows costs the rows it becomes and **one** row's document, not the
 /// whole page's.
 ///
@@ -542,7 +548,6 @@ std::int64_t PeakOf(const std::string& body, const Parse& parse) {
 /// rows become -- a struct and a few short strings each -- and by nothing that
 /// scales with their documents.
 void PageParse(checks::Checks& c) {
-  constexpr std::size_t kRows = 64;
   // Far more than the struct and strings one row becomes on either standard
   // library, and far less than one row's document (~8 KiB of nodes for `Row`).
   constexpr std::int64_t kPerRow = 1024;
@@ -646,7 +651,6 @@ std::string DeviceRow(std::size_t at) {
 /// Held whole, each was ~10x its text on aarch64: a 512-operation plan peaked at
 /// 1.3 MiB and a 117 KiB state listing at 980 KiB, on a 1.5 MiB heap.
 void ResponseParse(checks::Checks& c) {
-  constexpr std::size_t kRows = 64;
   // Over what one row becomes on either standard library -- an operation is
   // the largest, ~450 bytes on aarch64 -- and under one row's document, which is
   // ~3 KiB for the smallest of the four.
