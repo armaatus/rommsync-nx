@@ -64,7 +64,12 @@ enum class Error {
 /// so a platforms list past this fails the overlay's library screen rather than
 /// coming back smaller -- ~230 platforms at the 877 bytes a row 5.4.0 sends with
 /// no description, fewer if RomM carries a long one for each. A single rom whose
-/// own row is past it is left out of the rom index, and the tick says so.
+/// own row is past it is left out of the rom index, and the tick says so. And a
+/// rom whose detail (`GET /api/roms/{id}`) is past it cannot be downloaded: the
+/// queue fails it for good. That answer carries every user's saves, states,
+/// screenshots and notes for the rom and its RetroAchievements, so a rom much
+/// played on a busy server can grow into it. Parsing it streamed, as the rom
+/// pages are, would lift that; nothing does yet.
 inline constexpr std::size_t kMaxResponseBytes = 200 * 1024;
 
 struct Result;

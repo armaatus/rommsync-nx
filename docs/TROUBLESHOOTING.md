@@ -560,7 +560,7 @@ screen shows it waiting, and it never turns into a file.
 **What is happening.** The sysmodule drains the queue on the same thread that
 runs the sync tick, and it does it **last** — a sync that is due and a list page
 the overlay is waiting for both go first. So a rom that is not moving is usually
-one of six things, and the queue screen names which:
+one of seven things, and the queue screen names which:
 
 1. **`[downloads] enabled = false`.** Nothing is opened and nothing is lost;
    switching it back on resumes exactly what was there.
@@ -587,6 +587,14 @@ one of six things, and the queue screen names which:
    trying again changes nothing until you do: free space (or check the card) and
    queue the rom again. This version does not split a file over 4 GiB into the
    pieces Horizon can store; a rom that size has to reach the card some other way.
+7. **RomM describes the rom at more length than the console reads.** Before a
+   download the sysmodule asks RomM about the rom, and reads at most **200 KiB**
+   of answer. RomM's answer carries every user's saves, states, screenshots and
+   notes for that rom, and its RetroAchievements, so it grows as the rom is
+   used. Past that the row says "the server's description of this rom is larger
+   than this console reads" and the rom is failed rather than retried, because
+   the same answer comes back. This version has no way past it; deleting old
+   saves, states and screenshots of that rom in RomM's web UI shrinks the answer.
 
 **The fix.** Read the row on the overlay's queue screen first; it carries the
 reason for that rom. For 3, the drain is already retrying and nothing needs
