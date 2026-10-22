@@ -1752,9 +1752,15 @@ void SdEngine::SettleInstalls(http::HttpClient& client, const auth::StoredToken&
                     std::to_string(reported.status) + ")");
     } else if (reported.transport == http::Error::kCanceled) {
       break;
+    } else if (reported.transport != http::Error::kNone) {
+      // No answer, after every retry: the next report would go down the same
+      // link, and each spends its retries on the worker that drains the queue
+      // and runs the ticks. The rest wait, unsettled, for the next pass.
+      log::Warn(log::Event::kRemoteInstall, rom + ": " + reported.message);
+      break;
     } else {
       log::Warn(log::Event::kRemoteInstall, rom + ": " + reported.message);
-      // Kept for the next pass while asking again could work: no answer, a
+      // Kept for the next pass while asking again could work: a
       // server having a bad minute, or credentials a re-pairing restores. A
       // report RomM refused for what it says is not taken back by resending it.
       if (!reported.transient() && reported.status != 401 && reported.status != 403) {
