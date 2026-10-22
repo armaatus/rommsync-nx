@@ -36,7 +36,6 @@
 // the rom's `autosave` rows, its archival copies, the PSX states it named, and
 // the devices. Unique bytes per run, because RomM remembers what a slot lost
 // and answers `delete` to a client holding those bytes again.
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -93,6 +92,7 @@ struct SlotRow {
   std::string emulator;
   std::string file_name;
   std::string content_hash;
+  std::string updated_at;
 };
 
 std::vector<SlotRow> SlotRows(const Rig& rig, std::int64_t rom_id) {
@@ -108,9 +108,30 @@ std::vector<SlotRow> SlotRows(const Rig& rig, std::int64_t rom_id) {
       continue;
     }
     rows.push_back({harness::Number(save, "id"), harness::Field(save, "emulator"),
-                    harness::Field(save, "file_name"), harness::Field(save, "content_hash")});
+                    harness::Field(save, "file_name"), harness::Field(save, "content_hash"),
+                    harness::Field(save, "updated_at")});
   }
   return rows;
+}
+
+/// The slot's versions as `<id>@<updated_at>`, so "nothing was uploaded" is a
+/// claim about rows rather than a count: RomM files an upload landing in the
+/// second an existing version was tagged with onto that row (#85), which a
+/// count does not see.
+std::vector<std::string> Versions(const Rig& rig, std::int64_t rom_id) {
+  std::vector<std::string> versions;
+  for (const SlotRow& row : SlotRows(rig, rom_id)) {
+    versions.push_back(std::to_string(row.id) + "@" + row.updated_at);
+  }
+  return versions;
+}
+
+std::string Listed(const std::vector<std::string>& versions) {
+  std::string out;
+  for (const std::string& version : versions) {
+    out += (out.empty() ? "" : ", ") + version;
+  }
+  return "[" + out + "]";
 }
 
 /// Delete what the shared slot and the archive hold for `rom_id`: before a cell,
@@ -121,6 +142,21 @@ void ClearRom(const Rig& rig, std::int64_t rom_id) {
   }
   harness::DeleteArchivalCopies(rig.client, rig.base, rig.fixture, rom_id);
 }
+
+/// A device row RomM holds for a cell, deleted when the cell is done with it.
+class DeviceRow {
+ public:
+  DeviceRow(const Rig& rig, std::string id) : rig_(rig), id_(std::move(id)) {}
+  ~DeviceRow() { harness::DeleteDevice(rig_.client, rig_.base, rig_.fixture, id_); }
+  DeviceRow(const DeviceRow&) = delete;
+  DeviceRow& operator=(const DeviceRow&) = delete;
+
+  const std::string& id() const { return id_; }
+
+ private:
+  const Rig& rig_;
+  std::string id_;
+};
 
 // --- the Switch ---------------------------------------------------------------
 
@@ -168,14 +204,16 @@ class TickLines final : public rlog::Sink {
 /// A Switch: its card, its engine on a device of its own, and the service the
 /// overlay talks to. No tick of its own -- each is a press, run to its end.
 ///
-/// The members are in teardown order: the worker stops before the card it reads
-/// goes, and the card's backup audit runs last.
+/// The members are declared in reverse teardown order: the worker stops before
+/// the card it reads and the device it ticks as go, and the card's backup audit
+/// runs last.
 class Switch {
  public:
   Switch(rig::Checks& c, const Rig& rig, const std::string& name, bool states)
-      : sandbox(c, name), rig_(rig), checks_(c) {
+      : sandbox(c, name),
+        checks_(c),
+        device_(rig, harness::CreateDevice(c, rig.client, rig.base, rig.fixture, name)) {
     directory_ = sandbox.Host(harness::kConfigDir) + "/";
-    device_id_ = harness::CreateDevice(c, rig.client, rig.base, rig.fixture, name);
     sandbox.Write("/config/rommsync/config.ini",
                   "[server]\nurl = " + rig.base +
                       "\n\n[sync]\nenabled = true\ninterval_min = 0\non_boot = false\n"
@@ -184,7 +222,7 @@ class Switch {
     auth::StoredToken token;
     token.server_url = rig.base;
     token.access_token = rig.fixture.token;
-    token.device_id = device_id_;
+    token.device_id = device_.id();
     token.scopes = {"roms.read"};
     c.Expect(auth::SaveToken(directory_ + auth::kTokenFileName, token).ok(),
              name + ": the Switch is paired as its own device");
@@ -195,8 +233,6 @@ class Switch {
     engine_.UseCard(card_.get());
     engine_.StartWorker();
   }
-
-  ~Switch() { harness::DeleteDevice(rig_.client, rig_.base, rig_.fixture, device_id_); }
 
   Switch(const Switch&) = delete;
   Switch& operator=(const Switch&) = delete;
@@ -280,17 +316,24 @@ class Switch {
     ipc::Dispatch(*core_, static_cast<std::uint32_t>(command), request, response);
   }
 
-  const Rig& rig_;
   rig::Checks& checks_;
   TickLines ticks_;
+  DeviceRow device_;
   std::string directory_;
-  std::string device_id_;
   std::unique_ptr<fs::FileSystem> card_;
   sysmodule::SdEngine engine_;
   std::unique_ptr<ipc::ServiceCore> core_;
 };
 
 // --- the other clients --------------------------------------------------------
+
+/// The PSX states a client writes, and when (`kClients` says which).
+struct PsxState {
+  const char* emulator;
+  const char* core_folder;
+  bool before_switch;
+  bool web_names;
+};
 
 /// One save state of a core's, as the client names it.
 struct StateRef {
@@ -373,6 +416,8 @@ class RetroArch final : public OtherClient {
     return served.successful() ? served.response.body : std::string();
   }
 
+
+ private:
   /// A WebDAV request as Cloud Sync makes it.
   http::Result Dav(http::Method method, const std::string& path,
                    const std::string& body = std::string()) const {
@@ -388,7 +433,6 @@ class RetroArch final : public OtherClient {
     return rig_.client.Send(request);
   }
 
- private:
   std::string SavePath() const {
     return std::string("saves/") + game_.core_folder + "/" + game_.Stem() + ".srm";
   }
@@ -409,23 +453,12 @@ class NegotiatingDevice final : public OtherClient {
 
   NegotiatingDevice(rig::Checks& c, const Rig& rig, const Game& game, Style style,
                     const std::string& name)
-      : rig_(rig), game_(game), style_(style), storage_(c, name), checks_(c) {
-    const bool web = style == Style::kWeb;
-    const http::Result created = harness::PostJson(
-        rig.client, rig.base + "/api/devices", rig.fixture,
-        "{\"name\":" + json::Quote(name + "-" + harness::UniqueSlot("device")) +
-            ",\"platform\":" + json::Quote(web ? "Web" : "Linux") +
-            ",\"client\":" + json::Quote(web ? "web" : "grout") +
-            ",\"sync_mode\":\"api\",\"allow_existing\":false}");
-    device_id_ = rig::JsonString(created.response.body, "device_id");
-    c.Expect(created.successful() && !device_id_.empty(),
-             name + ": RomM registers the other device: HTTP " +
-                 std::to_string(created.response.status) + " " + created.response.body);
-  }
-
-  ~NegotiatingDevice() override {
-    harness::DeleteDevice(rig_.client, rig_.base, rig_.fixture, device_id_);
-  }
+      : rig_(rig),
+        game_(game),
+        style_(style),
+        storage_(c, name),
+        checks_(c),
+        device_(rig, Register(c, rig, style, name)) {}
 
   NegotiatingDevice(const NegotiatingDevice&) = delete;
   NegotiatingDevice& operator=(const NegotiatingDevice&) = delete;
@@ -464,12 +497,7 @@ class NegotiatingDevice final : public OtherClient {
         rig_.base + "/api/states?rom_id=" + std::to_string(state.rom_id) +
             "&emulator=" + state.emulator,
         rig_.fixture);
-    http::FormPart part;
-    part.name = "stateFile";
-    part.file_path = staged;
-    part.file_name = state.file_name;
-    part.content_type = "application/octet-stream";
-    request.form.push_back(part);
+    request.form.push_back(FilePart("stateFile", staged, state.file_name));
     return rig_.client.Send(request).successful();
   }
 
@@ -485,6 +513,34 @@ class NegotiatingDevice final : public OtherClient {
   }
 
  private:
+  /// `POST /api/devices` as the client registers itself (the web player's
+  /// `registerDevice`), never `allow_existing`: a device of the cell's own.
+  static std::string Register(rig::Checks& c, const Rig& rig, Style style,
+                              const std::string& name) {
+    const bool web = style == Style::kWeb;
+    const http::Result created = harness::PostJson(
+        rig.client, rig.base + "/api/devices", rig.fixture,
+        "{\"name\":" + json::Quote(name + "-" + harness::UniqueSlot("device")) +
+            ",\"platform\":" + json::Quote(web ? "Web" : "Linux") +
+            ",\"client\":" + json::Quote(web ? "web" : "grout") +
+            ",\"sync_mode\":\"api\",\"allow_existing\":false}");
+    const std::string id = rig::JsonString(created.response.body, "device_id");
+    c.Expect(created.successful() && !id.empty(),
+             name + ": RomM registers the other device: HTTP " +
+                 std::to_string(created.response.status) + " " + created.response.body);
+    return id;
+  }
+
+  static http::FormPart FilePart(const char* field, const std::string& path,
+                                 const std::string& file_name) {
+    http::FormPart part;
+    part.name = field;
+    part.file_path = path;
+    part.file_name = file_name;
+    part.content_type = "application/octet-stream";
+    return part;
+  }
+
   /// One sync, start to `complete`: negotiate, then carry out what it says for
   /// this device's rom. Operations for any other rom are not this device's.
   bool Sync() {
@@ -497,7 +553,7 @@ class NegotiatingDevice final : public OtherClient {
               ",\"updated_at\":" + json::Quote(sync::FormatTimestamp(written_)) +
               ",\"file_size_bytes\":" + std::to_string(bytes_->size()) + "}]";
     }
-    std::string body = "{\"device_id\":" + json::Quote(device_id_) +
+    std::string body = "{\"device_id\":" + json::Quote(device_.id()) +
                        ",\"rom_ids\":[" + std::to_string(game_.rom_id) + "],\"saves\":" + saves;
     if (style_ == Style::kWeb) {
       body += ",\"restore_unlisted\":true,\"emulators\":[" + json::Quote(game_.emulator) + "]";
@@ -515,15 +571,13 @@ class NegotiatingDevice final : public OtherClient {
     const std::int64_t session = harness::Number(plan.value, "session_id");
     int completed = 0;
     int failed = 0;
-    last_action_ = "none";
     if (const json::Value* operations = plan.value.Find("operations"); operations != nullptr) {
       for (const json::Value& operation : operations->elements()) {
         if (harness::Number(operation, "rom_id") != game_.rom_id ||
             harness::Field(operation, "slot") != kSlot) {
           continue;
         }
-        last_action_ = harness::Field(operation, "action");
-        const bool done = Apply(operation, session);
+        const bool done = Apply(harness::Field(operation, "action"), operation, session);
         completed += done ? 1 : 0;
         failed += done ? 0 : 1;
       }
@@ -532,16 +586,16 @@ class NegotiatingDevice final : public OtherClient {
     return failed == 0;
   }
 
-  bool Apply(const json::Value& operation, std::int64_t session) {
-    if (last_action_ == "upload" && bytes_.has_value()) {
+  bool Apply(const std::string& action, const json::Value& operation, std::int64_t session) {
+    if (action == "upload" && bytes_.has_value()) {
       return Upload(session);
     }
-    if (last_action_ == "download" || last_action_ == "conflict") {
+    if (action == "download" || action == "conflict") {
       // A conflict keeps the local copy aside (the web player archives it) and
       // takes the server's, as RomM's keep-both guidance has every client do.
       return Download(harness::Number(operation, "save_id"), session);
     }
-    if (last_action_ == "delete") {
+    if (action == "delete") {
       bytes_.reset();
       synced_.clear();
     }
@@ -553,18 +607,13 @@ class NegotiatingDevice final : public OtherClient {
     rig::WriteFile(staged, *bytes_);
     std::string url = rig_.base + "/api/saves?rom_id=" + std::to_string(game_.rom_id) +
                       "&emulator=" + game_.emulator + "&slot=autosave&overwrite=true" +
-                      "&device_id=" + device_id_ + "&session_id=" + std::to_string(session) +
+                      "&device_id=" + device_.id() + "&session_id=" + std::to_string(session) +
                       "&content_hash=" + crypto::Md5Hex(*bytes_);
     if (style_ == Style::kWeb) {
       url += "&autocleanup=true";
     }
     http::Request request = harness::Authed(http::Method::kPost, url, rig_.fixture);
-    http::FormPart part;
-    part.name = "saveFile";
-    part.file_path = staged;
-    part.file_name = game_.Stem() + ".srm";
-    part.content_type = "application/octet-stream";
-    request.form.push_back(part);
+    request.form.push_back(FilePart("saveFile", staged, game_.Stem() + ".srm"));
     const http::Result posted = rig_.client.Send(request);
     checks_.Expect(posted.successful(), "the other device uploads: HTTP " +
                                             std::to_string(posted.response.status) + " " +
@@ -578,7 +627,7 @@ class NegotiatingDevice final : public OtherClient {
   bool Download(std::int64_t save_id, std::int64_t session) {
     const http::Result fetched = rig_.client.Send(harness::Authed(
         http::Method::kGet,
-        rig_.base + "/api/saves/" + std::to_string(save_id) + "/content?device_id=" + device_id_ +
+        rig_.base + "/api/saves/" + std::to_string(save_id) + "/content?device_id=" + device_.id() +
             "&session_id=" + std::to_string(session) + "&optimistic=true",
         rig_.fixture));
     if (!fetched.successful()) {
@@ -592,7 +641,7 @@ class NegotiatingDevice final : public OtherClient {
     harness::PostJson(rig_.client, rig_.base + "/api/saves/" + std::to_string(save_id) +
                                        "/downloaded",
                       rig_.fixture,
-                      "{\"device_id\":" + json::Quote(device_id_) +
+                      "{\"device_id\":" + json::Quote(device_.id()) +
                           ",\"content_hash\":" + json::Quote(synced_) + "}");
     return true;
   }
@@ -602,11 +651,10 @@ class NegotiatingDevice final : public OtherClient {
   Style style_;
   harness::Sandbox storage_;
   rig::Checks& checks_;
-  std::string device_id_;
+  DeviceRow device_;
   std::optional<std::string> bytes_;
   std::string synced_;
   sync::Timestamp written_{};
-  std::string last_action_;
 };
 
 // --- the cells ----------------------------------------------------------------
@@ -617,7 +665,7 @@ struct Cell {
   const Rig& rig;
   const Game& game;
   OtherClient& other;
-  std::string client;  ///< `retroarch`, `grout` or `web`
+  const PsxState& psx;  ///< the other client's PSX states
   std::string name;    ///< `interop.<client>.<cell>`, every message's prefix
   std::string stamp;   ///< unique bytes per run
 
@@ -641,8 +689,9 @@ void FromSwitch(const Cell& cell) {
                          std::string(cell.game.emulator)));
   cell.c.ExpectEq(cell.other.Load(), played, cell.Say("and it is what the other client loads"));
 
+  const std::vector<std::string> synced = Versions(cell.rig, cell.game.rom_id);
   console.Tick(cell.Say("the next tick"));
-  cell.c.ExpectEq(SlotRows(cell.rig, cell.game.rom_id).size(), std::size_t{1},
+  cell.c.ExpectEq(Listed(Versions(cell.rig, cell.game.rom_id)), Listed(synced),
                   cell.Say("which uploads nothing more"));
   cell.c.ExpectEq(console.sandbox.Read(cell.game.SwitchSave()), played,
                   cell.Say("and leaves the card as it was"));
@@ -654,6 +703,7 @@ void FromSwitch(const Cell& cell) {
 void ToSwitch(const Cell& cell) {
   const std::string first = cell.Bytes("the other client's progress");
   cell.c.Expect(cell.other.Save(first), cell.Say("the other client syncs its save"));
+  const std::vector<std::string> theirs = Versions(cell.rig, cell.game.rom_id);
   Switch console(cell.c, cell.rig, cell.name, /*states=*/false);
   const std::string save = cell.game.SwitchSave();
 
@@ -666,13 +716,13 @@ void ToSwitch(const Cell& cell) {
   cell.c.ExpectEq(console.sandbox.Read(save), first,
                   cell.Say("places the save in Tico's folder under the rom's name") +
                       console.Log());
-  cell.c.ExpectEq(SlotRows(cell.rig, cell.game.rom_id).size(), std::size_t{1},
+  cell.c.ExpectEq(Listed(Versions(cell.rig, cell.game.rom_id)), Listed(theirs),
                   cell.Say("and uploads nothing back"));
 
   harness::PassASecond();
   const std::string second = cell.Bytes("the other client played on");
   cell.c.Expect(cell.other.Save(second), cell.Say("the other client syncs again"));
-  const std::size_t versions = SlotRows(cell.rig, cell.game.rom_id).size();
+  const std::vector<std::string> versions = Versions(cell.rig, cell.game.rom_id);
   console.Tick(cell.Say("the next tick"));
   cell.c.ExpectEq(console.sandbox.Read(save), second, cell.Say("brings the newer save down"));
   cell.c.Expect(console.sandbox.HasBackupOf(first),
@@ -681,7 +731,7 @@ void ToSwitch(const Cell& cell) {
                 cell.Say("a download, not a conflict"));
 
   console.Tick(cell.Say("and the one after"));
-  cell.c.ExpectEq(SlotRows(cell.rig, cell.game.rom_id).size(), versions,
+  cell.c.ExpectEq(Listed(Versions(cell.rig, cell.game.rom_id)), Listed(versions),
                   cell.Say("which sends nothing: the card holds the server's head"));
   cell.c.ExpectEq(cell.other.Load(), second, cell.Say("and the other client keeps its own"));
 }
@@ -770,34 +820,6 @@ void Delete(const Cell& cell) {
   cell.c.ExpectEq(cell.other.Load(), std::string(), cell.Say("and the other client has nothing"));
 }
 
-/// The PSX states each client writes, and when. RetroArch and Grout write two:
-/// `<game>.state2`, a name Tico's folder takes and the Switch holds nothing
-/// under, so only the core keeps it off the card -- and `<game>.state1`, the
-/// Switch's own, met the two ways `POST /api/states` keying on the name alone
-/// makes states meet:
-///
-///   retroarch -- first: the Switch's state meets a row another core wrote;
-///   grout     -- after, by POST: RomM writes it over the Switch's row and moves
-///                that row to Grout's core, which the Switch must not download;
-///   web       -- one, under the web player's `<game> [<local time>].state`:
-///                a name that collides with nothing, and Tico's folder refuses.
-struct PsxState {
-  const char* emulator;
-  const char* core_folder;
-  bool before_switch;
-  bool web_names;
-};
-
-PsxState PsxFor(std::string_view client) {
-  if (client == "retroarch") {
-    return {"pcsx_rearmed", "PCSX-ReARMed", true, false};
-  }
-  if (client == "grout") {
-    return {"swanstation", "SwanStation", false, false};
-  }
-  return {"mednafen_psx_hw", "Beetle PSX HW", true, true};
-}
-
 /// The web player's state name: the rom's name and the local time to the
 /// millisecond (its bundle's `sessionStateName`).
 std::string WebStateName(const std::string& game) {
@@ -854,8 +876,10 @@ void States(const Cell& cell) {
   if (rom.id == 0) {
     return;
   }
+  // The game is on the card, so its own slot is negotiated too.
+  ClearRom(cell.rig, rom.id);
   ClearStates(cell.rig, rom.id, game);
-  const PsxState plan = PsxFor(cell.client);
+  const PsxState& plan = cell.psx;
   std::vector<std::pair<StateRef, std::string>> theirs;
   for (const std::string& name :
        plan.web_names ? std::vector<std::string>{WebStateName(game)}
@@ -882,6 +906,17 @@ void States(const Cell& cell) {
       store("first");
     }
     console.Tick(cell.Say("the Switch syncs its state"));
+    // Which meeting this is turns on what that tick did: the Switch's state
+    // goes up unless its name is already another core's row.
+    const bool name_taken = plan.before_switch && !plan.web_names;
+    bool first_up = false;
+    for (const sync::ServerState& row : StatesNamed(cell.rig, rom.id, game + ".state1")) {
+      first_up = first_up ||
+                 (row.emulator == "tico-duckstation" && StateBytes(cell.rig, row.id) == first);
+    }
+    cell.c.ExpectEq(first_up, !name_taken,
+                    cell.Say("the Switch's state is on the server, as DuckStation's, unless "
+                             "its name was another core's first"));
     if (!plan.before_switch) {
       store("after");
     }
@@ -926,6 +961,7 @@ void States(const Cell& cell) {
     }
   }
   ClearStates(cell.rig, rom.id, game);
+  ClearRom(cell.rig, rom.id);
 }
 
 // --- the matrix ---------------------------------------------------------------
@@ -945,19 +981,56 @@ constexpr CellEntry kCells[] = {
     {"states", States},
 };
 
-/// The game each client plays: three systems, three cores.
-Game GameFor(std::string_view client) {
-  if (client == "retroarch") {
-    return {"240pee_mb.gba", "gba", "mgba", "mGBA", 0};
-  }
-  if (client == "grout") {
-    return {"gb240p.gb", "gb", "gambatte", "Gambatte", 0};
-  }
-  return {"240pee.nes", "nes", "fceumm", "FCEUmm", 0};
-}
+using MakeClient = std::unique_ptr<OtherClient> (*)(rig::Checks&, const Rig&, const Game&,
+                                                    const std::string&);
 
-void Run(rig::Checks& c, const Rig& rig, const std::string& client_name, const CellEntry& entry) {
-  Game game = GameFor(client_name);
+/// One column of the matrix: the client, the game it plays -- three systems,
+/// three cores -- and its PSX states, and when. RetroArch and Grout write two:
+/// `<game>.state2`, a name Tico's folder takes and the Switch holds nothing
+/// under, so only the core keeps it off the card -- and `<game>.state1`, the
+/// Switch's own, met the two ways `POST /api/states` keying on the name alone
+/// makes states meet:
+///
+///   retroarch -- first: the Switch's state meets a row another core wrote;
+///   grout     -- after, by POST: RomM writes it over the Switch's row and moves
+///                that row to Grout's core, which the Switch must not download;
+///   web       -- one, under the web player's `<game> [<local time>].state`:
+///                a name that collides with nothing, and Tico's folder refuses.
+struct ClientSpec {
+  const char* name;
+  Game game;
+  PsxState psx;
+  MakeClient make;
+};
+
+const ClientSpec kClients[] = {
+    {"retroarch",
+     {"240pee_mb.gba", "gba", "mgba", "mGBA", 0},
+     {"pcsx_rearmed", "PCSX-ReARMed", true, false},
+     [](rig::Checks&, const Rig& rig, const Game& game,
+        const std::string&) -> std::unique_ptr<OtherClient> {
+       return std::make_unique<RetroArch>(rig, game);
+     }},
+    {"grout",
+     {"gb240p.gb", "gb", "gambatte", "Gambatte", 0},
+     {"swanstation", "SwanStation", false, false},
+     [](rig::Checks& c, const Rig& rig, const Game& game,
+        const std::string& name) -> std::unique_ptr<OtherClient> {
+       return std::make_unique<NegotiatingDevice>(c, rig, game,
+                                                  NegotiatingDevice::Style::kGrout, name);
+     }},
+    {"web",
+     {"240pee.nes", "nes", "fceumm", "FCEUmm", 0},
+     {"mednafen_psx_hw", "Beetle PSX HW", true, true},
+     [](rig::Checks& c, const Rig& rig, const Game& game,
+        const std::string& name) -> std::unique_ptr<OtherClient> {
+       return std::make_unique<NegotiatingDevice>(c, rig, game, NegotiatingDevice::Style::kWeb,
+                                                  name);
+     }},
+};
+
+void Run(rig::Checks& c, const Rig& rig, const ClientSpec& spec, const CellEntry& entry) {
+  Game game = spec.game;
   harness::Rom rom;
   c.Expect(harness::FindRom(rig.client, rig.base, rig.fixture, game.fs_name, &rom),
            std::string("the fixture library has ") + game.fs_name);
@@ -965,20 +1038,12 @@ void Run(rig::Checks& c, const Rig& rig, const std::string& client_name, const C
     return;
   }
   game.rom_id = rom.id;
-  const std::string name = "interop." + client_name + "." + entry.name;
+  const std::string name = std::string("interop.") + spec.name + "." + entry.name;
   ClearRom(rig, game.rom_id);
   rlog::Reset();
   {
-    std::unique_ptr<OtherClient> other;
-    if (client_name == "retroarch") {
-      other = std::make_unique<RetroArch>(rig, game);
-    } else {
-      other = std::make_unique<NegotiatingDevice>(
-          c, rig, game,
-          client_name == "web" ? NegotiatingDevice::Style::kWeb : NegotiatingDevice::Style::kGrout,
-          name);
-    }
-    const Cell cell{c, rig, game, *other, client_name, name, harness::UniqueSlot(name)};
+    const std::unique_ptr<OtherClient> other = spec.make(c, rig, game, name);
+    const Cell cell{c, rig, game, *other, spec.psx, name, harness::UniqueSlot(name)};
     entry.run(cell);
   }
   ClearRom(rig, game.rom_id);
@@ -995,8 +1060,11 @@ int main(int argc, char** argv) {
   for (const CellEntry& one : kCells) {
     entry = cell_name == one.name ? &one : entry;
   }
-  if (entry == nullptr ||
-      (client_name != "retroarch" && client_name != "grout" && client_name != "web")) {
+  const ClientSpec* spec = nullptr;
+  for (const ClientSpec& one : kClients) {
+    spec = client_name == one.name ? &one : spec;
+  }
+  if (entry == nullptr || spec == nullptr) {
     std::cerr << "unknown cell: " << scenario << "\n";
     return 2;
   }
@@ -1019,7 +1087,7 @@ int main(int argc, char** argv) {
   // still read (harness::Sandbox).
   rig::Checks checks;
   const Rig rig{*client, base, fixture};
-  Run(checks, rig, client_name, *entry);
+  Run(checks, rig, *spec, *entry);
   if (checks.failures() == 0) {
     std::cout << "interop." << scenario << " ok against " << base << "\n";
   }
