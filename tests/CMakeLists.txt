@@ -1591,6 +1591,7 @@ set(TICK_RIG_SCENARIOS
   baseline_other_row  # #234: ...and against another device's new row (#227), never suppressed
   scoped           # #241: rom_ids on every negotiate, 500 at a time, and nothing off the card offered
   restore          # #241: a downloaded rom's save comes back, even one this device synced and lost
+  oversized        # #246: a plan past 128 operations is split down to one rom, not refused forever
   deleted          # M10-7: deleted in RomM -> backed up and removed, and never re-uploaded
   deleted_keep     # ...and under on_server_delete = keep, left on the card, never re-uploaded
   migrated         # #236: rc1's v2 row moves to the shared slot; its newer head lands, backed up

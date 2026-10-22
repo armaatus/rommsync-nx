@@ -18,6 +18,7 @@
 // **Every rig scenario runs `sync::RunTick` inside a `harness::Sandbox`**, so the
 // backup-before-overwrite audit judges it on teardown whether or not the
 // scenario thought to look, and every one ends on `harness::ExpectDisarmed`.
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -1890,6 +1891,8 @@ class Recording final : public http::HttpClient {
       const json::ParseResult plan = json::Parse(result.response.body);
       const json::Value* id = plan.ok() ? plan.value.Find("session_id") : nullptr;
       sessions.push_back(id != nullptr && id->is_integer() ? id->integer() : 0);
+      const json::Value* planned = plan.ok() ? plan.value.Find("operations") : nullptr;
+      operations.push_back(planned != nullptr && planned->is_array() ? planned->size() : 0);
     } else if (request.method == http::Method::kPost &&
                request.url.find("/api/saves?") != std::string::npos) {
       uploads.push_back(request.url);
@@ -1906,12 +1909,14 @@ class Recording final : public http::HttpClient {
   void Clear() {
     negotiations.clear();
     sessions.clear();
+    operations.clear();
     uploads.clear();
     completed = 0;
   }
 
   std::vector<std::string> negotiations;
   std::vector<std::int64_t> sessions;  ///< each negotiation's, in order
+  std::vector<std::size_t> operations;  ///< how many each one's plan held
   std::vector<std::string> uploads;    ///< every upload's URL
   int completed = 0;
 
@@ -2177,6 +2182,141 @@ void Restore(rig::Checks& checks, http::HttpClient& client, const std::string& b
     harness::DeleteSave(client, base, fixture, id);
   }
   harness::DeleteSave(client, base, fixture, server.id);
+  harness::DeleteDevice(client, base, fixture, device);
+}
+
+// --- oversized (#246) ---------------------------------------------------------
+//
+// A plan is held for the whole tick, so it is bounded (`sync::kMaxPlanOperations`,
+// 128) -- and a server can hold more saves for a card's roms than that without
+// the card reporting any of them: another device's library, a desktop RetroArch.
+// Refused whole, that plan was refused on every tick, and nothing on the card
+// ever synced again. So a chunk whose plan is too large is split and asked
+// again, down to one rom, and only a rom whose own saves are past the bound is
+// left out -- for that tick, and by name.
+
+/// The slot of the `n`th save this scenario seeds on `rom`. One slot each,
+/// because a POST to a slot the server holds overwrites it.
+std::string OversizedSlot(char rom, int n) {
+  return std::string("m9-20-big-") + rom + "-" + std::to_string(n);
+}
+
+/// Every save a previous run of this scenario left on `rom_id`.
+void ClearOversized(http::HttpClient& client, const std::string& base, const Fixture& fixture,
+                    std::int64_t rom_id) {
+  const http::Result listed = client.Send(harness::Authed(
+      http::Method::kGet, base + "/api/saves?rom_id=" + std::to_string(rom_id), fixture));
+  const json::ParseResult parsed = json::Parse(listed.response.body);
+  if (!listed.successful() || !parsed.ok() || !parsed.value.is_array()) {
+    return;
+  }
+  std::string ids;
+  for (const json::Value& save : parsed.value.elements()) {
+    if (harness::Field(save, "slot").rfind("m9-20-big-", 0) == 0) {
+      ids += (ids.empty() ? "" : ",") + std::to_string(harness::Number(save, "id"));
+    }
+  }
+  if (!ids.empty()) {
+    harness::PostJson(client, base + "/api/saves/delete", fixture, "{\"saves\":[" + ids + "]}");
+  }
+}
+
+void Oversized(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+               const Fixture& fixture) {
+  // Two roms whose saves fit a plan each but not one together, and a third whose
+  // own saves do not fit one at all.
+  struct Seeded {
+    const char* file;
+    char label;
+    int saves;
+    harness::Rom rom;
+  };
+  Seeded seeded[] = {{"gb240p.gb", 'a', 65, {}},
+                     {"nova.nes", 'b', 65, {}},
+                     {"240pee.nes", 'c', static_cast<int>(sync::kMaxPlanOperations) + 1, {}}};
+  for (Seeded& one : seeded) {
+    if (!harness::FindRom(client, base, fixture, one.file, &one.rom)) {
+      checks.Expect(false, std::string("the fixture holds ") + one.file);
+      return;
+    }
+    ClearOversized(client, base, fixture, one.rom.id);
+  }
+  const std::string device =
+      harness::CreateDevice(checks, client, base, fixture, "tick-oversized");
+  if (device.empty()) {
+    return;
+  }
+  Sandbox sandbox(checks, "tick-oversized");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const std::string staged = sandbox.Host("/config/rommsync/server-copy.srm");
+  rig::WriteFile(staged, "another device's save\n");
+  bool uploaded = true;
+  for (const Seeded& one : seeded) {
+    for (int n = 0; n < one.saves && uploaded; ++n) {
+      harness::Save save;
+      http::Result raw;
+      uploaded = harness::UploadSave(client, base, fixture, one.rom.id, OversizedSlot(one.label, n),
+                                     "m2-7", staged, OversizedSlot(one.label, n) + ".srm",
+                                     /*with_device=*/false, &save, &raw);
+      checks.Expect(uploaded, std::string("the server holds every seeded save: ") + one.file +
+                                  " #" + std::to_string(n) + " answered " +
+                                  std::to_string(raw.response.status) + " " +
+                                  raw.response.body.substr(0, 200));
+    }
+  }
+
+  auth::StoredToken token = TokenFor(base, fixture);
+  token.device_id = device;
+  Recording recording(client);
+  sync::TickOptions options = OptionsAt(1'757'000'600);
+  // Placed nowhere: what is under test is what gets negotiated, not 259 files.
+  options.execute.place = [](const sync::SyncOperation&) {
+    rommsync::place::Placement placement;
+    placement.reason = "not this scenario's to place";
+    return placement;
+  };
+  std::vector<std::int64_t> card;
+  for (const Seeded& one : seeded) {
+    card.push_back(one.rom.id);
+  }
+  std::sort(card.begin(), card.end());
+  options.rom_scope = card;
+
+  if (uploaded) {
+    const sync::TickResult tick =
+        sync::RunTick(recording, *files, token, {}, {}, state::Baseline{}, options);
+    checks.Expect(tick.outcome != sync::TickOutcome::kRefused,
+                  std::string("a server holding more saves than one plan carries is not a tick "
+                              "refused whole -- it was every tick, forever: ") +
+                      sync::ToString(tick.outcome) + ", " + tick.negotiated.message);
+    // Which negotiations named one rom each, and what they planned.
+    std::map<std::int64_t, std::size_t> alone;
+    for (std::size_t index = 0; index < recording.negotiations.size(); ++index) {
+      bool restoring = false;
+      const std::optional<std::vector<std::int64_t>> scope =
+          ScopeOf(recording.negotiations[index], &restoring);
+      if (scope.has_value() && scope->size() == 1 && index < recording.operations.size()) {
+        alone[scope->front()] = recording.operations[index];
+      }
+    }
+    for (const Seeded& one : seeded) {
+      const auto asked = alone.find(one.rom.id);
+      checks.Expect(asked != alone.end(),
+                    std::string("the split reaches ") + one.file + " on its own");
+      if (asked != alone.end()) {
+        checks.ExpectEq(asked->second, static_cast<std::size_t>(one.saves),
+                        std::string("and its plan is every save of ") + one.file);
+      }
+    }
+    checks.Expect(tick.outcome == sync::TickOutcome::kPartial,
+                  std::string("the rom left out makes the tick partial, not clean: ") +
+                      sync::ToString(tick.outcome));
+  }
+
+  for (const Seeded& one : seeded) {
+    ClearOversized(client, base, fixture, one.rom.id);
+  }
   harness::DeleteDevice(client, base, fixture, device);
 }
 
@@ -3804,6 +3944,8 @@ int main(int argc, char** argv) {
     Isolated(checks, *client, base, fixture);
   } else if (scenario == "isolated_ids") {
     IsolatedIds(checks, *client, base, fixture);
+  } else if (scenario == "oversized") {
+    Oversized(checks, *client, base, fixture);
   } else if (scenario == "scoped") {
     Scoped(checks, *client, base, fixture, rom);
   } else if (scenario == "restore") {
