@@ -1956,7 +1956,11 @@ foreach(scenario
         links       # every relative link and anchor resolves
         safety      # no account secret on the console, no weakened TLS
         pairing     # the state table is exactly what PairingState exposes
-        structure)  # #35's ten sections, the hardware note, the README link
+        structure   # #35's ten sections, the hardware note, the README link
+        # docs/INTEROP.md (#243): the other devices' half of the install guide.
+        interop          # its sections, the links to it, the two config pages
+        interop_facts    # versions, limits, keys and names read off the code
+        interop_table)   # the per-system table both ways against save_source.cpp
   add_test(NAME docs.install_${scenario}
            COMMAND ${Python3_EXECUTABLE} "${DOCS_INSTALL_TEST}" ${scenario}
                    --repo "${CMAKE_SOURCE_DIR}")
@@ -1980,7 +1984,9 @@ foreach(scenario
         emitted    # every documented tag has a call site outside the log module
         links      # every relative link and anchor resolves
         safety     # no step weakens TLS; the bug-report section names what not to send
-        structure) # #38's sections, the hardware note, the cap, the README/INSTALL links
+        structure  # #38's sections, the hardware note, the cap, the README/INSTALL links
+        sections   # every failure section quotes a line; skip reasons are the scanner's
+        limits)    # the saves/states/roms bounds are the code's (#243)
   add_test(NAME docs.troubleshooting_${scenario}
            COMMAND ${Python3_EXECUTABLE} "${DOCS_TROUBLESHOOTING_TEST}" ${scenario}
                    --repo "${CMAKE_SOURCE_DIR}")
