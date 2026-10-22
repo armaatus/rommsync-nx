@@ -737,7 +737,8 @@ overwritten. The same sync then asks RomM about that save once more
   newer save is downloaded over it, after a backup;
 - if it has, both changed, and it is a **conflict**: the server's copy goes on
   the card, and the card's bytes are kept under `/config/rommsync/.backup/` and
-  on RomM as an extra save named `<game> [switch-conflict <time>].srm`
+  on RomM as an extra save named `<game> [switch-conflict <time>]` plus the
+  save's extension
   ([INTEROP.md](INTEROP.md#when-two-devices-disagree)).
 
 Either way the line above does not stay. It is left — and the sync reads partly
@@ -747,8 +748,8 @@ and this client touches no save while one is
 the server did not answer it. The next sync settles it.
 
 **The fix.** Usually nothing. To keep the card's version after a conflict,
-restore it from the **Conflicts** screen; the next sync offers it to RomM as new
-progress. If the same 409 line comes back on every sync with no game open,
+restore it from the **Conflicts** screen; the next sync decides again, and will
+most likely offer it to RomM as new progress. If the same 409 line comes back on every sync with no game open,
 attach the log ([What to attach to a bug report](#what-to-attach-to-a-bug-report)).
 
 ---
@@ -808,7 +809,7 @@ works.
 
 ```
 6 warn scan.skipped unmatched /tico/saves/genesis/Sonic the Hedgehog (USA, Europe).srm: no rom named "Sonic the Hedgehog (USA, Europe)" on platform genesis
-1 info config.diagnostic line 14 [platform.megadrive]: is not a platform this build maps by default; it is used as written -- check it matches the folder name under RomM's library/roms/, because a slug that matches nothing maps nothing
+1 info config.diagnostic line 14 [platform.megadrive] is not a platform this build maps by default; it is used as written -- check it matches the folder name under RomM's library/roms/, because a slug that matches nothing maps nothing
 ```
 
 **What is happening.** The folder map is keyed by RomM's `platform_fs_slug`:

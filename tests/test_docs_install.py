@@ -460,10 +460,13 @@ INTEROP_SECTIONS = [
 
 
 def section(text: str, heading: str) -> str:
-    """The body under `## heading`, up to the next `## `."""
-    start = text.index("## " + heading)
-    end = re.search(r"^## ", text[start + 3:], re.MULTILINE)
-    return text[start: start + 3 + end.start()] if end else text[start:]
+    """The body under `## heading` exactly (not a `###` that ends the same way),
+    up to the next `## `."""
+    found = re.search(rf"^## {re.escape(heading)}\s*$", text, re.MULTILINE)
+    if not found:
+        raise SystemExit(fail(f"docs/INTEROP.md has no section '## {heading}'"))
+    end = re.search(r"^## ", text[found.end():], re.MULTILINE)
+    return text[found.start(): found.end() + end.start()] if end else text[found.start():]
 
 
 def headers_text(repo: str) -> str:
@@ -615,6 +618,9 @@ def phase_interop_facts(args) -> int:
                if n.endswith(".cpp")]
     literals = string_literals(sources)
     quoted = re.findall(r'\*\*"([^"]+)"\*\*', text)
+    if not quoted:
+        return fail("docs/INTEROP.md quotes no screen line at all; it is supposed to name "
+                    "what the overlay says when RomM is too old and when RetroArch syncs itself")
     for line in quoted:
         if not any(line in literal for literal in literals):
             return fail(f"docs/INTEROP.md quotes the console as saying {line!r}; no string "
@@ -651,6 +657,8 @@ def phase_interop_table(args) -> int:
         return fail("cannot find kTicoModules or RetroArchCores' table in save_source.cpp")
     code_modules = set(re.findall(r'\{"[a-z0-9-]+", "([^"]+)", "([a-z0-9_-]+)"\}', tico.group(1)))
     code_folders = set(re.findall(r'\{"([a-z0-9_-]+)", "([^"]+)"\}', cores.group(1)))
+    if not code_modules or not code_folders:
+        return fail("kTicoModules or RetroArchCores() parsed as empty")
 
     rows = table_rows(section(text, "Which systems sync with what"),
                       "| System | Tico module | Emulator id |")
@@ -676,6 +684,8 @@ def phase_interop_table(args) -> int:
                          "| Emulator id | RetroArch core folder |")
     by_id = {}
     for row in folders:
+        if len(row) < 2:
+            return fail(f"a row of the core folder table has {len(row)} cells: {row}")
         ident = re.findall(r"`([^`]+)`", row[0])
         folder = re.findall(r"`([^`]+)`", row[1])
         if len(ident) != 1 or len(folder) != 1:
@@ -690,7 +700,9 @@ def phase_interop_table(args) -> int:
         return fail(f"the core folder table leaves out {missing}, which the Switch syncs in "
                     "a RetroArch core's format")
 
-    print(f"{len(documented)} systems match the Tico module table both ways; "
+    # Pairs rather than systems: kTicoModules has a row per Tico folder, and the
+    # four Genesis Plus GX folders are one module and one id.
+    print(f"{len(documented)} module/id pairs match the Tico module table both ways; "
           f"{len(by_id)} RetroArch core folders match RomM's table")
     return 0
 

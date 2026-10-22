@@ -14,8 +14,9 @@ you control from an **Ultrahand / Tesla overlay**.
 > sysmodule and the overlay are written: pairing, the download queue, save sync
 > with backups and a conflicts screen, opt-in save states, and — on `main` since
 > the v1.0.0-rc1 pre-release — saves shared with RetroArch, RomM's web player,
-> Argosy and Grout ([`docs/INTEROP.md`](docs/INTEROP.md)). Every part is tested
-> against a real RomM; nothing has booted on a console yet, and the first
+> Argosy and Grout ([`docs/INTEROP.md`](docs/INTEROP.md)). Sync, downloads and
+> pairing are tested against a real RomM and the overlay's screens on the host;
+> nothing has booted on a console yet, and the first
 > real-console run is M8-2. It needs RomM 5.4.0 or later and refuses to sync
 > with anything older; that API is captured and verified — see
 > [`docs/API_CONTRACT.md`](docs/API_CONTRACT.md).

@@ -18,7 +18,8 @@ to the same RomM.
 ## Which RomM
 
 **RomM 5.4.0 or later.** The client asks the server which release it runs
-before every sync, and below 5.4.0 it syncs nothing — no save offered, none
+once a boot and again after pairing — and on every sync while the answer is too
+old — and below 5.4.0 it syncs nothing — no save offered, none
 downloaded — and the overlay says **"RomM is too old to sync with"**
 ([TROUBLESHOOTING.md](TROUBLESHOOTING.md#romm-is-too-old)). That is deliberate:
 5.4.0 is the first release that can tell a device a save was deleted, keep two
@@ -211,13 +212,14 @@ Switch last synced it, the **server's copy goes on the card**. Nothing is lost:
 
 - the card's bytes are copied under `/config/rommsync/.backup/` first;
 - they are also uploaded to RomM as a save **with no slot**, named
-  `<game> [switch-conflict <YYYY-MM-DD_HH-MM-SS>].srm` — the time, in UTC, of the
-  backup — under the Switch's emulator. RomM never syncs a save without a slot to
+  `<game> [switch-conflict <YYYY-MM-DD_HH-MM-SS>].srm` (or `.mcd`, `.eep`: the
+  save's own extension) — the time, in UTC, of the backup — under the emulator
+  the Switch synced it as. RomM never syncs a save without a slot to
   any device, so this copy stays on the server where you can download it from
   the web UI, and never comes back by itself;
 - the overlay's **Conflicts** screen lists it, says whether the server holds
-  that copy, and can put the card's bytes back. The next sync then offers them
-  to RomM as new progress.
+  that copy, and can put the card's bytes back. The next sync then decides
+  again, and will most likely offer them to RomM as new progress.
 
 The same happens when another device saves between the Switch asking what to
 sync and uploading: RomM refuses the Switch's upload (a 409), the Switch asks
@@ -247,6 +249,15 @@ the file instead and stops offering it
   make an old one refuse to load. Tico and RetroArch number their slots one
   apart: `[sync] map_state_slots` lines them up, and it belongs on every Switch
   or on none ([CONFIG.md](CONFIG.md#states-and-map_state_slots-save-states)).
+  RomM keeps one state per game per file name, whoever wrote it: another
+  device's `<game>.state1` uploaded after the Switch's replaces it on the
+  server. The Switch takes it only when the same core wrote it and the card's
+  copy is unchanged; otherwise it keeps its own, which is then on the card
+  alone ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#the-policy)).
+- **Deleting a save on the console is not a delete.** RomM and your other
+  devices keep it, and the Switch does not bring it back either. To delete a
+  save everywhere, delete it in RomM's web UI or in RetroArch; the Switch then
+  removes its copy, after a backup.
 - **128 saves per console.** The scan reads RetroArch's folders first, then the
   folder map, each folder's files in name order, and stops at 128 saves. The
   rest of the card is not read: not uploaded, and nothing is written over them.

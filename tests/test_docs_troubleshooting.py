@@ -507,6 +507,16 @@ def phase_sections(args) -> int:
                     f"the scanner writes:\n  {match.group(0)}\nthe reasons are "
                     f"{', '.join(reasons)}")
 
+    # `config::Diagnostic::Describe` writes `[section] key: message`, and with no
+    # key `[section] message` -- never `[section]:`. A line quoted with that colon
+    # is one the client cannot write, and a user searching for it finds nothing.
+    for match in quoted_lines(text):
+        if match.group(3) == "config.diagnostic" and re.search(r"\[[^\] ]+\]:",
+                                                               match.group(4) or ""):
+            return fail("the guide quotes a config.diagnostic line with `]:`, which "
+                        "Diagnostic::Describe never writes (core/src/config.cpp):\n  "
+                        + match.group(0))
+
     print(f"{len(failures)} failure sections each quote a line; {checked} scan.skipped lines "
           "name a reason the scanner spells")
     return 0
@@ -519,8 +529,12 @@ LIMITS = "Some saves are left out: the limits"
 
 def header_constant(repo: str, name: str, seen=()) -> int:
     """An integer `inline constexpr` from core/'s headers, its expression resolved
-    (`kMaxStates` is `state::kMaxRecords / 4`, not a number). The same reader as
-    docs.install_interop_facts', for the reason `slug` is shared above."""
+    (`kMaxStates` is `state::kMaxRecords / 4`, not a number). A copy of
+    tests/test_docs_install.py's `constant`, kept beside it for the reason `slug`
+    is copied above; named apart because `constant` here reads log.hpp.
+
+    A qualifier is dropped when resolving, so two headers defining one name would
+    resolve to the first; today each bound is defined once."""
     folder = os.path.join(repo, "core", "include", "rommsync")
     headers = "\n".join(read(os.path.join(folder, n)) for n in sorted(os.listdir(folder))
                         if n.endswith(".hpp"))
@@ -545,19 +559,22 @@ def phase_limits(args) -> int:
     if body is None:
         return fail(f"docs/TROUBLESHOOTING.md has no {LIMITS!r} section")
 
-    wanted = {
-        f"{header_constant(repo, 'kMaxSaves'):,} saves": "scan::kMaxSaves",
-        f"{header_constant(repo, 'kMaxPlanOperations'):,} saves": "sync::kMaxPlanOperations",
-        f"{header_constant(repo, 'kMaxStates'):,} states": "scan::kMaxStates",
-        f"{header_constant(repo, 'kMaxIndexRoms'):,} roms": "roms::kMaxIndexRoms",
-    }
-    for phrase, source in wanted.items():
+    # A list, not a dict: the scan's bound and a plan's are both 128 saves today,
+    # and each is checked under its own name.
+    wanted = [
+        (f"{header_constant(repo, 'kMaxSaves'):,} saves", "scan::kMaxSaves"),
+        (f"{header_constant(repo, 'kMaxPlanOperations'):,} saves", "sync::kMaxPlanOperations"),
+        (f"{header_constant(repo, 'kMaxStates'):,} states", "scan::kMaxStates"),
+        (f"{header_constant(repo, 'kMaxIndexRoms'):,} roms", "roms::kMaxIndexRoms"),
+    ]
+    phrases = sorted({phrase for phrase, _ in wanted})
+    for phrase, source in wanted:
         if phrase not in body:
             return fail(f"the limits section does not say {phrase!r} ({source})")
     for number, noun in re.findall(r"\b(\d[\d,]*) (saves|states|roms)\b", body):
-        if f"{number} {noun}" not in wanted:
+        if f"{number} {noun}" not in phrases:
             return fail(f"the limits section says {number} {noun}, which is no bound the code "
-                        "has; the bounds are " + ", ".join(sorted(wanted)))
+                        "has; the bounds are " + ", ".join(phrases))
 
     # The rom left out for holding too many saves is named in a sync.refused
     # line (sysmodule/source/engine.cpp, #246): show that line here.
@@ -565,7 +582,7 @@ def phase_limits(args) -> int:
         return fail("the limits section does not show the sync.refused line that names a "
                     "rom left out for holding more saves than one plan carries")
 
-    print("the limits section gives " + ", ".join(sorted(wanted)) +
+    print("the limits section gives " + ", ".join(phrases) +
           " and shows the oversized rom's line")
     return 0
 
