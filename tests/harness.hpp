@@ -50,7 +50,9 @@
 #include "scratch.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/md5.hpp"
+#include "rommsync/pairing.hpp"
 #include "rommsync/sync.hpp"
+#include "rommsync/token_store.hpp"
 #include "rommsync/state_sync.hpp"
 #include "rommsync/sync_execute.hpp"
 
@@ -441,6 +443,52 @@ inline void DeleteDevice(http::HttpClient& client, const std::string& base,
   if (!device_id.empty()) {
     client.Send(Authed(http::Method::kDelete, base + "/api/devices/" + device_id, fixture));
   }
+}
+
+/// A device of its own, paired the way a console pairs it, and the token bound
+/// to it.
+///
+/// `CreateDevice` is not enough where RomM checks the binding: the install
+/// endpoints a device claims and reports on answer 404 to a token bound to some
+/// other device (#245), and the fixture's own device is every rig process's, so
+/// a request queued for it would be claimed by whichever scenario ticked first.
+/// `identifier` is fixed per scenario, so a re-run adopts its row rather than
+/// adding one. Empty, with a failed check, when the pairing did not complete.
+inline auth::StoredToken PairDevice(rig::Checks& checks, http::HttpClient& client,
+                                    const std::string& base, const std::string& identifier) {
+  using namespace std::chrono_literals;
+  auth::PairingConfig config;
+  config.server_url = base;
+  config.client_device_identifier = identifier;
+  config.device_name = "rommsync-nx " + identifier;
+  config.max_poll_backoff = 5s;
+  auth::PairingSession session(client, config);
+  // RomM allows ten device inits a minute per IP, and the suite is one IP.
+  const std::chrono::steady_clock::time_point give_up = std::chrono::steady_clock::now() + 90s;
+  auth::PairingState state = session.Begin();
+  while (state == auth::PairingState::kFailed &&
+         session.status().message.find("429") != std::string::npos &&
+         std::chrono::steady_clock::now() < give_up) {
+    std::this_thread::sleep_for(2s);
+    state = session.Begin();
+  }
+  if (state != auth::PairingState::kPending) {
+    checks.Expect(false, "pairing started: " + session.status().message);
+    return {};
+  }
+  const http::Result approved =
+      rig::ApproveDeviceCode(client, base, session.status().user_code, config.requested_scopes);
+  checks.Expect(approved.successful(),
+                "the code is approved: HTTP " + std::to_string(approved.response.status));
+  while (!auth::IsTerminal(state) && std::chrono::steady_clock::now() < give_up) {
+    state = session.Poll();
+    std::this_thread::sleep_for(100ms);
+  }
+  if (state != auth::PairingState::kApproved || session.token() == nullptr) {
+    checks.Expect(false, "the pairing was approved: " + session.status().message);
+    return {};
+  }
+  return auth::StoredTokenFrom(base, *session.token());
 }
 
 // --- reading a plan -----------------------------------------------------------

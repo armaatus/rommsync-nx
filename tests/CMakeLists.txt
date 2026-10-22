@@ -1622,6 +1622,27 @@ foreach(scenario live faults)
   set_tests_properties(server.${scenario} PROPERTIES TIMEOUT 120)
 endforeach()
 
+# M10-19 (#245): "Install on device" from RomM's web UI. `parse` needs no
+# server; `live` and `faults` pair a device of their own, because the install
+# endpoints answer only to the token bound to the device -- and serial, because
+# RomM paces device inits per IP and the whole suite is one.
+add_executable(test_remote_install test_remote_install.cpp)
+target_link_libraries(test_remote_install PRIVATE rommsync::host)
+target_include_directories(test_remote_install PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_remote_install PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+add_test(NAME install.parse COMMAND test_remote_install parse)
+set_tests_properties(install.parse PROPERTIES TIMEOUT 60)
+foreach(scenario live faults)
+  add_test(NAME install.${scenario} COMMAND test_remote_install ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(install.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  set_tests_properties(install.${scenario} PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+endforeach()
+
 # M7-2 (#37), registered under `sched.` because what they check is the schedule
 # around a tick rather than the tick. They live in this executable because the
 # two acceptance cases they cover cannot be produced with an injected outcome: a

@@ -1808,8 +1808,7 @@ class Drainer {
       // go and look at.
       entry->destination = candidate;
       entry->bytes_done = detail.size_bytes;
-      return Settle(std::move(*entry), QueueState::kDone,
-                    "already on the card, with the bytes the server's hash describes");
+      return Settle(std::move(*entry), QueueState::kDone, kAlreadyOnCardMessage);
     }
     return std::nullopt;
   }

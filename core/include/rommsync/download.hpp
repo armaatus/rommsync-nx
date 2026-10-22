@@ -114,6 +114,13 @@ inline constexpr std::size_t kMaxQueueBytes = 160 * 1024;
 /// enough that `kMaxQueueEntries` of them are still a bounded file.
 inline constexpr std::size_t kMaxMessageChars = 200;
 
+/// The `message` of an entry the drain found already on the card, verified, and
+/// so settled `kDone` without a transfer. Named because a reader acts on it:
+/// it is how an install queued from the web UI is reported `already_installed`
+/// rather than `done` (remote_install.hpp, #245).
+inline constexpr const char* kAlreadyOnCardMessage =
+    "already on the card, with the bytes the server's hash describes";
+
 /// How many diagnostics a load reports before the rest are dropped.
 inline constexpr std::size_t kMaxDiagnostics = 16;
 

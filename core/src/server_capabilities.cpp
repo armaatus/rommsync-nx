@@ -403,7 +403,31 @@ auth::Parsed<std::string> ParseHeartbeatVersion(std::string_view body) {
   return out;
 }
 
-auth::Parsed<bool> ParseHeartbeatInstall(std::string_view) { return {}; }
+auth::Parsed<bool> ParseHeartbeatInstall(std::string_view body) {
+  auth::Parsed<bool> out;
+  const std::optional<std::string_view> install =
+      TopLevelMember(body, "DEVICE_INSTALL", &out.error);
+  if (!out.error.ok() || !install.has_value()) {
+    return out;
+  }
+  // The member is itself an object, so the same walk crosses it to `ENABLED`
+  // -- past the excluded-platform list, keeping none of it.
+  const std::optional<std::string_view> enabled = TopLevelMember(*install, "ENABLED", &out.error);
+  if (!out.error.ok()) {
+    out.error.field = "DEVICE_INSTALL" + (out.error.field.empty() ? "" : "." + out.error.field);
+    return out;
+  }
+  if (!enabled.has_value() || *enabled == "null") {
+    return out;
+  }
+  if (*enabled != "true" && *enabled != "false") {
+    out.error = Fail(0, "expected a boolean");
+    out.error.field = "DEVICE_INSTALL.ENABLED";
+    return out;
+  }
+  out.value = *enabled == "true";
+  return out;
+}
 
 bool Probe::transient() const {
   return (transport != http::Error::kNone && transport != http::Error::kInvalidRequest) ||
@@ -445,6 +469,10 @@ Probe ReadServer(http::HttpClient& client, std::string_view base_url,
       const auth::Parsed<std::string> version = ParseHeartbeatVersion(sent.response.body);
       if (version.ok()) {
         probe.capabilities = CapabilitiesFor(version.value, floor);
+        // Never a reason to refuse the server: a switch that will not read
+        // is a switch that is off (`install_enabled`).
+        const auth::Parsed<bool> install = ParseHeartbeatInstall(sent.response.body);
+        probe.capabilities.install_enabled = install.ok() && install.value;
         return probe;
       }
       probe.shape = version.error;
