@@ -254,9 +254,10 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
   }
 
   // A server that answers a page of one would otherwise take a round trip per
-  // rom, up to the whole of `kMaxIndexRoms`, every tick. The cap
-  // is on *requests*, so a pathological page size ends the fetch with a
-  // truncated index rather than with a tick that never finishes.
+  // rom, up to the whole of `kMaxIndexRoms`, every tick. The cap is on
+  // *requests* -- the pages that came back, and apart from them the ones refused
+  // as too large -- so a pathological page size ends the fetch with a truncated
+  // index rather than with a tick that never finishes.
   constexpr int kMaxPages = 256;
   // No larger than the default, because the default is a heap term rather than
   // a preference (`kDefaultPageSize`): a caller asking for more would be asking
@@ -264,16 +265,25 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
   //
   // And smaller again when a page comes back past the transport's ceiling
   // (`http::kMaxResponseBytes`, #248): a rom RomM identified is ~12 KiB of row,
-  // so 64 of them are ~750 KiB. The page is asked for again at half the rows,
-  // and the rest of the fetch keeps to that.
-  int page_size = std::clamp(options.page_size, 1, kDefaultPageSize);
+  // so 64 of them are ~750 KiB. The page is asked for again at half the rows.
+  //
+  // **And larger again after**, because what was too wide may be one rom: kept
+  // at the size that fit around it, a library of 1,024 behind a rom that halved
+  // the page to one row is a request a rom, and the cap above ends it a quarter
+  // of the way through, every tick. Past a rom left out the page is back at
+  // `largest`; otherwise it doubles after `wait` pages that came back. `wait`
+  // doubles each time a doubled page is refused, so a library that is wide
+  // everywhere -- every rom on IGDB -- pays a probe now and then rather than one
+  // a page.
+  const int largest = std::clamp(options.page_size, 1, kDefaultPageSize);
+  int page_size = largest;
+  int wait = 1;
+  int streak = 0;
+  bool probing = false;
 
   std::int64_t offset = 0;
   std::size_t room = 0;
   bool reserved = false;
-  // The page size that last came back, which a refused page halves from and a
-  // rom left out returns to.
-  int settled = page_size;
   // The roms left out, counted, and the first named by where it was: a count
   // and not a list, so a library of them costs nothing that grows with it.
   std::int64_t first_left_out = -1;
@@ -290,7 +300,9 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
     }
     return std::move(result);
   };
-  for (int page_number = 0; page_number < kMaxPages; ++page_number) {
+  int pages = 0;
+  int refused = 0;
+  while (pages < kMaxPages && refused < kMaxPages) {
     http::Request request;
     // Three things about this URL are not decoration.
     //
@@ -317,6 +329,12 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
 
     const http::Result sent = client.Send(request);
     if (http::AnsweredTooLarge(sent)) {
+      ++refused;
+      streak = 0;
+      if (probing) {
+        wait = std::min(wait * 2, kMaxPages);
+      }
+      probing = false;
       if (page_size > 1) {
         page_size /= 2;
         continue;
@@ -329,9 +347,11 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
         first_left_out = offset;
       }
       ++offset;
-      page_size = settled;
+      page_size = largest;
+      wait = 1;
       continue;
     }
+    ++pages;
     if (!sent.ok()) {
       result.transport = sent.error;
       result.message = std::string("the rom index could not be fetched: ") +
@@ -366,7 +386,15 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
       }
       return finished();
     }
-    settled = page_size;
+    if (probing) {
+      wait = 1;
+      probing = false;
+    }
+    if (page_size < largest && ++streak >= wait) {
+      page_size = std::min(page_size * 2, largest);
+      streak = 0;
+      probing = true;
+    }
     // Reserved once, from the first page's `total`, because the index is held
     // for the whole tick and is a heap term at its bound (sysmodule/source/
     // main.cpp): grown by doubling, a library of 1,025 roms would hold room for
@@ -407,8 +435,8 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
   }
 
   result.index.set_truncated(true);
-  result.message = "the rom index stopped after " + std::to_string(kMaxPages) +
-                   " pages; the rest of the library is not matched";
+  result.message = "the rom index stopped after " + std::to_string(pages + refused) +
+                   " requests; the rest of the library is not matched";
   return finished();
 }
 

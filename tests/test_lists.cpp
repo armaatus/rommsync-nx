@@ -906,12 +906,15 @@ void TooLarge(checks::Checks& c) {
     c.Expect(fetched.ok() && !fetched.index.truncated(),
              "a library whose pages are past the ceiling is still indexed: " + fetched.message);
     c.ExpectEq(fetched.index.size(), library.size(), "every rom, at the smaller page");
-    bool smaller = !client.limits.empty();
-    for (std::size_t at = 1; at < client.limits.size(); ++at) {
-      smaller = smaller && client.limits[at] <= client.limits[at - 1];
-    }
-    c.Expect(smaller && client.limits.back() <= 7,
-             "asking for half as many rows each time a page is refused, and keeping to it");
+    // 64, 32, 16 and 8 refused, ten pages of 4, and a page of 8 asked for again
+    // after one, two and four of them -- each refused, so each waits twice as
+    // long as the one before: a library wide everywhere is not asked for a page
+    // too large on every other request.
+    c.Expect(client.limits.size() >= 2 && client.limits[1] == client.limits[0] / 2 &&
+                 client.limits.back() <= 7,
+             "asking for half as many rows each time a page is refused");
+    c.Expect(client.requests <= 40 / 4 + 4 + 4,
+             "and for more again only now and then: " + std::to_string(client.requests));
   }
 
   // One rom too wide to come back even alone: left out and said so, the rest read.
@@ -971,6 +974,21 @@ void TooLarge(checks::Checks& c) {
     c.ExpectEq(fetched.index.size(), large.size(), "every rom");
     c.Expect(client.requests <= 400 / 64 + 2 * 7,
              "and the pages after it are full again: " + std::to_string(client.requests));
+  }
+
+  // A refused page is not counted as a page, and is still counted: a server
+  // that refuses every one ends the fetch rather than the tick.
+  {
+    FakeClient client(library);
+    client.Ceiling(0);
+    rommsync::roms::FetchOptions options;
+    options.base_url = "http://romm.invalid";
+    const rommsync::roms::FetchResult fetched = rommsync::roms::FetchRomIndex(client, options);
+    c.Expect(fetched.index.truncated() && fetched.index.size() == 0,
+             "a server that refuses every page is an empty index that says so: " +
+                 fetched.message);
+    c.Expect(client.requests <= 256, "in a bounded number of requests: " +
+                                         std::to_string(client.requests));
   }
 
   // The browser's rom list.
