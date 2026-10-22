@@ -48,6 +48,24 @@ curl -XPOST "$PROXY_BASE_URL/__fault" \
 The proxy never synthesises a RomM response of its own — that is what keeps the
 fidelity while still making failure deterministic and repeatable in CI.
 
+### The other clients are their requests (#244)
+
+The same rule covers the clients a library is shared with. `interop.*`
+(`tests/test_interop.cpp`) runs the whole engine against three of them, each
+reduced to what it sends RomM rather than to a model of it: RetroArch's Cloud
+Sync (WebDAV under `/api/sync/retroarch/`, Basic auth as the fixture user), a
+Grout-like device (its own device row, negotiate, upload, download, confirm),
+and the web player as RomM 5.4's bundle syncs (a `client: "web"` device
+negotiating one rom with `restore_unlisted` and its core as the `emulators`
+filter). Each meets the Switch in five cells, one ctest each and named
+`interop.<client>.<cell>`: `from_switch`, `to_switch` (including "not while the
+rom is not on the card", #241), `conflict` (#240's archival copy), `delete`
+(both ways: a save gone from the card is no deletion signal; one deleted by the
+other client is removed with a backup, #233) and `states` (a PSX core's state
+and DuckStation's never meet, #238/#239, under the three ways `POST
+/api/states`' name-only key makes two states meet). The fixture has no SNES
+rom, so the web player plays FCEUmm rather than `snes9x`.
+
 ### One proxy, several clients
 
 A fault belongs to the client that armed it. Every request the suite makes

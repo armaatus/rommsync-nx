@@ -2582,3 +2582,37 @@ foreach(phase workflow fresh)
   add_test(NAME soak.${phase} COMMAND "${BASH_PROGRAM}" "${SOAK_TEST}" ${phase})
   set_tests_properties(soak.${phase} PROPERTIES TIMEOUT 60)
 endforeach()
+
+# --- M10-18 (#244): the interop matrix -----------------------------------------
+# The Switch's whole engine against the clients a RomM 5.4 library is shared
+# with -- RetroArch's Cloud Sync over WebDAV, a Grout-like negotiating device,
+# and the web player as its 5.4 bundle syncs -- one test per cell, named
+# `interop.<client>.<cell>` so the output says which meeting broke. Built from
+# the engine's sources like test_engine; serial with the rest of the rig tests,
+# because they share the fixture user's library.
+add_executable(test_interop test_interop.cpp
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/engine.cpp"
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/power.cpp")
+target_link_libraries(test_interop PRIVATE rommsync::host Threads::Threads)
+target_include_directories(test_interop PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/sysmodule/source")
+target_compile_definitions(test_interop PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+set(INTEROP_CELLS
+  from_switch  # the Switch's save is what the other client loads
+  to_switch    # theirs: not without the rom on the card, then placed, then updated over a backup
+  conflict     # both moved: theirs on the card, the Switch's backed up and archived, theirs kept
+  delete       # gone from the card deletes nothing; deleted by them is removed, backed up, not re-sent
+  states       # their core's PSX state and DuckStation's never meet, whichever came first
+)
+foreach(client retroarch grout web)
+  foreach(cell IN LISTS INTEROP_CELLS)
+    add_test(NAME interop.${client}.${cell} COMMAND test_interop ${client}.${cell})
+    if(NOT ROMMSYNC_REQUIRE_RIG)
+      set_tests_properties(interop.${client}.${cell} PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    set_tests_properties(interop.${client}.${cell} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+  endforeach()
+endforeach()
