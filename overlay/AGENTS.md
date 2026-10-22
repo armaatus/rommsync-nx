@@ -68,8 +68,11 @@ Ultrahand overlay list.
   `tests/hostswitch/switch.h`, which stubs **only** what the files that reach
   for it name — `source/ipc_client.cpp` and `source/screen_frame.cpp` (the
   rest name no libnx symbol, or only what those two headers already carry) —
-  plus the two things the seam itself has to model: a session whose sysmodule
-  exited, and a count of sessions open so `overlay.cycles` can balance them.
+  plus the three things the seam itself has to model: a session whose sysmodule
+  exited, a count of sessions open so `overlay.cycles` can balance them, and a
+  count of `smGetService` requests for a name nobody registered -- which
+  Atmosphere's sm parks forever, so `overlay.version` asserts there are none
+  (M9-27, #254).
   A sysmodule that does not answer needs nothing from the shim: it is a
   `hostswitch::Server::Handle` that blocks. A file that needs it to grow
   is either one that does not belong on this seam, or a sign the seam has moved.
@@ -129,9 +132,13 @@ Ultrahand overlay list.
   until the one that is out comes back. So a command that can take as long as
   the card does is a command that **starts** work and a state the screen polls
   -- `RestoreBackup` and `GetRestoreState` are the pattern -- never one a frame
-  waits for. The one unbounded wait is `IpcClient::Shutdown`, on the way out,
-  because a worker cannot be left inside `serviceDispatchOut` when nx-ovlloader
-  unloads the overlay; libtesla has released input and the panel by then.
+  waits for. The one unbounded wait on the sysmodule is `IpcClient::Shutdown`,
+  on the way out, because a worker cannot be left inside `serviceDispatchOut`
+  when nx-ovlloader unloads the overlay; libtesla has released input and the
+  panel by then. `IpcClient::Open` goes to `sm` instead, and is not bounded
+  either: it asks whether `rommsync` is registered before asking for it, so a
+  sysmodule that is off is never a request sm parks, and a stuck `sm` is a
+  stopped console (`ipc_client.hpp`, #254).
 - **Every exit path ends in one teardown, and it is `Lifecycle::Stop`**
   (`source/lifecycle.*`). `main.cpp`'s hooks only forward to it, the destructor
   runs it too, and `ctest -R overlay.cycles` greps both `main.cpp` and the

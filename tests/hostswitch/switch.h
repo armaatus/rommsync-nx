@@ -2,11 +2,13 @@
 // client half of the IPC wire compiles and runs on a host (M9-7, #198).
 //
 // **This is not a libnx emulator and must not grow into one.** Everything below
-// is here because `ipc_client.cpp` or `screen_frame.cpp` names it, with two
+// is here because `ipc_client.cpp` or `screen_frame.cpp` names it, with three
 // exceptions that are the seam's own and are marked as such: `Module_Kernel` /
 // `KernelError_SessionClosed`, which is how a sysmodule exiting under a live
-// session is modelled, and `hostswitch::OpenSessions`, which is how
-// `overlay.cycles` balances what an open/close cycle took (M9-6, #209).
+// session is modelled, `hostswitch::OpenSessions`, which is how
+// `overlay.cycles` balances what an open/close cycle took (M9-6, #209), and
+// `hostswitch::DeferredRequests`, which is how a request sm would park forever
+// is counted rather than hung (M9-27, #254).
 // Anything else that wants adding is either a file that does not belong on
 // this seam or a sign the seam has moved -- say so in
 // `overlay/AGENTS.md` rather than growing this header. `tesla.hpp` in particular

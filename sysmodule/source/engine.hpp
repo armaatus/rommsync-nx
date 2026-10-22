@@ -976,7 +976,11 @@ class SdEngine : public ipc::Engine, public power::Sink {
     }
   };
 
-  /// A link whose retries back off on `AwaitBackoff` and stop on `cancel`.
+  /// A `CallPolicy` whose retries back off on `AwaitBackoff` and stop on
+  /// `cancel`: the heartbeat's and every `install::` exchange's.
+  sync::CallPolicy PolicyFor(const http::CancelToken* cancel);
+
+  /// A link sent with `PolicyFor(cancel)`.
   InstallLink InstallLinkFor(http::HttpClient& client, const std::string& base_url,
                              const auth::StoredToken& token, const http::CancelToken* cancel);
 

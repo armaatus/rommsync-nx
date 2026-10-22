@@ -1598,15 +1598,19 @@ void SdEngine::RecordIfCurrentLocked(std::uint64_t generation, Write write) {
   }
 }
 
-SdEngine::InstallLink SdEngine::InstallLinkFor(http::HttpClient& client,
-                                               const std::string& base_url,
-                                               const auth::StoredToken& token,
-                                               const http::CancelToken* cancel) {
+sync::CallPolicy SdEngine::PolicyFor(const http::CancelToken* cancel) {
   sync::CallPolicy policy;
   policy.cancel = cancel;
   // A backoff a shutdown or a sleep cuts short, as a drain's is.
   policy.wait = [this](std::chrono::milliseconds delay) { AwaitBackoff(delay); };
-  return InstallLink{client, base_url, token, std::move(policy)};
+  return policy;
+}
+
+SdEngine::InstallLink SdEngine::InstallLinkFor(http::HttpClient& client,
+                                               const std::string& base_url,
+                                               const auth::StoredToken& token,
+                                               const http::CancelToken* cancel) {
+  return InstallLink{client, base_url, token, PolicyFor(cancel)};
 }
 
 void SdEngine::ServeInstalls(const InstallLink& link, const config::Config& config,
@@ -2164,12 +2168,8 @@ bool SdEngine::ReadServerForTick(TickInputs* inputs) {
     inputs->generation = server_generation_;
   }
   if (!read) {
-    sync::CallPolicy policy;
-    policy.cancel = inputs->cancel.get();
-    // A backoff a shutdown or a sleep cuts short, as a drain's is.
-    policy.wait = [this](std::chrono::milliseconds delay) { AwaitBackoff(delay); };
-    const server::Probe probe =
-        server::ReadServer(*inputs->client, inputs->config->server.url, policy, inputs->floor);
+    const server::Probe probe = server::ReadServer(*inputs->client, inputs->config->server.url,
+                                                   PolicyFor(inputs->cancel.get()), inputs->floor);
     if (!probe.ok()) {
       // The heartbeat is unauthenticated, so nothing here is evidence about
       // the credentials and `auth::Gate` hears nothing. A link that is down
