@@ -270,6 +270,47 @@ if [ -f .github/workflows/ci.yml ]; then
   ok "main's builds are never cancelled by the next merge"
 fi
 
+# A required check is matched by the name a job REPORTS, and a matrix job does
+# not report its `name:` when that name holds no matrix expression: GitHub
+# appends the matrix values, so `name: host-tests` over `matrix: romm: [5.4.0]`
+# reports `host-tests (5.4.0)`. Branch protection requires `host-tests`, which
+# then never reports, and every pull request waits on it forever (#235 shipped
+# exactly that). So: no workflow job pairs a literal name with a matrix, and the
+# job behind the required `host-tests` check reports that name and no other.
+for wf in .github/workflows/*.yml; do
+  [ -f "$wf" ] || continue
+  # Per job: its id, its `name:` (empty if none), and whether it has a matrix.
+  bad="$(awk '
+    function flush() {
+      if (id != "" && matrix && name != "" && name !~ /\$\{\{.*matrix\./)
+        print id " (name: " name ")"
+    }
+    /^jobs:/ { in_jobs = 1; next }
+    in_jobs && /^[^ #]/ { flush(); in_jobs = 0; id = "" }
+    !in_jobs { next }
+    /^  [^ #][^:]*:[[:space:]]*$/ { flush(); id = $1; sub(/:$/, "", id); name = ""; matrix = 0; next }
+    /^    name:/ { name = $0; sub(/^    name:[[:space:]]*/, "", name); next }
+    /^      matrix:/ { matrix = 1 }
+    END { flush() }' "$wf")"
+  [ -z "$bad" ] ||
+    fail "$wf: a matrix job with a fixed name reports as '<name> (<values>)', not its name, so a required check on it never reports: $bad"
+done
+if [ -f .github/workflows/ci.yml ]; then
+  host_tests="$(awk '/^  host-tests:/ { in_job = 1; next }
+       in_job && /^  [^ #]+:/ { in_job = 0 }
+       in_job { print }' .github/workflows/ci.yml)"
+  if [ -z "$host_tests" ]; then
+    fail "ci.yml has no host-tests job; branch protection requires a check of that name"
+  elif grep -qE '^      matrix:' <<<"$host_tests"; then
+    fail "ci.yml's host-tests job is a matrix, so it reports as 'host-tests (<values>)' and the required 'host-tests' check never arrives"
+  elif grep -qE '^    name:' <<<"$host_tests" &&
+       ! grep -qE '^    name:[[:space:]]*host-tests[[:space:]]*$' <<<"$host_tests"; then
+    fail "ci.yml's host-tests job reports under another name; branch protection requires 'host-tests'"
+  else
+    ok "the job behind the required host-tests check reports exactly that name"
+  fi
+fi
+
 
 echo "== orca.yaml"
 if [ ! -f orca.yaml ]; then
