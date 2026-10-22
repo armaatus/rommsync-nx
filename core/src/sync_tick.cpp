@@ -389,7 +389,8 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
       // A shutdown, or a game launched while the last plan ran (#242): the
       // chunks left are the next tick's, unasked.
       const bool canceled = Canceled(options.cancel);
-      if (canceled || (options.hold != nullptr && options.hold())) {
+      result.held = !canceled && options.hold != nullptr && options.hold();
+      if (canceled || result.held) {
         outcome = Worse(outcome, canceled ? TickOutcome::kCanceled : TickOutcome::kPartial);
         stop();
         break;

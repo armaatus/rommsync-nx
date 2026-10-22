@@ -2261,6 +2261,7 @@ void Held(rig::Checks& checks, http::HttpClient& client, const std::string& base
                   "the roms of the chunks held are unasked, for the next tick");
   checks.Expect(tick.outcome == sync::TickOutcome::kPartial,
                 std::string("and the tick is partial, not clean: ") + sync::ToString(tick.outcome));
+  checks.Expect(tick.held, "and says it was held, so the caller asks again once the game closes");
   checks.ExpectEq(recording.completed, 1, "the plan that ran closed its session");
   harness::DeleteDevice(client, base, fixture, device);
 }

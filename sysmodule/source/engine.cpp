@@ -2427,9 +2427,11 @@ bool SdEngine::RunOneTick() {
   // The states half's requests went out on the same token, so what they were
   // answered counts towards the one verdict, as the saves half's did.
   ObserveAnswer(sync::AnswerOf(states));
-  if (states_held) {
-    log::Info(log::Event::kSyncHeld,
-              "a game started during this sync; its save states wait until it closes");
+  if (tick.held || states_held) {
+    log::Info(log::Event::kSyncHeld, tick.held ? "a game started during this sync; the rest of "
+                                                 "its saves wait until it closes"
+                                               : "a game started during this sync; its save "
+                                                 "states wait until it closes");
   }
 
   // Everything the tick has to say, before the counters go under `mutex_`: a
@@ -2502,9 +2504,9 @@ bool SdEngine::RunOneTick() {
 
   std::lock_guard<std::mutex> lock(mutex_);
   scheduler_.Finished(tick);
-  if (states_held) {
-    // The states it skipped, once the game closes: the worker holds this tick
-    // until then, as it does any (#242).
+  if (tick.held || states_held) {
+    // The chunks or states it skipped, once the game closes: the worker holds
+    // this tick until then, as it does any (#242).
     scheduler_.RunSoon();
   }
   last_sync_at_ = static_cast<std::int64_t>(

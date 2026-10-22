@@ -440,8 +440,13 @@ struct TickResult {
   std::vector<std::int64_t> oversized_roms;
 
   /// Every rom of the scope no plan covered this tick: the oversized ones, and
-  /// those of chunks a failure stopped the tick before. Ascending.
+  /// those of chunks a failure or a hold stopped the tick before. Ascending.
   std::vector<std::int64_t> unasked_roms;
+
+  /// `TickOptions::hold` stopped the chunks after a plan (#242): the rest wait
+  /// for the game to close, which is the caller's to ask for soon rather than
+  /// an interval later.
+  bool held = false;
 
   TickOutcome outcome = TickOutcome::kCompleted;
 

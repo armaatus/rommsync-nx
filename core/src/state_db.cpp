@@ -476,8 +476,8 @@ class Parser {
     if (dropped_ > 0) {
       loaded.diagnostics.push_back(
           "state.db was written by rc1, past the " + std::to_string(kMaxRecords) +
-          " rows this build reads; its states and archival rows were kept first, and " +
-          std::to_string(dropped_) + " row(s) were let go -- those saves are hashed again");
+          " rows this build reads; " + std::to_string(dropped_) +
+          " row(s) were let go, slotted saves before states -- those are hashed again");
     }
     loaded.value = std::move(baseline_);
     loaded.legacy_saves = std::move(legacy_);
