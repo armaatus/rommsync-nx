@@ -62,6 +62,8 @@
 //                runs, and one tick runs once it closes
 //   remote_install -- M10-19: a rom queued in RomM's web UI is claimed on a tick,
 //                downloaded, and reported done
+//   states_guard -- the states half does not run under a game, nor after a saves
+//                half refused or offline, and its own 401 counts towards the gate
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -74,6 +76,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -4848,6 +4851,289 @@ int RemoteInstall(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// The real client with a hook in front of it, which may answer a request
+/// itself, and a record of every request that went past.
+///
+/// For the answers a healthy RomM will not give on demand, aimed at exactly one
+/// endpoint: a 401 on the negotiate alone, a link that is down for one call, a
+/// claim refused once. The fault proxy matches a path too, but counts its uses
+/// across every client of the rig; this belongs to the one console it wraps.
+class Intercepting final : public http::HttpClient {
+ public:
+  using Hook = std::function<std::optional<http::Result>(const http::Request&)>;
+
+  explicit Intercepting(http::HttpClient& inner) : inner_(inner) {}
+
+  void Use(Hook hook) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    hook_ = std::move(hook);
+  }
+
+  http::Result Send(const http::Request& request) override {
+    if (std::optional<http::Result> answered = Note(request)) {
+      return *answered;
+    }
+    return inner_.Send(request);
+  }
+
+  http::Result Download(const http::Request& request,
+                        const http::DownloadTarget& target) override {
+    if (std::optional<http::Result> answered = Note(request)) {
+      return *answered;
+    }
+    return inner_.Download(request, target);
+  }
+
+  /// The URLs asked so far with `method`, containing `fragment`, in order.
+  std::vector<std::string> Asked(http::Method method, std::string_view fragment) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<std::string> out;
+    for (const auto& [asked_with, url] : seen_) {
+      if (asked_with == method && url.find(fragment) != std::string::npos) {
+        out.push_back(url);
+      }
+    }
+    return out;
+  }
+
+  std::size_t Count(http::Method method, std::string_view fragment) const {
+    return Asked(method, fragment).size();
+  }
+
+ private:
+  std::optional<http::Result> Note(const http::Request& request) {
+    Hook hook;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      seen_.emplace_back(request.method, request.url);
+      hook = hook_;
+    }
+    return hook ? hook(request) : std::nullopt;
+  }
+
+  http::HttpClient& inner_;
+  mutable std::mutex mutex_;
+  Hook hook_;
+  std::vector<std::pair<http::Method, std::string>> seen_;
+};
+
+/// A status from "the server", with a body that is none of RomM's shapes.
+http::Result Answered(int status) {
+  http::Result result;
+  result.response.status = status;
+  result.response.body = "{\"detail\":\"answered by the test\"}";
+  return result;
+}
+
+/// No response at all.
+http::Result Unreachable() {
+  http::Result result;
+  result.error = http::Error::kConnectFailed;
+  result.message = "the test took the link down for this request";
+  return result;
+}
+
+bool Asks(const http::Request& request, http::Method method, std::string_view fragment) {
+  return request.method == method && request.url.find(fragment) != std::string::npos;
+}
+
+/// Press Sync now and wait for that tick to end, however it ends.
+bool TickEnds(Console& console, const TickLines& ticks, rig::Checks& c, const std::string& what) {
+  const int before = ticks.ticks();
+  if (console.SyncNow() != ipc::SyncOutcome::kAccepted) {
+    c.Expect(false, what + ": Sync now starts a tick");
+    return false;
+  }
+  const std::chrono::steady_clock::time_point deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{120};
+  while ((ticks.ticks() <= before || console.Status().sync_in_progress) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  const bool ended = ticks.ticks() > before && !console.Status().sync_in_progress;
+  c.Expect(ended, what + ": the tick ended" + Rendered(console.Log()));
+  return ended;
+}
+
+/// The states half of a tick, held to what the saves half found (review of
+/// #242, #235, #36): it does not run under a game that started during the saves
+/// half, nor after a saves half the server refused or never answered -- and a
+/// 401 it meets itself counts towards `auth::Gate`'s verdict like any other.
+///
+/// Each case is its own console and its own device: the gate remembers.
+int StatesGuarded(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom),
+           "the fixture library has nova.nes");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  ClearSlots(client, base, fixture, rom.id);
+
+  // States on, and a rom on the card, so the saves half has a negotiate to
+  // make (#241 scopes it to the roms the card holds).
+  const auto set_up = [&](Console& console, const std::string& device_id) {
+    auth::StoredToken token;
+    token.server_url = base;
+    token.access_token = fixture.token;
+    token.device_id = device_id;
+    token.scopes = {"roms.read"};
+    const bool ok = console.sandbox.Write("/config/rommsync/config.ini",
+                                          "[server]\nurl = " + base +
+                                              "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                              "on_boot = false\nstates = true\n") &&
+                    auth::SaveToken(console.directory + auth::kTokenFileName, token).ok() &&
+                    console.sandbox.Write("/tico/roms/nes/nova.nes", "nova's rom\n");
+    c.Expect(ok, console.directory + ": configured, paired, and holding nova");
+    return ok;
+  };
+
+  // **A game launched while the saves half runs.** The worker asked before the
+  // tick and the tick asked again after the library; the game starts as the
+  // saves are negotiated. The states half is a second round of transfers, and
+  // it asks again before it starts.
+  {
+    const std::string device_id =
+        harness::CreateDevice(c, client, base, fixture, "engine-states-held");
+    rlog::Reset();
+    const TickLines ticks;
+    Console console(c, "engine-states-held");
+    const std::unique_ptr<fs::FileSystem> card = Card(console);
+    if (device_id.empty() || !set_up(console, device_id)) {
+      return c.failures();
+    }
+    Intercepting wire(client);
+    std::atomic<bool> running{false};
+    std::atomic<bool> armed{true};
+    wire.Use([&](const http::Request& request) -> std::optional<http::Result> {
+      if (Asks(request, http::Method::kPost, "/api/sync/negotiate") && armed.exchange(false)) {
+        running = true;
+      }
+      return std::nullopt;
+    });
+    console.Boot();
+    console.engine.UseForegroundProbe([&running] { return running.load(); },
+                                      std::chrono::milliseconds{50});
+    console.engine.UseServer(&wire, std::string());
+    console.engine.UseCard(card.get());
+    console.engine.StartWorker();
+
+    TickEnds(console, ticks, c, "held: the tick the game starts under");
+    c.Expect(running.load(), "held: the game started as the saves were negotiated");
+    c.ExpectEq(wire.Count(http::Method::kGet, "/api/states"), std::size_t{0},
+               "held: the states half did not run under it -- no state listed, none sent "
+               "or placed" + Rendered(console.Log()));
+    c.Expect(Logged(console.Log(), "sync.held"),
+             "held: and the log says why" + Rendered(console.Log()));
+    std::this_thread::sleep_for(std::chrono::milliseconds{500});
+    c.ExpectEq(ticks.ticks(), 1, "held: nothing more runs while the game is up");
+
+    running = false;
+    const std::chrono::steady_clock::time_point by =
+        std::chrono::steady_clock::now() + std::chrono::seconds{60};
+    while ((ticks.ticks() < 2 || console.Status().sync_in_progress) &&
+           std::chrono::steady_clock::now() < by) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    }
+    c.Expect(wire.Count(http::Method::kGet, "/api/states") > 0,
+             "held: once it closes, a tick runs by itself and syncs the states" +
+                 Rendered(console.Log()));
+    harness::DeleteDevice(client, base, fixture, device_id);
+  }
+
+  // **A saves half the server refused, or never answered.** States have no
+  // negotiate of their own: a 401 there is the same token, and a link that is
+  // down is down for `/api/states` too.
+  {
+    const std::string device_id =
+        harness::CreateDevice(c, client, base, fixture, "engine-states-refused");
+    rlog::Reset();
+    const TickLines ticks;
+    Console console(c, "engine-states-refused");
+    const std::unique_ptr<fs::FileSystem> card = Card(console);
+    if (device_id.empty() || !set_up(console, device_id)) {
+      return c.failures();
+    }
+    Intercepting wire(client);
+    std::atomic<int> negotiate{401};
+    wire.Use([&](const http::Request& request) -> std::optional<http::Result> {
+      if (!Asks(request, http::Method::kPost, "/api/sync/negotiate")) {
+        return std::nullopt;
+      }
+      return negotiate.load() == 0 ? Unreachable() : Answered(negotiate.load());
+    });
+    console.Boot();
+    console.engine.UseServer(&wire, std::string());
+    console.engine.UseCard(card.get());
+    console.engine.StartWorker();
+
+    TickEnds(console, ticks, c, "refused: a negotiate answered 401");
+    c.ExpectEq(wire.Count(http::Method::kGet, "/api/states"), std::size_t{0},
+               "refused: the states half is not asked with a token the server just refused" +
+                   Rendered(console.Log()));
+    negotiate = 0;
+    TickEnds(console, ticks, c, "offline: a negotiate that never answered");
+    c.ExpectEq(wire.Count(http::Method::kGet, "/api/states"), std::size_t{0},
+               "offline: nor after a negotiate the link never carried" +
+                   Rendered(console.Log()));
+    harness::DeleteDevice(client, base, fixture, device_id);
+  }
+
+  // **A 401 the states half meets itself.** The token is revoked between the
+  // saves and the states: the listing is the first request to hear it, and it
+  // is a rejection like the library's. Three in a row is the gate's budget
+  // (`auth::GateConfig`), so the console stops on the third tick's -- not on a
+  // fourth, as it would if the states half's were not heard.
+  {
+    const std::string device_id =
+        harness::CreateDevice(c, client, base, fixture, "engine-states-revoked");
+    rlog::Reset();
+    const TickLines ticks;
+    Console console(c, "engine-states-revoked");
+    const std::unique_ptr<fs::FileSystem> card = Card(console);
+    if (device_id.empty() || !set_up(console, device_id)) {
+      return c.failures();
+    }
+    Intercepting wire(client);
+    std::atomic<bool> revoked{false};
+    wire.Use([&](const http::Request& request) -> std::optional<http::Result> {
+      if (Asks(request, http::Method::kGet, "/api/states")) {
+        revoked = true;
+      }
+      // The heartbeat is unauthenticated, and tells the gate nothing.
+      if (revoked.load() && request.url.find("/api/heartbeat") == std::string::npos) {
+        return Answered(401);
+      }
+      return std::nullopt;
+    });
+    console.Boot();
+    console.engine.UseServer(&wire, std::string());
+    console.engine.UseCard(card.get());
+    console.engine.StartWorker();
+
+    TickEnds(console, ticks, c, "revoked: the tick whose states are refused");
+    c.Expect(revoked.load(), "revoked: the states half asked, and was refused");
+    c.Expect(console.Status().auth != ipc::AuthState::kUnauthenticated,
+             "revoked: one rejection is not a verdict");
+    TickEnds(console, ticks, c, "revoked: the second rejected tick");
+    TickEnds(console, ticks, c, "revoked: the third");
+    c.Expect(console.Status().auth == ipc::AuthState::kUnauthenticated,
+             "revoked: the third rejection in a row is the verdict -- the states half's "
+             "counted as the first" + Rendered(console.Log()));
+    c.Expect(console.sandbox.Exists("/config/rommsync/auth.json"),
+             "revoked: and it is on the card");
+    harness::DeleteDevice(client, base, fixture, device_id);
+  }
+  ClearSlots(client, base, fixture, rom.id);
+  return c.failures();
+}
+
 /// The scenarios that need the docker RomM, by name. A table rather than a
 /// second `if` chain, so the list of them is written down once.
 struct RigScenario {
@@ -4880,6 +5166,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"upgrade", Upgrade},
       {"placement", Placement},
       {"remote_install", RemoteInstall},
+      {"states_guard", StatesGuarded},
   };
   for (const RigScenario& scenario : kRigScenarios) {
     if (name == scenario.name) {

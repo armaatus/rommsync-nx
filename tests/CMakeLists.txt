@@ -2361,6 +2361,7 @@ set(ENGINE_RIG_SCENARIOS
   placement    # #237: a first-time restore lands in Tico's folder under the rom's name, and stays one save
   download_restores  # #241: a downloaded rom's save is placed before the next scheduled tick
   remote_install     # #245: a rom queued in RomM's web UI is claimed, downloaded and reported done
+  states_guard       # review: no states half under a game or after a refused saves half; its 401 counts
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
