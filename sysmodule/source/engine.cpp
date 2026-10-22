@@ -2031,8 +2031,8 @@ bool SdEngine::RunOneTick() {
   // -- and the GETs above wrote nothing. The tick goes back to the scheduler
   // as if the game had been running when the worker asked.
   //
-  // Once, not before every placement: a game launched mid-execute is a window
-  // of one transfer, where this one was the length of the library.
+  // Not the last time: a 409's resolution asks again (`hold_resolution`), and
+  // so does the states half before it starts.
   if (application_running()) {
     return false;
   }
@@ -2347,10 +2347,19 @@ bool SdEngine::RunOneTick() {
   sync::StateSyncReport states;
   // Not when RomM says sync is off for this console either: states have no
   // negotiate of their own to refuse them, and the user who turned the switch
-  // off did not mean "saves only" (#235).
-  if (config->sync.states && tick.outcome != sync::TickOutcome::kCanceled &&
-      tick.outcome != sync::TickOutcome::kDisabled &&
-      tick.outcome != sync::TickOutcome::kServerDisabled) {
+  // off did not mean "saves only" (#235). Nor after a 401 or a link that
+  // carried nothing: the same token and the same link, asked again.
+  const bool states_due = config->sync.states && tick.outcome != sync::TickOutcome::kCanceled &&
+                          tick.outcome != sync::TickOutcome::kDisabled &&
+                          tick.outcome != sync::TickOutcome::kServerDisabled &&
+                          tick.outcome != sync::TickOutcome::kUnauthorized &&
+                          tick.outcome != sync::TickOutcome::kOffline;
+  // **Asked again before the states half** (#242): the saves half is transfers,
+  // and a game launched during them has read the states this half would place.
+  // Skipped rather than handed back, because the saves half ran and is
+  // recorded below; the tick asked for after it is held until the game closes.
+  const bool states_held = states_due && application_running();
+  if (states_due && !states_held) {
     // The baseline is re-read rather than carried: `sync::RunTick` persisted its
     // own copy on the way out, and `SyncStates` advances the same file. Reading
     // it back is one small file and is what keeps the two halves from writing
@@ -2371,6 +2380,12 @@ bool SdEngine::RunOneTick() {
     conflicts::RecordStates(&history_, states, record);
   }
   writing.unlock();
+  // After the unlock: a verdict this completes is written to the card.
+  ObserveAnswer(sync::AnswerOf(states));
+  if (states_held) {
+    log::Info(log::Event::kSyncHeld,
+              "a game started during this sync; its save states wait until it closes");
+  }
 
   // Everything the tick has to say, before the counters go under `mutex_`: a
   // sink writes to the SD card, and holding the lock the frame-polled `GetStatus`
@@ -2442,6 +2457,11 @@ bool SdEngine::RunOneTick() {
 
   std::lock_guard<std::mutex> lock(mutex_);
   scheduler_.Finished(tick);
+  if (states_held) {
+    // The states it skipped, once the game closes: the worker holds this tick
+    // until then, as it does any (#242).
+    scheduler_.RunSoon();
+  }
   last_sync_at_ = static_cast<std::int64_t>(
       std::chrono::duration_cast<std::chrono::seconds>(
           scheduler_.last_tick_at().time_since_epoch())
@@ -2461,8 +2481,9 @@ bool SdEngine::RunOneTick() {
             static_cast<std::int64_t>(states.failed);
   switch (tick.outcome) {
     case sync::TickOutcome::kCompleted:
-      last_sync_result_ = states.failed > 0 || scan_cut ? ipc::SyncResult::kPartial
-                                                        : ipc::SyncResult::kOk;
+      last_sync_result_ = states.failed > 0 || scan_cut || states_held
+                              ? ipc::SyncResult::kPartial
+                              : ipc::SyncResult::kOk;
       break;
     case sync::TickOutcome::kPartial:
     case sync::TickOutcome::kUnreported:

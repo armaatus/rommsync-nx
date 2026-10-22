@@ -201,6 +201,22 @@ auth::Answer AnswerOf(StateError error) {
   return auth::Answer::kSilent;
 }
 
+auth::Answer AnswerOf(const StateSyncReport& report) {
+  if (!report.ran) {
+    return auth::Answer::kSilent;
+  }
+  // Nothing past the listing, so the listing answered: a 2xx with this token.
+  auth::Answer answer =
+      report.operations.empty() ? auth::Answer::kAccepted : auth::Answer::kSilent;
+  for (const StateOperationResult& operation : report.operations) {
+    const auth::Answer said = AnswerOf(operation.error);
+    if (said != auth::Answer::kSilent) {
+      answer = said;
+    }
+  }
+  return answer;
+}
+
 namespace {
 
 /// One `StateSchema` object, read strictly. Shared by the list and the single

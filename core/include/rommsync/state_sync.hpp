@@ -383,4 +383,13 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
                            const roms::RomIndex& index, state::Baseline* baseline,
                            const StateSyncOptions& options = {});
 
+/// What one states run says about the credentials, for `auth::Gate`: the last
+/// operation that spoke, as `AnswerOf(StateError)` reads it -- a listing the
+/// server refused is an operation too -- or `kAccepted` for a run whose listing
+/// answered and left nothing to do. `kSilent` when it did not run.
+///
+/// The caller's to feed, as `TickResult::answer` is: a states run is requests
+/// on the same token as the saves half, and a 401 it met is the same verdict.
+auth::Answer AnswerOf(const StateSyncReport& report);
+
 }  // namespace rommsync::sync

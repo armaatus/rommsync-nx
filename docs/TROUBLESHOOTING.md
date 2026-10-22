@@ -668,7 +668,12 @@ the same application its emulators run in.
 
 **What happens next.** One sync runs within a few seconds of the game closing,
 however many fell due while it was open, and ends with the usual `sync.tick`
-line. A "Sync now" pressed during the game is that same sync. Downloads from
+line. A "Sync now" pressed during the game is that same sync. A game started
+while a sync was already moving saves leaves that sync to finish its saves,
+and its save states wait instead —
+`sync.held a game started during this sync; its save states wait until it closes`,
+and the status screen says *partial* — for the sync that runs once the game
+closes. Downloads from
 the queue are not held — a rom is not a save — so a rom queued from the overlay
 mid-game still comes down.
 
