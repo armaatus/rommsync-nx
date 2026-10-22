@@ -254,6 +254,32 @@ void List(checks::Checks& c) {
   c.Expect(!wrong_type.ok(), "a platform that is not a string is refused");
   c.ExpectEq(wrong_type.error.field, std::string("platform"), "...and it is named");
 
+  // The console's own search, one row held (#248): the same answers as
+  // `FindByIdentifier` over the parsed list.
+  {
+    const auth::Parsed<auth::DeviceSearch> found =
+        auth::FindInDeviceList("[" + body + "," + other + "]", "probe-contract-script");
+    c.Expect(found.ok() && found.value.matches == 1 && found.value.device.has_value() &&
+                 found.value.device->id == two.value[0].id,
+             "the search finds the console's own device: " + found.error.Describe());
+    const auth::Parsed<auth::DeviceSearch> none =
+        auth::FindInDeviceList("[" + body + "," + other + "]", "nx-0123456789abcdef");
+    c.Expect(none.ok() && none.value.matches == 0 && !none.value.device.has_value(),
+             "an identifier no device carries finds nothing");
+    c.Expect(auth::FindInDeviceList("[" + body + "]", "").value.matches == 0,
+             "an empty identifier matches no device");
+    const auth::Parsed<auth::DeviceSearch> both = auth::FindInDeviceList(
+        "[" + body + "," + WithField(c, body, "id", "\"33333333-3333-3333-3333-333333333333\"") +
+            "]",
+        "probe-contract-script");
+    c.Expect(both.ok() && both.value.matches == 2, "two rows for one console are counted");
+    c.Expect(!auth::FindInDeviceList("[" + body + "," +
+                                         WithField(c, body, "sync_enabled", "\"yes\"") + "]",
+                                     "probe-contract-script")
+                  .ok(),
+             "and a row that will not parse still fails the list");
+  }
+
   c.Expect(!auth::ParseDeviceList(body).ok(), "one device is not a device list");
   const auth::Parsed<std::vector<auth::DeviceRecord>> broken =
       auth::ParseDeviceList("[" + body + "," + WithField(c, body, "sync_enabled", "\"yes\"") + "]");

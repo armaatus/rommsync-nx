@@ -220,6 +220,33 @@ Parsed<std::vector<DeviceRecord>> ParseDeviceList(std::string_view body) {
   return parsed;
 }
 
+Parsed<DeviceSearch> FindInDeviceList(std::string_view body, std::string_view identifier) {
+  Parsed<DeviceSearch> parsed;
+  DeviceSearch search;
+  const json::ParseResult document = json::ParseEach(
+      body, "",
+      [&search, identifier](const json::Value& element, std::size_t) {
+        // Every row read, for `ParseDeviceList`'s reason; one kept.
+        Parsed<DeviceRecord> device = ReadDevice(element);
+        if (!device.ok()) {
+          return device.error;
+        }
+        if (!identifier.empty() && device.value.client_device_identifier == identifier) {
+          if (++search.matches == 1) {
+            search.device = std::move(device.value);
+          }
+        }
+        return json::Error{};
+      },
+      "device list");
+  if (!document.ok()) {
+    parsed.error = document.error;
+    return parsed;
+  }
+  parsed.value = std::move(search);
+  return parsed;
+}
+
 const DeviceRecord* FindByIdentifier(const std::vector<DeviceRecord>& devices,
                                      std::string_view identifier) {
   if (identifier.empty()) {
@@ -399,30 +426,22 @@ Registration FindRegistration(http::HttpClient& client, const StoredToken& token
     return *refused;
   }
 
-  Parsed<std::vector<DeviceRecord>> parsed = ParseDeviceList(result.response.body);
+  // One row kept, however many devices the user has (#248).
+  Parsed<DeviceSearch> parsed = FindInDeviceList(result.response.body, client_device_identifier);
   if (!parsed.ok()) {
     return Fail(RegistrationError::kMalformed, "device list: " + parsed.error.Describe());
   }
-
-  const DeviceRecord* found = FindByIdentifier(parsed.value, client_device_identifier);
-  if (found != nullptr) {
-    return Accept(*found);
+  if (parsed.value.matches == 1) {
+    return Accept(std::move(*parsed.value.device));
   }
 
-  // `FindByIdentifier` answers nullptr to two very different situations, and
-  // they get different errors because they have different remedies: nothing
-  // carries the identifier (pair again), or several rows do (a state RomM
-  // allows, which only the user can tidy up -- pairing again would just find
-  // the same two).
-  std::size_t matches = 0;
-  for (const DeviceRecord& device : parsed.value) {
-    if (device.client_device_identifier == client_device_identifier) {
-      ++matches;
-    }
-  }
-  if (matches > 1) {
+  // Two very different situations short of one match, and they get different
+  // errors because they have different remedies: nothing carries the identifier
+  // (pair again), or several rows do (a state RomM allows, which only the user
+  // can tidy up -- pairing again would just find the same two).
+  if (parsed.value.matches > 1) {
     return Fail(RegistrationError::kAmbiguous,
-                "this server has " + std::to_string(matches) +
+                "this server has " + std::to_string(parsed.value.matches) +
                     " devices for this console; remove the extra ones in RomM");
   }
   return Fail(RegistrationError::kNoSuchDevice,

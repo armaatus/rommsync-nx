@@ -677,6 +677,24 @@ void ResponseParse(checks::Checks& c) {
   check("auth::ParseDeviceList", ArrayOf(1, DeviceRow), ArrayOf(kRows, DeviceRow),
         [](const std::string& body) { return auth::ParseDeviceList(body).ok(); });
 
+  // The console's own search holds the one row it finds, however many devices
+  // the list has (#248).
+  {
+    const auto find = [](const std::string& body) {
+      return auth::FindInDeviceList(body, "device-0").value.matches == 1;
+    };
+    const std::string one = ArrayOf(1, DeviceRow);
+    const std::string many = ArrayOf(kRows, DeviceRow);
+    c.Expect(find(one) && find(many), "auth::FindInDeviceList finds the row");
+    const std::int64_t at_one = PeakOf(one, find);
+    const std::int64_t at_many = PeakOf(many, find);
+    std::cout << "auth::FindInDeviceList: " << at_one << " bytes at 1 row, " << at_many << " at "
+              << kRows << "\n";
+    c.Expect(at_many - at_one < 1024,
+             "auth::FindInDeviceList holds one device, not the list: " +
+                 std::to_string(at_many - at_one));
+  }
+
   const auto queue = [](std::size_t rows) {
     std::vector<rommsync::download::QueueEntry> entries;
     for (std::size_t at = 0; at < rows; ++at) {
