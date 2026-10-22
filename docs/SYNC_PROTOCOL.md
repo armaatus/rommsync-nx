@@ -1,7 +1,7 @@
 # Save sync protocol (client side)
 
 How `sys-rommsync` implements RomM's negotiate → execute → complete loop (5.4.0
-or later; where 5.4.0 changed it, [API_CONTRACT.md](API_CONTRACT.md#520--540)
+or later; where 5.4.0 changed it, [API_CONTRACT.md](API_CONTRACT.md#since-520)
 says so).
 Endpoints and schemas: [API_CONTRACT.md](API_CONTRACT.md). The payload and
 response shapes below are the ones captured from a live 5.2.0 under

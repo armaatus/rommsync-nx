@@ -1115,8 +1115,10 @@ The **server contract** is testable off-console: `server/probe_contract.py`
 exercises auth + negotiate + saves against a RomM and prints the real response
 shapes — run it against the docker fixture (never production) to confirm any
 schema before implementing. Its `--capture` output is committed under
-`server/contract/captures/`, which is what [API_CONTRACT.md](API_CONTRACT.md),
-[AUTH.md](AUTH.md) and [SYNC_PROTOCOL.md](SYNC_PROTOCOL.md) quote; `ctest -R
+`server/contract/captures/5.4.0/` (5.2.0's, kept as history, at the top of
+`server/contract/captures/`), which is what [API_CONTRACT.md](API_CONTRACT.md)
+quotes ([AUTH.md](AUTH.md) and [SYNC_PROTOCOL.md](SYNC_PROTOCOL.md) still quote
+5.2.0's, #266); `ctest -R
 contract` re-captures and fails on drift, so those pages cannot quietly go
 stale.
 

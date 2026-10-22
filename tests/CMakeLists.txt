@@ -1706,6 +1706,15 @@ endif()
 # test reading the same library.
 set_tests_properties(contract.captures PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 
+# The other half: docs/API_CONTRACT.md against the floor it claims to describe.
+# contract.captures compares captures with a server and cannot see a page that
+# quotes another version's (#260). Reads three paths, so it never skips.
+add_test(NAME contract.page
+         COMMAND ${Python3_EXECUTABLE}
+                 "${CMAKE_CURRENT_SOURCE_DIR}/test_contract_page.py"
+                 --repo "${CMAKE_SOURCE_DIR}")
+set_tests_properties(contract.page PROPERTIES TIMEOUT 60)
+
 # --- the agent configuration itself ------------------------------------------
 # CLAUDE.md, REVIEW.md, the skills, the subagents and the hooks steer three
 # parallel worktrees, and every way they break is silent: a skill whose

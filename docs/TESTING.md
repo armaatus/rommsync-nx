@@ -1084,10 +1084,10 @@ any workflow job that pairs a fixed name with one.
 `contract.captures` re-runs `probe_contract.py --auth --negotiate
 --sync-scenarios` against the fixture and compares the result with the committed
 captures for the fixture's RomM — `server/contract/captures/5.4.0/` for 5.4.0,
-and `server/contract/captures/` for 5.2.0, kept as history — the responses [API_CONTRACT.md](API_CONTRACT.md),
-[AUTH.md](AUTH.md) and [SYNC_PROTOCOL.md](SYNC_PROTOCOL.md) quote and that M1/M2
-are coded against. It compares field names, nesting and JSON types, plus the
-`action`/`reason` pairs each scenario is named for; ids, timestamps and the
+the responses [API_CONTRACT.md](API_CONTRACT.md) quotes and the client is coded
+against, and `server/contract/captures/` for 5.2.0, kept as the record of a
+version the client refuses. It compares field names, nesting and JSON types,
+plus the `action`/`reason` pairs each scenario is named for; ids, timestamps and the
 per-run slot names differ every run and are ignored.
 
 The scenarios upload throwaway saves — an empty-save negotiate returns an empty
