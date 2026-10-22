@@ -176,6 +176,7 @@ Negotiation NegotiateScope(http::HttpClient& client, const auth::StoredToken& to
     } else {
       SyncPlan& plan = merged.plan;
       for (SyncOperation& operation : one.plan.operations) {
+        operation.session_id = session;
         plan.operations.push_back(std::move(operation));
       }
       plan.total_upload += one.plan.total_upload;

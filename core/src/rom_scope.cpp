@@ -2,6 +2,7 @@
 #include "rommsync/rom_scope.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <string_view>
 #include <utility>

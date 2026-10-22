@@ -240,9 +240,10 @@ struct SyncNegotiatePayload {
 inline constexpr std::size_t kMaxNegotiateRomIds = 500;
 
 /// What `rom_ids` adds to one negotiate body at most: `,"rom_ids":[]` and 500
-/// ids of up to 19 digits, each with its comma. The term the heap table's
-/// negotiate row is written from (#217, #246): a scope is only ever held as this
-/// text, one chunk at a time.
+/// ids of up to 19 digits, each with its comma. For the negotiate row #246 adds
+/// to the heap table (#217): one body is built and sent at a time. The scope's
+/// ids are held besides, as integers -- at most `roms::kMaxIndexRoms` of them,
+/// 8 KiB, chunked or not.
 inline constexpr std::size_t kMaxRomScopeBytes = kMaxNegotiateRomIds * 20 + 16;
 
 /// A request body, or the reason there isn't one. `body` is empty on failure and
@@ -432,6 +433,12 @@ struct SyncOperation {
   /// place for the two spellings to disagree.
   std::optional<std::string> server_updated_at;
   std::optional<std::string> server_content_hash;
+
+  /// The negotiation that planned this operation, when it is not the plan's
+  /// own: `RunTick` merges a large card's chunks into one plan (#241), and an
+  /// upload is filed under the session it belongs to. `0` -- never parsed, so
+  /// every plan RomM sent -- means `SyncPlan::session_id`.
+  std::int64_t session_id = 0;
 };
 
 /// A whole `SyncNegotiateResponse`.

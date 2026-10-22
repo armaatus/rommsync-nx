@@ -25,8 +25,8 @@
 #include "rommsync/placement.hpp"
 #include "rommsync/play_sessions.hpp"
 #include "rommsync/retroarch_cfg.hpp"
-#include "rommsync/rom_scope.hpp"
 #include "rommsync/rom_index.hpp"
+#include "rommsync/rom_scope.hpp"
 #include "rommsync/save_scan.hpp"
 #include "rommsync/scheduler.hpp"
 #include "rommsync/state_db.hpp"
@@ -1951,14 +1951,45 @@ bool SdEngine::RunOneTick() {
   const sync::TickResult tick =
       sync::RunTick(*client, *files, token, reported, targets, loaded.value, options);
   ObserveAnswer(tick.answer);
-  if (tick.negotiated.ok() && !fresh.empty()) {
-    // Asked for. A rom downloaded while this tick ran is not in `fresh` and stays.
+  if (tick.negotiated.ok() && !tick.executed.canceled && !fresh.empty()) {
+    // Asked for, and done. A rom whose restore was cut off -- the link, the
+    // server, the card -- keeps its place, or the next tick would read its save
+    // as one the user deleted and never bring it; so does a rom downloaded while
+    // this tick ran, which is not in `fresh`. A refusal that asking again cannot
+    // change (a file already at the path, a format nothing here reads) lets go,
+    // so it is not re-asked with `restore_unlisted` on every tick.
+    const auto again = [](const sync::OperationResult& operation) {
+      if (operation.outcome == sync::OperationOutcome::kCanceled) {
+        return true;
+      }
+      if (operation.outcome != sync::OperationOutcome::kFailed) {
+        return false;
+      }
+      switch (operation.error) {
+        case sync::OperationError::kTransferFailed:
+        case sync::OperationError::kRefused:
+        case sync::OperationError::kUnauthorized:
+        case sync::OperationError::kForbidden:
+        case sync::OperationError::kBackupFailed:
+        case sync::OperationError::kCommitFailed:
+          return true;
+        default:
+          return false;
+      }
+    };
+    const auto done = [&fresh, &tick, &again](std::int64_t rom_id) {
+      if (std::find(fresh.begin(), fresh.end(), rom_id) == fresh.end()) {
+        return false;
+      }
+      for (const sync::OperationResult& operation : tick.executed.operations) {
+        if (operation.rom_id == rom_id && again(operation)) {
+          return false;
+        }
+      }
+      return true;
+    };
     std::lock_guard<std::mutex> lock(mutex_);
-    fresh_roms_.erase(std::remove_if(fresh_roms_.begin(), fresh_roms_.end(),
-                                     [&fresh](std::int64_t rom_id) {
-                                       return std::find(fresh.begin(), fresh.end(), rom_id) !=
-                                              fresh.end();
-                                     }),
+    fresh_roms_.erase(std::remove_if(fresh_roms_.begin(), fresh_roms_.end(), done),
                       fresh_roms_.end());
   }
 
