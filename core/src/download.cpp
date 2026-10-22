@@ -801,8 +801,12 @@ const char* ToString(StoreError error) {
 
 namespace {
 
+/// How many pieces `AppendPiece` makes of `entries`: the opening, one an entry,
+/// and the closing.
+std::size_t PieceCount(const std::vector<QueueEntry>& entries) { return entries.size() + 2; }
+
 /// Piece `piece` of the file's text, appended to `out`: the opening, then one
-/// entry each, then the closing -- `entries.size() + 2` of them. The file is
+/// entry each, then the closing -- `PieceCount` of them. The file is
 /// written a piece at a time (`SaveQueue`), so what a write holds is the largest
 /// piece rather than the whole text beside the queue it came from (#247).
 void AppendPiece(const std::vector<QueueEntry>& entries, std::size_t piece, std::string* out) {
@@ -826,7 +830,7 @@ void AppendPiece(const std::vector<QueueEntry>& entries, std::size_t piece, std:
 
 std::string SerializeQueue(const std::vector<QueueEntry>& entries) {
   std::string out;
-  for (std::size_t piece = 0; piece < entries.size() + 2; ++piece) {
+  for (std::size_t piece = 0; piece < PieceCount(entries); ++piece) {
     AppendPiece(entries, piece, &out);
   }
   return out;
@@ -1042,7 +1046,7 @@ StoreResult SaveQueue(const std::string& path, const std::vector<QueueEntry>& en
   // whatever the worker holds (#247). Serialising twice is ~64 short strings.
   std::size_t size = 0;
   std::string piece;
-  for (std::size_t at = 0; at < entries.size() + 2; ++at) {
+  for (std::size_t at = 0; at < PieceCount(entries); ++at) {
     piece.clear();
     AppendPiece(entries, at, &piece);
     size += piece.size();
@@ -1059,7 +1063,7 @@ StoreResult SaveQueue(const std::string& path, const std::vector<QueueEntry>& en
   std::size_t next = 0;
   const io::WriteResult written =
       io::WriteAtomicallyEach(path, [&entries, &next](std::string* out) {
-        if (next == entries.size() + 2) {
+        if (next == PieceCount(entries)) {
           return false;
         }
         AppendPiece(entries, next++, out);

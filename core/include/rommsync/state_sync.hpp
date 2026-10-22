@@ -101,6 +101,11 @@ inline constexpr std::size_t kMaxStateListBytes = 128 * 1024;
 /// tracks no more states than that anyway. **The rest are not dropped**: a
 /// placed state is this console's from then on, claimed by the next run's scan
 /// rather than placed again, so the next run places the next ones.
+///
+/// **Placements come first.** A row that places nothing -- its path is taken,
+/// or nothing says where it goes -- is unclaimed again every run, so it is
+/// recorded only in what the placements left, and past that counted in one
+/// line; otherwise a listing that led with such rows would starve the rest.
 inline constexpr std::size_t kMaxStatePlacements = scan::kMaxStates;
 
 /// One row of `GET /api/states`, reduced to what arbitration uses.

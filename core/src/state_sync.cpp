@@ -324,6 +324,12 @@ bool ListServerStates(http::HttpClient& client, const auth::StoredToken& token,
   return true;
 }
 
+/// Whether `sd_path` already holds a file, which a placement may not write over.
+bool Taken(fs::FileSystem& files, const std::string& sd_path) {
+  const std::string resolved = files.Resolve(sd_path);
+  return !resolved.empty() && io::Exists(resolved);
+}
+
 /// The server's row for `(rom_id, file_name)`, or nullptr.
 const ServerState* FindServerState(const std::vector<ServerState>& states, std::int64_t rom_id,
                                    std::string_view file_name) {
@@ -966,15 +972,22 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
   // Whatever the server holds that no local file claimed. Placing one overwrites
   // nothing, so it is the one branch that needs no arbitration at all.
   //
-  // At most `kMaxStatePlacements` of them a run (#247), counted where a row
-  // becomes an operation: the silent filters below cost nothing to hold.
+  // **At most `kMaxStatePlacements` operations a run** (#247), and placements
+  // first. A row that places nothing -- nothing says where it goes, or its path
+  // is already taken -- comes back unclaimed every run, and a run that spent its
+  // budget on those before the rows behind them would never place those rows.
+  // So they are set aside, by index, and recorded in what the placements left;
+  // past that they are one line, not an operation each.
   std::size_t unclaimed_operations = 0;
+  std::vector<std::size_t> unplaceable;
+  bool more_to_place = false;
   for (std::size_t at = 0; at < server_states.size() && !stopped; ++at) {
     if (claimed[at]) {
       continue;
     }
     if (options.cancel != nullptr && options.cancel->canceled()) {
       report.canceled = true;
+      stopped = true;
       break;
     }
     const ServerState& server = server_states[at];
@@ -993,43 +1006,15 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
       ++report.filtered;
       continue;
     }
+    if (sd_path.empty() || Taken(files, sd_path)) {
+      unplaceable.push_back(at);
+      continue;
+    }
     if (unclaimed_operations == kMaxStatePlacements) {
-      report.warnings.push_back(
-          "the server holds more states for this console's roms than one sync places (" +
-          std::to_string(kMaxStatePlacements) + "); the rest wait for the next sync");
+      more_to_place = true;
       break;
     }
     ++unclaimed_operations;
-    if (sd_path.empty()) {
-      if (!record(Fail(server.rom_id, server.file_name, StateAction::kPlace,
-                       StateError::kNoPlacement,
-                       placement.reason.empty()
-                           ? "the server holds a state this console does not, and nothing said "
-                             "where a new one should go"
-                           : "the server holds a state this console does not, and none was "
-                             "placed: " + placement.reason))) {
-        break;
-      }
-      continue;
-    }
-    // **A placement may only create.** "No local file claimed this row" is not
-    // the same as "there is no file at that path": a state the scan *skipped* --
-    // ambiguous, or the loser of a duplicate name -- never claimed its row, and
-    // `place` is free to answer with the path it sits at. Writing there would be
-    // an overwrite on the strength of a row this console has no history for,
-    // which is exactly the case the policy keeps both copies for. The backup
-    // inside `Fetch` would keep it recoverable; that is not the promise.
-    const std::string resolved = files.Resolve(sd_path);
-    if (!resolved.empty() && io::Exists(resolved)) {
-      if (!record(KeepBoth(server.rom_id, server.file_name, sd_path,
-                           "the server holds a state this console has no history for, and " +
-                               sd_path +
-                               " is already taken; both copies are kept and neither was touched",
-                           &server))) {
-        break;
-      }
-      continue;
-    }
     // The emulator's folder for the system may not exist yet: a state the
     // console has never held is often for a system it has never run.
     if (const std::size_t parent = sd_path.rfind('/'); parent != std::string::npos && parent > 0) {
@@ -1038,7 +1023,7 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
         if (!record(Fail(server.rom_id, server.file_name, StateAction::kPlace,
                          StateError::kUnreadableCard,
                          "the folder for " + sd_path + " could not be made: " + made.message))) {
-          break;
+          stopped = true;
         }
         continue;
       }
@@ -1050,8 +1035,69 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
       AdvanceWritten(files, nullptr, server, sd_path, baseline, &report.warnings);
     }
     if (!record(std::move(result))) {
+      stopped = true;
+    }
+  }
+  if (more_to_place && !stopped) {
+    // True as written: what was placed is on the card now, so the next run's
+    // scan claims it rather than placing it again.
+    report.warnings.push_back(
+        "the server holds more states for this console's roms than one sync places (" +
+        std::to_string(kMaxStatePlacements) + "); the rest wait for the next sync");
+  }
+
+  std::size_t not_listed = 0;
+  for (const std::size_t at : unplaceable) {
+    if (stopped) {
       break;
     }
+    if (options.cancel != nullptr && options.cancel->canceled()) {
+      report.canceled = true;
+      break;
+    }
+    if (unclaimed_operations == kMaxStatePlacements) {
+      ++not_listed;
+      continue;
+    }
+    ++unclaimed_operations;
+    const ServerState& server = server_states[at];
+    // Asked again rather than kept from the pass above: a placement is a path
+    // and a sentence, and one per row set aside would be the listing's worth.
+    const place::Placement placement =
+        options.place != nullptr ? options.place(server) : place::Placement{};
+    const std::string& sd_path = placement.sd_path;
+    if (sd_path.empty()) {
+      if (!record(Fail(server.rom_id, server.file_name, StateAction::kPlace,
+                       StateError::kNoPlacement,
+                       placement.reason.empty()
+                           ? "the server holds a state this console does not, and nothing said "
+                             "where a new one should go"
+                           : "the server holds a state this console does not, and none was "
+                             "placed: " + placement.reason))) {
+        stopped = true;
+      }
+      continue;
+    }
+    // **A placement may only create.** "No local file claimed this row" is not
+    // the same as "there is no file at that path": a state the scan *skipped* --
+    // ambiguous, or the loser of a duplicate name -- never claimed its row, and
+    // `place` is free to answer with the path it sits at. Writing there would be
+    // an overwrite on the strength of a row this console has no history for,
+    // which is exactly the case the policy keeps both copies for. The backup
+    // inside `Fetch` would keep it recoverable; that is not the promise.
+    if (!record(KeepBoth(server.rom_id, server.file_name, sd_path,
+                         "the server holds a state this console has no history for, and " +
+                             sd_path +
+                             " is already taken; both copies are kept and neither was touched",
+                         &server))) {
+      stopped = true;
+    }
+  }
+  if (not_listed > 0) {
+    report.warnings.push_back(
+        std::to_string(not_listed) +
+        " more of the server's states for this console's roms could not be placed either -- "
+        "nothing said where they go, or their path is taken -- and are not listed one by one");
   }
 
   report.rows_dropped = TrimStates(report.operations, baseline, &report.warnings);

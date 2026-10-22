@@ -343,56 +343,55 @@ ipc::Error Service::FillFromQueueLocked(Entry& entry, ipc::ListPage* page) {
   std::int64_t served = 0;
   std::int64_t count = 0;
   queue_.Visit([&](const std::vector<download::QueueEntry>& rows) {
+    // The complaint about `queue.json` itself, as a row.
+    //
+    // #22 built `DownloadStatus::queue_message` as the home for it and kept a
+    // `[downloads]` section on `config_diagnostics()` standing anyway, because
+    // that was the only channel that reached a user until this list existed. This
+    // is the channel. It has to be a row because the projection is pinned whole
+    // (`ipc::list_keys`) and because a queue that was discarded has no rows of its
+    // own to hang the sentence on -- the screen would otherwise say "Nothing in
+    // the download queue" over a queue the card lost. `LibraryBrowserModel` draws
+    // it as an inert, unpressable row with the reason underneath, which is exactly
+    // what it is.
+    const bool complaint = !status.queue_message.empty();
+    count = static_cast<std::int64_t>(rows.size()) + (complaint ? 1 : 0);
 
-  // The complaint about `queue.json` itself, as a row.
-  //
-  // #22 built `DownloadStatus::queue_message` as the home for it and kept a
-  // `[downloads]` section on `config_diagnostics()` standing anyway, because
-  // that was the only channel that reached a user until this list existed. This
-  // is the channel. It has to be a row because the projection is pinned whole
-  // (`ipc::list_keys`) and because a queue that was discarded has no rows of its
-  // own to hang the sentence on -- the screen would otherwise say "Nothing in
-  // the download queue" over a queue the card lost. `LibraryBrowserModel` draws
-  // it as an inert, unpressable row with the reason underneath, which is exactly
-  // what it is.
-  const bool complaint = !status.queue_message.empty();
-  count = static_cast<std::int64_t>(rows.size()) + (complaint ? 1 : 0);
-
-  served =
-      FillPage(page, entry.offset, count, entry.request.page_size, [&](std::int64_t index) {
-        ipc::ListItem item;
-        if (complaint && index == 0) {
-          PutInteger(&item, keys::kQueueRomId, 0);
-          // Named after the file rather than left blank: the model falls back to
-          // "Rom 0" for a row with no `fs_name`, and this row is about the file.
-          PutText(&item, keys::kQueueFsName, download::kQueueFileName);
-          PutText(&item, keys::kQueuePlatformFsSlug, "");
-          PutText(&item, keys::kQueueState, download::ToString(download::QueueState::kFailed));
-          PutInteger(&item, keys::kQueueBytesDone, 0);
-          PutInteger(&item, keys::kQueueSizeBytes, 0);
-          PutInteger(&item, keys::kQueueBytesPerSecond, 0);
-          PutInteger(&item, keys::kQueueAttempts, 0);
-          PutText(&item, keys::kQueueMessage, status.queue_message);
+    served =
+        FillPage(page, entry.offset, count, entry.request.page_size, [&](std::int64_t index) {
+          ipc::ListItem item;
+          if (complaint && index == 0) {
+            PutInteger(&item, keys::kQueueRomId, 0);
+            // Named after the file rather than left blank: the model falls back to
+            // "Rom 0" for a row with no `fs_name`, and this row is about the file.
+            PutText(&item, keys::kQueueFsName, download::kQueueFileName);
+            PutText(&item, keys::kQueuePlatformFsSlug, "");
+            PutText(&item, keys::kQueueState, download::ToString(download::QueueState::kFailed));
+            PutInteger(&item, keys::kQueueBytesDone, 0);
+            PutInteger(&item, keys::kQueueSizeBytes, 0);
+            PutInteger(&item, keys::kQueueBytesPerSecond, 0);
+            PutInteger(&item, keys::kQueueAttempts, 0);
+            PutText(&item, keys::kQueueMessage, status.queue_message);
+            return item;
+          }
+          const download::QueueEntry& row =
+              rows[static_cast<std::size_t>(index - (complaint ? 1 : 0))];
+          PutInteger(&item, keys::kQueueRomId, row.rom_id);
+          PutText(&item, keys::kQueueFsName, row.fs_name);
+          PutText(&item, keys::kQueuePlatformFsSlug, row.platform_fs_slug);
+          PutText(&item, keys::kQueueState, download::ToString(row.state));
+          PutInteger(&item, keys::kQueueBytesDone, row.bytes_done);
+          PutInteger(&item, keys::kQueueSizeBytes, row.size_bytes);
+          // A rate is not a `QueueEntry` field and never reaches `queue.json`
+          // (`download.hpp`), so it comes off the live status and only for the row
+          // it was measured on -- a figure drawn against another rom's bar is a
+          // number that is simply wrong.
+          PutInteger(&item, keys::kQueueBytesPerSecond,
+                     status.rom_id == row.rom_id ? status.bytes_per_second : 0);
+          PutInteger(&item, keys::kQueueAttempts, row.attempts);
+          PutText(&item, keys::kQueueMessage, row.message);
           return item;
-        }
-        const download::QueueEntry& row =
-            rows[static_cast<std::size_t>(index - (complaint ? 1 : 0))];
-        PutInteger(&item, keys::kQueueRomId, row.rom_id);
-        PutText(&item, keys::kQueueFsName, row.fs_name);
-        PutText(&item, keys::kQueuePlatformFsSlug, row.platform_fs_slug);
-        PutText(&item, keys::kQueueState, download::ToString(row.state));
-        PutInteger(&item, keys::kQueueBytesDone, row.bytes_done);
-        PutInteger(&item, keys::kQueueSizeBytes, row.size_bytes);
-        // A rate is not a `QueueEntry` field and never reaches `queue.json`
-        // (`download.hpp`), so it comes off the live status and only for the row
-        // it was measured on -- a figure drawn against another rom's bar is a
-        // number that is simply wrong.
-        PutInteger(&item, keys::kQueueBytesPerSecond,
-                   status.rom_id == row.rom_id ? status.bytes_per_second : 0);
-        PutInteger(&item, keys::kQueueAttempts, row.attempts);
-        PutText(&item, keys::kQueueMessage, row.message);
-        return item;
-      });
+        });
   });
 
   return PageOf(entry, page, served, count);

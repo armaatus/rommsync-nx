@@ -564,14 +564,16 @@ constexpr size_t kTickStatesBytes =
 /// the direction the rom index is too, by more than the margin.
 constexpr size_t kQueuedRomTextBytes = 456;
 
-/// What a write of the queue, or a page of it, holds beside the rows: the row it
-/// writes over, the piece of `queue.json` in flight and the quoted field it is
-/// built from. Measured at 7,295 bytes for an update at the entries' bounds and
-/// 1,871 at the estimate above, and rounded up. Held on the IPC thread -- which
-/// is handing over no list page while it writes (`kHeapListPages`) -- or on the
+/// What a write of the queue holds beside the rows: the row it writes over, the
+/// piece of `queue.json` in flight and the quoted field it is built from.
+/// Measured on aarch64 at 7,295 bytes for an update and 5,716 for an enqueue
+/// with every entry at its bounds (1,871 and 1,686 at the estimate above), and
+/// set at what `alloc.queue_write` holds every write and rollback to: six
+/// entries at their bounds, ~2 KiB each. Held on the IPC thread -- which is
+/// handing over no list page while it writes (`kHeapListPages`) -- or on the
 /// worker, which is not ticking while it drains (`kHeapTickSaves`), so it is a
 /// bound under those rows and not one of its own.
-constexpr size_t kQueueWriteBytes = 8 * 1024;
+constexpr size_t kQueueWriteBytes = 12 * 1024;
 
 /// What one row of a rom page becomes while the worker builds the overlay's page
 /// out of it (`lists::RomPage`): 446 bytes and 2 blocks a row with every string

@@ -113,9 +113,14 @@ inline constexpr int kFormatVersion = 1;
 /// -- and ~131 KiB at the bounds above; the derivation is beside the table, in
 /// `sysmodule/source/main.cpp`. Thirty-two is still not a small queue: these
 /// are roms, so a full one is gigabytes of transfer, and a user who wants more
-/// queues more when these drain. What it costs is history: finished rows make
-/// way for new ones (`Queue::Enqueue`), so the queue screen shows the last
-/// thirty-two rather than sixty-four.
+/// queues more when these drain. What it costs:
+///   * `kQueueFull` at thirty-two roms still to do, not sixty-four;
+///   * history: finished rows make way for new ones (`Queue::Enqueue`), so the
+///     queue screen shows the last thirty-two rather than sixty-four;
+///   * a `queue.json` an older build wrote with more than thirty-two entries,
+///     or past `kMaxQueueBytes`, is discarded whole at boot, as any file past
+///     the bounds is. No console in the field holds one -- nothing has run on
+///     hardware before the v1 gate (CLAUDE.md) -- so this costs nobody a queue.
 inline constexpr std::size_t kMaxQueueEntries = 32;
 inline constexpr std::size_t kMaxQueueBytes = 80 * 1024;
 
