@@ -627,7 +627,8 @@ def phase_interop_facts(args) -> int:
 
 def table_rows(text: str, header: str) -> list:
     """The body rows of the table whose header line starts with `header`."""
-    lines = text.splitlines()
+    # Stripped, because a table inside a numbered step is indented under it.
+    lines = [line.strip() for line in text.splitlines()]
     for i, line in enumerate(lines):
         if line.startswith(header):
             rows = []

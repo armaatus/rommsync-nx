@@ -1,5 +1,8 @@
 # Configuration
 
+> This page is autofleet's project configuration. The console's `config.ini` —
+> what a user sets on the Switch — is [CONFIG.md](CONFIG.md).
+
 Everything autofleet knows about your project arrives through four files. The
 payload in `scripts/fleet/` knows about none of it, and a change that puts a
 project detail in there is the thing that makes the next repo fork this one

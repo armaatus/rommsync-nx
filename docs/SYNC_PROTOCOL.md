@@ -650,25 +650,11 @@ moves. The same holds inside #232's resolution of a 409, which executes through
 the same path. Two libretro cores in one slot are not this rule's: that is RomM's
 pairing and #236's filter.
 
-| System | Tico module | Emulator id | Syncs with | Status in M10 |
-|---|---|---|---|---|
-| NES | FCEUmm | `fceumm` | RetroArch `fceumm`, the web player | full [verify bytes] |
-| SNES | Snes9x | `snes9x` | RetroArch `snes9x`, the web player | full (`.rtc` in a slot of its own) |
-| GB / GBC | Gambatte | `gambatte` | RetroArch `gambatte` | full [verify RTC] |
-| GBA | mGBA | `mgba` | RetroArch `mgba`, the web player | full [verify] |
-| Genesis / SMS / GG / Sega CD | Genesis Plus GX | `genesis_plus_gx` | RetroArch `genesis_plus_gx` | full [verify `.brm`] |
-| Arcade | FinalBurn Neo | `fbneo` | RetroArch `fbneo` | full [verify] |
-| PS1 | DuckStation | `tico-duckstation` | DuckStation on another Switch | Switch-only: `<game>.mcd`, card 2 `<game>_2.mcd` (own slot), one card for every disc, kept under disc 1's rom; a first-time restore is placed under those names, and a card kept under a later disc's rom is not placed |
-| N64 | Mupen64Plus | `tico-mupen64plus` | Mupen64Plus on another Switch | Switch-only: `.eep`, `.sra`, `.fla`, `.mpk` each a save in its own slot (`autosave-eep` …) |
-| Dreamcast | Flycast | `tico-flycast` | Flycast on another Switch | Switch-only, for a file named after its rom [verify on #44: Flycast may name VMUs by game id] |
-| NDS | DraStic | `tico-drastic` | DraStic on another Switch | Switch-only (`.dsv` likely) [verify on #44] |
-| Saturn | YabaSanshiro | `tico-yabasanshiro` | YabaSanshiro on another Switch | Switch-only [verify the file name on #44] |
-| PSP | PPSSPP | `tico-ppsspp` | — | not synced: its saves are folders, a *save folder* skip; the `PSP-<folder>.zip` adapter needs #44 and RomM's per-entry ZIP hash (#234) |
-
-"Full" needs the other device on the same core for that system. A RetroArch save
-for an isolated system — Beetle PSX, `mupen64plus_next`, RetroArch's `ppsspp` —
-still syncs between RetroArch installs, the Switch's own included; it is only
-never written into Tico's folder, nor Tico's into RetroArch's.
+The per-system table — each Tico module, the emulator id it syncs under, and
+what else it meets — lives in [INTEROP.md](INTEROP.md#which-systems-sync-with-what),
+the page a user sets their other devices up from; `docs.install_interop_table`
+holds it to `kTicoModules` in
+[`save_source.cpp`](../core/src/save_source.cpp) both ways (#243).
 
 ### A save deleted on the server
 

@@ -274,6 +274,10 @@ One rule to read there before you edit the map: a `[platform.…]` section
 replaces that platform's defaults rather than adding to them
 ([CONFIG.md](CONFIG.md#a-platform-section-replaces-that-platforms-defaults)).
 
+To share those saves with RetroArch on another device, RomM's web player, Argosy
+or Grout, [INTEROP.md](INTEROP.md) is what to set on each of them and which
+systems sync with which.
+
 ---
 
 ## 6. Upgrading

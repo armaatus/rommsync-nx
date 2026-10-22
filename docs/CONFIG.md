@@ -1,5 +1,8 @@
 # Configuration
 
+> This page is the console's `config.ini`. The agent fleet's own project
+> configuration (`.autofleet/`) is [CONFIGURATION.md](CONFIGURATION.md).
+
 `sdmc:/config/rommsync/config.ini`. The sysmodule reads it at boot and on an
 IPC "reload"; the overlay edits it through the sysmodule (which owns writes).
 
@@ -276,7 +279,7 @@ Where RetroArch keeps saves is RetroArch's setting, so every sync reads it from
 | `cloud_sync_enable = true` (with `cloud_sync_sync_saves`) | nothing, unless `[sources] retroarch = on`: **RetroArch syncs itself** |
 
 A folder holds at most 512 entries as far as the client is concerned, the first
-by name. A sorted RetroArch folder past that still has every core folder RomM's
+512 the card lists. A sorted RetroArch folder past that still has every core folder RomM's
 table names read; a rom folder past it is read only as far as that, and the
 skip says so. At most 64 RetroArch core folders are read in one sync.
 
