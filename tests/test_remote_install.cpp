@@ -241,6 +241,13 @@ void Faults(rig::Checks& checks, http::HttpClient& client, const std::string& ba
   if (token.device_id.empty()) {
     return;
   }
+  // A request to claim, so the answer is long enough to be cut or dropped mid-way.
+  harness::Rom rom;
+  checks.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom), "the library has nova");
+  checks.Expect(install::Register(client, base, token, true).ok(), "the device registers");
+  checks.Expect(QueueFromTheBrowser(client, base, token.device_id, rom.id).successful(),
+                "and the web UI queues nova for it");
+
   const std::string path = "/api/devices/" + token.device_id + "/installs/claim";
   std::vector<std::chrono::milliseconds> waits;
   sync::CallPolicy policy;
@@ -285,6 +292,8 @@ void Faults(rig::Checks& checks, http::HttpClient& client, const std::string& ba
   checks.Expect(stopped.exchange.transport == http::Error::kCanceled &&
                     stopped.exchange.attempts == 0,
                 "a fired token costs no request");
+  checks.ExpectEq(install::Claim(client, base, token).page.requests.size(), std::size_t{1},
+                  "and none of it lost the request: the next clean claim still holds it");
   harness::DeleteDevice(client, base, fixture, token.device_id);
 }
 
