@@ -1084,6 +1084,31 @@ class PlanningClient final : public http::HttpClient {
 };
 
 void NewerBounds(rig::Checks& checks) {
+  // A tick scoped in chunks resolves each plan's 409s with that plan (#246), so
+  // `TickResult::resolved` is every plan's, folded -- not the last one's.
+  {
+    sync::ResolveReport tick;
+    sync::ResolveReport first;
+    first.refused = 2;
+    first.resolved = 1;
+    first.renegotiated = true;
+    first.negotiate_error = sync::NegotiateError::kServerError;
+    first.negotiate_message = "the first plan's";
+    first.second_session.error = sync::CompleteError::kUnreachable;
+    sync::ResolveReport second;
+    second.refused = 1;
+    second.resolved = 1;
+    second.held = true;
+    sync::Accumulate(&tick, first);
+    sync::Accumulate(&tick, second);
+    checks.ExpectEq(tick.refused, std::size_t{3}, "refused uploads are summed over the plans");
+    checks.ExpectEq(tick.resolved, std::size_t{2}, "and so are the resolved ones");
+    checks.Expect(tick.renegotiated && tick.held, "a plan that asked again, or held, is kept");
+    checks.Expect(tick.negotiate_error == sync::NegotiateError::kServerError &&
+                      tick.negotiate_message == "the first plan's",
+                  "and a failure is not overwritten by a later plan that had none");
+    checks.Expect(!tick.second_session.ok(), "nor is a second session's failed accounting");
+  }
   Sandbox sandbox(checks, "tick-newer-bounds");
   const std::unique_ptr<fs::FileSystem> files =
       rommsync::host::MakeNativeFileSystem(sandbox.root().string());

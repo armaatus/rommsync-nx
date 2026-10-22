@@ -525,7 +525,7 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
     // the next chunk is asked (`TickOptions::on_plan`).
     result.negotiated = std::move(one);
     result.executed = std::move(run.executed);
-    result.resolved = std::move(run.resolved);
+    Accumulate(&result.resolved, std::move(run.resolved));
 
     if (run.outcome == TickOutcome::kUnauthorized || run.outcome == TickOutcome::kCanceled) {
       // The next chunk would meet the same refusal, or the same shutdown.

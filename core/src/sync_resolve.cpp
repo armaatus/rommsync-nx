@@ -108,6 +108,8 @@ std::optional<SyncOperation> ResolveNewerOnServer(const SyncOperation& head,
   return resolved;
 }
 
+void Accumulate(ResolveReport* tick, ResolveReport run) { *tick = std::move(run); }
+
 ResolveReport ResolveRefusedUploads(http::HttpClient& client, fs::FileSystem& files,
                                     const auth::StoredToken& token,
                                     const std::vector<ClientSaveState>& reported,

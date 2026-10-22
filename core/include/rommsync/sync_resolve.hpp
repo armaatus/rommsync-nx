@@ -147,6 +147,10 @@ struct ResolveReport {
   Completion second_session;
 };
 
+/// Fold `run`, one plan's resolution, into `*tick`'s, for a tick that ran a plan
+/// per chunk (#246): `TickResult::resolved` is every plan's.
+void Accumulate(ResolveReport* tick, ResolveReport run);
+
 /// Resolve every operation in `*executed` that failed with `kNewerOnServer`,
 /// in place: the operation in `*plan` and its result in `*executed`, at the same
 /// index, become what the resolution ran and what became of it, and the
