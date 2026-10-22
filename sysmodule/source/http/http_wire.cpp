@@ -792,19 +792,29 @@ class FileWriter final : public BodyWriter {
     // let an empty 200 promote a stale partial file.
     if (staged_unconfirmed_) resume_from_ = 0;
     errno = 0;
-    bool flushed = file_ == nullptr || std::fflush(file_) == 0;
+    flushed_ = file_ == nullptr || std::fflush(file_) == 0;
     // Where a real full card often shows first: stdio held the last buffer.
     flush_errno_ = errno;
     Close();
-    if (flushed) {
-      // Through `io::Disk`, which asks the same hook: a sync made beside the
-      // seam is one the crash replay cannot see (#203).
-      flushed = io::Sync(path_);
+    if (!flushed_) {
+      return false;
     }
-    return flushed;
+    // Through `io::Disk`, which asks the same hook: a sync made beside the
+    // seam is one the crash replay cannot see (#203). Its `errno` is the one
+    // that names a card full at commit -- `fsdevCommitDevice` writing the FAT
+    // -- and a hook may refuse without setting one, which is still I/O.
+    errno = 0;
+    if (!io::Sync(path_)) {
+      flush_errno_ = errno != 0 ? errno : EIO;
+      return false;
+    }
+    return true;
   }
 
   std::uint64_t resume_from() const { return resume_from_; }
+  /// False when the flush itself was refused, true when only the sync was --
+  /// which of the two sentences the caller writes.
+  bool flushed() const { return flushed_; }
   int flush_errno() const { return flush_errno_; }
   std::uint64_t received() const { return received_; }
   std::string& error_body() { return error_body_; }
@@ -845,6 +855,7 @@ class FileWriter final : public BodyWriter {
   std::uint64_t body_length_ = 0;
   std::uint64_t received_ = 0;
   std::string error_body_;
+  bool flushed_ = false;
   int flush_errno_ = 0;
 };
 
@@ -1320,7 +1331,9 @@ Result WireHttpClient::Download(const Request& request, const DownloadTarget& ta
   }
   if (!flushed) {
     result.error = http::ErrorForWrite(writer.flush_errno());
-    result.message = "could not flush " + partial_path + ": " + std::strerror(writer.flush_errno());
+    result.message = std::string(writer.flushed() ? "could not make durable "
+                                                  : "could not flush ") +
+                     partial_path + ": " + std::strerror(writer.flush_errno());
     return result;
   }
 
