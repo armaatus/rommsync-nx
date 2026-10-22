@@ -5286,8 +5286,31 @@ int InstallSettle(http::HttpClient& client, const std::string& base) {
              "both reported done -- the one the pass stopped at and the one it kept");
   c.ExpectEq(notices(started, "failed"), std::size_t{0}, "and neither failed");
 
-  // The download asks for a tick of its own (#241); let it end before teardown.
+  // The download asks for a tick of its own (#241); let it end.
   UntilQuiet(console, wire, http::Method::kPost, "/api/sync/negotiate", std::chrono::seconds{1});
+
+  // **Downloads switched off with a report still owed.** nova is queued again,
+  // claimed, and settled from the card -- it is already there -- but the report
+  // does not go. Then downloads go off: what this console holds is told to the
+  // browser for what it is, not as a download that will never happen.
+  const std::int64_t before_off = rig::LatestNotificationId(client, base);
+  c.ExpectEq(queue_in_browser(device.nova).response.status, 201, "the web UI queues nova again");
+  down = true;
+  TickOnce(console, ticks, c, "the tick that claims it again");
+  UntilQuiet(console, wire, http::Method::kPut, "/installs/", std::chrono::seconds{5});
+  c.ExpectEq(open(), std::size_t{1}, "its report did not go, so it is still taken");
+  down = false;
+  c.Expect(console.Set(Edit("downloads", "enabled", "false")).outcome ==
+               ipc::WriteOutcome::kApplied,
+           "and downloads are switched off on the console");
+  TickOnce(console, ticks, c, "the tick after downloads went off");
+  c.ExpectEq(open(), std::size_t{0}, "the request is ended");
+  c.ExpectEq(notices(before_off, "failed"), std::size_t{0},
+             "and not as failed: the rom is on the card, settled before downloads went off" +
+                 Rendered(console.Log()));
+  c.ExpectEq(notices(before_off, "already_installed"), std::size_t{1},
+             "but as what its row says: already installed");
+
   install::Register(client, base, token, false);
   harness::DeleteDevice(client, base, fixture, token.device_id);
   return c.failures();
