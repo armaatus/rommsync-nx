@@ -418,6 +418,9 @@ Encoded EncodeNegotiateRequest(const SyncNegotiatePayload& payload) {
     body += ",\"emulators\":";
     body += json::QuoteArray(*payload.emulators);
   }
+  if (payload.restore_unlisted) {
+    body += ",\"restore_unlisted\":true";
+  }
   body += '}';
   encoded.body = std::move(body);
   return encoded;

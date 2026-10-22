@@ -44,7 +44,9 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -315,6 +317,29 @@ struct TickOptions {
   ExecuteOptions execute;
   FinishOptions finish;
 
+  /// The roms on the card (`FindRomsOnCard`), which every negotiation is then
+  /// scoped to with `rom_ids` -- together with the roms of the saves it reports
+  /// -- in chunks of `kMaxNegotiateRomIds` (#241, rom_scope.hpp). A server save
+  /// of a rom the card does not hold is then not offered, so nothing is placed
+  /// beside a game that is not there.
+  ///
+  /// The chunks are one tick: their operations are executed as one plan, the
+  /// baseline is written once, and each session is completed with its own
+  /// share (`TickResult::other_sessions`). A chunk that fails to negotiate fails
+  /// the tick before anything is written, as a single negotiation would; the
+  /// sessions the earlier chunks opened are left to RomM's cleanup.
+  ///
+  /// Nullopt -- and any server without `rom_ids` -- is the one unscoped
+  /// negotiation. The engine always sets it.
+  std::optional<std::vector<std::int64_t>> rom_scope;
+
+  /// Roms downloaded since the last tick that negotiated (#241). Each is asked
+  /// about in a negotiation of its own with `restore_unlisted`, so a save this
+  /// device synced before the rom was deleted comes back with it -- and nothing
+  /// else this device deleted does. Only with `rom_scope` set, and only on a
+  /// server with `restore_unlisted`; otherwise they are ordinary roms.
+  std::vector<std::int64_t> restore_roms;
+
   /// Asked once more, before a 409 is resolved (#232): true holds the
   /// resolution -- no second negotiation, no transfer -- and leaves the refused
   /// uploads for the next tick. The engine passes "a game is running" (#242):
@@ -357,6 +382,13 @@ struct TickResult {
   ResolveReport resolved;
 
   TickCompletion finished;
+
+  /// The completion of every session after the first, when `rom_scope` made
+  /// more than one negotiation (#241). Best-effort, like
+  /// `ResolveReport::second_session`: the baseline and the first session's
+  /// accounting are `finished`, and one of these failing costs a row in a
+  /// history.
+  std::vector<Completion> other_sessions;
 
   TickOutcome outcome = TickOutcome::kCompleted;
 

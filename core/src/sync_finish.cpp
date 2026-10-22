@@ -220,6 +220,31 @@ CompletionCounts CountsFor(const ExecutionReport& report) {
   return counts;
 }
 
+CompletionCounts CountsFor(const ExecutionReport& report, std::size_t begin, std::size_t end) {
+  CompletionCounts counts;
+  end = end < report.operations.size() ? end : report.operations.size();
+  for (std::size_t index = begin; index < end; ++index) {
+    switch (report.operations[index].outcome) {
+      case OperationOutcome::kFailed:
+      case OperationOutcome::kNotUnderstood:
+        // `not_understood` with the failures, as `CountsFor` above has it.
+        ++counts.operations_failed;
+        break;
+      case OperationOutcome::kCanceled:
+        break;
+      case OperationOutcome::kNoOp:
+      case OperationOutcome::kUploaded:
+      case OperationOutcome::kDownloaded:
+      case OperationOutcome::kKeptBoth:
+      case OperationOutcome::kRemoved:
+      case OperationOutcome::kKept:
+        ++counts.operations_completed;
+        break;
+    }
+  }
+  return counts;
+}
+
 BaselineUpdate AdvanceBaseline(state::Baseline previous, const SyncPlan& plan,
                                const ExecutionReport& report,
                                const std::vector<ClientSaveState>& reported,
@@ -391,7 +416,7 @@ TickCompletion FinishTick(http::HttpClient& client, fs::FileSystem& files,
     AddWarning(&tick.warnings, "the baseline left a row out: " + skipped);
   }
 
-  tick.counts = CountsFor(report);
+  tick.counts = options.counts.has_value() ? *options.counts : CountsFor(report);
   if (report.canceled && options.complete.cancel == nullptr) {
     // The one combination that is almost certainly a caller mistake: the tick
     // was cancelled, and the token that would end this call was not passed on.

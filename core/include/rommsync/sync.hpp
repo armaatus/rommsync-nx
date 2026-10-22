@@ -223,10 +223,27 @@ struct SyncNegotiatePayload {
   ///
   /// No entry may be empty; the encoder refuses one by name.
   std::optional<std::vector<std::string>> emulators;
+
+  /// Offer every current server save this request does not list as a download,
+  /// including one this device already synced (`restore_unlisted`, RomM 5.4).
+  /// Sent only when true.
+  ///
+  /// RomM otherwise reads a save it synced here that the card no longer lists as
+  /// one the user deleted, and offers nothing. That is right on an ordinary tick
+  /// and wrong for a rom that has just been downloaded, so only that negotiation
+  /// sets it -- scoped by `rom_ids` to the downloaded roms, so nothing else this
+  /// console deleted comes back (#241, sync_tick.hpp).
+  bool restore_unlisted = false;
 };
 
 /// RomM 5.4.0's `maxItems` on `SyncNegotiatePayload.rom_ids`.
 inline constexpr std::size_t kMaxNegotiateRomIds = 500;
+
+/// What `rom_ids` adds to one negotiate body at most: `,"rom_ids":[]` and 500
+/// ids of up to 19 digits, each with its comma. The term the heap table's
+/// negotiate row is written from (#217, #246): a scope is only ever held as this
+/// text, one chunk at a time.
+inline constexpr std::size_t kMaxRomScopeBytes = kMaxNegotiateRomIds * 20 + 16;
 
 /// A request body, or the reason there isn't one. `body` is empty on failure and
 /// must not be sent -- check `ok()`.
@@ -592,6 +609,10 @@ struct NegotiateOptions : CallPolicy {
   /// negotiation carries it; the 409's second one deliberately does not, because
   /// the slot guard is not filtered (sync_resolve.cpp).
   std::optional<std::vector<std::string>> emulators;
+
+  /// `SyncNegotiatePayload::restore_unlisted`. Only `RunTick`'s negotiation for
+  /// freshly downloaded roms sets it (#241).
+  bool restore_unlisted = false;
 };
 
 /// A plan, or the reason there isn't one. `plan` is left default-constructed on

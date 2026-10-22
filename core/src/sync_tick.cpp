@@ -14,6 +14,7 @@
 
 #include "rommsync/auth_gate.hpp"
 #include "rommsync/file_system.hpp"
+#include "rommsync/rom_scope.hpp"
 
 namespace rommsync::sync {
 namespace {
@@ -129,6 +130,70 @@ auth::Answer AnswerAfter(NegotiateError negotiated, const ExecutionReport& execu
   return AnswerOf(negotiated);
 }
 
+/// One session's share of a plan several negotiations made: its id, and the
+/// operations `[begin, end)` it planned.
+struct SessionShare {
+  std::int64_t id = 0;
+  std::size_t begin = 0;
+  std::size_t end = 0;
+};
+
+/// Negotiate `offered` over `options.rom_scope`, one chunk at a time, into one
+/// plan (rom_scope.hpp). The first failure is the answer, with the attempts and
+/// the backoff of every chunk before it.
+Negotiation NegotiateScope(http::HttpClient& client, const auth::StoredToken& token,
+                           const std::vector<ClientSaveState>& offered,
+                           const TickOptions& options, const NegotiateOptions& negotiate,
+                           std::vector<SessionShare>* shares) {
+  const std::vector<ScopeChunk> chunks =
+      ChunkScope(offered, *options.rom_scope,
+                 options.server.restore_unlisted ? options.restore_roms
+                                                 : std::vector<std::int64_t>{});
+  Negotiation merged;
+  for (const ScopeChunk& chunk : chunks) {
+    NegotiateOptions asked = negotiate;
+    asked.restore_unlisted = chunk.restore;
+    // The whole vector when there is one chunk, which is nearly every card:
+    // the tick that carries it is the heap's peak, and a copy of it buys nothing.
+    std::vector<ClientSaveState> some;
+    if (chunks.size() > 1) {
+      some.reserve(chunk.saves.size());
+      for (const std::size_t index : chunk.saves) {
+        some.push_back(offered[index]);
+      }
+    }
+    Negotiation one =
+        NegotiateRoms(client, token, chunks.size() > 1 ? some : offered, chunk.rom_ids, asked);
+    one.attempts += merged.attempts;
+    one.waited += merged.waited;
+    if (!one.ok()) {
+      return one;
+    }
+    const std::size_t begin = merged.plan.operations.size();
+    const std::int64_t session = one.plan.session_id;
+    if (shares->empty()) {
+      merged = std::move(one);
+    } else {
+      SyncPlan& plan = merged.plan;
+      for (SyncOperation& operation : one.plan.operations) {
+        plan.operations.push_back(std::move(operation));
+      }
+      plan.total_upload += one.plan.total_upload;
+      plan.total_download += one.plan.total_download;
+      plan.total_conflict += one.plan.total_conflict;
+      plan.total_no_op += one.plan.total_no_op;
+      plan.total_delete += one.plan.total_delete;
+      for (std::string& warning : one.plan.warnings) {
+        plan.warnings.push_back(std::move(warning));
+      }
+      merged.attempts = one.attempts;
+      merged.waited = one.waited;
+    }
+    shares->push_back({session, begin, merged.plan.operations.size()});
+  }
+  return merged;
+}
+
 }  // namespace
 
 const char* ToString(TickOutcome outcome) {
@@ -232,7 +297,12 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
 
   NegotiateOptions negotiate = options.negotiate;
   negotiate.cancel = options.cancel;
-  result.negotiated = Negotiate(client, token, *offered, negotiate);
+  // Scoped to the roms on the card, and chunked to RomM's bound, wherever the
+  // caller knows them (#241).
+  std::vector<SessionShare> shares;
+  result.negotiated = options.rom_scope.has_value() && options.server.rom_ids
+                          ? NegotiateScope(client, token, *offered, options, negotiate, &shares)
+                          : Negotiate(client, token, *offered, negotiate);
   if (!result.negotiated.ok()) {
     // The offline case, and the one the acceptance is sharpest about: nothing
     // after this point runs, so no save is touched, no backup is written and
@@ -293,10 +363,20 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
   // request (sync_finish.hpp).
   FinishOptions finish = options.finish;
   finish.complete.cancel = options.cancel;
+  if (shares.size() > 1) {
+    // Each session is told what it planned and saw done (#241). The resolution
+    // above replaced operations in place, so the shares still line up.
+    finish.counts = CountsFor(result.executed, shares.front().begin, shares.front().end);
+  }
   // `offered`, not `reported`: a withheld save is one this tick did not
   // mention, so its marked row stands as it is.
   result.finished = FinishTick(client, files, token, result.negotiated.plan, result.executed,
                                *offered, std::move(previous), finish);
+  for (std::size_t index = 1; index < shares.size(); ++index) {
+    result.other_sessions.push_back(CompleteSession(
+        client, token, shares[index].id,
+        CountsFor(result.executed, shares[index].begin, shares[index].end), {}, finish.complete));
+  }
 
   result.session_gone = SessionGone(result.finished.reported.error);
   result.outcome = OutcomeAfter(result.executed, result.finished);

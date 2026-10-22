@@ -1098,6 +1098,21 @@ foreach(scenario IN LISTS PLACE_SCENARIOS)
   set_tests_properties(place.${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
 
+# #241: what a negotiation is about -- the roms on the card, chunked to RomM's
+# 500, with a freshly downloaded rom asked about apart. Scratch directories and
+# no server, so it never skips.
+add_executable(test_rom_scope test_rom_scope.cpp)
+target_link_libraries(test_rom_scope PRIVATE rommsync::host)
+target_include_directories(test_rom_scope PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_rom_scope PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+foreach(scenario chunks on_card)
+  add_test(NAME scope.${scenario} COMMAND test_rom_scope ${scenario})
+  set_tests_properties(scope.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
 # M10-4: retroarch.cfg, read for where RetroArch keeps saves and whether it syncs
 # them itself. Pure apart from scratch files, so it never skips.
 add_executable(test_retroarch_cfg test_retroarch_cfg.cpp)
@@ -1571,6 +1586,8 @@ set(TICK_RIG_SCENARIOS
   baseline_downloaded # #234: ...the same from a /downloaded baseline
   baseline_conflict   # #234: real progress against a moved row is still a conflict
   baseline_other_row  # #234: ...and against another device's new row (#227), never suppressed
+  scoped           # #241: rom_ids on every negotiate, 500 at a time, and nothing off the card offered
+  restore          # #241: a downloaded rom's save comes back, even one this device synced and lost
   deleted          # M10-7: deleted in RomM -> backed up and removed, and never re-uploaded
   deleted_keep     # ...and under on_server_delete = keep, left on the card, never re-uploaded
   migrated         # #236: rc1's v2 row moves to the shared slot; its newer head lands, backed up

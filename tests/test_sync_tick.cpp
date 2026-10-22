@@ -1871,6 +1871,272 @@ void IsolatedIds(rig::Checks& checks, http::HttpClient& client, const std::strin
   }
 }
 
+// --- the rom scope (#241) -----------------------------------------------------
+//
+// Against a fresh device of their own: an unscoped negotiation offers a device
+// with no history every save in the library, which is exactly what the scope is
+// there to stop, and the fixture device's history is every other scenario's.
+
+/// Every negotiate body sent, and how many sessions were completed.
+class Recording final : public http::HttpClient {
+ public:
+  explicit Recording(http::HttpClient& inner) : inner_(inner) {}
+
+  http::Result Send(const http::Request& request) override {
+    const http::Result result = inner_.Send(request);
+    if (request.method == http::Method::kPost &&
+        request.url.find("/api/sync/negotiate") != std::string::npos) {
+      negotiations.push_back(request.body);
+    } else if (request.method == http::Method::kPost &&
+               request.url.find("/complete") != std::string::npos && result.successful()) {
+      ++completed;
+    }
+    return result;
+  }
+  http::Result Download(const http::Request& request, const http::DownloadTarget& into) override {
+    return inner_.Download(request, into);
+  }
+
+  void Clear() {
+    negotiations.clear();
+    completed = 0;
+  }
+
+  std::vector<std::string> negotiations;
+  int completed = 0;
+
+ private:
+  http::HttpClient& inner_;
+};
+
+/// The operation the plan holds for `(rom_id, slot)`, and how many it holds.
+const sync::SyncOperation* PlannedFor(const sync::TickResult& tick, std::int64_t rom_id,
+                                      const std::string& slot, int* count) {
+  const sync::SyncOperation* found = nullptr;
+  *count = 0;
+  for (const sync::SyncOperation& operation : tick.negotiated.plan.operations) {
+    if (operation.rom_id == rom_id && operation.slot.has_value() && *operation.slot == slot) {
+      found = &operation;
+      ++*count;
+    }
+  }
+  return found;
+}
+
+/// `rom_ids` of one recorded body, or nullopt when it sent none.
+std::optional<std::vector<std::int64_t>> ScopeOf(const std::string& body, bool* restoring) {
+  const json::ParseResult document = json::Parse(body);
+  *restoring = false;
+  if (!document.ok()) {
+    return std::nullopt;
+  }
+  const json::Value* flag = document.value.Find("restore_unlisted");
+  *restoring = flag != nullptr && flag->is_bool() && flag->boolean();
+  const json::Value* ids = document.value.Find("rom_ids");
+  if (ids == nullptr || !ids->is_array()) {
+    return std::nullopt;
+  }
+  std::vector<std::int64_t> out;
+  for (const json::Value& id : ids->elements()) {
+    out.push_back(id.is_integer() ? id.integer() : 0);
+  }
+  return out;
+}
+
+/// #241: every negotiate names the roms on the card, in chunks of RomM's 500, and
+/// what comes back is about those roms only -- a server save of a rom the card
+/// does not hold is not offered, so it is not placed beside nothing (#237).
+void Scoped(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+            const Fixture& fixture, const harness::Rom& rom) {
+  const std::string device = harness::CreateDevice(checks, client, base, fixture, "tick-scoped");
+  if (device.empty()) {
+    return;
+  }
+  Sandbox sandbox(checks, "tick-scoped");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const std::string slot = harness::UniqueSlot("m10-15-scope");
+  const std::string staged = sandbox.Host("/config/rommsync/server-copy.srm");
+  rig::WriteFile(staged, "another device's save, for the scope\n");
+  harness::Save server;
+  if (!harness::UploadSave(client, base, fixture, rom.id, slot, "m2-7", staged, "scoped.srm",
+                           /*with_device=*/false, &server)) {
+    checks.Expect(false, "another device's save is on the server");
+    harness::DeleteDevice(client, base, fixture, device);
+    return;
+  }
+
+  auth::StoredToken token = TokenFor(base, fixture);
+  token.device_id = device;
+  Recording recording(client);
+  sync::TickOptions options = OptionsAt(1'757'000'400);
+
+  // A card that holds some other rom: the server's save of this one is not
+  // offered at all.
+  const std::int64_t elsewhere = 900'000'001;
+  options.rom_scope = std::vector<std::int64_t>{elsewhere};
+  {
+    const sync::TickResult tick = sync::RunTick(recording, *files, token, {}, {}, {}, options);
+    int count = 0;
+    checks.Expect(tick.negotiated.ok(), "a scoped negotiation is answered: " +
+                                            tick.negotiated.message);
+    checks.Expect(PlannedFor(tick, rom.id, slot, &count) == nullptr,
+                  "a save of a rom the card does not hold is not offered");
+    bool restoring = true;
+    checks.Expect(recording.negotiations.size() == 1 &&
+                      ScopeOf(recording.negotiations[0], &restoring) ==
+                          std::vector<std::int64_t>{elsewhere} &&
+                      !restoring,
+                  "one negotiation, naming the card's rom, not restoring");
+  }
+
+  // The card holds it: offered.
+  recording.Clear();
+  options.rom_scope = std::vector<std::int64_t>{rom.id};
+  {
+    const sync::TickResult tick = sync::RunTick(recording, *files, token, {}, {}, {}, options);
+    int count = 0;
+    const sync::SyncOperation* offered = PlannedFor(tick, rom.id, slot, &count);
+    checks.Expect(offered != nullptr && offered->action == sync::Action::kDownload,
+                  "on the card, the server's save is offered as a download");
+  }
+
+  // The rom index's bound on the card: three negotiations, each inside RomM's
+  // 500 and each body inside `kMaxRomScopeBytes` of an unscoped one, and every
+  // session closed.
+  recording.Clear();
+  std::vector<std::int64_t> card = {rom.id};
+  for (std::int64_t id = 1; card.size() < rommsync::roms::kMaxIndexRoms; ++id) {
+    card.push_back(900'000'000 + id);
+  }
+  options.rom_scope = card;
+  {
+    const sync::TickResult tick = sync::RunTick(recording, *files, token, {}, {}, {}, options);
+    checks.Expect(tick.negotiated.ok(), "a chunked negotiation is answered: " +
+                                            tick.negotiated.message);
+    checks.ExpectEq(recording.negotiations.size(), std::size_t{3},
+                    "1,024 roms on the card are three negotiations");
+    sync::SyncNegotiatePayload unscoped;
+    unscoped.device_id = device;
+    const std::size_t plain = sync::EncodeNegotiateRequest(unscoped).body.size();
+    std::size_t named = 0;
+    for (const std::string& body : recording.negotiations) {
+      bool restoring = true;
+      const std::optional<std::vector<std::int64_t>> scope = ScopeOf(body, &restoring);
+      checks.Expect(scope.has_value() && scope->size() <= sync::kMaxNegotiateRomIds && !restoring,
+                    "each names at most 500 roms");
+      named += scope.has_value() ? scope->size() : 0;
+      checks.Expect(body.size() <= plain + sync::kMaxRomScopeBytes,
+                    "and costs at most kMaxRomScopeBytes more than an unscoped body: " +
+                        std::to_string(body.size()) + " against " + std::to_string(plain));
+    }
+    checks.ExpectEq(named, card.size(), "between them, every rom on the card once");
+    int count = 0;
+    PlannedFor(tick, rom.id, slot, &count);
+    checks.ExpectEq(count, 1, "the server's save is offered once, by the chunk that names it");
+    bool in_scope = true;
+    for (const sync::SyncOperation& operation : tick.negotiated.plan.operations) {
+      in_scope = in_scope && std::find(card.begin(), card.end(), operation.rom_id) != card.end();
+    }
+    checks.Expect(in_scope, "and nothing outside the card is offered by any of them");
+    checks.ExpectEq(recording.completed, 3, "every session is completed");
+    checks.Expect(tick.finished.reported.ok(), "the first by the tick's own accounting");
+    checks.ExpectEq(tick.other_sessions.size(), std::size_t{2}, "and the other two beside it");
+  }
+
+  harness::DeleteSave(client, base, fixture, server.id);
+  harness::DeleteDevice(client, base, fixture, device);
+}
+
+/// #241: a rom just downloaded has its save restored even when this device
+/// synced that save before -- which RomM otherwise reads as the user having
+/// deleted it -- and only that rom is asked with `restore_unlisted`.
+void Restore(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+             const Fixture& fixture, const harness::Rom& rom) {
+  const std::string device = harness::CreateDevice(checks, client, base, fixture, "tick-restore");
+  if (device.empty()) {
+    return;
+  }
+  Sandbox sandbox(checks, "tick-restore");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  sandbox.MakeDirs(harness::kSavesDir);
+  const std::string slot = harness::UniqueSlot("m10-15-restore");
+  const std::string bytes = "the save that goes with the rom " + slot + "\n";
+  const std::string staged = sandbox.Host("/config/rommsync/server-copy.srm");
+  rig::WriteFile(staged, bytes);
+  harness::Save server;
+  if (!harness::UploadSave(client, base, fixture, rom.id, slot, "m2-7", staged, "restore.srm",
+                           /*with_device=*/false, &server)) {
+    checks.Expect(false, "the server holds the save");
+    harness::DeleteDevice(client, base, fixture, device);
+    return;
+  }
+
+  auth::StoredToken token = TokenFor(base, fixture);
+  token.device_id = device;
+  Recording recording(client);
+  const std::string placed = SavePath("restore.srm");
+  sync::TickOptions options = OptionsAt(1'757'000'500);
+  options.execute.place = [&slot, &placed](const sync::SyncOperation& operation) {
+    rommsync::place::Placement placement;
+    if (operation.slot.has_value() && *operation.slot == slot) {
+      placement.sd_path = placed;
+    } else {
+      placement.reason = "not this scenario's save";
+    }
+    return placement;
+  };
+  options.rom_scope = std::vector<std::int64_t>{rom.id};
+
+  // Synced once: the save is on the card, and this device has a history of it.
+  sync::RunTick(recording, *files, token, {}, {}, state::Baseline{}, options);
+  checks.ExpectEq(sandbox.Read(placed), bytes, "the first tick restores the save");
+
+  // The rom and its save are deleted. RomM reads the missing save as one the
+  // user deleted, and offers nothing.
+  std::error_code error;
+  std::filesystem::remove(sandbox.Host(placed), error);
+  {
+    const sync::TickResult tick =
+        sync::RunTick(recording, *files, token, {}, {}, state::Baseline{}, options);
+    int count = 0;
+    checks.Expect(tick.negotiated.ok() && PlannedFor(tick, rom.id, slot, &count) == nullptr,
+                  "an ordinary tick does not bring back a save this device synced and lost");
+  }
+
+  // Downloaded again: asked about on its own, restoring, and the save is back.
+  recording.Clear();
+  const std::int64_t other = 900'000'002;
+  options.rom_scope = std::vector<std::int64_t>{rom.id, other};
+  options.restore_roms = {rom.id};
+  {
+    const sync::TickResult tick =
+        sync::RunTick(recording, *files, token, {}, {}, state::Baseline{}, options);
+    checks.ExpectEq(recording.negotiations.size(), std::size_t{2},
+                    "the card's other roms, and the downloaded one apart");
+    for (const std::string& body : recording.negotiations) {
+      bool restoring = false;
+      const std::optional<std::vector<std::int64_t>> scope = ScopeOf(body, &restoring);
+      if (scope == std::vector<std::int64_t>{rom.id}) {
+        checks.Expect(restoring, "the downloaded rom's negotiation restores");
+      } else {
+        checks.Expect(!restoring && scope == std::vector<std::int64_t>{other},
+                      "and the other one does not, and does not name it");
+      }
+    }
+    int count = 0;
+    const sync::SyncOperation* offered = PlannedFor(tick, rom.id, slot, &count);
+    checks.Expect(offered != nullptr && offered->action == sync::Action::kDownload && count == 1,
+                  "the save is offered once, as a download");
+    checks.ExpectEq(sandbox.Read(placed), bytes, "and it is back on the card");
+    checks.ExpectEq(recording.completed, 2, "both sessions are completed");
+  }
+
+  harness::DeleteSave(client, base, fixture, server.id);
+  harness::DeleteDevice(client, base, fixture, device);
+}
+
 // --- deleted ------------------------------------------------------------------
 //
 // M10-7 (#233)'s acceptance, on the live 5.4.0: a save this console uploaded is
@@ -3470,6 +3736,10 @@ int main(int argc, char** argv) {
     Isolated(checks, *client, base, fixture);
   } else if (scenario == "isolated_ids") {
     IsolatedIds(checks, *client, base, fixture);
+  } else if (scenario == "scoped") {
+    Scoped(checks, *client, base, fixture, rom);
+  } else if (scenario == "restore") {
+    Restore(checks, *client, base, fixture, rom);
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;

@@ -32,6 +32,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -538,6 +539,43 @@ void EncodesTheRomScope(checks::Checks& c) {
   c.Expect(!sync::EncodeNegotiateRequest(payload).ok(), "and so is a rom id that is not one");
 }
 
+/// #241: `restore_unlisted` is sent only when asked for -- RomM reads it as
+/// "every save I did not list is lost", so a body that carried `false` by habit
+/// would be one edit away from a console re-downloading what its user deleted.
+/// And the scope a chunk adds stays inside `kMaxRomScopeBytes`, the number the
+/// heap table's negotiate row is written from (#217, #246).
+void EncodesRestoreUnlisted(checks::Checks& c) {
+  sync::SyncNegotiatePayload payload;
+  payload.saves.push_back(SampleSave());
+  const sync::Encoded plain = sync::EncodeNegotiateRequest(payload);
+  {
+    const json::ParseResult document = json::Parse(plain.body);
+    c.Expect(document.ok() && document.value.Find("restore_unlisted") == nullptr,
+             "an ordinary negotiation sends no restore_unlisted at all");
+  }
+  payload.restore_unlisted = true;
+  {
+    const sync::Encoded restoring = sync::EncodeNegotiateRequest(payload);
+    const json::ParseResult document = json::Parse(restoring.body);
+    const json::Value* flag = document.ok() ? document.value.Find("restore_unlisted") : nullptr;
+    c.Expect(flag != nullptr && flag->is_bool() && flag->boolean(),
+             "a restoring one sends it as true: " + restoring.body);
+  }
+  payload.restore_unlisted = false;
+
+  // The widest scope there is: 500 ids, each the largest a JSON integer here
+  // can be. 9223372036854775807 is 19 digits.
+  payload.rom_ids =
+      std::vector<std::int64_t>(sync::kMaxNegotiateRomIds, std::numeric_limits<std::int64_t>::max());
+  const sync::Encoded widest = sync::EncodeNegotiateRequest(payload);
+  c.Expect(widest.ok(), "500 of the largest ids encode");
+  c.Expect(widest.body.size() - plain.body.size() <= sync::kMaxRomScopeBytes,
+           "and add at most kMaxRomScopeBytes to the body: " +
+               std::to_string(widest.body.size() - plain.body.size()));
+  c.Expect(sync::kMaxRomScopeBytes <= 10 * 1024,
+           "which is under 10 KiB -- a fraction of the heap table's 94 KiB margin (#217)");
+}
+
 /// #236: `emulators` (RomM 5.4) pairs and offers only server saves one of these
 /// wrote, so a lineage this console cannot load is never downloaded.
 void EncodesTheEmulatorFilter(checks::Checks& c) {
@@ -735,6 +773,7 @@ int main() {
   EncodesTheAbsentFieldsAsNull(c);
   EncodesAnEmptyLibrary(c);
   EncodesTheRomScope(c);
+  EncodesRestoreUnlisted(c);
   EncodesTheEmulatorFilter(c);
   QuotesRatherThanConcatenates(c);
   RefusesWhatItCannotSendFaithfully(c);
