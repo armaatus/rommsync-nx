@@ -88,10 +88,15 @@ std::string ToString(const Version& version);
 
 /// What one server can do, and the version it was inferred from.
 ///
-/// Every behaviour that depends on the server's release asks one of these
-/// fields -- #232's `overwrite=false`, #233's `delete`, #234's `content_hash`,
-/// #245's device `capabilities` -- so that the day a release changes one,
-/// `CapabilitiesFor` is the single edit.
+/// A behaviour that depends on the server's release asks one of these fields --
+/// #233's `delete`, #234's `content_hash`, #241's `rom_ids`, #245's device
+/// `capabilities` -- so that the day a release
+/// changes one, `CapabilitiesFor` is where it is said. Not all of them: below
+/// `kMinimumVersion` nothing syncs, so a 5.4 behaviour every supported server
+/// has is sent unconditionally -- #232's `overwrite=false` (`sync_execute.cpp`),
+/// #241's `restore_unlisted` (set where `rom_ids` is) -- and its field, where it
+/// has one, is read by nothing yet. A release that changes one of those is a
+/// second edit, at the call.
 struct ServerCapabilities {
   /// The version as the server spelled it, cut to `kMaxVersionBytes`. Empty
   /// when the heartbeat carried none.
