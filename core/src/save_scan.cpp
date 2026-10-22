@@ -482,14 +482,14 @@ std::vector<ScanFolder> PlanFolders(const config::Config& config,
   // Every mapped rom folder, which is one whatever led the scan to it: a
   // `savefile_directory` naming one, or a folder sorted by core above them,
   // still holds roms, and a rom download still stages its `.tmp` there.
-  std::set<std::string> rom_folders;
+  std::set<std::string> mapped_roms;
   for (const auto& [slug, mapped] : config.platforms) {
     for (const std::string& directory : mapped.roms) {
-      rom_folders.insert(LowerAscii(directory));
+      mapped_roms.insert(LowerAscii(directory));
     }
   }
-  const auto is_rom_folder = [&rom_folders](const std::string& directory) {
-    return rom_folders.count(LowerAscii(directory)) > 0;
+  const auto is_rom_folder = [&mapped_roms](const std::string& directory) {
+    return mapped_roms.count(LowerAscii(directory)) > 0;
   };
 
   std::vector<ScanFolder> plan;
@@ -1017,7 +1017,7 @@ ScanResult ScanStates(const config::Config& config, const retroarch::Settings& r
            return Emit::kSkipped;
          }
          if (past_bound) {
-           return Emit::kPastBound;
+           return Emit::kPastBound;  // a state, and the first one the walk has no room for
          }
 
          const std::string real_path = files.Resolve(file.sd_path);

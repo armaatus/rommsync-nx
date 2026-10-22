@@ -789,6 +789,46 @@ void Truncated(::checks::Checks& checks) {
     checks.Expect(std::find(full.folders.begin(), full.folders.end(), "/tico/saves/snes") !=
                       full.folders.end(),
                   "bound, then non-saves: a later folder is still read");
+
+    // And a save past those non-saves is still the one the bound refuses.
+    index.Add(MakeRom(static_cast<std::int64_t>(scan::kMaxSaves) + 2, "Snes Late", "snes"));
+    card.AddFile("/tico/saves/snes", "Snes Late.srm", 16, kMtime);
+    const scan::ScanResult over =
+        scan::ScanSaves(config::Defaults(), kRetroArchDefaults, index, card, kFirstTick);
+    checks.Expect(over.stopped_at_bound &&
+                      SkippedFor(over, "/tico/saves/snes/Snes Late.srm",
+                                 scan::SkipReason::kTooManySaves),
+                  "bound, non-saves, then a save: that save is where the walk stopped");
+  }
+
+  // States share the walk, against their own bound.
+  {
+    config::Config states = config::Defaults();
+    states.sync.states = true;
+    roms::RomIndex index;
+    FakeFileSystem card("bound-states");
+    for (std::size_t at = 0; at < scan::kMaxStates; ++at) {
+      std::string name = std::to_string(at);
+      name.insert(name.begin(), 4 - name.size(), '0');
+      index.Add(MakeRom(static_cast<std::int64_t>(at) + 1, "Game " + name, "gba"));
+      card.AddFile("/tico/states/gba", "Game " + name + ".state", 16, kMtime);
+    }
+    card.AddFile("/tico/states/gba", "Zzz No Rom.state", 16, kMtime);
+    const scan::ScanResult full =
+        scan::ScanStates(states, kRetroArchDefaults, index, card, kFirstTick);
+    checks.ExpectEq(full.states.size(), scan::kMaxStates, "states at the bound: every state");
+    checks.Expect(!full.stopped_at_bound,
+                  "states at the bound, then a non-state: read whole: " + full.DescribeSkipped());
+
+    index.Add(MakeRom(static_cast<std::int64_t>(scan::kMaxStates) + 1, "Zzz Late", "gba"));
+    card.AddFile("/tico/states/gba", "Zzz Late.state", 16, kMtime);
+    const scan::ScanResult over =
+        scan::ScanStates(states, kRetroArchDefaults, index, card, kFirstTick);
+    checks.ExpectEq(over.states.size(), scan::kMaxStates, "states past the bound: the bound");
+    checks.Expect(over.stopped_at_bound &&
+                      SkippedFor(over, "/tico/states/gba/Zzz Late.state",
+                                 scan::SkipReason::kTooManyStates),
+                  "states past the bound: stopped at the state it had no room for");
   }
 }
 
@@ -1160,6 +1200,20 @@ void RetroArch(::checks::Checks& checks) {
     const scan::SaveFile* gba = FindSave(sorted, "Gba Game.srm");
     checks.Expect(gba != nullptr && gba->emulator == "mgba" && Read(sorted, "/tico/roms/mGBA"),
                   "savefile_directory above the rom folders: a real core folder is read as one");
+
+    // The map's own save folder, when it names the platform's rom folder.
+    config::Config beside_map = defaults;
+    beside_map.platforms["gba"].saves = {"/tico/roms/gba"};
+    RetroArchCard mapped("map-into-roms");
+    mapped.Save("/tico/roms/gba", "Gba Game.gba");
+    mapped.Save("/tico/roms/gba", "Gba Game.srm");
+    const scan::ScanResult map =
+        scan::ScanSaves(beside_map, kRetroArchDefaults, index, mapped.files, kFirstTick);
+    checks.Expect(FindSave(map, "Gba Game.gba") == nullptr &&
+                      FindSave(map, "Gba Game.srm") != nullptr,
+                  "a map save folder that is a rom folder: the save, not the rom");
+    checks.Expect(!Read(map, "/tico/roms/gba"),
+                  "a map save folder that is a rom folder: not offered to the .tmp sweep");
   }
 
   // Cloud Sync on: RetroArch syncs itself and every RetroArch folder is left
