@@ -66,6 +66,7 @@
 //                half refused or offline, and its own 401 counts towards the gate
 //   install_settle -- a report the link did not carry stops the pass; the rest are
 //                reported once it does
+//   install_wake -- a refused claim is asked again after a wake, not only a boot
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -5316,6 +5317,88 @@ int InstallSettle(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// Remote install asked again after a wake (review of #245). A Switch mostly
+/// sleeps rather than reboots, so "until the server is read again" cannot mean
+/// "until the next boot": a claim refused once -- the feature off for a moment,
+/// as RomM answers a claim 404 then -- has to be asked again when the console
+/// wakes, and so does a heartbeat that said the feature was off.
+int InstallWake(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  const std::string name = "engine-install-wake";
+  InstallConsole device;
+  if (!AdoptInstallDevice(c, client, base, fixture, name, &device)) {
+    return c.failures();
+  }
+  const auth::StoredToken& token = device.token;
+
+  rlog::Reset();
+  const TickLines ticks;
+  Console console(c, name);
+  if (!ConfigureInstallConsole(c, console, base, token)) {
+    return c.failures();
+  }
+  Intercepting wire(client);
+  std::atomic<bool> refuse{true};
+  wire.Use([&](const http::Request& request) -> std::optional<http::Result> {
+    if (refuse.load() && Asks(request, http::Method::kPost, "/installs/claim")) {
+      return Answered(404);
+    }
+    return std::nullopt;
+  });
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseCard(card.get());
+  console.engine.UseServer(&wire, std::string());
+  console.Boot();
+  console.engine.StartWorker();
+
+  const auto claims = [&] { return wire.Count(http::Method::kPost, "/installs/claim"); };
+  TickOnce(console, ticks, c, "the tick whose claim is refused");
+  c.ExpectEq(claims(), std::size_t{1}, "the claim was asked, and answered 404");
+
+  // The server is fine again, and the user queues a rom for this console.
+  refuse = false;
+  const std::int64_t started = rig::LatestNotificationId(client, base);
+  c.ExpectEq(rig::AsTheUser(client, base, "/api/devices/" + token.device_id + "/installs",
+                            "{\"rom_id\":" + std::to_string(device.nova) + "}")
+                 .response.status,
+             201, "the web UI queues nova for it");
+  TickOnce(console, ticks, c, "a tick on the same boot");
+  c.ExpectEq(claims(), std::size_t{1},
+             "the refusal stands while the console stays awake: no claim every tick");
+
+  // Asleep, and awake again -- the console's ordinary day.
+  const std::size_t heartbeats = wire.Count(http::Method::kGet, "/api/heartbeat");
+  console.engine.Quiesce();
+  console.engine.Resume();
+  TickOnce(console, ticks, c, "the first tick after the wake");
+  c.Expect(wire.Count(http::Method::kGet, "/api/heartbeat") > heartbeats,
+           "the wake reads the server again: what it says of remote install may have changed");
+  c.ExpectEq(claims(), std::size_t{2}, "and claims again" + Rendered(console.Log()));
+
+  const std::chrono::steady_clock::time_point by =
+      std::chrono::steady_clock::now() + std::chrono::seconds{120};
+  const auto open = [&] { return install::Claim(client, base, token).page.requests.size(); };
+  while ((!console.sandbox.Exists("/tico/roms/nes/nova.nes") || open() != 0) &&
+         std::chrono::steady_clock::now() < by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  }
+  c.Expect(console.sandbox.Exists("/tico/roms/nes/nova.nes"),
+           "the rom the browser queued is on the card" + Rendered(console.Log()));
+  c.ExpectEq(rig::InstallNoticesSince(client, base, started, "rommsync-nx " + name, "done"),
+             std::size_t{1}, "and reported done");
+
+  // The download asks for a tick of its own (#241); let it end before teardown.
+  UntilQuiet(console, wire, http::Method::kPost, "/api/sync/negotiate", std::chrono::seconds{1});
+  install::Register(client, base, token, false);
+  harness::DeleteDevice(client, base, fixture, token.device_id);
+  return c.failures();
+}
+
 /// The scenarios that need the docker RomM, by name. A table rather than a
 /// second `if` chain, so the list of them is written down once.
 struct RigScenario {
@@ -5350,6 +5433,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"remote_install", RemoteInstall},
       {"states_guard", StatesGuarded},
       {"install_settle", InstallSettle},
+      {"install_wake", InstallWake},
   };
   for (const RigScenario& scenario : kRigScenarios) {
     if (name == scenario.name) {

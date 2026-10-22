@@ -2363,6 +2363,7 @@ set(ENGINE_RIG_SCENARIOS
   remote_install     # #245: a rom queued in RomM's web UI is claimed, downloaded and reported done
   states_guard       # review: no states half under a game or after a refused saves half; its 401 counts
   install_settle     # review: an install report the link did not carry stops the pass, not each claim
+  install_wake       # review: a refused remote-install claim is asked again after a wake
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
