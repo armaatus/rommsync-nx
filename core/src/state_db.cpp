@@ -1,6 +1,7 @@
 #include "rommsync/state_db.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -22,6 +23,10 @@
 
 namespace rommsync::state {
 namespace {
+
+/// `testing::SetBetweenReads`'s hook. Atomic for `io::SetFileSync`'s reason:
+/// set from one place, never swapped mid-read.
+std::atomic<testing::BetweenReads> g_between_reads{nullptr};
 
 std::string Describe(const std::string& path, std::string_view what) {
   return path + ": " + std::string(what);
@@ -607,6 +612,9 @@ io::BoundedRead Load(const std::string& path, LoadedBaseline* out) {
       return outcome;
     }
   }
+  if (const testing::BetweenReads hook = g_between_reads.load(); hook != nullptr) {
+    hook(path);
+  }
   std::FILE* file = std::fopen(path.c_str(), "rb");
   if (file == nullptr) {
     return io::BoundedRead::kUnreadable;
@@ -856,6 +864,12 @@ LoadedBaseline LoadBaseline(const std::string& path) {
   }
   return loaded;
 }
+
+namespace testing {
+
+BetweenReads SetBetweenReads(BetweenReads hook) { return g_between_reads.exchange(hook); }
+
+}  // namespace testing
 
 StoreResult SaveBaseline(const std::string& path, const Baseline& baseline) {
   StoreResult result;

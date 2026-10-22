@@ -908,6 +908,61 @@ void ARc1FileOverTheBoundsKeepsItsStates(checks::Checks& c) {
   c.Expect(state::ParseBaseline(past).value.empty(), "a v2 file past rc1's 512 rows is discarded");
 }
 
+/// `WriteAtomically`'s first rename, landing between the bounded read of a file
+/// past `kMaxStateBytes` and the streamed read of it (#255). It used to reopen
+/// the path there, find nothing, and call the file unreadable -- skipping the
+/// `.old` recovery a missing file gets, and costing the library a re-hash and
+/// rc1's states their rows.
+void ACommitWindowMidReadStillYieldsTheBaseline(checks::Checks& c) {
+  std::string v2 = "rommsync-state 2\n";
+  for (std::size_t at = 0; at < 200; ++at) {
+    v2 += "{\"rom_id\":" + std::to_string(1000 + at) +
+          ",\"slot\":\"retroarch-srm\",\"content_hash\":\"" + crypto::Md5Hex(std::to_string(at)) +
+          "\",\"mtime\":1757000000,\"file_size_bytes\":32768,\"server_updated_at\":1757000100,"
+          "\"server_content_hash\":\"" + crypto::Md5Hex("server " + std::to_string(at)) + "\"}\n";
+  }
+  v2 += "{\"kind\":\"state\",\"rom_id\":1000,\"file_name\":\"Game (USA).state\",\"emulator\":"
+        "\"tico\",\"content_hash\":\"" + crypto::Md5Hex("state") +
+        "\",\"mtime\":1757000100,\"file_size_bytes\":4,\"server_state_id\":1,"
+        "\"server_updated_at\":1757000090,\"server_file_size_bytes\":4}\n";
+  c.Expect(v2.size() > state::kMaxStateBytes, "the fixture is past this build's byte bound");
+
+  const std::filesystem::path path = FreshPath("mid-read.db");
+  WriteWhole(path.string(), v2);
+  const state::testing::BetweenReads previous =
+      state::testing::SetBetweenReads([](const std::string& at) {
+        std::error_code ignored;
+        std::filesystem::rename(at, io::PreviousPathFor(at), ignored);
+      });
+  const state::LoadedBaseline loaded = state::LoadBaseline(path.string());
+  state::testing::SetBetweenReads(previous);
+
+  c.Expect(!std::filesystem::exists(path) &&
+               std::filesystem::exists(io::PreviousPathFor(path.string())),
+           "the rename did land mid-read");
+  c.ExpectEq(loaded.version, state::kSourceSlotVersion,
+             "the baseline is still read -- " + loaded.DescribeDiagnostics());
+  c.Expect(loaded.value.FindState(1000, "Game (USA).state") != nullptr,
+           "with rc1's state row, which nothing rebuilds");
+  c.Expect(!Mentions(loaded, "could not be read"),
+           "and not called unreadable -- " + loaded.DescribeDiagnostics());
+}
+
+/// A later release's file past this build's byte bound is still a later
+/// release's file, said as one -- not "larger than a baseline can be".
+void ANewerFilePastTheBoundIsStillNewer(checks::Checks& c) {
+  const std::filesystem::path path = FreshPath("newer-huge.db");
+  std::string text = "rommsync-state " + std::to_string(state::kFormatVersion + 1) + "\n";
+  while (text.size() <= state::kMaxStateBytes) {
+    text += "{\"a row\":\"of a format this build has never seen\"}\n";
+  }
+  WriteWhole(path.string(), text);
+  const state::LoadedBaseline loaded = state::LoadBaseline(path.string());
+  c.Expect(loaded.value.empty(), "a newer state.db past the bound is discarded");
+  c.Expect(Mentions(loaded, "written by a newer release"),
+           "as a newer release's -- " + loaded.DescribeDiagnostics());
+}
+
 void TooManyRowsIsRefused(checks::Checks& c) {
   std::string text = std::string(state::kFormatMagic) + " " +
                      std::to_string(state::kFormatVersion) + "\n";
@@ -1070,6 +1125,8 @@ int main() {
   AnUnusableOldIsNotABrandNewCard(c);
   OversizedFilesAreRefusedBySize(c);
   ARc1FileOverTheBoundsKeepsItsStates(c);
+  ACommitWindowMidReadStillYieldsTheBaseline(c);
+  ANewerFilePastTheBoundIsStillNewer(c);
   TooManyRowsIsRefused(c);
   AMissingFileIsReportedAndNotAFailure(c);
   HashesAFileTheWayTheServerWill(c);

@@ -437,7 +437,24 @@ std::size_t AdoptLegacySaves(
 /// intact under `state.db.old`. A file that exists and will not open does not
 /// take it -- that is a bad moment, not a commit window -- and yields an empty
 /// baseline, which is safe here in a way it would not be for `device.dat`.
+///
+/// A file past `kMaxStateBytes` is read twice -- bounded, then streamed, for an
+/// rc1 file -- through **one** open (#255). Reopening it left a window in which
+/// `WriteAtomically`'s first rename made the file absent, and the second open's
+/// failure was then read as an unreadable file rather than the commit window
+/// `.old` exists for.
 LoadedBaseline LoadBaseline(const std::string& path);
+
+namespace testing {
+
+/// Called by `LoadBaseline` with the path after the bounded read of a file past
+/// `kMaxStateBytes` and before it is streamed: the moment another writer's
+/// rename could land, made reachable by a test. Null, the default, is nothing.
+/// Returns the hook it replaced.
+using BetweenReads = void (*)(const std::string& path);
+BetweenReads SetBetweenReads(BetweenReads hook);
+
+}  // namespace testing
 
 /// Why writing the baseline did not work. Mirrors `auth::StoreError`.
 ///
