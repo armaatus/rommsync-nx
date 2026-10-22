@@ -363,6 +363,11 @@ struct ScanResult {
 ///     with a `kDirectoryFailed` skip saying so: the bound counts the roms;
 ///   - with a per-content-directory layout, nothing: it is not read.
 ///
+/// **A folder the map lists as `roms` is a rom folder however the scan got to
+/// it** -- `savefile_directory` naming one, or a sorted folder above them making
+/// each a "core" folder: read as the content-dir rule above reads one, and
+/// never in `ScanResult::folders`.
+///
 /// The folder map's own entry for that folder is not read a second time, flat,
 /// beside it. And while `retroarch::Enabled` says no -- RetroArch's Cloud Sync,
 /// or `[sources] retroarch = off` -- no RetroArch folder is read at all, the

@@ -283,6 +283,11 @@ A folder holds at most 512 entries as far as the client is concerned, the first
 table names read; a rom folder past it is read only as far as that, and the
 skip says so. At most 64 RetroArch core folders are read in one sync.
 
+A folder the map lists as `roms` is read as one however the scan got there —
+`savefile_directory` naming it, or a sorted folder above the rom folders: only
+`.srm`/`.rtc` (`.state`, `.stateN`) in it, a subfolder only when RomM's table
+names the core, and its `.tmp`s are left to the rom download that staged them.
+
 RetroArch's folders are read before the map's, so when the map's
 `/retroarch/saves` still holds an older copy of a save, the copy RetroArch
 actually reads is the one that syncs. The map's entry for the folder

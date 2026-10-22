@@ -479,14 +479,28 @@ std::vector<ScanFolder> PlanFolders(const config::Config& config,
     return found == hints.end() ? std::string() : found->second;
   };
 
+  // Every mapped rom folder, which is one whatever led the scan to it: a
+  // `savefile_directory` naming one, or a folder sorted by core above them,
+  // still holds roms, and a rom download still stages its `.tmp` there.
+  std::set<std::string> rom_folders;
+  for (const auto& [slug, mapped] : config.platforms) {
+    for (const std::string& directory : mapped.roms) {
+      rom_folders.insert(LowerAscii(directory));
+    }
+  }
+  const auto is_rom_folder = [&rom_folders](const std::string& directory) {
+    return rom_folders.count(LowerAscii(directory)) > 0;
+  };
+
   std::vector<ScanFolder> plan;
   // FAT32 ignores case, so `/RetroArch/saves` and `/retroarch/saves` are one
   // folder, and reading it twice makes every save in it a duplicate of itself.
   std::set<std::string> planned;
-  const auto add = [&plan, &planned](ScanFolder folder) {
+  const auto add = [&plan, &planned, &is_rom_folder](ScanFolder folder) {
     if (!planned.insert(LowerAscii(folder.directory)).second) {
       return false;
     }
+    folder.beside_roms = folder.beside_roms || is_rom_folder(folder.directory);
     plan.push_back(std::move(folder));
     return true;
   };
@@ -565,7 +579,8 @@ std::vector<ScanFolder> PlanFolders(const config::Config& config,
         directory = fallback;
         decided.insert(LowerAscii(fallback));
       }
-      bases.push_back({directory, RetroArchFlat(directory), hint_for(directory), false});
+      bases.push_back(
+          {directory, RetroArchFlat(directory), hint_for(directory), is_rom_folder(directory)});
     }
 
     for (ScanFolder& base : bases) {
