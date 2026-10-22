@@ -2323,6 +2323,7 @@ set(ENGINE_RIG_SCENARIOS
   interop      # #236: RetroArch's Cloud Sync save reaches Tico's folder, and the Switch's reaches RetroArch
   upgrade      # #236: rc1's state.db and tico-srm rows: no data lost, no duplicate upload
   placement    # #237: a first-time restore lands in Tico's folder under the rom's name, and stays one save
+  download_restores  # #241: a downloaded rom's save is placed before the next scheduled tick
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})

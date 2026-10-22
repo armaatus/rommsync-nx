@@ -1150,6 +1150,12 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// has no use for "queued" as distinct from "copying", and the worker does.
   bool restore_pending_ = false;
 
+  /// Roms downloaded since the last tick that negotiated, whose saves that tick
+  /// asks for with `restore_unlisted` (#241). Guarded by `mutex_`; at most
+  /// `sync::kMaxNegotiateRomIds`, past which a rom is an ordinary rom on the
+  /// card -- its save still comes, unless this device synced it before.
+  std::vector<std::int64_t> fresh_roms_;
+
   /// The last tick's outcome, as the status screen reads it.
   std::int64_t last_sync_at_ = 0;
   ipc::SyncResult last_sync_result_ = ipc::SyncResult::kNever;

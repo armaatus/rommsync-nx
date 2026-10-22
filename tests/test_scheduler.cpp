@@ -255,6 +255,14 @@ void OnDemand(checks::Checks& c) {
   c.Expect(scheduler.Poll().run(), "the first press runs");
   scheduler.Finished(TickOutcome::kCompleted);
   c.Expect(scheduler.Poll().parked, "and the second is the same tick, not another one");
+
+  // A rom just downloaded (#241): a tick now, which nobody pressed for.
+  scheduler.RunSoon();
+  c.Expect(!scheduler.requested(), "a download's tick does not read as a press");
+  const Decision soon = scheduler.Poll();
+  c.Expect(soon.trigger == Trigger::kInterval, "and runs as the schedule's own tick");
+  scheduler.Finished(TickOutcome::kCompleted);
+  c.Expect(scheduler.Poll().parked, "once");
 }
 
 /// The switch. A disabled scheduler never fires -- not on boot, not on a timer,
@@ -269,6 +277,7 @@ void Disabled(checks::Checks& c) {
   c.ExpectEq(RunFor(scheduler, clocks, hours{24}, minutes{1}, TickOutcome::kCompleted), 0,
              "and fires nothing over a day at a five-minute interval");
   c.Expect(!scheduler.RequestNow(), "a Sync now against the switch is refused, not queued");
+  scheduler.RunSoon();
   c.Expect(scheduler.Poll().parked, "so nothing is waiting when it is switched back on");
   // ...and neither is one that was already waiting when the switch went off,
   // which is the case `Poll` and not `Reconfigure` has to catch.

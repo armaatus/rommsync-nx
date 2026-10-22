@@ -25,6 +25,7 @@
 #include "rommsync/placement.hpp"
 #include "rommsync/play_sessions.hpp"
 #include "rommsync/retroarch_cfg.hpp"
+#include "rommsync/rom_scope.hpp"
 #include "rommsync/rom_index.hpp"
 #include "rommsync/save_scan.hpp"
 #include "rommsync/scheduler.hpp"
@@ -201,6 +202,8 @@ void SdEngine::ForgetServerLocked(bool different_server) {
   if (different_server) {
     server_caps_ = server::ServerCapabilities{};
     server_too_old_ = false;
+    // Another server's rom ids.
+    fresh_roms_.clear();
   }
 }
 
@@ -1206,6 +1209,19 @@ SdEngine::DrainStep SdEngine::RunOneDrain() {
   LogDrain(result);
 
   std::lock_guard<std::mutex> lock(mutex_);
+  if (!result.done.empty()) {
+    // A rom that has just arrived has its save on the server and none on the
+    // card, and the user is about to launch it. The tick that brings it runs
+    // now rather than at the interval (#241); `RunSoon` does nothing while
+    // sync is switched off.
+    for (const std::int64_t rom_id : result.done) {
+      if (fresh_roms_.size() < sync::kMaxNegotiateRomIds &&
+          std::find(fresh_roms_.begin(), fresh_roms_.end(), rom_id) == fresh_roms_.end()) {
+        fresh_roms_.push_back(rom_id);
+      }
+    }
+    scheduler_.RunSoon();
+  }
   if (download_wakes_ != asked_at) {
     // A command that changes what a drain would decide landed while this one
     // was running, and cleared the pacing on the way past. Writing this drain's
@@ -1788,6 +1804,13 @@ bool SdEngine::RunOneTick() {
 
   const std::string baseline_path = files->Resolve(sync::kStateSdPath);
   const state::LoadedBaseline loaded = LoadBaselineFor(baseline_path, *config);
+  // Taken here and let go only once a negotiation has asked for them, so an
+  // offline tick keeps them for the next (#241).
+  std::vector<std::int64_t> fresh;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    fresh = fresh_roms_;
+  }
   // Where RetroArch keeps its saves this tick, and whether it syncs them itself
   // (#230). Read every tick rather than at boot: RetroArch rewrites its file on
   // exit, from another process, and a client that kept the boot-time answer
@@ -1867,6 +1890,19 @@ bool SdEngine::RunOneTick() {
   if (caps.emulators_filter) {
     options.negotiate.emulators = scan::EmulatorFilter(*config, scanned.saves);
   }
+  // Only the roms on the card are asked about, so a save of a game this
+  // console does not hold is not placed beside nothing (#241) -- and a rom
+  // just downloaded is asked about on its own, so its save comes with it.
+  if (caps.rom_ids) {
+    sync::RomsOnCard on_card = sync::FindRomsOnCard(*config, library.index, *files);
+    for (const std::string& folder : on_card.truncated) {
+      log::Warn(log::Event::kScanSkipped,
+                folder + " holds more than " + std::to_string(fs::kMaxDirectoryEntries) +
+                    " entries; roms past the first ones by name get no first-time restore");
+    }
+    options.rom_scope = std::move(on_card.rom_ids);
+    options.restore_roms = fresh;
+  }
   // The check above is the last before the plan. A 409's resolution is a second
   // negotiation and transfer after it, so it asks again (#232 against #242).
   options.hold_resolution = [this]() { return application_running(); };
@@ -1915,6 +1951,16 @@ bool SdEngine::RunOneTick() {
   const sync::TickResult tick =
       sync::RunTick(*client, *files, token, reported, targets, loaded.value, options);
   ObserveAnswer(tick.answer);
+  if (tick.negotiated.ok() && !fresh.empty()) {
+    // Asked for. A rom downloaded while this tick ran is not in `fresh` and stays.
+    std::lock_guard<std::mutex> lock(mutex_);
+    fresh_roms_.erase(std::remove_if(fresh_roms_.begin(), fresh_roms_.end(),
+                                     [&fresh](std::int64_t rom_id) {
+                                       return std::find(fresh.begin(), fresh.end(), rom_id) !=
+                                              fresh.end();
+                                     }),
+                      fresh_roms_.end());
+  }
 
   // The other half of M7-4: drop the sessions RomM accounted for, and keep the
   // ones it did not. A tick that never reached the server releases nothing, and

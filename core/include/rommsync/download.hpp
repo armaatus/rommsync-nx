@@ -926,6 +926,12 @@ struct DrainResult {
   int skipped = 0;
   int failed = 0;
 
+  /// The roms that reached `kDone` this drain, in order -- `downloaded` by id.
+  /// What the engine asks a save for next (#241): a rom that has just arrived
+  /// has an empty save folder, and its save is on the server. A cancelled or
+  /// failed drain still lists the ones it finished.
+  std::vector<std::int64_t> done;
+
   /// Requests actually sent and the backoff actually asked for, so a caller can
   /// see a drain that cost three attempts and a test can check the retry without
   /// waiting it out -- `sync::Negotiation`'s reasoning.

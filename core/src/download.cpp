@@ -1414,6 +1414,7 @@ class Drainer {
     }
 
     result.downloaded = downloaded_;
+    result.done = done_;
     result.skipped = skipped_;
     result.failed = failed_;
     result.attempts = requests_;
@@ -1508,6 +1509,7 @@ class Drainer {
     switch (state) {
       case QueueState::kDone:
         ++downloaded_;
+        done_.push_back(entry.rom_id);
         break;
       case QueueState::kSkipped:
         ++skipped_;
@@ -2144,6 +2146,7 @@ class Drainer {
   std::chrono::milliseconds waited_{0};
   int requests_ = 0;
   int downloaded_ = 0;
+  std::vector<std::int64_t> done_;
   int skipped_ = 0;
   int failed_ = 0;
 };

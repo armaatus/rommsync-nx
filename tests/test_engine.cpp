@@ -2963,6 +2963,23 @@ int DrainPreempted(http::HttpClient& client, const std::string& base) {
              "the worker picks the transfer back up once the tick is done, and finishes it");
   c.Expect(console.sandbox.Exists("/tico/roms/gba/synthetic-large.gba"),
            "so the rom still arrives");
+
+  // The finished rom asks for a tick of its own, to bring its save (#241).
+  // Waited out, so the card is not taken away from under it.
+  const auto ticks_logged = [&console]() {
+    int logged = 0;
+    for (const std::string& line : console.Log().lines) {
+      logged += line.find("sync.tick") != std::string::npos ? 1 : 0;
+    }
+    return logged;
+  };
+  const std::chrono::steady_clock::time_point by =
+      std::chrono::steady_clock::now() + std::chrono::seconds{120};
+  while ((ticks_logged() < 2 || console.Status().sync_in_progress) &&
+         std::chrono::steady_clock::now() < by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  c.ExpectEq(ticks_logged(), 2, "and the download's own tick ran after the press's");
   return c.failures();
 }
 
@@ -4581,8 +4598,15 @@ int Placement(http::HttpClient& client, const std::string& base) {
                  ipc::ToString(status.last_sync_result));
   };
 
-  tick(1);
+  // Not while the card does not hold the game (#241): negotiate names only the
+  // roms on the card, so the save is not offered, let alone placed.
   const std::string placed = "/tico/saves/nes/nova.srm";
+  tick(1);
+  c.Expect(!console.sandbox.Exists(placed),
+           "no save is placed for a rom the card does not hold" + Rendered(console.Log()));
+
+  console.sandbox.Write("/tico/roms/nes/nova.nes", "nova's rom\n");
+  tick(2);
   c.ExpectEq(console.sandbox.Read(placed), server_bytes,
              "the save is in Tico's nes folder under the rom's name" + Rendered(console.Log()));
   for (const char* folder : {"/retroarch/saves", "/retroarch/cores/savefiles"}) {
@@ -4599,11 +4623,87 @@ int Placement(http::HttpClient& client, const std::string& base) {
            "nor under the server's tagged name");
 
   // The next tick reads it back as the save it came from: nothing to upload.
-  tick(2);
+  tick(3);
   c.ExpectEq(SaveIdsFor(client, base, fixture, rom.id).size(), before.size(),
              "the placed save is the server's own, so no tick sends it back as another");
   c.ExpectEq(console.sandbox.Read(placed), server_bytes, "and it is left as it is");
 
+  ClearSlots(client, base, fixture, rom.id);
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
+/// #241's acceptance, through the real engine: the server holds a save, the
+/// console downloads the rom, and the save is in the folder the emulator reads
+/// before the next scheduled tick -- of which there is none: `interval_min = 0`
+/// and no boot tick, so the only tick that can run is the one the download asks
+/// for.
+int DownloadRestores(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom),
+           "the fixture library has nova.nes");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  ClearSlots(client, base, fixture, rom.id);
+  const std::string device_id =
+      harness::CreateDevice(c, client, base, fixture, "engine-download-restores");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+
+  const std::string server_bytes =
+      "nova's save, waiting for the rom " + harness::UniqueSlot("restores") + "\n";
+  {
+    harness::Sandbox staging(c, "engine-download-restores-upload");
+    const std::string staged = staging.Host("/config/rommsync/server-copy.srm");
+    rig::WriteFile(staged, server_bytes);
+    harness::Save server;
+    c.Expect(harness::UploadSave(client, base, fixture, rom.id, "autosave", "fceumm", staged,
+                                 "nova.srm", /*with_device=*/false, &server),
+             "another device's save is on the server");
+  }
+
+  rlog::Reset();
+  const TickLines ticks;
+  Console console(c, "engine-download-restores");
+  if (!PointAtTheRig(console, c, base, fixture, device_id)) {
+    return c.failures();
+  }
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseCard(card.get());
+  console.engine.UseServer(&client, std::string());
+  console.Boot();
+  console.engine.StartWorker();
+
+  // Nothing is on the card, and nothing ticks on its own.
+  std::this_thread::sleep_for(std::chrono::milliseconds{300});
+  c.ExpectEq(ticks.ticks(), 0, "a console with no schedule does not tick by itself");
+
+  std::int32_t position = 0;
+  c.Expect(console.Enqueue(rom.id, &position) == ipc::Error::kOk, "the overlay queues the rom");
+  const std::string placed = "/tico/saves/nes/nova.srm";
+  const std::chrono::steady_clock::time_point by =
+      std::chrono::steady_clock::now() + std::chrono::seconds{120};
+  while (console.sandbox.Read(placed) != server_bytes && std::chrono::steady_clock::now() < by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+  }
+  c.Expect(console.sandbox.Exists("/tico/roms/nes/nova.nes"), "the rom was downloaded");
+  c.ExpectEq(console.sandbox.Read(placed), server_bytes,
+             "and its save is in Tico's nes folder, under the rom's name, with no tick asked "
+             "for" + Rendered(console.Log()));
+  c.Expect(ticks.ticks() >= 1, "brought by the tick the download asked for");
+
+  // Settled before the cleanup, so the tick is not cut off half way.
+  while (console.Status().sync_in_progress && std::chrono::steady_clock::now() < by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
   ClearSlots(client, base, fixture, rom.id);
   harness::DeleteDevice(client, base, fixture, device_id);
   return c.failures();
@@ -4635,6 +4735,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"romm_version", RommVersion},
       {"foreground", Foreground},
       {"tico_accounts", TicoAccounts},
+      {"download_restores", DownloadRestores},
       {"server_deleted", ServerDeleted},
       {"interop", Interop},
       {"upgrade", Upgrade},

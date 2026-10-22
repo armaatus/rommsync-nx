@@ -218,6 +218,13 @@ class Scheduler {
   /// the caller can say so.
   bool RequestNow();
 
+  /// Something on the card changed that a tick should see now rather than at
+  /// the interval: a rom was downloaded, and its save belongs beside it before
+  /// the game is launched (#241). Polled as `kInterval`, ahead of the backoff,
+  /// the way a rescan is -- nobody pressed anything, so `requested()` stays
+  /// false -- and dropped while `enabled` is false.
+  void RunSoon();
+
   /// Whether a request is waiting to be picked up by the next `Poll()` -- one
   /// pressed, or one pressed and handed back by `Defer`.
   bool requested() const { return on_demand_; }
@@ -345,9 +352,9 @@ class Scheduler {
 
   bool on_demand_ = false;
 
-  /// The last tick answered `kRescanNeeded` and is to be run again at once. Kept
-  /// apart from `on_demand_` so a rescan cannot look like a user pressing a
-  /// button -- see `Trigger::kOnDemand`.
+  /// The last tick answered `kRescanNeeded`, or `RunSoon` was asked, and a tick
+  /// is to run at once. Kept apart from `on_demand_` so neither can look like a
+  /// user pressing a button -- see `Trigger::kOnDemand`.
   bool rerun_ = false;
 
   /// The boot, rescan or interval trigger `Defer` handed back, or `kNone`. A

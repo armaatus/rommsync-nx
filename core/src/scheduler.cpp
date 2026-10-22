@@ -72,6 +72,12 @@ bool Scheduler::RequestNow() {
   return true;
 }
 
+void Scheduler::RunSoon() {
+  if (config_.enabled) {
+    rerun_ = true;
+  }
+}
+
 std::chrono::milliseconds Scheduler::Elapsed(Steady steady_now, Wall wall_now) const {
   auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(steady_now - last_steady_);
   if (elapsed < std::chrono::milliseconds::zero()) {
