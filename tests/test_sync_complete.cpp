@@ -758,6 +758,44 @@ void Advance(rig::Checks& checks) {
                   "so the file can still be written at all");
   }
 
+  // `kMaxRecords` bounds save rows and state rows together (#246), and the saves
+  // half is handed both. With every save row reported, nothing stale is left to
+  // drop, and a trim of saves alone left a file `SaveBaseline` refused whole on
+  // every tick. State rows go before a save row does, as `TrimStates` has it.
+  {
+    state::Baseline mixed;
+    std::vector<sync::ClientSaveState> all;
+    const std::size_t saves = state::kMaxRecords - 28;
+    for (std::size_t index = 0; index < saves; ++index) {
+      state::SaveRecord row;
+      row.rom_id = static_cast<std::int64_t>(2000 + index);
+      row.slot = "autosave";
+      row.content_hash = crypto::Md5Hex("save " + std::to_string(index));
+      row.mtime = sync::Timestamp{} + std::chrono::seconds{kReportedMtime};
+      row.file_size_bytes = 1;
+      mixed.Set(row);
+      all.push_back(ReportedSave(row.rom_id, "autosave", row.content_hash, kReportedMtime, 1));
+    }
+    for (std::size_t index = 0; index < 32; ++index) {
+      state::StateRecord row;
+      row.rom_id = static_cast<std::int64_t>(2000 + index);
+      row.file_name = "Game " + std::to_string(index) + ".state";
+      row.content_hash = crypto::Md5Hex("state " + std::to_string(index));
+      row.mtime = sync::Timestamp{} + std::chrono::seconds{kReportedMtime};
+      row.server_state_id = static_cast<std::int64_t>(index) + 1;
+      row.server_updated_at = row.mtime;
+      mixed.SetState(row);
+    }
+    const sync::BaselineUpdate fitted =
+        sync::AdvanceBaseline(mixed, sync::SyncPlan{}, sync::ExecutionReport{}, all, *files);
+    checks.ExpectEq(fitted.value.size(), state::kMaxRecords,
+                    "saves and states past the bound are trimmed to it, states first");
+    checks.ExpectEq(fitted.value.rows().size(), saves, "...and every save row stands");
+    checks.Expect(!fitted.warnings.empty(), "...and the drop is said");
+    checks.Expect(state::SaveBaseline(files->Resolve(sync::kStateSdPath), fitted.value).ok(),
+                  "so the file can be written");
+  }
+
   // `kStateSdPath` spells the file name that `state::kStateFileName` owns. Two
   // spellings of it is one tick writing a baseline the next one cannot find.
   {

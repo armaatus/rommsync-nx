@@ -2634,8 +2634,28 @@ void Deleted(rig::Checks& checks, http::HttpClient& client, const std::string& b
   }
   sync::TickOptions after = OptionsAt(1'757'000'902);
   after.execute.on_server_delete = mode;
-  const sync::TickResult third = sync::RunTick(client, *files, token, reported, targets,
-                                               StoredBaseline(*files).value, after);
+  // A baseline at its bound with rows nothing on the card mentions, so the
+  // tick has to trim one. The kept save's mark is not one of them: the file is
+  // on the card, withheld rather than gone, and dropping its row is offering
+  // the deleted bytes again on the tick after.
+  state::Baseline crowded = StoredBaseline(*files).value;
+  for (std::int64_t at = 0; crowded.size() <= state::kMaxRecords; ++at) {
+    state::SaveRecord stale;
+    stale.rom_id = 900'000'000 + at;
+    stale.slot = "deleted-long-ago";
+    stale.content_hash = crypto::Md5Hex("row " + std::to_string(at));
+    stale.mtime = sync::Timestamp{} + std::chrono::seconds{1'700'000'000};
+    crowded.Set(stale);
+  }
+  const sync::TickResult third =
+      sync::RunTick(client, *files, token, reported, targets, std::move(crowded), after);
+  if (keep) {
+    const state::LoadedBaseline trimmed = StoredBaseline(*files);
+    const state::SaveRecord* row = trimmed.value.Find(rom.id, arranged.slot);
+    checks.Expect(row != nullptr && row->deleted_on_server,
+                  "keep: a full baseline trims a row the card no longer holds, never the mark "
+                  "of a save it withheld");
+  }
   checks.Expect(third.outcome == sync::TickOutcome::kCompleted,
                 what + ": the following tick completes: " + sync::ToString(third.outcome));
   int for_slot = 0;
