@@ -1887,6 +1887,12 @@ class Recording final : public http::HttpClient {
     if (request.method == http::Method::kPost &&
         request.url.find("/api/sync/negotiate") != std::string::npos) {
       negotiations.push_back(request.body);
+      const json::ParseResult plan = json::Parse(result.response.body);
+      const json::Value* id = plan.ok() ? plan.value.Find("session_id") : nullptr;
+      sessions.push_back(id != nullptr && id->is_integer() ? id->integer() : 0);
+    } else if (request.method == http::Method::kPost &&
+               request.url.find("/api/saves?") != std::string::npos) {
+      uploads.push_back(request.url);
     } else if (request.method == http::Method::kPost &&
                request.url.find("/complete") != std::string::npos && result.successful()) {
       ++completed;
@@ -1899,10 +1905,14 @@ class Recording final : public http::HttpClient {
 
   void Clear() {
     negotiations.clear();
+    sessions.clear();
+    uploads.clear();
     completed = 0;
   }
 
   std::vector<std::string> negotiations;
+  std::vector<std::int64_t> sessions;  ///< each negotiation's, in order
+  std::vector<std::string> uploads;    ///< every upload's URL
   int completed = 0;
 
  private:
@@ -2106,13 +2116,25 @@ void Restore(rig::Checks& checks, http::HttpClient& client, const std::string& b
   }
 
   // Downloaded again: asked about on its own, restoring, and the save is back.
+  // A save of its own in another slot rides in the same negotiation, and its
+  // upload is that session's, not the first one's.
+  const std::string own_slot = harness::UniqueSlot("m10-15-own");
+  sandbox.SeedSave(SavePath("restore-own.srm"), "this console's own, in another slot\n");
+  sync::ClientSaveState own;
+  if (!LocalSaveOnCard(checks, *files, sandbox, rom.id, "restore-own.srm", own_slot, &own)) {
+    harness::DeleteSave(client, base, fixture, server.id);
+    harness::DeleteDevice(client, base, fixture, device);
+    return;
+  }
+  const std::vector<sync::SaveTarget> targets = {
+      {rom.id, own_slot, SavePath("restore-own.srm"), "restore-own.srm"}};
   recording.Clear();
   const std::int64_t other = 900'000'002;
   options.rom_scope = std::vector<std::int64_t>{rom.id, other};
   options.restore_roms = {rom.id};
   {
     const sync::TickResult tick =
-        sync::RunTick(recording, *files, token, {}, {}, state::Baseline{}, options);
+        sync::RunTick(recording, *files, token, {own}, targets, state::Baseline{}, options);
     checks.ExpectEq(recording.negotiations.size(), std::size_t{2},
                     "the card's other roms, and the downloaded one apart");
     for (const std::string& body : recording.negotiations) {
@@ -2131,8 +2153,29 @@ void Restore(rig::Checks& checks, http::HttpClient& client, const std::string& b
                   "the save is offered once, as a download");
     checks.ExpectEq(sandbox.Read(placed), bytes, "and it is back on the card");
     checks.ExpectEq(recording.completed, 2, "both sessions are completed");
+
+    std::int64_t restoring_session = 0;
+    for (std::size_t index = 0; index < recording.negotiations.size(); ++index) {
+      bool restoring = false;
+      ScopeOf(recording.negotiations[index], &restoring);
+      if (restoring && index < recording.sessions.size()) {
+        restoring_session = recording.sessions[index];
+      }
+    }
+    checks.Expect(recording.uploads.size() == 1 && restoring_session != 0 &&
+                      recording.uploads[0].find("&session_id=" +
+                                                std::to_string(restoring_session) + "&") !=
+                          std::string::npos,
+                  "the save it carried is uploaded under the session that planned it: " +
+                      (recording.uploads.empty() ? std::string("no upload")
+                                                 : recording.uploads[0]));
   }
 
+  std::vector<std::int64_t> own_rows;
+  SaveRowsFor(client, base, fixture, rom.id, own_slot, &own_rows);
+  for (const std::int64_t id : own_rows) {
+    harness::DeleteSave(client, base, fixture, id);
+  }
   harness::DeleteSave(client, base, fixture, server.id);
   harness::DeleteDevice(client, base, fixture, device);
 }
