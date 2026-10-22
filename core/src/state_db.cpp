@@ -713,6 +713,27 @@ std::string SerializeBaseline(const Baseline& baseline) {
   return out;
 }
 
+std::size_t SerializedSize(const SaveRecord& record) {
+  return SerializeRecord(record).size() + 1;
+}
+
+std::size_t SerializedSize(const StateRecord& record) {
+  return SerializeRecord(record).size() + 1;
+}
+
+std::size_t SerializedSize(const Baseline& baseline) {
+  std::size_t bytes = FormatHeader().size() + 1;
+  for (const auto& [key, record] : baseline.rows()) {
+    (void)key;
+    bytes += SerializedSize(record);
+  }
+  for (const auto& [key, record] : baseline.state_rows()) {
+    (void)key;
+    bytes += SerializedSize(record);
+  }
+  return bytes;
+}
+
 LoadedBaseline ParseBaseline(std::string_view text) {
   Parser parser;
   for (std::size_t at = 0; at <= text.size();) {

@@ -41,15 +41,16 @@ std::string Name(std::int64_t rom_id, const std::optional<std::string>& slot) {
   return "rom " + std::to_string(rom_id) + ", slot " + (slot.has_value() ? *slot : "<none>");
 }
 
-/// Drop rows nothing mentioned this tick, but only as far as the bound.
+/// Drop rows nothing mentioned this tick, but only as far as the bounds.
 ///
 /// The failure this exists for is the one #11 named, arriving from the other
 /// side: rows for saves that have been deleted from the card accumulate, and a
-/// baseline over `state::kMaxRecords` is one `SaveBaseline` refuses **whole**.
-/// Nothing is then written, and the library is re-hashed on that tick and every
-/// tick after it, silently.
+/// baseline over `state::kMaxRecords` rows or `state::kMaxStateBytes` of text is
+/// one `SaveBaseline` refuses **whole**. Nothing is then written, and the
+/// library is re-hashed on that tick and every tick after it, silently -- and
+/// any `deleted_on_server` mark this tick set is lost with it (#233).
 ///
-/// Only as far as the bound, because a row nothing mentioned is *usually* a
+/// Only as far as the bounds, because a row nothing mentioned is *usually* a
 /// deleted save and is also what one unreadable folder produces -- and a save
 /// dropped from the baseline over a folder that failed to list once costs that
 /// save a re-hash. Keeping them until keeping them costs the file is the trade
@@ -63,12 +64,21 @@ void TrimToFit(const SyncPlan& plan, const std::map<Key, const ClientSaveState*>
   // skip is the writer's own predicate and is not exported, and erring towards
   // trimming costs a handful of saves one re-hash while erring the other way
   // costs the whole file (see the header).
-  if (update->value.size() <= state::kMaxRecords) {
+  //
+  // The byte count is taken once and a dropped row's own line subtracted, so a
+  // trim never builds the file's text to see whether it fits.
+  std::size_t bytes = state::SerializedSize(update->value);
+  const auto over = [&] {
+    return update->value.size() > state::kMaxRecords || bytes > state::kMaxStateBytes;
+  };
+  if (!over()) {
     return;
   }
+  const std::string bounds = std::to_string(state::kMaxRecords) + " rows and " +
+                             std::to_string(state::kMaxStateBytes) + " bytes";
   // Built here rather than beside `local`, because it is a second copy of every
   // slot string in the plan and the ordinary tick never needs it: a baseline
-  // inside the bound is trimmed by nothing.
+  // inside the bounds is trimmed by nothing.
   std::set<Key> planned;
   for (const SyncOperation& operation : plan.operations) {
     planned.insert(Key{operation.rom_id, operation.slot});
@@ -81,24 +91,27 @@ void TrimToFit(const SyncPlan& plan, const std::map<Key, const ClientSaveState*>
     }
   }
   for (const Key& key : stale) {
-    if (update->value.size() <= state::kMaxRecords) {
+    if (!over()) {
       break;
     }
+    bytes -= state::SerializedSize(*update->value.Find(key.first, key.second));
     update->value.Erase(key.first, key.second);
     ++update->dropped;
     AddWarning(&update->warnings, Name(key.first, key.second) +
-                               ": dropped from the baseline to keep it inside the " +
-                               std::to_string(state::kMaxRecords) +
-                               " rows a baseline can be read back with; this save was neither "
-                               "reported nor planned this tick");
+                                      ": dropped from the baseline to keep it inside the " +
+                                      bounds +
+                                      " a baseline can be read back with; this save was "
+                                      "neither reported nor planned this tick");
   }
-  // Then state rows, which share the bound (state_db.hpp): this half is handed
-  // them, and a file over it is refused whole. A save is what hard rule 2
+  // Then state rows, which share the bounds (state_db.hpp): this half is handed
+  // them, and a file over either is refused whole. A save is what hard rule 2
   // protects, so a state goes first -- `TrimStates`' order -- and is compared
   // from scratch next tick.
   std::size_t states = 0;
-  while (update->value.size() > state::kMaxRecords && !update->value.state_rows().empty()) {
-    const state::Baseline::StateKey key = update->value.state_rows().begin()->first;
+  while (over() && !update->value.state_rows().empty()) {
+    const auto first = update->value.state_rows().begin();
+    const state::Baseline::StateKey key = first->first;
+    bytes -= state::SerializedSize(first->second);
     update->value.EraseState(key.first, key.second);
     ++states;
   }
@@ -106,21 +119,22 @@ void TrimToFit(const SyncPlan& plan, const std::map<Key, const ClientSaveState*>
     update->dropped += states;
     AddWarning(&update->warnings,
                std::to_string(states) + " state row(s) dropped to keep the baseline inside the " +
-                   std::to_string(state::kMaxRecords) +
-                   " rows it can be read back with, saves first; those states are compared "
+                   bounds +
+                   " it can be read back with, saves first; those states are compared "
                    "from scratch");
   }
-  if (update->value.size() > state::kMaxRecords) {
+  if (over()) {
     // Nothing left that this tick does not know about, so the file cannot be
     // made writable from here. `SaveBaseline` refuses it and says so, but its
     // message names a count and not the reason -- and the reason is that this
     // card has outgrown a bound that moves with the sysmodule's heap.
     AddWarning(&update->warnings,
-        "this tick reported and planned " + std::to_string(update->value.size()) +
-            " saves, more than the " + std::to_string(state::kMaxRecords) +
-            " a baseline can be read back with, and none of the rows is stale enough to drop; "
-            "the baseline cannot be written until scan::kMaxSaves, state::kMaxRecords and "
-            "kInnerHeapSize are raised together");
+               "this tick reported and planned " + std::to_string(update->value.size()) +
+                   " saves (" + std::to_string(bytes) + " bytes), past the " + bounds +
+                   " a baseline can be read back with, and none of the rows is stale enough to "
+                   "drop; the baseline cannot be written until scan::kMaxSaves, "
+                   "state::kMaxRecords, state::kMaxStateBytes and kInnerHeapSize are raised "
+                   "together");
   }
 }
 

@@ -379,6 +379,15 @@ struct LoadedBaseline {
 /// The whole file, version line included, ending in a newline.
 std::string SerializeBaseline(const Baseline& baseline);
 
+/// The bytes `SerializeBaseline` would produce, without holding the text: a
+/// trim that has to bring a baseline inside `kMaxStateBytes` asks this once
+/// and subtracts a row's own size as it drops it, rather than building 32 KiB
+/// per row it tries.
+std::size_t SerializedSize(const Baseline& baseline);
+/// One row's line, newline included.
+std::size_t SerializedSize(const SaveRecord& record);
+std::size_t SerializedSize(const StateRecord& record);
+
 /// Parse the contents of a `state.db`.
 ///
 /// Pure: no filesystem, no clock. **A malformed file yields an empty baseline,
