@@ -5312,6 +5312,32 @@ int InstallSettle(http::HttpClient& client, const std::string& base) {
   c.ExpectEq(notices(before_off, "already_installed"), std::size_t{1},
              "but as what its row says: already installed");
 
+  // **And downloads switched off while the link still will not carry it.** The
+  // switch is told once, so a report it could not make must not be dropped
+  // with the claims: the next tick tells the browser what this one could not.
+  c.Expect(console.Set(Edit("downloads", "enabled", "true")).outcome ==
+               ipc::WriteOutcome::kApplied,
+           "downloads are switched back on");
+  TickOnce(console, ticks, c, "the tick that offers the console again");
+  const std::int64_t before_down = rig::LatestNotificationId(client, base);
+  c.ExpectEq(queue_in_browser(device.other).response.status, 201,
+             "the web UI queues 240pee again");
+  down = true;
+  TickOnce(console, ticks, c, "the tick that claims 240pee");
+  UntilQuiet(console, wire, http::Method::kPut, "/installs/", std::chrono::seconds{5});
+  c.ExpectEq(open(), std::size_t{1}, "settled from the card, and its report did not go");
+  c.Expect(console.Set(Edit("downloads", "enabled", "false")).outcome ==
+               ipc::WriteOutcome::kApplied,
+           "downloads go off with the link still down");
+  TickOnce(console, ticks, c, "the tick after downloads went off, offline for reports");
+  down = false;
+  TickOnce(console, ticks, c, "the tick after the link comes back");
+  c.ExpectEq(open(), std::size_t{0},
+             "the request is ended once the link carries it" + Rendered(console.Log()));
+  c.ExpectEq(notices(before_down, "failed"), std::size_t{0}, "not as failed");
+  c.ExpectEq(notices(before_down, "already_installed"), std::size_t{1},
+             "but as already installed");
+
   install::Register(client, base, token, false);
   harness::DeleteDevice(client, base, fixture, token.device_id);
   return c.failures();
