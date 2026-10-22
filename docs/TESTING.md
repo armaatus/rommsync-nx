@@ -483,7 +483,11 @@ ctest --test-dir build --output-on-failure
   byte, so a format cannot move without its version. Each is then bumped one
   version past this build and must be refused or discarded by its policy
   ([ARCHITECTURE.md](ARCHITECTURE.md#formats-across-releases)), never misread,
-  and the refused ones never rewritten. `engine.newer` is the same downgrade
+  and the refused ones never rewritten. `config.ini`, `token.dat`,
+  `conflicts.db` and `state.db` must each say so in the one sentence
+  `records::NewerRelease` builds — file, version, a newer release wrote it,
+  what to install (#255) — spelled out in the test rather than built with it,
+  so a record that phrases it its own way fails. `engine.newer` is the same downgrade
   through a booted engine: a later release's `config.ini` and `token.dat` are
   two errors on the status screen, and an edit from the overlay leaves both on
   the card as they were.
@@ -507,7 +511,15 @@ ctest --test-dir build --output-on-failure
   three, because a prefix is individually well-formed and collectively a lie.
   It also covers the commit-window recovery from `.old` — including the case
   that used to be silent, where `state.db` is missing *and* the `.old` beside it
-  is unusable, which must not report as the brand-new card it looks like. On the
+  is unusable, which must not report as the brand-new card it looks like, and
+  the case that used to cost a re-hash: a rename landing between the bounded
+  and the streamed read of a file past `kMaxStateBytes`
+  (`state::testing::SetBetweenReads`), which must still yield the baseline
+  through the one open both reads share (#255). An rc1 file past this build's
+  row bound keeps the same slotted rows whichever order they are written in,
+  and a row repeating one it let go discards the file as any second row does.
+  A later release's file past the byte bound is still said as a later
+  release's. On the
   writer side it separates the two kinds of bad: an individual unusable row is
   **skipped** and the rest are written (a console with an unset RTC stamps a
   save with the epoch, and refusing the whole file over it would freeze the

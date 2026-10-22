@@ -67,13 +67,16 @@
 // state is kept on both sides forever -- and every save's digest. Its states and
 // archival rows are in force as they were; its slotted rows are held apart in
 // `LoadedBaseline::legacy_saves` and moved by `AdoptLegacySaves` to the slot
-// each file is synced in now. A newer file than this build's is discarded.
+// each file is synced in now. A newer file than this build's is discarded, and
+// said as every record says one (`records::NewerRelease`, #255).
 //
 // rc1 wrote it at rc1's bounds, 512 rows and 128 KiB, four times this build's
 // (#246). So a v2 file is read at those -- streamed a line at a time past
 // `kMaxStateBytes`, its text never held whole -- and kept to `kMaxRecords`
-// rows: states and archival rows first, then slotted rows while there is
-// room. A slotted row let go costs its save one re-hash, and is said.
+// rows: states and archival rows first, then the slotted rows first in
+// `(rom_id, slot)` order, whatever order the file has them in (#255). A slotted
+// row let go costs its save one re-hash, and is said; a row repeating one let
+// go is a second row, and discards the file as any second row does.
 //
 // Timestamps are whole Unix seconds, not RFC 3339. The comparison the server
 // makes is at second granularity anyway, and a number cannot be spelled two

@@ -11,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -403,6 +404,38 @@ constexpr std::size_t kRc1MaxStateBytes = 128 * 1024;
 /// line past this is not one any build wrote.
 constexpr std::size_t kMaxLineBytes = 4 * 1024;
 
+/// A row's key, as 64 bits: what `Parser` remembers of a row it let go, so the
+/// rows past rc1's bound cost eight bytes each rather than a key apiece. FNV-1a;
+/// a collision reads as a second row and discards the file, which costs a
+/// re-hash -- the price of every damaged `state.db` -- at odds no card meets.
+std::uint64_t Fingerprint(char kind, std::int64_t rom_id, const std::string* name) {
+  std::uint64_t hash = 0xcbf29ce484222325ULL;
+  const auto mix = [&hash](unsigned char byte) {
+    hash ^= byte;
+    hash *= 0x100000001b3ULL;
+  };
+  mix(static_cast<unsigned char>(kind));
+  for (int shift = 0; shift < 64; shift += 8) {
+    mix(static_cast<unsigned char>(static_cast<std::uint64_t>(rom_id) >> shift));
+  }
+  // Present-or-not before the bytes, so a null slot is not the empty one.
+  mix(name == nullptr ? 0 : 1);
+  if (name != nullptr) {
+    for (const char byte : *name) {
+      mix(static_cast<unsigned char>(byte));
+    }
+  }
+  return hash;
+}
+
+std::uint64_t Fingerprint(const SaveRecord& record) {
+  return Fingerprint('s', record.rom_id, record.slot.has_value() ? &*record.slot : nullptr);
+}
+
+std::uint64_t Fingerprint(const StateRecord& record) {
+  return Fingerprint('t', record.rom_id, &record.file_name);
+}
+
 /// A `state.db`, a line at a time, so a file can be read without its text held
 /// whole (`Load`).
 ///
@@ -411,6 +444,11 @@ constexpr std::size_t kMaxLineBytes = 4 * 1024;
 /// that, states and archival rows are kept first -- nothing rebuilds a state's
 /// row, and an archival row is keyed as it was -- and slotted save rows fill
 /// what is left, the rest let go: each costs its save one re-hash.
+///
+/// **Which slotted rows is a rule** (#255): the first in `(rom_id, slot)` order,
+/// the order `AdoptLegacySaves` settles a contest in, whatever order rc1 wrote
+/// them in. A row let go is remembered by its `Fingerprint`, so one repeating it
+/// is a second row like one repeating a row that was kept.
 class Parser {
  public:
   /// One line, without its `\n`.
@@ -498,7 +536,8 @@ class Parser {
       loaded.diagnostics.push_back(
           "state.db was written by rc1, past the " + std::to_string(kMaxRecords) +
           " rows this build reads; " + std::to_string(dropped_) +
-          " row(s) were let go, slotted saves before states -- those are hashed again");
+          " row(s) were let go, slotted saves before states and the last in (rom_id, slot) "
+          "order first -- those are hashed again");
     }
     loaded.value = std::move(baseline_);
     loaded.legacy_saves = std::move(legacy_);
@@ -511,18 +550,41 @@ class Parser {
     return version_ == kSourceSlotVersion ? kRc1MaxRecords : kMaxRecords;
   }
 
-  /// Whether a row more than this build's bound would be kept: a held-apart
-  /// save row is let go for it, or, with none left, the row itself.
-  bool MakeRoom() {
+  /// Whether a row is kept, at this build's bound. A held-apart row with a
+  /// larger key than `held`'s -- or than any, when `held` is null and the row is
+  /// a state or an archival one -- is let go to make room; with none, the row
+  /// itself is, and its `fingerprint` remembered.
+  bool MakeRoom(std::uint64_t fingerprint, const SaveRecord* held) {
     if (baseline_.size() + legacy_.size() < kMaxRecords) {
       return true;
     }
     ++dropped_;
-    if (legacy_.empty()) {
+    if (legacy_.empty() || (held != nullptr && !Before(*held, legacy_.back()))) {
+      LetGo(fingerprint);
       return false;
     }
+    LetGo(Fingerprint(legacy_.back()));
     legacy_.pop_back();
     return true;
+  }
+
+  /// Key order, `Baseline::Key`'s, without building a key.
+  static bool Before(const SaveRecord& a, const SaveRecord& b) {
+    return std::tie(a.rom_id, a.slot) < std::tie(b.rom_id, b.slot);
+  }
+
+  /// Where `record` is held, or goes: `legacy_` is kept in key order, which
+  /// makes the largest held key the back and a repeat a binary search.
+  std::vector<SaveRecord>::iterator Held(const SaveRecord& record) {
+    return std::lower_bound(legacy_.begin(), legacy_.end(), record, Before);
+  }
+
+  void LetGo(std::uint64_t fingerprint) {
+    let_go_.insert(std::lower_bound(let_go_.begin(), let_go_.end(), fingerprint), fingerprint);
+  }
+
+  bool WasLetGo(std::uint64_t fingerprint) const {
+    return std::binary_search(let_go_.begin(), let_go_.end(), fingerprint);
   }
 
   void Row(std::string_view line) {
@@ -541,22 +603,25 @@ class Parser {
           return;
         }
         const bool held_apart = version_ == kSourceSlotVersion && record.slot.has_value();
-        const bool second =
-            held_apart ? std::any_of(legacy_.begin(), legacy_.end(),
-                                     [&record](const SaveRecord& held) {
-                                       return held.rom_id == record.rom_id &&
-                                              held.slot == record.slot;
-                                     })
-                       : baseline_.Find(record.rom_id, record.slot) != nullptr;
+        const std::uint64_t fingerprint = Fingerprint(record);
+        bool second = WasLetGo(fingerprint);
+        if (!second && held_apart) {
+          const auto at = Held(record);
+          second = at != legacy_.end() && !Before(record, *at);
+        } else if (!second) {
+          second = baseline_.Find(record.rom_id, record.slot) != nullptr;
+        }
         if (second) {
           Add(&complaints_, where + "a second row for the same (rom_id, slot)");
           return;
         }
-        if (!MakeRoom()) {
+        if (!MakeRoom(fingerprint, held_apart ? &record : nullptr)) {
           return;
         }
         if (held_apart) {
-          legacy_.push_back(std::move(record));
+          // Looked up again: `MakeRoom` may have let the back go.
+          const auto at = Held(record);
+          legacy_.insert(at, std::move(record));
         } else {
           baseline_.Set(std::move(record));
         }
@@ -568,11 +633,13 @@ class Parser {
           Add(&complaints_, where + why);
           return;
         }
-        if (baseline_.FindState(record.rom_id, record.file_name) != nullptr) {
+        const std::uint64_t fingerprint = Fingerprint(record);
+        if (WasLetGo(fingerprint) ||
+            baseline_.FindState(record.rom_id, record.file_name) != nullptr) {
           Add(&complaints_, where + "a second row for the same (rom_id, file_name) state");
           return;
         }
-        if (MakeRoom()) {
+        if (MakeRoom(fingerprint, nullptr)) {
           baseline_.SetState(std::move(record));
         }
         return;
@@ -591,7 +658,8 @@ class Parser {
   int newer_ = 0;
   bool over_ = false;
   Baseline baseline_;
-  std::vector<SaveRecord> legacy_;
+  std::vector<SaveRecord> legacy_;  ///< sorted by key
+  std::vector<std::uint64_t> let_go_;  ///< sorted
   std::vector<std::string> complaints_;
 };
 
