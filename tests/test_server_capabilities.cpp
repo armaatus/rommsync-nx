@@ -182,6 +182,56 @@ void Heartbeat(rig::Checks& checks) {
                 "a " + std::to_string(wide.size()) + "-byte heartbeat still reads");
 }
 
+/// #245: `DEVICE_INSTALL.ENABLED`, the switch that makes RomM's web UI offer
+/// "Install on device". Read the way `SYSTEM` is, and walked rather than
+/// parsed, so the excluded-platform list beside it costs nothing however long
+/// an admin makes it.
+void HeartbeatInstall(rig::Checks& checks) {
+  const auth::Parsed<bool> old = server::ParseHeartbeatInstall(kHeartbeat520);
+  checks.Expect(old.ok() && !old.value,
+                "a 5.2.0 heartbeat has no DEVICE_INSTALL: off, not an error");
+
+  // The member as the 5.4.0 fixture serves it, verified live (#228's note on #245).
+  const auth::Parsed<bool> current = server::ParseHeartbeatInstall(
+      R"({"SYSTEM":{"VERSION":"5.4.0"},"DEVICE_INSTALL":{"ENABLED": true,)"
+      R"("EXCLUDED_PLATFORM_SLUGS":["win","win3x","win9x","windows-apps"]},"TASKS":{}})");
+  checks.Expect(current.ok() && current.value,
+                "the 5.4.0 shape reads as enabled: " + current.error.Describe());
+  const auth::Parsed<bool> off = server::ParseHeartbeatInstall(
+      R"({"DEVICE_INSTALL":{"EXCLUDED_PLATFORM_SLUGS":["a\"}"],"ENABLED":false}})");
+  checks.Expect(off.ok() && !off.value,
+                "ENABLED false, after a list whose string holds a quote and a brace");
+  for (const char* absent :
+       {R"({"DEVICE_INSTALL":{}})", R"({"DEVICE_INSTALL":{"ENABLED":null}})"}) {
+    const auth::Parsed<bool> read = server::ParseHeartbeatInstall(absent);
+    checks.Expect(read.ok() && !read.value, std::string("no ENABLED is off: ") + absent);
+  }
+
+  // No bound refuses a long list: the walk keeps nothing of it.
+  std::string wide = R"({"DEVICE_INSTALL":{"EXCLUDED_PLATFORM_SLUGS":[)";
+  for (int i = 0; i < 8000; ++i) {
+    wide += (i == 0 ? "\"" : ",\"") + std::string("platform-") + std::to_string(i) + "\"";
+  }
+  wide += R"(],"ENABLED":true},"SYSTEM":{"VERSION":"5.4.0"}})";
+  const auth::Parsed<bool> big = server::ParseHeartbeatInstall(wide);
+  checks.Expect(big.ok() && big.value, "a " + std::to_string(wide.size()) +
+                                           "-byte DEVICE_INSTALL still reads as enabled");
+
+  for (const char* broken :
+       {"", "[]", R"({"DEVICE_INSTALL":true})", R"({"DEVICE_INSTALL":{"ENABLED":"yes"}})",
+        R"({"DEVICE_INSTALL":{"ENABLED":1}})", R"({"DEVICE_INSTALL":{"ENABLED":tru}})",
+        R"({"DEVICE_INSTALL":{"ENABLED":true,"ENABLED":false}})",
+        R"({"DEVICE_INSTALL":{"ENABLED":true},"DEVICE_INSTALL":{"ENABLED":true}})",
+        R"({"DEVICE_INSTALL":{"ENABLED":true})"}) {
+    checks.Expect(!server::ParseHeartbeatInstall(broken).ok(), std::string("refused: ") + broken);
+  }
+
+  // The switch is configuration, not a release feature, so a version alone
+  // never claims it.
+  checks.Expect(!server::CapabilitiesFor(server::kMinimumVersion).install_enabled,
+                "CapabilitiesFor(version) leaves install_enabled off");
+}
+
 server::Version FixtureVersion(http::HttpClient& client, const std::string& base) {
   // An independent read of the same fact: the whole body through the strict
   // parser, which is what the shallow read must agree with.
@@ -210,6 +260,11 @@ void Live(rig::Checks& checks, http::HttpClient& client, const std::string& base
   } else {
     checks.Expect(!probe.capabilities.supported,
                   "the " + server::ToString(fixture) + " fixture is below the floor and refused");
+  }
+  if (fixture >= server::kRelease54) {
+    // The fixture runs with RomM's default `DEVICE_INSTALL_ENABLED`, which is on.
+    checks.Expect(probe.capabilities.install_enabled,
+                  "and its heartbeat says Install on device is enabled (#245)");
   }
   std::cout << "  fixture RomM " << probe.capabilities.version
             << (probe.capabilities.supported ? " (supported)" : " (refused)") << "\n";
@@ -266,6 +321,7 @@ int main(int argc, char** argv) {
       Versions(checks);
     } else {
       Heartbeat(checks);
+      HeartbeatInstall(checks);
     }
   } else {
     const std::string base = rig::BaseUrl();

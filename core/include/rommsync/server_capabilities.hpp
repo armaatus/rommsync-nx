@@ -112,6 +112,15 @@ struct ServerCapabilities {
   bool restore_unlisted = false;     ///< 5.4: negotiate takes `restore_unlisted`
   bool hash_baselines = false;       ///< 5.4: `content_hash` records per-device baselines
   bool device_capabilities = false;  ///< 5.4: `POST /api/devices` takes `capabilities`
+
+  /// `DEVICE_INSTALL.ENABLED` in the heartbeat: the server's web UI offers
+  /// "Install on device", and `/api/devices/{id}/installs` answers (#245).
+  ///
+  /// **Configuration, not a release feature**, so it is the one field
+  /// `CapabilitiesFor` never sets: only `ReadServer`, from the body it read. And
+  /// it never fails a read -- a member that is missing or will not walk is
+  /// "off", because an optional feature must not cost a console its sync.
+  bool install_enabled = false;
 };
 
 /// The capabilities of a server reporting `version_text`. Never fails: see the
@@ -135,6 +144,23 @@ ServerCapabilities CapabilitiesFor(const Version& version);
 /// when `SYSTEM` is not an object of at most `kMaxSystemBytes` whose `VERSION`,
 /// if present, is a string or null.
 auth::Parsed<std::string> ParseHeartbeatVersion(std::string_view body);
+
+/// `DEVICE_INSTALL.ENABLED` out of a heartbeat body (#245).
+///
+/// **Walked, not parsed, and so bounded by nothing.** #228 asked for a bound on
+/// this member like `kMaxSystemBytes`, because `EXCLUDED_PLATFORM_SLUGS` grows
+/// with the server's configuration. A bound is what keeps a *parse* from
+/// costing heap; this one parses nothing -- the walk crosses the member to find
+/// `ENABLED` and holds no part of it -- so the list costs no heap at any length,
+/// and a bound could only turn a long list into a remote install that silently
+/// stopped working. The platforms it excludes are the server's to enforce: it
+/// refuses to queue one (`POST .../installs` answers 400).
+///
+/// `value` is false, and `ok()`, when there is no `DEVICE_INSTALL` or no
+/// `ENABLED` in it, or `ENABLED` is null. It is an error when the body is not a
+/// heartbeat object, when `DEVICE_INSTALL` is not an object, appears twice, or
+/// holds an `ENABLED` that is not `true`, `false` or `null`.
+auth::Parsed<bool> ParseHeartbeatInstall(std::string_view body);
 
 /// What asking the server came to.
 struct Probe {

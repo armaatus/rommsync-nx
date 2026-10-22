@@ -403,6 +403,8 @@ auth::Parsed<std::string> ParseHeartbeatVersion(std::string_view body) {
   return out;
 }
 
+auth::Parsed<bool> ParseHeartbeatInstall(std::string_view) { return {}; }
+
 bool Probe::transient() const {
   return (transport != http::Error::kNone && transport != http::Error::kInvalidRequest) ||
          TransientStatus(status);
