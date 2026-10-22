@@ -1,8 +1,8 @@
 #include "rommsync/sync.hpp"
 
+#include <charconv>
 #include <chrono>
 #include <cstddef>
-#include <cstdio>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -273,16 +273,26 @@ std::string FormatTimestamp(Timestamp when) {
   const std::int64_t month = march_month + (march_month < 10 ? 3 : -9);
   const std::int64_t year = year_of_era + era * 400 + (month <= 2 ? 1 : 0);
 
-  char text[32];
-  const int written = std::snprintf(
-      text, sizeof(text), "%04lld-%02lld-%02lldT%02lld:%02lld:%02lldZ",
-      static_cast<long long>(year), static_cast<long long>(month), static_cast<long long>(day),
-      static_cast<long long>(rest / 3600), static_cast<long long>((rest / 60) % 60),
-      static_cast<long long>(rest % 60));
-  if (written <= 0 || static_cast<std::size_t>(written) >= sizeof(text)) {
-    return {};
-  }
-  return std::string(text, static_cast<std::size_t>(written));
+  // Digits and separators by hand rather than `snprintf`, which on the console
+  // links newlib's whole formatter for this one line (switch.builds). Every
+  // field is non-negative in range, and the year has four digits there.
+  std::string text;
+  text.reserve(20);
+  const auto put = [&text](std::int64_t value, std::size_t width, char after) {
+    char digits[20];
+    const std::to_chars_result written = std::to_chars(digits, digits + sizeof(digits), value);
+    const std::size_t length = static_cast<std::size_t>(written.ptr - digits);
+    text.append(length < width ? width - length : 0, '0');
+    text.append(digits, length);
+    text.push_back(after);
+  };
+  put(year, 4, '-');
+  put(month, 2, '-');
+  put(day, 2, 'T');
+  put(rest / 3600, 2, ':');
+  put((rest / 60) % 60, 2, ':');
+  put(rest % 60, 2, 'Z');
+  return text;
 }
 
 json::Error Validate(const ClientSaveState& save) {

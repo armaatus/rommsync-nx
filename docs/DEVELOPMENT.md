@@ -165,6 +165,12 @@ is read before anything is allocated. So `switch.mk` compiles for size (#200):
   ~27 KiB in the sysmodule (~34 KiB in the overlay, which links more of libnx).
 - **`-Os`, not `-O2`.** The larger win by far, and libultrahand's own
   recommended flag set.
+- **No `snprintf` in the sysmodule.** One call links newlib's `_svfprintf_r`,
+  and with it `_dtoa_r`, `assert` and `_vfiprintf_r`: about 40 KiB of `.text`
+  for lines that only format a string and an integer. Boot lines go through
+  `boot::Append`/`AppendNumber` and timestamps through `std::to_chars`;
+  `switch.builds` fails if the formatter comes back. (libnx's resolver keeps
+  `fprintf`'s own.)
 
 Measured in `devkitpro/devkita64:20260219` (GCC 15.2.0) with
 `aarch64-none-elf-size -A`; "image" is the end of `.bss`, i.e. everything the loader maps:

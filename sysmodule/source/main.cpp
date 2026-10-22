@@ -1301,11 +1301,15 @@ bool MayProceedWith(const char* service, rommsync::sysmodule::boot::Waiter& wait
   char line[boot::kMaxNoteBytes] = {};
   if (!waiter.Probed()) {
     g_sm_unaskable = true;
-    std::snprintf(line, sizeof(line),
-                  "rommsync: sm does not answer AtmosphereHasService; waits are unbounded");
+    boot::Append(line, sizeof(line), 0,
+                 "rommsync: sm does not answer AtmosphereHasService; waits are unbounded");
   } else {
-    std::snprintf(line, sizeof(line), "rommsync: %s never registered after %lldms", service,
-                  static_cast<long long>(outcome.waited.count()));
+    std::size_t at = boot::Append(line, sizeof(line), 0, "rommsync: ");
+    at = boot::Append(line, sizeof(line), at, service);
+    at = boot::Append(line, sizeof(line), at, " never registered after ");
+    at = boot::AppendNumber(line, sizeof(line), at,
+                            static_cast<std::uint64_t>(outcome.waited.count()));
+    boot::Append(line, sizeof(line), at, "ms");
   }
   boot::Note(g_boot, line);
   svcOutputDebugString(line, std::strlen(line));
@@ -1448,7 +1452,7 @@ void __appInit(void) {
   SetSysSerialNumber serial{};
   if (R_SUCCEEDED(setsysGetSerialNumber(&serial))) {
     serial.number[sizeof(serial.number) - 1] = '\0';
-    std::snprintf(g_serial, sizeof(g_serial), "%s", serial.number);
+    rommsync::sysmodule::boot::Append(g_serial, sizeof(g_serial), 0, serial.number);
   }
   setsysExit();
 

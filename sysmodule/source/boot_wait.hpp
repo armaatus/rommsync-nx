@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <string_view>
 #include <type_traits>
 
 namespace rommsync::sysmodule::boot {
@@ -138,5 +139,16 @@ void Note(Journal& journal, const char* what, std::uint32_t code);
 
 /// Line `index`, or nullptr past the end.
 const char* NoteAt(const Journal& journal, std::size_t index);
+
+/// `text` written into the C string `line` of `capacity` bytes from offset
+/// `at`, cut to fit and terminated; the new end. How a boot line is built,
+/// rather than `snprintf`: that one call links newlib's whole formatter, about
+/// 35 KiB of `.text` (`switch.builds`), and nothing here formats more than a
+/// string and an integer. No heap either way, which `__appInit` needs.
+std::size_t Append(char* line, std::size_t capacity, std::size_t at, std::string_view text);
+
+/// ...an unsigned integer, in `base` 10 or 16 (lowercase, no prefix).
+std::size_t AppendNumber(char* line, std::size_t capacity, std::size_t at,
+                         std::uint64_t value, int base = 10);
 
 }  // namespace rommsync::sysmodule::boot
