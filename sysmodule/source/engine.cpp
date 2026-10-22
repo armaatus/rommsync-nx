@@ -2016,6 +2016,13 @@ bool SdEngine::RunOneTick() {
     RecordFailedTickLocked();
     return true;
   }
+  if (!library.message.empty()) {
+    // An index that is not whole -- cut at its bound, a library that moved
+    // mid-fetch, a rom too large to read (#248) -- is read anyway, and the
+    // scan's unmatched lines say a save "may be a rom that was never read". This
+    // is the line that says why.
+    log::Warn(log::Event::kScanSkipped, "GET /api/roms: " + library.message);
+  }
 
   // **Asked again, here** (#242). The worker asked before this tick started,
   // and the rom index can be several pages: a game launched meanwhile has

@@ -274,14 +274,19 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
   // The page size that last came back, which a refused page halves from and a
   // rom left out returns to.
   int settled = page_size;
-  std::string left_out;
-  // Whatever else the fetch says, a rom left out is named by where it was.
-  const auto finished = [&result, &left_out]() -> FetchResult {
-    if (!left_out.empty()) {
+  // The roms left out, counted, and the first named by where it was: a count
+  // and not a list, so a library of them costs nothing that grows with it.
+  std::int64_t first_left_out = -1;
+  std::int64_t left_out = 0;
+  const auto finished = [&result, &first_left_out, &left_out]() -> FetchResult {
+    if (left_out > 0) {
+      const std::string where = "at offset " + std::to_string(first_left_out);
       result.message += std::string(result.message.empty() ? "" : "; ") +
-                        "the rom at offset " + left_out + " is larger than the " +
-                        std::to_string(http::kMaxResponseBytes / 1024) +
-                        " KiB this client reads in one answer, and is not matched";
+                        (left_out == 1 ? "the rom " + where + " is"
+                                       : std::to_string(left_out) + " roms, the first " + where +
+                                             ", are") +
+                        " larger than the " + std::to_string(http::kMaxResponseBytes / 1024) +
+                        " KiB this client reads in one answer, and not matched";
     }
     return std::move(result);
   };
@@ -311,7 +316,7 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
     }
 
     const http::Result sent = client.Send(request);
-    if (sent.error == http::Error::kTooLarge) {
+    if (http::AnsweredTooLarge(sent)) {
       if (page_size > 1) {
         page_size /= 2;
         continue;
@@ -320,7 +325,9 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
       // says it is not whole -- the same as a library cut at its bound, which is
       // what it is to that rom's saves.
       result.index.set_truncated(true);
-      left_out += (left_out.empty() ? "" : ", ") + std::to_string(offset);
+      if (left_out++ == 0) {
+        first_left_out = offset;
+      }
       ++offset;
       page_size = settled;
       continue;
@@ -329,20 +336,20 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
       result.transport = sent.error;
       result.message = std::string("the rom index could not be fetched: ") +
                        http::ToString(sent.error) + " (" + sent.message + ")";
-      return result;
+      return finished();
     }
     if (!sent.successful()) {
       result.status = sent.response.status;
       result.message =
           "the rom index was refused with status " + std::to_string(sent.response.status);
-      return result;
+      return finished();
     }
 
     Page page;
     if (const json::Error error = ParsePage(sent.response.body, &page); !error.ok()) {
       result.shape = error;
       result.message = "the rom index is not the shape this client reads: " + error.Describe();
-      return result;
+      return finished();
     }
 
     if (page.roms.empty()) {

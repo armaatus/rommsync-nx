@@ -301,7 +301,7 @@ bool ListServerStates(http::HttpClient& client, const auth::StoredToken& token,
   const http::Result result =
       client.Send(Authed(http::Method::kGet, http::JoinUrl(token.server_url, kStatesPath), token,
                          options));
-  if (result.error == http::Error::kTooLarge) {
+  if (http::AnsweredTooLarge(result)) {
     // Past the transport's ceiling, which is past `kMaxStateListBytes` too: the
     // same refusal, made before the body was read (#248).
     *error = StateError::kRefused;

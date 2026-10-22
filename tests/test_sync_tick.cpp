@@ -1270,6 +1270,7 @@ class CeilingClient final : public http::HttpClient {
     ++negotiations;
     if (request.body.find("\"rom_ids\":[1,2]") != std::string::npos) {
       result.error = http::Error::kTooLarge;
+      result.response.status = status;
       result.message = "past the ceiling";
       return result;
     }
@@ -1284,6 +1285,8 @@ class CeilingClient final : public http::HttpClient {
     return result;
   }
   int negotiations = 0;
+  /// The status the refused answer carried: a plan's 200, or an error page's.
+  int status = 200;
 };
 
 void TooLarge(rig::Checks& checks) {
@@ -1304,6 +1307,14 @@ void TooLarge(rig::Checks& checks) {
                 std::string("a plan past the ceiling is a plan too large: ") +
                     sync::ToString(refused.error));
   checks.ExpectEq(alone.negotiations, 1, "which is not asked again");
+
+  // An error page past the ceiling is the server failing, not a plan too large.
+  CeilingClient failing;
+  failing.status = 502;
+  const sync::Negotiation failed = sync::NegotiateRoms(failing, token, {}, {1, 2}, once);
+  checks.Expect(failed.error != sync::NegotiateError::kPlanTooLarge && sync::ShouldRetry(failed.error),
+                std::string("an error page past the ceiling is retried, not split: ") +
+                    sync::ToString(failed.error));
 
   CeilingClient client;
   sync::TickOptions options = OptionsAt(1'757'000'400);

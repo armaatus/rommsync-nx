@@ -59,7 +59,21 @@ enum class Error {
 /// that pages can ask for less (`roms::FetchRomIndex`); one that cannot fails by
 /// name. 200 KiB is the platforms list at its row bound, which is the response
 /// the table was already sized for.
+///
+/// **What a user loses**: `/api/platforms` is the one list RomM will not page,
+/// so a platforms list past this fails the overlay's library screen rather than
+/// coming back smaller -- ~230 platforms at the 877 bytes a row 5.4.0 sends with
+/// no description, fewer if RomM carries a long one for each. A single rom whose
+/// own row is past it is left out of the rom index, and the tick says so.
 inline constexpr std::size_t kMaxResponseBytes = 200 * 1024;
+
+struct Result;
+
+/// A **successful** answer `Send` refused for its size (`kMaxResponseBytes`) --
+/// the one a caller can do something about by asking for less. An error page
+/// past the ceiling is `kTooLarge` too, and is the server failing: asking for
+/// fewer rows, or reading it as a plan too large, would not be true of it.
+bool AnsweredTooLarge(const Result& result);
 
 /// Stable, log-friendly name for an error. Never null.
 const char* ToString(Error error);

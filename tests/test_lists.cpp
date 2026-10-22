@@ -252,6 +252,7 @@ class FakeClient : public http::HttpClient {
     if (limit > ceiling_rows_ || (wide_ >= offset && wide_ < offset + limit)) {
       http::Result refused;
       refused.error = http::Error::kTooLarge;
+      refused.response.status = 200;
       refused.message = "past the ceiling";
       return refused;
     }
@@ -941,6 +942,32 @@ void TooLarge(checks::Checks& c) {
     c.ExpectEq(static_cast<int>(walk.error), static_cast<int>(ipc::Error::kOk),
                "a list whose pages are past the ceiling still pages");
     c.ExpectEq(walk.items.size(), library.size(), "every rom, at the smaller page");
+  }
+
+  // ...and one rom too large to come back alone is stepped past, not asked for
+  // again on every page after it.
+  {
+    Console console(c, "lists-too-large-one");
+    c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                   ConfigWith("http://127.0.0.1:1")),
+             "a config with a server on it");
+    console.Boot();
+    FakeClient client(library);
+    client.Ceiling(64, 12);
+    console.engine.UseServer(&client, "fixture-token");
+    ipc::ListRequest request;
+    request.kind = ipc::ListKind::kRoms;
+    request.page_size = 8;
+    const Walk walk = WalkList(console, request);
+    c.ExpectEq(static_cast<int>(walk.error), static_cast<int>(ipc::Error::kOk),
+               "a list with one rom past the ceiling still pages");
+    c.ExpectEq(walk.items.size(), library.size() - 1, "every other rom, once");
+    std::set<std::int64_t> seen;
+    for (const ipc::ListItem& item : walk.items) {
+      seen.insert(Number(item, keys::kRomId));
+    }
+    c.Expect(seen.size() == library.size() - 1 && seen.count(13) == 0,
+             "and the one stepped past is the one too large");
   }
 }
 

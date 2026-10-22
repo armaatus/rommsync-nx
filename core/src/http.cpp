@@ -41,6 +41,11 @@ Error ErrorForWrite(int error_number) {
   return Error::kWriteFailed;
 }
 
+bool AnsweredTooLarge(const Result& result) {
+  return result.error == Error::kTooLarge && result.response.status >= 200 &&
+         result.response.status < 300;
+}
+
 const char* ToString(Error error) {
   switch (error) {
     case Error::kNone:           return "ok";

@@ -656,7 +656,7 @@ class StringWriter final : public BodyWriter {
       if (ParseDecimal(Trim(*declared), &length)) {
         undeclared_ = false;
         if (length > http::kMaxResponseBytes) {
-          declared_past_ = length;
+          refused_length_ = length;
           *error = Error::kTooLarge;
           return false;
         }
@@ -692,13 +692,13 @@ class StringWriter final : public BodyWriter {
 
   /// The length a refused body declared, past `http::kMaxResponseBytes`; zero
   /// when none was refused.
-  std::uint64_t declared_past() const { return declared_past_; }
+  std::uint64_t refused_length() const { return refused_length_; }
 
  private:
   std::string* body_;
   bool undeclared_ = false;
   bool overflowed_ = false;
-  std::uint64_t declared_past_ = 0;
+  std::uint64_t refused_length_ = 0;
 };
 
 /// `Download`'s sink: `<path>.part`, and the resume bookkeeping around it.
@@ -1256,8 +1256,8 @@ Result WireHttpClient::Send(const Request& request) {
     result.message = "the response declared no Content-Length and ran past the " +
                      std::to_string(kMaxUndeclaredBodyBytes / 1024) +
                      " KiB this client holds without one";
-  } else if (writer.declared_past() != 0) {
-    result.message = "the response declared " + std::to_string(writer.declared_past()) +
+  } else if (writer.refused_length() != 0) {
+    result.message = "the response declared " + std::to_string(writer.refused_length()) +
                      " bytes, past the " + std::to_string(http::kMaxResponseBytes / 1024) +
                      " KiB this client holds";
   }

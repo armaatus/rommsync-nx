@@ -915,9 +915,12 @@ static_assert(sizeof(rommsync::conflicts::Entry) == 408,
 static_assert(kHeapConflictHistory == 0x8C00,
               "conflicts::kMaxEntries moved; retotal the table");
 // The history read at boot, before the worker starts, under the response row --
-// one more thing held one at a time, as `queue.json` is.
-static_assert(rommsync::conflicts::kMaxHistoryBytes <= kHeapListResponse,
-              "conflicts.db at its bound is now larger than the response row it is read under");
+// one more thing held one at a time, as `queue.json` is. `Load` holds the file's
+// text, the entries it parses and the history's own array as they move across:
+// three times the file at most.
+static_assert(3 * rommsync::conflicts::kMaxHistoryBytes <= kHeapListResponse,
+              "conflicts.db at its bound, read, is now larger than the response row it is "
+              "read under");
 // What a queue write holds beside the rows, under the two rows whose holder it
 // excludes, and the file read at boot -- before the worker starts -- under the
 // response row, one more thing held one at a time.

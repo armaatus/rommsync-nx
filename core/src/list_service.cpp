@@ -53,6 +53,9 @@ json::Error ReadDrawnText(const json::Value& object, const char* key, std::strin
   return {};
 }
 
+/// How many roms too large to come back alone one rom page steps past (#248).
+constexpr std::int64_t kMaxRowsStepped = 4;
+
 /// Prefix `where` onto a field name, so a complaint names the row it came from.
 json::Error At(const std::string& where, json::Error error) {
   error.field = where + error.field;
@@ -686,10 +689,10 @@ bool Service::Pump() {
     url = configuration->server.url;
   }
 
-  http::Request request;
-  if (asked.kind == ipc::ListKind::kPlatforms) {
-    request.url = url + "/api/platforms";
-  } else {
+  // Everything a rom page's URL says but its `limit` and `offset`, which can
+  // move (#248, below).
+  std::string query;
+  if (asked.kind != ipc::ListKind::kPlatforms) {
     // `order_by=id&order_dir=asc` is a **total** order, which is what makes
     // "every rom exactly once across pages" true: the endpoint's default orders
     // by name, and a name is not unique in a RomM library, so a tie straddling
@@ -700,19 +703,16 @@ bool Service::Pump() {
     // otherwise haul the whole library's `rom_id_index` and a freshly
     // aggregated `filter_values` through a JSON parser on a sysmodule heap, all
     // of it discarded here. Turning them off is most of what this request costs.
-    //
-    // `limit` is filled in below, because it can shrink (#248).
-    request.url = "&offset=" + std::to_string(offset) +
-                  "&order_by=id&order_dir=asc"
-                  "&with_char_index=false&with_filter_values=false&with_rom_id_index=false";
+    query = "&order_by=id&order_dir=asc"
+            "&with_char_index=false&with_filter_values=false&with_rom_id_index=false";
     if (asked.platform_id > 0) {
-      request.url += "&platform_ids=" + std::to_string(asked.platform_id);
+      query += "&platform_ids=" + std::to_string(asked.platform_id);
     }
     if (!asked.search.empty()) {
-      request.url += "&search_term=" + http::EncodeQueryValue(asked.search);
+      query += "&search_term=" + http::EncodeQueryValue(asked.search);
     }
   }
-  const std::string query = std::move(request.url);
+  http::Request request;
   if (!token.empty()) {
     request.headers.push_back({"Authorization", "Bearer " + token});
   }
@@ -720,16 +720,32 @@ bool Service::Pump() {
 
   // A rom page past the transport's ceiling (`http::kMaxResponseBytes`) is asked
   // for again at half the rows, down to one (#248): a rom RomM identified is
-  // ~12 KiB of row, and the page drawn from it a few hundred bytes of it.
+  // ~12 KiB of row, and the page drawn from it a few hundred bytes of it. A rom
+  // too large to come back even alone is stepped past -- the list would
+  // otherwise ask for it again on every `ListNext`, and show nothing after it --
+  // at most `kMaxRowsStepped` a page. These are size retries, not failure ones:
+  // each request has its timeout, and the answer that ends them is a success.
   http::Result sent;
-  for (std::int32_t limit = asked.page_size;; limit /= 2) {
-    request.url = asked.kind == ipc::ListKind::kPlatforms
-                      ? url + "/api/platforms"
-                      : url + "/api/roms?limit=" + std::to_string(limit) + query;
+  std::int64_t stepped = 0;
+  if (asked.kind == ipc::ListKind::kPlatforms) {
+    request.url = url + "/api/platforms";
     sent = client->Send(request);
-    if (sent.error != http::Error::kTooLarge || limit <= 1 ||
-        asked.kind == ipc::ListKind::kPlatforms) {
-      break;
+  } else {
+    for (std::int32_t limit = asked.page_size;;) {
+      request.url = url + "/api/roms?limit=" + std::to_string(limit) +
+                    "&offset=" + std::to_string(offset + stepped) + query;
+      sent = client->Send(request);
+      if (!http::AnsweredTooLarge(sent)) {
+        break;
+      }
+      if (limit > 1) {
+        limit /= 2;
+      } else if (stepped < kMaxRowsStepped) {
+        ++stepped;
+        limit = asked.page_size;
+      } else {
+        break;
+      }
     }
   }
 
@@ -751,7 +767,7 @@ bool Service::Pump() {
   // from "could not reach it", and it is what a truncated body earns. The one
   // thing neither may be is a short page: that reads as the end of the library.
   ipc::Error failure = ipc::Error::kOk;
-  if (sent.error == http::Error::kTooLarge) {
+  if (http::AnsweredTooLarge(sent)) {
     // Reached, and too large to read even a row at a time: `kInternal`'s case.
     failure = ipc::Error::kInternal;
   } else if (!sent.ok() || !sent.successful()) {
@@ -770,7 +786,7 @@ bool Service::Pump() {
     } else {
       // Built outside the lock: it reads the card for `on_disk` and the queue
       // for `queued`, and both take locks of their own.
-      built = BuildRomPage(fetched, offset, asked.page_size, card, *configuration);
+      built = BuildRomPage(fetched, offset + stepped, asked.page_size, card, *configuration);
     }
   }
 
@@ -798,6 +814,9 @@ bool Service::Pump() {
   if (asked.kind == ipc::ListKind::kPlatforms) {
     entry->platforms = std::move(platforms);
   }
+  // Past the rows stepped over as well as the ones the page serves, which
+  // `ListNext` adds when it hands the page over.
+  entry->offset += stepped;
   entry->ready = std::move(built);
   entry->fetch = Fetch::kReady;
   return true;

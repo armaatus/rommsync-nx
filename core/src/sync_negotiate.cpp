@@ -175,7 +175,7 @@ std::optional<Negotiation> Refused(const http::Result& result) {
                       (result.message.empty() ? std::string("the caller cancelled")
                                               : result.message));
   }
-  if (result.error == http::Error::kTooLarge) {
+  if (http::AnsweredTooLarge(result)) {
     // A plan whose text is past the transport's ceiling (`http::kMaxResponseBytes`)
     // is one past `kMaxPlanOperations` several times over, refused before it was
     // read rather than held whole and refused while parsed (#248, §4) -- and the

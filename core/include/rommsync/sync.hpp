@@ -666,7 +666,9 @@ struct NegotiateOptions : CallPolicy {
   bool restore_unlisted = false;
 
   /// `ParseNegotiateResponse`'s `keep`: the operations of the answer that are
-  /// held. Empty holds every one.
+  /// held. Empty holds every one. Called once for each operation of the one
+  /// answer that is parsed, in order -- a negotiation is never parsed twice
+  /// (`ShouldRetry`) -- so it may keep count of what it has held.
   std::function<bool(const SyncOperation&)> keep;
 };
 
