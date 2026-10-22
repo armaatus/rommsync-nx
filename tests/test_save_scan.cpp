@@ -28,6 +28,8 @@
 //                   alone while RetroArch's Cloud Sync is on (#230)
 //   tico         -- Tico 0.7.9, and 0.8.0 with one account and with two (#231);
 //                   backups/, .tmp, screenshots and .restart are never synced
+//   contest      -- #258: a slot RetroArch's and Tico's copy contest goes to the
+//                   frontend play_with names
 //   library      -- a Sandbox scanned against the docker library, end to end
 //   grown        -- the index is reserved from the first page's total, and a
 //                   library that grows mid-fetch stops it there, and says so
@@ -1997,6 +1999,86 @@ void Grown(::checks::Checks& checks) {
   checks.Expect(capped.index.truncated(), "and says so");
 }
 
+/// #258, #237's open (4): one rom's RetroArch copy and Tico copy contest one
+/// pairing key -- a save's `(rom_id, slot)` since #236, a state's name under
+/// `[sync] map_state_slots` -- and the frontend `play_with` plays the platform
+/// in keeps it, whichever folder the walk reads first. That is the copy a
+/// first-time restore is placed for, so the one a user is playing is the one
+/// that syncs. A platform played in neither keeps scan order.
+void Contest(::checks::Checks& checks) {
+  roms::RomIndex index;
+  index.Add(MakeRom(2, "nova", "nes"));
+  index.Add(MakeRom(3, "ps2 game", "ps2"));
+
+  FakeFileSystem files("contest");
+  // RetroArch's flat folder is read before Tico's, so scan order alone would
+  // keep RetroArch's copy every time.
+  files.AddFile("/retroarch/saves", "nova.srm", 512, kMtime);
+  files.AddFile("/tico/saves/nes", "nova.srm", 640, kMtime);
+  files.AddFile("/retroarch/states", "nova.state.auto", 96, kMtime);
+  files.AddFile("/tico/states/nes", "nova.state5", 128, kMtime);
+  files.AddFile("/saves/ps2", "ps2 game.ps2", 64, kMtime);
+  files.AddFile("/tico/saves/ps2", "ps2 game.ps2", 80, kMtime);
+
+  const auto saves = [&](const config::Config& config, const std::string& winner,
+                         const std::string& loser, const std::string& what) {
+    const scan::ScanResult result =
+        scan::ScanSaves(config, kRetroArchDefaults, index, files, kFirstTick);
+    const scan::SaveFile* kept = SaveAt(result, winner);
+    checks.Expect(kept != nullptr, what + ": " + winner + " keeps the slot -- " +
+                                       result.DescribeSkipped());
+    if (kept != nullptr) {
+      checks.ExpectEq(kept->content_hash, state::HashFile(files.Resolve(winner)).content_hash,
+                      what + ": with its own digest");
+    }
+    checks.Expect(SaveAt(result, loser) == nullptr &&
+                      SkippedFor(result, loser, scan::SkipReason::kDuplicateSlot),
+                  what + ": " + loser + " is the duplicate, reported and not synced");
+    checks.ExpectEq(result.saves.size(), std::size_t{1}, what + ": one save for the slot");
+  };
+
+  const config::Config tico = config::Defaults();
+  saves(tico, "/tico/saves/nes/nova.srm", "/retroarch/saves/nova.srm",
+        "nes is played in Tico by default");
+  config::LoadResult retroarch = config::ParseConfig("[platform.nes]\nplay_with = retroarch\n");
+  saves(retroarch.value, "/retroarch/saves/nova.srm", "/tico/saves/nes/nova.srm",
+        "play_with = retroarch");
+  const config::LoadResult neither = config::ParseConfig(
+      "[platform.ps2]\nroms = /roms/ps2\nsaves = /saves/ps2, /tico/saves/ps2\n");
+  const scan::ScanResult unplayed =
+      scan::ScanSaves(neither.value, kRetroArchDefaults, index, files, kFirstTick);
+  checks.Expect(SaveAt(unplayed, "/saves/ps2/ps2 game.ps2") != nullptr &&
+                    SkippedFor(unplayed, "/tico/saves/ps2/ps2 game.ps2",
+                               scan::SkipReason::kDuplicateSlot),
+                "a platform played in neither keeps the first copy in scan order");
+
+  // States contest a name only once Tico's slots carry RetroArch's names.
+  config::Config mapped = tico;
+  mapped.sync.states = true;
+  mapped.sync.map_state_slots = true;
+  const scan::ScanResult states =
+      scan::ScanStates(mapped, kRetroArchDefaults, index, files, kFirstTick);
+  const scan::StateFile* kept = nullptr;
+  for (const scan::StateFile& state : states.states) {
+    if (state.file_name == "nova.state.auto") {
+      kept = &state;
+    }
+  }
+  checks.Expect(kept != nullptr && kept->sd_path == "/tico/states/nes/nova.state5",
+                "a state's contested name goes to Tico's copy too -- " +
+                    (kept == nullptr ? std::string("none") : kept->sd_path));
+  checks.Expect(SkippedFor(states, "/retroarch/states/nova.state.auto",
+                           scan::SkipReason::kDuplicateName),
+                "and RetroArch's is the duplicate");
+  retroarch.value.sync.states = true;
+  retroarch.value.sync.map_state_slots = true;
+  const scan::ScanResult retro_states =
+      scan::ScanStates(retroarch.value, kRetroArchDefaults, index, files, kFirstTick);
+  checks.Expect(SkippedFor(retro_states, "/tico/states/nes/nova.state5",
+                           scan::SkipReason::kDuplicateName),
+                "and under play_with = retroarch, Tico's is");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2013,7 +2095,7 @@ int main(int argc, char** argv) {
   if (scenario == "names" || scenario == "ambiguous" || scenario == "walked_once" ||
       scenario == "unusable" || scenario == "truncated" || scenario == "hashing" ||
       scenario == "sources" || scenario == "grown" || scenario == "retroarch" ||
-      scenario == "tico" || scenario == "isolated") {
+      scenario == "tico" || scenario == "isolated" || scenario == "contest") {
     if (scenario == "names") {
       Names(checks);
     } else if (scenario == "ambiguous") {
@@ -2034,6 +2116,8 @@ int main(int argc, char** argv) {
       Tico(checks);
     } else if (scenario == "isolated") {
       Isolated(checks);
+    } else if (scenario == "contest") {
+      Contest(checks);
     } else {
       Unusable(checks);
     }

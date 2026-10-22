@@ -1614,6 +1614,27 @@ void Placed(rig::Checks& checks, http::HttpClient& client, const std::string& ba
     checks.ExpectEq(sandbox.Read(target), server_bytes, "into the folder it made for it");
   }
 
+  // #258: a fetch that fails after the folder was made takes the folder away
+  // again -- every one it made, and none it did not -- rather than leaving an
+  // empty system folder behind for an emulator to find.
+  {
+    Sandbox sandbox(checks, "execute-placed-unmade");
+    const auto files = rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    const std::string account = "/tico/saves/users/0123456789abcdef0123456789abcdef";
+    sandbox.MakeDirs(account);
+    sync::SyncPlan wrong = plan;
+    if (!wrong.operations.empty()) {
+      wrong.operations[0].server_content_hash = std::string(sync::kContentHashDigits, '0');
+    }
+    const sync::ExecutionReport report = sync::ExecutePlan(
+        client, *files, TokenFor(base, fixture), wrong, /*targets=*/{},
+        placing(account + "/gb/deeper/gb240p.srm", 1'757'000'305));
+    checks.ExpectEq(report.failed, 1, "bytes that are not the plan's fail the placement");
+    checks.Expect(!sandbox.Exists(account + "/gb"),
+                  "and the folders it made for them are gone again");
+    checks.Expect(sandbox.Exists(account), "but not the one that was there before");
+  }
+
   // Onto a file the scan did not pair with this row: someone else's save.
   {
     Sandbox sandbox(checks, "execute-placed-taken");

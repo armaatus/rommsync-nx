@@ -13,6 +13,8 @@
 //   saves   -- `place::Placer::Save` against a real card: Tico's layouts,
 //              RetroArch's, and every reason it places nothing
 //   states  -- the same rule for a state, which keeps the name it pairs on
+//   rom_folder -- #258: a rom folder, cut or not, placed in exactly when the
+//              scan reads the file back
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -536,6 +538,94 @@ void Saves(checks::Checks& c) {
   }
 }
 
+/// #258: the placer and the scan agree on a rom folder -- one RetroArch keeps
+/// saves beside, or one the map also lists as a save folder. Each case is
+/// asked of both: a placement is accepted exactly when the scan reads the file
+/// back as the same save, and a refused one is a file the scan would not read.
+void RomFolder(checks::Checks& c) {
+  const roms::RomIndex index = Library();
+  const std::string slot = ScanSlot("x.srm");
+  const sync::SyncOperation smw = Download(1, slot, "snes9x", "x.srm");
+  const config::LoadResult opted = config::ParseConfig(
+      "[platform.snes]\nplay_with = retroarch\n\n[sources]\nretroarch_content_dir = true\n");
+  retroarch::Settings sorted;
+  sorted.savefiles_in_content_dir = true;
+  retroarch::Settings flat = sorted;
+  flat.sort_savefiles = false;
+
+  // A rom folder past `fs::kMaxDirectoryEntries`, `prefix` deciding where its
+  // roms sort against `Snes9x/` and against the save's own name.
+  const auto fill = [](Card& card, const std::string& folder, const std::string& prefix) {
+    card.MakeDirs(folder);
+    for (std::size_t at = 0; at < fs::kMaxDirectoryEntries + 8; ++at) {
+      card.Write(folder + "/" + prefix + std::to_string(1000 + at) + ".sfc", "rom\n");
+    }
+  };
+  // `expected` is where the placement goes when the scan reads it back, and the
+  // path it is refused at when the scan does not.
+  const auto agrees = [&](Card& card, const config::Config& config,
+                          const retroarch::Settings& settings, const sync::SyncOperation& operation,
+                          const std::string& expected, bool read_back, const std::string& what) {
+    place::Placer placer(config, settings, index, card.files());
+    const place::Placement placed = placer.Save(operation);
+    std::string said;
+    const bool reads = ReadsBack(card, config, settings, index, expected, operation.rom_id,
+                                 *operation.slot, &said);
+    c.Expect(reads == read_back, what + ": the scan " + (read_back ? "reads" : "does not read") +
+                                     " " + expected + " back -- " + said);
+    if (read_back) {
+      c.ExpectEq(placed.sd_path, expected, what + ": placed where it is read back: " +
+                                               placed.reason);
+    } else {
+      c.Expect(!placed.ok() && !placed.reason.empty(),
+               what + ": placed nowhere, with a reason -- got '" + placed.sd_path + "'");
+    }
+  };
+
+  {
+    // The roms sort before `Snes9x/` and before the save: the cut listing keeps
+    // only them, so neither the core folder nor a loose save past it is read.
+    Card card("rom-folder-cut");
+    fill(card, "/tico/roms/snes", "A Rom ");
+    agrees(card, opted.value, sorted, smw,
+           "/tico/roms/snes/Snes9x/Super Mario World (USA).srm", false,
+           "sorted, a core folder past a rom folder's cut");
+    agrees(card, opted.value, flat, smw, "/tico/roms/snes/Super Mario World (USA).srm", false,
+           "unsorted, a save past a rom folder's cut");
+  }
+  {
+    // The roms sort after both: the cut keeps the core folder and the save.
+    Card card("rom-folder-reached");
+    fill(card, "/tico/roms/snes", "z rom ");
+    agrees(card, opted.value, sorted, smw,
+           "/tico/roms/snes/Snes9x/Super Mario World (USA).srm", true,
+           "sorted, a core folder the cut listing reaches");
+    agrees(card, opted.value, flat, smw, "/tico/roms/snes/Super Mario World (USA).srm", true,
+           "unsorted, a save the cut listing reaches");
+  }
+  {
+    // RetroArch's own folder, cut: every core folder RomM's table names is read
+    // whether the listing reached it or not, so the placement stands.
+    Card card("rom-folder-own-cut");
+    fill(card, "/retroarch/cores/savefiles", "A stale ");
+    const config::LoadResult retro = config::ParseConfig("[platform.snes]\nplay_with = retroarch\n");
+    agrees(card, retro.value, retroarch::Settings{}, smw,
+           "/retroarch/cores/savefiles/Snes9x/Super Mario World (USA).srm", true,
+           "a cut RetroArch folder's core folder RomM's table names");
+  }
+  {
+    // A Tico folder the map also lists as a rom folder is read as one: only
+    // RetroArch's own names, so DuckStation's card is not read back there.
+    Card card("rom-folder-tico");
+    card.MakeDirs("/tico/saves/psx");
+    const config::LoadResult shared =
+        config::ParseConfig("[platform.psx]\nroms = /tico/saves/psx\nsaves = /tico/saves/psx\n");
+    agrees(card, shared.value, retroarch::Settings{},
+           Download(3, ScanSlot("x.mcd"), "tico-duckstation", "Psx Game.mcd"),
+           "/tico/saves/psx/Psx Game.mcd", false, "a card in a Tico folder that is a rom folder");
+  }
+}
+
 /// The state scan's answer for `sd_path`, written and removed again: read back
 /// as `rom_id` under the same name.
 /// `as` is the name the state must pair on once read back: its own file name
@@ -861,6 +951,8 @@ int main(int argc, char** argv) {
     StateTable(c);
   } else if (scenario == "state_slots") {
     StateSlots(c);
+  } else if (scenario == "rom_folder") {
+    RomFolder(c);
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;
