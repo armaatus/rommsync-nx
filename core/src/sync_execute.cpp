@@ -517,8 +517,7 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
   if (operation.slot.has_value()) {
     url += "&slot=" + http::EncodeQueryValue(*operation.slot);
   }
-  url += "&session_id=" +
-         std::to_string(operation.session_id != 0 ? operation.session_id : plan.session_id);
+  url += "&session_id=" + std::to_string(plan.session_id);
   url += "&device_id=" + http::EncodeQueryValue(token.device_id);
   if (options.send_content_hash) {
     // Hashed here, just before the transport streams the file, rather than

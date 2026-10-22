@@ -676,7 +676,7 @@ a sysmodule pays for a TLS request is therefore:
    cursor. Neither had a row. At the 512 saves `state::kMaxRecords` allowed, the
    tick alone was ~856 KiB, so the bound is now **128 saves**, what the heap
    holds after growing to `0x180000`; each further 64 is ~140 KiB of resident
-   `.bss`, and the image is within 56 KiB of `scripts/image-budget.sh`'s ceiling.
+   `.bss`, and the image is within 36 KiB of `scripts/image-budget.sh`'s ceiling.
 2. **The in-flight buffers** — ours to size. Roms stream to file and never sit
    in RAM whole (hard rule 2's sibling: nothing is buffered that does not have
    to be). Every `sslConnectionRead` is an IPC round trip to the `ssl`

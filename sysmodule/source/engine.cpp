@@ -1933,6 +1933,10 @@ bool SdEngine::RunOneTick() {
   // and held to the end they were a third copy of every save beside the plan --
   // ~450 bytes a save on aarch64 (`kHeapTickSaves`, main.cpp; M9-20, #246).
   std::vector<scan::SaveFile>().swap(scanned.saves);
+  // A card the scan stopped short of is not a clean sync, however well the saves
+  // it did see went (#246): the status screen says partial, beside the
+  // `scan.skipped` line above that says why.
+  const bool scan_cut = scanned.stopped_at_bound;
   for (const play::BufferedSession& buffered : play_sent) {
     options.finish.play_sessions.push_back(buffered.session);
   }
@@ -1953,45 +1957,96 @@ bool SdEngine::RunOneTick() {
   // released before the counters go under `mutex_`.
   std::unique_lock<std::timed_mutex> writing(save_write_mutex_);
 
+  // M7-1 (#36)'s call site, which nothing in this build had. It is outside
+  // `sync::RunTick` because `conflict_record.hpp` includes `state_sync.hpp`, so
+  // recording from inside would be a cycle -- the same reason persisting the
+  // baseline after `SyncStates` is the caller's.
+  conflicts::RecordOptions record;
+  record.rom_name = [index](std::int64_t rom_id) -> std::string {
+    const roms::Rom* rom = index->ById(rom_id);
+    // The index carries `fs_name_no_ext` and no display name at all
+    // (rom_index.hpp), so that is what a row gets. An empty answer is not a
+    // failure: the screen falls back to the file name.
+    return rom == nullptr ? std::string() : rom->fs_name_no_ext;
+  };
+
+  // **Every operation is read here, plan by plan**, and not off the result:
+  // a tick runs each chunk's plan on its own and frees it before the next
+  // (#246), so `tick.executed` is the last plan's alone (`TickOptions::on_plan`).
+  //
+  // A rom whose restore was cut off -- the link, the server, the card -- keeps
+  // its place in `fresh_roms_`, or the next tick would read its save as one the
+  // user deleted and never bring it. A refusal that asking again cannot change
+  // (a file already at the path, a format nothing here reads) lets go, so it is
+  // not re-asked with `restore_unlisted` on every tick.
+  std::vector<std::int64_t> ask_again;
+  std::int64_t uploaded = 0;
+  std::int64_t downloaded = 0;
+  std::int64_t arbitrated = 0;
+  options.on_plan = [&](const sync::SyncPlan& plan, const sync::ExecutionReport& executed) {
+    for (const sync::OperationResult& operation : executed.operations) {
+      bool again = operation.outcome == sync::OperationOutcome::kCanceled;
+      if (operation.outcome == sync::OperationOutcome::kFailed) {
+        switch (operation.error) {
+          case sync::OperationError::kTransferFailed:
+          case sync::OperationError::kRefused:
+          case sync::OperationError::kUnauthorized:
+          case sync::OperationError::kForbidden:
+          case sync::OperationError::kBackupFailed:
+          case sync::OperationError::kCommitFailed:
+            again = true;
+            break;
+          default:
+            break;
+        }
+      }
+      if (again) {
+        ask_again.push_back(operation.rom_id);
+      }
+      // Counted off the operations rather than off `TickCompletion::counts`,
+      // which carries only what the *server* is told -- completed and failed --
+      // and not which way each transfer went. The status screen draws three
+      // separate numbers (`ipc::Status`), and a conflict is an overwrite the
+      // server arbitrated rather than a fourth outcome, so it is counted where
+      // the backup was written.
+      if (operation.outcome == sync::OperationOutcome::kUploaded) {
+        ++uploaded;
+      } else if (operation.outcome == sync::OperationOutcome::kDownloaded) {
+        ++downloaded;
+      }
+      // A removal (#233) leaves a backup too, and is not an arbitration.
+      if (!operation.backup_sd_path.empty() &&
+          operation.outcome != sync::OperationOutcome::kRemoved) {
+        ++arbitrated;
+      }
+      // A save leaving the card, or staying on it against the server's word,
+      // is never silent (#233). The message names the save's path and its
+      // backup.
+      if (operation.outcome == sync::OperationOutcome::kRemoved ||
+          operation.outcome == sync::OperationOutcome::kKept) {
+        log::Info(log::Event::kSaveDeleted, operation.message);
+      }
+    }
+    // Every operation that did not do what the plan asked. These are the lines
+    // `ExecutionReport::warnings` was built for: a card that is full shows up
+    // here as a backup that could not be taken, and a backup that could not be
+    // taken is an overwrite that did not happen (hard rule 2).
+    log::WriteEach(log::Level::kError, log::Event::kSaveFailed, executed.warnings);
+    std::lock_guard<std::mutex> history(history_mutex_);
+    conflicts::RecordSaves(&history_, plan, executed, reported, record);
+  };
+
   const sync::TickResult tick =
       sync::RunTick(*client, *files, token, reported, targets, loaded.value, options);
   ObserveAnswer(tick.answer);
-  if (tick.negotiated.ok() && !tick.executed.canceled && !fresh.empty()) {
-    // Asked for, and done. A rom whose restore was cut off -- the link, the
-    // server, the card -- keeps its place, or the next tick would read its save
-    // as one the user deleted and never bring it; so does a rom downloaded while
-    // this tick ran, which is not in `fresh`. A refusal that asking again cannot
-    // change (a file already at the path, a format nothing here reads) lets go,
-    // so it is not re-asked with `restore_unlisted` on every tick.
-    const auto again = [](const sync::OperationResult& operation) {
-      if (operation.outcome == sync::OperationOutcome::kCanceled) {
-        return true;
-      }
-      if (operation.outcome != sync::OperationOutcome::kFailed) {
-        return false;
-      }
-      switch (operation.error) {
-        case sync::OperationError::kTransferFailed:
-        case sync::OperationError::kRefused:
-        case sync::OperationError::kUnauthorized:
-        case sync::OperationError::kForbidden:
-        case sync::OperationError::kBackupFailed:
-        case sync::OperationError::kCommitFailed:
-          return true;
-        default:
-          return false;
-      }
-    };
-    const auto done = [&fresh, &tick, &again](std::int64_t rom_id) {
-      if (std::find(fresh.begin(), fresh.end(), rom_id) == fresh.end()) {
-        return false;
-      }
-      for (const sync::OperationResult& operation : tick.executed.operations) {
-        if (operation.rom_id == rom_id && again(operation)) {
-          return false;
-        }
-      }
-      return true;
+  if (tick.totals.plans > 0 && tick.outcome != sync::TickOutcome::kCanceled && !fresh.empty()) {
+    // Asked for, and done -- unless it was asked again for, or a plan never
+    // reached it this tick (`TickResult::unasked_roms`). A rom downloaded while
+    // this tick ran is not in `fresh`, and keeps its place too.
+    const auto done = [&fresh, &tick, &ask_again](std::int64_t rom_id) {
+      return std::find(fresh.begin(), fresh.end(), rom_id) != fresh.end() &&
+             std::find(ask_again.begin(), ask_again.end(), rom_id) == ask_again.end() &&
+             !std::binary_search(tick.unasked_roms.begin(), tick.unasked_roms.end(), rom_id);
     };
     std::lock_guard<std::mutex> lock(mutex_);
     fresh_roms_.erase(std::remove_if(fresh_roms_.begin(), fresh_roms_.end(), done),
@@ -2010,21 +2065,25 @@ bool SdEngine::RunOneTick() {
     LogPlayStore(play_.Release(reconciled.release));
   }
 
-  // M7-1 (#36)'s call site, which nothing in this build had. It is outside
-  // `sync::RunTick` because `conflict_record.hpp` includes `state_sync.hpp`, so
-  // recording from inside would be a cycle -- the same reason persisting the
-  // baseline after `SyncStates` is the caller's.
-  conflicts::RecordOptions record;
-  record.rom_name = [index](std::int64_t rom_id) -> std::string {
+  // A rom whose own saves on the server are more than one plan carries was left
+  // out of this tick (#246): its saves were not offered and nothing of it was
+  // touched. Named, so the one game that is not syncing can be found.
+  for (const std::int64_t rom_id : tick.oversized_roms) {
     const roms::Rom* rom = index->ById(rom_id);
-    // The index carries `fs_name_no_ext` and no display name at all
-    // (rom_index.hpp), so that is what a row gets. An empty answer is not a
-    // failure: the screen falls back to the file name.
-    return rom == nullptr ? std::string() : rom->fs_name_no_ext;
-  };
-  {
-    std::lock_guard<std::mutex> history(history_mutex_);
-    conflicts::RecordSaves(&history_, tick.negotiated.plan, tick.executed, reported, record);
+    log::Warn(log::Event::kSyncRefused,
+              (rom != nullptr ? rom->fs_name_no_ext : std::string("rom")) + " (rom " +
+                  std::to_string(rom_id) + "): the server holds more saves for it than the " +
+                  std::to_string(sync::kMaxPlanOperations) +
+                  " one plan can carry, so it was left out of this sync");
+  }
+  if (tick.totals.plans > 0 && !tick.negotiated.ok()) {
+    // A chunk after the first failed to negotiate: what ran stands, the rest
+    // waits for the next tick, and the outcome is partial -- which the switch
+    // below would otherwise leave unexplained.
+    log::Warn(log::Event::kSyncRefused,
+              "negotiate: " + std::string(sync::ToString(tick.negotiated.error)) + "; " +
+                  tick.negotiated.message + "; " + std::to_string(tick.unasked_roms.size()) +
+                  " roms wait for the next sync");
   }
 
   sync::StateSyncReport states;
@@ -2109,30 +2168,19 @@ bool SdEngine::RunOneTick() {
       break;
   }
 
-  // Every operation that did not do what the plan asked, and every leftover the
-  // sweep could not deal with. These are the lines `ExecutionReport::warnings`
-  // and `RecoveryReport::warnings` were built for and had nowhere to go: a card
-  // that is full shows up here as a backup that could not be taken, and a backup
-  // that could not be taken is an overwrite that did not happen (hard rule 2).
-  log::WriteEach(log::Level::kError, log::Event::kSaveFailed, tick.executed.warnings);
+  // Every leftover the sweep could not deal with, and every baseline row the
+  // finish could not write. The operations' own lines went out plan by plan
+  // (`options.on_plan` above).
   log::WriteEach(log::Level::kError, log::Event::kSaveFailed, tick.finished.warnings);
   log::WriteEach(log::Level::kWarn, log::Event::kSaveFailed, tick.recovered.warnings);
-  // A save leaving the card, or staying on it against the server's word, is
-  // never silent (#233). The message names the save's path and its backup.
-  for (const sync::OperationResult& operation : tick.executed.operations) {
-    if (operation.outcome == sync::OperationOutcome::kRemoved ||
-        operation.outcome == sync::OperationOutcome::kKept) {
-      log::Info(log::Event::kSaveDeleted, operation.message);
-    }
-  }
   if (states.ran) {
     log::WriteEach(log::Level::kWarn, log::Event::kScanSkipped, states.scan.DescribeSkipped());
   }
 
   // The one line a user is asked for first. Last, so it reads as the summary of
   // everything above it.
-  LogTickEnd(tick.outcome, tick.executed.completed, tick.executed.failed, states.completed,
-             states.failed, tick.finished.stored.ok());
+  LogTickEnd(tick.outcome, tick.totals.completed, tick.totals.failed, states.completed,
+             states.failed, tick.totals.stored);
 
   std::lock_guard<std::mutex> lock(mutex_);
   scheduler_.Finished(tick);
@@ -2140,26 +2188,10 @@ bool SdEngine::RunOneTick() {
       std::chrono::duration_cast<std::chrono::seconds>(
           scheduler_.last_tick_at().time_since_epoch())
           .count());
-  // Counted off the operations rather than off `TickCompletion::counts`, which
-  // carries only what the *server* is told -- completed and failed -- and not
-  // which way each transfer went. The status screen draws three separate
-  // numbers (`ipc::Status`), and a conflict is an overwrite the server arbitrated
-  // rather than a fourth outcome, so it is counted where the backup was written.
-  uploaded_ = 0;
-  downloaded_ = 0;
-  conflicts_ = 0;
-  for (const sync::OperationResult& operation : tick.executed.operations) {
-    if (operation.outcome == sync::OperationOutcome::kUploaded) {
-      ++uploaded_;
-    } else if (operation.outcome == sync::OperationOutcome::kDownloaded) {
-      ++downloaded_;
-    }
-    // A removal (#233) leaves a backup too, and is not an arbitration.
-    if (!operation.backup_sd_path.empty() &&
-        operation.outcome != sync::OperationOutcome::kRemoved) {
-      ++conflicts_;
-    }
-  }
+  // Counted plan by plan, in `options.on_plan`, for the reasons given there.
+  uploaded_ = uploaded;
+  downloaded_ = downloaded;
+  conflicts_ = arbitrated;
   for (const sync::StateOperationResult& operation : states.operations) {
     if (operation.outcome == sync::StateOutcome::kUploaded) {
       ++uploaded_;
@@ -2167,11 +2199,12 @@ bool SdEngine::RunOneTick() {
       ++downloaded_;
     }
   }
-  failed_ = static_cast<std::int64_t>(tick.executed.failed) +
+  failed_ = static_cast<std::int64_t>(tick.totals.failed) +
             static_cast<std::int64_t>(states.failed);
   switch (tick.outcome) {
     case sync::TickOutcome::kCompleted:
-      last_sync_result_ = states.failed > 0 ? ipc::SyncResult::kPartial : ipc::SyncResult::kOk;
+      last_sync_result_ = states.failed > 0 || scan_cut ? ipc::SyncResult::kPartial
+                                                        : ipc::SyncResult::kOk;
       break;
     case sync::TickOutcome::kPartial:
     case sync::TickOutcome::kUnreported:

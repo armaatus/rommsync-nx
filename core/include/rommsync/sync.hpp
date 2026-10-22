@@ -433,12 +433,6 @@ struct SyncOperation {
   /// place for the two spellings to disagree.
   std::optional<std::string> server_updated_at;
   std::optional<std::string> server_content_hash;
-
-  /// The negotiation that planned this operation, when it is not the plan's
-  /// own: `RunTick` merges a large card's chunks into one plan (#241), and an
-  /// upload is filed under the session it belongs to. `0` -- never parsed, so
-  /// every plan RomM sent -- means `SyncPlan::session_id`.
-  std::int64_t session_id = 0;
 };
 
 /// A whole `SyncNegotiateResponse`.
@@ -496,7 +490,11 @@ struct SyncPlan {
 /// the plan is held for the whole tick, so it is the operations' count that the
 /// heap pays for -- `sysmodule/source/main.cpp` counts the plan at this bound
 /// (M9-20, #246).
-auth::Parsed<SyncPlan> ParseNegotiateResponse(std::string_view body);
+///
+/// `too_large`, when given, is set to whether that is why it was refused, which
+/// `Negotiate` reports as `NegotiateError::kPlanTooLarge` rather than
+/// `kMalformed`.
+auth::Parsed<SyncPlan> ParseNegotiateResponse(std::string_view body, bool* too_large = nullptr);
 
 /// The most operations a plan may carry: as many saves as `state.db` can record
 /// (`state::kMaxRecords`, which `state_db.hpp` asserts this equals).
@@ -541,6 +539,14 @@ enum class NegotiateError {
   kUnreachable,      ///< the exchange never completed -- offline, stalled, dropped
   kServerError,      ///< 5xx, or the 429/408 a rate limiter or a proxy answers with
   kMalformed,        ///< a 2xx that is not a plan -- truncated, or a shape that moved
+
+  /// A 2xx plan of more than `kMaxPlanOperations` operations (M9-20, #246).
+  ///
+  /// Not `kMalformed`: the body is a plan, just a larger one than this console
+  /// holds, and the remedy is to ask about fewer roms at once -- which a scoped
+  /// tick does, down to one rom (`sync::RunTick`). Asking the same question
+  /// again gets the same answer, so it is no more retried than a malformed one.
+  kPlanTooLarge,
 };
 
 /// Stable, log-friendly name. Never null.

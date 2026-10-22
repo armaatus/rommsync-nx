@@ -771,6 +771,7 @@ void Walk(const std::vector<ScanFolder>& folders, Folders which, const roms::Rom
 
       if (emitted >= limit) {
         record_skip(limit_reason, sd_path, limit_message);
+        result->stopped_at_bound = true;
         return;
       }
 

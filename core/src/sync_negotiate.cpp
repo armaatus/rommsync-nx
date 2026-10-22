@@ -316,6 +316,8 @@ const char* ToString(NegotiateError error) {
       return "server_error";
     case NegotiateError::kMalformed:
       return "malformed";
+    case NegotiateError::kPlanTooLarge:
+      return "plan_too_large";
   }
   return "none";
 }
@@ -340,6 +342,8 @@ auth::Answer AnswerOf(NegotiateError error) {
     case NegotiateError::kNone:
     case NegotiateError::kNoSuchDevice:
     case NegotiateError::kSyncDisabled:
+    // A plan, if a larger one than this console holds: RomM read the token.
+    case NegotiateError::kPlanTooLarge:
       return auth::Answer::kAccepted;
     // The rest say nothing, `kRejected` -- a bare 4xx -- included.
     case NegotiateError::kRejected:
@@ -354,15 +358,21 @@ auth::Answer AnswerOf(NegotiateError error) {
   return auth::Answer::kSilent;
 }
 
-auth::Parsed<SyncPlan> ParseNegotiateResponse(std::string_view body) {
+auth::Parsed<SyncPlan> ParseNegotiateResponse(std::string_view body, bool* too_large) {
   auth::Parsed<SyncPlan> parsed;
+  if (too_large != nullptr) {
+    *too_large = false;
+  }
   // An operation at a time (`json::ParseEach`): the plan held as one document is
   // ~10x its text, 1.3 MiB at 512 operations on aarch64 (M9-20, #246).
   SyncPlan plan;
   const json::ParseResult document = json::ParseEach(
       body, "operations",
-      [&plan](const json::Value& element, std::size_t index) {
+      [&plan, too_large](const json::Value& element, std::size_t index) {
         if (index >= kMaxPlanOperations) {
+          if (too_large != nullptr) {
+            *too_large = true;
+          }
           return Fail("operations", "holds more than the " + std::to_string(kMaxPlanOperations) +
                                         " operations one plan may carry");
         }
@@ -508,9 +518,14 @@ Negotiation NegotiateWith(http::HttpClient& client, const auth::StoredToken& tok
     if (const std::optional<Negotiation> refused = Refused(result)) {
       outcome = *refused;
     } else {
-      auth::Parsed<SyncPlan> parsed = ParseNegotiateResponse(result.response.body);
+      bool too_large = false;
+      auth::Parsed<SyncPlan> parsed = ParseNegotiateResponse(result.response.body, &too_large);
       if (parsed.ok()) {
         outcome.plan = std::move(parsed.value);
+      } else if (too_large) {
+        outcome = Refuse(NegotiateError::kPlanTooLarge,
+                         "the plan holds more than the " + std::to_string(kMaxPlanOperations) +
+                             " operations this console can carry at once");
       } else {
         outcome = Refuse(NegotiateError::kMalformed,
                          "the plan could not be read: " + parsed.error.Describe());

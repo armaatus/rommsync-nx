@@ -184,11 +184,17 @@ RomM takes at most 500 ids a request, so a larger card is negotiated in chunks
 - Each save is sent in the chunk that names its rom. RomM widens a chunk's
   scope by the roms of the saves it carries, so a save sent elsewhere would
   leave its own rom's chunk offering the server's copy over it.
-- The chunks are one tick. Their operations run as one plan, the baseline is
-  written once, and each session is completed with its own share
-  (`TickResult::other_sessions`).
-- A chunk that fails to negotiate fails the tick before anything is written.
-  The sessions the earlier chunks opened are left to RomM's cleanup.
+- The chunks are one tick, and each chunk's plan is carried out on its own
+  (#246): negotiated, executed, written into the baseline and its session
+  completed (`TickResult::other_sessions` after the first), and freed before
+  the next chunk is asked. A plan is held for its whole run, and one plan is
+  what the sysmodule's heap is sized for (`sync::kMaxPlanOperations`).
+- A chunk whose plan is past that bound is halved and asked again, down to one
+  rom; a rom whose own saves are still past it is left out of the tick, named,
+  and the tick is partial (`TickResult::oversized_roms`).
+- A chunk that fails to negotiate before any plan ran fails the tick, and
+  nothing is written. After one ran, what it did stands, the rest waits for the
+  next tick, and the tick is partial.
 
 `rom_ids` costs at most `kMaxRomScopeBytes` (about 10 KiB) of request body. The
 response only shrinks.
@@ -266,9 +272,14 @@ things about the answer are worth stating here rather than leaving to the code:
   nobody hears about again. A truncated body is that failure in its quietest
   form, which is why `sync.truncated` forces one. A plan of more than
   `sync::kMaxPlanOperations` operations — `state::kMaxRecords`, 128 — is refused
-  the same way and for a sibling reason: it is read an operation at a time but
-  held for the whole tick, and past that bound it is more than the sysmodule's
-  heap was sized for (M9-20, #246).
+  too, as `plan_too_large`, for a sibling reason: it is read an operation at a
+  time but held for the length of its run, and past that bound it is more than
+  the sysmodule's heap was sized for (M9-20, #246). A scoped tick does not stop
+  there: it halves that negotiation's `rom_ids` and asks again, down to one rom,
+  and each chunk's plan is carried out and freed before the next is asked. Only
+  a rom whose own saves on the server are past the bound is left out — its saves
+  are not offered, so nothing of it is touched — named in a `sync.refused` line,
+  and the tick is partial rather than clean.
 - **An `action` this client does not recognise becomes `no_op`, and is logged.**
   On a save, the default branch is the one that can overwrite it. The same goes
   for an unrecognised `reason`, except that the action there is still obeyed: the

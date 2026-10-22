@@ -736,6 +736,28 @@ void Truncated(::checks::Checks& checks) {
   checks.Expect(repeat == names, "and reading it again gives the same entries");
 
   std::filesystem::remove_all(root, error);
+
+  // The scan's own bound, `kMaxSaves`: a card holding more matched saves than it
+  // stops at one walk past it, and says so in a flag the engine reads -- the
+  // skip that says the same is the last recorded, and may not be spelled out
+  // (M9-20, #246).
+  const auto scan_of = [](std::size_t saves) {
+    roms::RomIndex index;
+    FakeFileSystem card("bound");
+    for (std::size_t at = 0; at < saves; ++at) {
+      std::string name = std::to_string(at);
+      name.insert(name.begin(), 4 - name.size(), '0');
+      index.Add(MakeRom(static_cast<std::int64_t>(at) + 1, "Game " + name, "gba"));
+      card.AddFile("/tico/saves/gba", "Game " + name + ".srm", 16, kMtime);
+    }
+    return scan::ScanSaves(config::Defaults(), kRetroArchDefaults, index, card, kFirstTick);
+  };
+  const scan::ScanResult at_bound = scan_of(scan::kMaxSaves);
+  checks.ExpectEq(at_bound.saves.size(), scan::kMaxSaves, "a card at the bound reports all of it");
+  checks.Expect(!at_bound.stopped_at_bound, "and is not a card the scan stopped short of");
+  const scan::ScanResult past = scan_of(scan::kMaxSaves + 3);
+  checks.ExpectEq(past.saves.size(), scan::kMaxSaves, "one past it reports the bound");
+  checks.Expect(past.stopped_at_bound, "and says the walk stopped there");
 }
 
 // --- sources ------------------------------------------------------------------

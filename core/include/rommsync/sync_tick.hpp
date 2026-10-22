@@ -323,11 +323,27 @@ struct TickOptions {
   /// of a rom the card does not hold is then not offered, so nothing is placed
   /// beside a game that is not there.
   ///
-  /// The chunks are one tick: their operations are executed as one plan, the
-  /// baseline is written once, and each session is completed with its own
-  /// share (`TickResult::other_sessions`). A chunk that fails to negotiate fails
-  /// the tick before anything is written, as a single negotiation would; the
-  /// sessions the earlier chunks opened are left to RomM's cleanup.
+  /// **Each chunk's plan is carried out on its own, one after another** (M9-20,
+  /// #246): negotiated, executed, resolved, written into the baseline and its
+  /// session completed, and freed before the next chunk is asked. A plan is
+  /// held for the length of its run, and `kMaxPlanOperations` is what the heap
+  /// holds of one (`sysmodule/source/main.cpp`), so several merged would be
+  /// a plan the heap was never sized for. Each run starts from the baseline the
+  /// one before it wrote. The first chunk's completion is
+  /// `TickResult::finished` and carries the play sessions; the rest are
+  /// `TickResult::other_sessions`.
+  ///
+  /// **A chunk whose plan is past `kMaxPlanOperations` is split in half and
+  /// asked again**, its saves going with their roms, down to a single rom. A
+  /// rom whose own plan is still past it is left out of this tick -- its saves
+  /// are not offered, so nothing of it is touched -- and named in
+  /// `TickResult::oversized_roms`, which makes the tick `kPartial`.
+  ///
+  /// A chunk that fails to negotiate for any other reason ends the tick there.
+  /// Before any plan ran that is the tick's failure, as a single negotiation's
+  /// would be, and nothing is written; after one, what ran stands and the tick
+  /// is `kPartial` (`kUnauthorized` and `kCanceled` stay themselves). The roms
+  /// no plan covered are `TickResult::unasked_roms`.
   ///
   /// Nullopt -- and any server without `rom_ids` -- is the one unscoped
   /// negotiation. The engine always sets it.
@@ -347,6 +363,15 @@ struct TickOptions {
   /// trip after it, so a game launched meanwhile has already read the save the
   /// resolution would replace. Null never holds.
   std::function<bool()> hold_resolution;
+
+  /// Called once for every plan the tick carried out, in order, after it was
+  /// executed, resolved and finished and before it is freed (#246). The plan and
+  /// its report pair by position, as `TickResult`'s do.
+  ///
+  /// The way to see every operation of a tick that ran several plans:
+  /// `TickResult::negotiated` and `executed` hold only the last one, because
+  /// holding them all is what the per-chunk run exists to avoid. Null is fine.
+  std::function<void(const SyncPlan& plan, const ExecutionReport& executed)> on_plan;
 
   /// Optional, not owned; must outlive the call.
   ///
@@ -389,6 +414,27 @@ struct TickResult {
   /// accounting are `finished`, and one of these failing costs a row in a
   /// history.
   std::vector<Completion> other_sessions;
+
+  /// What every plan the tick ran did, summed (#246). With one plan these are
+  /// `executed`'s and `finished`'s; with several, `negotiated` and `executed`
+  /// are the last plan's alone (`TickOptions::on_plan`) and these are the
+  /// tick's.
+  struct Totals {
+    std::size_t plans = 0;
+    int completed = 0;
+    int failed = 0;
+    /// Every run's baseline reached the card.
+    bool stored = true;
+  };
+  Totals totals;
+
+  /// Roms whose own plan was past `kMaxPlanOperations`, left out of this tick
+  /// (#246). Ascending. Any makes the tick `kPartial`.
+  std::vector<std::int64_t> oversized_roms;
+
+  /// Every rom of the scope no plan covered this tick: the oversized ones, and
+  /// those of chunks a failure stopped the tick before. Ascending.
+  std::vector<std::int64_t> unasked_roms;
 
   TickOutcome outcome = TickOutcome::kCompleted;
 

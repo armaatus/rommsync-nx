@@ -2025,6 +2025,12 @@ void Scoped(rig::Checks& checks, http::HttpClient& client, const std::string& ba
     card.push_back(900'000'000 + id);
   }
   options.rom_scope = card;
+  // Each chunk's plan is carried out on its own and freed before the next
+  // (#246), so the tick's operations are the ones every plan handed over.
+  std::vector<sync::SyncOperation> planned;
+  options.on_plan = [&planned](const sync::SyncPlan& plan, const sync::ExecutionReport&) {
+    planned.insert(planned.end(), plan.operations.begin(), plan.operations.end());
+  };
   {
     const sync::TickResult tick = sync::RunTick(recording, *files, token, {}, {}, {}, options);
     checks.Expect(tick.negotiated.ok(), "a chunked negotiation is answered: " +
@@ -2047,10 +2053,13 @@ void Scoped(rig::Checks& checks, http::HttpClient& client, const std::string& ba
     }
     checks.ExpectEq(named, card.size(), "between them, every rom on the card once");
     int count = 0;
-    PlannedFor(tick, rom.id, slot, &count);
+    for (const sync::SyncOperation& operation : planned) {
+      count += operation.rom_id == rom.id && operation.slot == slot ? 1 : 0;
+    }
     checks.ExpectEq(count, 1, "the server's save is offered once, by the chunk that names it");
+    checks.ExpectEq(tick.totals.plans, std::size_t{3}, "and each chunk's plan ran on its own");
     bool in_scope = true;
-    for (const sync::SyncOperation& operation : tick.negotiated.plan.operations) {
+    for (const sync::SyncOperation& operation : planned) {
       in_scope = in_scope && std::find(card.begin(), card.end(), operation.rom_id) != card.end();
     }
     checks.Expect(in_scope, "and nothing outside the card is offered by any of them");
@@ -2282,6 +2291,12 @@ void Oversized(rig::Checks& checks, http::HttpClient& client, const std::string&
   }
   std::sort(card.begin(), card.end());
   options.rom_scope = card;
+  std::size_t executed_plans = 0;
+  std::size_t largest_plan = 0;
+  options.on_plan = [&](const sync::SyncPlan& plan, const sync::ExecutionReport&) {
+    ++executed_plans;
+    largest_plan = std::max(largest_plan, plan.operations.size());
+  };
 
   if (uploaded) {
     const sync::TickResult tick =
@@ -2312,6 +2327,16 @@ void Oversized(rig::Checks& checks, http::HttpClient& client, const std::string&
     checks.Expect(tick.outcome == sync::TickOutcome::kPartial,
                   std::string("the rom left out makes the tick partial, not clean: ") +
                       sync::ToString(tick.outcome));
+    const std::int64_t big = seeded[2].rom.id;
+    checks.Expect(tick.oversized_roms == std::vector<std::int64_t>{big},
+                  "and it is named: the rom whose own saves are past the bound, and no other");
+    checks.Expect(tick.unasked_roms == std::vector<std::int64_t>{big},
+                  "the only rom no plan covered");
+    checks.ExpectEq(tick.totals.plans, std::size_t{2},
+                    "the two that fit ran one plan each, one after another");
+    checks.ExpectEq(executed_plans, std::size_t{2}, "each handed to on_plan before it was freed");
+    checks.Expect(largest_plan <= sync::kMaxPlanOperations,
+                  "and none of them held more than one plan may: " + std::to_string(largest_plan));
   }
 
   for (const Seeded& one : seeded) {

@@ -44,7 +44,6 @@
 #pragma once
 
 #include <cstddef>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -75,11 +74,6 @@ inline constexpr const char* kStateSdPath = "/config/rommsync/state.db";
 /// the cancellation are in neither total, so the two add up to less than
 /// `report.operations.size()`. That is honest: they were not attempted.
 CompletionCounts CountsFor(const ExecutionReport& report);
-
-/// The counts `report.operations[begin, end)` earned, read off each one's
-/// outcome by the same rule: one session's share of a plan that several
-/// negotiations made (`RunTick`'s rom scope chunks, #241). `end` is clamped.
-CompletionCounts CountsFor(const ExecutionReport& report, std::size_t begin, std::size_t end);
 
 /// The baseline a tick should store, and everything it could not put in it.
 struct BaselineUpdate {
@@ -180,12 +174,6 @@ struct FinishOptions {
   /// see `TickCompletion::play_sessions_sent`. Play time is the most droppable
   /// thing in the client; the session RomM is waiting to have closed is not.
   std::vector<PlaySession> play_sessions;
-
-  /// What the completion of `plan.session_id` carries, when the plan is more
-  /// than that session's: `RunTick` negotiates a large card in chunks (#241),
-  /// executes their operations as one plan, and completes each session with
-  /// its own share. Unset, the whole report is counted (`CountsFor`).
-  std::optional<CompletionCounts> counts;
 };
 
 /// What the end of a tick did. Both halves are reported, because they fail
@@ -258,10 +246,15 @@ struct TickCompletion {
 /// written either way. That is the split on purpose. A caller that wants
 /// neither can persist the baseline itself with `AdvanceBaseline` and
 /// `state::SaveBaseline`, in that order.
+///
+/// `advanced`, when given, receives the baseline as it was written -- moved,
+/// not copied -- for a tick that finishes several plans one after another and
+/// starts each from what the one before it left (#246).
 TickCompletion FinishTick(http::HttpClient& client, fs::FileSystem& files,
                           const auth::StoredToken& token, const SyncPlan& plan,
                           const ExecutionReport& report,
                           const std::vector<ClientSaveState>& reported,
-                          state::Baseline previous, const FinishOptions& options = {});
+                          state::Baseline previous, const FinishOptions& options = {},
+                          state::Baseline* advanced = nullptr);
 
 }  // namespace rommsync::sync

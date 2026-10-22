@@ -8,6 +8,9 @@
 #include "rommsync/sync_tick.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <deque>
 #include <string>
 #include <utility>
 #include <vector>
@@ -47,6 +50,9 @@ TickOutcome OutcomeOf(NegotiateError error) {
     case NegotiateError::kNoSuchDevice:
     case NegotiateError::kRejected:
     case NegotiateError::kMalformed:
+    // Unsplittable here: only an unscoped negotiation reaches this, and it has
+    // no rom ids to halve (`RunTick` splits a scoped one before it gets here).
+    case NegotiateError::kPlanTooLarge:
       // Answers that do not get better by asking again. A malformed body is in
       // here rather than with the transport failures on purpose: a truncated
       // plan is a plan with a save missing from it, and the cheap mistake is to
@@ -130,69 +136,112 @@ auth::Answer AnswerAfter(NegotiateError negotiated, const ExecutionReport& execu
   return AnswerOf(negotiated);
 }
 
-/// One session's share of a plan several negotiations made: its id, and the
-/// operations `[begin, end)` it planned.
-struct SessionShare {
-  std::int64_t id = 0;
-  std::size_t begin = 0;
-  std::size_t end = 0;
+/// How far from clean an outcome is, for a tick that ran several plans: the
+/// furthest is the tick's. Only the outcomes a plan's run can end in are ranked.
+int Severity(TickOutcome outcome) {
+  switch (outcome) {
+    case TickOutcome::kCompleted:
+      return 0;
+    case TickOutcome::kPartial:
+      return 1;
+    case TickOutcome::kUnreported:
+      return 2;
+    case TickOutcome::kUnauthorized:
+      return 3;
+    case TickOutcome::kCanceled:
+      return 4;
+    default:
+      return 1;
+  }
+}
+
+TickOutcome Worse(TickOutcome left, TickOutcome right) {
+  return Severity(right) > Severity(left) ? right : left;
+}
+
+/// `chunk` cut in two by its rom ids, each save going with its rom -- the rule
+/// `ChunkScope` keeps (rom_scope.hpp) -- and a save whose rom is in neither half
+/// with the first, where `ChunkScope` put it.
+std::pair<ScopeChunk, ScopeChunk> Halve(const ScopeChunk& chunk,
+                                        const std::vector<ClientSaveState>& offered) {
+  ScopeChunk lower;
+  ScopeChunk upper;
+  lower.restore = upper.restore = chunk.restore;
+  const std::size_t middle = chunk.rom_ids.size() / 2;
+  lower.rom_ids.assign(chunk.rom_ids.begin(), chunk.rom_ids.begin() + middle);
+  upper.rom_ids.assign(chunk.rom_ids.begin() + middle, chunk.rom_ids.end());
+  for (const std::size_t index : chunk.saves) {
+    const std::int64_t rom = offered[index].rom_id;
+    const bool in_upper = std::binary_search(upper.rom_ids.begin(), upper.rom_ids.end(), rom);
+    (in_upper ? upper : lower).saves.push_back(index);
+  }
+  return {std::move(lower), std::move(upper)};
+}
+
+/// What one plan's run did, before it is folded into the tick.
+struct PlanRun {
+  ExecutionReport executed;
+  ResolveReport resolved;
+  TickCompletion finished;
+  TickOutcome outcome = TickOutcome::kCompleted;
+  auth::Answer answer = auth::Answer::kSilent;
 };
 
-/// Negotiate `offered` over `options.rom_scope`, one chunk at a time, into one
-/// plan (rom_scope.hpp). The first failure is the answer, with the attempts and
-/// the backoff of every chunk before it.
-Negotiation NegotiateScope(http::HttpClient& client, const auth::StoredToken& token,
-                           const std::vector<ClientSaveState>& offered,
-                           const TickOptions& options, const NegotiateOptions& negotiate,
-                           std::vector<SessionShare>* shares) {
-  const std::vector<ScopeChunk> chunks =
-      ChunkScope(offered, *options.rom_scope,
-                 options.server.restore_unlisted ? options.restore_roms
-                                                 : std::vector<std::int64_t>{});
-  Negotiation merged;
-  for (const ScopeChunk& chunk : chunks) {
-    NegotiateOptions asked = negotiate;
-    asked.restore_unlisted = chunk.restore;
-    // The whole vector when there is one chunk, which is nearly every card:
-    // the tick that carries it is the heap's peak, and a copy of it buys nothing.
-    std::vector<ClientSaveState> some;
-    if (chunks.size() > 1) {
-      some.reserve(chunk.saves.size());
-      for (const std::size_t index : chunk.saves) {
-        some.push_back(offered[index]);
-      }
-    }
-    Negotiation one =
-        NegotiateRoms(client, token, chunks.size() > 1 ? some : offered, chunk.rom_ids, asked);
-    one.attempts += merged.attempts;
-    one.waited += merged.waited;
-    if (!one.ok()) {
-      return one;
-    }
-    const std::size_t begin = merged.plan.operations.size();
-    const std::int64_t session = one.plan.session_id;
-    if (shares->empty()) {
-      merged = std::move(one);
-    } else {
-      SyncPlan& plan = merged.plan;
-      for (SyncOperation& operation : one.plan.operations) {
-        operation.session_id = session;
-        plan.operations.push_back(std::move(operation));
-      }
-      plan.total_upload += one.plan.total_upload;
-      plan.total_download += one.plan.total_download;
-      plan.total_conflict += one.plan.total_conflict;
-      plan.total_no_op += one.plan.total_no_op;
-      plan.total_delete += one.plan.total_delete;
-      for (std::string& warning : one.plan.warnings) {
-        plan.warnings.push_back(std::move(warning));
-      }
-      merged.attempts = one.attempts;
-      merged.waited = one.waited;
-    }
-    shares->push_back({session, begin, merged.plan.operations.size()});
+/// Execute, resolve and finish one plan, starting from `*baseline` and leaving
+/// in it what was written. `first` is the run that carries the play sessions.
+PlanRun CarryOut(http::HttpClient& client, fs::FileSystem& files, const auth::StoredToken& token,
+                 const std::vector<ClientSaveState>& offered,
+                 const std::vector<SaveTarget>& targets, Negotiation* negotiated,
+                 state::Baseline* baseline, const TickOptions& options,
+                 const NegotiateOptions& negotiate, bool first) {
+  PlanRun run;
+  ExecuteOptions execute = options.execute;
+  execute.cancel = options.cancel;
+  execute.send_content_hash = options.server.hash_baselines;
+  // A `delete` (#233) is obeyed only where the heartbeat said the server means
+  // one, and only on the bytes this tick reported: the server ruled on those.
+  execute.delete_action = options.server.delete_action;
+  execute.reported = &offered;
+  run.executed = ExecutePlan(client, files, token, negotiated->plan, targets, execute);
+
+  // Before the baseline is written, because the baseline is written from the
+  // plan and the report this changes: an upload the slot guard refused becomes
+  // a download of the server's head, or a conflict, at the same index -- never
+  // another upload, and never more than one second negotiation (#232).
+  ResolveOptions resolve;
+  resolve.rom_ids = options.server.rom_ids;
+  resolve.hold = options.hold_resolution;
+  resolve.negotiate = negotiate;
+  resolve.execute = execute;
+  // Never a removal inside the resolution (#233): it only ever runs the heads
+  // `ResolveNewerOnServer` turned into a download or a conflict, and a delete
+  // that slipped past it is still not obeyed here.
+  resolve.execute.delete_action = false;
+  resolve.complete = options.finish.complete;
+  resolve.complete.cancel = options.cancel;
+  // `offered` again: a save withheld as deleted on the server (#233) was never
+  // uploaded, so it cannot have drawn a 409, and is not asked about here either.
+  run.resolved = ResolveRefusedUploads(client, files, token, offered, targets, *baseline,
+                                       &negotiated->plan, &run.executed, resolve);
+
+  // Always, including after a cancellation and after a 401. The baseline is
+  // local and is the expensive thing to lose; the completion call is the cheap
+  // one, and with the token plumbed a cancelled tick abandons it without a
+  // request (sync_finish.hpp). Each run completes its own session, so the
+  // whole report is its count.
+  FinishOptions finish = options.finish;
+  finish.complete.cancel = options.cancel;
+  if (!first) {
+    finish.play_sessions.clear();
   }
-  return merged;
+  // `offered`, not `reported`: a withheld save is one this tick did not
+  // mention, so its marked row stands as it is.
+  run.finished = FinishTick(client, files, token, negotiated->plan, run.executed, offered,
+                            std::move(*baseline), finish, baseline);
+
+  run.outcome = OutcomeAfter(run.executed, run.finished);
+  run.answer = AnswerAfter(negotiated->error, run.executed, run.finished);
+  return run;
 }
 
 }  // namespace
@@ -298,90 +347,185 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
 
   NegotiateOptions negotiate = options.negotiate;
   negotiate.cancel = options.cancel;
-  // Scoped to the roms on the card, and chunked to RomM's bound, wherever the
-  // caller knows them (#241).
-  std::vector<SessionShare> shares;
-  result.negotiated = options.rom_scope.has_value() && options.server.rom_ids
-                          ? NegotiateScope(client, token, *offered, options, negotiate, &shares)
-                          : Negotiate(client, token, *offered, negotiate);
-  if (!result.negotiated.ok()) {
-    // The offline case, and the one the acceptance is sharpest about: nothing
-    // after this point runs, so no save is touched, no backup is written and
-    // `state.db` is not rewritten.
-    result.outcome = OutcomeOf(result.negotiated.error);
-    result.answer = AnswerOf(result.negotiated.error);
-    return result;
-  }
 
-  // Only now: nothing needs `.backup/` until an operation does, and a tick that
-  // never reached the server must not have written anything to the card.
-  if (options.create_backup_dir) {
-    const fs::MakeDirResult made = files.CreateDirectory(options.execute.backup_dir);
-    if (!made.ok() && result.recovered.warnings.size() < kMaxRecoveryWarnings) {
-      // Not fatal. Every operation that would overwrite a save fails with
-      // `kBackupFailed` further down -- no backup, no overwrite -- and an upload
-      // or a no-op does not need the directory at all, so a tick that can still
-      // do half its work does it. Bounded by the same cap the sweep's own lines
-      // are, because the list is the same list.
-      result.recovered.warnings.push_back("the backup directory " + options.execute.backup_dir +
-                                          " could not be created: " + made.message);
+  // Scoped to the roms on the card, and chunked to RomM's bound, wherever the
+  // caller knows them (#241) -- and each chunk's plan carried out on its own,
+  // one after another, a chunk too large for one plan split in half until it
+  // fits or is one rom (#246; sync_tick.hpp, `TickOptions::rom_scope`).
+  const bool scoped = options.rom_scope.has_value() && options.server.rom_ids;
+  std::deque<ScopeChunk> pending;
+  if (scoped) {
+    const std::vector<ScopeChunk> chunks =
+        ChunkScope(*offered, *options.rom_scope,
+                   options.server.restore_unlisted ? options.restore_roms
+                                                   : std::vector<std::int64_t>{});
+    pending.assign(chunks.begin(), chunks.end());
+  } else {
+    pending.emplace_back();
+  }
+  const bool whole = pending.size() == 1;
+
+  state::Baseline baseline = std::move(previous);
+  TickOutcome outcome = TickOutcome::kCompleted;
+  auth::Answer answer = auth::Answer::kSilent;
+  int attempts = 0;
+  std::chrono::milliseconds waited{0};
+  bool backup_made = false;
+  bool left_out = false;
+  const auto unasked = [&result](const ScopeChunk& chunk) {
+    result.unasked_roms.insert(result.unasked_roms.end(), chunk.rom_ids.begin(),
+                               chunk.rom_ids.end());
+  };
+  const auto stop = [&]() {
+    for (const ScopeChunk& rest : pending) {
+      unasked(rest);
+    }
+    pending.clear();
+  };
+
+  while (!pending.empty()) {
+    if (result.totals.plans > 0 && Canceled(options.cancel)) {
+      outcome = Worse(outcome, TickOutcome::kCanceled);
+      stop();
+      break;
+    }
+    ScopeChunk chunk = std::move(pending.front());
+    pending.pop_front();
+
+    Negotiation one;
+    if (!scoped) {
+      one = Negotiate(client, token, *offered, negotiate);
+    } else {
+      NegotiateOptions asked = negotiate;
+      asked.restore_unlisted = chunk.restore;
+      // The whole vector when there is one chunk, which is nearly every card:
+      // the tick that carries it is the heap's peak, and a copy of it buys
+      // nothing.
+      std::vector<ClientSaveState> some;
+      if (!whole) {
+        some.reserve(chunk.saves.size());
+        for (const std::size_t index : chunk.saves) {
+          some.push_back((*offered)[index]);
+        }
+      }
+      one = NegotiateRoms(client, token, whole ? *offered : some, chunk.rom_ids, asked);
+    }
+    attempts += one.attempts;
+    waited += one.waited;
+
+    if (scoped && one.error == NegotiateError::kPlanTooLarge) {
+      if (chunk.rom_ids.size() > 1) {
+        // Both halves before the chunks after them, so the order the tick works
+        // in is still the scope's.
+        std::pair<ScopeChunk, ScopeChunk> halves = Halve(chunk, *offered);
+        pending.push_front(std::move(halves.second));
+        pending.push_front(std::move(halves.first));
+        continue;
+      }
+      // One rom whose own saves are more than a plan holds: left out of this
+      // tick, its saves unoffered and untouched, and named.
+      left_out = true;
+      result.oversized_roms.insert(result.oversized_roms.end(), chunk.rom_ids.begin(),
+                                   chunk.rom_ids.end());
+      unasked(chunk);
+      continue;
+    }
+
+    if (!one.ok()) {
+      if (result.totals.plans == 0) {
+        // The offline case, and the one the acceptance is sharpest about:
+        // nothing after this point runs, so no save is touched, no backup is
+        // written and `state.db` is not rewritten.
+        unasked(chunk);
+        stop();
+        one.attempts = attempts;
+        one.waited = waited;
+        result.outcome = OutcomeOf(one.error);
+        result.answer = AnswerOf(one.error);
+        result.negotiated = std::move(one);
+        std::sort(result.oversized_roms.begin(), result.oversized_roms.end());
+        std::sort(result.unasked_roms.begin(), result.unasked_roms.end());
+        return result;
+      }
+      // After a plan ran, what it did stands; the rest waits for the next tick.
+      const TickOutcome failed = OutcomeOf(one.error);
+      outcome = Worse(outcome, failed == TickOutcome::kUnauthorized || failed == TickOutcome::kCanceled
+                                   ? failed
+                                   : TickOutcome::kPartial);
+      if (const auth::Answer said = AnswerOf(one.error); said != auth::Answer::kSilent) {
+        answer = said;
+      }
+      unasked(chunk);
+      stop();
+      result.negotiated = std::move(one);
+      result.executed = ExecutionReport{};
+      result.resolved = ResolveReport{};
+      break;
+    }
+
+    // Only now: nothing needs `.backup/` until an operation does, and a tick that
+    // never reached the server must not have written anything to the card.
+    if (!backup_made && options.create_backup_dir) {
+      backup_made = true;
+      const fs::MakeDirResult made = files.CreateDirectory(options.execute.backup_dir);
+      if (!made.ok() && result.recovered.warnings.size() < kMaxRecoveryWarnings) {
+        // Not fatal. Every operation that would overwrite a save fails with
+        // `kBackupFailed` further down -- no backup, no overwrite -- and an
+        // upload or a no-op does not need the directory at all, so a tick that
+        // can still do half its work does it. Bounded by the same cap the
+        // sweep's own lines are, because the list is the same list.
+        result.recovered.warnings.push_back("the backup directory " +
+                                            options.execute.backup_dir +
+                                            " could not be created: " + made.message);
+      }
+    }
+
+    const bool first = result.totals.plans == 0;
+    PlanRun run = CarryOut(client, files, token, *offered, targets, &one, &baseline, options,
+                           negotiate, first);
+    ++result.totals.plans;
+    result.totals.completed += run.executed.completed;
+    result.totals.failed += run.executed.failed;
+    result.totals.stored = result.totals.stored && run.finished.stored.ok();
+    if (options.on_plan) {
+      options.on_plan(one.plan, run.executed);
+    }
+    outcome = Worse(outcome, run.outcome);
+    if (run.answer != auth::Answer::kSilent) {
+      answer = run.answer;
+    }
+    if (first) {
+      result.session_gone = SessionGone(run.finished.reported.error);
+      result.finished = std::move(run.finished);
+    } else {
+      result.other_sessions.push_back(std::move(run.finished.reported));
+      result.finished.warnings.insert(result.finished.warnings.end(),
+                                      run.finished.warnings.begin(),
+                                      run.finished.warnings.end());
+    }
+    // The last plan is kept for the caller; any before it is freed here, before
+    // the next chunk is asked (`TickOptions::on_plan`).
+    result.negotiated = std::move(one);
+    result.executed = std::move(run.executed);
+    result.resolved = std::move(run.resolved);
+
+    if (run.outcome == TickOutcome::kUnauthorized || run.outcome == TickOutcome::kCanceled) {
+      // The next chunk would meet the same refusal, or the same shutdown.
+      stop();
     }
   }
 
-  ExecuteOptions execute = options.execute;
-  execute.cancel = options.cancel;
-  execute.send_content_hash = options.server.hash_baselines;
-  // A `delete` (#233) is obeyed only where the heartbeat said the server means
-  // one, and only on the bytes this tick reported: the server ruled on those.
-  execute.delete_action = options.server.delete_action;
-  execute.reported = offered;
-  result.executed =
-      ExecutePlan(client, files, token, result.negotiated.plan, targets, execute);
-
-  // Before the baseline is written, because the baseline is written from the
-  // plan and the report this changes: an upload the slot guard refused becomes
-  // a download of the server's head, or a conflict, at the same index -- never
-  // another upload, and never more than one second negotiation (#232).
-  ResolveOptions resolve;
-  resolve.rom_ids = options.server.rom_ids;
-  resolve.hold = options.hold_resolution;
-  resolve.negotiate = negotiate;
-  resolve.execute = execute;
-  // Never a removal inside the resolution (#233): it only ever runs the heads
-  // `ResolveNewerOnServer` turned into a download or a conflict, and a delete
-  // that slipped past it is still not obeyed here.
-  resolve.execute.delete_action = false;
-  resolve.complete = options.finish.complete;
-  resolve.complete.cancel = options.cancel;
-  // `offered` again: a save withheld as deleted on the server (#233) was never
-  // uploaded, so it cannot have drawn a 409, and is not asked about here either.
-  result.resolved = ResolveRefusedUploads(client, files, token, *offered, targets, previous,
-                                          &result.negotiated.plan, &result.executed, resolve);
-
-  // Always, including after a cancellation and after a 401. The baseline is
-  // local and is the expensive thing to lose; the completion call is the cheap
-  // one, and with the token plumbed a cancelled tick abandons it without a
-  // request (sync_finish.hpp).
-  FinishOptions finish = options.finish;
-  finish.complete.cancel = options.cancel;
-  if (shares.size() > 1) {
-    // Each session is told what it planned and saw done (#241). The resolution
-    // above replaced operations in place, so the shares still line up.
-    finish.counts = CountsFor(result.executed, shares.front().begin, shares.front().end);
+  // Every chunk a rom too large for a plan is a tick in which nothing ran and
+  // nothing was written -- `kPartial` below, never `kCompleted`.
+  result.negotiated.attempts = attempts;
+  result.negotiated.waited = waited;
+  if (left_out) {
+    outcome = Worse(outcome, TickOutcome::kPartial);
   }
-  // `offered`, not `reported`: a withheld save is one this tick did not
-  // mention, so its marked row stands as it is.
-  result.finished = FinishTick(client, files, token, result.negotiated.plan, result.executed,
-                               *offered, std::move(previous), finish);
-  for (std::size_t index = 1; index < shares.size(); ++index) {
-    result.other_sessions.push_back(CompleteSession(
-        client, token, shares[index].id,
-        CountsFor(result.executed, shares[index].begin, shares[index].end), {}, finish.complete));
-  }
-
-  result.session_gone = SessionGone(result.finished.reported.error);
-  result.outcome = OutcomeAfter(result.executed, result.finished);
-  result.answer = AnswerAfter(result.negotiated.error, result.executed, result.finished);
+  std::sort(result.oversized_roms.begin(), result.oversized_roms.end());
+  std::sort(result.unasked_roms.begin(), result.unasked_roms.end());
+  result.outcome = outcome;
+  result.answer = answer;
   return result;
 }
 

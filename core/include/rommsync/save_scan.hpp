@@ -308,6 +308,15 @@ struct ScanResult {
   /// for a library problem that is really a client bound.
   bool index_truncated = false;
 
+  /// The walk stopped at its bound -- `kMaxSaves`, or `kMaxStates` for the
+  /// state walk -- and the rest of the card was not read (M9-20, #246).
+  ///
+  /// Its own flag rather than a skip to look for: the skip that says so is
+  /// recorded last, and past `kMaxSkipsReported` it is counted but not spelled
+  /// out. A tick that synced every save it saw is still not a clean one when
+  /// it could not see them all, and the engine says so on the status screen.
+  bool stopped_at_bound = false;
+
   /// Saves reported with no digest because their bytes could not be read, in
   /// scan order and bounded like `skipped`.
   ///
