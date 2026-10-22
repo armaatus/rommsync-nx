@@ -1597,6 +1597,9 @@ void Isolated(::checks::Checks& checks) {
   card.Save(saves + "/psp/ULUS10041", "PARAM.SFO");
   card.Save(saves + "/psp/ULUS10041", "DATA.BIN");
   card.Save(saves + "/psp/backups", "Psp Game.1");
+  // And a loose file named for the rom, which PPSSPP does not write: still no
+  // PSP save, so nothing goes up under `tico-ppsspp`.
+  card.Save(saves + "/psp", "Psp Game.sav");
   // The layout before 0.8.0 holds a PSP folder too, and is outside it now.
   card.Save("/tico/saves/psp/NPJH50505", "DATA.BIN");
 
@@ -1647,11 +1650,13 @@ void Isolated(::checks::Checks& checks) {
                 "a PPSSPP save folder is a named skip: " + result.DescribeSkipped());
   checks.Expect(SkippedFor(result, "/tico/saves/psp/NPJH50505", scan::SkipReason::kSaveFolder),
                 "and so is one left in the layout before 0.8.0, which is not read either");
+  checks.Expect(SkippedFor(result, saves + "/psp/Psp Game.sav", scan::SkipReason::kSaveFolder),
+                "a loose file in the psp folder is no PSP save either, whatever it is named");
   checks.Expect(SkippedFor(result, saves + "/psx/Twin.mcd", scan::SkipReason::kAmbiguous),
                 "a card two disc-1 roms could own is not guessed");
   checks.Expect(SkippedFor(result, saves + "/psx/Nobody_2.mcd", scan::SkipReason::kUnmatched),
                 "a card 2 of no rom is unmatched");
-  checks.ExpectEq(result.skipped_total, std::size_t{4},
+  checks.ExpectEq(result.skipped_total, std::size_t{5},
                   "and nothing else -- backups/ is litter, not a save folder: " +
                       result.DescribeSkipped());
   for (const scan::Skip& skip : result.skipped) {
