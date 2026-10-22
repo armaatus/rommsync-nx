@@ -401,9 +401,15 @@ PC, and back. RetroArch's slot 0 and slots past 5 have no Tico file and are not
 placed in Tico's folder. Off — the default — each frontend's states keep their
 own names, Tico's are placed only in Tico's folder and RetroArch's only in
 RetroArch's, and Tico's `.state1`–`.state5` share their names with RetroArch's
-slots 1–5 a slot apart. Turn it on on every Switch or on none: changing it
-renames every Tico state the server is sent, and the old rows are left on the
-server. The `.png` Tico (and RetroArch) keeps beside a state is uploaded as the
+slots 1–5 a slot apart — so with it off, a Tico state of a libretro module
+that reaches RetroArch lands one slot along, and Tico's Auto in RetroArch's
+slot 5. Turn it on on every Switch or on none: the server's names do not say
+which numbering wrote them. Changing it renames every Tico state this console
+sends. A renamed state that meets a row synced from another of its files —
+`Game.state0`, now `Game.state1`, meeting the row the card's own `Game.state1`
+went up as — is kept apart rather than uploaded over it, and said so every tick
+until that row is deleted in RomM; the Auto slot, a new name either way, simply
+uploads. The `.png` Tico (and RetroArch) keeps beside a state is uploaded as the
 state's screenshot in RomM.
 
 ### `conflict_show` hides the screen, never the recording

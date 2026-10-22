@@ -12,7 +12,7 @@ namespace {
 using config::text::LowerAscii;
 
 constexpr std::string_view kState = ".state";
-constexpr std::string_view kAuto = ".state.auto";
+constexpr std::string_view kAutoSuffix = ".state.auto";
 
 /// What follows a state's stem.
 enum class Kind {
@@ -35,10 +35,11 @@ struct Suffix {
 Suffix Split(std::string_view name) {
   const std::string lowered = LowerAscii(name);
   Suffix suffix;
-  if (lowered.size() > kAuto.size() &&
-      lowered.compare(lowered.size() - kAuto.size(), kAuto.size(), kAuto) == 0) {
+  const std::size_t auto_at = lowered.size() - kAutoSuffix.size();
+  if (lowered.size() > kAutoSuffix.size() &&
+      lowered.compare(auto_at, kAutoSuffix.size(), kAutoSuffix) == 0) {
     suffix.kind = Kind::kAuto;
-    suffix.stem = name.substr(0, name.size() - kAuto.size());
+    suffix.stem = name.substr(0, name.size() - kAutoSuffix.size());
     return suffix;
   }
   const std::size_t at = lowered.rfind(kState);
@@ -73,7 +74,7 @@ std::optional<std::string> RetroArchStateName(std::string_view tico_name) {
     return std::nullopt;
   }
   if (suffix.number == kTicoAuto) {
-    return std::string(suffix.stem) + std::string(kAuto);
+    return std::string(suffix.stem) + std::string(kAutoSuffix);
   }
   return std::string(suffix.stem) + std::string(kState) + std::to_string(suffix.number + 1);
 }
@@ -102,7 +103,7 @@ bool IsRetroArchStateName(std::string_view name) {
 
 std::string StateMatchName(std::string_view name) {
   // `.auto` off the end, and the rom lookup takes `.state` off what is left.
-  constexpr std::size_t kDotAuto = kAuto.size() - kState.size();
+  constexpr std::size_t kDotAuto = kAutoSuffix.size() - kState.size();
   return Split(name).kind == Kind::kAuto ? std::string(name.substr(0, name.size() - kDotAuto))
                                          : std::string(name);
 }

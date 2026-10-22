@@ -428,18 +428,9 @@ bool IsRetroArchFile(std::string_view name, Folders which) {
   if (which == Folders::kSaves) {
     return extension == "srm" || extension == "rtc";
   }
-  if (IsRetroArchStateName(name)) {
-    return true;  // `.state.auto` among them (#239)
-  }
-  if (extension.rfind("state", 0) != 0) {
-    return false;
-  }
-  for (std::size_t i = 5; i < extension.size(); ++i) {
-    if (extension[i] < '0' || extension[i] > '9') {
-      return false;
-    }
-  }
-  return true;
+  // `.state`, `.stateN` and `.state.auto` -- the placer's rule too, so what is
+  // placed beside the roms is what is read back there (#239).
+  return IsRetroArchStateName(name);
 }
 
 /// A file an emulator keeps beside its saves and states that is never one: a

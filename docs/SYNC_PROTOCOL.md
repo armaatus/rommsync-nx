@@ -906,6 +906,13 @@ writes RetroArch's back under Tico's (`scan::RetroArchStateName`,
 | Auto | `.state5` | `.state.auto` |
 | RetroArch slot 0 | — | `.state` |
 
+Turning the mapping on or off renames the keys, not the files, so a key can meet
+a `state.db` row taken of a *different* file — the card's `Game.state0`, now
+`Game.state1`, meets the row its own `Game.state1` was synced under. The table
+reads that as "this console played on" and would upload menu slot 1 over slot
+2's row. So an upload over a row is kept both instead while another scanned
+state of the rom still matches that row exactly (`RowDescribesAnother`).
+
 Either way a placement takes only a name its frontend loads: `.state0`–`.state5`
 in Tico's folder, `.state`, `.state<N>` (N ≥ 1) or `.state.auto` in RetroArch's.
 RetroArch's `.state.auto` is matched to its rom by the name before `.state`, like

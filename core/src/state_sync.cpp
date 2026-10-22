@@ -373,6 +373,26 @@ bool LocalUnmoved(const state::StateRecord& row, const scan::StateFile& file) {
          !file.content_hash.empty() && row.content_hash == file.content_hash;
 }
 
+/// Another scanned state of the same rom that `row` still describes exactly, or
+/// nullptr.
+///
+/// The row under a name was taken of one file, and the file now under that name
+/// can be a different one: `[sync] map_state_slots` renames every Tico slot one
+/// along, so the card's `Game.state0` is keyed `Game.state1` -- the name the
+/// card's own `Game.state1` was synced under until now (#239). Read as "this
+/// console played on", that is an upload of slot 1 over slot 2's row. When the
+/// file the row was taken of is still on the card, unchanged, it is not that.
+const scan::StateFile* RowDescribesAnother(const state::StateRecord& row,
+                                           const scan::StateFile& file,
+                                           const std::vector<scan::StateFile>& scanned) {
+  for (const scan::StateFile& other : scanned) {
+    if (other.rom_id == file.rom_id && other.sd_path != file.sd_path && LocalUnmoved(row, other)) {
+      return &other;
+    }
+  }
+  return nullptr;
+}
+
 /// The decision table from the file header, as one function.
 StateAction Decide(const state::StateRecord* row, const ServerState* server,
                    const scan::StateFile& file, std::string* why) {
@@ -904,7 +924,20 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
     const state::StateRecord* row = baseline->FindState(file.rom_id, file.file_name);
 
     std::string why;
-    const StateAction action = Decide(row, server, file, &why);
+    StateAction action = Decide(row, server, file, &why);
+    if (action == StateAction::kUpload && row != nullptr && server != nullptr) {
+      // An upload over a row this console synced -- unless the row was taken of
+      // another file, which is a rename rather than play, and the row holds that
+      // file's state for whoever reads it.
+      if (const scan::StateFile* other =
+              RowDescribesAnother(*row, file, report.scan.states)) {
+        action = StateAction::kKeepBoth;
+        why = "the server's state under this name was synced from " + other->sd_path +
+              ", not " + file.sd_path +
+              " -- the names were renamed, as turning [sync] map_state_slots on or off does; "
+              "both copies are kept and neither was touched";
+      }
+    }
     switch (action) {
       case StateAction::kNoOp: {
         StateOperationResult result;
