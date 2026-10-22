@@ -20,6 +20,7 @@
 #include <string_view>
 #include <string>
 #include <system_error>
+#include <vector>
 
 #include "checks.hpp"
 #include "scratch.hpp"
@@ -908,6 +909,66 @@ void ARc1FileOverTheBoundsKeepsItsStates(checks::Checks& c) {
   c.Expect(state::ParseBaseline(past).value.empty(), "a v2 file past rc1's 512 rows is discarded");
 }
 
+/// Which of an rc1 file's slotted rows survive its bound is a rule, not an
+/// accident of the order rc1 happened to write them in (#255): the first in
+/// `(rom_id, slot)` order -- the order `AdoptLegacySaves` settles a contest in
+/// -- and a row repeating one already let go is as much a second row as one
+/// repeating a row that was kept.
+void AnRc1FilesSurvivorsAreARule(checks::Checks& c) {
+  const auto row = [](std::int64_t rom_id) {
+    return "{\"rom_id\":" + std::to_string(rom_id) +
+           ",\"slot\":\"retroarch-srm\",\"content_hash\":\"" +
+           crypto::Md5Hex(std::to_string(rom_id)) +
+           "\",\"mtime\":1757000000,\"file_size_bytes\":32768,\"server_updated_at\":1757000100,"
+           "\"server_content_hash\":null}\n";
+  };
+  const std::string state_row =
+      "{\"kind\":\"state\",\"rom_id\":1000,\"file_name\":\"Game (USA).state\",\"emulator\":"
+      "\"tico\",\"content_hash\":\"" + crypto::Md5Hex("state") +
+      "\",\"mtime\":1757000100,\"file_size_bytes\":4,\"server_state_id\":1,"
+      "\"server_updated_at\":1757000090,\"server_file_size_bytes\":4}\n";
+  // 200 slotted rows and a state: the state and 127 slotted rows fit.
+  std::string forward = "rommsync-state 2\n";
+  std::string backward = "rommsync-state 2\n" + state_row;
+  for (std::int64_t at = 0; at < 200; ++at) {
+    forward += row(1000 + at);
+    backward += row(1199 - at);
+  }
+  forward += state_row;
+
+  const auto survivors = [](const state::LoadedBaseline& loaded) {
+    std::vector<std::int64_t> ids;
+    for (const state::SaveRecord& record : loaded.legacy_saves) {
+      ids.push_back(record.rom_id);
+    }
+    std::sort(ids.begin(), ids.end());
+    return ids;
+  };
+  std::vector<std::int64_t> expected;
+  for (std::int64_t at = 1000; at < 1127; ++at) {
+    expected.push_back(at);
+  }
+  const state::LoadedBaseline in_order = state::ParseBaseline(forward);
+  const state::LoadedBaseline reversed = state::ParseBaseline(backward);
+  c.Expect(in_order.value.FindState(1000, "Game (USA).state") != nullptr &&
+               reversed.value.FindState(1000, "Game (USA).state") != nullptr,
+           "the state stands either way");
+  c.Expect(survivors(in_order) == expected,
+           "written in key order, roms 1000 to 1126 survive -- " + in_order.DescribeDiagnostics());
+  c.Expect(survivors(reversed) == expected,
+           "written backwards, the same rows survive -- " + reversed.DescribeDiagnostics());
+  c.Expect(Mentions(in_order, "73 row(s)"), "and the 73 let go are counted -- " +
+                                               in_order.DescribeDiagnostics());
+
+  // rom 1150 was let go; a second row for it is a damaged file, as a second row
+  // for a kept one is.
+  const state::LoadedBaseline repeated = state::ParseBaseline(forward + row(1150));
+  c.Expect(repeated.value.empty() && repeated.legacy_saves.empty(),
+           "a row repeating one let go discards the file, like any second row");
+  c.Expect(Mentions(repeated, "a second row for the same (rom_id, slot)"),
+           "and is said -- " + repeated.DescribeDiagnostics());
+}
+
 /// `WriteAtomically`'s first rename, landing between the bounded read of a file
 /// past `kMaxStateBytes` and the streamed read of it (#255). It used to reopen
 /// the path there, find nothing, and call the file unreadable -- skipping the
@@ -1125,6 +1186,7 @@ int main() {
   AnUnusableOldIsNotABrandNewCard(c);
   OversizedFilesAreRefusedBySize(c);
   ARc1FileOverTheBoundsKeepsItsStates(c);
+  AnRc1FilesSurvivorsAreARule(c);
   ACommitWindowMidReadStillYieldsTheBaseline(c);
   ANewerFilePastTheBoundIsStillNewer(c);
   TooManyRowsIsRefused(c);
