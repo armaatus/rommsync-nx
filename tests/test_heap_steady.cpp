@@ -69,6 +69,7 @@
 #include "harness.hpp"
 #include "rig.hpp"
 #include "rommsync/auth.hpp"
+#include "rommsync/conflict_log.hpp"
 #include "rommsync/device_registration.hpp"
 #include "rommsync/download.hpp"
 #include "rommsync/host/curl_http_client.hpp"
@@ -1359,6 +1360,70 @@ void TickChunks(checks::Checks& c) {
   std::filesystem::remove_all(dir, error);
 }
 
+/// One conflict-history entry at the names the heap table budgets: a No-Intro
+/// rom name and file name, a core's emulator id, RomM's reason sentence, and the
+/// save's path and its backup's under a 63-byte folder.
+rommsync::conflicts::Entry HistoryEntry(std::size_t at) {
+  rommsync::conflicts::Entry entry;
+  entry.kind = rommsync::conflicts::EntryKind::kSave;
+  entry.event = rommsync::conflicts::Event::kConflict;
+  entry.rom_id = static_cast<std::int64_t>(at) + 1;
+  entry.rom_name = "Synthetic Adventure Game " + std::to_string(1000 + at) + " (USA, Europe)";
+  entry.file_name = entry.rom_name + ".srm";
+  entry.slot = "retroarch-srm";
+  entry.emulator = "mgba_libretro";
+  entry.when = 1757000000;
+  entry.reason = "Both sides changed since last sync";
+  entry.sd_path = "/retroarch/cores/savefiles/mGBA/xxxxxxxxxxxxxxxxxxxxxxxxxxxxx/" + entry.file_name;
+  entry.local_size_bytes = 131072;
+  entry.local_content_hash = std::string(32, 'a');
+  entry.local_modified = 1757000000;
+  entry.server_content_hash = std::string(32, 'b');
+  entry.server_updated_at = "2026-10-21T09:02:11+00:00";
+  entry.server_size_bytes = 131072;
+  entry.backup_sd_path = "/config/rommsync/.backup/" + entry.file_name + ".1757000000";
+  return entry;
+}
+
+/// The conflict history is resident, and a conflict recorded mid-run costs an
+/// entry, not the history again (#248, §7).
+///
+/// Every `Append` rewrote `conflicts.db` from one string of the whole history,
+/// grown by doubling to `kMaxHistoryBytes` -- and, at `kMaxEntries`, inserted
+/// into a vector with no room left, which doubled it too. It is called from
+/// `TickOptions::on_plan`, with the plan and its results alive: the tick's run
+/// phase, which had no room for either.
+void ConflictHistory(checks::Checks& c) {
+  namespace conflicts = rommsync::conflicts;
+  rommsync::host::InstallPosixFileSync();
+  std::error_code error;
+  const std::filesystem::path dir = std::filesystem::path(rig::ScratchDir()) / "alloc-history";
+  std::filesystem::remove_all(dir, error);
+  std::filesystem::create_directories(dir, error);
+
+  std::int64_t one = 0;
+  {
+    const std::int64_t before = count_new::Now().outstanding_bytes;
+    const conflicts::Entry probe = HistoryEntry(0);
+    one = count_new::Now().outstanding_bytes - before + static_cast<std::int64_t>(sizeof(probe));
+  }
+  conflicts::History history((dir / conflicts::kHistoryFileName).string());
+  history.Load();
+  for (std::size_t at = 0; at < conflicts::kMaxEntries; ++at) {
+    c.Expect(history.Append(HistoryEntry(at)).ok(), "a full history is written");
+  }
+  conflicts::Entry next = HistoryEntry(conflicts::kMaxEntries);
+  count_new::ResetPeak();
+  const std::int64_t before = count_new::Now().outstanding_bytes;
+  c.Expect(history.Append(std::move(next)).ok(), "an entry is recorded over a full history");
+  const std::int64_t peak = count_new::Now().peak_bytes - before;
+  std::cout << "one entry is " << one << " bytes; recording one over a full history of "
+            << conflicts::kMaxEntries << " peaks at " << peak << "\n";
+  c.Expect(peak < 4 * one, "recording a conflict costs a few entries, not the history: " +
+                               std::to_string(peak) + " >= " + std::to_string(4 * one));
+  std::filesystem::remove_all(dir, error);
+}
+
 int main(int argc, char** argv) {
   const std::string scenario = argc > 1 ? argv[1] : "counts";
   // Refused rather than clamped: a mistyped round count on the soak workflow's
@@ -1383,7 +1448,7 @@ int main(int argc, char** argv) {
       scenario == "page_parse" || scenario == "heartbeat" || scenario == "response_parse" ||
       scenario == "wrong_shape" || scenario == "queue_write" || scenario == "wide_rows" ||
       scenario == "negotiate_exchange" || scenario == "list_build" ||
-      scenario == "tick_chunks") {
+      scenario == "tick_chunks" || scenario == "conflict_history") {
     if (scenario == "counts") {
       Counts(checks);
     } else if (scenario == "wide_rows") {
@@ -1394,6 +1459,8 @@ int main(int argc, char** argv) {
       ListBuild(checks);
     } else if (scenario == "tick_chunks") {
       TickChunks(checks);
+    } else if (scenario == "conflict_history") {
+      ConflictHistory(checks);
     } else if (scenario == "response_parse") {
       ResponseParse(checks);
     } else if (scenario == "wrong_shape") {

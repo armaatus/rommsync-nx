@@ -2565,7 +2565,8 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 endif()
 
 foreach(scenario counts judge log_ring page_parse heartbeat response_parse wrong_shape
-                 queue_write wide_rows negotiate_exchange list_build tick_chunks)
+                 queue_write wide_rows negotiate_exchange list_build tick_chunks
+                 conflict_history)
   add_test(NAME alloc.${scenario} COMMAND test_heap_steady ${scenario})
   set_tests_properties(alloc.${scenario} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 endforeach()
