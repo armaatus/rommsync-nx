@@ -44,9 +44,11 @@ set -euo pipefail
 #
 # Measured at 2,080,768 bytes (1.98 MiB) when this was set, of which the heap
 # was 1,441,792 -- ~272 KiB of headroom, a little over one 256 KiB `state.db`
-# term. #246 then raised the heap by 128 KiB (`kInnerHeapSize` 0x180000), which
-# leaves about 144 KiB: less than one such term. Growth past it is a decision, made here with its reason
-# beside it, and not something a PR does by accident. Atmosphere leaves third-
+# term. #246 then raised the heap by 128 KiB (`kInnerHeapSize` 0x180000), and
+# M10's code took most of the rest: 2,355,200 bytes at the whole-branch review
+# (2026-10-22), 4 KiB under. The next growth meets this line, and growth past
+# it is a decision, made here with its reason beside it, and not something a PR
+# does by accident. Atmosphere leaves third-
 # party sysmodules a shared pool (7 MB on HOS 21.0.0+, docs/DEVELOPMENT.md#what-the-image-costs),
 # and this process is one tenant of it.
 IMAGE_BUDGET=$(( 2304 * 1024 ))
