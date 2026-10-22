@@ -118,24 +118,25 @@ inline constexpr int kSourceSlotVersion = 2;
 /// A bound larger than the heap is not a bound -- it is a `bad_alloc` with a
 /// constant next to it. The arithmetic, from
 /// [docs/DEVELOPMENT.md](../../../docs/DEVELOPMENT.md#tls-in-a-sysmodule):
-/// `kInnerHeapSize` is `0x160000` (1.4 MiB) since M9-10 (#201) -- M1-7 (#126) made
+/// `kInnerHeapSize` is `0x180000` (1.5 MiB) since M9-20 (#246) -- M1-7 (#126) made
 /// it a number somebody derived rather than devkitPro's template default,
 /// #207 re-derived it once the two thread stacks and the open-directory cache
-/// had terms, and #201 added the download's 64 KiB read chunk -- and the trimmed
-/// socket transfer memory takes 116 KiB of it,
-/// leaving **~1.3 MiB** for everything else
-/// -- which is the download buffer *and* this. Loading a baseline costs the file's
-/// text and then the parsed `Baseline`, whose per-row `std::string`s each
-/// exceed the 15-character small-string buffer and land on the heap, so the map
-/// costs more than the text it came from. At ~214 bytes a row, `kMaxRecords`
-/// rows is ~110 KiB of text and ~130 KiB parsed: about 240 KiB at the peak,
-/// with room left for a transfer.
+/// had terms, #201 added the download's 64 KiB read chunk, and #246 the rows a
+/// tick holds for every save -- and the trimmed socket transfer memory takes
+/// 116 KiB of it. Loading a baseline costs the file's text and then the parsed
+/// `Baseline`, whose per-row `std::string`s each exceed the 15-character
+/// small-string buffer and land on the heap, so the map costs more than the text
+/// it came from. At ~214 bytes a row, `kMaxRecords` rows is ~27 KiB of text and
+/// ~33 KiB parsed, under the 32 KiB each the heap table gives them.
 ///
-/// **The heap grew and these did not**, which is the safe direction and is
-/// deliberate: this pair bounds the *file*, and how many saves a console may
-/// hold is a decision about a library rather than about a heap. What the extra
-/// headroom bought was the terms M1-7 added beside this one -- a buffered
-/// `/api/platforms` and two worker thread stacks -- not a bigger baseline.
+/// **128, and 32 KiB, since M9-20 (#246).** They were 512 and 128 KiB, sized
+/// against the baseline alone -- and a save costs a tick far more than its row
+/// here: the scan's record, what is reported and targeted, the plan's operation
+/// and what it did, ~1.7 KiB a save on aarch64 at the tick's worst moment, all
+/// held beside the baseline. At 512 that was more heap than the table had, so
+/// `kMaxRecords` is what the heap holds, and the trade -- ~140 KiB of resident
+/// `.bss` for each further 64 saves -- is `sysmodule/source/main.cpp`'s to make
+/// again, beside the rest of the table, rather than this constant's alone.
 ///
 /// `core.state_db` asserts the two agree -- a full baseline must serialize to
 /// less than the byte bound, or the writer would produce a file the reader
@@ -166,8 +167,8 @@ inline constexpr int kSourceSlotVersion = 2;
 ///
 /// A card with more saves than this needs the sysmodule heap raised first.
 /// These two constants and `kInnerHeapSize` move together.
-inline constexpr std::size_t kMaxRecords = 512;
-inline constexpr std::size_t kMaxStateBytes = 128 * 1024;
+inline constexpr std::size_t kMaxRecords = 128;
+inline constexpr std::size_t kMaxStateBytes = 32 * 1024;
 
 // A plan names one operation per save, and a save this file cannot record is a
 // save no tick can finish: the two bounds are one number (M9-20, #246).

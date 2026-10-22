@@ -61,10 +61,13 @@ const char* ToString(ListError error);
 /// mid-write, and a corrupt directory region is a plausible source of an
 /// unbounded loop.
 ///
-/// **512: `state::kMaxRecords`, and a number the heap holds** (M9-19, #217). A
-/// folder holding more files than the baseline can record saves gains nothing
-/// from listing past them, and an entry costs ~148 bytes -- 56 of `Entry` on
-/// aarch64, half again while the vector last grew, and its name's heap string.
+/// **512: a number the heap holds** (M9-19, #217). It was chosen as
+/// `state::kMaxRecords`, which M9-20 (#246) lowered to 128 and this did not
+/// follow: a folder is listed to *find* saves among a card's other files -- a
+/// rom folder read for content-dir saves holds the roms too -- so its listing
+/// is not bounded by how many of them are saves. An entry costs ~148 bytes --
+/// 56 of `Entry` on aarch64, half again while the vector last grew, and its
+/// name's heap string.
 /// Two listings at this bound fit under the largest response the heap table
 /// already budgets (`sysmodule/source/main.cpp`), so it costs nothing of its
 /// own; 4,096 did not, and was never costed.

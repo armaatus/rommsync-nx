@@ -54,28 +54,6 @@ namespace {
 
 constexpr const char* kStatesPath = "/api/states";
 
-/// The largest `GET /api/states` body this client will work from.
-///
-/// `/api/states` takes no `limit` and returns every state the user has, so
-/// unlike `GET /api/roms` there is no paging lever to pull -- the bound is all
-/// there is. At the ~600 bytes a `StateSchema` row costs, this is around 220
-/// states across the whole library, against `scan::kMaxStates` local ones.
-///
-/// **Over the bound the whole run stops rather than working from what fits.**
-/// A partial listing is worse than none: a local state whose server row fell off
-/// the end reads as "the server has no row with this name", and the answer to
-/// that is an upload -- which, `POST /api/states` being an upsert, would replace
-/// the row that was there. So the listing is all of it or none of it.
-///
-/// **It bounds the parse, not the allocation.** `http::HttpClient::Send` reads a
-/// successful body whole, so a four-megabyte listing is already resident by the
-/// time this is checked; what the bound stops is turning it into that many more
-/// `ServerState`s, each of them several heap strings. Bounding the *transfer*
-/// needs a ceiling on `http::Request`, which every list call in this engine
-/// would want and none has -- `GET /api/roms` pages instead, and `/api/states`
-/// offers no `limit` to page with.
-constexpr std::size_t kMaxStateListBytes = 128 * 1024;
-
 /// How one state is named in a log line: the rom and the file. Never a token,
 /// and never the file's contents.
 std::string Describe(std::int64_t rom_id, std::string_view file_name) {
@@ -773,7 +751,7 @@ void AdvanceWritten(fs::FileSystem& files, const scan::StateFile* local,
 /// a file.
 ///
 /// **A card whose saves alone fill the baseline cannot record a state at all.**
-/// `scan::kMaxSaves` is the whole of `state::kMaxRecords`, so 512 saves leave no
+/// `scan::kMaxSaves` is the whole of `state::kMaxRecords`, so that many leave no
 /// room, both passes run, and every state row goes -- including the ones this
 /// run just wrote. The next tick then finds no row for any state and answers
 /// keep-both, which is safe and settles rather than churning, but it does mean

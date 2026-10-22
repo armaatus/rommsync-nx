@@ -264,7 +264,11 @@ things about the answer are worth stating here rather than leaving to the code:
   response, because a plan with a save missing from it looks exactly like a plan
   for a device that is already in sync — and the save that got dropped is the one
   nobody hears about again. A truncated body is that failure in its quietest
-  form, which is why `sync.truncated` forces one.
+  form, which is why `sync.truncated` forces one. A plan of more than
+  `sync::kMaxPlanOperations` operations — `state::kMaxRecords`, 128 — is refused
+  the same way and for a sibling reason: it is read an operation at a time but
+  held for the whole tick, and past that bound it is more than the sysmodule's
+  heap was sized for (M9-20, #246).
 - **An `action` this client does not recognise becomes `no_op`, and is logged.**
   On a save, the default branch is the one that can overwrite it. The same goes
   for an unrecognised `reason`, except that the action there is still obeyed: the

@@ -46,7 +46,7 @@ with `cat`, and both substitute the same `version.hpp.in`.
   because libultrahand's own objects reference them (its updater and its package
   handling), and `--gc-sections` cannot drop a symbol a linked object still
   names. The overlay is a launched process with the applet's memory, not a
-  resident sysmodule in a `0x160000` heap, so the footprint M0-1 was measuring
+  resident sysmodule in a `0x180000` heap, so the footprint M0-1 was measuring
   does not apply to it -- and `ovl-rommsync` itself opens no socket: everything
   it does over the network happens in `sys-rommsync` (overlay/AGENTS.md). The
   rule for the **sysmodule** is unchanged.
@@ -634,7 +634,7 @@ a sysmodule pays for a TLS request is therefore:
    left as it was — it measured what it measured, and a spike edited after the
    fact measures nothing.
 
-   `sys-rommsync`'s inner heap is `0x160000` (1.4 MiB), derived term by term in
+   `sys-rommsync`'s inner heap is `0x180000` (1.5 MiB), derived term by term in
    `sysmodule/source/main.cpp` and checked there by a `static_assert` and by
    `tests/test_heap_budget.py` rather than by this table. It was `0xC0000` until
    M9-2 (#207), which found the table wrong by more than its own margin — two
@@ -642,7 +642,7 @@ a sysmodule pays for a TLS request is therefore:
    `DIR` costing ~24 KiB with no term at all — and M9-10 (#201) added 64 KiB to
    it: 48 KiB for the download's bigger read chunk and 16 KiB for the pairing
    thread's buffer, which the table had never counted (item 2). The default socket config does not
-   fit in it and never will; the sysmodule's leaves ~1.3 MiB. **Never call
+   fit in it and never will; the sysmodule's leaves ~1.4 MiB. **Never call
    `socketInitializeDefault()` from the sysmodule** — that single line is the
    difference between a working engine and one that dies at `socketInitialize`.
 
@@ -663,6 +663,20 @@ a sysmodule pays for a TLS request is therefore:
    the three bounds that had been set beside the heap rather than from it — the
    rom index's page (64) and size (1,024 roms), and a directory listing (512
    entries) — and `main.cpp` holds each as a row or a pinned term.
+
+   M9-20 (#246) counted what was left. Every other response whose size comes
+   from an array — the negotiate plan, the state listing, the device list,
+   `queue.json` — is read a row at a time too; a body of the wrong shape is
+   refused before it is parsed; and an API body with no `Content-Length` is
+   capped at 128 KiB (`kMaxUndeclaredBodyBytes`), where it used to grow without
+   one. It also measured what a **tick holds for every save** — the scan's
+   record, what is reported and targeted, the plan's operation and what it did,
+   ~1.7 KiB a save at the tick's worst moment — and what the list service keeps
+   between pumps, now one platform snapshot and one built page across every
+   cursor. Neither had a row. At the 512 saves `state::kMaxRecords` allowed, the
+   tick alone was ~856 KiB, so the bound is now **128 saves**, what the heap
+   holds after growing to `0x180000`; each further 64 is ~140 KiB of resident
+   `.bss`, and the image is within 56 KiB of `scripts/image-budget.sh`'s ceiling.
 2. **The in-flight buffers** — ours to size. Roms stream to file and never sit
    in RAM whole (hard rule 2's sibling: nothing is buffered that does not have
    to be). Every `sslConnectionRead` is an IPC round trip to the `ssl`
@@ -960,7 +974,7 @@ say "update the sysmodule" instead of decoding garbage.
 ### The bounds
 
 `ipc::kMaxPayloadBytes` (8 KiB) caps every single request and response, in both
-directions. The inner heap is `0x160000` with ~1.3 MiB left after the trimmed bsd
+directions. The inner heap is `0x180000` with ~1.4 MiB left after the trimmed bsd
 transfer memory ([M0-1](#m0-1-the-measurement-and-the-decision)), and that budget
 already owes a download buffer and the `state.db` baseline.
 

@@ -33,7 +33,7 @@ break by accident.
   `sysmodule/sys-rommsync.json` sets `main_thread_stack_size` to `0x8000` — 32
   KiB, raised from the template's `0x4000` by M1-7 (#126) because
   `SdEngine::Load` parses documents off a card on that thread — and the inner
-  heap is `0x160000` (1.4 MiB). The deepest parse is budgeted to **half** of that
+  heap is `0x180000` (1.5 MiB). The deepest parse is budgeted to **half** of that
   32 KiB in `sysmodule/source/stack_budget.hpp`, which is why `json::kMaxDepth`
   is 16 rather than 64: at 64 the parse alone was the whole stack (#216), and
   `stack.fit` fails if either number moves out from under the other. A worker

@@ -201,7 +201,7 @@ guess, and is still wrong to make now.
   libnx reads the regions from the kernel — so the choice is the layout that is
   not deprecated rather than the one the template copied. sys-con ships 1, so
   neither is a risk; this is a decision rather than an inheritance.
-- **Heap and capabilities, settled.** `kInnerHeapSize` is `0x160000` (1.4 MiB)
+- **Heap and capabilities, settled.** `kInnerHeapSize` is `0x180000` (1.5 MiB)
   and is derived term by term in the table above the constant in
   `source/main.cpp`, where a `static_assert` fails the build rather than the
   console if a term outgrows it and `ctest -R heap` fails when the table, the

@@ -70,6 +70,26 @@
 
 namespace rommsync::sync {
 
+/// The largest `GET /api/states` body this client will work from.
+///
+/// `/api/states` takes no `limit` and returns every state the user has, so
+/// unlike `GET /api/roms` there is no paging lever to pull -- the bound is all
+/// there is. At the ~600 bytes a `StateSchema` row costs, this is around 220
+/// states across the whole library, against `scan::kMaxStates` local ones.
+///
+/// **Over the bound the whole run stops rather than working from what fits.**
+/// A partial listing is worse than none: a local state whose server row fell off
+/// the end reads as "the server has no row with this name", and the answer to
+/// that is an upload -- which, `POST /api/states` being an upsert, would replace
+/// the row that was there. So the listing is all of it or none of it.
+///
+/// **It bounds the rows, and the text only once it is here.** `Send` reads a
+/// body whole, so a listing past this is already resident when it is refused --
+/// which is a response row's worth in `sysmodule/source/main.cpp`, where this
+/// constant is read. Under it, the listing is read a row at a time and costs its
+/// text and one row's document (`json::ParseEach`, M9-20, #246).
+inline constexpr std::size_t kMaxStateListBytes = 128 * 1024;
+
 /// One row of `GET /api/states`, reduced to what arbitration uses.
 ///
 /// The listing is taken **unfiltered, once per run**. The endpoint takes an

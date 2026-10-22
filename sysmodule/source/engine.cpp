@@ -1821,7 +1821,7 @@ bool SdEngine::RunOneTick() {
   // Tico's layout is read off the card the same way, every tick: a Tico
   // update or a new account changes it without touching config.ini.
   NoteSources(*config, retroarch_cfg, tico::Notes(*config, *files));
-  const scan::ScanResult scanned =
+  scan::ScanResult scanned =
       scan::ScanSaves(*config, retroarch_cfg.value, library.index, *files, loaded.value);
   // One line per file the scan would not report, at the spelling the scanner
   // already renders for a log -- an unmatched name, a name on two platforms with
@@ -1928,6 +1928,11 @@ bool SdEngine::RunOneTick() {
     }
   }
   options.recover_dirs.push_back(std::string(sync::kBackupDir));
+  // The scan's records go here, before the plan arrives: everything the rest of
+  // the tick reads of them is in `reported`, `targets` and the options above,
+  // and held to the end they were a third copy of every save beside the plan --
+  // ~450 bytes a save on aarch64 (`kHeapTickSaves`, main.cpp; M9-20, #246).
+  std::vector<scan::SaveFile>().swap(scanned.saves);
   for (const play::BufferedSession& buffered : play_sent) {
     options.finish.play_sessions.push_back(buffered.session);
   }

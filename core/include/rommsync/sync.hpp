@@ -505,7 +505,7 @@ auth::Parsed<SyncPlan> ParseNegotiateResponse(std::string_view body);
 /// the ones it was told about, so its length is the server's, and a library with
 /// more saves than one console can track is refused here, by name, rather than
 /// held on a heap that was never sized for it.
-inline constexpr std::size_t kMaxPlanOperations = 512;
+inline constexpr std::size_t kMaxPlanOperations = 128;
 
 /// Why a negotiation did not produce a plan.
 ///
