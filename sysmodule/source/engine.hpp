@@ -1194,7 +1194,7 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// The claim answered 404 although the heartbeat said the feature is on -- the
   /// server turned it off since, or this pairing's device is not the one the
   /// token is bound to -- or the registration was refused outright. Not asked
-  /// again until the server is read again.
+  /// again until the server is read again, or the console wakes (`Resume`).
   bool install_refused_ = false;
 
   /// The last tick's outcome, as the status screen reads it.
@@ -1213,7 +1213,10 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// again, so the next tick asks the server it is now paired with. A server
   /// below the floor is the exception -- it is asked again every tick, because
   /// the remedy is upgrading it and a console that only noticed the upgrade at
-  /// its next reboot would keep refusing a server that now works.
+  /// its next reboot would keep refusing a server that now works. And a wake
+  /// sets it false while #245's remote install is off or refused, because a
+  /// console that sleeps rather than reboots would otherwise never see an
+  /// admin turn it on.
   ///
   /// Read on the worker, at the top of a tick, and never on the pairing thread:
   /// that thread has nothing to decide with it -- #245's `install_enabled` is

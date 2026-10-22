@@ -1387,7 +1387,16 @@ void SdEngine::Resume() {
     // exactly this reason. `erpt` turns its own filesystem access back on at the
     // same point.
     log::SetSinkEnabled(true);
-    // Wake the worker, and **nothing else**.
+    // A console mostly sleeps rather than reboots, so "read again with the
+    // server" cannot wait for a boot (#245): remote install refused or off is
+    // asked again on the next tick -- one unauthenticated heartbeat a wake, and
+    // only while the feature is not working. A server that has it on is not
+    // asked.
+    if (install_refused_ || !server_caps_.install_enabled) {
+      install_refused_ = false;
+      server_read_ = false;
+    }
+    // Wake the worker, and **nothing else** that paces it.
     //
     // Not `WakeDownloads`'s clear of `download_due_`/`download_backoff_`, which
     // is the tempting mistake: a drain cancelled by the suspend already ends
