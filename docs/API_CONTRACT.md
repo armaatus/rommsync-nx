@@ -916,6 +916,24 @@ itself needed no change:
 `genesis`, `nds`, `psp`, `dreamcast`). The client maps each to a Tico /
 RetroArch SD folder; default map + override scheme in [CONFIG.md](CONFIG.md).
 
+### Remote installs from the web UI
+
+RomM 5.4's "Install on device" (#245, `core/include/rommsync/remote_install.hpp`).
+Gated on `DEVICE_INSTALL.ENABLED` in the heartbeat, read beside `SYSTEM.VERSION`.
+Polled once a tick; the `/devices` Socket.IO namespace is not used. Checked live
+against the 5.4.0 fixture:
+
+| Call | What it does | Answers worth knowing |
+|---|---|---|
+| `PUT /api/devices/{id}` `{"capabilities":{"remote_install":true}}` | Lets the web UI queue for this device. Not `POST /api/devices`, which makes a second device ([above](#why-post-apidevices-is-the-wrong-call)). | Without it, `POST .../installs` is `400 "does not accept remote installs"`. |
+| `POST /api/devices/{id}/installs/claim` | Takes every pending request and answers **every request the device holds taken**, oldest first, as `InstallRequestSchema[]` (~260 bytes each). | Idempotent: a second claim returns the same taken requests. Needs the token **bound to that device**: another device's token is a 404 (the device is "not theirs"), an unbound one a 403. `DEVICE_INSTALL_ENABLED=false` is a 404 too. |
+| `PUT /api/devices/{id}/installs/{request_id}` `{"status":…,"reason":…}` | Ends a taken request as `done`, `already_installed` or `failed`, and notifies the user. | Any other status is a 422. A request already ended, cancelled in the web UI or expired is a 404. `reason` is at most 500 characters. |
+
+`file_ids` names the rom's game, update and DLC files; the client downloads the
+rom the way the overlay does and does not read it. Platforms in
+`EXCLUDED_PLATFORM_SLUGS` are refused by the server when queued, so the client
+does not read that list either.
+
 ## Resume & integrity
 
 - Range requests are supported on `content` endpoints (SwitchRomM already relies
@@ -987,7 +1005,7 @@ the issue that acts on it.
 | Device-code flow keeps its shape. | Captures `auth-device-*.json`: no field differs from 5.2.0's. | — |
 | `(user, client_device_identifier)` is unique, so re-pairing reuses the device. | Asserted, not captured — the shapes are `auth-device-token.json`'s: on 5.4+ the probe pairs a second time as the same `client_device_identifier` and fails unless the token names the same `device_id`. | #228 |
 | `capabilities` on `POST /api/devices` and on `DeviceSchema`. | Snapshot `DeviceCreatePayload`, `DeviceSchema` (required there); capture `devices-get.json`. | #228 |
-| Remote-install endpoints and a `/devices` Socket.IO namespace. | Snapshot: `/api/devices/{device_id}/installs` and its children, `/api/devices/online`. The namespace is not in OpenAPI. | — |
+| Remote-install endpoints and a `/devices` Socket.IO namespace. | Snapshot: `/api/devices/{device_id}/installs` and its children, `/api/devices/online`. The namespace is not in OpenAPI. Checked live for #245: [Remote installs](#remote-installs-from-the-web-ui). | #245 |
 | Malformed or expired credentials → 401, not 500. | Capture `auth-401-malformed-token.json`: `Bearer not-a-token` → 401. On 5.2.0 the same header, a `Bearer a.b.c` or a garbled `Basic` is a bare `500 Internal Server Error`, checked live for #227; an unknown `rmm_…` client token was already 401 there. The expired half is **not captured**: fixture tokens do not expire. | #228 |
 
 ### Play sessions, ROM list, version

@@ -50,12 +50,14 @@
 #include "power.hpp"
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/core.hpp"
+#include "rommsync/download.hpp"
 #include "rommsync/device_identity.hpp"
 #include "rommsync/file_system.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/list_service.hpp"
 #include "rommsync/log.hpp"
 #include "rommsync/play_sessions.hpp"
+#include "rommsync/remote_install.hpp"
 #include "rommsync/rom_index.hpp"
 #include "rommsync/save_scan.hpp"
 #include "rommsync/server_capabilities.hpp"
@@ -94,8 +96,9 @@ namespace {
 //   | the log's in-memory tail (M7-3)          | `kHeapLogTail`          | 0x1800  |   6 KiB |
 //   | the play-session buffer (M7-4)           | `kHeapPlaySessions`     | 0x8000  |  32 KiB |
 //   | the directories open at once (M9-2)      | `kHeapOpenDirectories`  | 0x2000  |   8 KiB |
+//   | the claimed remote installs (M10-19)     | `kHeapInstallClaims`    | 0x1000  |   4 KiB |
 //   | newlib arena overhead and fragmentation  | `kHeapNewlibOverhead`   | 0x8000  |  32 KiB |
-//   | **peak**                                 | `kHeapPeak`             | 0x173000 | 1484 KiB |
+//   | **peak**                                 | `kHeapPeak`             | 0x174000 | 1488 KiB |
 //
 // The table is written this way so that something other than a reader adds it
 // up. `tests/test_heap_budget.py` totals these rows and compares each against
@@ -315,6 +318,13 @@ constexpr size_t kOperationJsonBytes = 512;
 /// which *is* a bound.
 constexpr size_t kStateJsonBytes = 768;
 
+/// What one install request weighs in a claim's answer (M10-19, #245). Measured
+/// against the 5.4.0 fixture: 262 and 264 bytes for a rom of one file and one of
+/// two. `file_ids` grows with a rom's updates and DLC, so it is rounded up to
+/// 512. Not a bound anything enforces either: a claim answers every request the
+/// device holds taken, and the count is what the user queued.
+constexpr size_t kInstallRequestJsonBytes = 512;
+
 /// How many entries fsdev caches per open `DIR`, against libnx's default of 32
 /// (M9-2, #207).
 ///
@@ -532,9 +542,20 @@ constexpr size_t kHeapNegotiateResponse =
 constexpr size_t kHeapStateListResponse =
     rommsync::sync::kMaxStateListBytes + kStateJsonBytes * kJsonDocumentPerTextByte;
 constexpr size_t kHeapUndeclaredBody = rommsync::sysmodule::kMaxUndeclaredBodyBytes * 3 / 2;
+// A claim's answer (M10-19, #245): read on the worker in the tick, after the
+// index fetch, a row at a time into at most `install::kMaxClaims` requests --
+// one more thing held one at a time. Budgeted at a full download queue's worth
+// of requests, which is past what one console can be handed between two ticks
+// by anyone but a script; a longer answer is the transport's unbounded body
+// (#246 §4), not a row of its own.
+constexpr size_t kHeapInstallClaimResponse =
+    rommsync::download::kMaxQueueEntries * kInstallRequestJsonBytes +
+    kInstallRequestJsonBytes * kJsonDocumentPerTextByte +
+    rommsync::install::kMaxClaims * (sizeof(rommsync::install::Request) + kHeapNameBytes);
 constexpr size_t kHeapListResponse = RoundUpToKiB(std::max(
     {kHeapPlatformsResponse, kHeapRomPageResponse, kHeapDirectoryListing, kHeapHeartbeat,
-     kHeapNegotiateResponse, kHeapStateListResponse, kHeapUndeclaredBody}));
+     kHeapNegotiateResponse, kHeapStateListResponse, kHeapUndeclaredBody,
+     kHeapInstallClaimResponse}));
 // Beside whichever of those the tick holds: the index, and the page whose rows
 // are on their way into it, before it is freed.
 constexpr size_t kHeapRomIndex =
@@ -558,13 +579,18 @@ constexpr size_t kHeapWatcherStack =
 constexpr size_t kHeapLogTail = rommsync::log::kTailLines * rommsync::log::kMaxLineBytes;
 constexpr size_t kHeapPlaySessions = 2 * rommsync::play::kMaxBufferBytes;
 constexpr size_t kHeapOpenDirectories = kMaxOpenDirectories * kOpenDirectoryBytes;
+// The engine's claimed requests (`SdEngine::install_claims_`), resident for the
+// boot, and the working copy a tick builds beside them before it swaps it in.
+// A request is its id -- a 36-byte UUID, one name's chunk -- and its rom id.
+constexpr size_t kHeapInstallClaims = RoundUpToKiB(
+    2 * rommsync::install::kMaxClaims * (sizeof(rommsync::install::Request) + kHeapNameBytes));
 constexpr size_t kHeapNewlibOverhead = 0x8000;
 
 constexpr size_t kHeapPeak = kHeapSocketMemory + kHeapStateBaseline + kHeapTransferBuffer +
                              kHeapListResponse + kHeapRomIndex + kHeapTickSaves +
                              kHeapListPages + kHeapThreadStacks + kHeapWatcherStack +
                              kHeapLogTail + kHeapPlaySessions + kHeapOpenDirectories +
-                             kHeapNewlibOverhead;
+                             kHeapInstallClaims + kHeapNewlibOverhead;
 
 // The arithmetic above, checked by the compiler rather than by a reader. It is
 // the transfer memory that this is really about: the trimmed socket config is
@@ -641,6 +667,8 @@ static_assert(rommsync::sync::kMaxPlanOperations * kOperationJsonBytes <=
                       rommsync::sysmodule::kMaxReservedBodyBytes &&
                   rommsync::sync::kMaxStateListBytes <= rommsync::sysmodule::kMaxReservedBodyBytes,
               "the plan or the state listing is larger than the body the wire reserves");
+static_assert(kHeapInstallClaimResponse <= kHeapPlatformsResponse,
+              "a claim's answer is now the largest response the worker holds (#245)");
 static_assert(kHeapListResponse == 0x35400,
               "a response or listing bound moved; retotal the table");
 // The reservation that makes "its text, once" true has to reach every response
@@ -667,19 +695,22 @@ static_assert(kHeapThreadStacks == 0x44000, "kThreadStackBytes moved; retotal th
 static_assert(kHeapWatcherStack == 0xA000, "kWatcherStackBytes moved; retotal the table");
 static_assert(kHeapLogTail == 0x1800, "log::kTailLines moved; retotal the table");
 static_assert(kHeapPlaySessions == 0x8000, "play::kMaxBufferBytes moved; retotal the table");
+static_assert(sizeof(rommsync::install::Request) == 40,
+              "install::Request changed size; retotal the table");
+static_assert(kHeapInstallClaims == 0x1000, "install::kMaxClaims moved; retotal the table");
 static_assert(kHeapOpenDirectories == 0x2000,
               "the direntry cache or the open-directory bound moved; retotal the table");
 // The one term with no bound behind it, so this pin is what binds the constant
 // to its row rather than a second reader of a bound. Changing the term is a red
 // build here, which is the point: it is the term a reader is likeliest to nudge.
 static_assert(kHeapNewlibOverhead == 0x8000, "the newlib arena term moved; retotal the table");
-static_assert(kHeapPeak == 0x173000, "the table above no longer sums to its peak row");
+static_assert(kHeapPeak == 0x174000, "the table above no longer sums to its peak row");
 
-// 0x180000 leaves 0xD000 -- 52 KiB -- over that peak, which is the margin a
+// 0x180000 leaves 0xC000 -- 48 KiB -- over that peak, which is the margin a
 // process nobody can attach a debugger to needs. It is the only margin stated
-// here on purpose: #207's prose quoted two, 94 KiB and 78 KiB, and the
-// arithmetic gave neither. M9-4 (#208) took 40 KiB of it for the PSC watcher's
-// thread, which is the row above.
+// here on purpose: #207's prose quoted two, and the arithmetic gave neither.
+// M9-4 (#208) took 40 KiB of it for the PSC watcher's thread, which is the row
+// above, and M10-19 (#245) 4 KiB for the claimed installs.
 //
 // **It grew by 0x20000 in M9-20 (#246)**, from 0x160000, when the two rows it
 // added -- a tick's saves and the list service's pages, 360 KiB between them --
@@ -763,7 +794,7 @@ constexpr size_t kInnerHeapSize = 0x180000;
 constexpr size_t kHeapMargin = kInnerHeapSize - kHeapPeak;
 
 static_assert(kHeapPeak < kInnerHeapSize, "the heap no longer covers the peak in the table above");
-static_assert(kHeapMargin == 0xD000,
+static_assert(kHeapMargin == 0xC000,
               "the margin in the sentence above is no longer the one left");
 
 alignas(16) u8 g_inner_heap[kInnerHeapSize];

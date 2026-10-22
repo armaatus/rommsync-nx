@@ -349,6 +349,8 @@ const char* ToString(Event event) {
       return "sync.held";
     case Event::kSaveDeleted:
       return "save.deleted";
+    case Event::kRemoteInstall:
+      return "download.remote";
   }
   return "unknown";
 }

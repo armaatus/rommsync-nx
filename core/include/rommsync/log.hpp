@@ -187,6 +187,13 @@ enum class Event {
   /// `[sync] on_server_delete = keep`. The one line that explains a save
   /// leaving the card, so it is written for every one.
   kSaveDeleted,
+
+  /// A rom queued for this console in RomM's web UI (M10-19, #245): taken into
+  /// the download queue, reported back, or -- as a warning -- an exchange with
+  /// the install endpoints that did not work. **Never a reason to fail a
+  /// tick**: the feature is optional, and a server that will not answer it
+  /// still syncs.
+  kRemoteInstall,
 };
 
 /// Every event, in declaration order. The guide and the emitted set are both
@@ -199,7 +206,7 @@ inline constexpr std::array kAllEvents = {
     Event::kSyncRefused, Event::kSyncTick,    Event::kSaveFailed,
     Event::kDownload,    Event::kPlayFailed,  Event::kPower,
     Event::kServerVersion, Event::kServerUnsupported,
-    Event::kSyncHeld,    Event::kSaveDeleted,
+    Event::kSyncHeld,    Event::kSaveDeleted, Event::kRemoteInstall,
 };
 
 /// Stable tag -- `net.offline`. Never null.

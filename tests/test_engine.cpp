@@ -4788,6 +4788,23 @@ int RemoteInstall(http::HttpClient& client, const std::string& base) {
   console.Boot();
   console.engine.StartWorker();
 
+  // Where RomM records what a device reported: the request itself is gone
+  // the moment it ends. Counted, because an earlier run left its own.
+  const auto done_notices = [&] {
+    http::Request notifications;
+    notifications.url = base + "/api/notifications";
+    notifications.headers.push_back(
+        {"Authorization", "Basic " + rig::Base64(std::string(rig::kUser) + ":" + rig::kPassword)});
+    const std::string body = client.Send(notifications).response.body;
+    const std::string mark = "\"device_name\":\"rommsync-nx " + name + "\",\"status\":\"done\"";
+    std::size_t seen = 0;
+    for (std::size_t at = body.find(mark); at != std::string::npos; at = body.find(mark, at + 1)) {
+      ++seen;
+    }
+    return seen;
+  };
+  const std::size_t done_before = done_notices();
+
   TickOnce(console, ticks, c, "the first tick");
   const http::Result queued = queue_in_browser();
   c.ExpectEq(queued.response.status, 201,
@@ -4811,15 +4828,9 @@ int RemoteInstall(http::HttpClient& client, const std::string& base) {
            "the rom the browser queued is on the card" + Rendered(console.Log()));
   c.ExpectEq(open(), std::size_t{0}, "and the request is ended, not left taken");
 
-  http::Request notifications;
-  notifications.url = base + "/api/notifications";
-  notifications.headers.push_back(
-      {"Authorization", "Basic " + rig::Base64(std::string(rig::kUser) + ":" + rig::kPassword)});
-  c.Expect(client.Send(notifications)
-                   .response.body.find("\"device_name\":\"rommsync-nx " + name +
-                                       "\",\"status\":\"done\"") != std::string::npos,
-           "RomM was told it is done, and told the user");
-  c.Expect(Logged(console.Log(), "install.remote"), "the console's log says so too");
+  c.ExpectEq(done_notices(), done_before + 1,
+             "RomM was told it is done, and told the user so");
+  c.Expect(Logged(console.Log(), "download.remote"), "the console's log says so too");
 
   // The download asks for a tick of its own (#241); let it end before teardown.
   while ((ticks.ticks() < 3 || console.Status().sync_in_progress) &&

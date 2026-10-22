@@ -109,6 +109,7 @@ and a log is not worth it. A save is never in that position; see
 | `server.unsupported` | the server is older than RomM 5.4.0, so nothing is synced with it | [RomM is too old](#romm-is-too-old) |
 | `sync.held` | a sync fell due while a game was open, and waits for it to close | [Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open) |
 | `save.deleted` | RomM said a save on this console was deleted on the server, and what became of the file | [A save disappeared from the card](#a-save-disappeared-from-the-card) |
+| `download.remote` | a rom queued for this console in RomM's web UI was taken into the queue or reported back, or the server would not answer about one | [A queued rom never arrives](#a-queued-rom-never-arrives) |
 
 The overlay shows the end of the log under **Settings → Log**, read off the
 sysmodule over IPC — `GetLog`, command 16 in
@@ -589,6 +590,26 @@ one of six things, and the queue screen names which:
 **The fix.** Read the row on the overlay's queue screen first; it carries the
 reason for that rom. For 3, the drain is already retrying and nothing needs
 doing. For 1 and 2, the settings and pairing screens are where both are fixed.
+
+**Queued from RomM's web UI instead.** "Install on device" in RomM 5.4 puts the
+rom in this same queue, so everything above applies once it is there. Getting
+it there takes a sync tick: the console asks RomM for new requests once a tick
+rather than holding a connection open, so a rom queued in the browser starts at
+the next scheduled sync, or at once on **Sync now**. With sync switched off, no
+tick runs and nothing is fetched. When the rom is done, failed or taken out of
+the queue on the console, RomM is told and shows it.
+
+```
+12 info download.remote RomM's web UI can install roms on this console
+13 info download.remote rom 42 queued from RomM's web UI
+13 info download.remote rom 42 from RomM's web UI: reported done
+```
+
+The console is not offered in the browser at all while `[downloads] enabled =
+false` (it says `RomM's web UI will not offer this console`), or when the
+server has `DEVICE_INSTALL_ENABLED` off. A `warn download.remote` line is an
+exchange that did not work; the next tick tries again, and sync carries on
+either way.
 
 ---
 

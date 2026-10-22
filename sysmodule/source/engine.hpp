@@ -52,6 +52,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -69,6 +70,7 @@
 #include "rommsync/list_service.hpp"
 #include "rommsync/pairing.hpp"
 #include "rommsync/play_sessions.hpp"
+#include "rommsync/remote_install.hpp"
 #include "rommsync/retroarch_cfg.hpp"
 #include "rommsync/scheduler.hpp"
 #include "rommsync/server_capabilities.hpp"
@@ -868,6 +870,20 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// to the scheduler exactly as if the game had been running when it asked.
   bool RunOneTick();
 
+  /// #245, on a tick: say whether this console takes remote installs, then
+  /// claim what the web UI queued for it into the download queue. Outside
+  /// `mutex_`. **Never fails the tick** -- every exchange that does not work is
+  /// a `download.remote` warning and the next tick asks again.
+  void ServeInstalls(http::HttpClient& client, const auth::StoredToken& token,
+                     const config::Config& config, const server::ServerCapabilities& caps,
+                     const http::CancelToken* cancel);
+
+  /// Report every claimed request whose queue row has finished, and forget the
+  /// ones RomM has settled. Called after each drain and before each claim, on
+  /// the worker, outside `mutex_`.
+  void SettleInstalls(http::HttpClient& client, const auth::StoredToken& token,
+                      const std::string& base_url, const http::CancelToken* cancel);
+
   /// The restore `RequestRestore` took, start to finish, and its outcome
   /// recorded in `restore_` (#209). Called on the worker, or on the caller when
   /// there is no worker; `mutex_` not held, because a restore is card I/O.
@@ -1155,6 +1171,23 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// `sync::kMaxNegotiateRomIds`, past which a rom is an ordinary rom on the
   /// card -- its save still comes, unless this device synced it before.
   std::vector<std::int64_t> fresh_roms_;
+
+  /// Install requests from RomM's web UI this console has taken and not yet
+  /// reported (#245). Guarded by `mutex_`; at most `install::kMaxClaims`, and in
+  /// memory only, because a claim hands back every request still taken
+  /// (remote_install.hpp) -- a reboot loses nothing the next claim does not
+  /// return. Emptied by `ForgetServerLocked`: they are one device's, on one
+  /// server.
+  std::vector<install::Request> install_claims_;
+
+  /// What this boot last told the server `remote_install` is, or empty when it
+  /// has told it nothing yet. Guarded by `mutex_`, and forgotten with the server.
+  std::optional<bool> install_registered_;
+
+  /// The claim answered 404 although the heartbeat said the feature is on: the
+  /// server turned it off since, or this pairing's device is not the one the
+  /// token is bound to. Not asked again until the server is read again.
+  bool install_refused_ = false;
 
   /// The last tick's outcome, as the status screen reads it.
   std::int64_t last_sync_at_ = 0;

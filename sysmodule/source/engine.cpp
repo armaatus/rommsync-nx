@@ -24,6 +24,7 @@
 #include "rommsync/pairing.hpp"
 #include "rommsync/placement.hpp"
 #include "rommsync/play_sessions.hpp"
+#include "rommsync/remote_install.hpp"
 #include "rommsync/retroarch_cfg.hpp"
 #include "rommsync/rom_index.hpp"
 #include "rommsync/rom_scope.hpp"
@@ -199,6 +200,11 @@ void SdEngine::UseMinimumServerVersion(server::Version floor) {
 void SdEngine::ForgetServerLocked(bool different_server) {
   server_read_ = false;
   ++server_generation_;
+  // One device's claims on one server, and what it was told: a re-pairing may
+  // be a different device. The next claim hands back whatever is still taken.
+  install_claims_.clear();
+  install_registered_.reset();
+  install_refused_ = false;
   if (different_server) {
     server_caps_ = server::ServerCapabilities{};
     server_too_old_ = false;
@@ -1195,6 +1201,9 @@ SdEngine::DrainStep SdEngine::RunOneDrain() {
 
   const download::DrainResult result =
       download::Drain(*client, *files, *config, queue_, options);
+  // A rom the web UI queued is reported the moment its row settles (#245),
+  // under the drain's own cancel, so a sleep or an Unpair stops this too.
+  SettleInstalls(*client, token, config->server.url, cancel.get());
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1558,6 +1567,182 @@ void SdEngine::LogPlayStore(const play::StoreResult& stored) {
   }
 }
 
+void SdEngine::ServeInstalls(http::HttpClient& client, const auth::StoredToken& token,
+                             const config::Config& config,
+                             const server::ServerCapabilities& caps,
+                             const http::CancelToken* cancel) {
+  if (!caps.install_enabled || !caps.device_capabilities || token.device_id.empty()) {
+    return;
+  }
+  // With downloads off a claimed rom would sit in the queue, so the web UI is
+  // told this console takes none rather than left offering it.
+  const bool wanted = config.downloads.enabled;
+  std::optional<bool> registered;
+  bool refused = false;
+  std::uint64_t generation = 0;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    registered = install_registered_;
+    refused = install_refused_;
+    generation = server_generation_;
+  }
+  sync::CallPolicy policy;
+  policy.cancel = cancel;
+  policy.wait = [this](std::chrono::milliseconds delay) { AwaitBackoff(delay); };
+
+  if (registered != wanted) {
+    // Once a boot, and again when the switch moves: a capability RomM already
+    // holds costs nothing to restate, and one it lost to a re-pairing is put
+    // back by the next tick.
+    const install::Exchange said =
+        install::Register(client, config.server.url, token, wanted, policy);
+    if (!said.ok()) {
+      if (said.transport != http::Error::kCanceled) {
+        log::Warn(log::Event::kRemoteInstall, said.message);
+      }
+      return;
+    }
+    log::Info(log::Event::kRemoteInstall,
+              wanted ? "RomM's web UI can install roms on this console"
+                     : "RomM's web UI will not offer this console: [downloads] enabled = false");
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (server_generation_ == generation) {
+      install_registered_ = wanted;
+    }
+  }
+  if (!wanted || refused) {
+    return;
+  }
+
+  // Reports first, so a request this console finished is ended before the
+  // claim would hand it back.
+  SettleInstalls(client, token, config.server.url, cancel);
+  const install::Claimed claimed = install::Claim(client, config.server.url, token, policy);
+  if (!claimed.exchange.ok()) {
+    if (claimed.exchange.transport == http::Error::kCanceled) {
+      return;
+    }
+    log::Warn(log::Event::kRemoteInstall, claimed.exchange.message);
+    if (claimed.exchange.status == 404) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (server_generation_ == generation) {
+        install_refused_ = true;
+      }
+    }
+    return;
+  }
+
+  std::vector<install::Request> tracked;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    tracked = install_claims_;
+  }
+  const auto in = [](const std::vector<install::Request>& requests, const std::string& id) {
+    return std::any_of(requests.begin(), requests.end(),
+                       [&id](const install::Request& request) { return request.id == id; });
+  };
+  if (claimed.page.dropped == 0) {
+    // A request the server no longer holds taken was cancelled in the web UI
+    // or expired, and has nothing left to report. Its download, if it is still
+    // queued, is left alone: it is in the user's queue now.
+    tracked.erase(std::remove_if(tracked.begin(), tracked.end(),
+                                 [&](const install::Request& request) {
+                                   return !in(claimed.page.requests, request.id);
+                                 }),
+                  tracked.end());
+  }
+  for (const install::Request& request : claimed.page.requests) {
+    if (in(tracked, request.id)) {
+      continue;
+    }
+    if (tracked.size() >= install::kMaxClaims) {
+      // Still taken on the server, and in the next claim.
+      break;
+    }
+    std::int32_t position = 0;
+    // The overlay's own path in: `queue.json`, the drain, and #241's restore.
+    const ipc::Error queued = Enqueue(request.rom_id, &position);
+    if (queued == ipc::Error::kOk || queued == ipc::Error::kDuplicate) {
+      tracked.push_back(request);
+      log::Info(log::Event::kRemoteInstall,
+                "rom " + std::to_string(request.rom_id) + " queued from RomM's web UI" +
+                    (queued == ipc::Error::kDuplicate ? "; it was already in the queue" : ""));
+    } else {
+      // Left taken on the server, which hands it back with the next claim.
+      log::Warn(log::Event::kRemoteInstall, "rom " + std::to_string(request.rom_id) +
+                                                " from RomM's web UI was not queued: " +
+                                                ipc::ToString(queued));
+    }
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (server_generation_ == generation) {
+    install_claims_ = std::move(tracked);
+  }
+}
+
+void SdEngine::SettleInstalls(http::HttpClient& client, const auth::StoredToken& token,
+                              const std::string& base_url, const http::CancelToken* cancel) {
+  std::vector<install::Request> claims;
+  std::uint64_t generation = 0;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (install_claims_.empty() || token.device_id.empty()) {
+      return;
+    }
+    claims = install_claims_;
+    generation = server_generation_;
+  }
+  sync::CallPolicy policy;
+  policy.cancel = cancel;
+  policy.wait = [this](std::chrono::milliseconds delay) { AwaitBackoff(delay); };
+
+  std::vector<std::string> settled;
+  for (const install::Request& claim : claims) {
+    const std::optional<install::Verdict> verdict = install::VerdictFor(queue_.Find(claim.rom_id));
+    if (!verdict.has_value()) {
+      continue;
+    }
+    const install::Exchange reported =
+        install::Report(client, base_url, token, claim.id, *verdict, policy);
+    const std::string rom = "rom " + std::to_string(claim.rom_id) + " from RomM's web UI";
+    if (reported.ok()) {
+      settled.push_back(claim.id);
+      log::Info(log::Event::kRemoteInstall,
+                rom + ": reported " + install::ToString(verdict->outcome) +
+                    (verdict->reason.empty() ? "" : " (" + verdict->reason + ")"));
+    } else if (reported.ended()) {
+      settled.push_back(claim.id);
+      log::Info(log::Event::kRemoteInstall,
+                rom + ": the request had already ended on the server (HTTP " +
+                    std::to_string(reported.status) + ")");
+    } else if (reported.transport == http::Error::kCanceled) {
+      break;
+    } else {
+      log::Warn(log::Event::kRemoteInstall, rom + ": " + reported.message);
+      // Kept for the next pass while asking again could work: no answer, a
+      // server having a bad minute, or credentials a re-pairing restores. A
+      // report RomM refused for what it says is not taken back by resending it.
+      if (!reported.transient() && reported.status != 401 && reported.status != 403) {
+        settled.push_back(claim.id);
+      }
+    }
+  }
+  if (settled.empty()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (server_generation_ != generation) {
+    return;
+  }
+  install_claims_.erase(
+      std::remove_if(install_claims_.begin(), install_claims_.end(),
+                     [&settled](const install::Request& claim) {
+                       return std::find(settled.begin(), settled.end(), claim.id) !=
+                              settled.end();
+                     }),
+      install_claims_.end());
+}
+
 bool SdEngine::RunOneTick() {
   const std::shared_ptr<const config::Config> config = ConfigSnapshot();
   http::HttpClient* client = nullptr;
@@ -1801,6 +1986,11 @@ bool SdEngine::RunOneTick() {
   if (application_running()) {
     return false;
   }
+
+  // What RomM's web UI queued for this console (#245). Here, past the library
+  // fetch, so a console that is offline spends nothing more on it; it only
+  // fills the download queue, which drains after the tick.
+  ServeInstalls(*client, token, *config, caps, cancel.get());
 
   const std::string baseline_path = files->Resolve(sync::kStateSdPath);
   const state::LoadedBaseline loaded = LoadBaselineFor(baseline_path, *config);
