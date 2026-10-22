@@ -335,8 +335,14 @@ ipc::Error Service::ListEnd(ipc::Cursor cursor) {
 }
 
 ipc::Error Service::FillFromQueueLocked(Entry& entry, ipc::ListPage* page) {
-  const std::vector<download::QueueEntry> rows = queue_.Snapshot();
   const download::DownloadStatus status = queue_.Status();
+  // The rows are read where they are, under the queue's lock, and not copied:
+  // a copy was the whole queue again on the IPC thread, ~2 KiB an entry at its
+  // bounds, for a page that holds a few of them (#247). The page is the only
+  // thing built here, and `kHeapListPages` counts it.
+  std::int64_t served = 0;
+  std::int64_t count = 0;
+  queue_.Visit([&](const std::vector<download::QueueEntry>& rows) {
 
   // The complaint about `queue.json` itself, as a row.
   //
@@ -350,9 +356,9 @@ ipc::Error Service::FillFromQueueLocked(Entry& entry, ipc::ListPage* page) {
   // it as an inert, unpressable row with the reason underneath, which is exactly
   // what it is.
   const bool complaint = !status.queue_message.empty();
-  const std::int64_t count = static_cast<std::int64_t>(rows.size()) + (complaint ? 1 : 0);
+  count = static_cast<std::int64_t>(rows.size()) + (complaint ? 1 : 0);
 
-  const std::int64_t served =
+  served =
       FillPage(page, entry.offset, count, entry.request.page_size, [&](std::int64_t index) {
         ipc::ListItem item;
         if (complaint && index == 0) {
@@ -387,6 +393,7 @@ ipc::Error Service::FillFromQueueLocked(Entry& entry, ipc::ListPage* page) {
         PutText(&item, keys::kQueueMessage, row.message);
         return item;
       });
+  });
 
   return PageOf(entry, page, served, count);
 }

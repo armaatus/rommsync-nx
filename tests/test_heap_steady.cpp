@@ -905,14 +905,18 @@ void QueueWrite(checks::Checks& c) {
     entries.push_back(WidestEntry(at));
   }
   // What one entry holds, so the bound below is in entries rather than bytes
-  // either standard library would disagree about.
+  // either standard library would disagree about. A write holds the entry it
+  // writes over, the piece of text it is writing and the quoted field that piece
+  // is being built from -- each at most an entry, some of them grown by
+  // doubling -- and nothing that grows with the queue: a write before #247 was
+  // the queue three times, ~250 entries' worth at this one's bound.
   std::int64_t one = 0;
   {
     const std::int64_t before = count_new::Now().outstanding_bytes;
     const download::QueueEntry copy = entries.front();
     one = count_new::Now().outstanding_bytes - before + static_cast<std::int64_t>(sizeof(copy));
   }
-  const std::int64_t kBound = 4 * one;
+  const std::int64_t kBound = 6 * one;
   c.Expect(download::SaveQueue(path, entries).ok(), "a full queue at its widest is writable");
 
   download::Queue queue;
@@ -968,7 +972,11 @@ void QueueWrite(checks::Checks& c) {
                                   std::to_string(rollback) + " >= " + std::to_string(kBound));
 
   // The overlay's queue screen, a page of it: the page is `kHeapListPages`'s,
-  // and nothing beside it may be the whole queue.
+  // and nothing beside it may be the whole queue. What is built beside the page
+  // -- its items as they are measured against the payload, the item vector as
+  // it grows -- scales with the page, which a payload bounds, not with the
+  // queue; a copy of the queue was ~64 entries.
+  const std::int64_t kPageBound = 16 * one;
   rommsync::config::Config configuration = rommsync::config::Defaults();
   rommsync::lists::Service service(rommsync::lists::Service::FixedConfig(configuration), queue);
   ipc::ListRequest request;
@@ -983,9 +991,9 @@ void QueueWrite(checks::Checks& c) {
   const std::int64_t kept = count_new::Now().outstanding_bytes - before;
   std::cout << "a queue page of " << page.items.size() << " items: " << kept
             << " bytes kept, " << listed << " at its peak\n";
-  c.Expect(listed - kept < kBound,
+  c.Expect(listed - kept < kPageBound,
            "a queue page is built without a copy of the whole queue beside it: " +
-               std::to_string(listed - kept) + " >= " + std::to_string(kBound));
+               std::to_string(listed - kept) + " >= " + std::to_string(kPageBound));
   std::filesystem::remove_all(dir, error);
 }
 

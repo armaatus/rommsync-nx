@@ -67,8 +67,10 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "rommsync/auth_gate.hpp"
@@ -394,6 +396,15 @@ class Queue {
   /// running.
   std::vector<QueueEntry> Snapshot() const;
 
+  /// Hand every entry, in queue order, to `visit` under the lock, rather than a
+  /// copy of them (M9-21, #247): the overlay's queue screen reads a page of the
+  /// queue, and `Snapshot` would be the whole of it again for that page.
+  ///
+  /// `visit` may not call back into this object -- the lock is not recursive --
+  /// and should do no more than read: every other reader, the transfer
+  /// thread's progress included, waits it out.
+  void Visit(const std::function<void(const std::vector<QueueEntry>&)>& visit) const;
+
   /// The entry for `rom_id`, or a default-constructed one with `rom_id == 0`.
   QueueEntry Find(std::int64_t rom_id) const;
 
@@ -406,12 +417,13 @@ class Queue {
   /// reached this method could not put back `live_rom_id_` and the rest, and
   /// could not be atomic against the download worker either.
   ///
-  /// A rollback replaces the whole vector rather than reversing the change,
-  /// because reversing is not exact: `Enqueue` erases a terminal entry to
-  /// re-queue a rom, and a `Remove` that put the new row back would lose the
-  /// `failed` row a user is entitled to still see. Anything else that replaces
-  /// the whole queue is a bug: the queue is the user's list, and the only
-  /// things that shorten it are `Remove` and `Clear`.
+  /// A rollback puts back the rows the change touched at the positions they
+  /// held, rather than reversing the change by its meaning, because that is not
+  /// exact: `Enqueue` erases a terminal entry to re-queue a rom, and a `Remove`
+  /// of the new row would lose the `failed` row a user is entitled to still see
+  /// (`Undo`). Anything else that replaces the whole queue is a bug: the queue
+  /// is the user's list, and the only things that shorten it are `Remove` and
+  /// `Clear`.
   void Reset(std::vector<QueueEntry> entries);
 
   /// Entries the worker still has to do: everything not `Terminal`. This is the
@@ -486,8 +498,9 @@ class Queue {
   ///
   /// `store` is handed the entries as they stand after the change and answers
   /// whether they reached the card; a `false` puts the queue back exactly as it
-  /// was, `kMaxQueueEntries`-full re-queue and all -- which is why the whole
-  /// vector is kept rather than the change reversed (`Reset`).
+  /// was, `kMaxQueueEntries`-full re-queue and all -- which is why the rows the
+  /// change touched are kept, positions and all, rather than the change
+  /// reversed (`Undo`).
   ///
   /// **The lock is held across `store`, and that is the point.** Until M9-5
   /// (#197) the queue had one writer at a time -- `sysmodule::SdEngine::Commit`
@@ -513,15 +526,15 @@ class Queue {
   template <typename Store>
   ipc::Error EnqueueAndStore(std::int64_t rom_id, std::int32_t* position, Store&& store) {
     std::lock_guard<std::mutex> held(mutex_);
-    const Undo before = TakeUndoLocked();
-    const ipc::Error refused = EnqueueLocked(rom_id, position);
+    Undo before = TakeUndoLocked();
+    const ipc::Error refused = EnqueueLocked(rom_id, position, &before);
     if (refused != ipc::Error::kOk) {
       return refused;
     }
     if (store(Rows())) {
       return ipc::Error::kOk;
     }
-    RestoreLocked(before);
+    RestoreLocked(std::move(before));
     return ipc::Error::kWriteFailed;
   }
 
@@ -537,38 +550,53 @@ class Queue {
   template <typename Store>
   ipc::Error RemoveAndStore(std::int64_t rom_id, QueueEntry* removed, Store&& store) {
     std::lock_guard<std::mutex> held(mutex_);
-    const Undo before = TakeUndoLocked();
-    const ipc::Error refused = RemoveLocked(rom_id, removed);
+    Undo before = TakeUndoLocked();
+    const ipc::Error refused = RemoveLocked(rom_id, removed, &before);
     if (refused != ipc::Error::kOk) {
       return refused;
     }
     if (store(Rows())) {
       return ipc::Error::kOk;
     }
-    RestoreLocked(before);
+    RestoreLocked(std::move(before));
     return ipc::Error::kWriteFailed;
   }
 
   template <typename Store>
   Committed UpdateAndStore(const QueueEntry& entry, Store&& store) {
     std::lock_guard<std::mutex> held(mutex_);
-    const Undo before = TakeUndoLocked();
-    if (!UpdateLocked(entry)) {
+    Undo before = TakeUndoLocked();
+    if (!UpdateLocked(entry, &before)) {
       return Committed::kGone;
     }
     if (store(Rows())) {
       return Committed::kOk;
     }
-    RestoreLocked(before);
+    RestoreLocked(std::move(before));
     return Committed::kStoreFailed;
   }
 
  private:
-  /// Everything a failed write has to put back -- the rows, and the three
-  /// fields of bookkeeping that are not on them (`live_rom_id_`,
+  /// Everything a failed write has to put back -- the rows the change touched,
+  /// and the three fields of bookkeeping that are not on them (`live_rom_id_`,
   /// `live_bytes_per_second_`, `last_finished_rom_id_`).
+  ///
+  /// **The rows it touched and where they stood, not a copy of every row**
+  /// (M9-21, #247). A change is at most one row out and one appended, or one
+  /// written over, and the lock is held from the change to the undo, so putting
+  /// those back at their positions is exact -- the `failed` row an `Enqueue`
+  /// erased goes back where it was, ahead of the rows behind it. The copy it
+  /// replaces was the whole queue again on every write, ~2 KiB an entry at its
+  /// bounds, from the IPC thread as well as the worker.
   struct Undo {
-    std::vector<QueueEntry> entries;
+    /// A row the change took out (`Enqueue`'s re-queue or full queue, `Remove`)
+    /// or wrote over (`Update`), and its index.
+    std::optional<QueueEntry> row;
+    std::size_t at = 0;
+    /// `row` was written over in place rather than taken out.
+    bool replaced = false;
+    /// The change appended a row (`Enqueue`), which the undo takes off first.
+    bool appended = false;
     std::int64_t live_rom_id = 0;
     std::int64_t live_bytes_per_second = 0;
     std::int64_t last_finished_rom_id = 0;
@@ -579,14 +607,14 @@ class Queue {
 
   /// The caller holds `mutex_`.
   Undo TakeUndoLocked() const;
-  void RestoreLocked(const Undo& undo);
+  void RestoreLocked(Undo undo);
 
   /// The bodies of `Enqueue`, `Remove` and `Update`, with the lock already
   /// held, so the transactional forms above are the same code and cannot drift
-  /// from the plain ones.
-  ipc::Error EnqueueLocked(std::int64_t rom_id, std::int32_t* position);
-  ipc::Error RemoveLocked(std::int64_t rom_id, QueueEntry* removed);
-  bool UpdateLocked(const QueueEntry& entry);
+  /// from the plain ones. `undo`, when not null, is told what the change did.
+  ipc::Error EnqueueLocked(std::int64_t rom_id, std::int32_t* position, Undo* undo = nullptr);
+  ipc::Error RemoveLocked(std::int64_t rom_id, QueueEntry* removed, Undo* undo = nullptr);
+  bool UpdateLocked(const QueueEntry& entry, Undo* undo = nullptr);
 
   /// The caller holds `mutex_`.
   std::vector<QueueEntry>::iterator FindLocked(std::int64_t rom_id);

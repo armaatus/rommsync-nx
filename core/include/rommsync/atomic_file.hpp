@@ -17,6 +17,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <utility>
 #include <string_view>
@@ -193,6 +194,22 @@ std::string PreviousPathFor(std::string_view path);
 /// are on the card before the rename publishes them. A hook that refuses is
 /// `kWriteFailed`, and the destination is untouched.
 WriteResult WriteAtomically(const std::string& path, std::string_view contents);
+
+/// `WriteAtomically`, for a record produced a piece at a time rather than held
+/// whole (M9-21, #247).
+///
+/// `next` is handed an empty string, appends the next piece of the record to it
+/// and returns true, or returns false once there is no more. One piece is in
+/// memory at a time -- the buffer is cleared and reused, so it costs the
+/// largest piece and not the record. Every guarantee above is the same one: the
+/// pieces go to the temp file, and only a complete, flushed, synced temp file is
+/// renamed onto `path`.
+///
+/// For a record whose text would be a second copy of something already in
+/// memory: `queue.json`, written whole on every change to the download queue,
+/// was the queue again in text beside the queue.
+WriteResult WriteAtomicallyEach(const std::string& path,
+                                const std::function<bool(std::string* piece)>& next);
 
 /// Move a file that is already staged on disk onto `path`, atomically.
 ///

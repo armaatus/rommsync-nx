@@ -187,7 +187,12 @@ WriteResult CommitStaged(const std::string& staged, const std::string& path) {
   return committed;
 }
 
-WriteResult WriteAtomically(const std::string& path, std::string_view contents) {
+namespace {
+
+/// The body of both writers: `write` puts the whole record into the temp file
+/// and says whether every byte went, and the rest -- flush, close, sync, commit
+/// -- is the same whether the record came in one piece or many.
+WriteResult WriteStaged(const std::string& path, const std::function<bool(std::FILE*)>& write) {
   const std::string temp = TempPathFor(path);
 
   std::FILE* file = OpenForWriting(temp, "wb");
@@ -197,13 +202,13 @@ WriteResult WriteAtomically(const std::string& path, std::string_view contents) 
   }
 
   errno = 0;
-  const std::size_t written = Write(file, contents.data(), contents.size());
+  const bool written = write(file);
   // The flush has to happen while the handle is still open: fclose reports a
   // failed flush too, but by then there is nothing left to distinguish "the
   // bytes never left the buffer" from "the close itself failed". The sync comes
   // after the close, by path, because that is the contract both platforms can
   // hold (`FileSync`).
-  const bool flushed = written == contents.size() && std::fflush(file) == 0;
+  const bool flushed = written && std::fflush(file) == 0;
   // Read before `fclose` can overwrite it: what the card said, if it said no.
   const int refused = flushed ? 0 : errno;
   const bool closed = std::fclose(file) == 0;
@@ -219,6 +224,30 @@ WriteResult WriteAtomically(const std::string& path, std::string_view contents) 
   // Everything above touched only the temp file, so a failure up to this point
   // leaves whatever `path` already held exactly as it was.
   return CommitStaged(temp, path);
+}
+
+}  // namespace
+
+WriteResult WriteAtomically(const std::string& path, std::string_view contents) {
+  return WriteStaged(path, [contents](std::FILE* file) {
+    return Write(file, contents.data(), contents.size()) == contents.size();
+  });
+}
+
+WriteResult WriteAtomicallyEach(const std::string& path,
+                                const std::function<bool(std::string* piece)>& next) {
+  return WriteStaged(path, [&next](std::FILE* file) {
+    std::string piece;
+    for (;;) {
+      piece.clear();
+      if (!next(&piece)) {
+        return true;
+      }
+      if (Write(file, piece.data(), piece.size()) != piece.size()) {
+        return false;
+      }
+    }
+  });
 }
 
 const char* ToString(CopyError error) {

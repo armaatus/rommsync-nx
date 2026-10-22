@@ -97,8 +97,12 @@ bool Usable(const QueueEntry& entry, std::string* why) {
   return true;
 }
 
-std::string SerializeEntry(const QueueEntry& entry) {
-  std::string out("{\"rom_id\":");
+/// One entry's JSON, appended to `*out` rather than built beside it: the file
+/// is written an entry at a time, and a second string per entry was one more
+/// entry's text on every write (#247).
+void AppendEntry(const QueueEntry& entry, std::string* out_text) {
+  std::string& out = *out_text;
+  out += "{\"rom_id\":";
   out += std::to_string(entry.rom_id);
   out += ",\"platform_fs_slug\":";
   out += json::Quote(entry.platform_fs_slug);
@@ -110,7 +114,11 @@ std::string SerializeEntry(const QueueEntry& entry) {
   // no hash for this rom" is an answer, and a reader that could not tell it from
   // a missing field would have to guess which one it was looking at.
   out += ",\"sha1_hash\":";
-  out += entry.sha1_hash.empty() ? std::string("null") : json::Quote(entry.sha1_hash);
+  if (entry.sha1_hash.empty()) {
+    out += "null";
+  } else {
+    out += json::Quote(entry.sha1_hash);
+  }
   out += ",\"destination\":";
   out += json::Quote(entry.destination);
   out += ",\"state\":";
@@ -124,7 +132,6 @@ std::string SerializeEntry(const QueueEntry& entry) {
   out += ",\"queued_at\":";
   out += std::to_string(entry.queued_at);
   out += "}";
-  return out;
 }
 
 /// A `string | null` field read straight off the object.
@@ -413,14 +420,32 @@ std::vector<QueueEntry>::iterator Queue::FindLocked(std::int64_t rom_id) {
 }
 
 Queue::Undo Queue::TakeUndoLocked() const {
-  return {entries_, live_rom_id_, live_bytes_per_second_, last_finished_rom_id_};
+  Undo undo;
+  undo.live_rom_id = live_rom_id_;
+  undo.live_bytes_per_second = live_bytes_per_second_;
+  undo.last_finished_rom_id = last_finished_rom_id_;
+  return undo;
 }
 
-void Queue::RestoreLocked(const Undo& undo) {
+void Queue::RestoreLocked(Undo undo) {
+  // The change in reverse: the row it appended off the end, then the row it
+  // took out back at its index, or the row it wrote over back in place. The
+  // lock has been held since the change, so every index still means what it
+  // did (`Undo`).
+  if (undo.appended && !entries_.empty()) {
+    entries_.pop_back();
+  }
+  if (undo.row.has_value()) {
+    if (undo.replaced) {
+      entries_[undo.at] = std::move(*undo.row);
+    } else {
+      entries_.insert(entries_.begin() + static_cast<std::ptrdiff_t>(undo.at),
+                      std::move(*undo.row));
+    }
+  }
   // Exactly as it was, the two off-row fields included: a rollback that put the
   // rows back and left `live_rom_id_` pointing at a transfer the change had
   // cleared would quote a rate against a bar that is not moving.
-  entries_ = undo.entries;
   live_rom_id_ = undo.live_rom_id;
   live_bytes_per_second_ = undo.live_bytes_per_second;
   last_finished_rom_id_ = undo.last_finished_rom_id;
@@ -431,7 +456,7 @@ ipc::Error Queue::Enqueue(std::int64_t rom_id, std::int32_t* position) {
   return EnqueueLocked(rom_id, position);
 }
 
-ipc::Error Queue::EnqueueLocked(std::int64_t rom_id, std::int32_t* position) {
+ipc::Error Queue::EnqueueLocked(std::int64_t rom_id, std::int32_t* position, Undo* undo) {
   if (rom_id <= 0) {
     // There is no such rom, and saying so here means every caller is held to it
     // -- `EnqueueRom` checks the library, and a `sysmodule` engine that skipped
@@ -446,6 +471,10 @@ ipc::Error Queue::EnqueueLocked(std::int64_t rom_id, std::int32_t* position) {
     // "Try again" -- see the header. Erased and re-added rather than reset in
     // place, so a rom re-queued after a failure goes behind the entries that
     // were already waiting rather than ahead of them.
+    if (undo != nullptr) {
+      undo->at = static_cast<std::size_t>(existing - entries_.begin());
+      undo->row = std::move(*existing);
+    }
     entries_.erase(existing);
   } else if (entries_.size() >= kMaxQueueEntries) {
     // The file is full. A finished row is history the queue screen shows and
@@ -456,6 +485,10 @@ ipc::Error Queue::EnqueueLocked(std::int64_t rom_id, std::int32_t* position) {
     if (oldest == entries_.end()) {
       return ipc::Error::kQueueFull;
     }
+    if (undo != nullptr) {
+      undo->at = static_cast<std::size_t>(oldest - entries_.begin());
+      undo->row = std::move(*oldest);
+    }
     entries_.erase(oldest);
   }
 
@@ -463,6 +496,9 @@ ipc::Error Queue::EnqueueLocked(std::int64_t rom_id, std::int32_t* position) {
   entry.rom_id = rom_id;
   entry.queued_at = NowSeconds();
   entries_.push_back(std::move(entry));
+  if (undo != nullptr) {
+    undo->appended = true;
+  }
 
   std::int32_t pending = 0;
   for (const QueueEntry& row : entries_) {
@@ -477,13 +513,17 @@ ipc::Error Queue::Remove(std::int64_t rom_id) {
   return RemoveLocked(rom_id, nullptr);
 }
 
-ipc::Error Queue::RemoveLocked(std::int64_t rom_id, QueueEntry* removed) {
+ipc::Error Queue::RemoveLocked(std::int64_t rom_id, QueueEntry* removed, Undo* undo) {
   const auto found = FindLocked(rom_id);
   if (found == entries_.end()) {
     return ipc::Error::kNotQueued;
   }
   if (removed != nullptr) {
     *removed = *found;
+  }
+  if (undo != nullptr) {
+    undo->at = static_cast<std::size_t>(found - entries_.begin());
+    undo->row = std::move(*found);
   }
   entries_.erase(found);
   if (rom_id == last_finished_rom_id_) {
@@ -507,6 +547,11 @@ void Queue::Clear() {
 std::vector<QueueEntry> Queue::Snapshot() const {
   std::lock_guard<std::mutex> held(mutex_);
   return entries_;
+}
+
+void Queue::Visit(const std::function<void(const std::vector<QueueEntry>&)>& visit) const {
+  std::lock_guard<std::mutex> held(mutex_);
+  visit(entries_);
 }
 
 QueueEntry Queue::Find(std::int64_t rom_id) const {
@@ -682,10 +727,15 @@ bool Queue::Update(const QueueEntry& entry) {
   return UpdateLocked(entry);
 }
 
-bool Queue::UpdateLocked(const QueueEntry& entry) {
+bool Queue::UpdateLocked(const QueueEntry& entry, Undo* undo) {
   const auto found = FindLocked(entry.rom_id);
   if (found == entries_.end()) {
     return false;
+  }
+  if (undo != nullptr) {
+    undo->at = static_cast<std::size_t>(found - entries_.begin());
+    undo->row = std::move(*found);
+    undo->replaced = true;
   }
   *found = entry;
   if (Terminal(entry.state)) {
@@ -748,19 +798,36 @@ const char* ToString(StoreError error) {
   return "none";
 }
 
-std::string SerializeQueue(const std::vector<QueueEntry>& entries) {
-  std::string out("{\"format\":");
-  out += json::Quote(kFormatMagic);
-  out += ",\"version\":";
-  out += std::to_string(kFormatVersion);
-  out += ",\"entries\":[";
-  for (std::size_t at = 0; at < entries.size(); ++at) {
-    if (at != 0) {
-      out += ",";
+namespace {
+
+/// Piece `piece` of the file's text, appended to `out`: the opening, then one
+/// entry each, then the closing -- `entries.size() + 2` of them. The file is
+/// written a piece at a time (`SaveQueue`), so what a write holds is the largest
+/// piece rather than the whole text beside the queue it came from (#247).
+void AppendPiece(const std::vector<QueueEntry>& entries, std::size_t piece, std::string* out) {
+  if (piece == 0) {
+    *out += "{\"format\":";
+    *out += json::Quote(kFormatMagic);
+    *out += ",\"version\":";
+    *out += std::to_string(kFormatVersion);
+    *out += ",\"entries\":[";
+  } else if (piece <= entries.size()) {
+    if (piece != 1) {
+      *out += ",";
     }
-    out += SerializeEntry(entries[at]);
+    AppendEntry(entries[piece - 1], out);
+  } else {
+    *out += "]}\n";
   }
-  out += "]}\n";
+}
+
+}  // namespace
+
+std::string SerializeQueue(const std::vector<QueueEntry>& entries) {
+  std::string out;
+  for (std::size_t piece = 0; piece < entries.size() + 2; ++piece) {
+    AppendPiece(entries, piece, &out);
+  }
   return out;
 }
 
@@ -969,16 +1036,34 @@ StoreResult SaveQueue(const std::string& path, const std::vector<QueueEntry>& en
     }
   }
 
-  const std::string contents = SerializeQueue(entries);
-  if (contents.size() > kMaxQueueBytes) {
+  // Sized first and then written, a piece at a time both times: the text whole
+  // was the queue a second time over, and this runs from the IPC thread beside
+  // whatever the worker holds (#247). Serialising twice is ~64 short strings.
+  std::size_t size = 0;
+  std::string piece;
+  for (std::size_t at = 0; at < entries.size() + 2; ++at) {
+    piece.clear();
+    AppendPiece(entries, at, &piece);
+    size += piece.size();
+  }
+  if (size > kMaxQueueBytes) {
     result.error = StoreError::kTooLarge;
     result.message =
-        Describe(path, "would be " + std::to_string(contents.size()) + " bytes; " +
+        Describe(path, "would be " + std::to_string(size) + " bytes; " +
                            std::to_string(kMaxQueueBytes) + " is the most a queue may take");
     return result;
   }
+  std::string().swap(piece);
 
-  const io::WriteResult written = io::WriteAtomically(path, contents);
+  std::size_t next = 0;
+  const io::WriteResult written =
+      io::WriteAtomicallyEach(path, [&entries, &next](std::string* out) {
+        if (next == entries.size() + 2) {
+          return false;
+        }
+        AppendPiece(entries, next++, out);
+        return true;
+      });
   switch (written.error) {
     case io::WriteError::kNone:
       break;
