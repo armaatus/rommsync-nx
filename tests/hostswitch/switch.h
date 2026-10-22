@@ -133,6 +133,19 @@ const Dispatched& LastDispatched();
 /// the life of the console, because nx-ovlloader's process never exits.
 int OpenSessions();
 
+/// How many `smGetService` calls named a service nobody had registered.
+///
+/// **On a console each of these never returns.** Atmosphere's sm *defers* a
+/// request for a name that is not registered, and a deferred request is
+/// answered only when the name appears (`sm_service_manager.cpp`,
+/// sysmodule/source/boot_wait.hpp). nx-ovlloader's SAC lets the overlay ask for
+/// any name, so `smGetService("rommsync")` with the sysmodule not running
+/// parks the draw thread -- and the panel and the user's input with it --
+/// forever. The shim cannot park a test, so it answers `LibnxError_NotFound`
+/// and counts the request here; `overlay.version` asserts the count stays
+/// zero (#254).
+int DeferredRequests();
+
 }  // namespace hostswitch
 
 /// A session, as far as this client uses one. `serviceIsActive` is the whole of
