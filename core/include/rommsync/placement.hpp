@@ -67,6 +67,14 @@ struct Placement {
   /// `sync::ExecuteOptions::reads_as` is asked instead.
   std::string emulator;
 
+  /// No path because the file is not this console's to load (#239): a state
+  /// written by a core the platform is not played in here, or in a slot the
+  /// frontend it is played in has no file for. `reason` still says which. A
+  /// caller that filters the server's rows by emulator passes over it rather
+  /// than failing it -- it is the normal shape of a library several devices
+  /// share, not something a user can fix.
+  bool foreign = false;
+
   bool ok() const { return !sd_path.empty(); }
 };
 
@@ -109,6 +117,13 @@ Placement Place(const roms::Rom& rom, std::string_view emulator_id,
 /// and never to an isolated `tico-*` format. Pure.
 bool Compatible(std::string_view server_emulator, std::string_view target_emulator);
 
+/// True when a *state* `server_emulator` wrote is one `target_emulator` loads:
+/// the same id, or two ids RomM files under one RetroArch core folder. Stricter
+/// than `Compatible`, because a state is a core's memory rather than the game's
+/// SRAM: two cores' states never load in each other, and a state that does not
+/// say which core wrote it loads in none this client can name (#239). Pure.
+bool LoadsState(std::string_view server_emulator, std::string_view target_emulator);
+
 /// The placements of one tick, against one card.
 ///
 /// Holds references: everything it is built from must outlive it. Reads the
@@ -125,9 +140,16 @@ class Placer {
   /// a placed copy is a new save on the next tick.
   Placement Save(const sync::SyncOperation& operation);
 
-  /// Where a server state no local state claimed goes. Under the server's own
-  /// `file_name` -- a state pairs on `(rom_id, file_name)`, so a renamed one is
-  /// a different state -- in the folder the save rule picks.
+  /// Where a server state no local state claimed goes, in the folder the save
+  /// rule picks. Under the server's own `file_name` -- a state pairs on
+  /// `(rom_id, file_name)`, so a renamed one is a different state -- except in
+  /// Tico's folder under `[sync] map_state_slots`, where RetroArch's name is
+  /// Tico's for the same slot and the scan maps it back (#239,
+  /// `scan::TicoStateName`).
+  ///
+  /// Only a state the target core loads (`LoadsState`), and only under a name
+  /// that frontend loads one from (`scan::IsTicoStateName`,
+  /// `scan::IsRetroArchStateName`); anything else is `foreign`.
   Placement State(std::int64_t rom_id, std::string_view file_name, std::string_view emulator);
 
  private:
@@ -136,6 +158,7 @@ class Placer {
     std::string map_folder;     ///< the map's folder the layout came from, for its platform hint
     std::string emulator_id;    ///< the emulator the file is written for
     std::string reason;         ///< set when there is no target
+    bool foreign = false;       ///< ...because the server's copy is not that emulator's
   };
 
   Target TargetFor(const roms::Rom& rom, std::string_view server_emulator, bool saves);

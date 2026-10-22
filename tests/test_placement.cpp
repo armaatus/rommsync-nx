@@ -29,6 +29,7 @@
 #include "rommsync/rom_index.hpp"
 #include "rommsync/save_scan.hpp"
 #include "rommsync/state_db.hpp"
+#include "rommsync/state_names.hpp"
 #include "rommsync/sync.hpp"
 
 namespace {
@@ -537,9 +538,12 @@ void Saves(checks::Checks& c) {
 
 /// The state scan's answer for `sd_path`, written and removed again: read back
 /// as `rom_id` under the same name.
+/// `as` is the name the state must pair on once read back: its own file name
+/// unless the scan maps it to RetroArch's (#239).
 bool StateReadsBack(Card& card, const config::Config& config,
                     const retroarch::Settings& settings, const roms::RomIndex& index,
-                    const std::string& sd_path, std::int64_t rom_id, std::string* said) {
+                    const std::string& sd_path, std::int64_t rom_id, std::string* said,
+                    const std::string& as = "") {
   if (sd_path.empty() || sd_path.front() != '/') {
     *said = "nothing was placed";
     return false;
@@ -552,7 +556,7 @@ bool StateReadsBack(Card& card, const config::Config& config,
   for (const scan::StateFile& file : result.states) {
     if (file.sd_path == sd_path) {
       *said = "read back as rom " + std::to_string(file.rom_id) + " named " + file.file_name;
-      return file.rom_id == rom_id && file.file_name == name;
+      return file.rom_id == rom_id && file.file_name == (as.empty() ? name : as);
     }
   }
   *said = "not read back at all: " + result.DescribeSkipped();
@@ -569,18 +573,18 @@ void States(checks::Checks& c) {
     Card card("states-tico");
     card.MakeDirs("/tico/states/users/" + kAccount);
     place::Placer placer(config, ra_defaults, index, card.files());
-    const place::Placement placed = placer.State(1, "Super Mario World (USA).state", "snes9x");
+    const place::Placement placed = placer.State(1, "Super Mario World (USA).state0", "snes9x");
     c.ExpectEq(placed.sd_path,
-               "/tico/states/users/" + kAccount + "/snes/Super Mario World (USA).state",
+               "/tico/states/users/" + kAccount + "/snes/Super Mario World (USA).state0",
                "Tico's state folder for the account, under the name it pairs on: " +
                    placed.reason);
     std::string said;
     c.Expect(StateReadsBack(card, config, ra_defaults, index, placed.sd_path, 1, &said),
              "read back as the same state: " + said);
-    c.Expect(!placer.State(1, "Super Mario World (USA).state", "bsnes").ok(),
+    c.Expect(!placer.State(1, "Super Mario World (USA).state0", "bsnes").ok(),
              "another core's state is not one Snes9x loads");
     c.Expect(!placer.State(1, "Super Mario World (USA).state.auto", "snes9x").ok(),
-             "a name the scan would not match back to the rom is not placed");
+             "a name Tico does not load a state from is not placed in its folder (#239)");
     c.Expect(!placer.State(1, "../Super Mario World (USA).state", "snes9x").ok(),
              "nor one that is a path");
     c.Expect(!placer.State(99, "Game.state", "snes9x").ok(), "nor one for a rom not in the index");
@@ -665,6 +669,181 @@ void Cards(checks::Checks& c) {
            "a Beetle save is not placed in DuckStation's folder");
 }
 
+/// #239: a state is placed only where its emulator loads it, and under the name
+/// that frontend gives the slot -- RetroArch's mapped onto Tico's when asked.
+/// Every refusal for "not this console's to load" is marked `foreign`, which
+/// `sync::SyncStates` passes over silently rather than failing every tick.
+void StateSlots(checks::Checks& c) {
+  const roms::RomIndex index = Library();
+  const retroarch::Settings ra_defaults;
+  config::Config mapped = config::Defaults();
+  mapped.sync.states = true;
+  mapped.sync.map_state_slots = true;
+  config::Config unmapped = mapped;
+  unmapped.sync.map_state_slots = false;
+  const std::string snes = "/tico/states/users/" + kAccount + "/snes/";
+  const std::string smw = "Super Mario World (USA)";
+
+  {
+    Card card("state-slots-tico");
+    card.MakeDirs("/tico/states/users/" + kAccount);
+    place::Placer placer(mapped, ra_defaults, index, card.files());
+    struct Row {
+      const char* server;
+      const char* tico;
+    };
+    for (const Row row : {Row{".state.auto", ".state5"}, Row{".state1", ".state0"},
+                          Row{".state5", ".state4"}}) {
+      const place::Placement placed = placer.State(1, smw + row.server, "snes9x");
+      c.ExpectEq(placed.sd_path, snes + smw + row.tico,
+                 std::string("RetroArch's ") + row.server + " lands as Tico's " + row.tico + ": " +
+                     placed.reason);
+      std::string said;
+      c.Expect(StateReadsBack(card, mapped, ra_defaults, index, placed.sd_path, 1, &said,
+                              smw + row.server),
+               std::string("and is read back under RetroArch's name again: ") + said);
+    }
+    for (const char* none : {".state", ".state6", ".state0"}) {
+      const place::Placement placed = placer.State(1, smw + none, "snes9x");
+      c.Expect(!placed.ok() && placed.foreign,
+               std::string(none) + " is a slot Tico has none of, passed over: " + placed.reason);
+    }
+    const place::Placement other = placer.State(1, smw + ".state.auto", "bsnes");
+    c.Expect(!other.ok() && other.foreign, "another core's state is not this console's to load");
+    const place::Placement unnamed = placer.State(1, smw + ".state.auto", "");
+    c.Expect(!unnamed.ok() && unnamed.foreign,
+             "nor is one that does not say which core wrote it: a state is a core's memory");
+  }
+
+  {
+    // Off, each keeps its own name, and Tico takes only its own.
+    Card card("state-slots-unmapped");
+    card.MakeDirs("/tico/states/users/" + kAccount);
+    place::Placer placer(unmapped, ra_defaults, index, card.files());
+    const place::Placement own = placer.State(1, smw + ".state5", "snes9x");
+    c.ExpectEq(own.sd_path, snes + smw + ".state5", "Tico's own Auto, as it is: " + own.reason);
+    std::string said;
+    c.Expect(StateReadsBack(card, unmapped, ra_defaults, index, own.sd_path, 1, &said),
+             "read back under the same name: " + said);
+    const place::Placement auto_state = placer.State(1, smw + ".state.auto", "snes9x");
+    c.Expect(!auto_state.ok() && auto_state.foreign,
+             "RetroArch's Auto is not one Tico loads without the mapping");
+  }
+
+  {
+    // The acceptance: DuckStation's and a RetroArch PSX core's never meet.
+    Card card("state-slots-psx");
+    card.MakeDirs("/tico/states/users/" + kAccount);
+    place::Placer tico(mapped, ra_defaults, index, card.files());
+    const place::Placement own = tico.State(3, "Psx Game.state5", "tico-duckstation");
+    c.ExpectEq(own.sd_path, "/tico/states/users/" + kAccount + "/psx/Psx Game.state5",
+               "DuckStation's state, never mapped, in DuckStation's folder: " + own.reason);
+    std::string said;
+    c.Expect(StateReadsBack(card, mapped, ra_defaults, index, own.sd_path, 3, &said),
+             "read back under its own name: " + said);
+    for (const char* core : {"pcsx_rearmed", "swanstation", "mednafen_psx_hw"}) {
+      const place::Placement placed = tico.State(3, "Psx Game.state5", core);
+      c.Expect(!placed.ok() && placed.foreign,
+               std::string(core) + "'s state is never placed for DuckStation");
+    }
+
+    config::LoadResult retro = config::ParseConfig("[platform.psx]\nplay_with = retroarch\n");
+    retro.value.sync.states = true;
+    retro.value.sync.map_state_slots = true;
+    place::Placer retroarch_psx(retro.value, ra_defaults, index, card.files());
+    const place::Placement isolated =
+        retroarch_psx.State(3, "Psx Game.state5", "tico-duckstation");
+    c.Expect(!isolated.ok() && isolated.foreign,
+             "and DuckStation's is never placed for a RetroArch PSX core");
+    const place::Placement core = retroarch_psx.State(3, "Psx Game.state.auto", "pcsx_rearmed");
+    c.ExpectEq(core.sd_path,
+               std::string("/retroarch/cores/savestates/PCSX-ReARMed/Psx Game.state.auto"),
+               "a RetroArch core's Auto goes to that core's folder: " + core.reason);
+    c.Expect(StateReadsBack(card, retro.value, ra_defaults, index, core.sd_path, 3, &said),
+             "and RetroArch's Auto is read back as its rom's: " + said);
+    const place::Placement zero = retroarch_psx.State(3, "Psx Game.state0", "pcsx_rearmed");
+    c.Expect(!zero.ok() && zero.foreign, "RetroArch loads no .state0");
+  }
+}
+
+/// #239: the two names one state goes by, Tico's and RetroArch's -- the table
+/// from the issue, row by row, both ways, and the names neither side has.
+void StateTable(checks::Checks& c) {
+  struct Row {
+    const char* slot;
+    const char* tico;       ///< "" -- Tico has no such slot
+    const char* retroarch;  ///< "" -- RetroArch has no such slot
+  };
+  const Row kTable[] = {
+      {"menu slot 1", "Game (USA).state0", "Game (USA).state1"},
+      {"menu slot 2", "Game (USA).state1", "Game (USA).state2"},
+      {"menu slot 3", "Game (USA).state2", "Game (USA).state3"},
+      {"menu slot 4", "Game (USA).state3", "Game (USA).state4"},
+      {"menu slot 5", "Game (USA).state4", "Game (USA).state5"},
+      {"Auto", "Game (USA).state5", "Game (USA).state.auto"},
+      {"RetroArch slot 0", "", "Game (USA).state"},
+      {"RetroArch slot 6", "", "Game (USA).state6"},
+  };
+  for (const Row& row : kTable) {
+    const std::string slot = row.slot;
+    if (*row.tico != '\0') {
+      c.ExpectEq(scan::RetroArchStateName(row.tico).value_or("(none)"),
+                 std::string(row.retroarch), slot + ": Tico's file under RetroArch's name");
+      c.Expect(scan::IsTicoStateName(row.tico), slot + ": a name Tico loads");
+    }
+    const std::optional<std::string> tico = scan::TicoStateName(row.retroarch);
+    c.ExpectEq(tico.value_or(""), std::string(row.tico),
+               slot + ": RetroArch's file under Tico's name, or none");
+    c.Expect(scan::IsRetroArchStateName(row.retroarch), slot + ": a name RetroArch loads");
+  }
+
+  // The names that are neither side's slot map to nothing, rather than to a
+  // guess: RetroArch never writes `.state0`, Tico never `.state6` or `.state`.
+  for (const char* name : {"Game.state0", "Game.srm", "Game", ".state", "Game.state01",
+                           "Game.state-1", "Game.auto"}) {
+    c.Expect(!scan::TicoStateName(name).has_value(),
+             std::string(name) + " is not a RetroArch slot Tico has");
+  }
+  for (const char* name : {"Game.state", "Game.state6", "Game.state.auto", "Game.srm", ".state0",
+                           "Game.state00"}) {
+    c.Expect(!scan::RetroArchStateName(name).has_value(),
+             std::string(name) + " is not a Tico slot RetroArch has");
+  }
+  c.Expect(!scan::IsRetroArchStateName("Game.state0"), "RetroArch's slot 0 is .state, not .state0");
+  c.Expect(!scan::IsTicoStateName("Game.state.auto") && !scan::IsTicoStateName("Game.state"),
+           "Tico writes only .state0 to .state5");
+
+  // FAT32 does not keep case apart, and neither does the table; the stem is
+  // kept as it was.
+  c.ExpectEq(scan::RetroArchStateName("Game.STATE5").value_or(""), std::string("Game.state.auto"),
+             "an upper-case extension maps like a lower-case one");
+  c.ExpectEq(scan::TicoStateName("Game.State.Auto").value_or(""), std::string("Game.state5"),
+             "both ways");
+
+  // What a state's name is matched to a rom by: `.state.auto` is one extension.
+  c.ExpectEq(scan::StateMatchName("Game (USA).state.auto"), std::string("Game (USA).state"),
+             "RetroArch's Auto state is matched by its rom's name");
+  c.ExpectEq(scan::StateMatchName("Game (USA).state3"), std::string("Game (USA).state3"),
+             "and every other name as it is");
+
+  // Mapped only when asked, and only for a libretro core.
+  config::Config on = config::Defaults();
+  on.sync.map_state_slots = true;
+  c.Expect(!config::Defaults().sync.map_state_slots, "the mapping is off by default (#226 D4)");
+  c.Expect(scan::MapsStateSlots(on, "snes9x"), "on, a libretro module's slots are mapped");
+  c.Expect(!scan::MapsStateSlots(on, "tico-duckstation"),
+           "an isolated module's are not: no RetroArch core loads them");
+  c.Expect(!scan::MapsStateSlots(on, ""), "nor an unnamed emulator's");
+  c.Expect(!scan::MapsStateSlots(config::Defaults(), "snes9x"), "and off, nobody's");
+  const config::LoadResult parsed = config::ParseConfig("[sync]\nmap_state_slots = true\n");
+  bool said_of_it = false;
+  for (const config::Diagnostic& note : parsed.diagnostics) {
+    said_of_it = said_of_it || note.key == "map_state_slots";
+  }
+  c.Expect(parsed.value.sync.map_state_slots && !said_of_it,
+           "[sync] map_state_slots = true turns it on: " + parsed.DescribeDiagnostics());
+}
+
 int main(int argc, char** argv) {
   const std::string scenario = argc > 1 ? argv[1] : "config";
   checks::Checks c;
@@ -678,6 +857,10 @@ int main(int argc, char** argv) {
     States(c);
   } else if (scenario == "cards") {
     Cards(c);
+  } else if (scenario == "state_table") {
+    StateTable(c);
+  } else if (scenario == "state_slots") {
+    StateSlots(c);
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;

@@ -29,6 +29,11 @@ on_boot       = true
 saves         = true
 slot          = autosave           ; the slot RetroArch's Cloud Sync, the web player and Grout share
 states        = false              ; save states are core-specific; opt-in
+; A state loads only in the core, and the core version, that wrote it: one from
+; another device after a core update may not load at all. With map_state_slots,
+; Tico's Auto (.state5) and menu slots sync as RetroArch's .state.auto and
+; .state1-.state5, so play resumes across the two (docs/CONFIG.md).
+map_state_slots = false
 conflict_show = true               ; surface conflicts in the overlay
 ; A save you deleted in RomM: remove takes it off the card, after backing it up
 ; under /config/rommsync/.backup/; keep leaves it here and never uploads it.

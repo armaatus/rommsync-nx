@@ -867,7 +867,7 @@ For one local state, keyed `(rom_id, file_name)`:
 | id X    | id ≠ X          | —         | **keep both** |
 | id X    | id X, unmoved   | unchanged | no-op |
 | id X    | id X, unmoved   | changed   | upload |
-| id X    | id X, moved     | unchanged | download |
+| id X    | id X, moved     | unchanged | download, **only if the row's `emulator` is this state's core** — else keep both |
 | id X    | id X, moved     | changed   | **keep both** |
 
 A server state no local file claimed is *placed* — and a placement may only
@@ -875,7 +875,44 @@ A server state no local file claimed is *placed* — and a placement may only
 because the folder depends on the rom's platform and on which emulator the state
 belongs to; nothing said is a named failure rather than a guessed path. The
 engine's is the save rule above (`place::Placer::State`), with one difference:
-the state keeps the server's name, since `(rom_id, file_name)` is what pairs it.
+the state keeps the server's name, since `(rom_id, file_name)` is what pairs it
+— Tico's slots excepted, below.
+
+**A state moves only between devices running its core** (#239). A state is a
+core's memory, so `place::LoadsState` is stricter than a save's
+`place::Compatible`: the same id, or two ids RomM files under one RetroArch core
+folder, and never a state that names no emulator. Since a POST moves a row's
+`emulator`, a row this console paired with can come back holding another core's
+state, which is kept apart rather than downloaded. And since states have no
+negotiate to filter by `emulators`, the client filters the listing itself: a row
+the placer calls `foreign` — another core's, or in a slot the frontend the
+platform is played in has no file for — is counted in `filtered` and passed over
+silently, the way a state for a rom this console lacks is. DuckStation's
+`tico-duckstation` states therefore meet only DuckStation on another Switch, and
+a RetroArch PSX core's never land in Tico's folder.
+
+**Tico's slots, under RetroArch's names** (`[sync] map_state_slots`, off by
+default; #226 D4). Tico writes `<game>.state0`–`.state4` for menu slots 1–5 and
+`.state5` for Auto; RetroArch writes `<game>.state{k}` for slot k,
+`.state` for slot 0 and `.state.auto` for Auto. With the mapping on, the scan
+reports a Tico state of a libretro module under RetroArch's name — the key,
+the upload and `state.db` all use it, the card keeps Tico's — and the placer
+writes RetroArch's back under Tico's (`scan::RetroArchStateName`,
+`scan::TicoStateName`, `core/include/rommsync/state_names.hpp`):
+
+| Slot | Tico | RetroArch |
+|---|---|---|
+| menu slot k (1–5) | `.state{k-1}` | `.state{k}` |
+| Auto | `.state5` | `.state.auto` |
+| RetroArch slot 0 | — | `.state` |
+
+Either way a placement takes only a name its frontend loads: `.state0`–`.state5`
+in Tico's folder, `.state`, `.state<N>` (N ≥ 1) or `.state.auto` in RetroArch's.
+RetroArch's `.state.auto` is matched to its rom by the name before `.state`, like
+every other state. The `<state>.png` beside a state is uploaded as its
+`screenshotFile` under the server's name plus `.png`, which is how RomM binds a
+screenshot to a state; it is never itself scanned.
+
 If there
 is already a file at the path it names, that is keep-both too: "no local state
 claimed this row" is not "there is nothing at that path" — a state the scan

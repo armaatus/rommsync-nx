@@ -16,6 +16,7 @@ on_boot       = true
 saves         = true
 slot          = autosave           ; the slot RetroArch, the web player and Grout share
 states        = false              ; fragile across cores; opt-in
+map_state_slots = false            ; Tico's state slots under RetroArch's names; see below
 conflict_show = true               ; surface conflicts in the overlay
 on_server_delete = remove          ; remove | keep; a save deleted in RomM, see below
 
@@ -363,6 +364,47 @@ reads: letters, digits, `-` and `_`, up to 64 of them. Anything else is a
 `warning` and `autosave` stays in force. Changing it moves every save to the new
 slot on the next tick, as a first meeting with whatever is there; the old slot
 is left on the server. The overlay does not edit it.
+
+### `states` and `map_state_slots`: save states
+
+`[sync] states = true` syncs save states as well as saves. It is off by default
+for a reason worth reading before turning it on: **a state is a snapshot of one
+emulator core's memory, at one version of that core.** It loads in that core and
+no other, and a core update can make every state it wrote before refuse to load
+— or load into a crash. A save survives both; a state survives neither. What a
+bad state costs is a resume, never progress: states never touch a save file, and
+a local state is backed up under `.backup/` before anything is written over it
+(docs/SYNC_PROTOCOL.md#save-states).
+
+So a state moves only between devices running the same core (#239): one is
+uploaded with the id of the core that wrote it, a server state written by
+another core is never downloaded or placed here, and one this console has no
+emulator for is passed over without a word — RomM has no negotiation for states,
+so this client filters the server's list itself. DuckStation's (`tico-duckstation`)
+meet only DuckStation's on another Switch; RetroArch's PSX cores meet only
+themselves.
+
+Tico and RetroArch number their slots differently. `map_state_slots = true`
+syncs a Tico state of a libretro module (every Tico system whose
+[`emulator`](#emulator-which-emulator-romm-is-told-wrote-a-platforms-saves) is a
+RetroArch core) under RetroArch's name for the same slot, and places RetroArch's
+back under Tico's:
+
+| Slot | Tico file | RetroArch file |
+|---|---|---|
+| menu slot k (1–5) | `<game>.state{k-1}` (`.state0`–`.state4`) | `<game>.state{k}` |
+| Auto (written on exit) | `<game>.state5` | `<game>.state.auto` |
+| RetroArch slot 0 | — | `<game>.state` |
+
+With it on, a game Tico suspended on exit resumes in RetroArch's Auto slot on a
+PC, and back. RetroArch's slot 0 and slots past 5 have no Tico file and are not
+placed in Tico's folder. Off — the default — each frontend's states keep their
+own names, Tico's are placed only in Tico's folder and RetroArch's only in
+RetroArch's, and Tico's `.state1`–`.state5` share their names with RetroArch's
+slots 1–5 a slot apart. Turn it on on every Switch or on none: changing it
+renames every Tico state the server is sent, and the old rows are left on the
+server. The `.png` Tico (and RetroArch) keeps beside a state is uploaded as the
+state's screenshot in RomM.
 
 ### `conflict_show` hides the screen, never the recording
 

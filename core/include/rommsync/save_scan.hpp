@@ -137,6 +137,10 @@ struct StateFile {
   /// The file's own name, `Game (USA).state`. Never a path -- and this is the
   /// pairing key with `rom_id`, on both sides: RomM stores a state under the
   /// name it was sent, without the ingest tag it stamps on a save.
+  ///
+  /// The one exception is a Tico slot under `[sync] map_state_slots`, which is
+  /// RetroArch's name for it -- `Game.state.auto` for the card's `Game.state5`
+  /// (#239, `RetroArchStateName`). `sd_path` keeps the card's.
   std::string file_name;
 
   /// RomM's `emulator` for it, from `scan::ResolveSource`; empty when nothing
@@ -394,6 +398,10 @@ ScanResult ScanSaves(const config::Config& config, const retroarch::Settings& re
 /// The same walk over `config::Config::StateScanDirs()` and RetroArch's
 /// `savestate_directory`, under its own four settings, emitting states.
 ///
+/// A state is matched by `StateMatchName`, so RetroArch's `Game.state.auto` is
+/// `Game`'s; and a libretro module's Tico slot is reported under RetroArch's
+/// name when `[sync] map_state_slots` is on (#239, state_names.hpp).
+///
 /// **It does not consult `sync.states`.** `StateScanDirs()` answers regardless
 /// of the toggle because whether to scan is the engine's decision rather than
 /// the map's (config.hpp), and the engine makes it in `sync::SyncStates` -- one
@@ -413,7 +421,9 @@ ScanResult ScanStates(const config::Config& config, const retroarch::Settings& r
 /// One extension, not every one: `Game.state.auto` reduces to `Game.state`,
 /// which matches no rom and is reported. That is the honest answer -- stripping
 /// until something matches is how `Game.nes.srm` becomes a match for a rom
-/// called `Game.nes` that the user does not have.
+/// called `Game.nes` that the user does not have. (The state walk knows
+/// `.state.auto` as one extension, RetroArch's, and strips it first:
+/// `StateMatchName`.)
 std::string BaseName(std::string_view file_name);
 
 /// The slot a save called `file_name` is synced in, under the configured `slot`

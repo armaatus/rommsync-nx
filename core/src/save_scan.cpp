@@ -1,5 +1,6 @@
 #include "rommsync/save_scan.hpp"
 
+#include "rommsync/state_names.hpp"
 #include "rommsync/tico.hpp"
 
 #include <algorithm>
@@ -427,6 +428,9 @@ bool IsRetroArchFile(std::string_view name, Folders which) {
   if (which == Folders::kSaves) {
     return extension == "srm" || extension == "rtc";
   }
+  if (IsRetroArchStateName(name)) {
+    return true;  // `.state.auto` among them (#239)
+  }
   if (extension.rfind("state", 0) != 0) {
     return false;
   }
@@ -441,8 +445,8 @@ bool IsRetroArchFile(std::string_view name, Folders which) {
 /// A file an emulator keeps beside its saves and states that is never one: a
 /// `.tmp` it writes before renaming (Tico, #226 R5) -- and one a crash left
 /// behind must never be uploaded as the save it was about to replace -- a state's
-/// `.png` screenshot (Tico and RetroArch both; #239 may send it as the state's
-/// screenshot), and DuckStation's `.restart`. Not a skip: they are not saves
+/// `.png` screenshot (Tico and RetroArch both; `sync::SyncStates` sends it as the
+/// state's, read beside the state, #239), and DuckStation's `.restart`. Not a skip: they are not saves
 /// this client declined, any more than a rom in a rom folder is.
 ///
 /// Tico's `backups/` needs no rule here: it is a folder, and the walk does not
@@ -780,8 +784,10 @@ void Walk(const std::vector<ScanFolder>& folders, Folders which, const roms::Rom
       }
 
       int card = 1;
+      // RetroArch's Auto state, `Game.state.auto`, is matched by `Game` (#239).
       const roms::Match match =
-          MatchSave(index, entry.name, platform_hint, folder.memory_cards, &card);
+          MatchSave(index, which == Folders::kStates ? StateMatchName(entry.name) : entry.name,
+                    platform_hint, folder.memory_cards, &card);
       if (match.outcome == roms::MatchOutcome::kAmbiguous) {
         record_skip(SkipReason::kAmbiguous, sd_path, match.reason);
         continue;
@@ -957,6 +963,14 @@ ScanResult ScanStates(const config::Config& config, const retroarch::Settings& r
          file.sd_path = sd_path;
          file.file_name = entry.name;
          file.emulator = ResolveSource(folder_source, rom.platform_fs_slug, config).emulator_id;
+         // A libretro module's Tico slot, under RetroArch's name for it when the
+         // user asked (#239). The key, the upload's name and the baseline's all
+         // follow; the file on the card keeps its own.
+         if (folder_source.source == Source::kTico && MapsStateSlots(config, file.emulator)) {
+           if (std::optional<std::string> mapped = RetroArchStateName(entry.name)) {
+             file.file_name = std::move(*mapped);
+           }
+         }
          file.platform_fs_slug = rom.platform_fs_slug;
          file.size_bytes = entry.size_bytes;
          file.modified_unix = entry.modified_unix;

@@ -317,6 +317,8 @@ void ApplySync(const ParseState& state, int line, std::string_view key, std::str
     target = &config->sync.saves;
   } else if (key == "states") {
     target = &config->sync.states;
+  } else if (key == "map_state_slots") {
+    target = &config->sync.map_state_slots;
   } else if (key == "conflict_show") {
     target = &config->sync.conflict_show;
   }

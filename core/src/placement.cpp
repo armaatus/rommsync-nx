@@ -3,6 +3,7 @@
 #include "rommsync/config_text.hpp"
 #include "rommsync/save_scan.hpp"
 #include "rommsync/save_source.hpp"
+#include "rommsync/state_names.hpp"
 
 #include <algorithm>
 #include <optional>
@@ -87,6 +88,13 @@ bool PlainExtension(std::string_view extension) {
 Placement Refuse(std::string reason) {
   Placement refused;
   refused.reason = std::move(reason);
+  return refused;
+}
+
+/// A refusal because the file is not this console's to load (#239).
+Placement Foreign(std::string reason) {
+  Placement refused = Refuse(std::move(reason));
+  refused.foreign = true;
   return refused;
 }
 
@@ -190,6 +198,20 @@ bool Compatible(std::string_view server_emulator, std::string_view target_emulat
   }
   if (server_emulator.empty()) {
     return IsLibretro(target_emulator);
+  }
+  if (!IsLibretro(target_emulator)) {
+    return false;
+  }
+  const std::vector<std::string> aliases = scan::RetroArchAliases(target_emulator);
+  return std::find(aliases.begin(), aliases.end(), server_emulator) != aliases.end();
+}
+
+bool LoadsState(std::string_view server_emulator, std::string_view target_emulator) {
+  if (server_emulator.empty() || target_emulator.empty()) {
+    return false;
+  }
+  if (server_emulator == target_emulator) {
+    return true;
   }
   if (!IsLibretro(target_emulator)) {
     return false;
@@ -321,7 +343,9 @@ Placer::Target Placer::TargetFor(const roms::Rom& rom, std::string_view server_e
                     slug;
     return target;
   }
-  if (!Compatible(server_emulator, target.emulator_id)) {
+  if (saves ? !Compatible(server_emulator, target.emulator_id)
+            : !LoadsState(server_emulator, target.emulator_id)) {
+    target.foreign = true;
     target.reason = "the server's copy was written by " +
                     (server_emulator.empty() ? std::string("an unnamed emulator")
                                              : std::string(server_emulator)) +
@@ -359,7 +383,11 @@ std::string Placer::ReadsBackAs(const roms::Rom& rom, std::string_view file_name
   const bool memory_cards = saves && target.layout.play_with == config::PlayWith::kTico &&
                             scan::TicoSlugFor(hint) == "psx";
   int read_card = 1;
-  const roms::Match match = scan::MatchSave(index_, file_name, hint, memory_cards, &read_card);
+  // A state is matched as the scan matches one: RetroArch's `.state.auto` by
+  // its rom's name (#239).
+  const roms::Match match = scan::MatchSave(
+      index_, saves ? std::string(file_name) : scan::StateMatchName(file_name), hint,
+      memory_cards, &read_card);
   if (!match.matched()) {
     return "the scan would not read it back as this rom's (" + match.reason +
            "), so it would come back as a file nobody syncs";
@@ -450,25 +478,36 @@ Placement Placer::State(std::int64_t rom_id, std::string_view file_name,
   }
   const Target target = TargetFor(*rom, emulator, false);
   if (!target.reason.empty()) {
-    return Refuse(target.reason);
+    return target.foreign ? Foreign(target.reason) : Refuse(target.reason);
   }
-  Placement placed = JoinUnder(target.layout, target.emulator_id, file_name);
+  // The name the target frontend loads the slot from. A state in a slot it has
+  // no file for is a state it cannot load, so it is passed over like another
+  // core's -- and a file it would never read is not left in its folder (#239).
+  std::string name(file_name);
+  if (target.layout.play_with == config::PlayWith::kTico) {
+    if (scan::MapsStateSlots(config_, target.emulator_id)) {
+      const std::optional<std::string> tico = scan::TicoStateName(file_name);
+      if (!tico.has_value()) {
+        return Foreign("it is in a RetroArch slot Tico has no slot for");
+      }
+      name = *tico;
+    }
+    if (!scan::IsTicoStateName(name)) {
+      return Foreign(std::string("Tico loads a state only as .state0 to .state5") +
+                     (config_.sync.map_state_slots
+                          ? ""
+                          : "; [sync] map_state_slots = true maps RetroArch's slots onto them"));
+    }
+  } else if (!scan::IsRetroArchStateName(name)) {
+    // Also every name the scan reads beside the roms, where only RetroArch's
+    // own are read back.
+    return Foreign("RetroArch loads a state only as .state, .state<N> or .state.auto");
+  }
+  Placement placed = JoinUnder(target.layout, target.emulator_id, name);
   if (!placed.ok()) {
     return placed;
   }
-  if (target.layout.play_with == config::PlayWith::kRetroArch &&
-      retroarch_.savestates_in_content_dir) {
-    // Beside the roms the scan reads only RetroArch's own state names.
-    const std::string extension = LowerAscii(sync::ExtensionOf(file_name));
-    bool numbered = extension.rfind(".state", 0) == 0;
-    for (std::size_t i = 6; numbered && i < extension.size(); ++i) {
-      numbered = extension[i] >= '0' && extension[i] <= '9';
-    }
-    if (!numbered) {
-      return Refuse("beside the roms only RetroArch's own .state names are read back");
-    }
-  }
-  if (const std::string why = ReadsBackAs(*rom, file_name, target, false); !why.empty()) {
+  if (const std::string why = ReadsBackAs(*rom, name, target, false); !why.empty()) {
     return Refuse(why);
   }
   return placed;

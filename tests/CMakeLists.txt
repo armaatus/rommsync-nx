@@ -1090,6 +1090,8 @@ set(PLACE_SCENARIOS
   saves    # Tico's layouts and RetroArch's, read back by the scan -- and every refusal
   states   # the same rule for a state, under the name it pairs on
   cards    # #238: DuckStation's cards under the game's name, card 2 apart, never disc 2 over disc 1
+  state_table  # #239: Tico's state slots under RetroArch's names and back, row by row
+  state_slots  # #239: a state placed only where its emulator loads it, under that frontend's name
 )
 foreach(scenario IN LISTS PLACE_SCENARIOS)
   add_test(NAME place.${scenario} COMMAND test_placement ${scenario})
@@ -1340,6 +1342,7 @@ set(STATES_UNIT_SCENARIOS
   placing   # a state this console lacks is created, never written over
   listing   # a listing this client cannot work from stops the run
   recording # an upload's row comes from the scan, and the next tick is a no-op
+  emulators # #239: only the same core's state moves; Tico's Auto goes up as .state.auto
 )
 foreach(scenario IN LISTS STATES_UNIT_SCENARIOS)
   add_test(NAME states.${scenario} COMMAND test_state_sync ${scenario})
@@ -1353,6 +1356,7 @@ set(STATES_RIG_SCENARIOS
   crash      # M9-14: ...and a power cut at every call of it loses nothing
   truncate   # a clean short body never replaces a local state
   keeps_both # both sides moved: nothing is transferred, both survive
+  mapped     # #239: Tico's Auto up as .state.auto with its screenshot, down as Tico's and RetroArch's
 )
 foreach(scenario IN LISTS STATES_RIG_SCENARIOS)
   add_test(NAME states.${scenario} COMMAND test_state_sync ${scenario})

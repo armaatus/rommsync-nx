@@ -167,6 +167,14 @@ struct SyncConfig {
   /// they thought was safe. Opt-in, per docs/CONFIG.md.
   bool states = false;
 
+  /// Sync a Tico state of a libretro module under RetroArch's name for its
+  /// slot -- Auto `.state5` as `.state.auto`, menu slot k `.state{k-1}` as
+  /// `.state{k}` -- and place RetroArch's back under Tico's (#239,
+  /// `scan::RetroArchStateName`). Off by default (#226 D4): a state resumes only
+  /// in the same core at the same version, and turning this on renames every
+  /// Tico state the server holds, so it is the user's to choose.
+  bool map_state_slots = false;
+
   bool conflict_show = true;
 
   OnServerDelete on_server_delete = OnServerDelete::kRemove;

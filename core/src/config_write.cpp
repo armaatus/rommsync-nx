@@ -349,6 +349,7 @@ const bool* BoolField(const Config& config, const std::string& section,
     if (key == "on_boot") return &config.sync.on_boot;
     if (key == "saves") return &config.sync.saves;
     if (key == "states") return &config.sync.states;
+    if (key == "map_state_slots") return &config.sync.map_state_slots;
     if (key == "conflict_show") return &config.sync.conflict_show;
     return nullptr;
   }

@@ -12,11 +12,15 @@
 //   | id X         | id != X                   | -          | keep both |
 //   | id X         | id X, unmoved             | unchanged  | no-op     |
 //   | id X         | id X, unmoved             | changed    | upload    |
-//   | id X         | id X, moved               | unchanged  | download  |
+//   | id X         | id X, moved               | unchanged  | download* |
 //   | id X         | id X, moved               | changed    | keep both |
 //
+// * only when the row's `emulator` is a core that loads this state
+//   (`place::LoadsState`, #239); another core's is kept apart.
+//
 // ...and one server row no local file claimed is placed, which overwrites
-// nothing. **Every branch that is not an unambiguous match keeps both copies**,
+// nothing -- or, when the placement calls it `foreign`, filtered without a word
+// (#239). **Every branch that is not an unambiguous match keeps both copies**,
 // and no branch deletes anything.
 //
 // The overwrite order is `sync_execute.cpp`'s, unchanged and not re-spelled:
@@ -402,6 +406,18 @@ StateAction Decide(const state::StateRecord* row, const ServerState* server,
     return StateAction::kUpload;
   }
   if (!local_moved) {
+    // POST moves a row's `emulator` to whoever sent it, so a row this console
+    // paired with may since hold another core's memory under the same name.
+    // Downloaded, it is a state this console's core cannot load, written over
+    // one it can (#239).
+    if (!place::LoadsState(server->emulator, file.emulator)) {
+      *why = "the server's state under this name was last written by " +
+             (server->emulator.empty() ? std::string("an unnamed emulator") : server->emulator) +
+             ", whose states " +
+             (file.emulator.empty() ? std::string("this console's emulator") : file.emulator) +
+             " does not load; both copies are kept and neither was touched";
+      return StateAction::kKeepBoth;
+    }
     return StateAction::kDownload;
   }
   *why = "both this console's copy and the server's have changed since the last sync, and RomM "
@@ -443,6 +459,20 @@ StateOperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
   part.file_name = file.file_name;
   part.content_type = "application/octet-stream";
   request.form.push_back(std::move(part));
+
+  // Tico and RetroArch both keep a screenshot beside a state, `<state>.png`
+  // [Tico's name: verify on #44]. Sent as the row's, under the server's name
+  // for the state plus `.png`: RomM binds a screenshot to the state whose name
+  // is its stem (#239). Without one the state goes up alone.
+  const std::string screenshot = files.Resolve(file.sd_path + ".png");
+  if (!screenshot.empty() && io::Exists(screenshot)) {
+    http::FormPart picture;
+    picture.name = "screenshotFile";
+    picture.file_path = screenshot;
+    picture.file_name = file.file_name + ".png";
+    picture.content_type = "image/png";
+    request.form.push_back(std::move(picture));
+  }
 
   const http::Result result = client.Send(request);
   if (const auto refused = Refused(result, "the state upload")) {
@@ -940,6 +970,13 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
     const place::Placement placement =
         options.place != nullptr ? options.place(server) : place::Placement{};
     const std::string& sd_path = placement.sd_path;
+    if (sd_path.empty() && placement.foreign) {
+      // Another core's state, or a slot this frontend has no file for: states
+      // have no negotiate to filter by emulator, so this is the filter (#239).
+      // Silent for the reason a rom this console lacks is.
+      ++report.filtered;
+      continue;
+    }
     if (sd_path.empty()) {
       if (!record(Fail(server.rom_id, server.file_name, StateAction::kPlace,
                        StateError::kNoPlacement,

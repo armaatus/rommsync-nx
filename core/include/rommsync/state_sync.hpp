@@ -262,6 +262,11 @@ struct StateSyncReport {
   /// survive. Neither completed nor failed -- it is the policy working.
   int kept_both = 0;
 
+  /// Server rows passed over because they are not this console's to load: the
+  /// placement said `foreign` -- another core's state, or a slot the frontend
+  /// has no file for (#239). Counted and nothing else: no operation, no warning.
+  int filtered = 0;
+
   /// The `CancelToken` fired: this operation, and every one after it, was not
   /// attempted.
   bool canceled = false;
