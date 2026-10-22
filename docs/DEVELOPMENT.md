@@ -147,13 +147,39 @@ is one about nx-ovlloader's NPDM, which this repo does not build.
 
 Both Switch targets live in a memory budget somebody else sets. The sysmodule's
 comes out of what Atmosphere leaves custom system modules, shared with every
-other sysmodule installed. That has shrunk on recent firmware -- Atmosphere's
-1.9.0 and 1.10.0 changelogs each say so -- and boot2 aborts outright on a launch
-that does not fit. (How much is left on HOS 21: #200 cites 7 MB from
-`kern_k_system_control.cpp` and 32 MB from pm's `pm_spec.cpp`, constants in
-different layers, not yet reconciled. Nothing here is sized against either.) The
-overlay's is nx-ovlloader's heap, 4 MB by default, into which the whole `.ovl`
-is read before anything is allocated. So `switch.mk` compiles for size (#200):
+other sysmodule installed, and boot2 aborts outright on a launch that does not
+fit. The overlay's is nx-ovlloader's heap, 4 MB by default, into which the whole
+`.ovl` is read before anything is allocated.
+
+How large the sysmodule's pool is, reconciled (#253; Atmosphere at
+[`6b0c077`](https://github.com/Atmosphere-NX/Atmosphere/tree/6b0c077b4c608a3a2ee712b8dc35fee87ceb62e8)).
+Two constants had been quoted, and only one of them is live:
+
+- **The kernel's, which is the budget.** `KSystemControl::Init::GetAppletPoolSize()`
+  ([`kern_k_system_control.cpp`](https://github.com/Atmosphere-NX/Atmosphere/blob/6b0c077b4c608a3a2ee712b8dc35fee87ceb62e8/libraries/libmesosphere/source/board/nintendo/nx/kern_k_system_control.cpp#L363-L375))
+  takes `ExtraSystemMemoryForAtmosphere` out of the applet pool, and the system
+  pool is laid out below it, so every byte taken is a byte of system pool. pm
+  then sizes the System resource limit from what the kernel reports -- total
+  less application, applet and Nintendo's own 5 MB reserve
+  ([`pm_spec.cpp`](https://github.com/Atmosphere-NX/Atmosphere/blob/6b0c077b4c608a3a2ee712b8dc35fee87ceb62e8/stratosphere/pm/source/impl/pm_spec.cpp#L360-L380))
+  -- so the System limit grows by exactly that constant. It is **40 MB** up to
+  HOS 19, **14 MB** on 20.x, **7 MB on 21.x and 22.x**, and on 23.0.0+ 16 MB
+  in the release that added 23.0.0 and 40 MB again from the release after it
+  (its changelog, 1.12.0 and 1.12.1). Which release this project targets is
+  `ATMOSPHERE_TARGET`'s to say, not this section's.
+- **pm's `ExtraSystemMemorySizeAtmosphere = 32_MB`, which is dead on any
+  firmware we run on.** It is applied only when `hos_version < 5.0.0`, where pm
+  hard-codes the limits instead of asking the kernel.
+
+So the tightest case is 7 MB, on HOS 21 and 22. It is not ours alone: it is
+everything Atmosphere adds to the system pool, `ams.mitm` and every other
+custom sysmodule included (1.9.0 cut `ams.mitm`'s heap by 20 MB to make the
+14 MB livable). What is left of it for this process cannot be read out of
+source; it is a runtime figure (`svcGetResourceLimitCurrentValue` on the System
+limit) and waits for the M8-1 gate like every other measurement on a console.
+The 2.25 MiB budget below is about a third of the 7 MB.
+
+So `switch.mk` compiles for size (#200, #253):
 
 - **`-fno-unwind-tables -fno-asynchronous-unwind-tables`.** The build is
   `-fno-exceptions`, so nothing unwinds through our frames, and `.eh_frame`
@@ -171,6 +197,23 @@ is read before anything is allocated. So `switch.mk` compiles for size (#200):
   `boot::Append`/`AppendNumber` and timestamps through `std::to_chars`;
   `switch.builds` fails if the formatter comes back. (libnx's resolver keeps
   `fprintf`'s own.)
+- **LTO (`-flto=auto`, #253).** Code is generated once, at the link, over the
+  whole image: an inline header function forty units emitted is one copy, and a
+  helper with one caller is no call. `=auto` because a bare `-flto` logs "using
+  serial compilation" and `switch.builds` refuses a warning. `switch.mk` names
+  the code-generation flags once and gives them to the link too, and puts
+  `$(DEFINES)` on it, which is how `stack.measured` still sees the frames
+  (below). Two checks had to learn to read an LTO build: `switch.builds` reads
+  unwind tables off the link map, since an LTO object holds no code, and looks
+  for symbols LTO cannot inline away (`json::Parse`, `ipc::Dispatch`, libnx's
+  `smRegisterServiceCmif`) instead of `version()` and `ServiceServer::Serve`.
+- **No floating-point parser (#253).** `json::Parse` made a `double` of every
+  number with a fraction or an exponent, and nothing ever read one: every number
+  the client takes is an integer. That double was libstdc++'s
+  `from_chars(..., double&)`, which is fast_float, in both images. A non-integer
+  is now "a number, not an integer", with no value (`core/include/rommsync/json.hpp`
+  records the decision, and that `1e400` is no longer refused for being out of a
+  double's range), and `switch.builds` fails if the parser comes back.
 
 Measured in `devkitpro/devkita64:20260219` (GCC 15.2.0) with
 `aarch64-none-elf-size -A`; "image" is the end of `.bss`, i.e. everything the loader maps:
@@ -186,6 +229,33 @@ Measured in `devkitpro/devkita64:20260219` (GCC 15.2.0) with
 | overlay `.text` | 820,608 | 820,608 | 506,944 |
 | overlay `.eh_frame` | 81,376 | 34,864 | 34,936 |
 | `.ovl` | 1,015,868 | 970,812 | **647,228** |
+
+M10 then grew the sysmodule's `.text` by about 90 KiB, and #246 its heap by
+128 KiB, until the whole-branch review found the image 4 KiB under its budget;
+#252's `snprintf` cut took back 40 KiB, and it was 44 KiB under when #253
+started. #253, in the same image -- "mapped" is what `scripts/image-budget.sh`
+sums, each LOAD segment rounded up to its page, which is the figure the budget
+holds:
+
+| | before (#252) | `+ -flto=auto` | `+` no fast_float (now) |
+|---|---|---|---|
+| sysmodule `.text` | 598,352 | 523,952 | **512,496** |
+| sysmodule `.rodata` | 68,384 | 68,224 | 56,440 |
+| sysmodule `.eh_frame` | 25,584 | 25,560 | 25,000 |
+| sysmodule mapped | 2,314,240 | 2,236,416 | **2,215,936** |
+| ...under the 2,359,296 budget | 45,056 | 122,880 | **143,360** |
+| `.nsp` | 512,688 | 465,879 | 443,950 |
+| overlay `.text` | 527,328 | 475,936 | 464,400 |
+| overlay `.rodata` | 59,288 | 57,800 | 46,024 |
+| `.ovl` | 671,804 | 614,460 | **589,884** |
+
+LTO is ~73 KiB of the sysmodule's `.text` and ~50 KiB of the overlay's;
+fast_float is ~23 KiB in each, half code and half its power-of-five tables.
+LTO's cost is on the stack instead: inlining across units folds callees' frames
+into their callers, and the main thread's deepest parsing chain grew from 5,488
+to 6,880 bytes beside the levels (`main` alone from 2,048 to 2,608), while a
+JSON level shrank from 432 to 288. `stack_budget.hpp`'s ceilings moved with
+them, and still fit half the stack (`stack.fit`).
 
 The trade `-Os` could have cost is speed on the one hot loop: hashing a whole rom
 to verify a download (`crypto::Sha1FileHex` / `Md5FileHex`, 4 KiB at a time).
@@ -209,8 +279,10 @@ against 1.47--1.50 s). That says little: the rig runs host-compiled code over
 small fixtures, so it cannot see `switch.mk`'s flags at all. How long a verify
 takes on a real A57 is a hardware measurement, and waits for the M8-1 gate.
 
-`ctest -R switch.builds` holds the result: no object this build compiles may
-carry an `.eh_frame`, the sysmodule's linked `.eh_frame` stays under 32 KiB, and
+`ctest -R switch.builds` holds the result: no code this build compiles may
+carry an `.eh_frame` (read off each target's link map, which names the LTRANS
+object every input section came from), the sysmodule's linked `.eh_frame` stays
+under 32 KiB, and
 both targets' `.text` under 640 KiB, which a revert to `-O2` overshoots in both;
 and the build log carries no warning, vendored code and the link included, since
 neither is `-Werror`.
@@ -223,12 +295,11 @@ to the run's summary; `switch.builds` runs the same script over its own build.
 Moving the budget is an edit to that script, with its reason beside it -- the CI
 step passes no flag, and `switch.ci_requires_artifacts` refuses one.
 
-What is still linked and could go: newlib's full `printf` (`_svfprintf_r`,
-~15 KiB, plus `_dtoa_r`), first pulled in by our six `snprintf` calls, none of
-which formats a float (whether libnx needs it too is not audited); and
-libstdc++'s `fast_float` (a 10 KiB power-of-five table and ~6 KiB of parser),
-which `core/src/json.cpp` genuinely uses to parse JSON numbers with a
-fraction or exponent.
+What is still linked and could go: the prebuilt libraries' own `.eh_frame`
+(~25 KiB), which only a fork of libnx's `switch.ld` can drop -- declined above.
+newlib's `printf` formatter went with #252's `snprintf` cut, and libstdc++'s
+fast_float with #253's integer-only JSON numbers; `switch.builds` refuses either
+coming back.
 
 ## Repo build layout
 

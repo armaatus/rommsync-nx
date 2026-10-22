@@ -48,10 +48,14 @@ set -euo pipefail
 # M10's code took most of the rest: 2,355,200 bytes at the whole-branch review
 # (2026-10-22), 4 KiB under. Dropping the six `snprintf` calls that linked
 # newlib's formatter (`switch.builds` now refuses it) gave back 40 KiB of
-# .text: 2,310,144 bytes, 48 KiB under. Growth past it is a decision, made here
-# with its reason beside it, and not something a PR does by accident. Atmosphere leaves third-
-# party sysmodules a shared pool (7 MB on HOS 21.0.0+, docs/DEVELOPMENT.md#what-the-image-costs),
-# and this process is one tenant of it.
+# .text: 2,310,144 bytes, 48 KiB under, and 2,314,240 after the merges that
+# followed. #253's LTO and integer-only JSON numbers (no fast_float) took it to
+# 2,215,936: 140 KiB under.
+# Growth past it is a decision, made here with its reason beside it, and not
+# something a PR does by accident. Atmosphere adds 7 MB to the system pool on
+# HOS 21.x and 22.x, shared by every custom sysmodule and its own
+# (docs/DEVELOPMENT.md#what-the-image-costs reconciles the two figures once
+# quoted), and this process is one tenant of it.
 IMAGE_BUDGET=$(( 2304 * 1024 ))
 # What `.bss` may hold besides the heap: every other file-scope object.
 # ~17 KiB today (libnx's and newlib's state, the log ring's bookkeeping).

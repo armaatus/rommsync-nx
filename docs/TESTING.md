@@ -761,7 +761,8 @@ ctest --test-dir build --output-on-failure
   to at least twice the deepest response shape a pinned RomM OpenAPI snapshot
   describes; `stack.walk` is the call-graph arithmetic on hand-built graphs.
   Those three read the tree and never skip. `stack.measured` cross-compiles the
-  sysmodule with `-fcallgraph-info=su`, walks the deepest chain from `main`, and
+  sysmodule with `-fcallgraph-info=su`, walks the deepest chain from `main` in
+  the graph the LTO link writes (named by the toolchain's `c++filt`, #253), and
   fails when a frame outgrows the header's ceilings; it needs the devkitPro
   image, so it skips where `npdm.svcs` does and runs in the `switch-build` job
   beside it, under the same `toolchain` label.

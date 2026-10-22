@@ -169,13 +169,27 @@ ROMMSYNC_VENDOR_DROPS := -Wextra -Wpedantic -Werror
 #   * -Os rather than -O2: the larger win by far -- it halves the sysmodule's
 #     .text -- and measured against the one hot loop it could slow, hashing a
 #     whole rom to verify a download, it is not a loss.
+#   * -flto=auto (#253): the code is generated once, at the link, over the
+#     whole image, so an inline header function emitted by forty units and a
+#     helper only one caller reaches stop costing a copy or a call each. ~70
+#     KiB of the sysmodule's .text and ~50 KiB of the overlay's. `=auto` rather
+#     than a bare -flto, which logs "using serial compilation" at the link, and
+#     `switch.builds` refuses any warning in the build log. Every vendored
+#     object takes it too, through VENDOR_CFLAGS.
+#
+# Under LTO these are code-generation flags of the link as much as of the
+# compile, so they are named once and LDFLAGS repeats them: GCC's own advice
+# is the same optimisation flags at both ends, and an option given only to the
+# compile is one the LTRANS step is merely trusted to have carried across.
 #
 # The before/after numbers are docs/DEVELOPMENT.md#what-the-image-costs.
-# `ctest -R switch.builds` holds the result: no object of ours with an
-# .eh_frame, the sysmodule's .eh_frame under 32 KiB, both .texts under 640 KiB.
-CFLAGS := -g $(ROMMSYNC_WARNINGS) -Os -ffunction-sections -fdata-sections \
-			-fno-unwind-tables -fno-asynchronous-unwind-tables \
-			$(ARCH) $(DEFINES)
+# `ctest -R switch.builds` holds the result: no unwind table in the code the
+# link generates, the sysmodule's .eh_frame under 32 KiB, both .texts under
+# 640 KiB.
+ROMMSYNC_CODEGEN := -Os -flto=auto -ffunction-sections -fdata-sections \
+			-fno-unwind-tables -fno-asynchronous-unwind-tables
+
+CFLAGS := -g $(ROMMSYNC_WARNINGS) $(ROMMSYNC_CODEGEN) $(ARCH) $(DEFINES)
 
 CFLAGS += $(INCLUDE) -D__SWITCH__
 
@@ -198,7 +212,13 @@ VENDOR_CXXFLAGS := $(filter-out $(ROMMSYNC_VENDOR_DROPS),$(CXXFLAGS))
 ASFLAGS := -g $(ARCH)
 # --gc-sections pairs with -ffunction-sections above. A sysmodule is resident in
 # a tight heap, so dropping unreferenced code is not a micro-optimisation here.
-LDFLAGS = -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,--gc-sections -Wl,-Map,$(notdir $*.map)
+#
+# $(DEFINES) is on the link for LTO's sake: it is where a caller adds compile
+# flags (`stack.measured` adds -fstack-usage -fcallgraph-info=su), and under
+# LTO the compile that decides the frames is the link's. A -D in it is inert
+# here, since the link preprocesses nothing.
+LDFLAGS = -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) $(ROMMSYNC_CODEGEN) $(DEFINES) \
+			-Wl,--gc-sections -Wl,-Map,$(notdir $*.map)
 
 LIBS += -lnx
 
