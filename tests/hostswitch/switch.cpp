@@ -70,6 +70,21 @@ int OpenSessions() { return Open().load(); }
 
 int DeferredRequests() { return Deferred().load(); }
 
+Result TipcDispatchInOut(TipcService* service, u32 request_id, const void* in, std::size_t in_size,
+                         void* out, std::size_t out_size) {
+  if (service == nullptr || request_id != 65100 || in_size != sizeof(SmServiceName) ||
+      out_size != sizeof(bool)) {
+    return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+  }
+  SmServiceName asked{};
+  std::memcpy(&asked, in, sizeof(asked));
+  const SmServiceName held = smEncodeName(RegisteredName().c_str());
+  const bool registered = RegisteredServer() != nullptr &&
+                          std::memcmp(asked.name, held.name, sizeof(asked.name)) == 0;
+  std::memcpy(out, &registered, sizeof(registered));
+  return 0;
+}
+
 Result DispatchOut(Service* service, u32 command_id, void* out, std::size_t out_size,
                    const SfDispatchParams& params) {
   if (!serviceIsActive(service)) {
@@ -135,6 +150,11 @@ Result smGetService(Service* out, const char* name) {
   out->generation = Generation();
   ++Open();
   return 0;
+}
+
+TipcService* smGetServiceSessionTipc() {
+  static TipcService sm;
+  return &sm;
 }
 
 void serviceClose(Service* s) {

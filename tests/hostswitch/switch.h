@@ -164,6 +164,39 @@ void serviceClose(Service* s);
 
 Result smGetService(Service* out, const char* name);
 
+/// libnx's spelling of a service name on the wire: eight bytes, unterminated
+/// when it fills them.
+struct SmServiceName {
+  char name[8];
+};
+
+inline SmServiceName smEncodeName(const char* name) {
+  SmServiceName out{};
+  for (std::size_t i = 0; i < sizeof(out.name) && name[i] != '\0'; ++i) {
+    out.name[i] = name[i];
+  }
+  return out;
+}
+
+/// sm's own session, as `IpcClient::Open` uses it: the target of one tipc
+/// command, Atmosphere's `AtmosphereHasService` (65100).
+struct TipcService {};
+TipcService* smGetServiceSessionTipc();
+
+namespace hostswitch {
+
+/// One tipc command to sm. Only 65100 is answered -- whether a name is
+/// registered, which sm answers rather than defers -- because it is the only
+/// one this client sends; anything else is libnx's "bad input".
+Result TipcDispatchInOut(TipcService* service, u32 request_id, const void* in, std::size_t in_size,
+                         void* out, std::size_t out_size);
+
+}  // namespace hostswitch
+
+/// libnx's macro, in the one form `IpcClient::Open` uses.
+#define tipcDispatchInOut(_s, _rid, _in, _out) \
+  ::hostswitch::TipcDispatchInOut((_s), (_rid), &(_in), sizeof(_in), &(_out), sizeof(_out))
+
 /// libnx's `SfBufferAttr`/`SfBuffer` pair, in the shape
 /// `serviceDispatchOut`'s designated-initialiser call site builds.
 struct SfBuffer {
