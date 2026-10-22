@@ -259,10 +259,16 @@ def phase_events(args) -> int:
 
 # --- emitted ------------------------------------------------------------------
 
+# One pass, left to right, so whichever of a string, a character literal, a
+# line comment or a block comment starts first is the one that is read: a `/*`
+# inside `// services/*.c` or `"Accept: */*"` is text, not an opener.
+_TOKEN = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|//[^\n]*|/\*.*?\*/',
+                    re.DOTALL)
+
+
 def strip_comments(text: str) -> str:
-    """`text` with its comments removed: the two passes this used to be."""
-    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
-    return re.sub(r"//[^\n]*", "", text)
+    """`text` with its comments removed and its literals kept."""
+    return _TOKEN.sub(lambda m: " " if m.group(0).startswith("/") else m.group(0), text)
 
 
 def phase_emitted(args) -> int:
