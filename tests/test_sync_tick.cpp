@@ -3415,9 +3415,11 @@ void BaselineConflict(rig::Checks& checks, http::HttpClient& client, const std::
   TouchMtime(sandbox, SavePath(arranged.name));
   sync::ClientSaveState played;
   if (LocalSaveOnCard(checks, *files, sandbox, rom.id, arranged.name, arranged.slot, &played)) {
+    // The one upload is the conflict's archival copy (#240), held to the same
+    // audit: its digest is the MD5 of the bytes it streams.
     const sync::TickResult second =
         AuditedTick(checks, client, *files, base, fixture, played, arranged.targets,
-                    StoredBaseline(*files).value, 1'757'000'805, "the played tick", 0, 1);
+                    StoredBaseline(*files).value, 1'757'000'805, "the played tick", 1, 1);
     sync::Action action = sync::Action::kNoOp;
     sync::OperationResult done;
     if (OnlyOperation(checks, second, "the played tick", &action, &done)) {
@@ -3464,10 +3466,11 @@ void BaselineOtherRow(rig::Checks& checks, http::HttpClient& client, const std::
   TouchMtime(sandbox, SavePath(arranged.name));
   sync::ClientSaveState played;
   if (LocalSaveOnCard(checks, *files, sandbox, rom.id, arranged.name, arranged.slot, &played)) {
-    // One upload, refused by the guard; then the head, taken keep-both.
+    // One upload, refused by the guard; then the head, taken keep-both, with the
+    // local bytes uploaded as the conflict's archival copy (#240).
     const sync::TickResult second =
         AuditedTick(checks, client, *files, base, fixture, played, arranged.targets,
-                    StoredBaseline(*files).value, 1'757'000'806, "the played tick", 1, 1);
+                    StoredBaseline(*files).value, 1'757'000'806, "the played tick", 2, 1);
     checks.ExpectEq(second.resolved.refused, std::size_t{1}, "the slot guard refused the upload");
     sync::Action action = sync::Action::kNoOp;
     sync::OperationResult done;
