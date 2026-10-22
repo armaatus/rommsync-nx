@@ -1142,6 +1142,12 @@ void Drain(checks::Checks& c, http::HttpClient& client, const std::string& base,
                  download::ToString(present.outcome) + " (" + present.message + ")");
     c.ExpectEq(present.attempts, 1,
                "having spent one request: the rom detail, and no transfer at all");
+    // Not in `done`: the engine reads that list as "just arrived" and asks for
+    // the rom's save with `restore_unlisted` (#241), which for a rom this card
+    // already held brings back a save the user deleted beside it.
+    c.Expect(present.done.empty(),
+             "and a rom that was already there is not listed as one that just arrived");
+    c.ExpectEq(present.downloaded, 1, "though its row still settles done");
     const QueueEntry skipped = rig.Persisted(rom_id);
     c.Expect(skipped.state == QueueState::kDone, "the entry is done");
     c.Expect(skipped.message.find("already on the card") != std::string::npos,
