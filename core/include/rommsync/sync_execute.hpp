@@ -525,8 +525,9 @@ struct ExecuteOptions {
   /// wrote since this one last synced is answered with a 409
   /// (`OperationError::kNewerOnServer`) rather than silently replaced. The
   /// override is the player's to make, per save, knowing what it replaces --
-  /// never the engine's. Empty, which is every tick today; the overlay choice
-  /// that fills it is #240's.
+  /// never the engine's. Empty, which is every tick today: the overlay choice
+  /// that fills it was split out of #240 into a later PR, so a conflict is
+  /// always resolved Keep server (with the local copy archived on the server).
   std::vector<std::pair<std::int64_t, std::optional<std::string>>> keep_local;
 
   /// Whether an upload and a `/downloaded` carry `content_hash`: the MD5 of the

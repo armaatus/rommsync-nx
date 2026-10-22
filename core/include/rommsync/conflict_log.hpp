@@ -155,6 +155,23 @@ const char* ToString(Event event);
 /// True when this event replaced or removed bytes, and therefore owes a backup.
 bool Overwrote(Event event);
 
+/// Where else a conflict's losing local bytes are, besides `backup_sd_path`
+/// (#240). Keep both uploads them as an archival (`null`-slot) save before the
+/// server's copy lands, so another device can recover them; when that upload
+/// fails they are on this card alone, and the screen says so.
+enum class LocalCopy {
+  /// Not recorded: anything that is not a save conflict, and every entry
+  /// written before #240.
+  kUnrecorded,
+
+  /// On the server too, as the archival save `Entry::archive_save_id`.
+  kOnServer,
+
+  /// On this card only: the server holds no copy.
+  kCardOnly,
+};
+const char* ToString(LocalCopy copy);
+
 /// One overwrite, as the overlay reads it back.
 struct Entry {
   /// Stable for as long as the entry is in the file, and what `RestoreBackup`
@@ -221,6 +238,18 @@ struct Entry {
   /// when nothing was overwritten -- a `kKeptBoth` state. Never re-derived; see
   /// the header note.
   std::string backup_sd_path;
+
+  /// Whether the server holds the bytes `backup_sd_path` does (#240).
+  ///
+  /// **Optional in the file**, unlike every field above: a row written before
+  /// #240 has neither key and reads as `kUnrecorded`, so a history survives the
+  /// upgrade whole without a format version an older build would refuse. An
+  /// older build ignores both keys, so a downgrade loses nothing but them.
+  LocalCopy local_copy = LocalCopy::kUnrecorded;
+
+  /// The archival save's id when `kOnServer` and the server's answer named it;
+  /// zero otherwise.
+  std::int64_t archive_save_id = 0;
 
   /// True when this entry could be restored if the backup is still there.
   bool restorable() const { return Overwrote(event) && !backup_sd_path.empty(); }

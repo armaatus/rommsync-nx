@@ -357,7 +357,8 @@ emulator — is newer than this device's last sync of it. That is the protection
 shared slot needs: without it, a RetroArch or Argosy upload landing between this
 tick's negotiate and its upload would be silently superseded. So the guard is
 kept, and only a player's explicit **Keep local** for one save sends
-`overwrite=true` (`ExecuteOptions::keep_local`; the overlay choice is #240's).
+`overwrite=true` (`ExecuteOptions::keep_local`; #240 split the overlay choice
+that fills it into a later PR, so nothing fills it yet).
 
 On 5.4.0 the 409 is not only a race. Every other device's upload is a new row
 and becomes the head, this device has no sync row against it, and negotiate
@@ -570,6 +571,39 @@ The arbitration is per `(device, save)`. Sync history is written by an upload
 carrying `device_id` and by `POST /api/saves/{id}/downloaded` — a download the
 client never confirms leaves the device looking like it has never seen the save,
 which puts every later comparison in the no-sync-history branch above.
+
+#### The losing side stays on the server too (#240)
+
+`.backup/` is on one SD card, where no other device can recover it. So keep
+both also uploads the local bytes as an **archival** save, following RomM's own
+"keep both" guidance (#226 R4):
+
+1. fetch the server copy to a staged file and verify it;
+2. back up the local file under `.backup/`;
+3. `POST /api/saves` with the backup's bytes, **no `slot`**, the local emulator
+   (what step 0 reported), `device_id`, `content_hash` and `overwrite=false`,
+   under `<stem> [switch-conflict <YYYY-MM-DD_HH-MM-SS>].<ext>`;
+4. commit the server copy onto the save, and confirm it.
+
+RomM never pairs a `null`-slot row in negotiate (it reads `slot_not_null` rows
+only) and never prunes one, so the copy cannot come back into sync, and the
+server copy still wins on the card. The name carries the conflict's second
+because RomM tags no `null`-slot upload: it keeps the name as sent, and a second
+upload of a name it already holds replaces that row's bytes. No `session_id`:
+RomM counts every upload naming one as a completed operation of the session.
+
+The upload follows the backup rather than preceding it, so a card that refuses
+the backup — every tick, until someone fixes it — refuses before anything is
+sent, and a stuck conflict does not leave an archival row per tick. It precedes
+the commit, so the server holds the copy before the card loses it. A conflict
+that lands on a path nothing was at (a placement) replaced nothing and uploads
+nothing. The 409's conflict (#232) runs through the same branch.
+
+**A failed upload does not stop the conflict.** The local bytes are in
+`.backup/` exactly as before; the result is `ArchiveOutcome::kFailed`, the tick
+logs that the bytes are only on this card, and the conflicts screen says the
+server holds no copy (`conflicts::LocalCopy::kCardOnly`), on the row and in the
+detail. An entry recorded before #240 says nothing either way.
 
 ### Formats only one emulator reads
 

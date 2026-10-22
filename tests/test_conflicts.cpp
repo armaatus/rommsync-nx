@@ -249,6 +249,48 @@ void Store(checks::Checks& c) {
                  partial.diagnostics[0]);
   }
 
+  // #240: where else the losing bytes are -- on the server as an archival row,
+  // or on this card alone -- round-trips. And a row written before #240, which
+  // has neither field, still reads: it is an index to a real backup, and the
+  // file's version is not bumped for a field an older build can ignore.
+  {
+    conflicts::Entry on_server = SaveEntry(4, "kept.srm");
+    on_server.id = 3;
+    on_server.local_copy = conflicts::LocalCopy::kOnServer;
+    on_server.archive_save_id = 77;
+    conflicts::Entry card_only = SaveEntry(5, "card.srm");
+    card_only.id = 2;
+    card_only.local_copy = conflicts::LocalCopy::kCardOnly;
+    conflicts::Entry before = SaveEntry(6, "before.srm");
+    before.id = 1;
+    std::string old_row = conflicts::SerializeEntry(before);
+    for (const std::string field : {",\"local_copy\":null", ",\"archive_save_id\":null"}) {
+      const std::size_t at = old_row.find(field);
+      c.Expect(at != std::string::npos, "the row spells " + field);
+      if (at != std::string::npos) {
+        old_row.erase(at, field.size());
+      }
+    }
+    const conflicts::LoadedHistory read = conflicts::ParseHistory(
+        std::string(conflicts::kFormatMagic) + " " + std::to_string(conflicts::kFormatVersion) +
+        " 9\n" + conflicts::SerializeEntry(on_server) + "\n" +
+        conflicts::SerializeEntry(card_only) + "\n" + old_row + "\n");
+    c.ExpectEq(read.entries.size(), std::size_t{3}, "all three rows read back");
+    if (read.entries.size() == 3) {
+      c.Expect(read.entries[0].local_copy == conflicts::LocalCopy::kOnServer &&
+                   read.entries[0].archive_save_id == 77,
+               std::string("a copy on the server round-trips with its row: ") +
+                   conflicts::ToString(read.entries[0].local_copy));
+      c.Expect(read.entries[1].local_copy == conflicts::LocalCopy::kCardOnly &&
+                   read.entries[1].archive_save_id == 0,
+               std::string("a copy on the card alone round-trips: ") +
+                   conflicts::ToString(read.entries[1].local_copy));
+      c.Expect(read.entries[2].local_copy == conflicts::LocalCopy::kUnrecorded,
+               std::string("a pre-#240 row reads as not recorded: ") +
+                   conflicts::ToString(read.entries[2].local_copy));
+    }
+  }
+
   // A header that is not this file's is fatal, because those bytes are not this
   // file. Naming the expected header rather than quoting what was found: a
   // corrupt card region holds anything.
@@ -399,6 +441,12 @@ void Record(checks::Checks& c) {
       Reported(6, "retroarch-srm", "six.srm", "device six\n"),
   };
 
+  // #240: the first conflict's local copy went up as an archival row, the
+  // second's did not.
+  report.operations[0].archive = sync::ArchiveOutcome::kKept;
+  report.operations[0].archive_save_id = 77;
+  report.operations[1].archive = sync::ArchiveOutcome::kFailed;
+
   conflicts::RecordOptions options = At(kWhen);
   options.rom_name = [](std::int64_t rom_id) { return "Rom " + std::to_string(rom_id); };
   const std::size_t recorded = conflicts::RecordSaves(&history, plan, report, reported, options);
@@ -423,6 +471,16 @@ void Record(checks::Checks& c) {
   c.ExpectEq(both_changed.backup_sd_path, std::string(harness::kBackupDir) + "/4-a.srm",
              "the backup path is the one M2-5 wrote, stored exactly");
   c.ExpectEq(both_changed.when, kWhen, "stamped from the clock it was given");
+  c.Expect(both_changed.local_copy == conflicts::LocalCopy::kOnServer &&
+               both_changed.archive_save_id == 77,
+           std::string("a conflict records that its local copy is on the server, and as which "
+                       "row: ") +
+               conflicts::ToString(both_changed.local_copy));
+  c.Expect(same_timestamp.local_copy == conflicts::LocalCopy::kCardOnly,
+           std::string("...or that the server holds none: ") +
+               conflicts::ToString(same_timestamp.local_copy));
+  c.Expect(history.entries()[0].local_copy == conflicts::LocalCopy::kUnrecorded,
+           "a replacement was never a question of keeping both");
   c.Expect(history.entries()[0].event == conflicts::Event::kReplaced,
            "a download that landed on an existing file is a replacement, not a conflict");
 
@@ -1136,6 +1194,54 @@ void Overlay(checks::Checks& c) {
                "a conflict with no backup path recorded is unrestorable, not untouched");
       c.Expect(drawn.rows[0].note.find("Nothing was overwritten") == std::string::npos,
                "and never says the save was left alone: " + drawn.rows[0].note);
+    }
+
+    // #240: a conflict whose losing copy could not be put on the server says so
+    // -- on the row, before a press, and in the detail -- and one that is there
+    // names the row it is in.
+    {
+      overlay::ConflictsModel archive;
+      archive.Next();
+      ipc::ConflictPage two;
+      two.offset = 0;
+      two.total = 2;
+      conflicts::Entry card_only = SaveEntry(4, "card.srm");
+      card_only.id = 22;
+      card_only.local_copy = conflicts::LocalCopy::kCardOnly;
+      conflicts::Entry on_server = SaveEntry(5, "server.srm");
+      on_server.id = 21;
+      on_server.local_copy = conflicts::LocalCopy::kOnServer;
+      on_server.archive_save_id = 77;
+      two.entries = {Row(card_only, true), Row(on_server, true)};
+      archive.OnPage(two);
+      overlay::ConflictsView drawn = archive.Render();
+      c.Expect(drawn.rows[0].note.find("server holds no copy") != std::string::npos,
+               "the row of a card-only copy says the server holds none: " + drawn.rows[0].note);
+      c.Expect(drawn.rows[0].tone == overlay::Tone::kWarn, "as a warning");
+      c.Expect(drawn.rows[1].note.find("server holds no copy") == std::string::npos,
+               "and a copy that is on the server is not said to be missing: " +
+                   drawn.rows[1].note);
+
+      const auto detail_value = [](const overlay::ConflictsView& view, const std::string& label) {
+        for (const overlay::ConflictDetailLine& line : view.detail) {
+          if (line.label == label) {
+            return line.value;
+          }
+        }
+        return std::string();
+      };
+      archive.Activate();
+      drawn = archive.Render();
+      const std::string card_line = detail_value(drawn, "On the server");
+      c.Expect(card_line.find("no copy") != std::string::npos,
+               "the detail says the server holds no copy: " + card_line);
+      archive.Back();
+      archive.MoveSelection(1);
+      archive.Activate();
+      drawn = archive.Render();
+      const std::string server_line = detail_value(drawn, "On the server");
+      c.Expect(server_line.find("77") != std::string::npos,
+               "the detail names the archival row: " + server_line);
     }
 
     // A press on an entry whose backup is gone opens it and stops there.

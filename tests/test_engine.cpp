@@ -4499,6 +4499,24 @@ int Upgrade(http::HttpClient& client, const std::string& base) {
   c.Expect(ConflictRecorded(console, older.rom_id),
            "gb240p: and it is on the conflicts screen, restorable:\n" +
                console.sandbox.Read("/config/rommsync/conflicts.db"));
+  // #240: the Switch's progress is on the server deliberately, not only by
+  // rc1's `tico-srm` row happening to hold it: an archival row, outside every
+  // slot, and the conflicts screen knows which.
+  const auto archived_copies = [&]() {
+    std::vector<harness::ArchivalRow> copies;
+    for (harness::ArchivalRow& row : harness::ArchivalRows(client, base, fixture, older.rom_id)) {
+      if (row.content_hash == crypto::Md5Hex(older.bytes)) {
+        copies.push_back(std::move(row));
+      }
+    }
+    return copies;
+  };
+  std::vector<harness::ArchivalRow> archived = archived_copies();
+  c.ExpectEq(archived.size(), std::size_t{1},
+             "gb240p: the Switch's progress is on the server as one archival row");
+  c.Expect(console.sandbox.Read("/config/rommsync/conflicts.db")
+                   .find("\"local_copy\":\"server\"") != std::string::npos,
+           "gb240p: and the conflicts screen says the server holds it");
 
   for (const Game& game : games) {
     const std::vector<ServerRow> old_rows = RowsFor(client, base, fixture, game.rom_id, "tico-srm");
@@ -4519,9 +4537,14 @@ int Upgrade(http::HttpClient& client, const std::string& base) {
   c.ExpectEq(console.sandbox.Read(empty.save), empty.bytes, "nova: unchanged");
   c.ExpectEq(console.sandbox.Read(newer.save), newer.retroarch, "240pee: unchanged");
   c.ExpectEq(console.sandbox.Read(older.save), older.retroarch, "gb240p: unchanged");
+  archived = archived_copies();
+  c.ExpectEq(archived.size(), std::size_t{1}, "gb240p: and archived once, not once a tick");
 
   for (const Game& game : games) {
     ClearSlots(client, base, fixture, game.rom_id);
+  }
+  for (const harness::ArchivalRow& row : archived) {
+    harness::DeleteSave(client, base, fixture, row.id);
   }
   harness::DeleteDevice(client, base, fixture, device_id);
   return c.failures();

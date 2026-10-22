@@ -10,6 +10,10 @@
 //   3. copy the save's current bytes into `.backup/`
 //   4. `io::CommitStaged` the verified bytes onto the save
 //
+// A conflict puts one more step between 3 and 4: the bytes step 3 preserved go
+// up as an archival save (`Archive`, #240). It writes nothing local and cannot
+// stop the overwrite.
+//
 // Every step before 4 can fail without the save changing at all, and step 4
 // cannot start until step 3 has succeeded. That is docs/SYNC_PROTOCOL.md's hard
 // rule expressed as a sequence rather than as a promise, and
@@ -243,7 +247,21 @@ const char* ToString(ArchiveOutcome outcome) {
   return "none";
 }
 
-std::string ArchiveFileName(std::string_view, std::int64_t) { return {}; }
+std::string ArchiveFileName(std::string_view file_name, std::int64_t unix_seconds) {
+  const std::string_view extension = ExtensionOf(file_name);
+  const std::string_view stem = file_name.substr(0, file_name.size() - extension.size());
+  // `2025-09-04T15:33:22Z` respelt the way RomM tags its own versions,
+  // `2025-09-04_15-33-22`: a name a FAT32 card and RomM's sanitiser both keep.
+  std::string when =
+      FormatTimestamp(Timestamp{std::chrono::seconds{unix_seconds}});
+  if (!when.empty() && when.back() == 'Z') {
+    when.pop_back();
+  }
+  for (char& character : when) {
+    character = character == 'T' ? '_' : character == ':' ? '-' : character;
+  }
+  return std::string(stem) + " [switch-conflict " + when + "]" + std::string(extension);
+}
 
 const char* ToString(OperationError error) {
   switch (error) {
@@ -562,6 +580,85 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
   return uploaded;
 }
 
+/// The emulator step 0 reported for `target`, or empty.
+std::string ReportedEmulator(const ExecuteOptions& options, const SaveTarget& target) {
+  if (options.reported != nullptr) {
+    for (const ClientSaveState& save : *options.reported) {
+      if (save.rom_id == target.rom_id && save.slot == target.slot) {
+        return save.emulator.value_or(std::string());
+      }
+    }
+  }
+  return {};
+}
+
+/// A conflict's losing local copy, put on the server as an archival save before
+/// the server's copy replaces it (#240): `POST /api/saves` with **no `slot`**,
+/// the bytes `BackUpFirst` just preserved, the local emulator and
+/// `ArchiveFileName`. What happened is written onto `result`.
+///
+/// Never a reason to stop the conflict. A failure leaves the bytes in
+/// `.backup/` exactly as before #240, and says -- on the result, for the
+/// overlay, and in a warning -- that the server holds no copy.
+///
+/// No `session_id`: RomM counts every upload naming one as a completed
+/// operation of that session, and this is not one the plan had. `device_id`
+/// is sent, so the row records which console it came from; a `null`-slot row
+/// never enters negotiate, so the sync row it writes pairs with nothing.
+void Archive(http::HttpClient& client, fs::FileSystem& files, const auth::StoredToken& token,
+             const SyncOperation& operation, const SaveTarget& target,
+             const ExecuteOptions& options, std::int64_t unix_seconds, OperationResult* result,
+             std::vector<std::string>* warnings) {
+  const auto failed = [&](const std::string& why) {
+    result->archive = ArchiveOutcome::kFailed;
+    warnings->push_back(Describe(operation) + ": the local copy could not be kept on the server (" +
+                        why + "); it is only in " + result->backup_sd_path + " on this card");
+  };
+  const std::string source = files.Resolve(result->backup_sd_path);
+  if (source.empty()) {
+    failed("the backup is not a path on this card");
+    return;
+  }
+  std::string url = http::JoinUrl(token.server_url, kSavesPath) +
+                    "?rom_id=" + std::to_string(operation.rom_id);
+  if (const std::string emulator = ReportedEmulator(options, target); !emulator.empty()) {
+    url += "&emulator=" + http::EncodeQueryValue(emulator);
+  }
+  url += "&device_id=" + http::EncodeQueryValue(token.device_id);
+  if (options.send_content_hash) {
+    const state::HashOutcome digest = state::HashFile(source);
+    if (!digest.ok()) {
+      failed("the backup could not be hashed: " + digest.message);
+      return;
+    }
+    url += "&content_hash=" + digest.content_hash;
+  }
+  // RomM keeps a `null`-slot name as sent and replaces a row that already has
+  // it. `ArchiveFileName`'s second keeps that from happening; `overwrite=false`
+  // is the guard behind it, refusing a row another device moved since.
+  url += "&overwrite=false";
+
+  http::Request request =
+      Authed(http::Method::kPost, std::move(url), token, options.timeout, options.cancel);
+  http::FormPart part;
+  part.name = "saveFile";
+  part.file_path = source;
+  part.file_name = ArchiveFileName(target.file_name, unix_seconds);
+  part.content_type = "application/octet-stream";
+  request.form.push_back(std::move(part));
+
+  const http::Result posted = client.Send(request);
+  if (const auto refused = Refused(posted, "the archival upload")) {
+    failed(refused->second);
+    return;
+  }
+  const json::ParseResult document = json::Parse(posted.response.body);
+  result->archive = ArchiveOutcome::kKept;
+  // Read for the overlay, not to decide anything: the bytes are on the server
+  // whether or not the row can be read back.
+  result->archive_save_id = document.ok() ? SaveIdOf(document.value) : std::nullopt;
+}
+
 /// `GET /api/saves/{id}` -- the size and digest the download is judged against.
 ServerSave DescribeServerSave(http::HttpClient& client, const auth::StoredToken& token,
                               std::int64_t save_id, const ExecuteOptions& options,
@@ -670,6 +767,9 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
                 "the plan says to fetch a save the server named no id for");
   }
   const std::int64_t save_id = *operation.save_id;
+  // A placed file replaces no local copy, so a conflict landing there has no
+  // losing side to keep (#240).
+  const bool matched = target != nullptr;
 
   // Where it goes. A matched local file keeps its own path; a save the client
   // has never seen needs one invented, which the plan cannot do -- the server's
@@ -828,6 +928,17 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
     return failed;
   }
 
+  // The losing side of a conflict, kept where another device can reach it
+  // (#240). After the backup, so it uploads exactly the bytes `.backup/` holds
+  // and a card that refuses a backup refuses before anything is sent -- a
+  // conflict that fails there every tick would otherwise archive every tick.
+  // Before the commit, so the server holds the copy before the card loses it.
+  if (success == OperationOutcome::kKeptBoth && matched && !result.backup_sd_path.empty()) {
+    const std::int64_t stamp =
+        UnixSeconds(options.now != nullptr ? options.now() : std::chrono::system_clock::now());
+    Archive(client, files, token, operation, *target, options, stamp, &result, warnings);
+  }
+
   const std::string staged_path = staged.path();
   // Consumed by the commit whether it succeeds or fails, so the guard is done.
   staged.Release();
@@ -838,6 +949,8 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
              "the verified bytes could not be put in place: " + committed.message);
     failed.sd_path = target->sd_path;
     failed.backup_sd_path = result.backup_sd_path;
+    failed.archive = result.archive;
+    failed.archive_save_id = result.archive_save_id;
     return failed;
   }
 
@@ -884,6 +997,8 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
     failed.sd_path = target->sd_path;
     failed.backup_sd_path = result.backup_sd_path;
     failed.save_id = save_id;
+    failed.archive = result.archive;
+    failed.archive_save_id = result.archive_save_id;
     return failed;
   }
 
@@ -892,6 +1007,13 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
                    (result.backup_sd_path.empty()
                         ? std::string(", replacing nothing")
                         : ", after backing up its previous bytes to " + result.backup_sd_path);
+  if (result.archive == ArchiveOutcome::kKept) {
+    result.message += ", and keeping them on the server as archival save " +
+                      (result.archive_save_id.has_value() ? std::to_string(*result.archive_save_id)
+                                                          : std::string("(id unread)"));
+  } else if (result.archive == ArchiveOutcome::kFailed) {
+    result.message += "; the server holds no copy of them";
+  }
   return result;
 }
 

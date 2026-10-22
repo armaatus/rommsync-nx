@@ -3109,6 +3109,25 @@ void NewerConflict(rig::Checks& checks, http::HttpClient& client, const std::str
   checks.ExpectEq(SaveRowsFor(client, base, fixture, rom.id, arranged.slot, nullptr), 2,
                   "nothing was uploaded over the other device's save");
 
+  // #240: a 409's conflict runs through the same keep-both, so this device's
+  // progress is on the server too -- as an archival row, outside the slot.
+  std::int64_t archive_id = 0;
+  if (!tick.executed.operations.empty()) {
+    const sync::OperationResult& done = tick.executed.operations[0];
+    checks.Expect(done.archive == sync::ArchiveOutcome::kKept,
+                  std::string("the losing side went up as an archival save: ") +
+                      sync::ToString(done.archive));
+    archive_id = done.archive_save_id.value_or(0);
+  }
+  bool archived = false;
+  for (const harness::ArchivalRow& row : harness::ArchivalRows(client, base, fixture, rom.id)) {
+    if (row.id == archive_id && archive_id != 0) {
+      archived = row.content_hash == crypto::Md5Hex(edited);
+      planted.push_back(row.id);
+    }
+  }
+  checks.Expect(archived, "the server holds a null-slot row with this device's progress");
+
   // The conflict reaches the history the overlay reads, with the guard's own
   // sentence as the reason and the head's digest as the server side.
   conflicts::History history(sandbox.Host("/config/rommsync/conflicts.db"));
@@ -3123,6 +3142,9 @@ void NewerConflict(rig::Checks& checks, http::HttpClient& client, const std::str
                     "with the slot guard's own sentence as the reason");
     checks.Expect(entry.server_content_hash == std::optional<std::string>(crypto::Md5Hex(theirs)),
                   "and the head's digest as the server's side");
+    checks.Expect(entry.local_copy == conflicts::LocalCopy::kOnServer &&
+                      entry.archive_save_id == archive_id,
+                  "and the archival row the local bytes are kept in (#240)");
   }
   sweep();
 }

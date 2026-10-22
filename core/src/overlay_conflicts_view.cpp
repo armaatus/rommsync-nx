@@ -40,6 +40,11 @@ constexpr const char* kNotRecorded = "not recorded";
 constexpr const char* kNoServerDigest =
     "RomM computes no digest for a save state, so the two were never compared by content";
 
+/// A conflict's row when its losing bytes could not be put on the server
+/// (#240). Another device cannot recover them, and a lost card loses them.
+constexpr const char* kCardOnlyNote =
+    "The server holds no copy of this console's bytes -- only the backup on this card does";
+
 std::string Number(std::int64_t value) { return std::to_string(value); }
 
 /// `1234 bytes`. Bytes rather than a rounded unit: the number is here so a user
@@ -582,6 +587,12 @@ ConflictsView ConflictsModel::Render() const {
                          ? std::string("Press A for both copies and the backup")
                          : entry.reason;
         drawn.tone = entry.event == conflicts::Event::kConflict ? Tone::kWarn : Tone::kNeutral;
+        if (entry.local_copy == conflicts::LocalCopy::kCardOnly) {
+          // The one fact that outranks the server's sentence (#240): the bytes
+          // this console lost are on this card and nowhere else.
+          drawn.note = kCardOnlyNote;
+          drawn.tone = Tone::kWarn;
+        }
       } else {
         drawn.note = RestorabilityText(drawn.restorable);
         drawn.tone = RestorabilityTone(drawn.restorable);
@@ -690,6 +701,17 @@ ConflictsView ConflictsModel::Render() const {
   } else {
     line("Backup", entry.backup_sd_path,
          restorable == Restorability::kBackupGone ? Tone::kWarn : Tone::kNeutral);
+  }
+  // Where else this console's bytes are (#240). Drawn only when recorded: an
+  // entry from before it says nothing rather than guessing.
+  if (entry.local_copy == conflicts::LocalCopy::kOnServer) {
+    line("On the server", entry.archive_save_id > 0
+                              ? "this console's bytes, as archival save " +
+                                    Number(entry.archive_save_id)
+                              : std::string("this console's bytes, as an archival save"));
+  } else if (entry.local_copy == conflicts::LocalCopy::kCardOnly) {
+    line("On the server", "no copy -- the upload failed, so the backup is the only one",
+         Tone::kWarn);
   }
 
   view.can_restore = restorable == Restorability::kReady && !restored_ && restoring_ == 0;

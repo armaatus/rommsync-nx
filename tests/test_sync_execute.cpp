@@ -1720,8 +1720,12 @@ void Conflict(rig::Checks& checks, http::HttpClient& client, const std::string& 
                 std::string("...with the history reason: ") + plan.operations[0].reason_text);
 
   const std::vector<sync::SaveTarget> targets = {{rom.id, slot, SavePath(name), name}};
+  // What step 0 reported is where the archive's emulator comes from (#240), as
+  // `RunTick` sets it.
+  sync::ExecuteOptions options = OptionsAt(1'757'000'002);
+  options.reported = &payload.saves;
   const sync::ExecutionReport report = sync::ExecutePlan(
-      client, *files, TokenFor(base, fixture), plan, targets, OptionsAt(1'757'000'002));
+      client, *files, TokenFor(base, fixture), plan, targets, options);
 
   checks.ExpectEq(report.completed, 1,
                   "the conflict resolved" +

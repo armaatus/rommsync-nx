@@ -88,6 +88,14 @@ std::size_t RecordSaves(History* history, const sync::SyncPlan& plan,
     entry.server_content_hash = operation.server_content_hash;
     entry.server_updated_at = operation.server_updated_at.value_or(std::string());
     entry.backup_sd_path = result.backup_sd_path;
+    // Whether the losing bytes reached the server as well (#240). Only a
+    // keep-both asks; everything else stays `kUnrecorded`.
+    if (result.archive == sync::ArchiveOutcome::kKept) {
+      entry.local_copy = LocalCopy::kOnServer;
+      entry.archive_save_id = result.archive_save_id.value_or(0);
+    } else if (result.archive == sync::ArchiveOutcome::kFailed) {
+      entry.local_copy = LocalCopy::kCardOnly;
+    }
 
     // The local facts are the ones step 0 reported, not the ones on the card:
     // the card now holds the server's copy.

@@ -182,6 +182,12 @@ std::string SerializeEntry(const Entry& entry) {
   AppendOptionalText(&out, "server_updated_at", entry.server_updated_at);
   AppendInteger(&out, "server_size_bytes", entry.server_size_bytes);
   AppendOptionalText(&out, "backup_sd_path", entry.backup_sd_path);
+  // Last, and the two keys a reader tolerates missing (`Entry::local_copy`).
+  AppendKey(&out, "local_copy");
+  out += entry.local_copy == LocalCopy::kUnrecorded ? std::string("null")
+                                                    : json::Quote(ToString(entry.local_copy));
+  AppendKey(&out, "archive_save_id");
+  out += entry.archive_save_id > 0 ? std::to_string(entry.archive_save_id) : std::string("null");
   out += "}";
   return out;
 }
@@ -248,11 +254,49 @@ bool ParseEntry(const json::Value& object, Entry* out, std::string* why) {
   entry.server_updated_at = server_updated_at.value_or(std::string());
   entry.backup_sd_path = backup.value_or(std::string());
 
+  // #240's two keys, read by hand because absent is an answer here: a row from
+  // before them is `kUnrecorded`, not a row to drop. Present, they are held to
+  // the same bar as the rest -- a value this build does not know is refused
+  // rather than read as "not recorded".
+  if (const json::Value* copy = object.Find("local_copy"); copy != nullptr && !copy->is_null()) {
+    if (!copy->is_string()) {
+      *why = "field local_copy: not a string";
+      return false;
+    }
+    if (copy->string() == ToString(LocalCopy::kOnServer)) {
+      entry.local_copy = LocalCopy::kOnServer;
+    } else if (copy->string() == ToString(LocalCopy::kCardOnly)) {
+      entry.local_copy = LocalCopy::kCardOnly;
+    } else {
+      *why = "field local_copy: " + copy->string() + " is not a copy this build records";
+      return false;
+    }
+  }
+  if (const json::Value* id = object.Find("archive_save_id"); id != nullptr && !id->is_null()) {
+    if (!id->is_integer() || id->integer() <= 0) {
+      *why = "field archive_save_id: not a save id";
+      return false;
+    }
+    entry.archive_save_id = id->integer();
+  }
+
   *out = std::move(entry);
   return true;
 }
 
 const char* ToString(EntryKind kind) { return KindText(kind); }
+
+const char* ToString(LocalCopy copy) {
+  switch (copy) {
+    case LocalCopy::kUnrecorded:
+      return "unrecorded";
+    case LocalCopy::kOnServer:
+      return "server";
+    case LocalCopy::kCardOnly:
+      return "card";
+  }
+  return "unrecorded";
+}
 
 const char* ToString(Event event) { return EventText(event); }
 
