@@ -1945,6 +1945,7 @@ int main(int argc, char** argv) {
 
   rig::DisarmFault(*client, base);
   harness::ExpectDisarmed(checks, *client, base, "the scenario left the proxy disarmed");
+  harness::DeleteArchivalCopies(*client, base, fixture, rom.id);  // #240
 
   if (checks.failures() == 0) {
     std::cout << "conflicts." << scenario << " ok against " << base << "\n";

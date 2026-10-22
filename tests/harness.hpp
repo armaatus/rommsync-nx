@@ -751,6 +751,19 @@ inline std::vector<ArchivalRow> ArchivalRows(http::HttpClient& client, const std
   return rows;
 }
 
+/// Delete every archival copy a conflict left for `rom_id` -- the rows
+/// `sync::ArchiveFileName` names. Every rig scenario that resolves a real
+/// conflict leaves one (#240), and a scenario's own cleanup deletes only the
+/// slot rows it planted, so a suite sweeps these once its scenario is done.
+inline void DeleteArchivalCopies(http::HttpClient& client, const std::string& base,
+                                 const Fixture& fixture, std::int64_t rom_id) {
+  for (const ArchivalRow& row : ArchivalRows(client, base, fixture, rom_id)) {
+    if (row.file_name.find(" [switch-conflict ") != std::string::npos) {
+      DeleteSave(client, base, fixture, row.id);
+    }
+  }
+}
+
 /// The archival row of `rom_id` holding `content_hash`, or one with id 0.
 inline ArchivalRow ArchivalWith(http::HttpClient& client, const std::string& base,
                                 const Fixture& fixture, std::int64_t rom_id,

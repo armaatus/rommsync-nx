@@ -1746,15 +1746,19 @@ void Conflict(rig::Checks& checks, http::HttpClient& client, const std::string& 
   // #240: and not on this card alone. The losing bytes are on the server as an
   // archival row -- no slot, so negotiate never pairs it -- under the local
   // emulator and the conflict's own name.
-  const harness::ArchivalRow archived =
-      harness::ArchivalWith(client, base, fixture, rom.id, crypto::Md5Hex(previous));
-  checks.Expect(archived.id != 0, "the server holds a null-slot row with the local bytes");
   checks.Expect(done.archive == sync::ArchiveOutcome::kKept,
                 std::string("the result says the local copy is on the server: ") +
                     sync::ToString(done.archive));
-  checks.Expect(done.archive_save_id == archived.id,
-                "...and names the row: " + std::to_string(done.archive_save_id.value_or(0)) +
-                    " vs " + std::to_string(archived.id));
+  // Found by the id the result names: an earlier run's copy of the same bytes
+  // may still be on the fixture.
+  harness::ArchivalRow archived;
+  for (const harness::ArchivalRow& row : harness::ArchivalRows(client, base, fixture, rom.id)) {
+    if (done.archive_save_id == row.id) {
+      archived = row;
+    }
+  }
+  checks.Expect(archived.id != 0, "the server holds the null-slot row the result names");
+  checks.ExpectEq(archived.content_hash, crypto::Md5Hex(previous), "holding the local bytes");
   checks.ExpectEq(archived.emulator, std::string("m2-5"), "under the local copy's emulator");
   checks.ExpectEq(archived.file_name, sync::ArchiveFileName(name, 1'757'000'002),
                   "under the conflict's archival name, untagged");
@@ -2632,8 +2636,10 @@ int main(int argc, char** argv) {
   }
 
   // Whatever the scenario did, it does not get to leave a fault armed for
-  // whichever test runs next.
+  // whichever test runs next -- nor the archival copies its conflicts left
+  // (#240).
   rig::DisarmFault(*client, base);
+  harness::DeleteArchivalCopies(*client, base, fixture, rom.id);
   harness::ExpectDisarmed(checks, *client, base, "the scenario left the proxy disarmed");
 
   if (checks.failures() == 0) {

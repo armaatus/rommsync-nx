@@ -462,11 +462,18 @@ namespace {
 
 /// `BackUpFirst` with a save's discriminator and this execution's clock filled
 /// in. The order and the primitives are the shared ones; only the name differs.
+///
+/// `stamped`, when given, receives the second the backup was named for, so a
+/// conflict's archival upload (#240) carries the same one.
 OperationError BackUp(fs::FileSystem& files, const ExecuteOptions& options,
                       const SyncOperation& operation, const SaveTarget& target,
-                      std::string* backup_sd_path, std::string* message) {
+                      std::string* backup_sd_path, std::string* message,
+                      std::int64_t* stamped = nullptr) {
   const std::int64_t stamp =
       UnixSeconds(options.now != nullptr ? options.now() : std::chrono::system_clock::now());
+  if (stamped != nullptr) {
+    *stamped = stamp;
+  }
   return BackUpFirst(files, options.backup_dir, target.sd_path, operation.rom_id,
                      SlotBackupDiscriminator(operation.slot), target.file_name, stamp,
                      backup_sd_path, message);
@@ -633,9 +640,11 @@ void Archive(http::HttpClient& client, fs::FileSystem& files, const auth::Stored
     }
     url += "&content_hash=" + digest.content_hash;
   }
-  // RomM keeps a `null`-slot name as sent and replaces a row that already has
-  // it. `ArchiveFileName`'s second keeps that from happening; `overwrite=false`
-  // is the guard behind it, refusing a row another device moved since.
+  // RomM keeps a `null`-slot name as sent and replaces the row of that rom,
+  // emulator and name if there is one. `ArchiveFileName`'s second is what keeps
+  // that from happening. `overwrite=false` guards only a narrower case: a
+  // same-name row this device synced and another device moved since is a 409
+  // rather than replaced. A row this device wrote itself is not protected by it.
   url += "&overwrite=false";
 
   http::Request request =
@@ -920,8 +929,9 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   result.save_id = save_id;
 
   std::string message;
+  std::int64_t stamp = 0;
   const OperationError backed_up =
-      BackUp(files, options, operation, *target, &result.backup_sd_path, &message);
+      BackUp(files, options, operation, *target, &result.backup_sd_path, &message, &stamp);
   if (backed_up != OperationError::kNone) {
     OperationResult failed = Fail(operation, backed_up, std::move(message));
     failed.sd_path = target->sd_path;
@@ -933,9 +943,9 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   // and a card that refuses a backup refuses before anything is sent -- a
   // conflict that fails there every tick would otherwise archive every tick.
   // Before the commit, so the server holds the copy before the card loses it.
+  // A commit that then fails repeats the conflict next tick, and with it the
+  // archive under a new second -- at the rate the backups already repeat.
   if (success == OperationOutcome::kKeptBoth && matched && !result.backup_sd_path.empty()) {
-    const std::int64_t stamp =
-        UnixSeconds(options.now != nullptr ? options.now() : std::chrono::system_clock::now());
     Archive(client, files, token, operation, *target, options, stamp, &result, warnings);
   }
 

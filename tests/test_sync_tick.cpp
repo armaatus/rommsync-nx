@@ -3820,6 +3820,7 @@ int main(int argc, char** argv) {
                           "tick." + scenario + " left the fault proxy disarmed");
   rig::DisarmFault(*client, base);
   harness::CloseOpenSessions(*client, base, fixture);
+  harness::DeleteArchivalCopies(*client, base, fixture, rom.id);  // #240
 
   if (checks.failures() == 0) {
     std::cout << "tick." << scenario << " ok against " << base << "\n";
