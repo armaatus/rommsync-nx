@@ -106,7 +106,7 @@ add_executable(test_auth_shapes test_auth_shapes.cpp)
 target_link_libraries(test_auth_shapes PRIVATE rommsync::core)
 target_include_directories(test_auth_shapes PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(test_auth_shapes PRIVATE
-  ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures")
+  ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures/5.4.0")
 add_test(NAME auth.shapes COMMAND test_auth_shapes)
 
 # The negotiate request payload, against the pinned OpenAPI snapshot rather than
@@ -118,7 +118,7 @@ add_executable(test_sync_payload test_sync_payload.cpp)
 target_link_libraries(test_sync_payload PRIVATE rommsync::core)
 target_include_directories(test_sync_payload PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(test_sync_payload PRIVATE
-  ROMMSYNC_OPENAPI="${CMAKE_SOURCE_DIR}/server/contract/romm-openapi-5.2.0.json")
+  ROMMSYNC_OPENAPI="${CMAKE_SOURCE_DIR}/server/contract/romm-openapi-5.4.0.json")
 add_test(NAME sync.payload COMMAND test_sync_payload)
 
 # The other direction: the plan RomM sends back, against the captured responses
@@ -130,7 +130,7 @@ add_executable(test_sync_plan test_sync_plan.cpp)
 target_link_libraries(test_sync_plan PRIVATE rommsync::core)
 target_include_directories(test_sync_plan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(test_sync_plan PRIVATE
-  ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures")
+  ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures/5.4.0")
 add_test(NAME sync.plan COMMAND test_sync_plan)
 
 # token.dat. Pure filesystem and parsing, so this never skips either -- and the
@@ -190,7 +190,7 @@ add_executable(test_device_shapes test_device_shapes.cpp)
 target_link_libraries(test_device_shapes PRIVATE rommsync::core)
 target_include_directories(test_device_shapes PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(test_device_shapes PRIVATE
-  ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures"
+  ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures/5.4.0"
   ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
 add_test(NAME device.shapes COMMAND test_device_shapes)
 
@@ -1404,7 +1404,7 @@ target_include_directories(test_sync_complete PRIVATE "${CMAKE_CURRENT_SOURCE_DI
 target_compile_definitions(test_sync_complete PRIVATE
   ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
   ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
-  ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures"
+  ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures/5.4.0"
   ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
 
 set(COMPLETE_UNIT_SCENARIOS
