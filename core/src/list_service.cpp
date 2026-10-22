@@ -59,6 +59,14 @@ json::Error At(const std::string& where, json::Error error) {
   return error;
 }
 
+/// How many fields each kind's item carries (`ipc::list_keys`), so an item is
+/// reserved at its size: grown a field at a time, a platform's five sat in room
+/// for eight and a queue row's nine in room for sixteen, at 88 bytes a field --
+/// a third of a page held, on the IPC thread beside everything (#248).
+constexpr std::size_t kPlatformFields = 5;
+constexpr std::size_t kRomFields = 8;
+constexpr std::size_t kQueueFields = 9;
+
 void PutText(ipc::ListItem* item, std::string_view key, std::string_view value) {
   item->fields.push_back({std::string(key), ipc::ListValue::Text(Shorten(value))});
 }
@@ -370,6 +378,7 @@ ipc::Error Service::FillFromQueueLocked(Entry& entry, ipc::ListPage* page) {
     served =
         FillPage(page, entry.offset, count, entry.request.page_size, [&](std::int64_t index) {
           ipc::ListItem item;
+          item.fields.reserve(kQueueFields);
           if (complaint && index == 0) {
             PutInteger(&item, keys::kQueueRomId, 0);
             // Named after the file rather than left blank: the model falls back to
@@ -414,6 +423,7 @@ ipc::Error Service::FillFromPlatformsLocked(Entry& entry, ipc::ListPage* page) {
       FillPage(page, entry.offset, count, entry.request.page_size, [&](std::int64_t index) {
         const PlatformRow& platform = entry.platforms[static_cast<std::size_t>(index)];
         ipc::ListItem item;
+        item.fields.reserve(kPlatformFields);
         PutInteger(&item, keys::kPlatformId, platform.id);
         PutText(&item, keys::kPlatformFsSlug, platform.fs_slug);
         PutText(&item, keys::kPlatformName, platform.name);
@@ -489,6 +499,7 @@ ipc::ListPage Service::BuildRomPage(const RomPage& fetched, std::int64_t offset,
     }
     const download::QueueEntry queued = queue_.Find(rom.id);
     ipc::ListItem item;
+    item.fields.reserve(kRomFields);
     PutInteger(&item, keys::kRomId, rom.id);
     PutText(&item, keys::kRomName, rom.name);
     PutText(&item, keys::kRomFsName, rom.fs_name);

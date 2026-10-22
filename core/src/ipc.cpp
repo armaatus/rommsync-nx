@@ -1,5 +1,6 @@
 #include "rommsync/ipc.hpp"
 
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -1092,9 +1093,36 @@ Decoded<Cursor> DecodeCursor(std::string_view text) {
                               });
 }
 
-std::string EncodeListPage(const ListPage& page) {
-  std::string out("{");
-  AppendKey(&out, "items", /*first=*/true);
+namespace {
+
+/// What a page encodes to, counted rather than built (#248).
+struct EncodedLength {
+  std::size_t bytes = 0;
+  EncodedLength& operator+=(std::string_view text) {
+    bytes += text.size();
+    return *this;
+  }
+  EncodedLength& operator+=(char) {
+    ++bytes;
+    return *this;
+  }
+};
+
+/// `page` as its wire text, into anything that takes text: the string it is
+/// sent as, or the count that sizes that string and decides whether an item
+/// still fits. One writer for both, so the size a page is judged by is the size
+/// it is sent at.
+template <typename Out>
+void WriteListPage(Out& out, const ListPage& page) {
+  const auto key = [&out](std::string_view name, bool first) {
+    if (!first) {
+      out += ',';
+    }
+    out += json::Quote(name);
+    out += ':';
+  };
+  out += '{';
+  key("items", /*first=*/true);
   out += '[';
   bool first_item = true;
   for (const ListItem& item : page.items) {
@@ -1105,15 +1133,19 @@ std::string EncodeListPage(const ListPage& page) {
     out += '{';
     bool first_field = true;
     for (const ListField& field : item.fields) {
-      AppendKey(&out, field.key, first_field);
+      key(field.key, first_field);
       first_field = false;
       switch (field.value.type) {
         case ListValue::Type::kString:
           out += json::Quote(field.value.text);
           break;
-        case ListValue::Type::kInteger:
-          out += std::to_string(field.value.number);
+        case ListValue::Type::kInteger: {
+          char digits[24];
+          const std::to_chars_result written =
+              std::to_chars(digits, digits + sizeof(digits), field.value.number);
+          out += std::string_view(digits, static_cast<std::size_t>(written.ptr - digits));
           break;
+        }
         case ListValue::Type::kBool:
           out += field.value.flag ? "true" : "false";
           break;
@@ -1122,9 +1154,27 @@ std::string EncodeListPage(const ListPage& page) {
     out += '}';
   }
   out += ']';
-  AppendBool(&out, "has_more", page.has_more);
-  AppendBool(&out, "pending", page.pending);
+  key("has_more", false);
+  out += page.has_more ? "true" : "false";
+  key("pending", false);
+  out += page.pending ? "true" : "false";
   out += '}';
+}
+
+std::size_t EncodedSize(const ListPage& page) {
+  EncodedLength length;
+  WriteListPage(length, page);
+  return length.bytes;
+}
+
+}  // namespace
+
+std::string EncodeListPage(const ListPage& page) {
+  // Reserved to its length, so a page is its text once on its way out rather
+  // than its text doubling there (#248).
+  std::string out;
+  out.reserve(EncodedSize(page));
+  WriteListPage(out, page);
   return out;
 }
 
@@ -1184,7 +1234,10 @@ bool AppendIfItFits(ListPage* page, ListItem item) {
     return false;
   }
   page->items.push_back(std::move(item));
-  if (Fits(EncodeListPage(*page))) {
+  // Counted, not encoded: an encode per append held the page's text as it
+  // doubled past `kMaxPayloadBytes`, ~24 KiB beside the page on the IPC thread
+  // (#248). The count is the encoder's own (`WriteListPage`).
+  if (EncodedSize(*page) <= kMaxPayloadBytes) {
     return true;
   }
   page->items.pop_back();

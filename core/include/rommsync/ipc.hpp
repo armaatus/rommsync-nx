@@ -797,10 +797,13 @@ struct ListPage {
 /// does not fit a payload, which is a projection that needs shortening rather
 /// than a page that needs splitting.
 ///
-/// It re-encodes the page per append, which is O(n^2) in a page of at most 64
-/// items fetched at the speed a human scrolls. That is the right trade for a
+/// It measures the whole page per append, which is O(n^2) in a page of at most
+/// 64 items fetched at the speed a human scrolls. That is the right trade for a
 /// bound that is checked rather than estimated: an estimate that drifted would be
-/// a `kTooLarge` on a real user's library and on nobody's test.
+/// a `kTooLarge` on a real user's library and on nobody's test. **Measured, not
+/// encoded** (#248): the count is `EncodeListPage`'s own writer, so the size a
+/// page is judged by is the size it is sent at -- and an encode per append held
+/// the page's text as it doubled past the payload, ~24 KiB beside the page.
 bool AppendIfItFits(ListPage* page, ListItem item);
 
 /// A cursor names one open list. `0` is never a valid one, so a
