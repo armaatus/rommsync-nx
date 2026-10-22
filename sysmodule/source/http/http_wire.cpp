@@ -18,6 +18,7 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -230,6 +231,12 @@ struct BodySegment {
   std::string literal;
   std::string file_path;
   std::uint64_t file_size = 0;
+  /// The caller's own text, read where it is instead of copied into `literal`:
+  /// a request's body outlives the exchange that sends it, and a copy was the
+  /// negotiate body again for the length of the exchange (#248).
+  const std::string* borrowed = nullptr;
+
+  const std::string& text() const { return borrowed != nullptr ? *borrowed : literal; }
 };
 
 /// The request body, streamed. `size()` is the `Content-Length` -- known before
@@ -240,7 +247,7 @@ class BodyStream {
  public:
   explicit BodyStream(std::vector<BodySegment> segments) : segments_(std::move(segments)) {
     for (const BodySegment& segment : segments_) {
-      total_ += segment.file_path.empty() ? segment.literal.size() : segment.file_size;
+      total_ += segment.file_path.empty() ? segment.text().size() : segment.file_size;
     }
   }
 
@@ -261,12 +268,13 @@ class BodyStream {
     while (*produced == 0 && at_ < segments_.size()) {
       const BodySegment& segment = segments_[at_];
       if (segment.file_path.empty()) {
-        const std::size_t left = segment.literal.size() - offset_;
+        const std::string& literal = segment.text();
+        const std::size_t left = literal.size() - offset_;
         const std::size_t take = std::min(size, left);
-        std::memcpy(out, segment.literal.data() + offset_, take);
+        std::memcpy(out, literal.data() + offset_, take);
         offset_ += take;
         *produced = take;
-        if (offset_ == segment.literal.size()) Advance();
+        if (offset_ == literal.size()) Advance();
         if (take == 0) continue;
         return true;
       }
@@ -1032,7 +1040,9 @@ Result WireHttpClient::OneHop(const Request& request, const std::string& url, Bo
     }
     content_type = "multipart/form-data; boundary=" + boundary;
   } else if (!request.body.empty()) {
-    segments.push_back({request.body, "", 0});
+    BodySegment borrowed;
+    borrowed.borrowed = &request.body;
+    segments.push_back(std::move(borrowed));
   }
   BodyStream body(std::move(segments));
   const bool has_body = request.method == Method::kPost || request.method == Method::kPut;
@@ -1198,14 +1208,20 @@ Result WireHttpClient::Exchange(const Request& request, BodyWriter* writer,
   }
 
   Budget budget(request, Clock::now());
-  Request hop = request;
+  // The caller's request until a redirect changes it, and a copy only then: a
+  // copy up front was the negotiate body twice for the length of every
+  // exchange, in the tick's plan phase (#248).
+  std::optional<Request> redirected;
   std::string url = request.url;
   const int limit = options_.follow_redirects ? std::max(0, options_.max_redirects) : 0;
 
   for (int redirect = 0;; ++redirect) {
     std::string next;
-    result = OneHop(hop, url, writer, buffer_size, budget, redirect < limit, &next);
+    result = OneHop(redirected ? *redirected : request, url, writer, buffer_size, budget,
+                    redirect < limit, &next);
     if (next.empty()) return result;
+    if (!redirected) redirected = request;
+    Request& hop = *redirected;
 
     // A 303 -- and, by every client's convention, a 301 or 302 on a POST --
     // continues as a GET with no body. 307 and 308 keep both, which is why a

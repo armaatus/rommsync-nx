@@ -480,15 +480,10 @@ Negotiation NegotiateWith(http::HttpClient& client, const auth::StoredToken& tok
                       invalid.Describe());
   }
 
-  SyncNegotiatePayload payload;
-  payload.device_id = token.device_id;
-  payload.saves = saves;
-  if (rom_ids != nullptr) {
-    payload.rom_ids = *rom_ids;
-  }
-  payload.emulators = options.emulators;
-  payload.restore_unlisted = options.restore_unlisted;
-  const Encoded encoded = EncodeNegotiateRequest(payload);
+  // The saves and roms read where the caller holds them, not copied into a
+  // payload first: that was every save twice in the tick's plan phase (#248).
+  Encoded encoded = EncodeNegotiateRequest(token.device_id, saves, rom_ids, options.emulators,
+                                           options.restore_unlisted);
   if (!encoded.ok()) {
     // The payload's own fields -- a blank `device_id` -- which the loop above
     // does not cover. Nothing is sent either way.
@@ -502,7 +497,8 @@ Negotiation NegotiateWith(http::HttpClient& client, const auth::StoredToken& tok
   request.headers.push_back({"Accept", "application/json"});
   request.headers.push_back({"Content-Type", "application/json"});
   request.headers.push_back({"Authorization", "Bearer " + token.access_token});
-  request.body = encoded.body;
+  // Moved, not copied: one body, held while the plan arrives and no longer.
+  request.body = std::move(encoded.body);
   request.timeout = options.timeout;
   request.cancel = options.cancel;
 
@@ -528,6 +524,10 @@ Negotiation NegotiateWith(http::HttpClient& client, const auth::StoredToken& tok
     if (const std::optional<Negotiation> refused = Refused(result)) {
       outcome = *refused;
     } else {
+      // Let go of before the plan is read: an answer that parses, or does not,
+      // is never sent again (`ShouldRetry`), and the plan is the tick's largest
+      // thing beside it (#248, `kHeapTickSaves`'s plan phase).
+      std::string().swap(request.body);
       bool too_large = false;
       auth::Parsed<SyncPlan> parsed = ParseNegotiateResponse(result.response.body, &too_large);
       if (parsed.ok()) {

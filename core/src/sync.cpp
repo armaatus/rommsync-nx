@@ -107,7 +107,21 @@ json::Error ValidateNullable(const std::optional<std::string>& value, std::strin
   return {};
 }
 
-void AppendMember(std::string& out, std::string_view key, const std::optional<std::string>& value) {
+/// A body's length, written the way the body is (`EncodeNegotiateRequest`).
+struct Length {
+  std::size_t bytes = 0;
+  Length& operator+=(std::string_view text) {
+    bytes += text.size();
+    return *this;
+  }
+  Length& operator+=(char) {
+    ++bytes;
+    return *this;
+  }
+};
+
+template <typename Out>
+void AppendMember(Out& out, std::string_view key, const std::optional<std::string>& value) {
   out += ",\"";
   out += key;
   out += "\":";
@@ -336,25 +350,35 @@ json::Error Validate(const ClientSaveState& save) {
 }
 
 Encoded EncodeNegotiateRequest(const SyncNegotiatePayload& payload) {
+  return EncodeNegotiateRequest(payload.device_id, payload.saves,
+                                payload.rom_ids.has_value() ? &*payload.rom_ids : nullptr,
+                                payload.emulators, payload.restore_unlisted);
+}
+
+Encoded EncodeNegotiateRequest(const std::optional<std::string>& device_id,
+                               const std::vector<ClientSaveState>& saves,
+                               const std::vector<std::int64_t>* rom_ids,
+                               const std::optional<std::vector<std::string>>& emulators,
+                               bool restore_unlisted) {
   Encoded encoded;
   // A blank device_id is the one that has to be caught here rather than by the
   // server: it is what a token store that lost its device leaves behind, and
   // RomM would read the whole negotiation as belonging to no device -- every
   // save with no sync history, every plan a first encounter.
-  if (const json::Error error = ValidateNullable(payload.device_id, "device_id"); !error.ok()) {
+  if (const json::Error error = ValidateNullable(device_id, "device_id"); !error.ok()) {
     encoded.error = error;
     return encoded;
   }
 
-  if (payload.rom_ids.has_value()) {
+  if (rom_ids != nullptr) {
     // RomM's own bounds (`maxItems`, `exclusiveMinimum`), checked here so a body
     // it would refuse whole is never sent.
-    if (payload.rom_ids->size() > kMaxNegotiateRomIds) {
+    if (rom_ids->size() > kMaxNegotiateRomIds) {
       encoded.error = Fail("rom_ids", "more than " + std::to_string(kMaxNegotiateRomIds) +
                                           " roms in one negotiation");
       return encoded;
     }
-    for (const std::int64_t rom_id : *payload.rom_ids) {
+    for (const std::int64_t rom_id : *rom_ids) {
       if (rom_id <= 0) {
         encoded.error = Fail("rom_ids", "a rom id is not positive");
         return encoded;
@@ -362,8 +386,8 @@ Encoded EncodeNegotiateRequest(const SyncNegotiatePayload& payload) {
     }
   }
 
-  if (payload.emulators.has_value()) {
-    for (const std::string& emulator : *payload.emulators) {
+  if (emulators.has_value()) {
+    for (const std::string& emulator : *emulators) {
       if (emulator.empty()) {
         encoded.error = Fail("emulators", "an emulator id is empty");
         return encoded;
@@ -371,58 +395,66 @@ Encoded EncodeNegotiateRequest(const SyncNegotiatePayload& payload) {
     }
   }
 
-  std::string body("{\"device_id\":");
-  body += payload.device_id.has_value() ? json::Quote(*payload.device_id) : "null";
-  body += ",\"saves\":[";
-
-  for (std::size_t index = 0; index < payload.saves.size(); ++index) {
-    const ClientSaveState& save = payload.saves[index];
-    if (const json::Error error = Validate(save); !error.ok()) {
+  for (std::size_t index = 0; index < saves.size(); ++index) {
+    if (const json::Error error = Validate(saves[index]); !error.ok()) {
       encoded.error = error;
       encoded.error.field = "saves[" + std::to_string(index) + "]." + error.field;
       return encoded;
     }
-
-    if (index != 0) {
-      body += ',';
-    }
-    // Field order follows the snapshot, which is also the order
-    // server/probe_contract.py sent to a live 5.2.0. Nothing depends on it --
-    // it is what makes a captured body and an encoded one diffable by eye.
-    body += "{\"rom_id\":";
-    body += std::to_string(save.rom_id);
-    body += ",\"file_name\":";
-    body += json::Quote(save.file_name);
-    AppendMember(body, "slot", save.slot);
-    AppendMember(body, "emulator", save.emulator);
-    AppendMember(body, "content_hash", save.content_hash);
-    body += ",\"updated_at\":";
-    body += json::Quote(FormatTimestamp(save.updated_at));
-    body += ",\"file_size_bytes\":";
-    body += std::to_string(save.file_size_bytes);
-    body += '}';
   }
 
-  body += ']';
-  if (payload.rom_ids.has_value()) {
-    body += ",\"rom_ids\":[";
-    for (std::size_t index = 0; index < payload.rom_ids->size(); ++index) {
+  // Written twice: once into a count, to reserve the body at exactly its
+  // length, and once into it -- a body appended to doubles its way there, which
+  // is up to twice its text held while the plan arrives (#248).
+  const auto write = [&](auto& body) {
+    body += "{\"device_id\":";
+    body += device_id.has_value() ? json::Quote(*device_id) : "null";
+    body += ",\"saves\":[";
+    for (std::size_t index = 0; index < saves.size(); ++index) {
+      const ClientSaveState& save = saves[index];
       if (index != 0) {
         body += ',';
       }
-      body += std::to_string((*payload.rom_ids)[index]);
+      // Field order follows the snapshot, which is also the order
+      // server/probe_contract.py sent to a live 5.2.0. Nothing depends on it --
+      // it is what makes a captured body and an encoded one diffable by eye.
+      body += "{\"rom_id\":";
+      body += std::to_string(save.rom_id);
+      body += ",\"file_name\":";
+      body += json::Quote(save.file_name);
+      AppendMember(body, "slot", save.slot);
+      AppendMember(body, "emulator", save.emulator);
+      AppendMember(body, "content_hash", save.content_hash);
+      body += ",\"updated_at\":";
+      body += json::Quote(FormatTimestamp(save.updated_at));
+      body += ",\"file_size_bytes\":";
+      body += std::to_string(save.file_size_bytes);
+      body += '}';
     }
     body += ']';
-  }
-  if (payload.emulators.has_value()) {
-    body += ",\"emulators\":";
-    body += json::QuoteArray(*payload.emulators);
-  }
-  if (payload.restore_unlisted) {
-    body += ",\"restore_unlisted\":true";
-  }
-  body += '}';
-  encoded.body = std::move(body);
+    if (rom_ids != nullptr) {
+      body += ",\"rom_ids\":[";
+      for (std::size_t index = 0; index < rom_ids->size(); ++index) {
+        if (index != 0) {
+          body += ',';
+        }
+        body += std::to_string((*rom_ids)[index]);
+      }
+      body += ']';
+    }
+    if (emulators.has_value()) {
+      body += ",\"emulators\":";
+      body += json::QuoteArray(*emulators);
+    }
+    if (restore_unlisted) {
+      body += ",\"restore_unlisted\":true";
+    }
+    body += '}';
+  };
+  Length length;
+  write(length);
+  encoded.body.reserve(length.bytes);
+  write(encoded.body);
   return encoded;
 }
 

@@ -304,6 +304,20 @@ bool IsSingleFileName(std::string_view value);
 /// worse than no body, since the plan that comes back looks complete.
 Encoded EncodeNegotiateRequest(const SyncNegotiatePayload& payload);
 
+/// The same body, over saves and roms the caller already holds (#248).
+///
+/// A `SyncNegotiatePayload` is a copy of every save, and `Negotiate` built one
+/// beside the tick's own list -- ~300 bytes a save at `scan::kMaxSaves`, in the
+/// plan phase, for a body it then built from the copy. This reads them where
+/// they are, and the body it returns is exactly its length: measured first and
+/// then written, where a body appended to doubled its way there and held up to
+/// twice itself.
+Encoded EncodeNegotiateRequest(const std::optional<std::string>& device_id,
+                               const std::vector<ClientSaveState>& saves,
+                               const std::vector<std::int64_t>* rom_ids,
+                               const std::optional<std::vector<std::string>>& emulators,
+                               bool restore_unlisted);
+
 // --- the answer ---------------------------------------------------------------
 
 /// What the server decided to do about one save.
