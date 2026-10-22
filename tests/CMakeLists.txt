@@ -2559,7 +2559,8 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   target_compile_options(test_heap_steady PRIVATE -fno-allocation-dce)
 endif()
 
-foreach(scenario counts judge log_ring page_parse heartbeat response_parse wrong_shape)
+foreach(scenario counts judge log_ring page_parse heartbeat response_parse wrong_shape
+                 queue_write)
   add_test(NAME alloc.${scenario} COMMAND test_heap_steady ${scenario})
   set_tests_properties(alloc.${scenario} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 endforeach()

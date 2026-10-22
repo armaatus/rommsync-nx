@@ -953,6 +953,48 @@ void Placing(rig::Checks& checks) {
     checks.ExpectEq(sandbox.Read(target), std::string(40, 'z'), "with the server's bytes");
   }
 
+  // More of the server's states than one tick places (#247): every one is an
+  // operation the tick holds to its end, and a listing at its byte bound is ~220
+  // rows, so one tick places at most `kMaxStatePlacements` and the next places
+  // the rest -- which are this console's by then, and so claimed, not placed.
+  {
+    Sandbox sandbox(checks, "states-placing-bounded");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    constexpr std::size_t kMore = 5;
+    const std::size_t rows = sync::kMaxStatePlacements + kMore;
+    std::string listing = "[";
+    for (std::size_t at = 0; at < rows; ++at) {
+      listing += (at == 0 ? "" : ",") +
+                 StateRowJson(static_cast<std::int64_t>(at) + 100, 1,
+                              "Game " + std::to_string(at) + ".state", "retroarch", 40,
+                              "2026-09-06T03:00:00+00:00");
+    }
+    ScriptedClient client;
+    client.listing = listing + "]";
+    client.content = std::string(40, 'z');
+    sync::StateSyncOptions options = OptionsAt(kStamp);
+    options.place = [](const sync::ServerState& server) {
+      rommsync::place::Placement placement;
+      placement.sd_path = "/placed/" + server.file_name;
+      return placement;
+    };
+    state::Baseline baseline;
+    const sync::StateSyncReport report =
+        sync::SyncStates(client, *files, token, StatesOn(true), index, &baseline, options);
+    checks.ExpectEq(report.operations.size(), sync::kMaxStatePlacements,
+                    "one tick places at most kMaxStatePlacements of the server's states");
+    checks.ExpectEq(report.completed, static_cast<int>(sync::kMaxStatePlacements),
+                    "and each of those was placed");
+    checks.Expect(!sandbox.Exists("/placed/Game " + std::to_string(rows - 1) + ".state"),
+                  "the last row waits for the next tick");
+    checks.Expect(std::any_of(report.warnings.begin(), report.warnings.end(),
+                              [](const std::string& warning) {
+                                return warning.find("next sync") != std::string::npos;
+                              }),
+                  "and the tick says the rest wait for the next");
+  }
+
   // And a placement that says why it places nothing carries the reason.
   {
     Sandbox sandbox(checks, "states-placing-reason");

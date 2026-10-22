@@ -26,6 +26,10 @@
 //   alloc.wrong_shape
 //                  a body of the wrong shape is refused before it is parsed, not
 //                  after (M9-20, see `WrongShape`).
+//   alloc.queue_write
+//                  writing the download queue, rolling a write back, and listing
+//                  it cost a few entries however full it is, not a copy of it
+//                  (M9-21, see `QueueWrite`).
 //   alloc.steady   the real `SdEngine` -- its worker, its scheduler, the fixture
 //                  RomM -- run tick after tick through the IPC table, with what
 //                  is outstanding sampled between ticks. After a warm-up that
@@ -851,6 +855,140 @@ void HeartbeatCost(checks::Checks& c) {
                                       std::to_string(large_peak));
 }
 
+// --- the download queue, written and listed at its bound (M9-21, #247) --------
+
+/// A string of exactly `width` bytes, ending in `tag` so no two are equal, built
+/// at its own length: a `+` that grew one would measure libstdc++'s doubling,
+/// which `queue.json`'s reader does not do.
+std::string ExactText(std::size_t width, char fill, std::size_t tag) {
+  std::string text(width, fill);
+  const std::string digits = std::to_string(1000 + tag);
+  text.replace(width - digits.size(), digits.size(), digits);
+  return text;
+}
+
+/// A queue entry with every string at its own bound: `fs_name` and
+/// `destination` at `config::kMaxPathLength`, `message` at `kMaxMessageChars`.
+rommsync::download::QueueEntry WidestEntry(std::size_t at) {
+  rommsync::download::QueueEntry entry;
+  entry.rom_id = static_cast<std::int64_t>(at) + 1;
+  entry.platform_fs_slug = "gba";
+  entry.fs_name = ExactText(rommsync::config::kMaxPathLength, 'n', at);
+  entry.destination = "/" + ExactText(rommsync::config::kMaxPathLength - 1, 'd', at);
+  entry.sha1_hash = std::string(40, 'a');
+  entry.message = ExactText(rommsync::download::kMaxMessageChars, 'm', at);
+  entry.state = rommsync::download::QueueState::kDone;
+  entry.queued_at = 1704067200;
+  return entry;
+}
+
+/// Writing the queue costs a few entries, not the queue again.
+///
+/// Every change to the queue is written whole, from the IPC thread as well as
+/// the worker, and until #247 each write held the queue three times over: the
+/// queue, a copy of all of it to roll back to, and all of it serialised -- at
+/// the entries' bounds a full queue is ~2 KiB an entry, so a write was a few
+/// hundred KiB that no row of the heap table had. Listing the queue to the
+/// overlay copied all of it too. Each must now cost what a handful of entries
+/// cost, however full the queue is.
+void QueueWrite(checks::Checks& c) {
+  namespace download = rommsync::download;
+  rommsync::host::InstallPosixFileSync();
+  std::error_code error;
+  const std::filesystem::path dir = std::filesystem::path(rig::ScratchDir()) / "alloc-queue";
+  std::filesystem::remove_all(dir, error);
+  std::filesystem::create_directories(dir, error);
+  const std::string path = (dir / download::kQueueFileName).string();
+
+  std::vector<download::QueueEntry> entries;
+  for (std::size_t at = 0; at < download::kMaxQueueEntries; ++at) {
+    entries.push_back(WidestEntry(at));
+  }
+  // What one entry holds, so the bound below is in entries rather than bytes
+  // either standard library would disagree about.
+  std::int64_t one = 0;
+  {
+    const std::int64_t before = count_new::Now().outstanding_bytes;
+    const download::QueueEntry copy = entries.front();
+    one = count_new::Now().outstanding_bytes - before + static_cast<std::int64_t>(sizeof(copy));
+  }
+  const std::int64_t kBound = 4 * one;
+  c.Expect(download::SaveQueue(path, entries).ok(), "a full queue at its widest is writable");
+
+  download::Queue queue;
+  queue.Reset(std::move(entries));
+  const auto store = [&path](const std::vector<download::QueueEntry>& rows) {
+    return download::SaveQueue(path, rows).ok();
+  };
+
+  download::QueueEntry changed = queue.Find(1);
+  changed.message = "moved on";
+  count_new::ResetPeak();
+  std::int64_t before = count_new::Now().outstanding_bytes;
+  c.Expect(queue.UpdateAndStore(changed, store) == download::Queue::Committed::kOk,
+           "an update is written");
+  const std::int64_t update = count_new::Now().peak_bytes - before;
+
+  download::QueueEntry removed;
+  count_new::ResetPeak();
+  before = count_new::Now().outstanding_bytes;
+  c.Expect(queue.RemoveAndStore(2, &removed, store) == ipc::Error::kOk, "a removal is written");
+  const std::int64_t remove = count_new::Now().peak_bytes - before;
+
+  std::int32_t position = 0;
+  count_new::ResetPeak();
+  before = count_new::Now().outstanding_bytes;
+  c.Expect(queue.EnqueueAndStore(5000, &position, store) == ipc::Error::kOk,
+           "an enqueue into a full queue (a finished row makes way) is written");
+  const std::int64_t enqueue = count_new::Now().peak_bytes - before;
+
+  // A write that fails is rolled back exactly, at the same cost.
+  download::QueueEntry refused = queue.Find(3);
+  refused.message = "never written";
+  count_new::ResetPeak();
+  before = count_new::Now().outstanding_bytes;
+  c.Expect(queue.UpdateAndStore(refused, [](const std::vector<download::QueueEntry>&) {
+    return false;
+  }) == download::Queue::Committed::kStoreFailed,
+           "a refused write is reported");
+  const std::int64_t rollback = count_new::Now().peak_bytes - before;
+  c.Expect(queue.Find(3).message != "never written", "and undone");
+  c.ExpectEq(queue.size(), download::kMaxQueueEntries, "and the queue is still full");
+
+  std::cout << "one entry at its widest: " << one << " bytes; a write peaks at " << update
+            << " (update), " << remove << " (remove), " << enqueue << " (enqueue), " << rollback
+            << " (refused) over the " << download::kMaxQueueEntries << "-entry queue\n";
+  c.Expect(update < kBound, "an update costs a few entries, not the queue: " +
+                                std::to_string(update) + " >= " + std::to_string(kBound));
+  c.Expect(remove < kBound, "a removal costs a few entries, not the queue: " +
+                                std::to_string(remove) + " >= " + std::to_string(kBound));
+  c.Expect(enqueue < kBound, "an enqueue costs a few entries, not the queue: " +
+                                 std::to_string(enqueue) + " >= " + std::to_string(kBound));
+  c.Expect(rollback < kBound, "a rollback costs a few entries, not the queue: " +
+                                  std::to_string(rollback) + " >= " + std::to_string(kBound));
+
+  // The overlay's queue screen, a page of it: the page is `kHeapListPages`'s,
+  // and nothing beside it may be the whole queue.
+  rommsync::config::Config configuration = rommsync::config::Defaults();
+  rommsync::lists::Service service(rommsync::lists::Service::FixedConfig(configuration), queue);
+  ipc::ListRequest request;
+  request.kind = ipc::ListKind::kQueue;
+  ipc::Cursor cursor = 0;
+  c.Expect(service.ListBegin(request, &cursor) == ipc::Error::kOk, "the queue list opens");
+  ipc::ListPage page;
+  count_new::ResetPeak();
+  before = count_new::Now().outstanding_bytes;
+  c.Expect(service.ListNext(cursor, &page) == ipc::Error::kOk, "and serves a page");
+  const std::int64_t listed = count_new::Now().peak_bytes - before;
+  const std::int64_t kept = count_new::Now().outstanding_bytes - before;
+  std::cout << "a queue page of " << page.items.size() << " items: " << kept
+            << " bytes kept, " << listed << " at its peak\n";
+  c.Expect(listed - kept < kBound,
+           "a queue page is built without a copy of the whole queue beside it: " +
+               std::to_string(listed - kept) + " >= " + std::to_string(kBound));
+  std::filesystem::remove_all(dir, error);
+}
+
 int main(int argc, char** argv) {
   const std::string scenario = argc > 1 ? argv[1] : "counts";
   // Refused rather than clamped: a mistyped round count on the soak workflow's
@@ -873,13 +1011,15 @@ int main(int argc, char** argv) {
   rig::Checks checks;
   if (scenario == "counts" || scenario == "judge" || scenario == "log_ring" ||
       scenario == "page_parse" || scenario == "heartbeat" || scenario == "response_parse" ||
-      scenario == "wrong_shape") {
+      scenario == "wrong_shape" || scenario == "queue_write") {
     if (scenario == "counts") {
       Counts(checks);
     } else if (scenario == "response_parse") {
       ResponseParse(checks);
     } else if (scenario == "wrong_shape") {
       WrongShape(checks);
+    } else if (scenario == "queue_write") {
+      QueueWrite(checks);
     } else if (scenario == "heartbeat") {
       HeartbeatCost(checks);
     } else if (scenario == "judge") {

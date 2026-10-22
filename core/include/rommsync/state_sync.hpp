@@ -91,6 +91,18 @@ namespace rommsync::sync {
 /// #246), which `sysmodule/source/main.cpp` counts.
 inline constexpr std::size_t kMaxStateListBytes = 128 * 1024;
 
+/// The most server states one run places, keeps both of or fails to place --
+/// every row of the listing no local state claimed (M9-21, #247).
+///
+/// Each is an operation the tick holds to its end, ~1 KiB on aarch64 with the
+/// server's row copied into it, and a listing at `kMaxStateListBytes` is ~220
+/// rows: unbounded, the placements alone were most of the tick's heap row. At
+/// `scan::kMaxStates` they cost what the scan's own states do, and a console
+/// tracks no more states than that anyway. **The rest are not dropped**: a
+/// placed state is this console's from then on, claimed by the next run's scan
+/// rather than placed again, so the next run places the next ones.
+inline constexpr std::size_t kMaxStatePlacements = scan::kMaxStates;
+
 /// One row of `GET /api/states`, reduced to what arbitration uses.
 ///
 /// The listing is taken **unfiltered, once per run**. The endpoint takes an
