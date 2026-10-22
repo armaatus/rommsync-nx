@@ -288,8 +288,8 @@ void Counts(rig::Checks& checks) {
 
 // --- parse --------------------------------------------------------------------
 //
-// The response, read against the body a live 5.2.0 actually sent
-// (server/contract/captures/sync-complete.json). Everything here is offline: the
+// The response, read against the body a live 5.4.0 actually sent
+// (server/contract/captures/5.4.0/sync-complete.json). Everything here is offline: the
 // capture is the same bytes docs/API_CONTRACT.md quotes.
 
 void Parse(rig::Checks& checks) {

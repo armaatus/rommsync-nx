@@ -1,19 +1,21 @@
 // The negotiate PLAN against the real captured responses.
 //
 // The bodies here are not typed out from the docs: they are read from
-// server/contract/captures/, the unedited replies a live RomM 5.2.0 sent
-// (issue M0-4), which `contract.captures` re-checks against a running server.
+// server/contract/captures/5.4.0/, the unedited replies a live RomM 5.4.0 sent
+// -- the floor this client accepts -- which `contract.captures` re-checks
+// against a running server. The root captures are 5.2.0's (M0-4), kept as
+// history and read by nothing here.
 // So this keeps `SyncPlan` honest against those bytes, the way `auth.shapes`
 // does for the pairing responses.
 //
 // Two things the captures cannot cover, and that are checked here anyway:
 //
-//   - **The other eight reasons.** Only five of the thirteen strings 5.2.0 can
-//     emit appear in a capture, so the rest are pinned against the table in
+//   - **The other reasons.** Only some of the strings RomM can emit appear in
+//     a capture, so the rest are pinned against the table in
 //     docs/API_CONTRACT.md, in both directions -- a `reason` this client stopped
 //     recognising is a save it would silently take no action on.
 //   - **A server that moved.** An `action` this build does not know cannot be
-//     produced by a healthy 5.2.0 at all, and it is the one case where the
+//     produced by a healthy 5.4.0 at all, and it is the one case where the
 //     default branch is what overwrites a save. It is downgraded to `no_op`,
 //     reported, and checked here on a hand-built body -- the only shape in this
 //     file that no server sent.
@@ -197,12 +199,11 @@ void EmptyCapture(checks::Checks& c) {
              std::int64_t{0}, "and the totals agree");
 }
 
-/// 5.4.0's `delete` (#233), the one capture here from `captures/5.4.0/`: a slot
-/// emptied on the server, offered back by the device that wrote it. It is the
+/// 5.4.0's `delete` (#233): a slot emptied on the server, offered back by the device that wrote it. It is the
 /// first action that removes a file from the card, so it is pinned to the bytes
 /// the probe asserted rather than to a hand-built body.
 void DeleteCapture(checks::Checks& c) {
-  const auth::Parsed<sync::SyncPlan> parsed = ParseCapture(c, "5.4.0/sync-negotiate-delete.json");
+  const auth::Parsed<sync::SyncPlan> parsed = ParseCapture(c, "sync-negotiate-delete.json");
   const sync::SyncPlan& plan = parsed.value;
   c.ExpectEq(plan.total_delete, std::int64_t{1}, "total_delete is read");
   const sync::SyncOperation* deleted = nullptr;
@@ -222,18 +223,24 @@ void DeleteCapture(checks::Checks& c) {
   c.Expect(!deleted->server_content_hash.has_value(), "and no server copy");
 }
 
-/// A body without `total_delete` is a plan with no deletions. The 5.2.0
-/// captures and every hand-built body here have none, and a server below the
-/// 5.4.0 floor never reaches negotiate (sync_tick.hpp) -- so absent reads as
-/// zero rather than refusing a whole plan over a count nothing acts on.
+/// A body without `total_delete` is a plan with no deletions. 5.4.0 sends it
+/// on every plan and declares it required, but every hand-built body here omits
+/// it and a server below the 5.4.0 floor never reaches negotiate
+/// (sync_tick.hpp) -- so absent reads as zero rather than refusing a whole plan
+/// over a count nothing acts on. The body is 5.4.0's empty capture with that
+/// one field taken out, typed here because no server this client talks to
+/// sends it.
 void TotalDeleteIsOptional(checks::Checks& c) {
-  const auth::Parsed<sync::SyncPlan> parsed = ParseCapture(c, "sync-negotiate-empty.json");
+  const auth::Parsed<sync::SyncPlan> parsed = sync::ParseNegotiateResponse(
+      "{\"session_id\":1,\"operations\":[],\"total_upload\":0,\"total_download\":0,"
+      "\"total_conflict\":0,\"total_no_op\":0}");
+  c.Expect(parsed.ok(), "a plan without total_delete parses: " + parsed.error.Describe());
   c.ExpectEq(parsed.value.total_delete, std::int64_t{0}, "an absent total_delete is zero");
 }
 
 // --- the reason table ---------------------------------------------------------
 
-/// The complete set 5.2.0 can emit, from
+/// The complete set RomM can emit, from
 /// docs/API_CONTRACT.md#save-sync--negotiate--execute--complete. Typed out here
 /// on purpose: this table and the one in core/src/sync_negotiate.cpp are the two
 /// directions, and a reason that drifted in one of them is caught by the other.

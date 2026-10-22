@@ -98,8 +98,9 @@ target_link_libraries(test_json PRIVATE rommsync::core)
 target_include_directories(test_json PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 add_test(NAME core.json COMMAND test_json)
 
-# The auth structs against the committed captures in server/contract/captures/.
-# It reads those files rather than restating them, so the structs are pinned to
+# The auth structs against the committed captures in
+# server/contract/captures/5.4.0/ -- the floor the product accepts; the root
+# captures are 5.2.0's, kept as history and pinned by nothing. It reads those files rather than restating them, so the structs are pinned to
 # the same bytes the docs quote and contract.captures re-checks against a live
 # RomM. No network, so it never skips either.
 add_executable(test_auth_shapes test_auth_shapes.cpp)
@@ -110,8 +111,8 @@ target_compile_definitions(test_auth_shapes PRIVATE
 add_test(NAME auth.shapes COMMAND test_auth_shapes)
 
 # The negotiate request payload, against the pinned OpenAPI snapshot rather than
-# against a second copy of the field names. server/contract/romm-openapi-5.2.0.json
-# is what M0-4 pinned; this keeps `ClientSaveState` honest against it in both
+# against a second copy of the field names. server/contract/romm-openapi-5.4.0.json
+# is the floor's snapshot (M0-4 pinned 5.2.0's); this keeps `ClientSaveState` honest against it in both
 # directions -- a field the snapshot grew, and a field the encoder invented, are
 # both red. No network, so it never skips.
 add_executable(test_sync_payload test_sync_payload.cpp)
@@ -122,9 +123,9 @@ target_compile_definitions(test_sync_payload PRIVATE
 add_test(NAME sync.payload COMMAND test_sync_payload)
 
 # The other direction: the plan RomM sends back, against the captured responses
-# in server/contract/captures/ rather than against a second copy of the field
-# names. The reason table is the part no capture can pin -- only five of the
-# thirteen strings 5.2.0 emits appear in one -- so it is checked against the
+# in server/contract/captures/5.4.0/ rather than against a second copy of the
+# field names. The reason table is the part no capture can pin -- most of the
+# strings RomM emits appear in none -- so it is checked against the
 # table in docs/API_CONTRACT.md instead. No network, so it never skips.
 add_executable(test_sync_plan test_sync_plan.cpp)
 target_link_libraries(test_sync_plan PRIVATE rommsync::core)

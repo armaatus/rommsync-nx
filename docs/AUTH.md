@@ -1,13 +1,18 @@
 # Authentication — device-code flow
 
-The Switch has no keyboard-friendly login. RomM 5.2.0 ships the OAuth 2.0 Device
-Authorization Grant, which is designed for exactly this: the device shows a short
-code, the human approves it once in a browser, the device gets a token.
+The Switch has no keyboard-friendly login. RomM ships the OAuth 2.0 Device
+Authorization Grant (since 5.2.0; this client requires 5.4.0), which is designed
+for exactly this: the device shows a short code, the human approves it once in a
+browser, the device gets a token.
 
-Every response below is real, captured from a live 5.2.0 by
-`server/probe_contract.py --auth --capture` and committed under
-`server/contract/captures/` (issue M0-4). `ctest -R contract` re-captures and
-compares, so a RomM upgrade that changes these shapes turns the suite red.
+Every response below is real, captured by `server/probe_contract.py --auth
+--capture`: first from a live 5.2.0 (issue M0-4, committed under
+`server/contract/captures/` and kept as history), then from a live 5.4.0 under
+`server/contract/captures/5.4.0/` -- the bodies `auth.shapes` and
+`device.shapes` pin. The pairing bodies are identical across the two but for
+ids and timestamps; `GET /api/devices/{id}` gained `capabilities` in 5.4.0.
+`ctest -R contract` re-captures against the fixture's RomM and compares, so a
+RomM upgrade that changes these shapes turns the suite red.
 
 The engine codes against [`core/include/rommsync/auth.hpp`](../core/include/rommsync/auth.hpp),
 whose structs carry exactly these fields with these types — no field is inferred
@@ -266,8 +271,9 @@ limiter answered.
 ## Where the OpenAPI snapshot and the running server disagree
 
 `server/contract/romm-openapi-5.2.0.json` is what RomM *declares*; the captures
-are what it *does*. Both were checked field by field against this worktree's
-fixture, and on the **response bodies they agree exactly**: no field the
+are what it *does*. Both were checked field by field against a 5.2.0 fixture
+(5.4.0's snapshot, `romm-openapi-5.4.0.json`, is the one `sync.payload` now
+pins), and on the **response bodies they agree exactly**: no field the
 snapshot declares is missing from a live response, and no live response carries
 a field the snapshot does not declare. Where they part company is everything the
 snapshot does not model.

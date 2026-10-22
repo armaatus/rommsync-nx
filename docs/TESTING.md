@@ -439,7 +439,7 @@ ctest --test-dir build --output-on-failure
   that dies mid-body. They are `RUN_SERIAL` for the ten-inits-a-minute limit
   below, and because two of them at once would count each other's device rows.
 - `device.shapes` is the no-network half: `DeviceSchema` parsed out of
-  `captures/devices-get.json`, and the classification the sysmodule acts on —
+  `captures/5.4.0/devices-get.json`, and the classification the sysmodule acts on —
   registered / paired-but-not / unpaired, and whether a failure is worth
   retrying or worth a trip to the pairing screen. It never skips.
 - `core.token_store` covers `token.dat`: the atomic write, and specifically what
@@ -537,16 +537,17 @@ ctest --test-dir build --output-on-failure
   holds.
 - `sync.payload` pins the negotiate shapes to the committed OpenAPI snapshot
   rather than to a second copy of the field names: tables in the test are
-  checked against `server/contract/romm-openapi-5.2.0.json` — `ClientSaveState`
-  and `SyncNegotiatePayload` going out (M2-1), `SyncOperationSchema` and
-  `SyncNegotiateResponse` coming back (M2-4), plus the four `action` values the
-  schema enumerates — *and* `ClientSaveState` is checked again against a body
+  checked against `server/contract/romm-openapi-5.4.0.json`, the floor's
+  snapshot — `ClientSaveState` and `SyncNegotiatePayload` going out (M2-1),
+  `SyncOperationSchema` and `SyncNegotiateResponse` coming back (M2-4), plus the
+  five `action` values the schema enumerates — *and* `ClientSaveState` is checked again against a body
   `EncodeNegotiateRequest` actually produced, so drift on either side is red.
 - `sync.plan` is the response half, read off the committed captures rather than
-  restated: every field of `SyncOperation` against the five negotiate captures,
+  restated: every field of `SyncOperation` against the negotiate captures in
+  `captures/5.4.0/`,
   including the `upload` one where `save_id`, `server_updated_at` and
   `server_content_hash` are all null. Two things no capture can pin are checked
-  there too — the eight `reason` strings 5.2.0 can emit that no capture holds
+  there too — the `reason` strings RomM can emit that no capture holds
   (against the table in [API_CONTRACT.md](API_CONTRACT.md), in both directions),
   and an `action` from a server newer than this client, which is downgraded to
   `no_op`, flagged and logged rather than guessed at. That last body is the only

@@ -2,7 +2,7 @@
 //
 // One table below (`kSaveFields`) says what `ClientSaveState`'s seven fields are
 // called, which are required, and which may be null. It is checked against
-// server/contract/romm-openapi-5.2.0.json -- so a RomM that renames, re-types or
+// server/contract/romm-openapi-5.4.0.json -- so a RomM that renames, re-types or
 // re-requires a field goes red the moment the snapshot is refreshed -- and then
 // against a body `EncodeNegotiateRequest` actually produced, so the struct
 // cannot drift from the table either. Neither half is worth much alone: the
@@ -68,17 +68,23 @@ constexpr FieldSpec kSaveFields[] = {
     {"file_size_bytes", "integer", true, false},
 };
 
+/// The three after `saves` are 5.3/5.4's, and the encoder sends each only when
+/// asked to: `rom_ids` (#232), `restore_unlisted` (#241), `emulators` (#236).
+/// Their encoding is pinned below, each in its own check.
 constexpr FieldSpec kPayloadFields[] = {
     {"device_id", "string", false, true},
     {"saves", "array", true, false},
+    {"rom_ids", "array", false, true},
+    {"restore_unlisted", "boolean", false, false},
+    {"emulators", "array", false, true},
 };
 
 /// `SyncOperationSchema`, the entry `SyncOperation` is read from.
 ///
 /// Five of the nine are declared `T | null` and only four are in the schema's
 /// `required` set -- which is a pydantic default, not a promise that the other
-/// five may be absent: 5.2.0 emits all nine on every operation, as every capture
-/// under server/contract/captures/ shows. `ParseNegotiateResponse` therefore
+/// five may be absent: 5.4.0 emits all nine on every operation, as every capture
+/// under server/contract/captures/5.4.0/ shows. `ParseNegotiateResponse` therefore
 /// reads all nine with `RequiredNullable`, so a server that genuinely stopped
 /// sending one is a named error rather than a field that silently defaulted.
 constexpr FieldSpec kOperationFields[] = {
@@ -100,6 +106,9 @@ constexpr FieldSpec kPlanFields[] = {
     {"total_download", "integer", true, false},
     {"total_conflict", "integer", true, false},
     {"total_no_op", "integer", true, false},
+    // 5.4.0's (#233), and required by it. `ParseNegotiateResponse` still reads
+    // it as optional -- absent is no deletions -- which `sync.plan` pins.
+    {"total_delete", "integer", true, false},
 };
 
 /// `SyncCompletePayload`, the body step 3 sends (M2-6).
@@ -118,8 +127,8 @@ constexpr FieldSpec kCompletePayloadFields[] = {
 ///
 /// All twelve are read by `ParseCompleteResponse`, not the six a caller looks
 /// at, and all twelve strictly -- including the two this table marks *not*
-/// required. 5.2.0 emits every one of them on every response
-/// (`captures/sync-complete.json`), so a server that stopped sending one is a
+/// required. 5.4.0 emits every one of them on every response
+/// (`captures/5.4.0/sync-complete.json`), so a server that stopped sending one is a
 /// change worth a named error rather than a field that silently defaulted. This
 /// table pins what the snapshot *declares*; the strictness is the reader's
 /// decision and is argued in sync.hpp.
@@ -146,10 +155,10 @@ constexpr FieldSpec kCompleteResponseFields[] = {
     {"play_session_ingest", "", false, true},
 };
 
-/// The four actions, in the schema's own order. `no_op` carries the underscore;
+/// The five actions, in the schema's own order. `no_op` carries the underscore;
 /// a client that guessed `noop` would take every no-op through the unknown
-/// branch (`sync.plan` checks the classifier itself).
-constexpr const char* kActions[] = {"upload", "download", "conflict", "no_op"};
+/// branch (`sync.plan` checks the classifier itself). `delete` is 5.4.0's (#233).
+constexpr const char* kActions[] = {"upload", "download", "conflict", "no_op", "delete"};
 
 std::string ReadFile(const std::string& path) {
   std::ifstream in(path, std::ios::binary);
@@ -355,7 +364,7 @@ void SnapshotPin(checks::Checks& c) {
   if (enumerated == nullptr) {
     c.Expect(false, "SyncOperationSchema.action enumerates its values");
   } else {
-    c.ExpectEq(enumerated->size(), std::size(kActions), "the snapshot declares four actions");
+    c.ExpectEq(enumerated->size(), std::size(kActions), "the snapshot declares five actions");
     for (const char* expected : kActions) {
       c.Expect(Lists(enumerated, expected),
                std::string("the snapshot still declares the action ") + expected);

@@ -1,11 +1,11 @@
 // The auth structs against the REAL captured payloads.
 //
 // The bodies here are not typed out from the docs: they are read from
-// server/contract/captures/, the unedited responses a live RomM 5.2.0 sent
-// (issue M0-4). contract.captures keeps those files honest against a running
-// server; this keeps the structs honest against those files. Between the two,
-// a RomM that renames a field turns something red instead of being discovered
-// on a console.
+// server/contract/captures/5.4.0/, the unedited responses a live RomM 5.4.0 sent
+// (the root captures are 5.2.0's, from M0-4, kept as history). contract.captures
+// keeps those files honest against a running server; this keeps the structs
+// honest against those files. Between the two, a RomM that renames a field
+// turns something red instead of being discovered on a console.
 //
 // No network here, so this never skips.
 #include <algorithm>
@@ -89,8 +89,8 @@ void InitCapture(checks::Checks& c) {
   c.Expect(init.poll_interval() == std::chrono::seconds{5}, "poll_interval");
   c.Expect(init.lifetime() == std::chrono::seconds{600}, "lifetime");
 
-  // 5.2.0 sends a path. A RomM that moved to RFC 8628's absolute
-  // `verification_uri` must not have an origin glued onto the front of it.
+  // RomM sends a path, 5.2.0 and 5.4.0 alike. A RomM that moved to RFC 8628's
+  // absolute `verification_uri` must not have an origin glued onto the front.
   auth::DeviceInitResponse absolute = init;
   absolute.verification_path = "https://romm.example/pair/device";
   c.ExpectEq(absolute.VerificationUrl("http://romm.lan:8080"),
@@ -122,8 +122,8 @@ void TokenCapture(checks::Checks& c) {
   c.Expect(token.HasScope("roms.read"), "an approved scope is found");
   c.Expect(!token.HasScope("me.write"), "a scope that was never requested is not");
 
-  // The one nullable field, and null on every 5.2.0 response: this token does
-  // not expire on its own, which is never an error.
+  // The one nullable field, and null on every response 5.2.0 and 5.4.0 send:
+  // this token does not expire on its own, which is never an error.
   c.Expect(!token.expires_at.has_value(), "expires_at is null");
 
   // **And there is no refresh token**, which is why M1-4 (#8) has no refresh in
