@@ -149,13 +149,13 @@ elif [ $(( bss - heap )) -gt "$BSS_OTHER" ]; then
         "$(( bss - heap )) bytes of it is something other than the heap, more than" \
         "the $BSS_OTHER this allows (#207, #204)"
 fi
-if [ "$eh" -ge "$EH_FRAME_CEILING" ]; then
+if [ "$eh" -gt "$EH_FRAME_CEILING" ]; then
   error "the sysmodule's .eh_frame is $eh bytes, past the $EH_FRAME_CEILING ceiling (#200)"
 fi
-if [ "$text" -ge "$TEXT_CEILING" ]; then
+if [ "$text" -gt "$TEXT_CEILING" ]; then
   error "the sysmodule's .text is $text bytes, past $TEXT_CEILING -- is switch.mk still -Os? (#200)"
 fi
-if [ "$ovl_text" -ge "$TEXT_CEILING" ]; then
+if [ "$ovl_text" -gt "$TEXT_CEILING" ]; then
   error "the overlay's .text is $ovl_text bytes, past $TEXT_CEILING -- is switch.mk still -Os? (#200)"
 fi
 if [ "$ovl_bytes" -gt "$OVL_BUDGET" ]; then

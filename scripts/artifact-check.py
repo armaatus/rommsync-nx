@@ -60,6 +60,7 @@ _spec = importlib.util.spec_from_file_location("npdm_check", os.path.join(HERE, 
 npdm_check = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(npdm_check)
 read_pfs0 = npdm_check.read_pfs0
+_cstring = npdm_check._cstring
 
 # core/include/rommsync/version.hpp.in's `kBuildMarker`, up to the version.
 MARKER_PREFIX = b"ROMMSYNC_NX_VERSION="
@@ -77,10 +78,6 @@ NACP_DISPLAY_VERSION = 0x3060
 
 class Failure(Exception):
     """The file is not the shape it claims, or a check ran and said no."""
-
-
-def _cstring(blob):
-    return blob.split(b"\0", 1)[0].decode("utf-8", "replace")
 
 
 def _read(path):
