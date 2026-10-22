@@ -1089,6 +1089,47 @@ void RetroArch(::checks::Checks& checks) {
                   "content dir and sorted: the core folder beside the rom");
   }
 
+  // A `savefile_directory` that is a mapped rom folder is one whatever
+  // retroarch.cfg calls it: its roms are not saves, they do not count against
+  // the scan's bound, and the .tmp a rom download stages there is not swept.
+  // Case-insensitively, as FAT32 is.
+  {
+    retroarch::Settings into_roms;
+    into_roms.savefile_directory = "/tico/ROMS/snes";
+    into_roms.sort_savefiles = false;
+    RetroArchCard card("ra-into-roms");
+    card.Save("/tico/ROMS/snes", "Snes Game.sfc");
+    card.Save("/tico/ROMS/snes", "Snes Game.srm");
+    const scan::ScanResult flat = scan::ScanSaves(defaults, into_roms, index, card.files, kFirstTick);
+    checks.Expect(FindSave(flat, "Snes Game.sfc") == nullptr,
+                  "savefile_directory a rom folder: the rom is not a save");
+    checks.Expect(FindSave(flat, "Snes Game.srm") != nullptr,
+                  "savefile_directory a rom folder: RetroArch's save beside it still is");
+    checks.Expect(!Read(flat, "/tico/ROMS/snes"),
+                  "savefile_directory a rom folder: not offered to the .tmp sweep");
+    checks.ExpectEq(flat.files_seen, std::size_t{1},
+                    "savefile_directory a rom folder: the rom is not a file the scan saw");
+
+    // Sorted, with the folder that holds every rom folder: each platform's rom
+    // folder is then a "core" folder under it.
+    retroarch::Settings above_roms;
+    above_roms.savefile_directory = "/tico/roms";
+    RetroArchCard above("ra-above-roms");
+    above.Save("/tico/roms/snes", "Snes Game.sfc");
+    above.Save("/tico/roms/gba", "Gba Game.gba");
+    above.Save("/tico/roms/mGBA", "Gba Game.srm");
+    const scan::ScanResult sorted =
+        scan::ScanSaves(defaults, above_roms, index, above.files, kFirstTick);
+    checks.Expect(FindSave(sorted, "Snes Game.sfc") == nullptr &&
+                      FindSave(sorted, "Gba Game.gba") == nullptr,
+                  "savefile_directory above the rom folders: no rom is a save");
+    checks.Expect(!Read(sorted, "/tico/roms/snes") && !Read(sorted, "/tico/roms/gba"),
+                  "savefile_directory above the rom folders: none is offered to the .tmp sweep");
+    const scan::SaveFile* gba = FindSave(sorted, "Gba Game.srm");
+    checks.Expect(gba != nullptr && gba->emulator == "mgba" && Read(sorted, "/tico/roms/mGBA"),
+                  "savefile_directory above the rom folders: a real core folder is read as one");
+  }
+
   // Cloud Sync on: RetroArch syncs itself and every RetroArch folder is left
   // alone, the map's included. Tico's are not RetroArch's.
   {
