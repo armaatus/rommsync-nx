@@ -150,9 +150,17 @@ int Severity(TickOutcome outcome) {
       return 3;
     case TickOutcome::kCanceled:
       return 4;
-    default:
-      return 1;
+    // No plan's run ends in these; enumerated rather than defaulted, so a new
+    // outcome is ranked on purpose.
+    case TickOutcome::kOffline:
+    case TickOutcome::kRefused:
+    case TickOutcome::kServerDisabled:
+    case TickOutcome::kDisabled:
+    case TickOutcome::kRescanNeeded:
+    case TickOutcome::kUnsupported:
+      break;
   }
+  return 1;
 }
 
 TickOutcome Worse(TickOutcome left, TickOutcome right) {
