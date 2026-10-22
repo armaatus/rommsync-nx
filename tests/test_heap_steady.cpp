@@ -78,9 +78,11 @@
 #include "rommsync/list_service.hpp"
 #include "rommsync/log.hpp"
 #include "rommsync/rom_index.hpp"
+#include "rommsync/save_scan.hpp"
 #include "rommsync/server_capabilities.hpp"
 #include "rommsync/state_sync.hpp"
 #include "rommsync/sync.hpp"
+#include "rommsync/sync_tick.hpp"
 #include "rommsync/token_store.hpp"
 
 namespace auth = rommsync::auth;
@@ -1004,6 +1006,341 @@ void QueueWrite(checks::Checks& c) {
   std::filesystem::remove_all(dir, error);
 }
 
+// --- what #248 found beside the table ------------------------------------------
+
+/// `n` short strings, as a JSON array: a metadata list the way RomM sends one.
+std::string NameList(int n, const char* what) {
+  std::string out = "[";
+  for (int at = 0; at < n; ++at) {
+    out += std::string(at == 0 ? "" : ",") + "\"" + what + " " + std::to_string(at) +
+           " of a popular title\"";
+  }
+  return out + "]";
+}
+
+/// The members RomM 5.4.0 attaches to a rom it identified on IGDB, at a popular
+/// title's widths: a summary, forty keywords, ten similar games with their
+/// covers, the merged `metadatum`. ~9 KiB, against `Row`'s ~3 -- the fixture's
+/// roms are homebrew nobody has metadata for, which is what the table's row
+/// widths were measured on. And a platform's `description` and `firmware`,
+/// which the platform list carries in the same rows.
+std::string WideMembers() {
+  std::string related = "[";
+  for (int at = 0; at < 10; ++at) {
+    related += std::string(at == 0 ? "" : ",") + "{\"id\":" + std::to_string(1000 + at) +
+               ",\"name\":\"Related Game Title Number " + std::to_string(at) +
+               ": Subtitle\",\"slug\":\"related-game-title-number-" + std::to_string(at) +
+               "-subtitle\",\"type\":\"game\",\"cover_url\":\"https://images.igdb.com/igdb/"
+               "image/upload/t_cover_big/co" +
+               std::to_string(4000 + at) + ".jpg\"}";
+  }
+  related += "]";
+  std::string firmware = "[";
+  for (int at = 0; at < 6; ++at) {
+    firmware += std::string(at == 0 ? "" : ",") + "{\"id\":" + std::to_string(at + 1) +
+                ",\"file_name\":\"scph" + std::to_string(5500 + at) +
+                ".bin\",\"file_path\":\"bios/psx\",\"file_size_bytes\":524288,\"md5_hash\":"
+                "\"490f666e1afb15b7362b406ed1cea246\",\"is_verified\":true}";
+  }
+  firmware += "]";
+  return ",\"summary\":\"" + std::string(900, 's') +
+         "\",\"igdb_metadata\":{\"total_rating\":\"91.5\",\"genres\":" + NameList(3, "Genre") +
+         ",\"keywords\":" + NameList(40, "Keyword") + ",\"themes\":" + NameList(3, "Theme") +
+         ",\"alternative_names\":" + NameList(8, "Alternative name") +
+         ",\"companies\":" + NameList(5, "Company") + ",\"game_modes\":" +
+         NameList(3, "Mode") + ",\"ports\":" + related + ",\"similar_games\":" + related +
+         "},\"metadatum\":{\"genres\":" + NameList(3, "Genre") +
+         ",\"companies\":" + NameList(5, "Company") + ",\"collections\":" +
+         NameList(2, "Collection") + "},\"merged_screenshots\":" + NameList(5, "Screenshot") +
+         ",\"description\":\"" + std::string(1500, 'd') + "\",\"firmware\":" + firmware +
+         ",\"has_nested_single_file\":false,\"missing_from_fs\":false,\"sha1_hash\":null,"
+         "\"md5_hash\":null";
+}
+
+/// `Row` with `WideMembers` in it.
+std::string WideRow(std::int64_t id) {
+  std::string row = Row(id);
+  row.pop_back();
+  return row + WideMembers() + "}";
+}
+
+/// A row is what is read of it, however wide RomM makes it.
+///
+/// Every reader above parses one row at a time, but parses all of it: a row's
+/// document is ~16x its text, so a rom RomM identified -- ~12 KiB of IGDB
+/// metadata, none of which this client reads -- was ~190 KiB of `json::Value`s
+/// in flight, beside the page's text, and a rom's detail before a download the
+/// same. The fixture's homebrew rows are 2.4 KiB, which is what the heap table
+/// was measured on (#248, §3). What a reader keeps of a row is a handful of
+/// short fields, and that is what its document may cost.
+void WideRows(checks::Checks& c) {
+  // A row's kept members as nodes, their strings, and the member vector as it
+  // grows: well under this on either standard library. The whole row's document
+  // is twenty times it.
+  constexpr std::int64_t kKeptRow = 8 * 1024;
+  const std::string wide = WideRow(1);
+  struct Case {
+    const char* what;
+    std::string body;
+    std::function<bool(const std::string&)> parse;
+  };
+  const Case cases[] = {
+      {"roms::ParsePage", "{\"items\":[" + wide + "],\"total\":1,\"limit\":1,\"offset\":0}",
+       [](const std::string& body) {
+         rommsync::roms::Page page;
+         return rommsync::roms::ParsePage(body, &page).ok() && page.roms.size() == 1;
+       }},
+      {"lists::ParseRomPage", "{\"items\":[" + wide + "],\"total\":1}",
+       [](const std::string& body) {
+         rommsync::lists::RomPage page;
+         return rommsync::lists::ParseRomPage(body, &page).ok() && page.roms.size() == 1;
+       }},
+      {"lists::ParsePlatforms", "[" + wide + "]",
+       [](const std::string& body) {
+         std::vector<rommsync::lists::PlatformRow> rows;
+         return rommsync::lists::ParsePlatforms(body, &rows).ok() && rows.size() == 1;
+       }},
+      {"download::ParseRomDetail", wide,
+       [](const std::string& body) {
+         rommsync::download::RomDetail detail;
+         return rommsync::download::ParseRomDetail(body, &detail).ok() &&
+                detail.file_names.size() == 1;
+       }},
+  };
+  for (const Case& one : cases) {
+    c.Expect(one.parse(one.body), std::string(one.what) + " reads a wide row");
+    const std::int64_t peak = PeakOf(one.body, one.parse);
+    std::cout << one.what << ": " << peak << " bytes for a row of " << wide.size()
+              << " bytes of text\n";
+    c.Expect(peak < kKeptRow, std::string(one.what) + " costs what it reads of a wide row, not "
+                                                     "its whole document: " +
+                                  std::to_string(peak) + " >= " + std::to_string(kKeptRow));
+  }
+}
+
+/// A fake RomM for one negotiation: it answers `answer` and notes what the
+/// process held at the moment the request went out.
+class Negotiating final : public http::HttpClient {
+ public:
+  explicit Negotiating(std::string answer) : answer_(std::move(answer)) {}
+
+  http::Result Send(const http::Request& request) override {
+    held_at_send = count_new::Now().outstanding_bytes;
+    body_bytes = static_cast<std::int64_t>(request.body.size());
+    http::Result result;
+    result.response.status = 200;
+    result.response.body = answer_;
+    return result;
+  }
+  http::Result Download(const http::Request&, const http::DownloadTarget&) override {
+    http::Result result;
+    result.error = http::Error::kConnectFailed;
+    return result;
+  }
+
+  std::int64_t held_at_send = 0;
+  std::int64_t body_bytes = 0;
+
+ private:
+  std::string answer_;
+};
+
+/// The negotiate request's body is held once, and not beside the plan (§1).
+///
+/// One entry per save the card holds, ~250 bytes each at `scan::kMaxSaves`, and
+/// until #248 it was there several times over while the plan arrived: the saves
+/// copied into the payload, the body as it doubled its way to its length, and a
+/// copy of it in the request -- all of it still held while the answer was
+/// parsed into the plan, which is the tick's plan phase.
+void NegotiateExchange(checks::Checks& c) {
+  namespace sync = rommsync::sync;
+  std::vector<sync::ClientSaveState> saves;
+  for (std::size_t at = 0; at < rommsync::scan::kMaxSaves; ++at) {
+    sync::ClientSaveState save;
+    save.rom_id = static_cast<std::int64_t>(at) + 1;
+    save.file_name = "Synthetic Adventure Game " + std::to_string(1000 + at) + " (USA, Europe).srm";
+    save.emulator = "mgba_libretro";
+    save.content_hash = std::string(32, 'a');
+    save.updated_at = std::chrono::system_clock::now();
+    save.file_size_bytes = 131072;
+    saves.push_back(std::move(save));
+  }
+  const std::string answer = ArrayOf(
+      rommsync::scan::kMaxSaves, OperationRow, "{\"session_id\":4,\"operations\":",
+      ",\"total_upload\":0,\"total_download\":128,\"total_conflict\":0,\"total_no_op\":0}");
+  const std::int64_t parsing = PeakOf(answer, [](const std::string& body) {
+    return sync::ParseNegotiateResponse(body).ok();
+  });
+
+  auth::StoredToken token;
+  token.server_url = "http://romm.invalid";
+  token.access_token = "rmm_" + std::string(64, 'a');
+  token.device_id = "3e175584-2641-44bd-913b-e42d8fc64f85";
+  Negotiating client(answer);
+  sync::NegotiateOptions options;
+  options.max_attempts = 1;
+
+  count_new::ResetPeak();
+  const std::int64_t before = count_new::Now().outstanding_bytes;
+  const sync::Negotiation negotiated = sync::Negotiate(client, token, saves, options);
+  const std::int64_t peak = count_new::Now().peak_bytes - before;
+  c.Expect(negotiated.ok() && negotiated.plan.operations.size() == saves.size(),
+           "the plan is read: " + negotiated.message);
+  const std::int64_t sending = client.held_at_send - before;
+  std::cout << "the request body is " << client.body_bytes << " bytes; " << sending
+            << " held as it went out; " << peak << " at the negotiation's peak, against "
+            << answer.size() << " of answer and a parse that peaks at " << parsing << "\n";
+  c.Expect(sending < client.body_bytes + 2048,
+           "the body is held once as it goes out: " + std::to_string(sending) + " for a body of " +
+               std::to_string(client.body_bytes));
+  c.Expect(peak < static_cast<std::int64_t>(answer.size()) + parsing + 4096,
+           "and is let go of before the plan is read: " + std::to_string(peak) + " >= " +
+               std::to_string(static_cast<std::int64_t>(answer.size()) + parsing + 4096));
+}
+
+/// A list page costs the page, not the page again while it is measured (§6).
+///
+/// `ipc::AppendIfItFits` encoded the whole page on every append to see whether
+/// it still fit, so the last append held the page's text as it doubled past
+/// `kMaxPayloadBytes` -- ~24 KiB on the IPC thread, beside everything, measured
+/// 13 KiB past `kListPageBytes` for a queue page (#247). The encode that hands a
+/// page over is its text, once.
+void ListBuild(checks::Checks& c) {
+  const auto item = [](std::size_t at) {
+    ipc::ListItem built;
+    built.fields.push_back({"rom_id", ipc::ListValue::Integer(static_cast<std::int64_t>(at))});
+    built.fields.push_back(
+        {"fs_name", ipc::ListValue::Text("Synthetic Adventure Game " + std::to_string(at) +
+                                         " (USA, Europe).gba")});
+    built.fields.push_back({"platform_fs_slug", ipc::ListValue::Text("gba")});
+    built.fields.push_back({"state", ipc::ListValue::Text("queued")});
+    built.fields.push_back({"bytes_done", ipc::ListValue::Integer(0)});
+    built.fields.push_back({"size_bytes", ipc::ListValue::Integer(16777216)});
+    built.fields.push_back({"bytes_per_second", ipc::ListValue::Integer(0)});
+    built.fields.push_back({"attempts", ipc::ListValue::Integer(0)});
+    built.fields.push_back({"message", ipc::ListValue::Text("")});
+    return built;
+  };
+  std::int64_t one = 0;
+  {
+    const std::int64_t before = count_new::Now().outstanding_bytes;
+    const ipc::ListItem probe = item(1);
+    one = count_new::Now().outstanding_bytes - before;
+  }
+
+  ipc::ListPage page;
+  count_new::ResetPeak();
+  std::int64_t before = count_new::Now().outstanding_bytes;
+  for (std::size_t at = 0; ipc::AppendIfItFits(&page, item(at)); ++at) {
+  }
+  const std::int64_t held = count_new::Now().outstanding_bytes - before;
+  const std::int64_t built = count_new::Now().peak_bytes - before;
+  std::cout << "a page of " << page.items.size() << " items holds " << held
+            << " bytes and peaked at " << built << " while it was built (one item is " << one
+            << ")\n";
+  c.Expect(built - held < one + 1024,
+           "a page is built for the page and one item in flight: " +
+               std::to_string(built - held) + " >= " + std::to_string(one + 1024));
+
+  count_new::ResetPeak();
+  before = count_new::Now().outstanding_bytes;
+  const std::string text = ipc::EncodeListPage(page);
+  const std::int64_t encoded = count_new::Now().peak_bytes - before;
+  std::cout << "and is " << text.size() << " bytes of text, encoded at a peak of " << encoded
+            << "\n";
+  c.Expect(encoded < static_cast<std::int64_t>(text.size()) + 512,
+           "a page is encoded into its text once: " + std::to_string(encoded) + " for " +
+               std::to_string(text.size()));
+}
+
+/// A fake RomM for a tick that splits: the first negotiation names more than a
+/// plan holds, so the tick halves it and asks about each half in turn.
+class Chunking final : public http::HttpClient {
+ public:
+  http::Result Send(const http::Request& request) override {
+    http::Result result;
+    result.response.status = 200;
+    result.response.body = "{}";
+    if (request.url.find("/api/sync/negotiate") == std::string::npos) {
+      return result;
+    }
+    held_at_negotiation.push_back(count_new::Now().outstanding_bytes);
+    const bool whole = request.body.find("\"rom_ids\":[1,2]") != std::string::npos;
+    const std::size_t rows = whole ? rommsync::sync::kMaxPlanOperations + 1 : 100;
+    const std::int64_t rom = request.body.find("\"rom_ids\":[2]") != std::string::npos ? 2 : 1;
+    result.response.body = ArrayOf(
+        rows,
+        [rom](std::size_t at) {
+          return "{\"action\":\"no_op\",\"rom_id\":" + std::to_string(rom) + ",\"save_id\":" +
+                 std::to_string(at + 1) + ",\"file_name\":\"Synthetic Adventure Game (USA, "
+                 "Europe) [2026-10-21_09-02-11].srm\",\"slot\":\"slot-" +
+                 std::to_string(at) +
+                 "\",\"emulator\":\"mgba_libretro\",\"reason\":\"No changes since last sync\","
+                 "\"server_updated_at\":\"2026-10-21T09:02:11+00:00\",\"server_content_hash\":"
+                 "\"abd8fff93894e8112c7dd17386e54a5f\"}";
+        },
+        "{\"session_id\":" + std::to_string(held_at_negotiation.size()) + ",\"operations\":",
+        ",\"total_upload\":0,\"total_download\":0,\"total_conflict\":0,\"total_no_op\":" +
+            std::to_string(rows) + "}");
+    return result;
+  }
+  http::Result Download(const http::Request&, const http::DownloadTarget&) override {
+    http::Result result;
+    result.error = http::Error::kConnectFailed;
+    return result;
+  }
+
+  std::vector<std::int64_t> held_at_negotiation;
+};
+
+/// A tick asks about its next chunk without the last one's plan in hand (#248).
+///
+/// `TickResult` kept the last plan and what it did, so a tick of several chunks
+/// held the one before beside the next one arriving -- two plans and a run's
+/// results where `kHeapTickSaves` counts one plan. Each plan has been handed to
+/// `TickOptions::on_plan` by then, and nothing else reads it.
+void TickChunks(checks::Checks& c) {
+  namespace sync = rommsync::sync;
+  rommsync::host::InstallPosixFileSync();
+  std::error_code error;
+  const std::filesystem::path dir = std::filesystem::path(rig::ScratchDir()) / "alloc-chunks";
+  std::filesystem::remove_all(dir, error);
+  std::filesystem::create_directories(dir, error);
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(dir.string());
+
+  auth::StoredToken token;
+  token.server_url = "http://romm.invalid";
+  token.access_token = "rmm_" + std::string(64, 'a');
+  token.device_id = "3e175584-2641-44bd-913b-e42d8fc64f85";
+  sync::TickOptions options;
+  options.server = rommsync::server::CapabilitiesFor("5.4.0");
+  options.rom_scope = std::vector<std::int64_t>{1, 2};
+  options.negotiate.max_attempts = 1;
+  options.finish.complete.max_attempts = 1;
+  std::size_t plans = 0;
+  options.on_plan = [&plans](const sync::SyncPlan&, const sync::ExecutionReport&) { ++plans; };
+
+  Chunking client;
+  const sync::TickResult tick = sync::RunTick(client, *files, token, {}, {}, {}, options);
+  c.ExpectEq(plans, std::size_t{2}, "the tick ran both halves");
+  if (client.held_at_negotiation.size() != 3) {
+    c.Expect(false, "three negotiations: the whole scope, then each half; saw " +
+                        std::to_string(client.held_at_negotiation.size()));
+    return;
+  }
+  const std::int64_t first = client.held_at_negotiation[1];
+  const std::int64_t second = client.held_at_negotiation[2];
+  std::cout << "held as the first half was asked: " << first << " bytes; as the second: "
+            << second << " (" << tick.totals.plans << " plans)\n";
+  // A hundred operations and their results are ~100 KiB; the baseline the first
+  // half wrote is a few KiB.
+  c.Expect(second - first < 32 * 1024,
+           "the second half is asked without the first half's plan held: " +
+               std::to_string(second - first) + " bytes more");
+  std::filesystem::remove_all(dir, error);
+}
+
 int main(int argc, char** argv) {
   const std::string scenario = argc > 1 ? argv[1] : "counts";
   // Refused rather than clamped: a mistyped round count on the soak workflow's
@@ -1026,9 +1363,19 @@ int main(int argc, char** argv) {
   rig::Checks checks;
   if (scenario == "counts" || scenario == "judge" || scenario == "log_ring" ||
       scenario == "page_parse" || scenario == "heartbeat" || scenario == "response_parse" ||
-      scenario == "wrong_shape" || scenario == "queue_write") {
+      scenario == "wrong_shape" || scenario == "queue_write" || scenario == "wide_rows" ||
+      scenario == "negotiate_exchange" || scenario == "list_build" ||
+      scenario == "tick_chunks") {
     if (scenario == "counts") {
       Counts(checks);
+    } else if (scenario == "wide_rows") {
+      WideRows(checks);
+    } else if (scenario == "negotiate_exchange") {
+      NegotiateExchange(checks);
+    } else if (scenario == "list_build") {
+      ListBuild(checks);
+    } else if (scenario == "tick_chunks") {
+      TickChunks(checks);
     } else if (scenario == "response_parse") {
       ResponseParse(checks);
     } else if (scenario == "wrong_shape") {
