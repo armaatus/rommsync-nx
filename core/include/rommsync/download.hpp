@@ -980,10 +980,15 @@ struct DrainResult {
   int skipped = 0;
   int failed = 0;
 
-  /// The roms that reached `kDone` this drain, in order -- `downloaded` by id.
-  /// What the engine asks a save for next (#241): a rom that has just arrived
-  /// has an empty save folder, and its save is on the server. A cancelled or
-  /// failed drain still lists the ones it finished.
+  /// The roms that reached `kDone` this drain by arriving, in order. What the
+  /// engine asks a save for next (#241): a rom that has just arrived has an
+  /// empty save folder, and its save is on the server. A cancelled or failed
+  /// drain still lists the ones it finished.
+  ///
+  /// **Not a rom found already on the card** (`kAlreadyOnCardMessage`), which
+  /// `downloaded` still counts: the card held it before, so an empty save
+  /// folder beside it may be a save the user deleted, and asking with
+  /// `restore_unlisted` would put it back.
   std::vector<std::int64_t> done;
 
   /// Requests actually sent and the backoff actually asked for, so a caller can

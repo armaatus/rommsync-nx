@@ -1637,7 +1637,13 @@ class Drainer {
     switch (state) {
       case QueueState::kDone:
         ++downloaded_;
-        done_.push_back(entry.rom_id);
+        // A rom that was already on the card is not one that just arrived: the
+        // card has held it, so a save missing beside it may be one the user
+        // deleted, and `done` is what asks for a save with `restore_unlisted`
+        // (#241).
+        if (entry.message != kAlreadyOnCardMessage) {
+          done_.push_back(entry.rom_id);
+        }
         break;
       case QueueState::kSkipped:
         ++skipped_;
