@@ -385,10 +385,15 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
   };
 
   while (!pending.empty()) {
-    if (result.totals.plans > 0 && Canceled(options.cancel)) {
-      outcome = Worse(outcome, TickOutcome::kCanceled);
-      stop();
-      break;
+    if (result.totals.plans > 0) {
+      // A shutdown, or a game launched while the last plan ran (#242): the
+      // chunks left are the next tick's, unasked.
+      const bool canceled = Canceled(options.cancel);
+      if (canceled || (options.hold != nullptr && options.hold())) {
+        outcome = Worse(outcome, canceled ? TickOutcome::kCanceled : TickOutcome::kPartial);
+        stop();
+        break;
+      }
     }
     ScopeChunk chunk = std::move(pending.front());
     pending.pop_front();
