@@ -446,22 +446,35 @@ phase_tlsprobe() {
   # The footprint measurement compiles with what make makes of switch.mk, and
   # that is every flag switch.mk spells (#256). make's answer against the
   # file's text: a derivation that came back empty, or lost a flag, fails here.
-  local derived cxxflags flag
+  local derived cxxflags ldflags flag
   derived="$(bash "$REPO_ROOT/tlsprobe/measure-footprint.sh" --flags)" ||
     fail "measure-footprint.sh --flags could not read switch.mk's flags"
   cxxflags=" $(sed -n 's/^CXXFLAGS=//p' <<<"$derived") "
-  grep -q '^LDFLAGS=.*-specs=' <<<"$derived" ||
-    fail "measure-footprint.sh --flags gave no link flags: $derived"
+  ldflags=" $(sed -n 's/^LDFLAGS=//p' <<<"$derived") "
+  [[ "$ldflags" == *" -specs="*"/switch.specs "* ]] ||
+    fail "measure-footprint.sh would link without libnx's switch.specs: $derived"
   while read -r flag; do
     [[ "$cxxflags" == *" $flag "* ]] ||
       fail "measure-footprint.sh would compile without switch.mk's $flag: $derived"
   done < <(switch_mk_flags)
+  while read -r flag; do
+    [[ "$ldflags" == *" $flag "* ]] ||
+      fail "measure-footprint.sh would link without switch.mk's $flag: $derived"
+  done < <(switch_mk_ldflags)
   echo "$derived"
 
   echo "ok: the M0-1 probe builds as an NRO carrying $version, without core/"
 }
 
 # --- the footprint measurement's flags -------------------------------------------
+
+# The same for LDFLAGS: its literal flags, leaving out any that spells a make
+# variable -- `-specs=$(DEVKITPRO)/...` is a path in the image, and the map is
+# named per target.
+switch_mk_ldflags() {
+  sed -n 's/^LDFLAGS[[:space:]]*[:+]\{0,1\}=//p' "$REPO_ROOT/switch.mk" |
+    tr -s ' \t' '\n\n' | grep -E '^-' | grep -v '\$(' | sort -u
+}
 
 # The literal flags switch.mk's own definitions of ARCH, ROMMSYNC_WARNINGS,
 # CFLAGS and CXXFLAGS spell, continuation lines included, one a line. Read as
@@ -482,16 +495,17 @@ phase_footprint() {
   local script="$REPO_ROOT/tlsprobe/measure-footprint.sh"
   [ -f "$script" ] || fail "no tlsprobe/measure-footprint.sh"
   local flags
-  flags="$(switch_mk_flags)"
+  flags="$(switch_mk_flags; switch_mk_ldflags; echo '-specs=')"
   # Asserted, because an empty list would make the check below pass over a
   # script holding the whole copy.
   grep -qx -- '-fno-exceptions' <<<"$flags" && grep -qx -- '-Werror' <<<"$flags" ||
     fail "read no flags out of switch.mk; the check below would pass vacuously: $flags"
 
-  # The script's words, outside its comments, split the way a shell would.
+  # The script's words, outside its comments, split the way a shell would --
+  # and `-specs=` by its prefix, since its path is the image's to spell.
   local spelled
-  spelled="$(grep -v '^[[:space:]]*#' "$script" | tr -s " \t\"'\\\\" '\n\n\n\n\n' | sort -u |
-             comm -12 - <(echo "$flags"))"
+  spelled="$(grep -v '^[[:space:]]*#' "$script" | tr -s " \t\"'\\\\" '\n\n\n\n\n' |
+             sed 's/^-specs=.*/-specs=/' | sort -u | comm -12 - <(sort -u <<<"$flags"))"
   [ -z "$spelled" ] ||
     fail "tlsprobe/measure-footprint.sh spells switch.mk's flags itself ($(echo $spelled)); \
 read them from switch.mk, or the measurement drifts from the build (#256)"

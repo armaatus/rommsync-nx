@@ -312,10 +312,13 @@ class Elf:
         It does **not** keep out AArch64 literal pools, which the assembler
         emits inside `.text`: a constant whose word happens to match
         `0xD4xxxxx1` is indistinguishable from an `svc` here and would be
-        reported as a call this process makes. Every one of the 29 found today
+        reported as a call this process makes. Every one found today
         lands on a libnx `svc*` wrapper, so nothing is being papered over -- but
-        a failure naming a function that plainly issues no SVC is this, and the
-        answer is to look at the address, not to widen the grant.
+        a failure naming a function that plainly issues no SVC is this. Look at
+        the address before granting anything. Since the check became exact
+        (#256) there is no allowlist, so a confirmed literal can only be
+        granted: the conservative error, and the config's line should then say
+        why it is there.
         """
         calls = {}
         wanted = self.SHF_ALLOC | self.SHF_EXECINSTR

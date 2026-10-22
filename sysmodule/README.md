@@ -75,8 +75,9 @@ nothing outside it can issue an SVC:
   executable: `svcCreateCodeMemory`, `svcControlCodeMemory` and
   `svcMapProcessCodeMemory` are not granted, and `svcSetMemoryPermission` never
   grants execute. The `.nsp`'s NSO is elf2nso's copy of the ELF the scan reads.
-- **Nothing branches on the grant itself.** Mesosphère reads the SVC mask in
-  three places: at dispatch, for `svcGetInfo(InfoType_IsSvcPermitted)`, and
+- **Nothing branches on the grant itself.** This was read in October 2026,
+  against Atmosphère's `master` and the pinned image's libnx 4.12.0, so check it
+  again when either moves. Mesosphère reads the SVC mask in three places: at dispatch, for `svcGetInfo(InfoType_IsSvcPermitted)`, and
   when it pins or unpins a thread, where it keeps `ReturnFromException` (0x28)
   and `GetInfo` (0x29). Both of those are issued, so both stay. libnx's one
   branch on what is permitted is `jit.c`, on loader hints a sysmodule does not

@@ -41,10 +41,13 @@ IMAGE="$DEVKITPRO_IMAGE"
 # holds what this prints to switch.mk's text.
 #
 # The rule is handed to make with --eval, which defines it before switch.mk is
-# read; its recipe is expanded after, once every variable has its value. The
-# link map switch.mk asks for is named after the target ($*), so it is dropped
-# rather than written as `.map` into whatever directory make ran in.
-FLAGS_RULE='rommsync-flags: ; @: $(info CXXFLAGS=$(CXXFLAGS) $(foreach dir,$(LIBDIRS),-isystem $(dir)/include))$(info LDFLAGS=$(filter-out -Wl%.map,$(LDFLAGS)) $(LIBPATHS))'
+# read; its recipe is expanded after, once every variable has its value --
+# INCLUDE among them, which CFLAGS took while it was still empty. The include
+# path switch.mk builds for this directory names nothing that exists, so only
+# the toolchain's headers come of it. The link map switch.mk asks for is named
+# after the target ($*), so it is dropped rather than written as `.map` into
+# whatever directory make ran in.
+FLAGS_RULE='rommsync-flags: ; @: $(info CXXFLAGS=$(CXXFLAGS) $(INCLUDE))$(info LDFLAGS=$(filter-out -Wl%.map,$(LDFLAGS)) $(LIBPATHS))'
 
 missing="$(toolchain_missing)" && { echo "$missing" >&2; exit 1; }
 FLAGS="$(toolchain_run "$REPO_ROOT" \

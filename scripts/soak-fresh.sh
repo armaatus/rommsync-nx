@@ -70,7 +70,7 @@ except subprocess.TimeoutExpired:
     # the $(...) reading it would go on waiting.
     os.killpg(child.pid, signal.SIGKILL)
     child.wait()
-    print("gh gave no answer in %s s" % sys.argv[1], file=sys.stderr)
+    print("%s gave no answer in %s s" % (sys.argv[2], sys.argv[1]), file=sys.stderr)
     sys.exit(124)
 ' "$@"
 }

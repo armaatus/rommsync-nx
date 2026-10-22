@@ -14,7 +14,7 @@
 #   test_soak.sh bounded    a `gh` that never answers is abandoned within the
 #                           script's own timeout, on every attempt.
 #
-# Neither needs a network, a token or the rig, so neither skips.
+# None needs a network, a token or the rig, so none skips.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

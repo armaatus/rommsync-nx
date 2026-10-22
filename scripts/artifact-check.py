@@ -503,8 +503,10 @@ def main():
                 said = check_version(path, args.version)
             print("ok: %s: %s" % (path, said))
         # `struct.error` and `IndexError` are a file truncated past an offset
-        # this reads; `OSError` one that is not there. All are a FAIL line.
-        except (Failure, npdm_check.Failure, struct.error, IndexError, OSError) as failure:
+        # this reads, `ValueError` a string table with no terminator; `OSError`
+        # one that is not there. All are a FAIL line.
+        except (Failure, npdm_check.Failure, struct.error, IndexError, ValueError,
+                OSError) as failure:
             print("FAIL: %s: %s" % (path, failure), file=sys.stderr)
             status = 1
     return status
