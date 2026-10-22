@@ -1180,13 +1180,21 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// server.
   std::vector<install::Request> install_claims_;
 
+  /// Requests whose report RomM refused for what it said -- a 400 or a 422,
+  /// which resending does not change. Still taken on the server, so the next
+  /// claim hands them back; listed here so they are not queued and reported
+  /// again on every tick. At most `install::kMaxClaims`; forgotten with the
+  /// server, and with the boot.
+  std::vector<std::string> install_abandoned_;
+
   /// What this boot last told the server `remote_install` is, or empty when it
   /// has told it nothing yet. Guarded by `mutex_`, and forgotten with the server.
   std::optional<bool> install_registered_;
 
-  /// The claim answered 404 although the heartbeat said the feature is on: the
+  /// The claim answered 404 although the heartbeat said the feature is on -- the
   /// server turned it off since, or this pairing's device is not the one the
-  /// token is bound to. Not asked again until the server is read again.
+  /// token is bound to -- or the registration was refused outright. Not asked
+  /// again until the server is read again.
   bool install_refused_ = false;
 
   /// The last tick's outcome, as the status screen reads it.

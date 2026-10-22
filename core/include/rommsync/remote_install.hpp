@@ -15,7 +15,7 @@
 //   - **Register.** `PUT /api/devices/{id}` with `{"capabilities":
 //     {"remote_install": true}}`. Without it the web UI does not offer the
 //     console, and `POST .../installs` answers 400 "does not accept remote
-//     installs". A `PUT`, not the `POST /api/devices` the issue named, because
+//     installs". A `PUT`, not `POST /api/devices` with `capabilities`, because
 //     that call creates a second device however it is asked
 //     (device_registration.hpp) -- and pairing already made this one.
 //   - **Claim.** `POST /api/devices/{id}/installs/claim` takes every pending
@@ -30,7 +30,8 @@
 //     `already_installed` or `failed`, which ends the request. Only a taken
 //     request can be reported; one the user cancelled in the web UI meanwhile,
 //     or one already ended, answers 404, and so does one that expired
-//     (`DEVICE_INSTALL_REQUEST_TTL_DAYS`). Both mean "nothing left to report".
+//     (`DEVICE_INSTALL_REQUEST_TTL_DAYS`). All three mean "nothing left to
+//     report".
 //
 // What happens between the claim and the report is the download queue's, and
 // nothing new: the rom id goes in exactly as a press in the overlay puts it
@@ -155,13 +156,17 @@ struct Exchange {
 
   bool ok() const { return transport == http::Error::kNone && status == 0 && shape.ok(); }
 
-  /// Worth trying again later: no response, or a 5xx, 408 or 429.
+  /// Worth trying again: no response, a 5xx, 408 or 429 -- or a 409, which is
+  /// how RomM 5.4.0 answers a claim or a report whose Redis transaction kept
+  /// colliding with another writer (`InstallTransitionError`). A request a
+  /// device has claimed is never in the wrong status for its own report, so a
+  /// 409 here is that race and nothing else.
   bool transient() const;
 
   /// The request is not taken any more -- cancelled in the web UI, ended, or
   /// expired -- so there is nothing left to report on it. RomM answers 404 for
-  /// all three and 409 for a report racing another; both settle it.
-  bool ended() const { return status == 404 || status == 409; }
+  /// all three.
+  bool ended() const { return status == 404; }
 };
 
 struct Claimed {

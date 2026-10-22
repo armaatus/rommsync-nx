@@ -36,7 +36,9 @@ json::Error Fail(std::string field, std::string message) {
   return error;
 }
 
-bool TransientStatus(int status) { return status >= 500 || status == 408 || status == 429; }
+bool TransientStatus(int status) {
+  return status >= 500 || status == 408 || status == 429 || status == 409;
+}
 
 /// One exchange, retried with backoff while the failure is transient. `what`
 /// names it for the log, never with the token. The body of the last 2xx is left

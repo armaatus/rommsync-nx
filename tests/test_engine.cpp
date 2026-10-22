@@ -4790,20 +4790,22 @@ int RemoteInstall(http::HttpClient& client, const std::string& base) {
 
   // Where RomM records what a device reported: the request itself is gone
   // the moment it ends. Counted, because an earlier run left its own.
-  const auto done_notices = [&] {
+  const auto notices = [&](const std::string& status) {
     http::Request notifications;
     notifications.url = base + "/api/notifications";
     notifications.headers.push_back(
         {"Authorization", "Basic " + rig::Base64(std::string(rig::kUser) + ":" + rig::kPassword)});
     const std::string body = client.Send(notifications).response.body;
-    const std::string mark = "\"device_name\":\"rommsync-nx " + name + "\",\"status\":\"done\"";
+    const std::string mark =
+        "\"device_name\":\"rommsync-nx " + name + "\",\"status\":\"" + status + "\"";
     std::size_t seen = 0;
     for (std::size_t at = body.find(mark); at != std::string::npos; at = body.find(mark, at + 1)) {
       ++seen;
     }
     return seen;
   };
-  const std::size_t done_before = done_notices();
+  const std::size_t done_before = notices("done");
+  const std::size_t failed_before = notices("failed");
 
   TickOnce(console, ticks, c, "the first tick");
   const http::Result queued = queue_in_browser();
@@ -4828,7 +4830,7 @@ int RemoteInstall(http::HttpClient& client, const std::string& base) {
            "the rom the browser queued is on the card" + Rendered(console.Log()));
   c.ExpectEq(open(), std::size_t{0}, "and the request is ended, not left taken");
 
-  c.ExpectEq(done_notices(), done_before + 1,
+  c.ExpectEq(notices("done"), done_before + 1,
              "RomM was told it is done, and told the user so");
   c.Expect(Logged(console.Log(), "download.remote"), "the console's log says so too");
 
@@ -4837,6 +4839,19 @@ int RemoteInstall(http::HttpClient& client, const std::string& base) {
          std::chrono::steady_clock::now() < by) {
     std::this_thread::sleep_for(std::chrono::milliseconds{25});
   }
+
+  // Downloads switched off with a request outstanding: nothing here will fetch
+  // it, so the browser is told so rather than left waiting out its expiry, and
+  // stops offering the console.
+  c.ExpectEq(queue_in_browser().response.status, 201, "the web UI queues nova again");
+  c.Expect(console.Set(Edit("downloads", "enabled", "false")).outcome ==
+               ipc::WriteOutcome::kApplied,
+           "and downloads are switched off on the console");
+  TickOnce(console, ticks, c, "the tick after downloads went off");
+  c.ExpectEq(open(), std::size_t{0}, "that request is ended too");
+  c.ExpectEq(notices("failed"), failed_before + 1, "as failed, which the user is told");
+  c.ExpectEq(queue_in_browser().response.status, 400,
+             "and the web UI no longer offers this console");
   harness::DeleteDevice(client, base, fixture, token.device_id);
   return c.failures();
 }

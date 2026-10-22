@@ -606,7 +606,8 @@ the queue on the console, RomM is told and shows it.
 ```
 
 The console is not offered in the browser at all while `[downloads] enabled =
-false` (it says `RomM's web UI will not offer this console`), or when the
+false` (it says `RomM's web UI will not offer this console`, and any request it
+had taken is reported failed so the browser is not left waiting), or when the
 server has `DEVICE_INSTALL_ENABLED` off. A `warn download.remote` line is an
 exchange that did not work; the next tick tries again, and sync carries on
 either way.

@@ -50,8 +50,8 @@
 #include "power.hpp"
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/core.hpp"
-#include "rommsync/download.hpp"
 #include "rommsync/device_identity.hpp"
+#include "rommsync/download.hpp"
 #include "rommsync/file_system.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/list_service.hpp"
@@ -96,9 +96,9 @@ namespace {
 //   | the log's in-memory tail (M7-3)          | `kHeapLogTail`          | 0x1800  |   6 KiB |
 //   | the play-session buffer (M7-4)           | `kHeapPlaySessions`     | 0x8000  |  32 KiB |
 //   | the directories open at once (M9-2)      | `kHeapOpenDirectories`  | 0x2000  |   8 KiB |
-//   | the claimed remote installs (M10-19)     | `kHeapInstallClaims`    | 0x1000  |   4 KiB |
+//   | the claimed remote installs (M10-19)     | `kHeapInstallClaims`    | 0x2000  |   8 KiB |
 //   | newlib arena overhead and fragmentation  | `kHeapNewlibOverhead`   | 0x8000  |  32 KiB |
-//   | **peak**                                 | `kHeapPeak`             | 0x174000 | 1488 KiB |
+//   | **peak**                                 | `kHeapPeak`             | 0x175000 | 1492 KiB |
 //
 // The table is written this way so that something other than a reader adds it
 // up. `tests/test_heap_budget.py` totals these rows and compares each against
@@ -580,10 +580,14 @@ constexpr size_t kHeapLogTail = rommsync::log::kTailLines * rommsync::log::kMaxL
 constexpr size_t kHeapPlaySessions = 2 * rommsync::play::kMaxBufferBytes;
 constexpr size_t kHeapOpenDirectories = kMaxOpenDirectories * kOpenDirectoryBytes;
 // The engine's claimed requests (`SdEngine::install_claims_`), resident for the
-// boot, and the working copy a tick builds beside them before it swaps it in.
-// A request is its id -- a 36-byte UUID, one name's chunk -- and its rom id.
+// boot, with the working copy a tick or a report pass builds beside them; and
+// three lists of ids at most as long -- the requests given up on
+// (`install_abandoned_`, resident), its copy, and a pass's settled ones. A
+// request is its id -- a 36-byte UUID, one name's chunk -- and its rom id.
 constexpr size_t kHeapInstallClaims = RoundUpToKiB(
-    2 * rommsync::install::kMaxClaims * (sizeof(rommsync::install::Request) + kHeapNameBytes));
+    rommsync::install::kMaxClaims *
+    (2 * (sizeof(rommsync::install::Request) + kHeapNameBytes) +
+     3 * (sizeof(std::string) + kHeapNameBytes)));
 constexpr size_t kHeapNewlibOverhead = 0x8000;
 
 constexpr size_t kHeapPeak = kHeapSocketMemory + kHeapStateBaseline + kHeapTransferBuffer +
@@ -697,20 +701,20 @@ static_assert(kHeapLogTail == 0x1800, "log::kTailLines moved; retotal the table"
 static_assert(kHeapPlaySessions == 0x8000, "play::kMaxBufferBytes moved; retotal the table");
 static_assert(sizeof(rommsync::install::Request) == 40,
               "install::Request changed size; retotal the table");
-static_assert(kHeapInstallClaims == 0x1000, "install::kMaxClaims moved; retotal the table");
+static_assert(kHeapInstallClaims == 0x2000, "install::kMaxClaims moved; retotal the table");
 static_assert(kHeapOpenDirectories == 0x2000,
               "the direntry cache or the open-directory bound moved; retotal the table");
 // The one term with no bound behind it, so this pin is what binds the constant
 // to its row rather than a second reader of a bound. Changing the term is a red
 // build here, which is the point: it is the term a reader is likeliest to nudge.
 static_assert(kHeapNewlibOverhead == 0x8000, "the newlib arena term moved; retotal the table");
-static_assert(kHeapPeak == 0x174000, "the table above no longer sums to its peak row");
+static_assert(kHeapPeak == 0x175000, "the table above no longer sums to its peak row");
 
-// 0x180000 leaves 0xC000 -- 48 KiB -- over that peak, which is the margin a
+// 0x180000 leaves 0xB000 -- 44 KiB -- over that peak, which is the margin a
 // process nobody can attach a debugger to needs. It is the only margin stated
 // here on purpose: #207's prose quoted two, and the arithmetic gave neither.
 // M9-4 (#208) took 40 KiB of it for the PSC watcher's thread, which is the row
-// above, and M10-19 (#245) 4 KiB for the claimed installs.
+// above, and M10-19 (#245) 8 KiB for the claimed installs.
 //
 // **It grew by 0x20000 in M9-20 (#246)**, from 0x160000, when the two rows it
 // added -- a tick's saves and the list service's pages, 360 KiB between them --
@@ -794,7 +798,7 @@ constexpr size_t kInnerHeapSize = 0x180000;
 constexpr size_t kHeapMargin = kInnerHeapSize - kHeapPeak;
 
 static_assert(kHeapPeak < kInnerHeapSize, "the heap no longer covers the peak in the table above");
-static_assert(kHeapMargin == 0xC000,
+static_assert(kHeapMargin == 0xB000,
               "the margin in the sentence above is no longer the one left");
 
 alignas(16) u8 g_inner_heap[kInnerHeapSize];

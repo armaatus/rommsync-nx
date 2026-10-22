@@ -203,6 +203,7 @@ void SdEngine::ForgetServerLocked(bool different_server) {
   // One device's claims on one server, and what it was told: a re-pairing may
   // be a different device. The next claim hands back whatever is still taken.
   install_claims_.clear();
+  install_abandoned_.clear();
   install_registered_.reset();
   install_refused_ = false;
   if (different_server) {
@@ -1590,27 +1591,57 @@ void SdEngine::ServeInstalls(http::HttpClient& client, const auth::StoredToken& 
   policy.cancel = cancel;
   policy.wait = [this](std::chrono::milliseconds delay) { AwaitBackoff(delay); };
 
+  if (refused) {
+    return;
+  }
   if (registered != wanted) {
     // Once a boot, and again when the switch moves: a capability RomM already
     // holds costs nothing to restate, and one it lost to a re-pairing is put
     // back by the next tick.
-    const install::Exchange said =
+    const install::Exchange registration =
         install::Register(client, config.server.url, token, wanted, policy);
-    if (!said.ok()) {
-      if (said.transport != http::Error::kCanceled) {
-        log::Warn(log::Event::kRemoteInstall, said.message);
+    if (!registration.ok()) {
+      if (registration.transport == http::Error::kCanceled) {
+        return;
+      }
+      log::Warn(log::Event::kRemoteInstall, registration.message);
+      if (!registration.transient() && registration.status != 401 &&
+          registration.status != 403) {
+        // Asking again every tick changes nothing but the length of the log.
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (server_generation_ == generation) {
+          install_refused_ = true;
+        }
       }
       return;
     }
     log::Info(log::Event::kRemoteInstall,
               wanted ? "RomM's web UI can install roms on this console"
                      : "RomM's web UI will not offer this console: [downloads] enabled = false");
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (server_generation_ == generation) {
-      install_registered_ = wanted;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (server_generation_ == generation) {
+        install_registered_ = wanted;
+      }
+    }
+    if (!wanted) {
+      // Downloads went off with requests taken, or before a reboot left some:
+      // nothing here will fetch them, so the browser is told now rather than
+      // left waiting out the request's expiry. Once per switch, not per tick.
+      const install::Claimed held = install::Claim(client, config.server.url, token, policy);
+      for (const install::Request& request : held.page.requests) {
+        install::Report(client, config.server.url, token, request.id,
+                        {install::Outcome::kFailed,
+                         "downloads are switched off on the console ([downloads] enabled = false)"},
+                        policy);
+      }
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (server_generation_ == generation) {
+        install_claims_.clear();
+      }
     }
   }
-  if (!wanted || refused) {
+  if (!wanted) {
     return;
   }
 
@@ -1633,11 +1664,13 @@ void SdEngine::ServeInstalls(http::HttpClient& client, const auth::StoredToken& 
   }
 
   std::vector<install::Request> tracked;
+  std::vector<std::string> abandoned;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     tracked = install_claims_;
+    abandoned = install_abandoned_;
   }
-  const auto in = [](const std::vector<install::Request>& requests, const std::string& id) {
+  const auto holds = [](const std::vector<install::Request>& requests, const std::string& id) {
     return std::any_of(requests.begin(), requests.end(),
                        [&id](const install::Request& request) { return request.id == id; });
   };
@@ -1647,12 +1680,13 @@ void SdEngine::ServeInstalls(http::HttpClient& client, const auth::StoredToken& 
     // queued, is left alone: it is in the user's queue now.
     tracked.erase(std::remove_if(tracked.begin(), tracked.end(),
                                  [&](const install::Request& request) {
-                                   return !in(claimed.page.requests, request.id);
+                                   return !holds(claimed.page.requests, request.id);
                                  }),
                   tracked.end());
   }
   for (const install::Request& request : claimed.page.requests) {
-    if (in(tracked, request.id)) {
+    if (holds(tracked, request.id) ||
+        std::find(abandoned.begin(), abandoned.end(), request.id) != abandoned.end()) {
       continue;
     }
     if (tracked.size() >= install::kMaxClaims) {
@@ -1697,6 +1731,7 @@ void SdEngine::SettleInstalls(http::HttpClient& client, const auth::StoredToken&
   policy.wait = [this](std::chrono::milliseconds delay) { AwaitBackoff(delay); };
 
   std::vector<std::string> settled;
+  std::vector<std::string> refused;
   for (const install::Request& claim : claims) {
     const std::optional<install::Verdict> verdict = install::VerdictFor(queue_.Find(claim.rom_id));
     if (!verdict.has_value()) {
@@ -1724,6 +1759,7 @@ void SdEngine::SettleInstalls(http::HttpClient& client, const auth::StoredToken&
       // report RomM refused for what it says is not taken back by resending it.
       if (!reported.transient() && reported.status != 401 && reported.status != 403) {
         settled.push_back(claim.id);
+        refused.push_back(claim.id);
       }
     }
   }
@@ -1741,6 +1777,13 @@ void SdEngine::SettleInstalls(http::HttpClient& client, const auth::StoredToken&
                               settled.end();
                      }),
       install_claims_.end());
+  // Still taken on the server, which keeps handing them back; not queued again.
+  for (std::string& id : refused) {
+    if (install_abandoned_.size() >= install::kMaxClaims) {
+      install_abandoned_.erase(install_abandoned_.begin());
+    }
+    install_abandoned_.push_back(std::move(id));
+  }
 }
 
 bool SdEngine::RunOneTick() {
