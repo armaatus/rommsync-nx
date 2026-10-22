@@ -162,7 +162,8 @@ it. Each carries a version, and each has a stated answer for a file from an
 **older** release (an upgrade) and from a **newer** one (a downgrade, or a card
 where only one of the two halves was updated) (#205). What can be rebuilt is
 discarded and rebuilt; what cannot is refused and **left exactly as it is**, so
-an older build never writes over a newer file.
+an older build never writes over a newer file it refused. A newer file it
+discarded is replaced by the next write, which is what "rebuilt" costs.
 
 | File | Version | Older | Newer |
 |---|---|---|---|
@@ -171,7 +172,7 @@ an older build never writes over a newer file.
 | `device.dat` | none, by design | read | read for `client_device_identifier`, whatever else it carries — refusing would mint a second console |
 | `state.db` | header line | v2 (rc1) read, at rc1's own bounds (512 rows, 128 KiB) and streamed past this build's: states and archival rows kept first, slotted rows up to `kMaxRecords` (the rest rehashed), each moved to the shared slot its file is synced in now with its server half dropped (#236, `state::AdoptLegacySaves`); v1 discarded, every save rehashed | discarded, every save rehashed |
 | `conflicts.db` | header line | read | refused and never written over: this boot's entries stay in memory, the backups stay on the card |
-| `queue.json` | `"version"` | read | discarded; the user queues again |
+| `queue.json` | `"version"` | read, up to this build's 32 entries and 80 KiB; rc1's 64 entries and 160 KiB past them are discarded whole, and the user queues again (#247) | discarded; the user queues again |
 | `play.db` | header line | read | discarded: unsent play time is lost, nothing else |
 | `auth.json` | `"version"` | read | no verdict; re-derived by asking |
 

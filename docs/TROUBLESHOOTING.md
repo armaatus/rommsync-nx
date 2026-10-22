@@ -755,10 +755,18 @@ overwritten. The same sync then asks RomM about that save once more
   ([INTEROP.md](INTEROP.md#when-two-devices-disagree)).
 
 Either way the line above does not stay. It is left — and the sync reads partly
-finished — only when that second question could not be asked: a game was open,
-and this client touches no save while one is
-([Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open)), or
-the server did not answer it. The next sync settles it.
+finished — only when that second question could not settle it:
+
+- a game was open, and this client touches no save while one is
+  ([Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open));
+- the server did not answer it;
+- more than four uploads were refused at once: four are settled at a time
+  (`sync::kMaxResolvedUploads`, per round of a sync), and the rest keep the line
+  until a later sync reaches them;
+- or the save went from the server between the two questions, so the answer
+  named nothing to compare.
+
+The next sync settles it.
 
 **The fix.** Usually nothing. To keep the card's version after a conflict,
 restore it from the **Conflicts** screen; the next sync decides again, and will

@@ -148,7 +148,7 @@ jobs:
       - name: Start the RomM fixture
         run: ./scripts/orca/compose.sh up -d
 
-      # Five minutes is ample for either version: RomM migrates before it
+      # Five minutes is ample for 5.4.0: RomM migrates before it
       # answers, and on the empty volume a runner starts from 5.4.0's migrations
       # take seconds (21 s to first heartbeat, measured for #227). The 15-20
       # minutes in its release notes is an upgrade of a volume with data in it,

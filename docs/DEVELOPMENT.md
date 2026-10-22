@@ -650,7 +650,7 @@ a sysmodule pays for a TLS request is therefore:
 
    The heap was `0x80000` until M1-7, and the two terms it was short by are the
    two easiest to miss. **A list response is buffered whole** — `Send` returns a
-   `std::string` and nothing caps it — and the two that can be large were
+   `std::string`, which nothing capped until `http::kMaxResponseBytes` (#248) — and the two that can be large were
    measured against the fixture rather than guessed: `/api/platforms` is an
    unpaged bare array in 5.2.0 at ~800 bytes a row, so `kMaxPlatforms` of them is
    ~200 KiB, and `/api/roms?limit=64` is ~136 KiB. And there are **two** worker
@@ -705,7 +705,8 @@ a sysmodule pays for a TLS request is therefore:
    in flight costs what is kept of it rather than ~16× its text. The negotiate
    body is held once and freed before the plan is read; the last chunk's plan
    goes before the next is asked; the #232 resolution resolves at most
-   `sync::kMaxResolvedUploads` (4) uploads a tick; a list page is measured at its
+   `sync::kMaxResolvedUploads` (4) uploads a plan, and a tick's plans are held
+   one at a time; a list page is measured at its
    peak, not re-encoded per append; the device search keeps one row; and the
    **conflict history** — resident and never counted — has a row, and is
    written an entry at a time. The margin is 8 KiB.

@@ -56,7 +56,7 @@ rather than working around it.
 ## How tests work here
 
 There is no mock RomM. Tests run against a **real RomM** in Docker — the
-version `ROMM_VERSION` in `.env` names, 5.2.0 by default with 5.4.0 beside it
+version `ROMM_VERSION` in `.env` names, 5.4.0 by default and the floor since #235
 ([TESTING.md](docs/TESTING.md#choosing-the-romm-version)) — so a passing test
 means the behaviour is genuinely real. Failure modes a healthy RomM
 will not produce on demand (401 mid-sync, truncated body, dropped connection,

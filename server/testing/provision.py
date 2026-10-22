@@ -289,7 +289,8 @@ def scan_library(romm: Romm, timeout: int, version: tuple[int, ...]) -> dict:
         "apis": [],
         "launchbox_remote_enabled": False,
     }
-    # Only 5.2.0 is verified on this side of the line; 5.3 is in no matrix.
+    # Only 5.2.0 was verified on this side of the line, and since #235 neither
+    # CI nor the suites run below 5.4.0; this is kept for a .env from before it.
     if version < (5, 4):
         options["playmatch_enabled"] = False
     try:

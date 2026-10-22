@@ -1,4 +1,4 @@
-# RomM API contract (pinned to 5.2.0)
+# RomM API contract (5.2.0 body, 5.4.0 pinned beside it)
 
 Everything the Switch client talks to. **Verified against a live RomM `5.2.0`**:
 `server/contract/romm-openapi-5.2.0.json` is the full OpenAPI snapshot, and

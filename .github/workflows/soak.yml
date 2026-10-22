@@ -1,6 +1,6 @@
 name: soak
 
-# The sysmodule is meant to run for weeks without restarting, on a 1.4 MiB heap
+# The sysmodule is meant to run for weeks without restarting, on a 1.5 MiB heap
 # where running out is `std::terminate` (M9-15, #204). `ctest -R alloc.steady`
 # holds sixteen ticks flat on every push; this holds hundreds of rounds -- a
 # tick and a rom download each -- flat every night, against the same real RomM

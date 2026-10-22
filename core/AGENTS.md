@@ -29,7 +29,8 @@ break by accident.
 - Sources are globbed by `core/CMakeLists.txt` — add a `.cpp`, no CMake edit.
 - Streaming, not buffering: a rom may be gigabytes and the sysmodule heap is
   tiny. Write to a file as bytes arrive.
-- **A stack buffer here gets 16 KiB, and should assume less.**
+- **A stack buffer here gets the 16 KiB the deepest parse leaves, and should
+  assume less.**
   `sysmodule/sys-rommsync.json` sets `main_thread_stack_size` to `0x8000` — 32
   KiB, raised from the template's `0x4000` by M1-7 (#126) because
   `SdEngine::Load` parses documents off a card on that thread — and the inner

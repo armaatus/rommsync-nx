@@ -293,9 +293,9 @@ CopyResult CopyAtomically(const std::string& from, const std::string& to) {
     return result;
   }
 
-  // 4 KiB, the convention in this directory: the main thread gets a 16 KiB
-  // stack on the console, so a buffer sized for a desktop compiles here and
-  // overflows there (core/AGENTS.md).
+  // 4 KiB, the convention in this directory: the main thread gets a 32 KiB
+  // stack on the console, half of it the deepest parse's, so a buffer sized
+  // for a desktop compiles here and overflows there (core/AGENTS.md).
   char buffer[4096];
   std::uint64_t copied = 0;
   bool short_write = false;

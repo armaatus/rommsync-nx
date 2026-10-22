@@ -40,9 +40,10 @@ struct State {
   ///
   /// Here a slot is reserved at `kMaxLineBytes` the first time it is used and
   /// every later line is `assign`ed into it, which never reallocates: a line is
-  /// bounded by that same constant above. So the ring costs exactly the
+  /// bounded by that same constant above. So the ring costs the
   /// `kTailLines * kMaxLineBytes` the heap's table says it does (`kHeapLogTail`,
-  /// sysmodule/source/main.cpp), from the moment it is full and for as long as
+  /// sysmodule/source/main.cpp; each slot's terminator and allocator header are
+  /// the newlib overhead row's), from the moment it is full and for as long as
   /// the process lives -- not a figure it creeps up to as longer lines happen to
   /// land in more slots, which is what reusing a slot's capacity alone did: the
   /// soak's floor rose 64 bytes a round for eleven rounds before it settled.

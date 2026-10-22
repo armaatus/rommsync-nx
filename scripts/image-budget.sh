@@ -43,8 +43,9 @@ set -euo pipefail
 # The budget for the whole mapped image: 2.25 MiB.
 #
 # Measured at 2,080,768 bytes (1.98 MiB) when this was set, of which the heap
-# is 1,441,792 -- so this is ~272 KiB of headroom, a little over one 256 KiB
-# `state.db` term. Growth past it is a decision, made here with its reason
+# was 1,441,792 -- ~272 KiB of headroom, a little over one 256 KiB `state.db`
+# term. #246 then raised the heap by 128 KiB (`kInnerHeapSize` 0x180000), which
+# leaves about 144 KiB: less than one such term. Growth past it is a decision, made here with its reason
 # beside it, and not something a PR does by accident. Atmosphere leaves third-
 # party sysmodules a shared pool (7 MB on HOS 21.0.0+, docs/DEVELOPMENT.md#what-the-image-costs),
 # and this process is one tenant of it.
