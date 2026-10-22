@@ -131,16 +131,6 @@ void Parse(rig::Checks& checks) {
                 "a reason is cut to kMaxReasonBytes, never through a character");
 }
 
-/// The fixture user's notifications, which is where RomM records the outcome a
-/// device reported -- the request itself is gone the moment it ends.
-std::string Notifications(http::HttpClient& client, const std::string& base) {
-  http::Request request;
-  request.url = base + "/api/notifications";
-  request.headers.push_back(
-      {"Authorization", "Basic " + rig::Base64(std::string(rig::kUser) + ":" + rig::kPassword)});
-  return client.Send(request).response.body;
-}
-
 http::Result QueueFromTheBrowser(http::HttpClient& client, const std::string& base,
                                  const std::string& device_id, std::int64_t rom_id) {
   return rig::AsTheUser(client, base, "/api/devices/" + device_id + "/installs",
@@ -203,6 +193,8 @@ void Live(rig::Checks& checks, http::HttpClient& client, const std::string& base
   const install::Claimed foreign = install::Claim(client, base, elsewhere);
   checks.ExpectEq(foreign.exchange.status, 404, "a token bound to another device claims nothing");
 
+  // Newer than this, so a notice an earlier run left cannot pass for this one.
+  const std::int64_t before_report = rig::LatestNotificationId(client, base);
   const install::Exchange reported =
       install::Report(client, base, token, request_id, {install::Outcome::kDone, {}});
   checks.Expect(reported.ok(), "the device reports it done: " + reported.message);
@@ -213,10 +205,9 @@ void Live(rig::Checks& checks, http::HttpClient& client, const std::string& base
   checks.Expect(!twice.ok() && twice.ended() && !twice.transient(),
                 "a second report is a 404 that settles it, not a retry: HTTP " +
                     std::to_string(twice.status));
-  checks.Expect(Notifications(client, base)
-                        .find(R"("device_name":"rommsync-nx install-live","status":"done")") !=
-                    std::string::npos,
-                "RomM tells the user the install on this device is done");
+  checks.ExpectEq(rig::InstallNoticesSince(client, base, before_report,
+                                           "rommsync-nx install-live", "done"),
+                  std::size_t{1}, "RomM tells the user the install on this device is done");
 
   // A failure, with a reason past the server's bound: cut, not refused.
   const http::Result requeued = QueueFromTheBrowser(client, base, token.device_id, rom.id);

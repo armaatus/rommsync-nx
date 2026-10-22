@@ -4791,23 +4791,13 @@ int RemoteInstall(http::HttpClient& client, const std::string& base) {
   console.engine.StartWorker();
 
   // Where RomM records what a device reported: the request itself is gone
-  // the moment it ends. Counted, because an earlier run left its own.
+  // the moment it ends. Only what is newer than this run's start counts: an
+  // earlier run left its own, and RomM's cap of 200 evicts the oldest, so a
+  // before-and-after count can miss the one this run added (`rig::LatestNotificationId`).
+  const std::int64_t started = rig::LatestNotificationId(client, base);
   const auto notices = [&](const std::string& status) {
-    http::Request notifications;
-    notifications.url = base + "/api/notifications";
-    notifications.headers.push_back(
-        {"Authorization", "Basic " + rig::Base64(std::string(rig::kUser) + ":" + rig::kPassword)});
-    const std::string body = client.Send(notifications).response.body;
-    const std::string mark =
-        "\"device_name\":\"rommsync-nx " + name + "\",\"status\":\"" + status + "\"";
-    std::size_t seen = 0;
-    for (std::size_t at = body.find(mark); at != std::string::npos; at = body.find(mark, at + 1)) {
-      ++seen;
-    }
-    return seen;
+    return rig::InstallNoticesSince(client, base, started, "rommsync-nx " + name, status);
   };
-  const std::size_t done_before = notices("done");
-  const std::size_t failed_before = notices("failed");
 
   TickOnce(console, ticks, c, "the first tick");
   const http::Result queued = queue_in_browser();
@@ -4832,7 +4822,7 @@ int RemoteInstall(http::HttpClient& client, const std::string& base) {
            "the rom the browser queued is on the card" + Rendered(console.Log()));
   c.ExpectEq(open(), std::size_t{0}, "and the request is ended, not left taken");
 
-  c.ExpectEq(notices("done"), done_before + 1,
+  c.ExpectEq(notices("done"), std::size_t{1},
              "RomM was told it is done, and told the user so");
   c.Expect(Logged(console.Log(), "download.remote"), "the console's log says so too");
 
@@ -4851,7 +4841,7 @@ int RemoteInstall(http::HttpClient& client, const std::string& base) {
            "and downloads are switched off on the console");
   TickOnce(console, ticks, c, "the tick after downloads went off");
   c.ExpectEq(open(), std::size_t{0}, "that request is ended too");
-  c.ExpectEq(notices("failed"), failed_before + 1, "as failed, which the user is told");
+  c.ExpectEq(notices("failed"), std::size_t{1}, "as failed, which the user is told");
   c.ExpectEq(queue_in_browser().response.status, 400,
              "and the web UI no longer offers this console");
   harness::DeleteDevice(client, base, fixture, token.device_id);

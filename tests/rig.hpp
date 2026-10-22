@@ -213,6 +213,67 @@ inline http::Result AsTheUser(http::HttpClient& client, const std::string& base,
   return client.Send(request);
 }
 
+// --- the fixture user's notifications ----------------------------------------
+//
+// Where RomM 5.4.0 records what a device reported about a remote install
+// (#245). **Never counted across a run**: RomM keeps the newest 200 a user has
+// and deletes the rest (`MAX_NOTIFICATIONS_PER_USER`), so on a long-lived stack
+// a count taken before a report and after it can come out equal although the
+// report landed. An id is the watermark instead -- they only grow.
+
+/// The fixture user's notifications as RomM lists them, newest first. An empty
+/// array when the list does not read.
+inline rommsync::json::Value ListNotifications(http::HttpClient& client, const std::string& base) {
+  http::Request request;
+  request.url = base + "/api/notifications";
+  request.headers.push_back(
+      {"Authorization", "Basic " + Base64(std::string(kUser) + ":" + kPassword)});
+  rommsync::json::ParseResult parsed = rommsync::json::Parse(client.Send(request).response.body);
+  return parsed.ok() && parsed.value.is_array() ? std::move(parsed.value)
+                                                : rommsync::json::Value();
+}
+
+/// The newest notification's id, or 0 when there is none.
+inline std::int64_t LatestNotificationId(http::HttpClient& client, const std::string& base) {
+  std::int64_t latest = 0;
+  const rommsync::json::Value list = ListNotifications(client, base);
+  if (list.is_array()) {
+    for (const rommsync::json::Value& notice : list.elements()) {
+      const rommsync::json::Value* id = notice.Find("id");
+      if (id != nullptr && id->is_integer()) {
+        latest = std::max(latest, id->integer());
+      }
+    }
+  }
+  return latest;
+}
+
+/// Notifications newer than `after` that say device `device_name` reported
+/// `status` (`done`, `already_installed`, `failed`).
+inline std::size_t InstallNoticesSince(http::HttpClient& client, const std::string& base,
+                                       std::int64_t after, const std::string& device_name,
+                                       const std::string& status) {
+  std::size_t seen = 0;
+  const rommsync::json::Value list = ListNotifications(client, base);
+  if (!list.is_array()) {
+    return seen;
+  }
+  for (const rommsync::json::Value& notice : list.elements()) {
+    const rommsync::json::Value* id = notice.Find("id");
+    const rommsync::json::Value* data = notice.Find("data");
+    if (id == nullptr || !id->is_integer() || id->integer() <= after || data == nullptr) {
+      continue;
+    }
+    const rommsync::json::Value* device = data->Find("device_name");
+    const rommsync::json::Value* said = data->Find("status");
+    if (device != nullptr && device->is_string() && device->string() == device_name &&
+        said != nullptr && said->is_string() && said->string() == status) {
+      ++seen;
+    }
+  }
+  return seen;
+}
+
 /// Approve a live device code, granting `scopes`.
 inline http::Result ApproveDeviceCode(http::HttpClient& client, const std::string& base,
                                       const std::string& user_code,
