@@ -886,8 +886,9 @@ static_assert(kHeapPeak == 0x17A400, "the table above no longer sums to its peak
 //     was 353 KiB, of which 1,024 roms and the page on its way in take 259 and
 //     the margin was the rest. Each further 256 roms is ~62 KiB of resident
 //     `.bss` -- the heap growing with it, against an image ceiling
-//     (`scripts/image-budget.sh`) with 36 KiB to spare since M9-20 -- and that
-//     trade is this table's to make again rather than a constant's to drift into.
+//     (`scripts/image-budget.sh`) with 36 KiB to spare after M9-20 and less
+//     since; the script prints what is left -- and that trade is this table's
+//     to make again rather than a constant's to drift into.
 //
 // **The bound M9-20 (#246) derived**, the same way: `state::kMaxRecords` -- and
 // with it `scan::kMaxSaves`, `scan::kMaxStates` and `sync::kMaxPlanOperations`

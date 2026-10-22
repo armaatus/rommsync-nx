@@ -2999,10 +2999,10 @@ void SdEngine::RunRestore(std::int64_t entry_id) {
     std::lock_guard<std::mutex> history(history_mutex_);
 
     if (card_ == nullptr) {
-      // Nothing implements `fs::FileSystem` for Horizon yet (`engine.hpp`).
-      // `kBackupFailed` rather than a transport failure: its promise is that
-      // nothing was written, which is the one thing a build that cannot open
-      // the card is certain of.
+      // A build that never called `UseCard`; a console always has (`card.hpp`,
+      // since M7-2, #37). `kBackupFailed` rather than a transport failure: its
+      // promise is that nothing was written, which is the one thing a build
+      // that cannot open the card is certain of.
       report.outcome = conflicts::RestoreOutcome::kBackupFailed;
       report.message = "this build cannot open the SD card, so nothing was written";
     } else {
