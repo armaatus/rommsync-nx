@@ -84,6 +84,20 @@ phase_ci() {
     fail "switch-build still reports a skipped build as a notice"
   fi
 
+  # M9-29 (#256): the uploaded artifacts are read by scripts/artifact-check.py,
+  # the parser the toolchain entries use, and not by a second, hand-kept one in
+  # YAML -- `head -c 4` for PFS0, `tail -c 4` for ULTR, `dd skip=16` for NRO0.
+  # Each of the three files is named to it, so none can be dropped quietly.
+  local artifact
+  for artifact in sysmodule/sys-rommsync.nsp overlay/ovl-rommsync.ovl \
+                  tlsprobe/rommsync-tlsprobe.nro; do
+    grep -A4 'scripts/artifact-check.py container' <<<"$job" | grep -q "$artifact" ||
+      fail "switch-build does not hold $artifact to its container with scripts/artifact-check.py (#256)"
+  done
+  if grep -qE 'head -c|tail -c|dd if=' <<<"$job"; then
+    fail "switch-build reads an artifact's magic by hand; scripts/artifact-check.py is the parser (#256)"
+  fi
+
   # A green job that uploaded nothing is the same failure wearing a different
   # hat, so the upload has to be the thing that goes red.
   grep -q 'if-no-files-found: error' <<<"$job" ||
@@ -261,10 +275,11 @@ phase_builds() {
   local ovl="$SCRATCH/overlay/ovl-rommsync.ovl"
   [ -s "$nsp" ] || fail "no sys-rommsync.nsp"
   [ -s "$ovl" ] || fail "no ovl-rommsync.ovl"
-  [ "$(head -c 4 "$nsp")" = "PFS0" ] || fail "sys-rommsync.nsp is not a PFS0 archive"
-  # Without this Ultrahand does not list the overlay, and nothing else about the
-  # file looks wrong -- see overlay/README.md.
-  [ "$(tail -c 4 "$ovl")" = "ULTR" ] || fail "ovl-rommsync.ovl has no ULTR signature"
+  # A PFS0 holding the NSO and the NPDM, and an NRO with ULTR at its end --
+  # without which Ultrahand does not list the overlay, and nothing else about
+  # the file looks wrong (overlay/README.md). Read by the one parser (#256).
+  "${PYTHON:-python3}" "$REPO_ROOT/scripts/artifact-check.py" container "$nsp" "$ovl" ||
+    fail "an artifact is not the container its name says"
 
   # switch.mk generates version.hpp the way CMake does for the host build, from
   # the same VERSION file and the same template.
@@ -390,10 +405,9 @@ phase_tlsprobe() {
 
   local nro="$SCRATCH/tlsprobe/rommsync-tlsprobe.nro"
   [ -s "$nro" ] || fail "no rommsync-tlsprobe.nro"
-  # NRO0 sits at 0x10; the first 16 bytes are the entry branch and the mod0
-  # offset. A .nro without it is a file hbmenu will not launch.
-  [ "$(dd if="$nro" bs=1 skip=16 count=4 2>/dev/null)" = "NRO0" ] ||
-    fail "rommsync-tlsprobe.nro has no NRO0 magic"
+  # An NRO, which is what hbmenu launches -- read by the one parser (#256).
+  "${PYTHON:-python3}" "$REPO_ROOT/scripts/artifact-check.py" container "$nro" ||
+    fail "rommsync-tlsprobe.nro is not an NRO"
   # hbmenu launches it on the same HOS 21.0.0 kernel the shipped two run on.
   "${PYTHON:-python3}" "$REPO_ROOT/scripts/artifact-check.py" lny2 "$nro" ||
     fail "the probe lacks libnx's LNY2 stamp"

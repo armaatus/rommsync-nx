@@ -251,25 +251,17 @@ jobs:
       # and upload-artifact would happily publish an empty set. An .ovl without
       # its ULTR signature is the sharp case: it builds, it uploads, and
       # Ultrahand silently does not list it (overlay/README.md).
+      #
+      # Read by scripts/artifact-check.py, the parser the toolchain's ctest
+      # entries use, rather than by `head`, `tail` and `dd` here: one reader of
+      # the formats, held by `artifacts.parser`'s vectors (#256). A missing or
+      # empty file fails it as well as a wrong one.
       - name: Artifacts are what they claim to be
         run: |
-          set -eu
-          test -s sysmodule/sys-rommsync.nsp || {
-            echo "::error::sysmodule built no .nsp"; exit 1; }
-          test -s overlay/ovl-rommsync.ovl || {
-            echo "::error::overlay built no .ovl"; exit 1; }
-          # PFS0 is the ExeFS container magic; a .nsp that is not one is not
-          # something Atmosphere will load.
-          [ "$(head -c 4 sysmodule/sys-rommsync.nsp)" = "PFS0" ] || {
-            echo "::error::sys-rommsync.nsp is not a PFS0 archive"; exit 1; }
-          [ "$(tail -c 4 overlay/ovl-rommsync.ovl)" = "ULTR" ] || {
-            echo "::error::ovl-rommsync.ovl is missing its ULTR signature"; exit 1; }
-          test -s tlsprobe/rommsync-tlsprobe.nro || {
-            echo "::error::tlsprobe built no .nro"; exit 1; }
-          # NRO0 at offset 0x10; the first 16 bytes are the entry branch.
-          [ "$(dd if=tlsprobe/rommsync-tlsprobe.nro bs=1 skip=16 count=4 \
-                 2>/dev/null)" = "NRO0" ] || {
-            echo "::error::rommsync-tlsprobe.nro is not an NRO"; exit 1; }
+          python3 scripts/artifact-check.py container \
+            sysmodule/sys-rommsync.nsp \
+            overlay/ovl-rommsync.ovl \
+            tlsprobe/rommsync-tlsprobe.nro
 
       - name: Collect artifacts
         uses: actions/upload-artifact@v7
