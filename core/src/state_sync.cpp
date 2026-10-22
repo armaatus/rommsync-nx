@@ -965,6 +965,10 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
 
   // Whatever the server holds that no local file claimed. Placing one overwrites
   // nothing, so it is the one branch that needs no arbitration at all.
+  //
+  // At most `kMaxStatePlacements` of them a run (#247), counted where a row
+  // becomes an operation: the silent filters below cost nothing to hold.
+  std::size_t unclaimed_operations = 0;
   for (std::size_t at = 0; at < server_states.size() && !stopped; ++at) {
     if (claimed[at]) {
       continue;
@@ -989,6 +993,13 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
       ++report.filtered;
       continue;
     }
+    if (unclaimed_operations == kMaxStatePlacements) {
+      report.warnings.push_back(
+          "the server holds more states for this console's roms than one sync places (" +
+          std::to_string(kMaxStatePlacements) + "); the rest wait for the next sync");
+      break;
+    }
+    ++unclaimed_operations;
     if (sd_path.empty()) {
       if (!record(Fail(server.rom_id, server.file_name, StateAction::kPlace,
                        StateError::kNoPlacement,
