@@ -241,8 +241,10 @@ struct Entry {
 
   /// Whether the server holds the bytes `backup_sd_path` does (#240).
   ///
-  /// **Optional in the file**, unlike every field above: a row written before
-  /// #240 has neither key and reads as `kUnrecorded`, so a history survives the
+  /// **Optional in the file**, unlike every field above, and written only when
+  /// recorded: a row written before #240 has neither key and reads as
+  /// `kUnrecorded`, and one with nothing recorded is still written exactly as
+  /// before it (`compat.fixtures`). So a history survives the
   /// upgrade whole without a format version an older build would refuse. An
   /// older build ignores both keys, so a downgrade loses nothing but them.
   LocalCopy local_copy = LocalCopy::kUnrecorded;

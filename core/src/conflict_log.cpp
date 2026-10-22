@@ -182,12 +182,16 @@ std::string SerializeEntry(const Entry& entry) {
   AppendOptionalText(&out, "server_updated_at", entry.server_updated_at);
   AppendInteger(&out, "server_size_bytes", entry.server_size_bytes);
   AppendOptionalText(&out, "backup_sd_path", entry.backup_sd_path);
-  // Last, and the two keys a reader tolerates missing (`Entry::local_copy`).
-  AppendKey(&out, "local_copy");
-  out += entry.local_copy == LocalCopy::kUnrecorded ? std::string("null")
-                                                    : json::Quote(ToString(entry.local_copy));
-  AppendKey(&out, "archive_save_id");
-  out += entry.archive_save_id > 0 ? std::to_string(entry.archive_save_id) : std::string("null");
+  // Last, the two keys a reader tolerates missing (`Entry::local_copy`), and
+  // written only when they say something: an entry with nothing recorded is
+  // the row rc1 wrote, byte for byte, which is what lets the format keep its
+  // version (`compat.fixtures`).
+  if (entry.local_copy != LocalCopy::kUnrecorded) {
+    AppendText(&out, "local_copy", ToString(entry.local_copy));
+  }
+  if (entry.archive_save_id > 0) {
+    AppendInteger(&out, "archive_save_id", entry.archive_save_id);
+  }
   out += "}";
   return out;
 }

@@ -263,14 +263,11 @@ void Store(checks::Checks& c) {
     card_only.local_copy = conflicts::LocalCopy::kCardOnly;
     conflicts::Entry before = SaveEntry(6, "before.srm");
     before.id = 1;
-    std::string old_row = conflicts::SerializeEntry(before);
-    for (const std::string field : {",\"local_copy\":null", ",\"archive_save_id\":null"}) {
-      const std::size_t at = old_row.find(field);
-      c.Expect(at != std::string::npos, "the row spells " + field);
-      if (at != std::string::npos) {
-        old_row.erase(at, field.size());
-      }
-    }
+    // Nothing recorded is written as nothing at all: the row rc1 wrote.
+    const std::string old_row = conflicts::SerializeEntry(before);
+    c.Expect(old_row.find("local_copy") == std::string::npos &&
+                 old_row.find("archive_save_id") == std::string::npos,
+             "an entry with nothing recorded spells neither key: " + old_row);
     const conflicts::LoadedHistory read = conflicts::ParseHistory(
         std::string(conflicts::kFormatMagic) + " " + std::to_string(conflicts::kFormatVersion) +
         " 9\n" + conflicts::SerializeEntry(on_server) + "\n" +
