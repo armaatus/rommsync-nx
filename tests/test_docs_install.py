@@ -611,6 +611,20 @@ def phase_interop_facts(args) -> int:
         return fail("docs/INTEROP.md does not give the Cloud Sync path `AsRetroArch` "
                     "(tests/test_engine.cpp) exercises against the real RomM")
 
+    # The "tested with" table is #244's matrix: a row per client the matrix
+    # runs, so a client added to it is a row the page is missing.
+    cmake = read(os.path.join(repo, "tests", "CMakeLists.txt"))
+    matrix = re.search(r"foreach\(client ([a-z ]+)\)\s*\n\s*foreach\(cell IN LISTS INTEROP_CELLS\)",
+                       cmake)
+    if not matrix:
+        return fail("cannot find the interop matrix's clients in tests/CMakeLists.txt")
+    clients = matrix.group(1).split()
+    tested = table_rows(section(text, "The web player, Argosy and Grout"),
+                        "| Client | Plays, in the test |")
+    if len(tested) != len(clients):
+        return fail(f"the 'Tested with' table has {len(tested)} rows; the interop matrix "
+                    f"(tests/CMakeLists.txt) runs {len(clients)} clients: {', '.join(clients)}")
+
     # **"..."** is verbatim screen text, as in INSTALL.md: each is in a literal
     # the client draws or reports.
     sources = [os.path.join(repo, "core", "src", n)

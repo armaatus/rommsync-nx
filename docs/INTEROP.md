@@ -169,7 +169,12 @@ setup: the same core, the same rom.
 
 - **RomM's web player** runs in the browser on RomM's own cores — the table's
   "the web player" rows. Nothing to configure; a save made there is on the
-  Switch after its next sync, and the Switch's is in the browser after it.
+  Switch after its next sync, and the Switch's is in the browser after it. In
+  RomM 5.4 the web player is a sync device of its own: it registers itself, so
+  it is listed in RomM's devices beside the Switch, asks only about the game it
+  is playing, and on a conflict keeps its own copy aside as the Switch does. Its
+  save states are named `<game> [<local date and time>].state`, a name no Tico
+  or RetroArch slot loads, so they never reach the Switch.
 - **Grout** names the emulator after the folder the save is in on that device.
   The Switch accepts both the core's id and RetroArch's folder name for it
   (`snes9x` or `Snes9x`), so a save Grout files under either meets the Switch's;
@@ -177,8 +182,18 @@ setup: the same core, the same rom.
 - **Argosy** follows the same rule: a save filed in `autosave` under the core id
   the Switch uses meets it.
 
-Neither Argosy nor Grout has been run against this client; what is tested is the
-protocol they share with RetroArch, against a real RomM.
+**Tested with**, against a real RomM 5.4.0
+([TESTING.md](TESTING.md#the-other-clients-are-their-requests-244)):
+
+| Client | Plays, in the test | Each meets the Switch in |
+|---|---|---|
+| RetroArch's Cloud Sync | GBA, `mgba` | the Switch's save reaching it, its save reaching the Switch (and not while the rom is missing from the card), a conflict, a delete each way, and save states |
+| a Grout-like device | GB, `gambatte` | the same five |
+| RomM's web player | NES, `fceumm` | the same five |
+
+Each client there is the requests it sends RomM, not the app itself, and
+nothing has been run on a console. Argosy is not among them: it is expected to
+behave as the Grout row does, by the rule above, and that is not yet tested.
 
 ---
 
