@@ -428,8 +428,10 @@ BoundedRead ReadBounded(const std::string& path, std::size_t limit, std::string*
     // Released, not cleared: the caller streams the rest because it cannot hold
     // it, and the bound's worth of text would otherwise sit beside it.
     std::string().swap(*out);
-    std::rewind(file);
-    const BoundedRead streamed = past_limit(file);
+    // `fseek` rather than `rewind`, which cannot say it failed: a reader handed
+    // a file mid-way would see no header and call it corrupt.
+    const BoundedRead streamed =
+        std::fseek(file, 0, SEEK_SET) == 0 ? past_limit(file) : BoundedRead::kUnreadable;
     std::fclose(file);
     return streamed;
   }

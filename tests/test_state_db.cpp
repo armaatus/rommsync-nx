@@ -126,6 +126,23 @@ state::StateRecord FullState() {
   return record;
 }
 
+/// A slotted save row as rc1 wrote it: version 2, keyed on the slot #236 moved.
+std::string Rc1SlottedRow(std::int64_t rom_id) {
+  return "{\"rom_id\":" + std::to_string(rom_id) +
+         ",\"slot\":\"retroarch-srm\",\"content_hash\":\"" +
+         crypto::Md5Hex(std::to_string(rom_id)) +
+         "\",\"mtime\":1757000000,\"file_size_bytes\":32768,\"server_updated_at\":1757000100,"
+         "\"server_content_hash\":null}\n";
+}
+
+/// rc1's state row for rom 1000: the kind of row nothing rebuilds.
+std::string Rc1StateRow() {
+  return "{\"kind\":\"state\",\"rom_id\":1000,\"file_name\":\"Game (USA).state\",\"emulator\":"
+         "\"tico\",\"content_hash\":\"" + crypto::Md5Hex("state") +
+         "\",\"mtime\":1757000100,\"file_size_bytes\":4,\"server_state_id\":1,"
+         "\"server_updated_at\":1757000090,\"server_file_size_bytes\":4}\n";
+}
+
 bool Mentions(const state::LoadedBaseline& loaded, const std::string& fragment) {
   return loaded.DescribeDiagnostics().find(fragment) != std::string::npos;
 }
@@ -915,18 +932,8 @@ void ARc1FileOverTheBoundsKeepsItsStates(checks::Checks& c) {
 /// -- and a row repeating one already let go is as much a second row as one
 /// repeating a row that was kept.
 void AnRc1FilesSurvivorsAreARule(checks::Checks& c) {
-  const auto row = [](std::int64_t rom_id) {
-    return "{\"rom_id\":" + std::to_string(rom_id) +
-           ",\"slot\":\"retroarch-srm\",\"content_hash\":\"" +
-           crypto::Md5Hex(std::to_string(rom_id)) +
-           "\",\"mtime\":1757000000,\"file_size_bytes\":32768,\"server_updated_at\":1757000100,"
-           "\"server_content_hash\":null}\n";
-  };
-  const std::string state_row =
-      "{\"kind\":\"state\",\"rom_id\":1000,\"file_name\":\"Game (USA).state\",\"emulator\":"
-      "\"tico\",\"content_hash\":\"" + crypto::Md5Hex("state") +
-      "\",\"mtime\":1757000100,\"file_size_bytes\":4,\"server_state_id\":1,"
-      "\"server_updated_at\":1757000090,\"server_file_size_bytes\":4}\n";
+  const auto row = Rc1SlottedRow;
+  const std::string state_row = Rc1StateRow();
   // 200 slotted rows and a state: the state and 127 slotted rows fit.
   std::string forward = "rommsync-state 2\n";
   std::string backward = "rommsync-state 2\n" + state_row;
@@ -976,16 +983,10 @@ void AnRc1FilesSurvivorsAreARule(checks::Checks& c) {
 /// rc1's states their rows.
 void ACommitWindowMidReadStillYieldsTheBaseline(checks::Checks& c) {
   std::string v2 = "rommsync-state 2\n";
-  for (std::size_t at = 0; at < 200; ++at) {
-    v2 += "{\"rom_id\":" + std::to_string(1000 + at) +
-          ",\"slot\":\"retroarch-srm\",\"content_hash\":\"" + crypto::Md5Hex(std::to_string(at)) +
-          "\",\"mtime\":1757000000,\"file_size_bytes\":32768,\"server_updated_at\":1757000100,"
-          "\"server_content_hash\":\"" + crypto::Md5Hex("server " + std::to_string(at)) + "\"}\n";
+  for (std::int64_t at = 0; at < 200; ++at) {
+    v2 += Rc1SlottedRow(1000 + at);
   }
-  v2 += "{\"kind\":\"state\",\"rom_id\":1000,\"file_name\":\"Game (USA).state\",\"emulator\":"
-        "\"tico\",\"content_hash\":\"" + crypto::Md5Hex("state") +
-        "\",\"mtime\":1757000100,\"file_size_bytes\":4,\"server_state_id\":1,"
-        "\"server_updated_at\":1757000090,\"server_file_size_bytes\":4}\n";
+  v2 += Rc1StateRow();
   c.Expect(v2.size() > state::kMaxStateBytes, "the fixture is past this build's byte bound");
 
   const std::filesystem::path path = FreshPath("mid-read.db");

@@ -383,7 +383,8 @@ BoundedRead ReadBounded(const std::string& path, std::size_t limit, std::string*
 /// still open, and its answer is the read's. One open for both reads, so a
 /// rename landing between them -- `WriteAtomically`'s, say -- cannot turn the
 /// second into a failure the first never had (#255). Null `past_limit` is
-/// plain `ReadBounded`.
+/// plain `ReadBounded`. `past_limit` runs beneath this call's own 4 KiB chunk,
+/// so a reader with a stack buffer of its own counts both (core/AGENTS.md).
 BoundedRead ReadBounded(const std::string& path, std::size_t limit, std::string* out,
                         const std::function<BoundedRead(std::FILE* file)>& past_limit);
 

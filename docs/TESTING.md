@@ -519,8 +519,8 @@ ctest --test-dir build --output-on-failure
   row bound keeps the same slotted rows whichever order they are written in,
   and a row repeating one it let go discards the file as any second row does.
   A later release's file past the byte bound is still said as a later
-  release's. On the
-  writer side it separates the two kinds of bad: an individual unusable row is
+  release's. On the writer side it separates the two kinds of bad: an
+  individual unusable row is
   **skipped** and the rest are written (a console with an unset RTC stamps a
   save with the epoch, and refusing the whole file over it would freeze the
   baseline and re-hash the library on every tick from then on), while a file
