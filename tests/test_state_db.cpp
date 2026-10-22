@@ -850,6 +850,64 @@ void OversizedFilesAreRefusedBySize(checks::Checks& c) {
            "and the bound is named -- " + loaded.DescribeDiagnostics());
 }
 
+/// rc1 wrote its version 2 file at rc1's bounds -- 512 rows, 128 KiB -- and the
+/// bounds this build reads at are 128 and 32 KiB (#246). Discarded whole, its
+/// states' rows went with it, and no rescan rebuilds those: every state rc1
+/// synced was kept on both sides forever. So a v2 file is read at rc1's bounds,
+/// once, keeping what matters first -- states and archival rows -- and as many
+/// of the slotted save rows as still fit, which cost only a re-hash.
+void ARc1FileOverTheBoundsKeepsItsStates(checks::Checks& c) {
+  std::string v2 = "rommsync-state 2\n";
+  const std::size_t legacy_rows = 480;
+  for (std::size_t at = 0; at < legacy_rows; ++at) {
+    v2 += "{\"rom_id\":" + std::to_string(1000 + at) +
+          ",\"slot\":\"retroarch-srm\",\"content_hash\":\"" + crypto::Md5Hex(std::to_string(at)) +
+          "\",\"mtime\":1757000000,\"file_size_bytes\":32768,\"server_updated_at\":1757000100,"
+          "\"server_content_hash\":\"" + crypto::Md5Hex("server " + std::to_string(at)) + "\"}\n";
+  }
+  const std::size_t archival = 4;
+  for (std::size_t at = 0; at < archival; ++at) {
+    v2 += "{\"rom_id\":" + std::to_string(5000 + at) + ",\"slot\":null,\"content_hash\":\"" +
+          crypto::Md5Hex("archival") +
+          "\",\"mtime\":1757000000,\"file_size_bytes\":1,\"server_updated_at\":null,"
+          "\"server_content_hash\":null}\n";
+  }
+  const std::size_t states = 24;
+  for (std::size_t at = 0; at < states; ++at) {
+    v2 += "{\"kind\":\"state\",\"rom_id\":" + std::to_string(1000 + at) +
+          ",\"file_name\":\"Game (USA).state\",\"emulator\":\"tico\",\"content_hash\":\"" +
+          crypto::Md5Hex("state") +
+          "\",\"mtime\":1757000100,\"file_size_bytes\":4,\"server_state_id\":" +
+          std::to_string(at + 1) + ",\"server_updated_at\":1757000090,\"server_file_size_bytes\":4}\n";
+  }
+  c.Expect(v2.size() > state::kMaxStateBytes, "the fixture is past this build's byte bound too");
+
+  const auto kept = [&](const state::LoadedBaseline& loaded, const std::string& how) {
+    c.ExpectEq(loaded.version, state::kSourceSlotVersion, how + ": read as rc1's file -- " +
+                                                              loaded.DescribeDiagnostics());
+    c.ExpectEq(loaded.value.state_rows().size(), states, how + ": every state row stands");
+    c.ExpectEq(loaded.value.rows().size(), archival, how + ": and every archival row");
+    c.ExpectEq(loaded.value.size() + loaded.legacy_saves.size(), state::kMaxRecords,
+               how + ": and slotted save rows up to the bound, the rest let go");
+    c.Expect(Mentions(loaded, "re-hash") || Mentions(loaded, "hashed"),
+             how + ": which is said -- " + loaded.DescribeDiagnostics());
+  };
+  kept(state::ParseBaseline(v2), "parsed");
+  const std::filesystem::path path = FreshPath("rc1-full.db");
+  WriteWhole(path.string(), v2);
+  kept(state::LoadBaseline(path.string()), "loaded");
+
+  // A version 3 file over the bound is not one this build wrote, and stays
+  // refused (`TooManyRowsIsRefused`); so is a v2 file past rc1's own.
+  std::string past = "rommsync-state 2\n";
+  for (std::size_t at = 0; at <= 512; ++at) {
+    past += "{\"rom_id\":" + std::to_string(1000 + at) + ",\"slot\":null,\"content_hash\":\"" +
+            crypto::Md5Hex("x") + "\",\"mtime\":1757000000,\"file_size_bytes\":1,"
+            "\"server_updated_at\":null,\"server_content_hash\":null}\n";
+  }
+  c.Expect(state::ParseBaseline(past).value.empty(), "a v2 file past rc1's 512 rows is discarded");
+}
+
 void TooManyRowsIsRefused(checks::Checks& c) {
   std::string text = std::string(state::kFormatMagic) + " " +
                      std::to_string(state::kFormatVersion) + "\n";
@@ -1011,6 +1069,7 @@ int main() {
   AHugeTimestampIsDiagnosedNotOverflowed(c);
   AnUnusableOldIsNotABrandNewCard(c);
   OversizedFilesAreRefusedBySize(c);
+  ARc1FileOverTheBoundsKeepsItsStates(c);
   TooManyRowsIsRefused(c);
   AMissingFileIsReportedAndNotAFailure(c);
   HashesAFileTheWayTheServerWill(c);
