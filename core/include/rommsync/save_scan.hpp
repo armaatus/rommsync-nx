@@ -529,9 +529,10 @@ struct ScanFolder {
 struct SortedFolder {
   ScanFolder base;
 
-  /// The last name a cut listing (`fs::ListError::kTooManyEntries`) kept, or ""
-  /// for one read whole: a core folder sorting past it was not seen.
-  std::string last_kept;
+  /// Its listing was cut (`fs::ListError::kTooManyEntries`): a core folder it
+  /// did not reach is read only when RomM's table names it and `base` is not a
+  /// rom folder, and one made now may or may not be reached.
+  bool cut = false;
 };
 
 /// The folders one walk reads, in the order it reads them.
@@ -553,9 +554,9 @@ FolderPlan PlanFolders(const config::Config& config, const retroarch::Settings& 
                        Folders which, fs::FileSystem& files, ScanResult* result);
 
 /// How the walk `plan` describes reads `directory` -- a folder in it, or a core
-/// folder not made yet under one of its sorted folders that the walk's listing
-/// would reach once it is -- or nullopt when the walk reads nothing there.
-/// Case is ignored, as FAT32 ignores it.
+/// folder not made yet under one of its sorted folders whose listing was read
+/// whole, which that listing finds once it is made -- or nullopt when the walk
+/// reads nothing there. Case is ignored, as FAT32 ignores it.
 std::optional<ScanFolder> FolderIn(const FolderPlan& plan, std::string_view directory);
 
 /// What a walk does with a file called `name` in `folder`, before matching it
@@ -566,11 +567,6 @@ enum class FileRule {
   kSaveFolder,  ///< a loose file where PPSSPP keeps folders: a `kSaveFolder` skip
 };
 FileRule RuleFor(const ScanFolder& folder, std::string_view name, Folders which);
-
-/// True when a listing of a folder holds, or would hold, an entry called
-/// `name`: it was read whole, or `name` sorts no later than the last name its
-/// cut kept (`fs::kMaxDirectoryEntries` keeps the first by name).
-bool Reaches(const fs::Listing& listing, std::string_view name);
 
 /// Which platform each save directory implies, keyed by directory.
 ///

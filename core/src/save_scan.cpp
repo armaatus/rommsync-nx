@@ -461,25 +461,17 @@ bool IsCoreFolder(std::string_view leaf, bool beside_roms) {
   return !leaf.empty() && leaf.front() != '.' && (!beside_roms || !RetroArchCoreId(leaf).empty());
 }
 
-/// The last name a cut listing kept, or "" for a listing read whole.
-std::string LastKept(const fs::Listing& listing) {
-  std::string last;
-  if (listing.error == fs::ListError::kTooManyEntries) {
-    for (const fs::Entry& entry : listing.entries) {
-      if (entry.name > last) {
-        last = entry.name;
-      }
-    }
-  }
-  return last;
+/// The core folder `leaf` at `path`, under the sorted folder `base`.
+ScanFolder CoreFolder(const std::string& path, std::string_view leaf, const ScanFolder& base) {
+  ScanFolder core;
+  core.directory = path;
+  core.source = RetroArchCoreSource(path, leaf);
+  core.platform_hint = base.platform_hint;
+  core.beside_roms = base.beside_roms;
+  return core;
 }
 
 }  // namespace
-
-bool Reaches(const fs::Listing& listing, std::string_view name) {
-  const std::string last = LastKept(listing);
-  return last.empty() || name <= last;
-}
 
 FileRule RuleFor(const ScanFolder& folder, std::string_view name, Folders which) {
   if ((folder.beside_roms && !IsRetroArchFile(name, which)) || NeverSynced(name)) {
@@ -541,12 +533,7 @@ FolderPlan PlanFolders(const config::Config& config, const retroarch::Settings& 
                      " RetroArch core folders one scan reads; its saves are not read");
       return;
     }
-    ScanFolder core;
-    core.directory = path;
-    core.source = RetroArchCoreSource(path, leaf);
-    core.platform_hint = base.platform_hint;
-    core.beside_roms = base.beside_roms;
-    if (add(std::move(core))) {
+    if (add(CoreFolder(path, leaf, base))) {
       ++plan.core_folders;
     }
   };
@@ -605,7 +592,7 @@ FolderPlan PlanFolders(const config::Config& config, const retroarch::Settings& 
         RecordSkip(result, SkipReason::kDirectoryFailed, base.directory,
                    listing.message.empty() ? fs::ToString(listing.error) : listing.message);
       }
-      plan.sorted.push_back({base, LastKept(listing)});
+      plan.sorted.push_back({base, listing.error == fs::ListError::kTooManyEntries});
       std::sort(listing.entries.begin(), listing.entries.end(),
                 [](const fs::Entry& left, const fs::Entry& right) {
                   return left.name < right.name;
@@ -639,8 +626,7 @@ FolderPlan PlanFolders(const config::Config& config, const retroarch::Settings& 
           }
           continue;
         }
-        if ((base.beside_roms && !IsRetroArchFile(entry.name, which)) ||
-            NeverSynced(entry.name) || result == nullptr) {
+        if (RuleFor(base, entry.name, which) != FileRule::kRead || result == nullptr) {
           continue;  // a rom, or not a save at all
         }
         ++result->files_seen;
@@ -737,7 +723,7 @@ std::optional<ScanFolder> FolderIn(const FolderPlan& plan, std::string_view dire
     }
   }
   // A core folder not made yet: the walk finds it by listing its sorted
-  // folder, so it is read when that listing will reach it -- and the bound on
+  // folder, so it is read when that listing is read whole -- and the bound on
   // core folders has room.
   const std::size_t slash = directory.rfind('/');
   if (slash == std::string_view::npos || slash == 0 ||
@@ -747,17 +733,10 @@ std::optional<ScanFolder> FolderIn(const FolderPlan& plan, std::string_view dire
   const std::string parent = LowerAscii(directory.substr(0, slash));
   const std::string_view leaf = directory.substr(slash + 1);
   for (const SortedFolder& sorted : plan.sorted) {
-    if (LowerAscii(sorted.base.directory) != parent ||
-        !IsCoreFolder(leaf, sorted.base.beside_roms) ||
-        !(sorted.last_kept.empty() || leaf <= sorted.last_kept)) {
-      continue;
+    if (LowerAscii(sorted.base.directory) == parent && !sorted.cut &&
+        IsCoreFolder(leaf, sorted.base.beside_roms)) {
+      return CoreFolder(std::string(directory), leaf, sorted.base);
     }
-    ScanFolder core;
-    core.directory = std::string(directory);
-    core.source = RetroArchCoreSource(core.directory, leaf);
-    core.platform_hint = sorted.base.platform_hint;
-    core.beside_roms = sorted.base.beside_roms;
-    return core;
   }
   return std::nullopt;
 }
@@ -828,13 +807,26 @@ void ForgetUnhashed(ScanResult* result, const std::string& sd_path) {
   }
 }
 
+/// Put `record` where `records[at]` -- the copy it takes a key from -- was,
+/// and report that one as the duplicate (`reason`) instead.
+template <class Record>
+void Displace(std::vector<Record>* records, std::size_t at, Record record, SkipReason reason,
+              std::string message, ScanResult* result) {
+  Record& displaced = (*records)[at];
+  RecordSkip(result, reason, displaced.sd_path, std::move(message));
+  if (displaced.content_hash.empty()) {
+    ForgetUnhashed(result, displaced.sd_path);
+  }
+  displaced = std::move(record);
+}
+
 /// The sentence for the copy a played-in one took a key from.
 std::string Displaced(const config::Config& config, const std::string& platform,
                       const std::string& winner) {
-  const std::optional<config::PlayWith> play_with = config.PlayWithFor(platform);
+  // Only ever asked once `PlayedIn` said yes, so there is a frontend to name.
   return std::string("[platform.") + platform + "] play_with plays it in " +
-         (play_with.has_value() ? config::ToString(*play_with) : "") + ", so " + winner +
-         " is the copy synced this tick";
+         config::ToString(config.PlayWithFor(platform).value_or(config::PlayWith::kTico)) +
+         ", so " + winner + " is the copy synced this tick";
 }
 
 /// The half of both walks that is the same, which is nearly all of it.
@@ -1064,15 +1056,11 @@ ScanResult ScanSaves(const config::Config& config, const retroarch::Settings& re
          }
 
          if (claim == decltype(claimed)::Outcome::kTaken) {
-           SaveFile& displaced = result.saves[held_by];
-           record_skip(SkipReason::kDuplicateSlot, displaced.sd_path,
-                       "rom " + std::to_string(save.rom_id) + " has another save in slot \"" +
-                           save.slot + "\": " +
-                           Displaced(config, rom.platform_fs_slug, save.sd_path));
-           if (displaced.content_hash.empty()) {
-             ForgetUnhashed(&result, displaced.sd_path);
-           }
-           displaced = std::move(save);
+           std::string message = "rom " + std::to_string(save.rom_id) +
+                                 " has another save in slot \"" + save.slot + "\": " +
+                                 Displaced(config, rom.platform_fs_slug, save.sd_path);
+           Displace(&result.saves, held_by, std::move(save), SkipReason::kDuplicateSlot,
+                    std::move(message), &result);
            claimed.Hold(key, held_by, true);
            return Emit::kReplaced;
          }
@@ -1173,15 +1161,11 @@ ScanResult ScanStates(const config::Config& config, const retroarch::Settings& r
          }
 
          if (claim == decltype(claimed)::Outcome::kTaken) {
-           StateFile& displaced = result.states[held_by];
-           record_skip(SkipReason::kDuplicateName, displaced.sd_path,
-                       "rom " + std::to_string(file.rom_id) + " has another state called \"" +
-                           file.file_name + "\": " +
-                           Displaced(config, rom.platform_fs_slug, file.sd_path));
-           if (displaced.content_hash.empty()) {
-             ForgetUnhashed(&result, displaced.sd_path);
-           }
-           displaced = std::move(file);
+           std::string message = "rom " + std::to_string(file.rom_id) +
+                                 " has another state called \"" + file.file_name + "\": " +
+                                 Displaced(config, rom.platform_fs_slug, file.sd_path);
+           Displace(&result.states, held_by, std::move(file), SkipReason::kDuplicateName,
+                    std::move(message), &result);
            claimed.Hold(key, held_by, true);
            return Emit::kReplaced;
          }

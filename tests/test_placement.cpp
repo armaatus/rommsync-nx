@@ -601,24 +601,45 @@ void RomFolder(checks::Checks& c) {
            "unsorted, a save past a rom folder's cut");
   }
   {
-    // The roms sort after both: the cut keeps the core folder and the save.
-    Card card("rom-folder-reached");
-    fill(card, "/tico/roms/snes", "z rom ");
+    // A rom folder read whole: the core folder and the loose save both come back.
+    Card card("rom-folder-whole");
+    card.Write("/tico/roms/snes/A Rom.sfc", "rom\n");
     agrees(card, opted.value, sorted, smw,
            "/tico/roms/snes/Snes9x/Super Mario World (USA).srm", true,
-           "sorted, a core folder the cut listing reaches");
+           "sorted, a core folder under a rom folder read whole");
     agrees(card, opted.value, flat, smw, "/tico/roms/snes/Super Mario World (USA).srm", true,
-           "unsorted, a save the cut listing reaches");
+           "unsorted, a save in a rom folder read whole");
+  }
+  {
+    // The roms sort after both, so the cut would keep the new entry -- and push
+    // out the last one it kept, which may be a save that syncs now. A listing
+    // the scan keeps by name gets no new entry at all.
+    Card card("rom-folder-reached");
+    fill(card, "/tico/roms/snes", "z rom ");
+    for (const retroarch::Settings& settings : {sorted, flat}) {
+      place::Placer placer(opted.value, settings, index, card.files());
+      const place::Placement placed = placer.Save(smw);
+      c.Expect(!placed.ok() && !placed.reason.empty(),
+               "nothing new in a cut rom folder, even where the cut would reach it: " +
+                   placed.sd_path + placed.reason);
+    }
   }
   {
     // RetroArch's own folder, cut: every core folder RomM's table names is read
-    // whether the listing reached it or not, so the placement stands.
+    // whether the listing reached it or not, so a placement into one that is
+    // there stands -- and one that would make it is a new entry in the cut.
     Card card("rom-folder-own-cut");
     fill(card, "/retroarch/cores/savefiles", "A stale ");
     const config::LoadResult retro = config::ParseConfig("[platform.snes]\nplay_with = retroarch\n");
-    agrees(card, retro.value, retroarch::Settings{}, smw,
-           "/retroarch/cores/savefiles/Snes9x/Super Mario World (USA).srm", true,
-           "a cut RetroArch folder's core folder RomM's table names");
+    const std::string target = "/retroarch/cores/savefiles/Snes9x/Super Mario World (USA).srm";
+    place::Placer unmade(retro.value, retroarch::Settings{}, index, card.files());
+    const place::Placement refused = unmade.Save(smw);
+    c.Expect(!refused.ok() && refused.reason.find("entries") != std::string::npos,
+             "a core folder not made yet is a new entry in the cut folder: " + refused.sd_path +
+                 refused.reason);
+    card.MakeDirs("/retroarch/cores/savefiles/Snes9x");
+    agrees(card, retro.value, retroarch::Settings{}, smw, target, true,
+           "the same core folder once it is there");
   }
   {
     // A Tico folder the map also lists as a rom folder is read as one: only

@@ -84,7 +84,7 @@ MakeDirResult MadeFolders::Make(std::string_view sd_path) {
     }
     folder.resize(slash);
   }
-  made_.assign(missing.rbegin(), missing.rend());
+  made_.insert(made_.end(), missing.rbegin(), missing.rend());
   return files_->CreateDirectory(sd_path);
 }
 

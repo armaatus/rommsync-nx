@@ -218,6 +218,9 @@ struct SaveFormat {
 
   /// `extension` -- `.srm`, lowercased -- is one this emulator writes.
   bool Writes(std::string_view extension) const;
+
+  /// Anything at all is known about its names.
+  bool Known() const { return *primary != '\0' || also[0] != nullptr || folders; }
 };
 
 /// A libretro core's: RetroArch's `.srm`, and the `.rtc` some keep beside it.

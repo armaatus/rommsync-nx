@@ -80,7 +80,7 @@ std::string ExtensionFor(std::string_view emulator_id, std::string_view server_f
     // The same SRAM under another client's name: mGBA's own, a web player's.
     return format.primary;
   }
-  if (*format.primary == '\0' && format.also[0] == nullptr) {
+  if (!format.Known()) {
     // A module whose names nobody has read off a console yet [#44]. The save
     // can only have come from that same module (`Compatible`), so the name it
     // uploaded under is the name it writes.
@@ -307,10 +307,19 @@ std::string Placer::ReadsBackAs(const roms::Rom& rom, const std::string& sd_path
            (folder->beside_roms ? ", a rom folder" : "") +
            ", so it would come back as a file nobody syncs";
   }
-  if (!scan::Reaches(files_.List(directory), leaf)) {
-    return directory + " holds more than the " + std::to_string(fs::kMaxDirectoryEntries) +
-           " entries the scan lists, and the file would sort past them, so it would never come "
-           "back";
+  // The folder the new entry lands in: the file's own, or -- for a folder made
+  // for it -- the first one up that is there.
+  std::string holder = directory;
+  fs::Listing listing = files_.List(holder);
+  while (listing.error == fs::ListError::kMissing && holder.rfind('/') != 0 &&
+         holder.rfind('/') != std::string::npos) {
+    holder.resize(holder.rfind('/'));
+    listing = files_.List(holder);
+  }
+  if (listing.error == fs::ListError::kTooManyEntries) {
+    return holder + " holds more than the " + std::to_string(fs::kMaxDirectoryEntries) +
+           " entries the scan lists, which it keeps by name, so a new one there may never come "
+           "back or may push out a save that syncs now";
   }
   int read_card = 1;
   // A state is matched as the scan matches one: RetroArch's `.state.auto` by

@@ -167,9 +167,11 @@ class Placer {
   /// Why the scan would not read a file at `sd_path` back as `rom`'s -- as
   /// DuckStation's card `card` where the folder is one with memory cards
   /// (#238) -- or "" when it would. Asked of the scan's own plan of folders and
-  /// its own rules in one (`scan::FolderIn`, `scan::RuleFor`, `scan::Reaches`),
-  /// so a rom folder, a cut listing and a folder it does not read at all are
-  /// answered as the scan answers them (#258).
+  /// its own rules in one (`scan::FolderIn`, `scan::RuleFor`), so a rom folder
+  /// and a folder it does not read at all are answered as the scan answers them
+  /// (#258). Nor is anything placed that would add an entry to a listing cut at
+  /// `fs::kMaxDirectoryEntries`: which entries such a listing keeps is by name,
+  /// so a new one may be past it, or push out a save that synced until then.
   std::string ReadsBackAs(const roms::Rom& rom, const std::string& sd_path, scan::Folders which,
                           int card = 1);
 
