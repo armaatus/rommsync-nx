@@ -287,6 +287,14 @@ phase_builds() {
   grep -q 'rommsync::version()' "$SCRATCH/sysmodule/build/sys-rommsync.lst" ||
     fail "no core/ symbol in the linked sysmodule"
 
+  # No printf formatter. newlib's `_svfprintf_r` comes in only through a
+  # `snprintf` of ours, and brings `_dtoa_r`, `assert` and `_vfiprintf_r` with
+  # it: ~35 KiB of .text for six lines that format a string and an integer --
+  # the margin `check_image_budget` runs on (#204). libnx's resolver keeps
+  # `fprintf`'s own formatter, which is not this one.
+  ! grep -qE '(^| )_svfprintf_r$' "$SCRATCH/sysmodule/build/sys-rommsync.lst" ||
+    fail "the sysmodule links newlib's _svfprintf_r: something calls snprintf; build the line with std::to_chars instead"
+
   check_unwind_tables sysmodule overlay
   check_image_budget
 
