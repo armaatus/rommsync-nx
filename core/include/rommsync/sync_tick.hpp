@@ -405,8 +405,9 @@ struct TickResult {
   Negotiation negotiated;
   ExecutionReport executed;
 
-  /// The one second negotiation a tick may make, for the uploads RomM's slot
-  /// guard answered with a 409. Empty when none was.
+  /// The second negotiation each plan may make, for the uploads RomM's slot
+  /// guard answered with a 409 -- every plan's, folded (`Accumulate`): counts
+  /// summed, the first failure kept. Empty when none was.
   ResolveReport resolved;
 
   TickCompletion finished;

@@ -108,7 +108,21 @@ std::optional<SyncOperation> ResolveNewerOnServer(const SyncOperation& head,
   return resolved;
 }
 
-void Accumulate(ResolveReport* tick, ResolveReport run) { *tick = std::move(run); }
+void Accumulate(ResolveReport* tick, ResolveReport run) {
+  tick->refused += run.refused;
+  tick->resolved += run.resolved;
+  tick->held = tick->held || run.held;
+  // The first failure stands, and so does a second session that was not
+  // accounted for: a later plan that had neither says nothing about them.
+  if (tick->negotiate_error == NegotiateError::kNone) {
+    tick->negotiate_error = run.negotiate_error;
+    tick->negotiate_message = std::move(run.negotiate_message);
+  }
+  if (run.renegotiated && (!tick->renegotiated || tick->second_session.ok())) {
+    tick->second_session = std::move(run.second_session);
+  }
+  tick->renegotiated = tick->renegotiated || run.renegotiated;
+}
 
 ResolveReport ResolveRefusedUploads(http::HttpClient& client, fs::FileSystem& files,
                                     const auth::StoredToken& token,
@@ -138,7 +152,7 @@ ResolveReport ResolveRefusedUploads(http::HttpClient& client, fs::FileSystem& fi
     const bool asked_already = ReportedFor(asked, result.rom_id, result.slot) != nullptr;
     if (local == nullptr || (new_rom && rom_ids.size() >= kMaxNegotiateRomIds) ||
         (!asked_already && asked.size() >= kMaxResolvedUploads)) {
-      // Past RomM's bound on one scope, or past what one tick resolves
+      // Past RomM's bound on one scope, or past what one plan resolves
       // (`kMaxResolvedUploads`): not asked about this tick, so it stays refused
       // and the next tick asks.
       continue;
@@ -164,7 +178,7 @@ ResolveReport ResolveRefusedUploads(http::HttpClient& client, fs::FileSystem& fi
     return out;
   }
 
-  // Once per tick, and only the refused saves, scoped to their roms: unscoped,
+  // Once per plan, and only the refused saves, scoped to their roms: unscoped,
   // the server answers a narrow question with a download for every save in the
   // library this device has no history for.
   //

@@ -388,7 +388,9 @@ rather than counting it failed forever (`sync::ResolveRefusedUploads`,
 1. **Negotiate once more**, for the refused saves only, scoped with `rom_ids`.
    The first plan may name a head that has since been replaced, and downloading
    that row would fetch — and confirm — a superseded save. Never more than one
-   second negotiation per tick, and none while a game is running: the engine's
+   second negotiation per plan — a tick scoped in chunks runs one per chunk
+   (#246), each resolving at most `sync::kMaxResolvedUploads` saves, the rest
+   the next tick's — and none while a game is running: the engine's
    own check (#242) is before the plan, and this is a round trip after it, so
    it asks again (`TickOptions::hold`) and a held resolution leaves
    the 409 for the next tick.

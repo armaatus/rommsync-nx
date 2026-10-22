@@ -16,7 +16,8 @@
 //   1. **Ask the server again**, scoped to the refused saves' roms. The plan the
 //      upload came from may name a head the other device has since replaced, and
 //      a download of that row would fetch -- and confirm -- a superseded save.
-//      One second negotiation per tick, never more, and never a loop.
+//      One second negotiation per plan, never more, and never a loop -- a tick
+//      scoped in chunks runs a plan per chunk (#246), and resolves each with it.
 //   2. **Decide**, per save, with Grout's rule (#226 R3): bytes this device has
 //      not changed since it last synced take the head as a download; bytes it
 //      has changed, or cannot show are unchanged, are a conflict.
@@ -86,7 +87,9 @@ std::optional<SyncOperation> ResolveNewerOnServer(const SyncOperation& head,
                                                   const ClientSaveState* local,
                                                   const state::SaveRecord* last_synced);
 
-/// The most refused uploads one tick resolves (#248).
+/// The most refused uploads one plan's run resolves (#248) -- per chunk, then,
+/// as the heap is: each chunk's run and its resolution are freed before the
+/// next chunk is asked (#246).
 ///
 /// Each costs, beside the run it is resolving, its save asked about again, the
 /// head the server names, what that becomes and what running it did -- ~1.5 KiB
@@ -127,7 +130,7 @@ struct ResolveReport {
   /// uploads stay refused for the next tick. Nothing was sent.
   bool held = false;
 
-  /// The second negotiation was sent. At most once per tick, and only when
+  /// The second negotiation was sent. At most once per plan, and only when
   /// `refused` is not zero.
   bool renegotiated = false;
 

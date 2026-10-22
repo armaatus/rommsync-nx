@@ -477,7 +477,6 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
       stop();
       result.negotiated = std::move(one);
       result.executed = ExecutionReport{};
-      result.resolved = ResolveReport{};
       break;
     }
 
