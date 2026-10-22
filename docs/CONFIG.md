@@ -240,6 +240,15 @@ the default back.
 Never the map's first `saves` folder: that is `/retroarch/saves` for every
 system, which neither Tico nor a default RetroArch reads.
 
+**Only for a game the card holds** (#241). A rom counts as on the card when a
+file named after it is in one of its platform's `roms` folders, or a folder for a
+multi-file rom. The server is asked only about those roms, so a save for a game
+this console does not have is not placed. Keep your roms somewhere other than
+`/tico/roms/<folder>`? List that folder in `roms`, after the download target.
+The folder is not searched recursively, and only its first 512 entries are read.
+Downloading a rom from the overlay brings its save straight away, without
+waiting for the next scheduled sync.
+
 The name is the **rom's**, with the emulator's extension —
 `Super Mario World (USA).srm`, `Game.mcd` for DuckStation — never RomM's stored
 name (`Super Mario World (USA) [2026-10-01_12-00-00].srm`). A state keeps the

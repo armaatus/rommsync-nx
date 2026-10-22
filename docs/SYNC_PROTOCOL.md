@@ -164,6 +164,48 @@ the 409's second negotiation goes out **without** the filter, to see the save
 the guard saw. Filtered, it would answer with this console's own previous
 version, and every later upload would be refused and "resolved" the same way.
 
+### `rom_ids`: only the roms on the card (#241)
+
+Every negotiation also carries `"rom_ids": [...]`. These are the roms the card
+holds: a file named after the rom, or a folder for a multi-file rom, in one of
+its platform's mapped `roms` folders (`sync::FindRomsOnCard`). The roms of the
+saves the request reports are added. RomM then offers downloads for those roms
+only. Without the scope, a device with no history is offered every save in the
+library, and #237 would place them beside games the console does not have. The
+scope is read-only: a rom left out is outside the negotiation, never deleted.
+So a scope that is too narrow costs a first-time restore, never a save. A rom
+kept in a folder the map does not name gets no first-time restore until that
+folder is mapped (CONFIG.md).
+
+RomM takes at most 500 ids a request, so a larger card is negotiated in chunks
+(`sync::ChunkScope`). The rules:
+
+- Each rom is in exactly one chunk.
+- Each save is sent in the chunk that names its rom. RomM widens a chunk's
+  scope by the roms of the saves it carries, so a save sent elsewhere would
+  leave its own rom's chunk offering the server's copy over it.
+- The chunks are one tick. Their operations run as one plan, the baseline is
+  written once, and each session is completed with its own share
+  (`TickResult::other_sessions`).
+- A chunk that fails to negotiate fails the tick before anything is written.
+  The sessions the earlier chunks opened are left to RomM's cleanup.
+
+`rom_ids` costs at most `kMaxRomScopeBytes` (about 10 KiB) of request body. The
+response only shrinks.
+
+**A rom just downloaded is asked about on its own, with `restore_unlisted`.**
+When a download finishes, the engine asks for a tick at once
+(`Scheduler::RunSoon`). That tick sends the downloaded roms in a separate
+negotiation with `"restore_unlisted": true`, and the save is placed through
+#237 before the game is launched. The flag matters for a device that synced
+the save before the rom was deleted: RomM otherwise reads the missing save as
+one the user deleted and offers nothing. The flag applies to the whole request,
+so it goes only on a request scoped to the downloaded roms; nothing else this
+console deleted comes back. Those roms are kept until a negotiation has asked
+for them, so an offline tick keeps them for the next tick. They are not kept
+across a reboot. After a reboot the rom is an ordinary rom on the card, and its
+save still comes unless this device had synced it before.
+
 ### Upgrading from rc1: the old slots (#236)
 
 v1.0.0-rc1 synced each save in a slot of its own, `<source>-<extension>`
