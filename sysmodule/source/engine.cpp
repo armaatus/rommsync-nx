@@ -1627,12 +1627,6 @@ void SdEngine::ServeInstalls(http::HttpClient& client, const auth::StoredToken& 
     log::Info(log::Event::kRemoteInstall,
               wanted ? "RomM's web UI can install roms on this console"
                      : "RomM's web UI will not offer this console: [downloads] enabled = false");
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (server_generation_ == generation) {
-        install_registered_ = wanted;
-      }
-    }
     if (!wanted) {
       // Downloads went off with requests taken, or before a reboot left some:
       // nothing here will fetch them, so the browser is told now rather than
@@ -1642,7 +1636,25 @@ void SdEngine::ServeInstalls(http::HttpClient& client, const auth::StoredToken& 
       // done, already installed -- as the `wanted` path does; the claim then
       // hands back only what is still taken.
       SettleInstalls(client, token, config.server.url, cancel);
+      std::vector<install::Request> owed;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        owed = install_claims_;
+      }
+      // A settled request whose report did not go is not failed, and is not
+      // dropped either: the switch is recorded as told only once every report
+      // went, so the next tick restates it and tries again.
+      const bool settled =
+          std::none_of(owed.begin(), owed.end(), [this](const install::Request& claim) {
+            return install::VerdictFor(queue_.Find(claim.rom_id)).has_value();
+          });
+      if (!settled) {
+        return;
+      }
       const install::Claimed held = install::Claim(client, config.server.url, token, policy);
+      if (held.exchange.transport != http::Error::kNone) {
+        return;
+      }
       for (const install::Request& request : held.page.requests) {
         install::Report(client, config.server.url, token, request.id,
                         {install::Outcome::kFailed,
@@ -1653,6 +1665,10 @@ void SdEngine::ServeInstalls(http::HttpClient& client, const auth::StoredToken& 
       if (server_generation_ == generation) {
         install_claims_.clear();
       }
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (server_generation_ == generation) {
+      install_registered_ = wanted;
     }
   }
   if (!wanted) {
