@@ -24,6 +24,7 @@
 #include "checks.hpp"
 #include "scratch.hpp"
 #include "rommsync/atomic_file.hpp"
+#include "rommsync/config.hpp"
 #include "rommsync/md5.hpp"
 #include "rommsync/save_scan.hpp"
 #include "rommsync/state_db.hpp"
@@ -521,13 +522,17 @@ void RefusesAFileTheReaderWouldDiscard(checks::Checks& c) {
 /// The two bounds have to agree, or the writer produces files the reader throws
 /// away. A full baseline must serialize to less than the byte bound.
 void TheTwoBoundsAgree(checks::Checks& c) {
+  // The longest slot a save can be synced in: the longest `[sync] slot` the
+  // config accepts, and a companion file's suffix -- `-save`, the one a file
+  // with no usable extension gets, is longer than any real save's (`-srm`,
+  // `-rtc`, `-mcd`). A slot is the one field of a row a user chooses, so the
+  // byte bound has to hold at that slot's longest, not at `autosave`.
+  const std::string longest = std::string(rommsync::config::kMaxSlotLength, 'x') + "-save";
   state::Baseline full;
   for (std::size_t at = 0; at < state::kMaxRecords; ++at) {
     state::SaveRecord record = Full();
     record.rom_id = static_cast<std::int64_t>(at) + 1;
-    // A slot longer than any real one, so the headroom is real and not an
-    // artefact of the eight characters `Full()` happens to use.
-    record.slot = "autosave-" + std::string(23, 'x');
+    record.slot = longest;
     full.Set(record);
   }
   const std::string text = state::SerializeBaseline(full);
@@ -548,7 +553,7 @@ void TheTwoBoundsAgree(checks::Checks& c) {
   for (std::size_t at = 0; at < state::kMaxRecords - kStates; ++at) {
     state::SaveRecord record = Full();
     record.rom_id = static_cast<std::int64_t>(at) + 1;
-    record.slot = "autosave-" + std::string(23, 'x');
+    record.slot = longest;
     mixed.Set(record);
   }
   for (std::size_t at = 0; at < kStates; ++at) {
