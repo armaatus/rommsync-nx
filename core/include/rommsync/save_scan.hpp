@@ -209,7 +209,8 @@ enum class SkipReason {
   /// RomM and RetroArch hold those as a `PSP-<folder>.zip`, and the adapter that
   /// would bundle one -- hashed by RomM's per-entry ZIP rule, #234 -- comes after
   /// #44 captures real folders. One skip per folder; its files were never read.
-  /// The module's own `backups/` is not one.
+  /// The module's own `backups/` is not one. A loose file in that folder is
+  /// skipped the same way: PPSSPP writes none, so it is no PSP save either.
   kSaveFolder,
 };
 

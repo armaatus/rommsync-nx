@@ -945,7 +945,8 @@ void Sources(::checks::Checks& checks) {
       {"/tico/saves/dc", "Dc Romm.bin", "dc", "tico-flycast", "autosave-bin"},  // RomM's own spelling
       {"/tico/saves/nds", "Nds Tico.dsv", "nds", "tico-drastic", "autosave-dsv"},
       {"/tico/saves/saturn", "Saturn Tico.bkr", "saturn", "tico-yabasanshiro", "autosave-bkr"},
-      {"/tico/saves/psp", "Psp Tico.bin", "psp", "tico-ppsspp", "autosave-bin"},
+      // Tico's psp folder holds no file the scan reads: PPSSPP saves are folders,
+      // and a loose file is the named skip (#238, scan.isolated).
       // The override: mGBA for GB, set in config.ini.
       {"/tico/saves/gb", "Gb Tico.srm", "gb", "mgba", "autosave"},
       // A folder neither emulator owns: the override when there is one, else null.

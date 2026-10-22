@@ -805,6 +805,15 @@ void Walk(const std::vector<ScanFolder>& folders, Folders which, const roms::Rom
       }
       ++result->files_seen;
       const std::string sd_path = Join(directory, entry.name);
+      if (folder.save_folders && which == Folders::kSaves) {
+        // PPSSPP writes no loose save here, so a file named for a rom is not
+        // one -- and uploaded, it would open a `tico-ppsspp` lineage that the
+        // PSP adapter (#44) would then have to contest. PSP states are files.
+        record_skip(SkipReason::kSaveFolder, sd_path,
+                    "PPSSPP keeps each game's save as a folder, so a loose file here is no PSP "
+                    "save, and PSP saves are not synced yet (#238)");
+        continue;
+      }
 
       int card = 1;
       // RetroArch's Auto state, `Game.state.auto`, is matched by `Game` (#239).
