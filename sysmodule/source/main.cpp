@@ -885,7 +885,7 @@ static_assert(kNegotiateEntryBytes <=
               "a save's negotiate entry now costs more than its plan operation; it is no "
               "longer under the plan phase (M9-22)");
 static_assert(rommsync::sync::kMaxResolvedUploads == 4 && kTickResolveBytes == 6848,
-              "the uploads one tick resolves moved; retotal the run phase (M9-22)");
+              "the uploads one plan resolves moved; retotal the run phase (M9-22)");
 static_assert(sizeof(rommsync::scan::StateFile) == 184 &&
                   sizeof(rommsync::sync::ServerState) == 96 &&
                   sizeof(rommsync::sync::StateOperationResult) == 264,
@@ -1078,13 +1078,23 @@ std::unique_ptr<rommsync::fs::FileSystem> g_card;
 /// what the card is. A console without one can only be reading FAT32, so a "no"
 /// is certain; a "yes" -- nearly every console -- leaves the card unknown, and
 /// `card.cpp` holds an unknown card to FAT32's 4 GiB ceiling (#202). A call that
-/// fails is the same unknown.
-rommsync::fs::Format CardFormat() {
+/// fails is the same unknown. `basis` is which of the three it was, for the boot
+/// log: #44 checks on a real console that the call is not refused under this
+/// NPDM, and a log that only said "unknown" could not tell it.
+struct CardReading {
+  rommsync::fs::Format format = rommsync::fs::Format::kUnknown;
+  const char* basis = "";
+};
+
+CardReading CardFormat() {
   bool exfat = true;
-  if (R_SUCCEEDED(fsIsExFatSupported(&exfat)) && !exfat) {
-    return rommsync::fs::Format::kFat32;
+  if (R_FAILED(fsIsExFatSupported(&exfat))) {
+    return {rommsync::fs::Format::kUnknown, "fsIsExFatSupported was refused"};
   }
-  return rommsync::fs::Format::kUnknown;
+  if (!exfat) {
+    return {rommsync::fs::Format::kFat32, "this console has no exFAT driver"};
+  }
+  return {rommsync::fs::Format::kUnknown, "this console reads exFAT, so it could be either"};
 }
 
 /// `sdmc:/config/rommsync/rommsync.log`, and the reason there is one (M7-3,
@@ -1656,7 +1666,8 @@ int main(int, char**) {
   // files off the same card, and the rule that matters is that nothing here
   // touches the *network* (CLAUDE.md, "Never block boot"), which is still true.
   // Nothing in this block waits on anything.
-  g_card = rommsync::sysmodule::MakeSdCard(CardFormat());
+  const CardReading card_format = CardFormat();
+  g_card = rommsync::sysmodule::MakeSdCard(card_format.format);
   const rommsync::fs::MakeDirResult config_dir =
       g_card->CreateDirectory(rommsync::sysmodule::kConfigSdDir);
   g_log = std::make_unique<rommsync::log::FileSink>(
@@ -1706,6 +1717,9 @@ int main(int, char**) {
   Log(rommsync::sysmodule::NetworkReady()
           ? "rommsync: ssl transport up"
           : "rommsync: no transport; every request will answer connect-failed");
+  // Either answer this build can reach holds a file to 4 GiB (`card.cpp`).
+  Log(std::string("rommsync: card format ") + rommsync::fs::ToString(card_format.format) + " (" +
+      card_format.basis + "); a file on it stops at 4 GiB");
 
   // Read once, here rather than per request: `GetStatus` and `GetConfig` are
   // documented never to fail and are polled every frame by the status screen,
