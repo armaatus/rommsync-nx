@@ -683,6 +683,109 @@ void Emulators(rig::Checks& checks) {
     checks.Expect(client.Sent("POST /api/states?rom_id=1&emulator=fceumm"),
                   "as the libretro core Tico runs");
   }
+
+  // Turning the mapping on renames Tico's slots one up: the card's `Game.state0`
+  // is now keyed `Game.state1`, the name `Game.state1` itself synced under
+  // until now. That row describes another file on this card, so the renamed one
+  // must not be uploaded over it -- which would move menu slot 1's state into
+  // menu slot 2's row for every device that reads it.
+  {
+    Sandbox sandbox(checks, "states-emulators-toggled");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    sandbox.MakeDirs("/tico/states/nes");
+    sandbox.Write("/tico/states/nes/Game.state0", "menu slot 1's session");
+    sandbox.Write("/tico/states/nes/Game.state1", "menu slot 2's session, a longer one");
+
+    // The baseline as an unmapped tick left it: each file paired under its own name.
+    state::Baseline baseline;
+    std::string listing = "[";
+    for (const auto& [name, id] : {std::make_pair(std::string("Game.state0"), 7),
+                                   std::make_pair(std::string("Game.state1"), 8)}) {
+      fs::Directories directories(*files);
+      state::FileFacts facts;
+      std::string why;
+      checks.Expect(state::ReadBackFile(*files, directories, "/tico/states/nes/" + name, &facts,
+                                        &why),
+                    "the seeded state can be read back -- " + why);
+      state::StateRecord row;
+      row.rom_id = 1;
+      row.file_name = name;
+      row.emulator = "fceumm";
+      row.content_hash = facts.content_hash;
+      row.mtime = facts.mtime;
+      row.file_size_bytes = facts.file_size_bytes;
+      row.server_state_id = id;
+      row.server_updated_at = sync::Timestamp{} + std::chrono::seconds{1'788'663'600};
+      row.server_file_size_bytes = facts.file_size_bytes;
+      baseline.SetState(row);
+      listing += (id == 7 ? "" : ",") + StateRowJson(id, 1, name, "fceumm", facts.file_size_bytes,
+                                                      "2026-09-06T03:00:00+00:00");
+    }
+    listing += "]";
+
+    config::Config mapped = StatesOn(true);
+    mapped.sync.map_state_slots = true;
+    ScriptedClient client;
+    client.listing = listing;
+    client.upload_response =
+        StateRowJson(10, 1, "Game.state2", "fceumm", 35, "2026-09-06T03:00:00+00:00");
+    const sync::StateSyncReport report =
+        sync::SyncStates(client, *files, token, mapped, index, &baseline, OptionsAt(kStamp));
+    checks.Expect(std::find(client.parts.begin(), client.parts.end(),
+                            "stateFile=Game.state1") == client.parts.end(),
+                  "the renamed slot 1 is not uploaded over the row slot 2 synced under");
+    bool said = false;
+    for (const sync::StateOperationResult& operation : report.operations) {
+      said = said || (operation.file_name == "Game.state1" &&
+                      operation.outcome == sync::StateOutcome::kKeptBoth &&
+                      operation.message.find("map_state_slots") != std::string::npos);
+    }
+    checks.Expect(said, "it is kept apart, and the reason names the setting that renamed it");
+  }
+
+  // A state downloaded under RetroArch's name lands on the Tico file it is, and
+  // backs that file up first (the sandbox's teardown audit judges the order).
+  {
+    Sandbox sandbox(checks, "states-emulators-mapped-download");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    sandbox.MakeDirs("/tico/states/nes");
+    sandbox.SeedState("/tico/states/nes/Game.state5", kBytes);
+    fs::Directories directories(*files);
+    state::FileFacts facts;
+    std::string why;
+    checks.Expect(state::ReadBackFile(*files, directories, "/tico/states/nes/Game.state5", &facts,
+                                      &why),
+                  "the seeded state can be read back -- " + why);
+    state::StateRecord row;
+    row.rom_id = 1;
+    row.file_name = "Game.state.auto";
+    row.emulator = "fceumm";
+    row.content_hash = facts.content_hash;
+    row.mtime = facts.mtime;
+    row.file_size_bytes = facts.file_size_bytes;
+    row.server_state_id = 9;
+    row.server_updated_at = sync::Timestamp{} + std::chrono::seconds{1'700'000'000};
+    row.server_file_size_bytes = 40;
+    state::Baseline baseline;
+    baseline.SetState(row);
+
+    config::Config mapped = StatesOn(true);
+    mapped.sync.map_state_slots = true;
+    ScriptedClient client;
+    client.listing = "[" +
+                     StateRowJson(9, 1, "Game.state.auto", "fceumm", 40,
+                                  "2026-09-06T03:00:00+00:00") +
+                     "]";
+    client.content = std::string(40, 'r');
+    const sync::StateSyncReport report =
+        sync::SyncStates(client, *files, token, mapped, index, &baseline, OptionsAt(kStamp));
+    checks.ExpectEq(report.completed, 1, "RetroArch's newer Auto came down");
+    checks.ExpectEq(sandbox.Read("/tico/states/nes/Game.state5"), std::string(40, 'r'),
+                    "onto Tico's Auto file");
+    checks.Expect(sandbox.HasBackupOf(kBytes), "and the bytes it replaced are under .backup/");
+  }
 }
 
 // --- recording ----------------------------------------------------------------
