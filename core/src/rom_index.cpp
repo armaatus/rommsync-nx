@@ -255,9 +255,11 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
 
   // A server that answers a page of one would otherwise take a round trip per
   // rom, up to the whole of `kMaxIndexRoms`, every tick. The cap is on
-  // *requests* -- the pages that came back, and apart from them the ones refused
-  // as too large -- so a pathological page size ends the fetch with a truncated
-  // index rather than with a tick that never finishes.
+  // *requests*, so a pathological page size ends the fetch with a truncated
+  // index rather than with a tick that never finishes: this many pages that came
+  // back, and apart from them this many refused as too large -- at most twice
+  // it in all. Apart, because a refusal halving its way down to a wide rom is
+  // not a page of the library, and counted together they cut it short.
   constexpr int kMaxPages = 256;
   // No larger than the default, because the default is a heap term rather than
   // a preference (`kDefaultPageSize`): a caller asking for more would be asking
@@ -274,7 +276,8 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
   // `largest`; otherwise it doubles after `wait` pages that came back. `wait`
   // doubles each time a doubled page is refused, so a library that is wide
   // everywhere -- every rom on IGDB -- pays a probe now and then rather than one
-  // a page.
+  // a page. Nor is there a backoff between them: the server answered, and the
+  // same request is the same size however long it waits.
   const int largest = std::clamp(options.page_size, 1, kDefaultPageSize);
   int page_size = largest;
   int wait = 1;
@@ -332,6 +335,8 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
       ++refused;
       streak = 0;
       if (probing) {
+        // Past a fetch's pages the next probe never comes, which is the end of
+        // doubling and of `int` overflow both.
         wait = std::min(wait * 2, kMaxPages);
       }
       probing = false;

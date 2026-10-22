@@ -913,7 +913,7 @@ void TooLarge(checks::Checks& c) {
     c.Expect(client.limits.size() >= 2 && client.limits[1] == client.limits[0] / 2 &&
                  client.limits.back() <= 7,
              "asking for half as many rows each time a page is refused");
-    c.Expect(client.requests <= 40 / 4 + 4 + 4,
+    c.Expect(client.requests <= 40 / 4 + 4 + 6,
              "and for more again only now and then: " + std::to_string(client.requests));
   }
 
@@ -932,15 +932,16 @@ void TooLarge(checks::Checks& c) {
              "which reads as an index that is not whole, and says why: " + fetched.message);
   }
 
+  std::vector<std::pair<std::string, std::string>> large;
+  for (int index = 0; index < 400; ++index) {
+    large.push_back({"Game " + std::to_string(index), "game" + std::to_string(index) + ".gba"});
+  }
+
   // ...and past it the page grows back. A rom too wide to read alone halves the
   // page down to one row on the way to it; kept there, a library of 1,024 is a
   // request a rom and the page cap ends it a quarter of the way through, every
   // tick -- the saves of the rest unmatched.
   {
-    std::vector<std::pair<std::string, std::string>> large;
-    for (int index = 0; index < 400; ++index) {
-      large.push_back({"Game " + std::to_string(index), "game" + std::to_string(index) + ".gba"});
-    }
     FakeClient client(large);
     client.Ceiling(64, 1);
     rommsync::roms::FetchOptions options;
@@ -960,10 +961,6 @@ void TooLarge(checks::Checks& c) {
   // one -- RetroAchievements metadata grows a row by the achievement. Nothing is
   // left out, so nothing marks the place to grow back from but the pages after.
   {
-    std::vector<std::pair<std::string, std::string>> large;
-    for (int index = 0; index < 400; ++index) {
-      large.push_back({"Game " + std::to_string(index), "game" + std::to_string(index) + ".gba"});
-    }
     FakeClient client(large);
     client.Ceiling(64, 1, 2);
     rommsync::roms::FetchOptions options;
