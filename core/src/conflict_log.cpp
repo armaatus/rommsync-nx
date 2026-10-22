@@ -491,11 +491,19 @@ LoadedHistory LoadHistory(const std::string& path) {
   return ParseHistory(contents);
 }
 
-History::History(std::string path) : path_(std::move(path)) {}
+History::History(std::string path) : path_(std::move(path)) {
+  // Room for one past the bound, once: an `Append` inserts before it trims, and
+  // a vector with no room left doubles -- both arrays live while it moves, in
+  // the tick's run phase (#248).
+  entries_.reserve(kMaxEntries + 1);
+}
 
 std::vector<std::string> History::Load() {
   LoadedHistory loaded = LoadHistory(path_);
-  entries_ = std::move(loaded.entries);
+  entries_.clear();
+  for (Entry& entry : loaded.entries) {
+    entries_.push_back(std::move(entry));
+  }
   next_id_ = loaded.next_id;
   newer_version_ = loaded.newer_version;
   return std::move(loaded.diagnostics);
@@ -519,18 +527,38 @@ StoreResult History::Persist() {
                                          "and the file left as it is");
     return result;
   }
-  const std::string text = SerializeHistory(entries_, next_id_);
-  if (text.size() > kMaxHistoryBytes) {
+  // Written an entry at a time, never as one string: `SerializeHistory`'s text
+  // is every entry again, doubled its way to `kMaxHistoryBytes`, and this runs
+  // from `TickOptions::on_plan`, beside the plan and its results (#248). Sized
+  // first, the same way, so a file the reader would discard is never begun.
+  std::size_t size = FormatHeader(next_id_).size() + 1;
+  for (const Entry& entry : entries_) {
+    size += SerializeEntry(entry).size() + 1;
+  }
+  if (size > kMaxHistoryBytes) {
     // Unreachable with `kMaxEntries` entries of bounded strings -- which is what
     // `conflicts.store` asserts -- so reaching it means a bound moved. Refuse
     // rather than write a file the reader would discard whole.
     result.error = StoreError::kTooLarge;
-    result.message = Describe(path_, "would be " + std::to_string(text.size()) +
+    result.message = Describe(path_, "would be " + std::to_string(size) +
                                          " bytes, more than a conflict history can be read back "
                                          "with; nothing was written");
     return result;
   }
-  const io::WriteResult written = io::WriteAtomically(path_, text);
+  std::size_t next = 0;
+  const io::WriteResult written =
+      io::WriteAtomically(path_, [this, &next](std::string* piece) {
+        if (next == 0) {
+          *piece = FormatHeader(next_id_);
+        } else if (next <= entries_.size()) {
+          *piece = SerializeEntry(entries_[next - 1]);
+        } else {
+          return false;
+        }
+        *piece += '\n';
+        ++next;
+        return true;
+      });
   switch (written.error) {
     case io::WriteError::kNone:
       break;
