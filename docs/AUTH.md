@@ -54,7 +54,7 @@ sys-rommsync                         RomM server                 you (browser)
 ## The responses, verbatim
 
 `POST /api/auth/device/init` → **`201 Created`**, not `200`
-([`captures/auth-device-init.json`](../server/contract/captures/auth-device-init.json)):
+([`captures/5.4.0/auth-device-init.json`](../server/contract/captures/5.4.0/auth-device-init.json)):
 
 ```json
 {
@@ -68,21 +68,21 @@ sys-rommsync                         RomM server                 you (browser)
 ```
 
 `POST /api/auth/device/token` → `200` once approved
-([`captures/auth-device-token.json`](../server/contract/captures/auth-device-token.json)):
+([`captures/5.4.0/auth-device-token.json`](../server/contract/captures/5.4.0/auth-device-token.json)):
 
 ```json
 {
   "access_token": "rmm_<64 lowercase hex characters>",
-  "device_id": "9fdce844-779b-4216-a6e2-597a2f3e7027",
+  "device_id": "<the device row's UUID>",
   "scopes": ["assets.read", "assets.write", "collections.read", "devices.read",
-             "devices.write", "me.read", "roms.read", "roms.user.read",
-             "roms.user.write"],
+             "devices.write", "me.read", "platforms.read", "roms.read",
+             "roms.user.read", "roms.user.write"],
   "expires_at": null
 }
 ```
 
 A poll that has not been approved yet
-([`captures/auth-device-token-pending.json`](../server/contract/captures/auth-device-token-pending.json)):
+([`captures/5.4.0/auth-device-token-pending.json`](../server/contract/captures/5.4.0/auth-device-token-pending.json)):
 
 ```json
 {

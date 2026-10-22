@@ -540,13 +540,13 @@ ctest --test-dir build --output-on-failure
   checked against `server/contract/romm-openapi-5.4.0.json`, the floor's
   snapshot — `ClientSaveState` and `SyncNegotiatePayload` going out (M2-1),
   `SyncOperationSchema` and `SyncNegotiateResponse` coming back (M2-4), plus the
-  five `action` values the schema enumerates — *and* `ClientSaveState` is checked again against a body
-  `EncodeNegotiateRequest` actually produced, so drift on either side is red.
+  five `action` values the schema enumerates — *and* `ClientSaveState` is
+  checked again against a body `EncodeNegotiateRequest` actually produced, so
+  drift on either side is red.
 - `sync.plan` is the response half, read off the committed captures rather than
   restated: every field of `SyncOperation` against the negotiate captures in
-  `captures/5.4.0/`,
-  including the `upload` one where `save_id`, `server_updated_at` and
-  `server_content_hash` are all null. Two things no capture can pin are checked
+  `captures/5.4.0/`, including the `upload` one where `save_id`,
+  `server_updated_at` and `server_content_hash` are all null. Two things no capture can pin are checked
   there too — the `reason` strings RomM can emit that no capture holds
   (against the table in [API_CONTRACT.md](API_CONTRACT.md), in both directions),
   and an `action` from a server newer than this client, which is downgraded to
@@ -1075,9 +1075,9 @@ CI runs `host-tests` against 5.4.0 alone since #235, under the plain job name
 branch protection requires. The 5.2.0 leg was dropped with the flip, and with
 it the matrix: a matrix job whose `name:` holds no matrix expression reports as
 `host-tests (5.4.0)`, so the required `host-tests` check would never arrive.
-The next RomM beside it brings the matrix back with a name expression that
-keeps the required leg plain `host-tests`; `agent.config` fails the
-workflow otherwise.
+The next RomM beside it runs as a job of its own, so the required one stays
+plain `host-tests`; `agent.config` fails a `host-tests` that is a matrix, and
+any workflow job that pairs a fixed name with one.
 
 ### Keeping the captured contract honest
 

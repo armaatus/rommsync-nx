@@ -109,8 +109,8 @@ jobs:
   # version every suite asserts. NOT a matrix, even a one-leg one: a matrix job
   # whose name holds no matrix expression reports as `host-tests (5.4.0)`, and
   # branch protection requires `host-tests`, a check that then never arrives.
-  # A second RomM beside it needs a name expression that still yields plain
-  # `host-tests` for the required leg; agent.config (evals/lint.sh) holds this.
+  # A second RomM beside it runs as a job of its own, so this one stays plain
+  # `host-tests`; agent.config (evals/lint.sh) fails a host-tests matrix.
   host-tests:
     name: host-tests
     runs-on: ubuntu-latest

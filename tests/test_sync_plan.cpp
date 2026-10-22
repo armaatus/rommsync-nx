@@ -199,9 +199,10 @@ void EmptyCapture(checks::Checks& c) {
              std::int64_t{0}, "and the totals agree");
 }
 
-/// 5.4.0's `delete` (#233): a slot emptied on the server, offered back by the device that wrote it. It is the
-/// first action that removes a file from the card, so it is pinned to the bytes
-/// the probe asserted rather than to a hand-built body.
+/// 5.4.0's `delete` (#233): a slot emptied on the server, offered back by the
+/// device that wrote it. It is the first action that removes a file from the
+/// card, so it is pinned to the bytes the probe asserted rather than to a
+/// hand-built body.
 void DeleteCapture(checks::Checks& c) {
   const auth::Parsed<sync::SyncPlan> parsed = ParseCapture(c, "sync-negotiate-delete.json");
   const sync::SyncPlan& plan = parsed.value;

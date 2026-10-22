@@ -253,9 +253,9 @@ void PartialsAreRejected(checks::Checks& c) {
   c.Expect(no_scopes.ok(), "an empty scope list is accepted");
   c.Expect(no_scopes.value.scopes.empty(), "...and is empty");
 
-  // 5.2.0 always sends null, but the field is declared `string | null` and the
-  // pending endpoint already emits this shape. If RomM starts setting it, it
-  // must arrive rather than being refused.
+  // 5.2.0 and 5.4.0 always send null, but the field is declared
+  // `string | null` and the pending endpoint already emits this shape. If RomM
+  // starts setting it, it must arrive rather than being refused.
   const auth::Parsed<auth::DeviceTokenResponse> expiring = auth::ParseDeviceTokenResponse(
       R"({"access_token":"t","device_id":"d","scopes":["me.read"],)"
       R"("expires_at":"2026-09-04T13:04:00.528870+00:00"})");
@@ -324,7 +324,7 @@ void DurationsAreBounded(checks::Checks& c) {
 
   init.interval = 5;
   init.expires_in = 600;
-  c.Expect(init.poll_interval() == std::chrono::seconds{5}, "5.2.0's interval passes through");
+  c.Expect(init.poll_interval() == std::chrono::seconds{5}, "RomM's interval passes through");
   c.Expect(init.lifetime() == std::chrono::seconds{600}, "...and its lifetime");
 
   // The regression that matters: RomM restarts its pacing window on every poll
