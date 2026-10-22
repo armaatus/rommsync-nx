@@ -692,7 +692,23 @@ a sysmodule pays for a TLS request is therefore:
    of it serialised. A change now keeps the rows it touched, `queue.json` is
    written a piece at a time, and the queue's page reads the rows in place; even
    so the rows are ~21 KiB at 32 entries, which is why `kMaxQueueEntries` is 32
-   and not 64. The margin is 23 KiB, and what is still uncounted is #248.
+   and not 64. That left a 23 KiB margin and six things uncounted (#248).
+
+   M9-22 (#248) counted them, and found the widths everything above was sized
+   at were the fixture's: homebrew roms with no metadata, ~2.1 KiB a row. A rom
+   RomM identified on IGDB is ~12 KiB, so a 64-row page was ~750 KiB, grown past
+   a 256 KiB reservation into a heap that could not hold it. **Every backend now
+   caps a buffered body** at `http::kMaxResponseBytes` (200 KiB) — refused
+   unread when it declares its length, `Error::kTooLarge` — and the two rom
+   pagers ask for half the rows when a page meets it. A reader builds only the
+   members of a row it reads (`json::ParseEach`'s keeping form), so a wide row
+   in flight costs what is kept of it rather than ~16× its text. The negotiate
+   body is held once and freed before the plan is read; the last chunk's plan
+   goes before the next is asked; the #232 resolution resolves at most
+   `sync::kMaxResolvedUploads` (4) uploads a tick; a list page is measured at its
+   peak, not re-encoded per append; the device search keeps one row; and the
+   **conflict history** — resident and never counted — has a row, and is
+   written an entry at a time. The margin is 8 KiB.
 2. **The in-flight buffers** — ours to size. Roms stream to file and never sit
    in RAM whole (hard rule 2's sibling: nothing is buffered that does not have
    to be). Every `sslConnectionRead` is an IPC round trip to the `ssl`
